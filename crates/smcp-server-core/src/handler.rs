@@ -237,6 +237,8 @@ impl SmcpHandler {
         data: EnterOfficeReq,
         state: ServerState,
     ) -> Result<(bool, Option<String>), HandlerError> {
+        println!("!!! on_server_join_office called with data: {:?}", data);
+        info!("on_server_join_office called with data: {:?}", data);
         let sid = socket.id.to_string();
         let requested_role = ClientRole::from(data.role.clone());
         let requested_name = data.name.clone();
@@ -281,25 +283,46 @@ impl SmcpHandler {
             .update_office_id(&sid, Some(data.office_id.clone()))?;
 
         // 构建通知数据
+        let session_name = session.name.clone();
         let notification_data = if session.role == ClientRole::Computer {
             EnterOfficeNotification {
                 office_id: data.office_id.clone(),
-                computer: Some(session.name),
+                computer: Some(session_name.clone()),
                 agent: None,
             }
         } else {
             EnterOfficeNotification {
                 office_id: data.office_id.clone(),
                 computer: None,
-                agent: Some(session.name),
+                agent: Some(session_name.clone()),
             }
         };
 
         // 广播加入消息
-        let _ = socket
-            .within(data.office_id.clone())
+        println!(
+            "Broadcasting NOTIFY_ENTER_OFFICE to room '{}' from {} (sid: {})",
+            data.office_id, session_name, socket.id
+        );
+        info!(
+            "Broadcasting NOTIFY_ENTER_OFFICE to room '{}' from {} (sid: {})",
+            data.office_id, session_name, socket.id
+        );
+        
+        // Try broadcasting to all sockets without room filtering
+        println!("Trying broadcast to all sockets...");
+        let result_all = socket
+            .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data);
+        println!("Broadcast to all result: {:?}", result_all);
+        
+        // Also try room-based broadcast
+        println!("Trying broadcast to room...");
+        let result = socket
+            .to(data.office_id.clone())
             .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data)
             .await;
+        println!("Broadcast to room result: {:?}", result);
+            
+        info!("Broadcast completed with results: all={:?}, room={:?}", result_all, result);
 
         Ok((true, None))
     }
@@ -827,13 +850,29 @@ impl SmcpHandler {
         office_id: &str,
         state: &ServerState,
     ) -> Result<(), HandlerError> {
+        info!(
+            "handle_join_room called: sid={}, office_id={}, role={:?}",
+            socket.id, office_id, session.role
+        );
+        
         match Self::validate_join_room(session, office_id, &*state)? {
-            JoinRoomDecision::Noop => Ok(()),
+            JoinRoomDecision::Noop => {
+                info!("Noop decision for sid={}", socket.id);
+                Ok(())
+            },
             JoinRoomDecision::Join => {
+                println!("Joining room '{}' for sid={}", office_id, socket.id);
+                info!("Joining room '{}' for sid={}", office_id, socket.id);
                 socket.join(office_id.to_string());
+                // Verify the socket is now in the room
+                println!("Socket {} joined room successfully", socket.id);
                 Ok(())
             }
             JoinRoomDecision::LeaveAndJoin { leave_office } => {
+                info!(
+                    "Leaving room '{}' and joining '{}' for sid={}",
+                    leave_office, office_id, socket.id
+                );
                 socket.leave(leave_office);
                 socket.join(office_id.to_string());
                 Ok(())

@@ -1,10 +1,20 @@
+use tracing::info;
+use tracing_subscriber::fmt;
+
 #[tokio::main]
-async fn main() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = fmt().with_env_filter("info").try_init();
 
-    let _server = smcp_server_core::SmcpServerBuilder::new()
-        .build_layer()
-        .expect("failed to build SMCP server layer");
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let addr = if args.len() > 1 {
+        args[1].parse()?
+    } else {
+        "127.0.0.1:3000".parse()?
+    };
 
-    tracing::info!("smcp-server-hyper built successfully");
+    info!("Starting SMCP server on {}", addr);
+
+    // Build and run the server
+    smcp_server_hyper::run_server(addr).await
 }
