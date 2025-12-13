@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use socketioxide::extract::SocketRef;
 use socketioxide::SocketIo;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Notify};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use futures_util::future::BoxFuture;
 use http_body_util::Full;
@@ -23,6 +23,23 @@ use tower::{Layer, Service};
 async fn find_available_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().port()
+}
+
+fn counter_handler(
+    counter: Arc<AtomicUsize>,
+    notify: Option<Arc<Notify>>,
+) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync {
+    move |_payload: Payload, _client| {
+        let counter = counter.clone();
+        let notify = notify.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if let Some(notify) = notify {
+                notify.notify_one();
+            }
+        }
+        .boxed()
+    }
 }
 
 struct TestServer {
@@ -232,6 +249,268 @@ async fn test_socketioxide_and_rust_socketio_interop() {
     );
 
     client.disconnect().await.expect("Failed to disconnect");
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn test_update_notifications_and_role_checks() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+
+    // Counters for agent
+    let agent_update_config_count = Arc::new(AtomicUsize::new(0));
+    let agent_update_config_notify = Arc::new(Notify::new());
+    let agent_update_tool_list_count = Arc::new(AtomicUsize::new(0));
+    let agent_update_tool_list_notify = Arc::new(Notify::new());
+    let agent_update_desktop_count = Arc::new(AtomicUsize::new(0));
+    let agent_update_desktop_notify = Arc::new(Notify::new());
+    let agent_tool_cancel_count = Arc::new(AtomicUsize::new(0));
+    let agent_tool_cancel_notify = Arc::new(Notify::new());
+
+    // Counters for computer
+    let computer_update_config_count = Arc::new(AtomicUsize::new(0));
+    let computer_update_tool_list_count = Arc::new(AtomicUsize::new(0));
+    let computer_update_desktop_count = Arc::new(AtomicUsize::new(0));
+    let computer_tool_cancel_count = Arc::new(AtomicUsize::new(0));
+    let computer_tool_cancel_notify = Arc::new(Notify::new());
+
+    let computer_client = ClientBuilder::new(&server_url)
+        .namespace(smcp::SMCP_NAMESPACE)
+        .transport_type(TransportType::Websocket)
+        .opening_header("x-api-key", "test_secret")
+        .on(
+            smcp::events::NOTIFY_UPDATE_CONFIG,
+            counter_handler(computer_update_config_count.clone(), None),
+        )
+        .on(
+            smcp::events::NOTIFY_UPDATE_TOOL_LIST,
+            counter_handler(computer_update_tool_list_count.clone(), None),
+        )
+        .on(
+            smcp::events::NOTIFY_UPDATE_DESKTOP,
+            counter_handler(computer_update_desktop_count.clone(), None),
+        )
+        .on(
+            smcp::events::NOTIFY_TOOL_CALL_CANCEL,
+            counter_handler(
+                computer_tool_cancel_count.clone(),
+                Some(computer_tool_cancel_notify.clone()),
+            ),
+        )
+        .connect()
+        .await
+        .expect("Failed to connect computer client");
+
+    // 连接已经成功，无需等待 connect 事件
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (computer_join_tx, computer_join_rx) = oneshot::channel::<serde_json::Value>();
+    computer_client
+        .emit_with_ack(
+            smcp::events::SERVER_JOIN_OFFICE,
+            serde_json::json!({
+                "role": "computer",
+                "name": "comp_a",
+                "office_id": "shared_office"
+            }),
+            Duration::from_secs(2),
+            ack_to_sender(computer_join_tx, |p| match p {
+                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            }),
+        )
+        .await
+        .expect("computer join_office failed");
+    timeout(Duration::from_secs(5), computer_join_rx)
+        .await
+        .expect("computer join ack timeout")
+        .unwrap();
+
+    let agent_client = ClientBuilder::new(&server_url)
+        .namespace(smcp::SMCP_NAMESPACE)
+        .transport_type(TransportType::Websocket)
+        .opening_header("x-api-key", "test_secret")
+        .on(
+            smcp::events::NOTIFY_UPDATE_CONFIG,
+            counter_handler(
+                agent_update_config_count.clone(),
+                Some(agent_update_config_notify.clone()),
+            ),
+        )
+        .on(
+            smcp::events::NOTIFY_UPDATE_TOOL_LIST,
+            counter_handler(
+                agent_update_tool_list_count.clone(),
+                Some(agent_update_tool_list_notify.clone()),
+            ),
+        )
+        .on(
+            smcp::events::NOTIFY_UPDATE_DESKTOP,
+            counter_handler(
+                agent_update_desktop_count.clone(),
+                Some(agent_update_desktop_notify.clone()),
+            ),
+        )
+        .on(
+            smcp::events::NOTIFY_TOOL_CALL_CANCEL,
+            counter_handler(
+                agent_tool_cancel_count.clone(),
+                Some(agent_tool_cancel_notify.clone()),
+            ),
+        )
+        .connect()
+        .await
+        .expect("Failed to connect agent client");
+
+    // 连接已经成功，无需等待 connect 事件
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (agent_join_tx, agent_join_rx) = oneshot::channel::<serde_json::Value>();
+    agent_client
+        .emit_with_ack(
+            smcp::events::SERVER_JOIN_OFFICE,
+            serde_json::json!({
+                "role": "agent",
+                "name": "agent_a",
+                "office_id": "shared_office"
+            }),
+            Duration::from_secs(2),
+            ack_to_sender(agent_join_tx, |p| match p {
+                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            }),
+        )
+        .await
+        .expect("agent join_office failed");
+    timeout(Duration::from_secs(5), agent_join_rx)
+        .await
+        .expect("agent join ack timeout")
+        .unwrap();
+
+    // Positive cases: computer broadcasts updates to agent, skipping itself.
+    computer_client
+        .emit(
+            smcp::events::SERVER_UPDATE_CONFIG,
+            serde_json::json!({ "computer": "comp_a" }),
+        )
+        .await
+        .expect("emit update_config failed");
+    
+    // 添加调试日志
+    tracing::info!("Waiting for agent to receive update_config notification...");
+    tracing::info!("Agent update_config count: {}", agent_update_config_count.load(Ordering::SeqCst));
+    
+    timeout(Duration::from_secs(2), agent_update_config_notify.notified())
+        .await
+        .expect("agent did not receive update_config");
+    assert_eq!(agent_update_config_count.load(Ordering::SeqCst), 1);
+    assert_eq!(computer_update_config_count.load(Ordering::SeqCst), 0);
+
+    computer_client
+        .emit(
+            smcp::events::SERVER_UPDATE_TOOL_LIST,
+            serde_json::json!({ "computer": "comp_a" }),
+        )
+        .await
+        .expect("emit update_tool_list failed");
+    timeout(
+        Duration::from_secs(2),
+        agent_update_tool_list_notify.notified(),
+    )
+    .await
+    .expect("agent did not receive update_tool_list");
+    assert_eq!(agent_update_tool_list_count.load(Ordering::SeqCst), 1);
+    assert_eq!(computer_update_tool_list_count.load(Ordering::SeqCst), 0);
+
+    computer_client
+        .emit(
+            smcp::events::SERVER_UPDATE_DESKTOP,
+            serde_json::json!({ "computer": "comp_a" }),
+        )
+        .await
+        .expect("emit update_desktop failed");
+    timeout(
+        Duration::from_secs(2),
+        agent_update_desktop_notify.notified(),
+    )
+    .await
+    .expect("agent did not receive update_desktop");
+    assert_eq!(agent_update_desktop_count.load(Ordering::SeqCst), 1);
+    assert_eq!(computer_update_desktop_count.load(Ordering::SeqCst), 0);
+
+    // Positive case: agent cancels tool call, only computer receives.
+    agent_client
+        .emit(
+            smcp::events::SERVER_TOOL_CALL_CANCEL,
+            serde_json::json!({
+                "agent": "agent_a",
+                "req_id": "rid_tool"
+            }),
+        )
+        .await
+        .expect("emit tool_call_cancel failed");
+    timeout(
+        Duration::from_secs(2),
+        computer_tool_cancel_notify.notified(),
+    )
+    .await
+    .expect("computer did not receive tool_call_cancel");
+    assert_eq!(computer_tool_cancel_count.load(Ordering::SeqCst), 1);
+    assert_eq!(agent_tool_cancel_count.load(Ordering::SeqCst), 0);
+
+    // Negative case: wrong role should not broadcast.
+    let agent_update_config_before = agent_update_config_count.load(Ordering::SeqCst);
+    computer_client
+        .emit(
+            smcp::events::SERVER_TOOL_CALL_CANCEL,
+            serde_json::json!({
+                "agent": "comp_a",
+                "req_id": "invalid",
+            }),
+        )
+        .await
+        .expect("emit tool_call_cancel from computer failed");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        agent_tool_cancel_count.load(Ordering::SeqCst),
+        0,
+        "computer should not trigger tool cancel notify for agent"
+    );
+    assert_eq!(
+        computer_tool_cancel_count.load(Ordering::SeqCst),
+        1,
+        "computer should not receive self-broadcast"
+    );
+
+    agent_client
+        .emit(
+            smcp::events::SERVER_UPDATE_CONFIG,
+            serde_json::json!({ "computer": "comp_a" }),
+        )
+        .await
+        .expect("agent emit update_config failed");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        agent_update_config_count.load(Ordering::SeqCst),
+        agent_update_config_before,
+        "agent should not receive update_config triggered by itself with wrong role"
+    );
+    assert_eq!(
+        computer_update_config_count.load(Ordering::SeqCst),
+        0,
+        "computer should not receive update_config triggered by agent"
+    );
+
+    computer_client
+        .disconnect()
+        .await
+        .expect("Failed to disconnect computer");
+    agent_client
+        .disconnect()
+        .await
+        .expect("Failed to disconnect agent");
     server.shutdown();
 }
 

@@ -98,24 +98,27 @@ impl SmcpHandler {
             },
         );
 
+        let state_tool_call_cancel = state.clone();
         socket.on(
             smcp::events::SERVER_TOOL_CALL_CANCEL,
             move |socket: SocketRef, Data::<AgentCallData>(data)| async move {
-                Self::on_server_tool_call_cancel(socket, data).await
+                Self::on_server_tool_call_cancel(socket, data, state_tool_call_cancel.clone()).await
             },
         );
 
+        let state_update_config = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_CONFIG,
             move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
-                Self::on_server_update_config(socket, data).await
+                Self::on_server_update_config(socket, data, state_update_config.clone()).await
             },
         );
 
+        let state_update_tool_list = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_TOOL_LIST,
             move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
-                Self::on_server_update_tool_list(socket, data).await
+                Self::on_server_update_tool_list(socket, data, state_update_tool_list.clone()).await
             },
         );
 
@@ -147,10 +150,11 @@ impl SmcpHandler {
             },
         );
 
+        let state_update_desktop = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_DESKTOP,
             move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
-                Self::on_server_update_desktop(socket, data).await
+                Self::on_server_update_desktop(socket, data, state_update_desktop.clone()).await
             },
         );
 
@@ -234,18 +238,33 @@ impl SmcpHandler {
         state: ServerState,
     ) -> Result<(bool, Option<String>), HandlerError> {
         let sid = socket.id.to_string();
+        let requested_role = ClientRole::from(data.role.clone());
+        let requested_name = data.name.clone();
 
         // 获取或创建会话
         let session = match state.session_manager.get_session(&sid) {
-            Some(s) => s,
+            Some(s) => {
+                // 检查角色/状态一致性
+                if s.role != requested_role {
+                    return Err(HandlerError::InvalidRequest(format!(
+                        "Role mismatch: existing session has role {:?}, but requested {:?}",
+                        s.role, requested_role
+                    )));
+                }
+                
+                if s.name != requested_name {
+                    return Err(HandlerError::InvalidRequest(format!(
+                        "Name mismatch: existing session has name '{}', but requested '{}'",
+                        s.name, requested_name
+                    )));
+                }
+                
+                s
+            }
             None => {
-                // 从认证信息或请求数据中获取角色和名称
-                let role = ClientRole::from(data.role.clone());
-                let name = data.name.clone();
-
-                let new_session = SessionData::new(sid.clone(), name, role)
-                    .with_office_id(data.office_id.clone());
-
+                // 创建新会话
+                let new_session = SessionData::new(sid.clone(), requested_name, requested_role);
+                
                 state
                     .session_manager
                     .register_session(new_session.clone())?;
@@ -256,7 +275,7 @@ impl SmcpHandler {
         // 检查并加入房间
         Self::handle_join_room(socket.clone(), &session, &data.office_id, &state).await?;
 
-        // 更新会话的办公室 ID
+        // 更新会话的办公室 ID（在成功加入房间后）
         state
             .session_manager
             .update_office_id(&sid, Some(data.office_id.clone()))?;
@@ -328,29 +347,144 @@ impl SmcpHandler {
     }
 
     /// 处理工具调用取消事件
-    async fn on_server_tool_call_cancel(socket: SocketRef, data: AgentCallData) {
-        // 广播取消通知
-        let _ = socket.emit(smcp::events::NOTIFY_TOOL_CALL_CANCEL, &data);
+    async fn on_server_tool_call_cancel(socket: SocketRef, data: AgentCallData, state: ServerState) {
+        let sid = socket.id.to_string();
+        let session = match state.session_manager.get_session(&sid) {
+            Some(s) => s,
+            None => {
+                warn!("SERVER_TOOL_CALL_CANCEL from unknown session sid={}", sid);
+                return;
+            }
+        };
+
+        // Python 侧语义：向 office(room) 广播并跳过自己
+        // 这里沿用 socketioxide 的 to(room) 语义：从当前 socket 触发时，会自动排除自身。
+
+        // 角色断言：取消工具调用通常由 Agent 发起
+        if session.role != ClientRole::Agent {
+            warn!(
+                "SERVER_TOOL_CALL_CANCEL role mismatch: expected Agent, got {:?}, sid={}",
+                session.role, sid
+            );
+            return;
+        }
+
+        let office_id = match session.office_id {
+            Some(ref office_id) => office_id.clone(),
+            None => {
+                warn!("SERVER_TOOL_CALL_CANCEL but session not in office, sid={}", sid);
+                return;
+            }
+        };
+
+        if let Err(e) = socket
+            .to(office_id)
+            .emit(smcp::events::NOTIFY_TOOL_CALL_CANCEL, &data)
+            .await
+        {
+            warn!("Failed to broadcast NOTIFY_TOOL_CALL_CANCEL: {}", e);
+        }
     }
 
     /// 处理配置更新事件
-    async fn on_server_update_config(socket: SocketRef, data: UpdateComputerConfigReq) {
-        // 广播配置更新通知
-        let notification = UpdateMCPConfigNotification {
-            computer: data.computer,
+    async fn on_server_update_config(
+        socket: SocketRef,
+        data: UpdateComputerConfigReq,
+        state: ServerState,
+    ) {
+        let sid = socket.id.to_string();
+        let session = match state.session_manager.get_session(&sid) {
+            Some(s) => s,
+            None => {
+                warn!("SERVER_UPDATE_CONFIG from unknown session sid={}", sid);
+                return;
+            }
         };
 
-        let _ = socket.emit(smcp::events::NOTIFY_UPDATE_CONFIG, &notification);
+        // 角色断言：配置更新通常由 Computer 发起
+        if session.role != ClientRole::Computer {
+            warn!(
+                "SERVER_UPDATE_CONFIG role mismatch: expected Computer, got {:?}, sid={}",
+                session.role, sid
+            );
+            return;
+        }
+
+        let office_id = match session.office_id {
+            Some(ref office_id) => office_id.clone(),
+            None => {
+                warn!("SERVER_UPDATE_CONFIG but session not in office, sid={}", sid);
+                return;
+            }
+        };
+
+        // 广播配置更新通知（向 office 广播并跳过自己）
+        let notification = UpdateMCPConfigNotification {
+            computer: data.computer.clone(),
+        };
+
+        let office_id_clone = office_id.clone();
+        let computer_clone = data.computer.clone();
+        info!(
+            "Broadcasting NOTIFY_UPDATE_CONFIG to room '{}' from computer '{}' (sid: {})",
+            office_id_clone, computer_clone, sid
+        );
+
+        if let Err(e) = socket
+            .to(office_id.clone())
+            .emit(smcp::events::NOTIFY_UPDATE_CONFIG, &notification)
+            .await
+        {
+            warn!("Failed to broadcast NOTIFY_UPDATE_CONFIG: {}", e);
+        } else {
+            info!("Successfully broadcasted NOTIFY_UPDATE_CONFIG to room '{}'", office_id);
+        }
     }
 
     /// 处理工具列表更新事件
-    async fn on_server_update_tool_list(socket: SocketRef, data: UpdateComputerConfigReq) {
-        // 广播工具列表更新通知
+    async fn on_server_update_tool_list(
+        socket: SocketRef,
+        data: UpdateComputerConfigReq,
+        state: ServerState,
+    ) {
+        let sid = socket.id.to_string();
+        let session = match state.session_manager.get_session(&sid) {
+            Some(s) => s,
+            None => {
+                warn!("SERVER_UPDATE_TOOL_LIST from unknown session sid={}", sid);
+                return;
+            }
+        };
+
+        // 角色断言：工具列表更新通常由 Computer 发起
+        if session.role != ClientRole::Computer {
+            warn!(
+                "SERVER_UPDATE_TOOL_LIST role mismatch: expected Computer, got {:?}, sid={}",
+                session.role, sid
+            );
+            return;
+        }
+
+        let office_id = match session.office_id {
+            Some(ref office_id) => office_id.clone(),
+            None => {
+                warn!("SERVER_UPDATE_TOOL_LIST but session not in office, sid={}", sid);
+                return;
+            }
+        };
+
+        // 广播工具列表更新通知（向 office 广播并跳过自己）
         let notification = UpdateMCPConfigNotification {
             computer: data.computer,
         };
 
-        let _ = socket.emit(smcp::events::NOTIFY_UPDATE_TOOL_LIST, &notification);
+        if let Err(e) = socket
+            .to(office_id)
+            .emit(smcp::events::NOTIFY_UPDATE_TOOL_LIST, &notification)
+            .await
+        {
+            warn!("Failed to broadcast NOTIFY_UPDATE_TOOL_LIST: {}", e);
+        }
     }
 
     /// 处理客户端工具调用事件
@@ -595,21 +729,75 @@ impl SmcpHandler {
     }
 
     /// 处理桌面更新事件
-    async fn on_server_update_desktop(socket: SocketRef, data: UpdateComputerConfigReq) {
-        // 广播桌面更新通知
+    async fn on_server_update_desktop(
+        socket: SocketRef,
+        data: UpdateComputerConfigReq,
+        state: ServerState,
+    ) {
+        let sid = socket.id.to_string();
+        let session = match state.session_manager.get_session(&sid) {
+            Some(s) => s,
+            None => {
+                warn!("SERVER_UPDATE_DESKTOP from unknown session sid={}", sid);
+                return;
+            }
+        };
+
+        // 角色断言：桌面更新通常由 Computer 发起
+        if session.role != ClientRole::Computer {
+            warn!(
+                "SERVER_UPDATE_DESKTOP role mismatch: expected Computer, got {:?}, sid={}",
+                session.role, sid
+            );
+            return;
+        }
+
+        let office_id = match session.office_id {
+            Some(ref office_id) => office_id.clone(),
+            None => {
+                warn!("SERVER_UPDATE_DESKTOP but session not in office, sid={}", sid);
+                return;
+            }
+        };
+
+        // 广播桌面更新通知（向 office 广播并跳过自己）
         let notification = UpdateMCPConfigNotification {
             computer: data.computer,
         };
 
-        let _ = socket.emit(smcp::events::NOTIFY_UPDATE_DESKTOP, &notification);
+        if let Err(e) = socket
+            .to(office_id)
+            .emit(smcp::events::NOTIFY_UPDATE_DESKTOP, &notification)
+            .await
+        {
+            warn!("Failed to broadcast NOTIFY_UPDATE_DESKTOP: {}", e);
+        }
     }
 
     /// 处理列出房间事件
     async fn on_server_list_room(
-        _socket: SocketRef,
+        socket: SocketRef,
         data: ListRoomReq,
         state: ServerState,
     ) -> Result<ListRoomRet, HandlerError> {
+        // 获取发起者会话信息
+        let sid = socket.id.to_string();
+        let session = state
+            .session_manager
+            .get_session(&sid)
+            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+
+        // 权限校验：只能查询自己所在的办公室
+        let session_office_id = session.office_id.ok_or_else(|| {
+            HandlerError::InvalidRequest("You must be in an office to list room members".to_string())
+        })?;
+
+        if session_office_id != data.office_id {
+            return Err(HandlerError::InvalidRequest(
+                "You can only list members of your own office".to_string(),
+            ));
+        }
+
         // 获取指定办公室的所有会话
         let sessions = state
             .session_manager
