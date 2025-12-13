@@ -1,0 +1,16 @@
+[package]
+name = "smcp-server-hyper"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smcp-server-core = { path = "../smcp-server-core" }
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+hyper.workspace = true
+hyper-util.workspace = true
+socketioxide.workspace = true

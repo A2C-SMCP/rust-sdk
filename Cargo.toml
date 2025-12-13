@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/smcp",
+  "crates/smcp-agent",
+  "crates/smcp-computer",
+  "crates/smcp-server-core",
+  "crates/smcp-server-hyper",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[package]
+name = "a2c-smcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A2C-SMCP Rust SDK - Agent, Computer, and Server implementation"
+authors = ["A2C Team"]
+repository = "https://github.com/a2c-smcp/rust-sdk"
+homepage = "https://github.com/a2c-smcp/rust-sdk"
+documentation = "https://docs.rs/a2c-smcp"
+readme = "README.md"
+keywords = ["smcp", "agent", "computer", "server", "mcp"]
+categories = ["development-tools", "network-programming"]
+
+[features]
+default = []
+agent = ["dep:smcp-agent"]
+computer = ["dep:smcp-computer"]
+server = ["dep:smcp-server-core", "dep:smcp-server-hyper"]
+full = ["agent", "computer", "server"]
+
+[dependencies]
+# Core protocol types (always included)
+smcp = { path = "crates/smcp", version = "0.1.0" }
+
+# Optional components
+smcp-agent = { path = "crates/smcp-agent", version = "0.1.0", optional = true }
+smcp-computer = { path = "crates/smcp-computer", version = "0.1.0", optional = true }
+smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.0", optional = true }
+smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.0", optional = true }
+
+# Re-export commonly used dependencies for convenience
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Testing utilities
+tokio-test = "0.4"
+tempfile = "3"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+socketioxide = "0.16.3"
+rust_socketio = { version = "0.6", features = ["async"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = "0.5"
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper-tungstenite = "0.17"

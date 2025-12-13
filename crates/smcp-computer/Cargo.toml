@@ -1,0 +1,18 @@
+[package]
+name = "smcp-computer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smcp = { path = "../smcp" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+futures-util.workspace = true
+
+rust_socketio.workspace = true
