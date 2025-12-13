@@ -74,17 +74,18 @@ impl SmcpServerBuilder {
             .session_manager
             .unwrap_or_else(|| Arc::new(SessionManager::new()));
 
-        // 创建服务器状态
+        // 创建 Socket.IO
+        let (layer, io) = SocketIo::builder().build_layer();
+
+        // 更新状态中的 io 引用
         let state = ServerState {
             session_manager,
             auth_provider,
+            io: Arc::new(io.clone()),
         };
 
-        // 创建 Socket.IO
-        let (layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
-
         // 注册处理器
-        SmcpHandler::register_handlers(&io);
+        SmcpHandler::register_handlers(&io, state.clone());
 
         info!("SMCP Server layer built successfully");
 

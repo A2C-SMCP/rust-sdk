@@ -110,6 +110,16 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    fn name_key(role: &ClientRole, office_id: Option<&OfficeId>, name: &str) -> String {
+        match role {
+            ClientRole::Agent => format!("agent:{}", name),
+            ClientRole::Computer => match office_id {
+                Some(office_id) => format!("computer:{}:{}", office_id, name),
+                None => format!("computer::{}", name),
+            },
+        }
+    }
+
     /// 创建新的会话管理器
     pub fn new() -> Self {
         Self {
@@ -120,8 +130,9 @@ impl SessionManager {
 
     /// 注册新会话
     pub fn register_session(&self, session: SessionData) -> Result<(), SessionError> {
+        let key = Self::name_key(&session.role, session.office_id.as_ref(), &session.name);
         // 检查 name 是否已被其他 sid 使用
-        if let Some(existing_sid) = self.name_to_sid.get(&session.name) {
+        if let Some(existing_sid) = self.name_to_sid.get(&key) {
             if *existing_sid != session.sid {
                 return Err(SessionError::NameAlreadyRegistered(session.name));
             }
@@ -132,8 +143,7 @@ impl SessionManager {
 
         // 注册映射
         self.sessions.insert(session.sid.clone(), session.clone());
-        self.name_to_sid
-            .insert(session.name.clone(), session.sid.clone());
+        self.name_to_sid.insert(key, session.sid.clone());
 
         tracing::debug!("Registered session: {} -> {}", session.name, session.sid);
         Ok(())
@@ -144,7 +154,12 @@ impl SessionManager {
         let session = self.sessions.remove(sid)?;
 
         // 清理 name 映射
-        self.name_to_sid.remove(&session.1.name);
+        let key = Self::name_key(
+            &session.1.role,
+            session.1.office_id.as_ref(),
+            &session.1.name,
+        );
+        self.name_to_sid.remove(&key);
 
         tracing::debug!("Unregistered session: {} -> {}", session.1.name, sid);
         Some(session.1)
@@ -157,7 +172,8 @@ impl SessionManager {
 
     /// 通过名称获取会话 ID
     pub fn get_sid_by_name(&self, name: &str) -> Option<SessionId> {
-        self.name_to_sid.get(name).map(|s| s.clone())
+        let key = Self::name_key(&ClientRole::Agent, None, name);
+        self.name_to_sid.get(&key).map(|s| s.clone())
     }
 
     /// 更新会话的办公室 ID
@@ -170,6 +186,24 @@ impl SessionManager {
             .sessions
             .get_mut(sid)
             .ok_or_else(|| SessionError::NotFound(sid.clone()))?;
+
+        let role = session.role.clone();
+        let name = session.name.clone();
+        let old_office_id = session.office_id.clone();
+
+        let old_key = Self::name_key(&role, old_office_id.as_ref(), &name);
+        let new_key = Self::name_key(&role, office_id.as_ref(), &name);
+
+        if old_key != new_key {
+            if let Some(existing_sid) = self.name_to_sid.get(&new_key) {
+                if *existing_sid != *sid {
+                    return Err(SessionError::NameAlreadyRegistered(name));
+                }
+            }
+
+            self.name_to_sid.remove(&old_key);
+            self.name_to_sid.insert(new_key, sid.clone());
+        }
 
         session.office_id = office_id;
         Ok(())
@@ -197,6 +231,24 @@ impl SessionManager {
             s.office_id.as_ref() == Some(office_id)
                 && s.role == ClientRole::Computer
                 && s.name == name
+        })
+    }
+
+    /// 获取房间内指定 Computer 的 sid
+    pub fn get_computer_sid_in_office(
+        &self,
+        office_id: &OfficeId,
+        name: &str,
+    ) -> Option<SessionId> {
+        self.sessions.iter().find_map(|s| {
+            if s.office_id.as_ref() == Some(office_id)
+                && s.role == ClientRole::Computer
+                && s.name == name
+            {
+                Some(s.sid.clone())
+            } else {
+                None
+            }
         })
     }
 
@@ -274,6 +326,8 @@ mod tests {
         let manager = SessionManager::new();
         let sid1 = Uuid::new_v4().to_string();
         let sid2 = Uuid::new_v4().to_string();
+        let sid3 = Uuid::new_v4().to_string();
+        let sid4 = Uuid::new_v4().to_string();
 
         let session1 = SessionData::new(
             sid1.clone(),
@@ -283,14 +337,43 @@ mod tests {
         let session2 = SessionData::new(
             sid2.clone(),
             "duplicate_name".to_string(),
-            ClientRole::Computer,
+            ClientRole::Agent,
         );
+
+        let session3 = SessionData::new(
+            sid3.clone(),
+            "duplicate_name".to_string(),
+            ClientRole::Computer,
+        )
+        .with_office_id("office1".to_string());
+
+        let session4 = SessionData::new(
+            sid4.clone(),
+            "duplicate_name".to_string(),
+            ClientRole::Computer,
+        )
+        .with_office_id("office2".to_string());
 
         // 第一个注册成功
         assert!(manager.register_session(session1).is_ok());
 
-        // 第二个注册失败（名称重复）
+        // 第二个注册失败（Agent 名称全局唯一）
         assert!(manager.register_session(session2).is_err());
+
+        // Computer 名称按 office 唯一：同 office 冲突
+        assert!(manager.register_session(session3.clone()).is_ok());
+        assert!(manager.register_session(session3).is_ok());
+
+        let dup_same_office = SessionData::new(
+            Uuid::new_v4().to_string(),
+            "duplicate_name".to_string(),
+            ClientRole::Computer,
+        )
+        .with_office_id("office1".to_string());
+        assert!(manager.register_session(dup_same_office).is_err());
+
+        // 不同 office 允许同名
+        assert!(manager.register_session(session4).is_ok());
     }
 
     #[test]

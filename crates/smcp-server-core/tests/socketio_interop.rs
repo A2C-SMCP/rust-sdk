@@ -386,7 +386,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
     assert!(
         get_tools_payload
             .to_string()
-            .contains("Message forwarding not yet implemented"),
+            .contains("Only agents can get tools"),
         "unexpected get_tools response: {}",
         get_tools_payload
     );
@@ -398,10 +398,9 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             serde_json::json!({ "office_id": "office1" }),
             Duration::from_secs(2),
             ack_to_sender(leave_tx, |p| match p {
-                Payload::Text(mut values) => match values.pop() {
-                    Some(v) => v,
-                    None => serde_json::Value::Null,
-                },
+                Payload::Text(mut values) => {
+                    values.pop().unwrap_or_else(|| serde_json::Value::Null)
+                }
                 _ => serde_json::Value::Null,
             }),
         )

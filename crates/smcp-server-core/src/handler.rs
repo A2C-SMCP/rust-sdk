@@ -2,10 +2,11 @@
 
 use crate::auth::{AuthError, AuthenticationProvider};
 use crate::session::{ClientRole, SessionData, SessionError, SessionManager};
+use futures_util::StreamExt;
 use serde_json::Value;
 use smcp::*;
 use socketioxide::{
-    extract::{AckSender, Data, SocketRef, State},
+    extract::{AckSender, Data, SocketRef},
     SocketIo,
 };
 use std::sync::Arc;
@@ -43,6 +44,8 @@ pub struct ServerState {
     pub session_manager: Arc<SessionManager>,
     /// 认证提供者
     pub auth_provider: Arc<dyn AuthenticationProvider>,
+    /// SocketIo 实例引用，用于跨 socket 通信
+    pub io: Arc<SocketIo>,
 }
 
 /// SMCP 事件处理器
@@ -50,146 +53,119 @@ pub struct SmcpHandler;
 
 impl SmcpHandler {
     /// 注册所有事件处理器
-    pub fn register_handlers(io: &SocketIo) {
+    pub fn register_handlers(io: &SocketIo, state: ServerState) {
         // 注册命名空间和连接处理器
-        io.ns(
-            SMCP_NAMESPACE,
-            |socket: SocketRef, state: State<ServerState>| async move {
-                if let Err(e) =
-                    Self::on_connect(socket.clone(), socketioxide::extract::State(state.clone()))
-                        .await
-                {
+        io.ns(SMCP_NAMESPACE, move |socket: SocketRef| {
+            let state = state.clone();
+            async move {
+                if let Err(e) = Self::on_connect(socket.clone(), &state).await {
                     error!("on_connect failed: {}", e);
                     return;
                 }
 
                 // 连接时注册所有事件处理器
                 Self::handle_connection(socket, state)
-            },
-        );
+            }
+        });
     }
 
     /// 处理连接并注册事件处理器
-    fn handle_connection(socket: SocketRef, _state: State<ServerState>) {
+    fn handle_connection(socket: SocketRef, state: ServerState) {
         // 注册各种事件处理器
-        socket.on_disconnect(|socket: SocketRef, state: State<ServerState>| async move {
-            Self::on_disconnect(socket, state).await
-        });
-
-        socket.on(
-            smcp::events::SERVER_JOIN_OFFICE,
-            move |socket: SocketRef,
-                  Data::<EnterOfficeReq>(data),
-                  ack: AckSender,
-                  state: State<ServerState>| {
-                async move {
-                    let result = Self::on_server_join_office(socket, data, state).await;
-                    let _ = ack.send(&result);
-                }
-            },
-        );
-
-        socket.on(
-            smcp::events::SERVER_LEAVE_OFFICE,
-            move |socket: SocketRef,
-                  Data::<LeaveOfficeReq>(data),
-                  ack: AckSender,
-                  state: State<ServerState>| {
-                async move {
-                    let result = Self::on_server_leave_office(socket, data, state).await;
-                    let _ = ack.send(&result);
-                }
-            },
-        );
-
-        socket.on(smcp::events::SERVER_TOOL_CALL_CANCEL, move |socket: SocketRef, Data::<AgentCallData>(data), state: State<ServerState>| {
-            async move {
-                Self::on_server_tool_call_cancel(socket, data, state).await
+        socket.on_disconnect({
+            let state = state.clone();
+            move |socket: SocketRef| {
+                let state = state.clone();
+                async move { Self::on_disconnect(socket, state).await }
             }
         });
 
+        let state_join = state.clone();
+        socket.on(
+            smcp::events::SERVER_JOIN_OFFICE,
+            move |socket: SocketRef, Data::<EnterOfficeReq>(data), ack: AckSender| async move {
+                let result = Self::on_server_join_office(socket, data, state_join.clone()).await;
+                let _ = ack.send(&result);
+            },
+        );
+
+        let state_leave = state.clone();
+        socket.on(
+            smcp::events::SERVER_LEAVE_OFFICE,
+            move |socket: SocketRef, Data::<LeaveOfficeReq>(data), ack: AckSender| async move {
+                let result = Self::on_server_leave_office(socket, data, state_leave.clone()).await;
+                let _ = ack.send(&result);
+            },
+        );
+
+        socket.on(
+            smcp::events::SERVER_TOOL_CALL_CANCEL,
+            move |socket: SocketRef, Data::<AgentCallData>(data)| async move {
+                Self::on_server_tool_call_cancel(socket, data).await
+            },
+        );
+
         socket.on(
             smcp::events::SERVER_UPDATE_CONFIG,
-            move |socket: SocketRef,
-                  Data::<UpdateComputerConfigReq>(data),
-                  state: State<ServerState>| {
-                async move { Self::on_server_update_config(socket, data, state).await }
+            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+                Self::on_server_update_config(socket, data).await
             },
         );
 
         socket.on(
             smcp::events::SERVER_UPDATE_TOOL_LIST,
-            move |socket: SocketRef,
-                  Data::<UpdateComputerConfigReq>(data),
-                  state: State<ServerState>| {
-                async move { Self::on_server_update_tool_list(socket, data, state).await }
+            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+                Self::on_server_update_tool_list(socket, data).await
             },
         );
 
+        let state_tool_call = state.clone();
         socket.on(
             smcp::events::CLIENT_TOOL_CALL,
-            move |socket: SocketRef,
-                  Data::<ToolCallReq>(data),
-                  ack: AckSender,
-                  state: State<ServerState>| {
-                async move {
-                    let result = Self::on_client_tool_call(socket, data, state).await;
-                    let _ = ack.send(&result);
-                }
+            move |socket: SocketRef, Data::<ToolCallReq>(data), ack: AckSender| async move {
+                let result = Self::on_client_tool_call(socket, data, state_tool_call.clone()).await;
+                let _ = ack.send(&result);
             },
         );
 
+        let state_get_tools = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_TOOLS,
-            move |socket: SocketRef,
-                  Data::<GetToolsReq>(data),
-                  ack: AckSender,
-                  state: State<ServerState>| {
-                async move {
-                    let result = Self::on_client_get_tools(socket, data, state).await;
-                    let _ = ack.send(&result);
-                }
+            move |socket: SocketRef, Data::<GetToolsReq>(data), ack: AckSender| async move {
+                let result = Self::on_client_get_tools(socket, data, state_get_tools.clone()).await;
+                let _ = ack.send(&result);
             },
         );
 
+        let state_get_desktop = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_DESKTOP,
-            move |socket: SocketRef,
-                  Data::<GetDesktopReq>(data),
-                  ack: AckSender,
-                  state: State<ServerState>| {
-                async move {
-                    let result = Self::on_client_get_desktop(socket, data, state).await;
-                    let _ = ack.send(&result);
-                }
+            move |socket: SocketRef, Data::<GetDesktopReq>(data), ack: AckSender| async move {
+                let result =
+                    Self::on_client_get_desktop(socket, data, state_get_desktop.clone()).await;
+                let _ = ack.send(&result);
             },
         );
 
         socket.on(
             smcp::events::SERVER_UPDATE_DESKTOP,
-            move |socket: SocketRef,
-                  Data::<UpdateComputerConfigReq>(data),
-                  state: State<ServerState>| {
-                async move { Self::on_server_update_desktop(socket, data, state).await }
+            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+                Self::on_server_update_desktop(socket, data).await
             },
         );
 
+        let state_list_room = state.clone();
         socket.on(
             smcp::events::SERVER_LIST_ROOM,
-            move |socket: SocketRef,
-                  Data::<ListRoomReq>(data),
-                  ack: AckSender,
-                  state: State<ServerState>| {
-                async move {
-                    let result = Self::on_server_list_room(socket, data, state).await;
-                    let _ = ack.send(&result);
-                }
+            move |socket: SocketRef, Data::<ListRoomReq>(data), ack: AckSender| async move {
+                let result = Self::on_server_list_room(socket, data, state_list_room.clone()).await;
+                let _ = ack.send(&result);
             },
         );
     }
 
     /// 处理连接事件
-    async fn on_connect(socket: SocketRef, state: State<ServerState>) -> Result<(), HandlerError> {
+    async fn on_connect(socket: SocketRef, state: &ServerState) -> Result<(), HandlerError> {
         info!(
             "SocketIO Client {} connecting to {}...",
             socket.id, SMCP_NAMESPACE
@@ -213,7 +189,7 @@ impl SmcpHandler {
     }
 
     /// 处理断开连接事件
-    async fn on_disconnect(socket: SocketRef, state: State<ServerState>) {
+    async fn on_disconnect(socket: SocketRef, state: ServerState) {
         info!(
             "SocketIO Client {} disconnecting from {}...",
             socket.id, SMCP_NAMESPACE
@@ -255,7 +231,7 @@ impl SmcpHandler {
     async fn on_server_join_office(
         socket: SocketRef,
         data: EnterOfficeReq,
-        state: State<ServerState>,
+        state: ServerState,
     ) -> Result<(bool, Option<String>), HandlerError> {
         let sid = socket.id.to_string();
 
@@ -313,7 +289,7 @@ impl SmcpHandler {
     async fn on_server_leave_office(
         socket: SocketRef,
         data: LeaveOfficeReq,
-        state: State<ServerState>,
+        state: ServerState,
     ) -> Result<(bool, Option<String>), HandlerError> {
         let sid = socket.id.to_string();
 
@@ -352,21 +328,13 @@ impl SmcpHandler {
     }
 
     /// 处理工具调用取消事件
-    async fn on_server_tool_call_cancel(
-        socket: SocketRef,
-        data: AgentCallData,
-        _state: State<ServerState>,
-    ) {
+    async fn on_server_tool_call_cancel(socket: SocketRef, data: AgentCallData) {
         // 广播取消通知
         let _ = socket.emit(smcp::events::NOTIFY_TOOL_CALL_CANCEL, &data);
     }
 
     /// 处理配置更新事件
-    async fn on_server_update_config(
-        socket: SocketRef,
-        data: UpdateComputerConfigReq,
-        _state: State<ServerState>,
-    ) {
+    async fn on_server_update_config(socket: SocketRef, data: UpdateComputerConfigReq) {
         // 广播配置更新通知
         let notification = UpdateMCPConfigNotification {
             computer: data.computer,
@@ -376,11 +344,7 @@ impl SmcpHandler {
     }
 
     /// 处理工具列表更新事件
-    async fn on_server_update_tool_list(
-        socket: SocketRef,
-        data: UpdateComputerConfigReq,
-        _state: State<ServerState>,
-    ) {
+    async fn on_server_update_tool_list(socket: SocketRef, data: UpdateComputerConfigReq) {
         // 广播工具列表更新通知
         let notification = UpdateMCPConfigNotification {
             computer: data.computer,
@@ -391,49 +355,247 @@ impl SmcpHandler {
 
     /// 处理客户端工具调用事件
     async fn on_client_tool_call(
-        _socket: SocketRef,
-        _data: ToolCallReq,
-        _state: State<ServerState>,
+        socket: SocketRef,
+        data: ToolCallReq,
+        state: ServerState,
     ) -> Result<Value, HandlerError> {
-        // TODO: 实现消息转发
-        // 由于 socketioxide 0.16.3 的 API 限制，暂时返回错误
-        Err(HandlerError::InvalidRequest(
-            "Message forwarding not yet implemented".to_string(),
-        ))
+        // 获取 Agent 的会话信息
+        let sid = socket.id.to_string();
+        let session = state
+            .session_manager
+            .get_session(&sid)
+            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+
+        // 验证角色必须是 Agent
+        if session.role != ClientRole::Agent {
+            return Err(HandlerError::InvalidRequest(
+                "Only agents can make tool calls".to_string(),
+            ));
+        }
+
+        // 验证 Agent 在某个办公室内
+        let office_id = session.office_id.ok_or_else(|| {
+            HandlerError::InvalidRequest(
+                "Agent must be in an office to make tool calls".to_string(),
+            )
+        })?;
+
+        // 查找目标 Computer 的 sid
+        let computer_sid = state
+            .session_manager
+            .get_computer_sid_in_office(&office_id, &data.computer)
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest(format!(
+                    "Computer '{}' not found in office",
+                    data.computer
+                ))
+            })?;
+
+        // 获取目标 socket
+        let target_socket = state
+            .io
+            .get_socket(computer_sid.parse().unwrap())
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest("Target computer socket not found".to_string())
+            })?;
+
+        // 转发请求并等待响应
+        let timeout = tokio::time::Duration::from_secs(30);
+        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_TOOL_CALL, &data);
+
+        match tokio::time::timeout(timeout, async move {
+            match ack_result {
+                Ok(stream) => {
+                    let mut pinned = Box::pin(stream);
+                    match pinned.next().await {
+                        Some((_, response)) => response,
+                        None => Ok(serde_json::Value::Null),
+                    }
+                }
+                Err(_) => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        {
+            Ok(Ok(response)) => {
+                // 解析响应
+                match response {
+                    serde_json::Value::Object(mut map) => {
+                        // 提取 result 字段
+                        let result = map.remove("result").unwrap_or(serde_json::Value::Null);
+                        Ok(result)
+                    }
+                    _ => Ok(response),
+                }
+            }
+            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
+                "Failed to get response from computer: {}",
+                e
+            ))),
+            Err(_) => Err(HandlerError::Timeout(
+                "Tool call timed out after 30 seconds".to_string(),
+            )),
+        }
     }
 
     /// 处理获取工具列表事件
     async fn on_client_get_tools(
-        _socket: SocketRef,
-        _data: GetToolsReq,
-        _state: State<ServerState>,
+        socket: SocketRef,
+        data: GetToolsReq,
+        state: ServerState,
     ) -> Result<GetToolsRet, HandlerError> {
-        // TODO: 实现消息转发
-        // 由于 socketioxide 0.16.3 的 API 限制，暂时返回错误
-        Err(HandlerError::InvalidRequest(
-            "Message forwarding not yet implemented".to_string(),
-        ))
+        // 获取 Agent 的会话信息
+        let sid = socket.id.to_string();
+        let session = state
+            .session_manager
+            .get_session(&sid)
+            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+
+        // 验证角色必须是 Agent
+        if session.role != ClientRole::Agent {
+            return Err(HandlerError::InvalidRequest(
+                "Only agents can get tools".to_string(),
+            ));
+        }
+
+        // 验证 Agent 在某个办公室内
+        let office_id = session.office_id.ok_or_else(|| {
+            HandlerError::InvalidRequest("Agent must be in an office to get tools".to_string())
+        })?;
+
+        // 查找目标 Computer 的 sid
+        let computer_sid = state
+            .session_manager
+            .get_computer_sid_in_office(&office_id, &data.computer)
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest(format!(
+                    "Computer '{}' not found in office",
+                    data.computer
+                ))
+            })?;
+
+        // 获取目标 socket
+        let target_socket = state
+            .io
+            .get_socket(computer_sid.parse().unwrap())
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest("Target computer socket not found".to_string())
+            })?;
+
+        // 转发请求并等待响应
+        let timeout = tokio::time::Duration::from_secs(30);
+        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_GET_TOOLS, &data);
+
+        match tokio::time::timeout(timeout, async move {
+            match ack_result {
+                Ok(stream) => {
+                    let mut pinned = Box::pin(stream);
+                    match pinned.next().await {
+                        Some((_, response)) => response,
+                        None => Ok(serde_json::Value::Null),
+                    }
+                }
+                Err(_) => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        {
+            Ok(Ok(response)) => {
+                // 解析响应
+                serde_json::from_value(response).map_err(|e| {
+                    HandlerError::InvalidRequest(format!("Failed to parse response: {}", e))
+                })
+            }
+            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
+                "Failed to get response from computer: {}",
+                e
+            ))),
+            Err(_) => Err(HandlerError::Timeout(
+                "Get tools timed out after 30 seconds".to_string(),
+            )),
+        }
     }
 
     /// 处理获取桌面信息事件
     async fn on_client_get_desktop(
-        _socket: SocketRef,
-        _data: GetDesktopReq,
-        _state: State<ServerState>,
+        socket: SocketRef,
+        data: GetDesktopReq,
+        state: ServerState,
     ) -> Result<GetDesktopRet, HandlerError> {
-        // TODO: 实现消息转发
-        // 由于 socketioxide 0.16.3 的 API 限制，暂时返回错误
-        Err(HandlerError::InvalidRequest(
-            "Message forwarding not yet implemented".to_string(),
-        ))
+        // 获取 Agent 的会话信息
+        let sid = socket.id.to_string();
+        let session = state
+            .session_manager
+            .get_session(&sid)
+            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+
+        // 验证角色必须是 Agent
+        if session.role != ClientRole::Agent {
+            return Err(HandlerError::InvalidRequest(
+                "Only agents can get desktop".to_string(),
+            ));
+        }
+
+        // 验证 Agent 在某个办公室内
+        let office_id = session.office_id.ok_or_else(|| {
+            HandlerError::InvalidRequest("Agent must be in an office to get desktop".to_string())
+        })?;
+
+        // 查找目标 Computer 的 sid
+        let computer_sid = state
+            .session_manager
+            .get_computer_sid_in_office(&office_id, &data.computer)
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest(format!(
+                    "Computer '{}' not found in office",
+                    data.computer
+                ))
+            })?;
+
+        // 获取目标 socket
+        let target_socket = state
+            .io
+            .get_socket(computer_sid.parse().unwrap())
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest("Target computer socket not found".to_string())
+            })?;
+
+        // 转发请求并等待响应
+        let timeout = tokio::time::Duration::from_secs(30);
+        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_GET_DESKTOP, &data);
+
+        match tokio::time::timeout(timeout, async move {
+            match ack_result {
+                Ok(stream) => {
+                    let mut pinned = Box::pin(stream);
+                    match pinned.next().await {
+                        Some((_, response)) => response,
+                        None => Ok(serde_json::Value::Null),
+                    }
+                }
+                Err(_) => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        {
+            Ok(Ok(response)) => {
+                // 解析响应
+                serde_json::from_value(response).map_err(|e| {
+                    HandlerError::InvalidRequest(format!("Failed to parse response: {}", e))
+                })
+            }
+            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
+                "Failed to get response from computer: {}",
+                e
+            ))),
+            Err(_) => Err(HandlerError::Timeout(
+                "Get desktop timed out after 30 seconds".to_string(),
+            )),
+        }
     }
 
     /// 处理桌面更新事件
-    async fn on_server_update_desktop(
-        socket: SocketRef,
-        data: UpdateComputerConfigReq,
-        _state: State<ServerState>,
-    ) {
+    async fn on_server_update_desktop(socket: SocketRef, data: UpdateComputerConfigReq) {
         // 广播桌面更新通知
         let notification = UpdateMCPConfigNotification {
             computer: data.computer,
@@ -446,7 +608,7 @@ impl SmcpHandler {
     async fn on_server_list_room(
         _socket: SocketRef,
         data: ListRoomReq,
-        state: State<ServerState>,
+        state: ServerState,
     ) -> Result<ListRoomRet, HandlerError> {
         // 获取指定办公室的所有会话
         let sessions = state
@@ -475,7 +637,7 @@ impl SmcpHandler {
         socket: SocketRef,
         session: &SessionData,
         office_id: &str,
-        state: &State<ServerState>,
+        state: &ServerState,
     ) -> Result<(), HandlerError> {
         match Self::validate_join_room(session, office_id, &*state)? {
             JoinRoomDecision::Noop => Ok(()),
@@ -573,22 +735,31 @@ mod tests {
     use serde_json;
 
     fn create_test_state() -> ServerState {
+        let (_layer, io) = SocketIo::builder().build_layer();
         ServerState {
             session_manager: Arc::new(SessionManager::new()),
             auth_provider: Arc::new(DefaultAuthenticationProvider::new(
                 Some("test_secret".to_string()),
                 None,
             )),
+            io: Arc::new(io),
         }
     }
 
     #[tokio::test]
     async fn test_agent_join_office() {
-        let state = create_test_state();
-        let (_layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
+        let (_layer, io) = SocketIo::builder().build_layer();
+        let state = ServerState {
+            session_manager: Arc::new(SessionManager::new()),
+            auth_provider: Arc::new(DefaultAuthenticationProvider::new(
+                Some("test_secret".to_string()),
+                None,
+            )),
+            io: Arc::new(io.clone()),
+        };
 
         // 注册处理器
-        SmcpHandler::register_handlers(&io);
+        SmcpHandler::register_handlers(&io, state.clone());
 
         // 测试逻辑需要实际的 Socket.IO 客户端连接
         // 这里只做基本的单元测试
