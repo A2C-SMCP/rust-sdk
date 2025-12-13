@@ -270,3 +270,49 @@ pub enum Notification {
     UpdateToolList(UpdateToolListNotification),
     UpdateDesktop,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_req_id_helpers() {
+        let req_id = ReqId::new();
+        assert!(!req_id.as_str().is_empty());
+
+        let req_id2 = ReqId::from_string("abc".to_string());
+        assert_eq!(req_id2.as_str(), "abc");
+
+        let req_id3 = ReqId::default();
+        assert!(!req_id3.as_str().is_empty());
+    }
+
+    #[test]
+    fn test_role_serde_lowercase() {
+        let json = serde_json::to_string(&Role::Agent).unwrap();
+        assert_eq!(json, "\"agent\"");
+
+        let de: Role = serde_json::from_str("\"computer\"").unwrap();
+        assert!(matches!(de, Role::Computer));
+    }
+
+    #[test]
+    fn test_notification_serde() {
+        let n = Notification::EnterOffice(EnterOfficeNotification {
+            office_id: "office1".to_string(),
+            computer: Some("c1".to_string()),
+            agent: None,
+        });
+
+        let json = serde_json::to_string(&n).unwrap();
+        let de: Notification = serde_json::from_str(&json).unwrap();
+        match de {
+            Notification::EnterOffice(p) => {
+                assert_eq!(p.office_id, "office1");
+                assert_eq!(p.computer.as_deref(), Some("c1"));
+                assert!(p.agent.is_none());
+            }
+            _ => panic!("unexpected notification"),
+        }
+    }
+}
