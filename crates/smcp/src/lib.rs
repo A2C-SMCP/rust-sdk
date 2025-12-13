@@ -14,7 +14,7 @@ pub mod events {
     pub const CLIENT_GET_DESKTOP: &str = "client:get_desktop";
     /// 客户端工具调用请求
     pub const CLIENT_TOOL_CALL: &str = "client:tool_call";
-    
+
     /// 服务器加入办公室请求
     pub const SERVER_JOIN_OFFICE: &str = "server:join_office";
     /// 服务器离开办公室请求
@@ -29,7 +29,7 @@ pub mod events {
     pub const SERVER_TOOL_CALL_CANCEL: &str = "server:tool_call_cancel";
     /// 服务器列出房间请求
     pub const SERVER_LIST_ROOM: &str = "server:list_room";
-    
+
     /// 通知取消工具调用
     pub const NOTIFY_TOOL_CALL_CANCEL: &str = "notify:tool_call_cancel";
     /// 通知进入办公室
@@ -42,7 +42,7 @@ pub mod events {
     pub const NOTIFY_UPDATE_TOOL_LIST: &str = "notify:update_tool_list";
     /// 通知更新桌面
     pub const NOTIFY_UPDATE_DESKTOP: &str = "notify:update_desktop";
-    
+
     /// 通用通知前缀
     pub const NOTIFY_PREFIX: &str = "notify:";
 }
@@ -56,12 +56,12 @@ impl ReqId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
-    
+
     /// 从字符串创建请求ID
     pub fn from_string(s: String) -> Self {
         Self(s)
     }
-    
+
     /// 获取请求ID的字符串引用
     pub fn as_str(&self) -> &str {
         &self.0

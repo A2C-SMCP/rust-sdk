@@ -18,7 +18,10 @@ pub async fn find_available_port() -> u16 {
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wait for a condition with timeout
-pub async fn wait_with_timeout<F, Fut>(duration: Duration, future: F) -> Result<Fut::Output, &'static str>
+pub async fn wait_with_timeout<F, Fut>(
+    duration: Duration,
+    future: F,
+) -> Result<Fut::Output, &'static str>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,

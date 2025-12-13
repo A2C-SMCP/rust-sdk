@@ -1,8 +1,6 @@
 #[tokio::main]
 async fn main() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let _server = smcp_server_core::SmcpServerBuilder::new()
         .build_layer()

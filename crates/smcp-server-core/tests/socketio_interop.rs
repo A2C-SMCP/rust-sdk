@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use rust_socketio::TransportType;
 use rust_socketio::asynchronous::ClientBuilder;
 use rust_socketio::Payload;
+use rust_socketio::TransportType;
 use socketioxide::extract::Data;
 use socketioxide::extract::SocketRef;
 use socketioxide::SocketIo;
@@ -39,10 +39,13 @@ impl TestServer {
 
         io.ns("/", |s: SocketRef| {
             tracing::info!("server: socket connected");
-            s.on("smcp_ping", |s: SocketRef, _data: Data<serde_json::Value>| {
-                tracing::info!("server: got smcp_ping");
-                s.emit("smcp_pong", "pong").ok();
-            });
+            s.on(
+                "smcp_ping",
+                |s: SocketRef, _data: Data<serde_json::Value>| {
+                    tracing::info!("server: got smcp_ping");
+                    s.emit("smcp_pong", "pong").ok();
+                },
+            );
         });
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -169,9 +172,7 @@ impl SmcpTestServer {
 
 #[tokio::test]
 async fn test_socketioxide_and_rust_socketio_interop() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let server = TestServer::start().await;
     let server_url = server.url();
@@ -237,7 +238,8 @@ async fn test_socketioxide_and_rust_socketio_interop() {
 fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync {
+) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+{
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);
     move |payload: Payload, _client| {
@@ -255,9 +257,7 @@ fn ack_to_sender<T: Send + 'static>(
 
 #[tokio::test]
 async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let server = SmcpTestServer::start().await;
     let server_url = server.url();
@@ -293,14 +293,18 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             }),
             Duration::from_secs(2),
             ack_to_sender(join_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
-                Payload::String(s) => serde_json::Value::String(s),
+                Payload::Text(mut values) => {
+                    values.pop().unwrap_or_else(|| serde_json::Value::Null)
+                }
                 _ => serde_json::Value::Null,
             }),
         )
         .await
         .expect("join_office emit_with_ack failed");
-    let join_payload = timeout(Duration::from_secs(5), join_rx).await.unwrap().unwrap();
+    let join_payload = timeout(Duration::from_secs(5), join_rx)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(join_payload.to_string().contains("Ok"));
 
     let (list_tx, list_rx) = oneshot::channel::<serde_json::Value>();
@@ -314,8 +318,13 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             }),
             Duration::from_secs(2),
             ack_to_sender(list_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
-                Payload::String(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s)),
+                Payload::Text(mut values) => match values.pop() {
+                    Some(serde_json::Value::String(s)) => {
+                        serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                    }
+                    Some(v) => v,
+                    None => serde_json::Value::Null,
+                },
                 _ => serde_json::Value::Null,
             }),
         )
@@ -329,7 +338,9 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
 
     // ack 可能是 [ {"Ok": {...}} ] 的数组包裹形式
     let list_raw = match list_raw {
-        serde_json::Value::Array(mut a) if a.len() == 1 => a.pop().unwrap_or(serde_json::Value::Null),
+        serde_json::Value::Array(mut a) if a.len() == 1 => {
+            a.pop().unwrap_or(serde_json::Value::Null)
+        }
         v => v,
     };
 
@@ -341,8 +352,10 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         list_raw
     };
 
-    let list_ret: smcp::ListRoomRet = serde_json::from_value(list_payload.clone())
-        .unwrap_or_else(|e| panic!("failed to deserialize ListRoomRet from payload: {list_payload}. err: {e}"));
+    let list_ret: smcp::ListRoomRet =
+        serde_json::from_value(list_payload.clone()).unwrap_or_else(|e| {
+            panic!("failed to deserialize ListRoomRet from payload: {list_payload}. err: {e}")
+        });
     assert_eq!(list_ret.req_id.as_str(), "rid1");
     assert!(list_ret.sessions.iter().any(|s| s.name == "c1"));
 
@@ -357,16 +370,23 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             }),
             Duration::from_secs(2),
             ack_to_sender(get_tools_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
-                Payload::String(s) => serde_json::Value::String(s),
+                Payload::Text(mut values) => match values.pop() {
+                    Some(v) => v,
+                    None => serde_json::Value::Null,
+                },
                 _ => serde_json::Value::Null,
             }),
         )
         .await
         .expect("get_tools emit_with_ack failed");
-    let get_tools_payload = timeout(Duration::from_secs(5), get_tools_rx).await.unwrap().unwrap();
+    let get_tools_payload = timeout(Duration::from_secs(5), get_tools_rx)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        get_tools_payload.to_string().contains("Message forwarding not yet implemented"),
+        get_tools_payload
+            .to_string()
+            .contains("Message forwarding not yet implemented"),
         "unexpected get_tools response: {}",
         get_tools_payload
     );
@@ -378,14 +398,19 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             serde_json::json!({ "office_id": "office1" }),
             Duration::from_secs(2),
             ack_to_sender(leave_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
-                Payload::String(s) => serde_json::Value::String(s),
+                Payload::Text(mut values) => match values.pop() {
+                    Some(v) => v,
+                    None => serde_json::Value::Null,
+                },
                 _ => serde_json::Value::Null,
             }),
         )
         .await
         .expect("leave_office emit_with_ack failed");
-    let leave_payload = timeout(Duration::from_secs(5), leave_rx).await.unwrap().unwrap();
+    let leave_payload = timeout(Duration::from_secs(5), leave_rx)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(leave_payload.to_string().contains("Ok"));
 
     client.disconnect().await.expect("Failed to disconnect");

@@ -3,8 +3,8 @@
 use crate::auth::{AuthenticationProvider, DefaultAuthenticationProvider};
 use crate::handler::{ServerState, SmcpHandler};
 use crate::session::SessionManager;
-use socketioxide::{SocketIo};
 use socketioxide::layer::SocketIoLayer;
+use socketioxide::SocketIo;
 use std::sync::Arc;
 use tracing::info;
 
@@ -43,8 +43,15 @@ impl SmcpServerBuilder {
 
     /// 设置默认认证提供者（基于 API Key）
     /// Set default authentication provider (API Key based)
-    pub fn with_default_auth(mut self, admin_secret: Option<String>, api_key_name: Option<String>) -> Self {
-        let provider = Arc::new(DefaultAuthenticationProvider::new(admin_secret, api_key_name));
+    pub fn with_default_auth(
+        mut self,
+        admin_secret: Option<String>,
+        api_key_name: Option<String>,
+    ) -> Self {
+        let provider = Arc::new(DefaultAuthenticationProvider::new(
+            admin_secret,
+            api_key_name,
+        ));
         self.auth_provider = Some(provider);
         self
     }
@@ -60,11 +67,13 @@ impl SmcpServerBuilder {
     /// Build Socket.IO layer
     pub fn build_layer(self) -> Result<SmcpServerLayer, crate::handler::HandlerError> {
         // 使用默认值
-        let auth_provider = self.auth_provider
+        let auth_provider = self
+            .auth_provider
             .unwrap_or_else(|| Arc::new(DefaultAuthenticationProvider::new(None, None)));
-        let session_manager = self.session_manager
+        let session_manager = self
+            .session_manager
             .unwrap_or_else(|| Arc::new(SessionManager::new()));
-        
+
         // 创建服务器状态
         let state = ServerState {
             session_manager,
@@ -108,15 +117,17 @@ mod tests {
 
     #[test]
     fn test_server_builder() {
-        let builder = SmcpServerBuilder::new()
-            .with_default_auth(Some("test".to_string()), None);
+        let builder = SmcpServerBuilder::new().with_default_auth(Some("test".to_string()), None);
 
         assert!(builder.build_layer().is_ok());
     }
 
     #[test]
     fn test_server_builder_with_custom_auth() {
-        let auth = Arc::new(DefaultAuthenticationProvider::new(Some("test".to_string()), None));
+        let auth = Arc::new(DefaultAuthenticationProvider::new(
+            Some("test".to_string()),
+            None,
+        ));
 
         let builder = SmcpServerBuilder::new().with_auth_provider(auth);
         assert!(builder.build_layer().is_ok());

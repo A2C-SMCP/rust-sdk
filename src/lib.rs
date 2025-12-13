@@ -55,11 +55,11 @@ pub use smcp_server_core;
 pub use smcp_server_hyper;
 
 // Re-export commonly used dependencies for convenience
-pub use tokio;
 pub use serde;
 pub use serde_json;
-pub use tracing;
 pub use thiserror;
+pub use tokio;
+pub use tracing;
 
 #[cfg(test)]
 mod tests {

@@ -132,7 +132,8 @@ impl SessionManager {
 
         // 注册映射
         self.sessions.insert(session.sid.clone(), session.clone());
-        self.name_to_sid.insert(session.name.clone(), session.sid.clone());
+        self.name_to_sid
+            .insert(session.name.clone(), session.sid.clone());
 
         tracing::debug!("Registered session: {} -> {}", session.name, session.sid);
         Ok(())
@@ -141,10 +142,10 @@ impl SessionManager {
     /// 注销会话
     pub fn unregister_session(&self, sid: &SessionId) -> Option<SessionData> {
         let session = self.sessions.remove(sid)?;
-        
+
         // 清理 name 映射
         self.name_to_sid.remove(&session.1.name);
-        
+
         tracing::debug!("Unregistered session: {} -> {}", session.1.name, sid);
         Some(session.1)
     }
@@ -160,10 +161,15 @@ impl SessionManager {
     }
 
     /// 更新会话的办公室 ID
-    pub fn update_office_id(&self, sid: &SessionId, office_id: Option<OfficeId>) -> Result<(), SessionError> {
-        let mut session = self.sessions.get_mut(sid).ok_or_else(|| {
-            SessionError::NotFound(sid.clone())
-        })?;
+    pub fn update_office_id(
+        &self,
+        sid: &SessionId,
+        office_id: Option<OfficeId>,
+    ) -> Result<(), SessionError> {
+        let mut session = self
+            .sessions
+            .get_mut(sid)
+            .ok_or_else(|| SessionError::NotFound(sid.clone()))?;
 
         session.office_id = office_id;
         Ok(())
@@ -187,13 +193,11 @@ impl SessionManager {
 
     /// 检查房间内是否有指定名称的 Computer
     pub fn has_computer_in_office(&self, office_id: &OfficeId, name: &str) -> bool {
-        self.sessions
-            .iter()
-            .any(|s| {
-                s.office_id.as_ref() == Some(office_id) 
-                && s.role == ClientRole::Computer 
+        self.sessions.iter().any(|s| {
+            s.office_id.as_ref() == Some(office_id)
+                && s.role == ClientRole::Computer
                 && s.name == name
-            })
+        })
     }
 
     /// 获取所有会话
@@ -204,15 +208,17 @@ impl SessionManager {
     /// 获取会话统计信息
     pub fn get_stats(&self) -> SessionStats {
         let total = self.sessions.len();
-        let agents = self.sessions
+        let agents = self
+            .sessions
             .iter()
             .filter(|s| s.role == ClientRole::Agent)
             .count();
-        let computers = self.sessions
+        let computers = self
+            .sessions
             .iter()
             .filter(|s| s.role == ClientRole::Computer)
             .count();
-        
+
         SessionStats {
             total,
             agents,
@@ -240,9 +246,9 @@ impl Default for SessionManager {
 
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
     use super::*;
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn test_session_registration() {
@@ -268,9 +274,17 @@ mod tests {
         let manager = SessionManager::new();
         let sid1 = Uuid::new_v4().to_string();
         let sid2 = Uuid::new_v4().to_string();
-        
-        let session1 = SessionData::new(sid1.clone(), "duplicate_name".to_string(), ClientRole::Agent);
-        let session2 = SessionData::new(sid2.clone(), "duplicate_name".to_string(), ClientRole::Computer);
+
+        let session1 = SessionData::new(
+            sid1.clone(),
+            "duplicate_name".to_string(),
+            ClientRole::Agent,
+        );
+        let session2 = SessionData::new(
+            sid2.clone(),
+            "duplicate_name".to_string(),
+            ClientRole::Computer,
+        );
 
         // 第一个注册成功
         assert!(manager.register_session(session1).is_ok());
@@ -284,8 +298,12 @@ mod tests {
         let manager = SessionManager::new();
         let office_id = "office_123".to_string();
         let sid = Uuid::new_v4().to_string();
-        let session = SessionData::new(sid.clone(), "test_computer".to_string(), ClientRole::Computer)
-            .with_office_id(office_id.clone());
+        let session = SessionData::new(
+            sid.clone(),
+            "test_computer".to_string(),
+            ClientRole::Computer,
+        )
+        .with_office_id(office_id.clone());
 
         manager.register_session(session).unwrap();
 
@@ -308,11 +326,11 @@ mod tests {
         let session = SessionData::new(sid.clone(), "test_agent".to_string(), ClientRole::Agent);
 
         manager.register_session(session).unwrap();
-        
+
         // 注销会话
         let removed = manager.unregister_session(&sid);
         assert!(removed.is_some());
-        
+
         // 验证会话已删除
         assert!(manager.get_session(&sid).is_none());
         assert!(manager.get_sid_by_name("test_agent").is_none());
@@ -321,11 +339,23 @@ mod tests {
     #[test]
     fn test_stats() {
         let manager = SessionManager::new();
-        
+
         // 添加一些会话
-        let agent_session = SessionData::new(Uuid::new_v4().to_string(), "agent1".to_string(), ClientRole::Agent);
-        let computer_session1 = SessionData::new(Uuid::new_v4().to_string(), "computer1".to_string(), ClientRole::Computer);
-        let computer_session2 = SessionData::new(Uuid::new_v4().to_string(), "computer2".to_string(), ClientRole::Computer);
+        let agent_session = SessionData::new(
+            Uuid::new_v4().to_string(),
+            "agent1".to_string(),
+            ClientRole::Agent,
+        );
+        let computer_session1 = SessionData::new(
+            Uuid::new_v4().to_string(),
+            "computer1".to_string(),
+            ClientRole::Computer,
+        );
+        let computer_session2 = SessionData::new(
+            Uuid::new_v4().to_string(),
+            "computer2".to_string(),
+            ClientRole::Computer,
+        );
 
         manager.register_session(agent_session).unwrap();
         manager.register_session(computer_session1).unwrap();
@@ -358,19 +388,34 @@ mod tests {
         let session = SessionData::new(sid.clone(), "test".to_string(), ClientRole::Agent);
         manager.register_session(session).unwrap();
 
-        assert!(manager.update_office_id(&sid, Some("office_x".to_string())).is_ok());
-        assert_eq!(manager.get_session(&sid).unwrap().office_id, Some("office_x".to_string()));
+        assert!(manager
+            .update_office_id(&sid, Some("office_x".to_string()))
+            .is_ok());
+        assert_eq!(
+            manager.get_session(&sid).unwrap().office_id,
+            Some("office_x".to_string())
+        );
 
         let missing_sid = Uuid::new_v4().to_string();
-        let err = manager.update_office_id(&missing_sid, Some("office_y".to_string())).unwrap_err();
+        let err = manager
+            .update_office_id(&missing_sid, Some("office_y".to_string()))
+            .unwrap_err();
         assert!(matches!(err, SessionError::NotFound(s) if s == missing_sid));
     }
 
     #[test]
     fn test_get_all_sessions() {
         let manager = SessionManager::new();
-        let s1 = SessionData::new(Uuid::new_v4().to_string(), "a1".to_string(), ClientRole::Agent);
-        let s2 = SessionData::new(Uuid::new_v4().to_string(), "c1".to_string(), ClientRole::Computer);
+        let s1 = SessionData::new(
+            Uuid::new_v4().to_string(),
+            "a1".to_string(),
+            ClientRole::Agent,
+        );
+        let s2 = SessionData::new(
+            Uuid::new_v4().to_string(),
+            "c1".to_string(),
+            ClientRole::Computer,
+        );
         manager.register_session(s1).unwrap();
         manager.register_session(s2).unwrap();
 
@@ -395,7 +440,8 @@ mod tests {
     fn test_session_data_with_extra() {
         let sid = Uuid::new_v4().to_string();
         let extra = json!({"k": "v", "n": 1});
-        let session = SessionData::new(sid, "n".to_string(), ClientRole::Computer).with_extra(extra.clone());
+        let session =
+            SessionData::new(sid, "n".to_string(), ClientRole::Computer).with_extra(extra.clone());
         assert_eq!(session.extra, extra);
     }
 }

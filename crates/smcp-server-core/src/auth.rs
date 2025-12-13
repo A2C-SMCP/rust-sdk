@@ -28,7 +28,11 @@ pub trait AuthenticationProvider: Send + Sync + 'static + std::fmt::Debug {
     ///
     /// # Returns
     /// 认证是否成功 / Whether authentication succeeded
-    async fn authenticate(&self, headers: &HeaderMap, auth: Option<&serde_json::Value>) -> Result<(), AuthError>;
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        auth: Option<&serde_json::Value>,
+    ) -> Result<(), AuthError>;
 }
 
 /// 默认认证提供者，提供基础的认证逻辑实现
@@ -58,7 +62,11 @@ impl DefaultAuthenticationProvider {
 
 #[async_trait]
 impl AuthenticationProvider for DefaultAuthenticationProvider {
-    async fn authenticate(&self, headers: &HeaderMap, _auth: Option<&serde_json::Value>) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        _auth: Option<&serde_json::Value>,
+    ) -> Result<(), AuthError> {
         // 从 headers 中提取 API 密钥
         // Extract API key from headers
         let api_key = headers

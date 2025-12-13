@@ -13,18 +13,23 @@ pub struct HyperServer {
 impl HyperServer {
     /// Create a new HyperServer
     pub fn new() -> Self {
-        Self { _addr: "127.0.0.1:0".parse().unwrap() }
+        Self {
+            _addr: "127.0.0.1:0".parse().unwrap(),
+        }
     }
-    
+
     /// Run the server on the given address
-    pub async fn run(self, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run(
+        self,
+        addr: SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("Starting SMCP server on {} (placeholder)", addr);
-        
+
         // TODO: Implement actual server when smcp-server-core is ready
         // For now, just wait for a signal to exit
         tokio::signal::ctrl_c().await?;
         println!("Server stopped");
-        
+
         Ok(())
     }
 }
@@ -39,7 +44,7 @@ impl HyperServerBuilder {
     pub fn new() -> Self {
         Self { _config: () }
     }
-    
+
     /// Build the HyperServer
     pub fn build(self) -> HyperServer {
         HyperServer::new()

@@ -1,5 +1,5 @@
-use smcp::*;
 use serde_json;
+use smcp::*;
 
 #[test]
 fn test_req_id_serialization() {
@@ -15,7 +15,7 @@ fn test_agent_call_data() {
         agent: "test_agent".to_string(),
         req_id: ReqId::new(),
     };
-    
+
     let json = serde_json::to_string(&data).unwrap();
     let deserialized: AgentCallData = serde_json::from_str(&json).unwrap();
     assert_eq!(data.agent, deserialized.agent);
@@ -34,7 +34,7 @@ fn test_tool_call_req() {
         params: serde_json::json!({"arg1": "value1", "arg2": 42}),
         timeout: 30,
     };
-    
+
     let json = serde_json::to_string(&req).unwrap();
     let deserialized: ToolCallReq = serde_json::from_str(&json).unwrap();
     assert_eq!(req.base.agent, deserialized.base.agent);
@@ -58,7 +58,7 @@ fn test_smcp_tool() {
         return_schema: Some(serde_json::json!({"type": "string"})),
         meta: None,
     };
-    
+
     let json = serde_json::to_string(&tool).unwrap();
     let deserialized: SMCPTool = serde_json::from_str(&json).unwrap();
     assert_eq!(tool.name, deserialized.name);
@@ -75,7 +75,7 @@ fn test_enter_office_notification() {
         computer: Some("computer1".to_string()),
         agent: None,
     };
-    
+
     let json = serde_json::to_string(&notification).unwrap();
     let deserialized: EnterOfficeNotification = serde_json::from_str(&json).unwrap();
     assert_eq!(notification.office_id, deserialized.office_id);
@@ -90,7 +90,7 @@ fn test_all_events_constants() {
     assert_eq!(events::CLIENT_GET_CONFIG, "client:get_config");
     assert_eq!(events::CLIENT_GET_DESKTOP, "client:get_desktop");
     assert_eq!(events::CLIENT_TOOL_CALL, "client:tool_call");
-    
+
     assert_eq!(events::SERVER_JOIN_OFFICE, "server:join_office");
     assert_eq!(events::SERVER_LEAVE_OFFICE, "server:leave_office");
     assert_eq!(events::SERVER_UPDATE_CONFIG, "server:update_config");
@@ -98,13 +98,13 @@ fn test_all_events_constants() {
     assert_eq!(events::SERVER_UPDATE_DESKTOP, "server:update_desktop");
     assert_eq!(events::SERVER_TOOL_CALL_CANCEL, "server:tool_call_cancel");
     assert_eq!(events::SERVER_LIST_ROOM, "server:list_room");
-    
+
     assert_eq!(events::NOTIFY_TOOL_CALL_CANCEL, "notify:tool_call_cancel");
     assert_eq!(events::NOTIFY_ENTER_OFFICE, "notify:enter_office");
     assert_eq!(events::NOTIFY_LEAVE_OFFICE, "notify:leave_office");
     assert_eq!(events::NOTIFY_UPDATE_CONFIG, "notify:update_config");
     assert_eq!(events::NOTIFY_UPDATE_TOOL_LIST, "notify:update_tool_list");
     assert_eq!(events::NOTIFY_UPDATE_DESKTOP, "notify:update_desktop");
-    
+
     assert_eq!(events::NOTIFY_PREFIX, "notify:");
 }
