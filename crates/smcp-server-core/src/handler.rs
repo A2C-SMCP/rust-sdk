@@ -609,4 +609,26 @@ mod tests {
         let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
         assert_eq!(decision, JoinRoomDecision::Noop);
     }
+
+    #[test]
+    fn test_validate_join_room_agent_first_time_join() {
+        let state = create_test_state();
+        let session = SessionData::new("sid_agent".to_string(), "a".to_string(), ClientRole::Agent);
+
+        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
+        assert_eq!(decision, JoinRoomDecision::Join);
+    }
+
+    #[test]
+    fn test_validate_join_room_computer_first_time_join() {
+        let state = create_test_state();
+        let session = SessionData::new(
+            "sid_computer".to_string(),
+            "computer1".to_string(),
+            ClientRole::Computer,
+        );
+
+        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
+        assert_eq!(decision, JoinRoomDecision::Join);
+    }
 }
