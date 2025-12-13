@@ -18,9 +18,9 @@ socketioxide.workspace = true
 tower.workspace = true
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+reqwest.workspace = true
 rust_socketio = { workspace = true }
 serde_json = { workspace = true }
-futures = "0.3"
-async-trait = "0.1"
-http = "1.0"
+futures.workspace = true
+async-trait.workspace = true
+http.workspace = true

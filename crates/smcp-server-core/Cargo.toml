@@ -15,9 +15,9 @@ tracing.workspace = true
 
 socketioxide.workspace = true
 uuid.workspace = true
-async-trait = "0.1"
-dashmap = "5.5"
-http = "1.0"
+async-trait.workspace = true
+dashmap.workspace = true
+http.workspace = true
 futures-util.workspace = true
 tower = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }

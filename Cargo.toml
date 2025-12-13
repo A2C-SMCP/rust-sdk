@@ -73,3 +73,10 @@ tower = "0.5"
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper-tungstenite = "0.17"
+
+# 新增的workspace依赖
+async-trait = "0.1"
+dashmap = "5.5"
+http = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+futures = "0.3"
