@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
+use futures_util::FutureExt;
 use http_body_util::Full;
 use rust_socketio::asynchronous::ClientBuilder;
 use rust_socketio::Payload;
@@ -22,7 +22,8 @@ use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync {
+) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+{
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);
     move |payload: Payload, _client| {
@@ -142,7 +143,9 @@ async fn test_get_config_complete_flow() {
 
                 // 解析请求
                 if let Payload::Text(values) = payload {
-                    if let Ok(req) = serde_json::from_value::<GetComputerConfigReq>(values[0].clone()) {
+                    if let Ok(req) =
+                        serde_json::from_value::<GetComputerConfigReq>(values[0].clone())
+                    {
                         // 构造响应（模拟Computer会发送这个响应）
                         let _response = GetComputerConfigRet {
                             inputs: None,
@@ -157,7 +160,7 @@ async fn test_get_config_complete_flow() {
                                 ]
                             }),
                         };
-                        
+
                         // 注意：在真实的Computer客户端中，这里会通过ack发送响应
                         // 但在测试中，我们只能验证请求被正确转发
                     }
@@ -233,15 +236,19 @@ async fn test_get_config_complete_flow() {
         .expect("get_config emit_with_ack failed");
 
     // 等待响应
-    let result = tokio::time::timeout(Duration::from_secs(5), config_rx)
-        .await;
-    
+    let result = tokio::time::timeout(Duration::from_secs(5), config_rx).await;
+
     // 由于Computer没有发送ack，应该超时
-    assert!(result.is_err(), "Should timeout when Computer doesn't respond");
-    
+    assert!(
+        result.is_err(),
+        "Should timeout when Computer doesn't respond"
+    );
+
     // 但Computer应该收到了请求
-    assert!(computer_received.load(Ordering::SeqCst), 
-        "Computer should have received the request");
+    assert!(
+        computer_received.load(Ordering::SeqCst),
+        "Computer should have received the request"
+    );
 
     // 清理
     computer_client.disconnect().await.unwrap();
@@ -314,26 +321,28 @@ async fn test_get_config_computer_not_found() {
     // 验证错误响应
     let error_value: serde_json::Value = serde_json::from_value(config_payload)
         .expect("Should be able to deserialize error response");
-    
+
     // 错误响应可能是字符串或数组
     let error_msg = match error_value {
         serde_json::Value::String(s) => s,
         serde_json::Value::Array(arr) => {
             // 如果是数组，取第一个元素
-            arr.first().map(|v| {
-                // 如果元素是包含Err字段的对象
-                if let Some(err) = v.get("Err").and_then(|e| e.as_str()) {
-                    err.to_string()
-                } else if let Some(s) = v.as_str() {
-                    s.to_string()
-                } else {
-                    v.to_string()
-                }
-            }).unwrap_or_default()
+            arr.first()
+                .map(|v| {
+                    // 如果元素是包含Err字段的对象
+                    if let Some(err) = v.get("Err").and_then(|e| e.as_str()) {
+                        err.to_string()
+                    } else if let Some(s) = v.as_str() {
+                        s.to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .unwrap_or_default()
         }
         _ => error_value.to_string(),
     };
-    
+
     // 验证错误信息
     assert!(error_msg.contains("not found") || error_msg.contains("Computer"));
 

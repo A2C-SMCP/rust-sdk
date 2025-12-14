@@ -7,7 +7,6 @@
 * 依赖: None
 * 描述: SMCP服务器测试共享工具模块
 */
-
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,6 +14,7 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use http_body_util::Full;
+use hyper_util::rt::TokioIo;
 use rust_socketio::asynchronous::ClientBuilder;
 use rust_socketio::Payload;
 use rust_socketio::TransportType;
@@ -24,7 +24,6 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tower::{Layer, Service};
-use hyper_util::rt::TokioIo;
 
 use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 
@@ -118,7 +117,12 @@ pub async fn find_available_port() -> u16 {
 pub fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync {
+) -> impl FnMut(
+    Payload,
+    rust_socketio::asynchronous::Client,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+       + Send
+       + Sync {
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);
     move |payload: Payload, _client| {
@@ -135,7 +139,10 @@ pub fn ack_to_sender<T: Send + 'static>(
 }
 
 /// 创建测试客户端
-pub async fn create_test_client(server_url: &str, namespace: &str) -> rust_socketio::asynchronous::Client {
+pub async fn create_test_client(
+    server_url: &str,
+    namespace: &str,
+) -> rust_socketio::asynchronous::Client {
     ClientBuilder::new(server_url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
@@ -153,7 +160,10 @@ pub async fn create_client_with_handler<F>(
     handler: F,
 ) -> rust_socketio::asynchronous::Client
 where
-    F: FnMut(Payload, rust_socketio::asynchronous::Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    F: FnMut(
+            Payload,
+            rust_socketio::asynchronous::Client,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + 'static
         + Send
         + Sync,
@@ -169,7 +179,14 @@ where
 }
 
 /// 创建原子布尔标记的处理器
-pub fn create_atomic_handler(flag: Arc<AtomicBool>) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync {
+pub fn create_atomic_handler(
+    flag: Arc<AtomicBool>,
+) -> impl FnMut(
+    Payload,
+    rust_socketio::asynchronous::Client,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+       + Send
+       + Sync {
     move |payload: Payload, _client| {
         let flag = flag.clone();
         Box::pin(async move {
@@ -192,30 +209,27 @@ pub async fn join_office(
         role,
         name: name.to_string(),
     };
-    
+
     client
         .emit("server:join_office", json!(join_req))
         .await
         .expect("Failed to emit join_office");
-    
+
     // 等待加入完成
     sleep(Duration::from_millis(100)).await;
 }
 
 /// 离开办公室的辅助函数
-pub async fn leave_office(
-    client: &rust_socketio::asynchronous::Client,
-    office_id: &str,
-) {
+pub async fn leave_office(client: &rust_socketio::asynchronous::Client, office_id: &str) {
     let leave_req = json!({
         "office_id": office_id
     });
-    
+
     client
         .emit("server:leave_office", leave_req)
         .await
         .expect("Failed to emit leave_office");
-    
+
     // 等待离开完成
     sleep(Duration::from_millis(100)).await;
 }

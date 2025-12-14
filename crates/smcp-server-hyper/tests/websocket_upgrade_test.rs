@@ -1,11 +1,11 @@
 //! 测试WebSocket升级功能
 
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rust_socketio::asynchronous::ClientBuilder;
-use rust_socketio::TransportType;
 use rust_socketio::payload::Payload;
+use rust_socketio::TransportType;
 use serde_json::json;
 use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 use smcp_server_hyper::HyperServerBuilder;
@@ -14,7 +14,12 @@ use tokio::time::sleep;
 fn ack_to_sender<T: Send + 'static>(
     sender: tokio::sync::oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync {
+) -> impl FnMut(
+    Payload,
+    rust_socketio::asynchronous::Client,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+       + Send
+       + Sync {
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);
     move |payload: Payload, _client| {
@@ -53,13 +58,11 @@ async fn test_websocket_upgrade() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    
+
     let server_addr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // 在后台启动服务器
-    let server_handle = tokio::spawn(async move {
-        server.run(server_addr).await
-    });
+    let server_handle = tokio::spawn(async move { server.run(server_addr).await });
 
     // 等待服务器启动
     sleep(Duration::from_millis(100)).await;
@@ -87,14 +90,17 @@ async fn test_websocket_upgrade() {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let timeout = Duration::from_secs(2);
-    
+
     client
-        .emit_with_ack("server:join_office", join_req, timeout, ack_to_sender(tx, |payload| {
-            match payload {
+        .emit_with_ack(
+            "server:join_office",
+            join_req,
+            timeout,
+            ack_to_sender(tx, |payload| match payload {
                 Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
-            }
-        }))
+            }),
+        )
         .await
         .expect("Failed to emit message");
 
@@ -139,13 +145,11 @@ async fn test_websocket_upgrade_with_invalid_role() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    
+
     let server_addr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // 在后台启动服务器
-    let server_handle = tokio::spawn(async move {
-        server.run(server_addr).await
-    });
+    let server_handle = tokio::spawn(async move { server.run(server_addr).await });
 
     // 等待服务器启动
     sleep(Duration::from_millis(100)).await;
@@ -173,14 +177,17 @@ async fn test_websocket_upgrade_with_invalid_role() {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let timeout = Duration::from_secs(2);
-    
+
     client
-        .emit_with_ack("server:join_office", join_req, timeout, ack_to_sender(tx, |payload| {
-            match payload {
+        .emit_with_ack(
+            "server:join_office",
+            join_req,
+            timeout,
+            ack_to_sender(tx, |payload| match payload {
                 Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
-            }
-        }))
+            }),
+        )
         .await
         .expect("Failed to emit message");
 
@@ -225,7 +232,7 @@ async fn test_websocket_upgrade_with_polling_fallback() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    
+
     let server_addr = format!("127.0.0.1:{}", port).parse().unwrap();
     let server = HyperServerBuilder::new()
         .with_layer(layer)
@@ -233,9 +240,7 @@ async fn test_websocket_upgrade_with_polling_fallback() {
         .build();
 
     // 在后台启动服务器
-    let server_handle = tokio::spawn(async move {
-        server.run(server_addr).await
-    });
+    let server_handle = tokio::spawn(async move { server.run(server_addr).await });
 
     // 等待服务器启动
     sleep(Duration::from_millis(100)).await;
