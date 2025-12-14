@@ -150,6 +150,15 @@ impl SmcpHandler {
             },
         );
 
+        let state_get_config = state.clone();
+        socket.on(
+            smcp::events::CLIENT_GET_CONFIG,
+            move |socket: SocketRef, Data::<GetComputerConfigReq>(data), ack: AckSender| async move {
+                let result = Self::on_client_get_config(socket, data, state_get_config.clone()).await;
+                let _ = ack.send(&result);
+            },
+        );
+
         let state_update_desktop = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_DESKTOP,
@@ -296,12 +305,12 @@ impl SmcpHandler {
                 agent: Some(session_name.clone()),
             }
         };
-        
+
         let result = socket
             .to(data.office_id.clone())
             .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data)
             .await;
-        
+
         if let Err(e) = result {
             warn!("Failed to broadcast NOTIFY_ENTER_OFFICE: {}", e);
         }
@@ -549,7 +558,8 @@ impl SmcpHandler {
         // 获取目标 socket
         let target_socket = state
             .io
-            .get_socket(computer_sid.parse().unwrap())
+            .of(SMCP_NAMESPACE)
+            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
             .ok_or_else(|| {
                 HandlerError::InvalidRequest("Target computer socket not found".to_string())
             })?;
@@ -632,7 +642,8 @@ impl SmcpHandler {
         // 获取目标 socket
         let target_socket = state
             .io
-            .get_socket(computer_sid.parse().unwrap())
+            .of(SMCP_NAMESPACE)
+            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
             .ok_or_else(|| {
                 HandlerError::InvalidRequest("Target computer socket not found".to_string())
             })?;
@@ -710,7 +721,8 @@ impl SmcpHandler {
         // 获取目标 socket
         let target_socket = state
             .io
-            .get_socket(computer_sid.parse().unwrap())
+            .of(SMCP_NAMESPACE)
+            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
             .ok_or_else(|| {
                 HandlerError::InvalidRequest("Target computer socket not found".to_string())
             })?;
@@ -745,6 +757,85 @@ impl SmcpHandler {
             ))),
             Err(_) => Err(HandlerError::Timeout(
                 "Get desktop timed out after 30 seconds".to_string(),
+            )),
+        }
+    }
+
+    /// 处理获取计算机配置事件
+    async fn on_client_get_config(
+        socket: SocketRef,
+        data: GetComputerConfigReq,
+        state: ServerState,
+    ) -> Result<GetComputerConfigRet, HandlerError> {
+        // 获取 Agent 的会话信息
+        let sid = socket.id.to_string();
+        let session = state
+            .session_manager
+            .get_session(&sid)
+            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+
+        // 验证角色必须是 Agent
+        if session.role != ClientRole::Agent {
+            return Err(HandlerError::InvalidRequest(
+                "Only agents can get config".to_string(),
+            ));
+        }
+
+        // 验证 Agent 在某个办公室内
+        let office_id = session.office_id.ok_or_else(|| {
+            HandlerError::InvalidRequest("Agent must be in an office to get config".to_string())
+        })?;
+
+        // 查找目标 Computer 的 sid
+        let computer_sid = state
+            .session_manager
+            .get_computer_sid_in_office(&office_id, &data.computer)
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest(format!(
+                    "Computer '{}' not found in office",
+                    data.computer
+                ))
+            })?;
+
+        // 获取目标 socket
+        let target_socket = state
+            .io
+            .of(SMCP_NAMESPACE)
+            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
+            .ok_or_else(|| {
+                HandlerError::InvalidRequest("Target computer socket not found".to_string())
+            })?;
+
+        // 转发请求并等待响应
+        let timeout = tokio::time::Duration::from_secs(30);
+        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_GET_CONFIG, &data);
+
+        match tokio::time::timeout(timeout, async move {
+            match ack_result {
+                Ok(stream) => {
+                    let mut pinned = Box::pin(stream);
+                    match pinned.next().await {
+                        Some((_, response)) => response,
+                        None => Ok(serde_json::Value::Null),
+                    }
+                }
+                Err(_) => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        {
+            Ok(Ok(response)) => {
+                // 解析响应
+                serde_json::from_value(response).map_err(|e| {
+                    HandlerError::InvalidRequest(format!("Failed to parse response: {}", e))
+                })
+            }
+            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
+                "Failed to get response from computer: {}",
+                e
+            ))),
+            Err(_) => Err(HandlerError::Timeout(
+                "Get config timed out after 30 seconds".to_string(),
             )),
         }
     }
@@ -873,7 +964,7 @@ impl SmcpHandler {
                     "Leaving room '{}' and joining '{}' for sid={}",
                     leave_office, office_id, socket.id
                 );
-                
+
                 // 构建离开通知（Python语义：切换房间前需要通知旧房间）
                 let leave_notification = if session.role == ClientRole::Computer {
                     LeaveOfficeNotification {
@@ -888,13 +979,13 @@ impl SmcpHandler {
                         agent: Some(session.name.clone()),
                     }
                 };
-                
+
                 // 向旧房间广播离开消息
                 let _ = socket
                     .within(leave_office.clone())
                     .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &leave_notification)
                     .await;
-                
+
                 socket.leave(leave_office);
                 socket.join(office_id.to_string());
                 Ok(())
@@ -1143,13 +1234,13 @@ mod tests {
     fn test_enter_office_notification_computer() {
         let computer_name = "computer1".to_string();
         let office_id = "office1".to_string();
-        
+
         let notification = EnterOfficeNotification {
             office_id: office_id.clone(),
             computer: Some(computer_name.clone()),
             agent: None,
         };
-        
+
         assert_eq!(notification.office_id, office_id);
         assert_eq!(notification.computer, Some(computer_name));
         assert_eq!(notification.agent, None);
@@ -1159,13 +1250,13 @@ mod tests {
     fn test_enter_office_notification_agent() {
         let agent_name = "agent1".to_string();
         let office_id = "office1".to_string();
-        
+
         let notification = EnterOfficeNotification {
             office_id: office_id.clone(),
             computer: None,
             agent: Some(agent_name.clone()),
         };
-        
+
         assert_eq!(notification.office_id, office_id);
         assert_eq!(notification.computer, None);
         assert_eq!(notification.agent, Some(agent_name));
@@ -1175,13 +1266,13 @@ mod tests {
     fn test_leave_office_notification_computer() {
         let computer_name = "computer1".to_string();
         let office_id = "office1".to_string();
-        
+
         let notification = LeaveOfficeNotification {
             office_id: office_id.clone(),
             computer: Some(computer_name.clone()),
             agent: None,
         };
-        
+
         assert_eq!(notification.office_id, office_id);
         assert_eq!(notification.computer, Some(computer_name));
         assert_eq!(notification.agent, None);
@@ -1190,22 +1281,22 @@ mod tests {
     #[test]
     fn test_update_tool_list_notification() {
         let computer_name = "computer1".to_string();
-        
+
         let notification = UpdateToolListNotification {
             computer: computer_name.clone(),
         };
-        
+
         assert_eq!(notification.computer, computer_name);
     }
 
     #[test]
     fn test_update_mcp_config_notification() {
         let computer_name = "computer1".to_string();
-        
+
         let notification = UpdateMCPConfigNotification {
             computer: computer_name.clone(),
         };
-        
+
         assert_eq!(notification.computer, computer_name);
     }
 
@@ -1215,14 +1306,14 @@ mod tests {
         let tool_list_notification = UpdateToolListNotification {
             computer: "computer1".to_string(),
         };
-        
+
         let json = serde_json::to_string(&tool_list_notification).unwrap();
         assert!(json.contains("\"computer\":\"computer1\""));
-        
+
         let mcp_config_notification = UpdateMCPConfigNotification {
             computer: "computer1".to_string(),
         };
-        
+
         let json = serde_json::to_string(&mcp_config_notification).unwrap();
         assert!(json.contains("\"computer\":\"computer1\""));
     }

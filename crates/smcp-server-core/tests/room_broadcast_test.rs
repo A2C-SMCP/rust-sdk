@@ -1,20 +1,20 @@
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::net::SocketAddr;
 
 use futures_util::FutureExt;
+use http_body_util::Full;
 use rust_socketio::asynchronous::ClientBuilder;
 use rust_socketio::Payload;
 use rust_socketio::TransportType;
-use smcp::*;
 use serde_json::json;
+use smcp::*;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tower::Layer;
 use tower::Service;
-use http_body_util::Full;
 
 use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 
@@ -108,7 +108,7 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
     // 创建监听器来跟踪接收到的通知
     let leave_received = Arc::new(AtomicBool::new(false));
     let enter_received = Arc::new(AtomicBool::new(false));
-    
+
     let leave_received_clone = leave_received.clone();
     let enter_received_clone = enter_received.clone();
 
@@ -156,8 +156,11 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
         role: Role::Computer,
         name: "computer1".to_string(),
     };
-    
-    client1.emit("server:join_office", json!(join_req1)).await.unwrap();
+
+    client1
+        .emit("server:join_office", json!(join_req1))
+        .await
+        .unwrap();
     sleep(Duration::from_millis(100)).await;
 
     // 创建第二个客户端（在office1中监听）
@@ -177,8 +180,11 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
         role: Role::Agent,
         name: "agent1".to_string(),
     };
-    
-    client2.emit("server:join_office", json!(join_req2)).await.unwrap();
+
+    client2
+        .emit("server:join_office", json!(join_req2))
+        .await
+        .unwrap();
     sleep(Duration::from_millis(100)).await;
 
     // 现在，computer1从office1切换到office2
@@ -187,13 +193,18 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
         role: Role::Computer,
         name: "computer1".to_string(),
     };
-    
-    client1.emit("server:join_office", json!(join_req3)).await.unwrap();
+
+    client1
+        .emit("server:join_office", json!(join_req3))
+        .await
+        .unwrap();
     sleep(Duration::from_millis(200)).await;
 
     // 验证client2（在office1中）收到了leave_office通知
-    assert!(leave_received.load(Ordering::SeqCst), 
-        "Expected leave_office notification not received");
+    assert!(
+        leave_received.load(Ordering::SeqCst),
+        "Expected leave_office notification not received"
+    );
 
     // 清理
     client1.disconnect().await.unwrap();
@@ -212,7 +223,7 @@ async fn test_join_office_broadcasts_only_to_room() {
     let office1_received = Arc::new(AtomicBool::new(false));
     let office2_received = Arc::new(AtomicBool::new(false));
     let global_received = Arc::new(AtomicBool::new(false));
-    
+
     let office1_received_clone = office1_received.clone();
     let office2_received_clone = office2_received.clone();
     let global_received_clone = global_received.clone();
@@ -295,8 +306,11 @@ async fn test_join_office_broadcasts_only_to_room() {
         role: Role::Agent,
         name: "agent1".to_string(),
     };
-    
-    client1.emit("server:join_office", json!(join_req1)).await.unwrap();
+
+    client1
+        .emit("server:join_office", json!(join_req1))
+        .await
+        .unwrap();
     sleep(Duration::from_millis(100)).await;
 
     // client2加入office2
@@ -305,8 +319,11 @@ async fn test_join_office_broadcasts_only_to_room() {
         role: Role::Agent,
         name: "agent2".to_string(),
     };
-    
-    client2.emit("server:join_office", json!(join_req2)).await.unwrap();
+
+    client2
+        .emit("server:join_office", json!(join_req2))
+        .await
+        .unwrap();
     sleep(Duration::from_millis(100)).await;
 
     // 现在，computer1加入office1
@@ -315,7 +332,7 @@ async fn test_join_office_broadcasts_only_to_room() {
         role: Role::Computer,
         name: "computer1".to_string(),
     };
-    
+
     // 使用新的客户端连接来发送join请求
     let computer_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
@@ -326,17 +343,26 @@ async fn test_join_office_broadcasts_only_to_room() {
         .expect("Connection failed");
 
     sleep(Duration::from_millis(100)).await;
-    
-    computer_client.emit("server:join_office", json!(computer_join_req)).await.unwrap();
+
+    computer_client
+        .emit("server:join_office", json!(computer_join_req))
+        .await
+        .unwrap();
     sleep(Duration::from_millis(200)).await;
 
     // 验证只有office1中的客户端收到了通知
-    assert!(office1_received.load(Ordering::SeqCst), 
-        "office1 should receive enter_office notification");
-    assert!(!office2_received.load(Ordering::SeqCst), 
-        "office2 should not receive notification");
-    assert!(!global_received.load(Ordering::SeqCst), 
-        "global listener should not receive notification");
+    assert!(
+        office1_received.load(Ordering::SeqCst),
+        "office1 should receive enter_office notification"
+    );
+    assert!(
+        !office2_received.load(Ordering::SeqCst),
+        "office2 should not receive notification"
+    );
+    assert!(
+        !global_received.load(Ordering::SeqCst),
+        "global listener should not receive notification"
+    );
 
     // 清理
     client1.disconnect().await.unwrap();
