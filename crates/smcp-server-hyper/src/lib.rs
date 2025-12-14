@@ -71,6 +71,7 @@ impl HyperServer {
                 let io = TokioIo::new(stream);
                 if let Err(err) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
+                    .with_upgrades()
                     .await
                 {
                     error!("Failed to serve connection: {}", err);
