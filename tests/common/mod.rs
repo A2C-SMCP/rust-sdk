@@ -1,5 +1,7 @@
 //! Common test utilities for cross-crate integration tests
 
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,9 +17,11 @@ pub async fn find_available_port() -> u16 {
 }
 
 /// Test timeout duration
+#[allow(dead_code)]
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wait for a condition with timeout
+#[allow(dead_code)]
 pub async fn wait_with_timeout<F, Fut>(
     duration: Duration,
     future: F,
@@ -35,6 +39,7 @@ where
 
 /// A flag that can be used to signal test completion
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct TestFlag(Arc<AtomicBool>);
 
 impl TestFlag {
@@ -59,6 +64,7 @@ impl TestFlag {
 
 /// A notify wrapper for easier testing
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct TestNotify(Arc<Notify>);
 
 impl TestNotify {

@@ -2,11 +2,8 @@
 //!
 //! This test verifies that all components can work together
 
-use std::time::Duration;
-
 mod common;
-use common::{find_available_port, TestNotify, TEST_TIMEOUT};
-use tokio::time::timeout;
+use common::find_available_port;
 
 #[tokio::test]
 #[cfg_attr(not(feature = "full"), ignore)]

@@ -253,20 +253,20 @@ impl SmcpHandler {
                         s.role, requested_role
                     )));
                 }
-                
+
                 if s.name != requested_name {
                     return Err(HandlerError::InvalidRequest(format!(
                         "Name mismatch: existing session has name '{}', but requested '{}'",
                         s.name, requested_name
                     )));
                 }
-                
+
                 s
             }
             None => {
                 // 创建新会话
                 let new_session = SessionData::new(sid.clone(), requested_name, requested_role);
-                
+
                 state
                     .session_manager
                     .register_session(new_session.clone())?;
@@ -307,13 +307,12 @@ impl SmcpHandler {
             "Broadcasting NOTIFY_ENTER_OFFICE to room '{}' from {} (sid: {})",
             data.office_id, session_name, socket.id
         );
-        
+
         // Try broadcasting to all sockets without room filtering
         println!("Trying broadcast to all sockets...");
-        let result_all = socket
-            .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data);
+        let result_all = socket.emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data);
         println!("Broadcast to all result: {:?}", result_all);
-        
+
         // Also try room-based broadcast
         println!("Trying broadcast to room...");
         let result = socket
@@ -321,8 +320,11 @@ impl SmcpHandler {
             .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data)
             .await;
         println!("Broadcast to room result: {:?}", result);
-            
-        info!("Broadcast completed with results: all={:?}, room={:?}", result_all, result);
+
+        info!(
+            "Broadcast completed with results: all={:?}, room={:?}",
+            result_all, result
+        );
 
         Ok((true, None))
     }
@@ -370,7 +372,11 @@ impl SmcpHandler {
     }
 
     /// 处理工具调用取消事件
-    async fn on_server_tool_call_cancel(socket: SocketRef, data: AgentCallData, state: ServerState) {
+    async fn on_server_tool_call_cancel(
+        socket: SocketRef,
+        data: AgentCallData,
+        state: ServerState,
+    ) {
         let sid = socket.id.to_string();
         let session = match state.session_manager.get_session(&sid) {
             Some(s) => s,
@@ -395,7 +401,10 @@ impl SmcpHandler {
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
-                warn!("SERVER_TOOL_CALL_CANCEL but session not in office, sid={}", sid);
+                warn!(
+                    "SERVER_TOOL_CALL_CANCEL but session not in office, sid={}",
+                    sid
+                );
                 return;
             }
         };
@@ -436,7 +445,10 @@ impl SmcpHandler {
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
-                warn!("SERVER_UPDATE_CONFIG but session not in office, sid={}", sid);
+                warn!(
+                    "SERVER_UPDATE_CONFIG but session not in office, sid={}",
+                    sid
+                );
                 return;
             }
         };
@@ -460,7 +472,10 @@ impl SmcpHandler {
         {
             warn!("Failed to broadcast NOTIFY_UPDATE_CONFIG: {}", e);
         } else {
-            info!("Successfully broadcasted NOTIFY_UPDATE_CONFIG to room '{}'", office_id);
+            info!(
+                "Successfully broadcasted NOTIFY_UPDATE_CONFIG to room '{}'",
+                office_id
+            );
         }
     }
 
@@ -491,7 +506,10 @@ impl SmcpHandler {
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
-                warn!("SERVER_UPDATE_TOOL_LIST but session not in office, sid={}", sid);
+                warn!(
+                    "SERVER_UPDATE_TOOL_LIST but session not in office, sid={}",
+                    sid
+                );
                 return;
             }
         };
@@ -778,7 +796,10 @@ impl SmcpHandler {
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
-                warn!("SERVER_UPDATE_DESKTOP but session not in office, sid={}", sid);
+                warn!(
+                    "SERVER_UPDATE_DESKTOP but session not in office, sid={}",
+                    sid
+                );
                 return;
             }
         };
@@ -812,7 +833,9 @@ impl SmcpHandler {
 
         // 权限校验：只能查询自己所在的办公室
         let session_office_id = session.office_id.ok_or_else(|| {
-            HandlerError::InvalidRequest("You must be in an office to list room members".to_string())
+            HandlerError::InvalidRequest(
+                "You must be in an office to list room members".to_string(),
+            )
         })?;
 
         if session_office_id != data.office_id {
@@ -854,12 +877,12 @@ impl SmcpHandler {
             "handle_join_room called: sid={}, office_id={}, role={:?}",
             socket.id, office_id, session.role
         );
-        
-        match Self::validate_join_room(session, office_id, &*state)? {
+
+        match Self::validate_join_room(session, office_id, state)? {
             JoinRoomDecision::Noop => {
                 info!("Noop decision for sid={}", socket.id);
                 Ok(())
-            },
+            }
             JoinRoomDecision::Join => {
                 println!("Joining room '{}' for sid={}", office_id, socket.id);
                 info!("Joining room '{}' for sid={}", office_id, socket.id);

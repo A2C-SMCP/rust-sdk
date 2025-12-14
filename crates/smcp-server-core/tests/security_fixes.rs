@@ -46,11 +46,15 @@ async fn test_list_room_permission_validation() {
     session_manager.register_session(computer_session).unwrap();
 
     // 测试1: Agent 可以查询自己所在的办公室
-    let agent_in_office = session_manager.get_session(&"agent_sid_1".to_string()).unwrap();
+    let agent_in_office = session_manager
+        .get_session(&"agent_sid_1".to_string())
+        .unwrap();
     assert_eq!(agent_in_office.office_id, Some("office_1".to_string()));
-    
+
     // 测试2: Computer 不能查询房间成员（权限校验）
-    let computer_session = session_manager.get_session(&"computer_sid_1".to_string()).unwrap();
+    let computer_session = session_manager
+        .get_session(&"computer_sid_1".to_string())
+        .unwrap();
     assert_eq!(computer_session.role, ClientRole::Computer);
 
     println!("✅ list_room 权限校验测试通过");
@@ -70,11 +74,7 @@ async fn test_join_office_consistency_check() {
 
     // 测试1: 新会话可以正常加入
     let sid1 = "test_sid_1".to_string();
-    let new_session = SessionData::new(
-        sid1.clone(),
-        "test_agent".to_string(),
-        ClientRole::Agent,
-    );
+    let new_session = SessionData::new(sid1.clone(), "test_agent".to_string(), ClientRole::Agent);
     session_manager.register_session(new_session).unwrap();
 
     // 验证会话已注册
@@ -83,19 +83,12 @@ async fn test_join_office_consistency_check() {
     assert_eq!(retrieved.role, ClientRole::Agent);
 
     // 测试2: 相同的 role 和 name 应该允许（幂等操作）
-    let same_session = SessionData::new(
-        sid1.clone(),
-        "test_agent".to_string(),
-        ClientRole::Agent,
-    );
+    let same_session = SessionData::new(sid1.clone(), "test_agent".to_string(), ClientRole::Agent);
     assert!(session_manager.register_session(same_session).is_ok());
 
     // 测试3: 不同的 role 应该被拒绝
-    let _diff_role_session = SessionData::new(
-        sid1.clone(),
-        "test_agent".to_string(),
-        ClientRole::Computer,
-    );
+    let _diff_role_session =
+        SessionData::new(sid1.clone(), "test_agent".to_string(), ClientRole::Computer);
     // 这里我们只能测试 SessionManager 的层面
     // Handler 层的一致性检查需要实际的 SocketRef
 
@@ -108,11 +101,7 @@ async fn test_session_role_name_validation() {
     let sid = "test_sid".to_string();
 
     // 注册初始会话
-    let session1 = SessionData::new(
-        sid.clone(),
-        "test_name".to_string(),
-        ClientRole::Agent,
-    );
+    let session1 = SessionData::new(sid.clone(), "test_name".to_string(), ClientRole::Agent);
     manager.register_session(session1).unwrap();
 
     // 验证初始会话
@@ -160,8 +149,14 @@ async fn test_office_id_permissions() {
     assert_eq!(sessions.len(), 2);
 
     // 验证角色分布
-    let agents: Vec<_> = sessions.iter().filter(|s| s.role == ClientRole::Agent).collect();
-    let computers: Vec<_> = sessions.iter().filter(|s| s.role == ClientRole::Computer).collect();
+    let agents: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.role == ClientRole::Agent)
+        .collect();
+    let computers: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.role == ClientRole::Computer)
+        .collect();
     assert_eq!(agents.len(), 1);
     assert_eq!(computers.len(), 1);
 
@@ -171,7 +166,7 @@ async fn test_office_id_permissions() {
 #[tokio::test]
 async fn test_cross_office_access_prevention() {
     let manager = SessionManager::new();
-    
+
     // 创建不同办公室的会话
     let office1_agent = SessionData::new(
         "agent1_sid".to_string(),
@@ -194,7 +189,7 @@ async fn test_cross_office_access_prevention() {
     // 验证隔离性
     let office1_sessions = manager.get_sessions_in_office(&"office_1".to_string());
     let office2_sessions = manager.get_sessions_in_office(&"office_2".to_string());
-    
+
     assert_eq!(office1_sessions.len(), 1);
     assert_eq!(office2_sessions.len(), 1);
     assert_ne!(office1_sessions[0].sid, office2_sessions[0].sid);

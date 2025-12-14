@@ -6,11 +6,11 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use http_body_util::Full;
 use socketioxide::SocketIo;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
@@ -40,11 +40,14 @@ impl HyperServer {
     }
 
     /// Run the server on the given address
-    pub async fn run(self, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run(
+        self,
+        addr: SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let layer = self.layer.ok_or("SMCP layer not configured")?;
-        
+
         info!("Starting SMCP server on {}", addr);
-        
+
         // Create a TCP listener
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
@@ -62,7 +65,7 @@ impl HyperServer {
         loop {
             let (stream, remote_addr) = listener.accept().await?;
             info!("New connection from: {}", remote_addr);
-            
+
             let service = service.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -77,24 +80,26 @@ impl HyperServer {
     }
 }
 
+impl Default for HyperServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Handle HTTP requests
 pub async fn handle_request(
     req: Request<hyper::body::Incoming>,
     _io: &SocketIo,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let response = match (req.method(), req.uri().path()) {
-        (&Method::GET, "/") => {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from("SMCP Server is running")))
-                .unwrap()
-        }
-        (&Method::GET, "/health") => {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from("{\"status\":\"ok\"}")))
-                .unwrap()
-        }
+        (&Method::GET, "/") => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from("SMCP Server is running")))
+            .unwrap(),
+        (&Method::GET, "/health") => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from("{\"status\":\"ok\"}")))
+            .unwrap(),
         (&Method::GET, "/socket.io/") => {
             // Socket.IO will handle these requests through the layer
             Response::builder()
@@ -102,12 +107,10 @@ pub async fn handle_request(
                 .body(Full::new(Bytes::from("Not found")))
                 .unwrap()
         }
-        _ => {
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("Not found")))
-                .unwrap()
-        }
+        _ => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Full::new(Bytes::from("Not found")))
+            .unwrap(),
     };
 
     Ok(response)
@@ -170,7 +173,7 @@ pub async fn run_server(addr: SocketAddr) -> Result<(), Box<dyn std::error::Erro
         .with_layer(layer)
         .with_addr(addr)
         .build();
-    
+
     server.run(addr).await
 }
 

@@ -7,3 +7,9 @@ impl SmcpAgent {
         Self { _private: () }
     }
 }
+
+impl Default for SmcpAgent {
+    fn default() -> Self {
+        Self::new()
+    }
+}

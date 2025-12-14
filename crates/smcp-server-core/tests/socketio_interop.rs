@@ -28,7 +28,8 @@ async fn find_available_port() -> u16 {
 fn counter_handler(
     counter: Arc<AtomicUsize>,
     notify: Option<Arc<Notify>>,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync {
+) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+{
     move |_payload: Payload, _client| {
         let counter = counter.clone();
         let notify = notify.clone();
@@ -397,14 +398,20 @@ async fn test_update_notifications_and_role_checks() {
         )
         .await
         .expect("emit update_config failed");
-    
+
     // 添加调试日志
     tracing::info!("Waiting for agent to receive update_config notification...");
-    tracing::info!("Agent update_config count: {}", agent_update_config_count.load(Ordering::SeqCst));
-    
-    timeout(Duration::from_secs(2), agent_update_config_notify.notified())
-        .await
-        .expect("agent did not receive update_config");
+    tracing::info!(
+        "Agent update_config count: {}",
+        agent_update_config_count.load(Ordering::SeqCst)
+    );
+
+    timeout(
+        Duration::from_secs(2),
+        agent_update_config_notify.notified(),
+    )
+    .await
+    .expect("agent did not receive update_config");
     assert_eq!(agent_update_config_count.load(Ordering::SeqCst), 1);
     assert_eq!(computer_update_config_count.load(Ordering::SeqCst), 0);
 

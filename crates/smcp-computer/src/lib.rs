@@ -7,3 +7,9 @@ impl SmcpComputer {
         Self { _private: () }
     }
 }
+
+impl Default for SmcpComputer {
+    fn default() -> Self {
+        Self::new()
+    }
+}

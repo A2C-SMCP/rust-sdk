@@ -87,3 +87,42 @@ cargo test --test full_stack --features full
 # 运行单个 crate 的测试
 cargo test -p smcp-server-core
 ```
+
+## 代码覆盖率
+
+需要先安装 cargo-llvm-cov：
+```bash
+cargo install cargo-llvm-cov
+```
+
+### 生成覆盖率报告
+
+```bash
+# 运行测试并生成覆盖率报告（显示到终端）
+cargo llvm-cov --workspace
+
+# 生成 HTML 覆盖率报告（会在 target/llvm-cov/html/index.html）
+cargo llvm-cov --workspace --html
+
+# 生成覆盖率报告并显示未覆盖的行
+cargo llvm-cov --workspace --show-missing-lines
+
+# 只对特定 crate 生成覆盖率
+cargo llvm-cov -p smcp-server-core --show-missing-lines
+
+# 生成 LCOV 格式报告（用于 CI 集成）
+cargo llvm-cov --workspace --lcov --output-path lcov.info
+```
+
+### 常用覆盖率组合命令
+
+```bash
+# 一键运行测试并查看覆盖率摘要
+cargo llvm-cov --workspace --summary
+
+# 运行测试并打开 HTML 报告（macOS）
+cargo llvm-cov --workspace --html && open target/llvm-cov/html/index.html
+
+# 查看特定文件的覆盖率详情
+cargo llvm-cov --workspace --show-missing-lines --file src/lib.rs
+```
