@@ -237,7 +237,6 @@ impl SmcpHandler {
         data: EnterOfficeReq,
         state: ServerState,
     ) -> Result<(bool, Option<String>), HandlerError> {
-        println!("!!! on_server_join_office called with data: {:?}", data);
         info!("on_server_join_office called with data: {:?}", data);
         let sid = socket.id.to_string();
         let requested_role = ClientRole::from(data.role.clone());
@@ -297,34 +296,15 @@ impl SmcpHandler {
                 agent: Some(session_name.clone()),
             }
         };
-
-        // 广播加入消息
-        println!(
-            "Broadcasting NOTIFY_ENTER_OFFICE to room '{}' from {} (sid: {})",
-            data.office_id, session_name, socket.id
-        );
-        info!(
-            "Broadcasting NOTIFY_ENTER_OFFICE to room '{}' from {} (sid: {})",
-            data.office_id, session_name, socket.id
-        );
-
-        // Try broadcasting to all sockets without room filtering
-        println!("Trying broadcast to all sockets...");
-        let result_all = socket.emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data);
-        println!("Broadcast to all result: {:?}", result_all);
-
-        // Also try room-based broadcast
-        println!("Trying broadcast to room...");
+        
         let result = socket
             .to(data.office_id.clone())
             .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data)
             .await;
-        println!("Broadcast to room result: {:?}", result);
-
-        info!(
-            "Broadcast completed with results: all={:?}, room={:?}",
-            result_all, result
-        );
+        
+        if let Err(e) = result {
+            warn!("Failed to broadcast NOTIFY_ENTER_OFFICE: {}", e);
+        }
 
         Ok((true, None))
     }
@@ -515,7 +495,7 @@ impl SmcpHandler {
         };
 
         // 广播工具列表更新通知（向 office 广播并跳过自己）
-        let notification = UpdateMCPConfigNotification {
+        let notification = UpdateToolListNotification {
             computer: data.computer,
         };
 
@@ -884,11 +864,8 @@ impl SmcpHandler {
                 Ok(())
             }
             JoinRoomDecision::Join => {
-                println!("Joining room '{}' for sid={}", office_id, socket.id);
                 info!("Joining room '{}' for sid={}", office_id, socket.id);
                 socket.join(office_id.to_string());
-                // Verify the socket is now in the room
-                println!("Socket {} joined room successfully", socket.id);
                 Ok(())
             }
             JoinRoomDecision::LeaveAndJoin { leave_office } => {
@@ -896,6 +873,28 @@ impl SmcpHandler {
                     "Leaving room '{}' and joining '{}' for sid={}",
                     leave_office, office_id, socket.id
                 );
+                
+                // 构建离开通知（Python语义：切换房间前需要通知旧房间）
+                let leave_notification = if session.role == ClientRole::Computer {
+                    LeaveOfficeNotification {
+                        office_id: leave_office.clone(),
+                        computer: Some(session.name.clone()),
+                        agent: None,
+                    }
+                } else {
+                    LeaveOfficeNotification {
+                        office_id: leave_office.clone(),
+                        computer: None,
+                        agent: Some(session.name.clone()),
+                    }
+                };
+                
+                // 向旧房间广播离开消息
+                let _ = socket
+                    .within(leave_office.clone())
+                    .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &leave_notification)
+                    .await;
+                
                 socket.leave(leave_office);
                 socket.join(office_id.to_string());
                 Ok(())
@@ -1138,5 +1137,93 @@ mod tests {
 
         let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
         assert_eq!(decision, JoinRoomDecision::Join);
+    }
+
+    #[test]
+    fn test_enter_office_notification_computer() {
+        let computer_name = "computer1".to_string();
+        let office_id = "office1".to_string();
+        
+        let notification = EnterOfficeNotification {
+            office_id: office_id.clone(),
+            computer: Some(computer_name.clone()),
+            agent: None,
+        };
+        
+        assert_eq!(notification.office_id, office_id);
+        assert_eq!(notification.computer, Some(computer_name));
+        assert_eq!(notification.agent, None);
+    }
+
+    #[test]
+    fn test_enter_office_notification_agent() {
+        let agent_name = "agent1".to_string();
+        let office_id = "office1".to_string();
+        
+        let notification = EnterOfficeNotification {
+            office_id: office_id.clone(),
+            computer: None,
+            agent: Some(agent_name.clone()),
+        };
+        
+        assert_eq!(notification.office_id, office_id);
+        assert_eq!(notification.computer, None);
+        assert_eq!(notification.agent, Some(agent_name));
+    }
+
+    #[test]
+    fn test_leave_office_notification_computer() {
+        let computer_name = "computer1".to_string();
+        let office_id = "office1".to_string();
+        
+        let notification = LeaveOfficeNotification {
+            office_id: office_id.clone(),
+            computer: Some(computer_name.clone()),
+            agent: None,
+        };
+        
+        assert_eq!(notification.office_id, office_id);
+        assert_eq!(notification.computer, Some(computer_name));
+        assert_eq!(notification.agent, None);
+    }
+
+    #[test]
+    fn test_update_tool_list_notification() {
+        let computer_name = "computer1".to_string();
+        
+        let notification = UpdateToolListNotification {
+            computer: computer_name.clone(),
+        };
+        
+        assert_eq!(notification.computer, computer_name);
+    }
+
+    #[test]
+    fn test_update_mcp_config_notification() {
+        let computer_name = "computer1".to_string();
+        
+        let notification = UpdateMCPConfigNotification {
+            computer: computer_name.clone(),
+        };
+        
+        assert_eq!(notification.computer, computer_name);
+    }
+
+    #[test]
+    fn test_notification_serialization() {
+        // 验证通知类型序列化正确性
+        let tool_list_notification = UpdateToolListNotification {
+            computer: "computer1".to_string(),
+        };
+        
+        let json = serde_json::to_string(&tool_list_notification).unwrap();
+        assert!(json.contains("\"computer\":\"computer1\""));
+        
+        let mcp_config_notification = UpdateMCPConfigNotification {
+            computer: "computer1".to_string(),
+        };
+        
+        let json = serde_json::to_string(&mcp_config_notification).unwrap();
+        assert!(json.contains("\"computer\":\"computer1\""));
     }
 }
