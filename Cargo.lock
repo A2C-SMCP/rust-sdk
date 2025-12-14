@@ -1532,6 +1532,7 @@ dependencies = [
  "reqwest",
  "rust_socketio",
  "serde_json",
+ "smcp",
  "smcp-server-core",
  "socketioxide",
  "tokio",

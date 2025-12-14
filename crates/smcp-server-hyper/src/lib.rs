@@ -20,8 +20,8 @@ use smcp_server_core::SmcpServerLayer;
 
 /// A Hyper-based SMCP server
 pub struct HyperServer {
-    layer: Option<SmcpServerLayer>,
-    addr: SocketAddr,
+    pub layer: Option<SmcpServerLayer>,
+    pub addr: SocketAddr,
 }
 
 impl HyperServer {
@@ -78,7 +78,7 @@ impl HyperServer {
 }
 
 /// Handle HTTP requests
-async fn handle_request(
+pub async fn handle_request(
     req: Request<hyper::body::Incoming>,
     _io: &SocketIo,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
