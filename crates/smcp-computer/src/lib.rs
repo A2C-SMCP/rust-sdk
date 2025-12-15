@@ -1,15 +1,23 @@
-pub struct SmcpComputer {
-    _private: (),
-}
+/*!
+* 文件名: lib.rs
+* 作者: JQQ
+* 创建日期: 2025/12/15
+* 最后修改日期: 2025/12/15
+* 版权: 2023 JQQ. All rights reserved.
+* 依赖: None
+* 描述: A2C-SMCP Computer模块的Rust实现 / Rust implementation of A2C-SMCP Computer module
+*/
 
-impl SmcpComputer {
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-}
+pub mod cli;
+pub mod core;
+pub mod errors;
+pub mod inputs;
+pub mod manager;
+pub mod mcp_clients;
+pub mod transport;
 
-impl Default for SmcpComputer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[cfg(test)]
+pub use errors::{ComputerError, ComputerResult};
+
+/// Computer模块的版本号 / Version of the Computer module
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
