@@ -61,8 +61,36 @@ impl TestServer {
                                 let svc = tower::service_fn(|req| {
                                     let layer = layer.clone();
                                     async move {
-                                        let svc = tower::service_fn(|_req| async move {
-                                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(hyper::body::Bytes::new())))
+                                        let svc = tower::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                                            // 处理HTTP请求
+                                            match (req.method(), req.uri().path()) {
+                                                (&hyper::Method::GET, "/") => {
+                                                    Ok::<_, std::convert::Infallible>(
+                                                        hyper::Response::builder()
+                                                            .status(hyper::StatusCode::OK)
+                                                            .body(Full::new(hyper::body::Bytes::from("SMCP Server is running")))
+                                                            .unwrap()
+                                                    )
+                                                }
+                                                (&hyper::Method::GET, "/health") => {
+                                                    Ok::<_, std::convert::Infallible>(
+                                                        hyper::Response::builder()
+                                                            .status(hyper::StatusCode::OK)
+                                                            .header("content-type", "application/json")
+                                                            .body(Full::new(hyper::body::Bytes::from("{\"status\":\"ok\"}")))
+                                                            .unwrap()
+                                                    )
+                                                }
+                                                _ => {
+                                                    // 默认返回404
+                                                    Ok::<_, std::convert::Infallible>(
+                                                        hyper::Response::builder()
+                                                            .status(hyper::StatusCode::NOT_FOUND)
+                                                            .body(Full::new(hyper::body::Bytes::from("Not found")))
+                                                            .unwrap()
+                                                    )
+                                                }
+                                            }
                                         });
                                         let mut svc = layer.layer.layer(svc);
                                         svc.call(req).await

@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
-use smcp::*;
+use smcp::{*, SMCP_NAMESPACE};
 use test_utils::*;
 
 #[tokio::test]
@@ -21,9 +21,9 @@ async fn test_list_room_success() {
     let server_url = server.url();
 
     // 创建多个客户端
-    let agent_client = create_test_client(&server_url, "smcp").await;
-    let computer1_client = create_test_client(&server_url, "smcp").await;
-    let computer2_client = create_test_client(&server_url, "smcp").await;
+    let agent_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    let computer1_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    let computer2_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
 
     // 所有客户端加入同一办公室
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
@@ -71,10 +71,10 @@ async fn test_list_room_success() {
         serde_json::to_string_pretty(&result).unwrap()
     );
 
-    // 响应格式: [{"Ok": {"req_id": "...", "sessions": [...]}}]
+    // 响应格式: [{"req_id": "...", "sessions": [...]}]
     let response_data = if let Some(arr) = result.as_array() {
         if let Some(first) = arr.first() {
-            first.get("Ok").unwrap_or(&serde_json::Value::Null)
+            first
         } else {
             &serde_json::Value::Null
         }
@@ -134,13 +134,18 @@ async fn test_list_room_empty_office() {
     let server_url = server.url();
 
     // 创建Agent客户端
-    let agent_client = create_test_client(&server_url, "smcp").await;
+    let agent_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    
+    // 等待namespace连接完全建立
+    println!("Waiting for namespace connection to establish...");
+    sleep(Duration::from_millis(500)).await;
 
     // Agent加入办公室
     join_office(&agent_client, Role::Agent, "office_empty", "agent1").await;
 
-    // 等待加入完成和session稳定
-    sleep(Duration::from_millis(1000)).await;
+    // 等待加入完成和session稳定，增加等待时间
+    println!("Waiting for session to stabilize...");
+    sleep(Duration::from_millis(2000)).await;
 
     // Agent列出房间会话
     let list_room_req = ListRoomReq {
@@ -180,19 +185,10 @@ async fn test_list_room_empty_office() {
         serde_json::to_string_pretty(&result).unwrap()
     );
 
-    // 响应格式: [{"Ok": {"req_id": "...", "sessions": [...]}}] 或 [{"Err": "..."}]
+    // 响应格式: [{"req_id": "...", "sessions": [...]}]
     let response_data = if let Some(arr) = result.as_array() {
         if let Some(first) = arr.first() {
-            if let Some(err) = first.get("Err").and_then(|e| e.as_str()) {
-                // 如果是session错误，跳过这个测试或者调整测试逻辑
-                if err.contains("Session not found") {
-                    println!("Session not found error, this might be a timing issue");
-                    // 暂时跳过验证，让测试通过
-                    return;
-                }
-                panic!("Expected successful response but got error: {}", err);
-            }
-            first.get("Ok").unwrap_or(&serde_json::Value::Null)
+            first
         } else {
             &serde_json::Value::Null
         }
@@ -438,10 +434,10 @@ async fn test_list_room_multiple_offices() {
             serde_json::to_string_pretty(&result).unwrap()
         );
 
-        // 响应格式: [{"Ok": {"req_id": "...", "sessions": [...]}}]
+        // 响应格式: [{"req_id": "...", "sessions": [...]}]
         let response_data = if let Some(arr) = result.as_array() {
             if let Some(first) = arr.first() {
-                first.get("Ok").unwrap_or(&serde_json::Value::Null)
+                first
             } else {
                 &serde_json::Value::Null
             }

@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tower::{Layer, Service};
 
-use smcp::events;
+use smcp::{events, SMCP_NAMESPACE};
 use smcp_server_core::{
     auth::{AuthError, AuthenticationProvider},
 };
@@ -389,8 +389,8 @@ async fn test_server_basic_http_endpoints() {
 async fn test_socketio_connection() {
     let server = TestServer::new().await;
 
-    // 创建客户端连接到 /smcp 命名空间
-    let _client = create_client(server.addr, "/smcp").await;
+    // 创建客户端连接到 SMCP_NAMESPACE 命名空间
+    let _client = create_client(server.addr, SMCP_NAMESPACE).await;
 
     // 如果没有 panic，说明连接成功
     // RawClient 不提供 is_connected 方法，但连接失败会抛出异常
@@ -410,7 +410,7 @@ async fn test_agent_computer_join_office() {
     let events_clone = events.clone();
     let agent_client = create_client_with_handlers(
         server.addr,
-        "/smcp",
+        SMCP_NAMESPACE,
         events::NOTIFY_ENTER_OFFICE, // 使用标准事件常量
         move |payload, _client| {
             println!("!!! Agent received notify_enter_office event!");
@@ -444,7 +444,7 @@ async fn test_agent_computer_join_office() {
     sleep(Duration::from_millis(500)).await;
 
     // Computer 加入同一办公室
-    let computer_client = create_managed_client(server.addr, "/smcp").await;
+    let computer_client = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
     let computer_join_data = json!({
@@ -485,13 +485,13 @@ async fn test_list_room_sessions() {
     let server = TestServer::new().await;
 
     // 创建多个客户端
-    let agent1 = create_managed_client(server.addr, "/smcp").await;
+    let agent1 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
-    let computer1 = create_managed_client(server.addr, "/smcp").await;
+    let computer1 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
-    let computer2 = create_managed_client(server.addr, "/smcp").await;
+    let computer2 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
 
@@ -501,7 +501,7 @@ async fn test_list_room_sessions() {
         "name": "agent-1",
         "office_id": "office-list-test"
     });
-    emit_event(&agent1, "server:join_office", join_data)
+    let _response = emit_event_with_ack_validation(&agent1, "server:join_office", join_data, true)
         .await
         .unwrap();
 
@@ -511,7 +511,7 @@ async fn test_list_room_sessions() {
         "name": "computer-1",
         "office_id": "office-list-test"
     });
-    emit_event(&computer1, "server:join_office", comp1_data)
+    let _response = emit_event_with_ack_validation(&computer1, "server:join_office", comp1_data, true)
         .await
         .unwrap();
 
@@ -520,7 +520,7 @@ async fn test_list_room_sessions() {
         "name": "computer-2",
         "office_id": "office-list-test"
     });
-    emit_event(&computer2, "server:join_office", comp2_data)
+    let _response = emit_event_with_ack_validation(&computer2, "server:join_office", comp2_data, true)
         .await
         .unwrap();
 
@@ -529,8 +529,9 @@ async fn test_list_room_sessions() {
 
     // 列出房间会话
     let list_data = json!({
-        "office_id": "office-list-test",
-        "req_id": "test-req-1"
+        "agent": "agent-1",
+        "req_id": "test-req-1",
+        "office_id": "office-list-test"
     });
 
     // 列出房间会话并验证响应
@@ -539,27 +540,24 @@ async fn test_list_room_sessions() {
         .unwrap();
     
     // 验证响应包含会话列表
+    // 响应应该是一个包含ListRoomRet的数组
     if let Some(response_array) = list_response.as_array() {
-        if let Some(first_response) = response_array.first() {
-            if let Some(ok_data) = first_response.get("Ok") {
-                if let Some(sessions) = ok_data.get("sessions").and_then(|s| s.as_array()) {
-                    // 验证包含2个computer和1个agent
-                    assert_eq!(sessions.len(), 3, "Should have 3 sessions in the room");
-                    
-                    let computer_count = sessions.iter()
-                        .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("computer"))
-                        .count();
-                    let agent_count = sessions.iter()
-                        .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("agent"))
-                        .count();
-                    
-                    assert_eq!(computer_count, 2, "Should have 2 computers");
-                    assert_eq!(agent_count, 1, "Should have 1 agent");
-                } else {
-                    panic!("Response should contain sessions array");
-                }
+        if let Some(list_room_ret) = response_array.first() {
+            if let Some(sessions) = list_room_ret.get("sessions").and_then(|s| s.as_array()) {
+                // 验证包含2个computer和1个agent
+                assert_eq!(sessions.len(), 3, "Should have 3 sessions in the room");
+                
+                let computer_count = sessions.iter()
+                    .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("computer"))
+                    .count();
+                let agent_count = sessions.iter()
+                    .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("agent"))
+                    .count();
+                
+                assert_eq!(computer_count, 2, "Should have 2 computers");
+                assert_eq!(agent_count, 1, "Should have 1 agent");
             } else {
-                panic!("Response should contain Ok data");
+                panic!("Response should contain sessions array");
             }
         } else {
             panic!("Response array should not be empty");
@@ -574,7 +572,7 @@ async fn test_computer_name_conflict() {
     let server = TestServer::new().await;
 
     // 第一个 Computer 加入
-    let computer1 = create_managed_client(server.addr, "/smcp").await;
+    let computer1 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
     let join_data1 = json!({
@@ -588,10 +586,16 @@ async fn test_computer_name_conflict() {
         .await
         .unwrap();
     // 验证响应包含会话信息
-    assert!(response1.get("Ok").is_some(), "First computer should join successfully");
+    println!("DEBUG: response1 = {:?}", response1);
+    // 响应应该是一个数组 [true, null]
+    assert!(response1.is_array(), "Response should be an array");
+    let response_array = response1.as_array().unwrap();
+    assert_eq!(response_array.len(), 2, "Response array should have 2 elements");
+    assert_eq!(response_array[0], true, "First element should be true");
+    assert_eq!(response_array[1], serde_json::Value::Null, "Second element should be null");
 
     // 第二个 Computer 尝试使用相同名称加入
-    let computer2 = create_managed_client(server.addr, "/smcp").await;
+    let computer2 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
     let join_data2 = json!({
@@ -605,10 +609,14 @@ async fn test_computer_name_conflict() {
         .await
         .unwrap();
     // 验证返回错误
-    assert!(response2.get("Err").is_some(), "Second computer should fail due to name conflict");
+    assert!(response2.is_array(), "Response should be an array");
+    let response2_array = response2.as_array().unwrap();
+    assert_eq!(response2_array.len(), 2, "Response array should have 2 elements");
+    assert_eq!(response2_array[0], false, "First element should be false");
+    assert!(response2_array[1].is_string(), "Second element should be an error message");
 
     // 不同名称应该可以加入
-    let computer3 = create_managed_client(server.addr, "/smcp").await;
+    let computer3 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
     let join_data3 = json!({
@@ -622,7 +630,11 @@ async fn test_computer_name_conflict() {
         .await
         .unwrap();
     // 验证返回成功
-    assert!(response3.get("Ok").is_some(), "Third computer should join successfully with different name");
+    assert!(response3.is_array(), "Response should be an array");
+    let response3_array = response3.as_array().unwrap();
+    assert_eq!(response3_array.len(), 2, "Response array should have 2 elements");
+    assert_eq!(response3_array[0], true, "First element should be true");
+    assert_eq!(response3_array[1], serde_json::Value::Null, "Second element should be null");
 }
 
 #[tokio::test]
@@ -636,7 +648,7 @@ async fn test_computer_leave_office_notification() {
     let events_clone = events.clone();
     let agent = create_client_with_handlers(
         server.addr,
-        "/smcp",
+        SMCP_NAMESPACE,
         events::NOTIFY_LEAVE_OFFICE, // 使用标准事件常量
         move |payload, _client| {
             let events = events_clone.clone();
@@ -664,7 +676,7 @@ async fn test_computer_leave_office_notification() {
         .unwrap();
 
     // Computer 加入办公室
-    let computer = create_managed_client(server.addr, "/smcp").await;
+    let computer = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
     let comp_join = json!({

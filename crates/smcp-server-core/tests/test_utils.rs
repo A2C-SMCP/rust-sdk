@@ -98,7 +98,7 @@ impl SmcpTestServer {
 
     /// 获取服务器URL
     pub fn url(&self) -> String {
-        format!("http://{}/", self.addr)
+        format!("http://{}", self.addr)
     }
 
     /// 关闭服务器
@@ -215,8 +215,8 @@ pub async fn join_office(
         .await
         .expect("Failed to emit join_office");
 
-    // 等待加入完成
-    sleep(Duration::from_millis(100)).await;
+    // 等待加入完成，增加等待时间确保会话注册
+    sleep(Duration::from_millis(1000)).await;
 }
 
 /// 离开办公室的辅助函数

@@ -591,7 +591,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(join_payload.to_string().contains("Ok"));
+    assert!(join_payload.to_string().contains("true") || join_payload.to_string().contains("[true, null]"));
 
     let (list_tx, list_rx) = oneshot::channel::<serde_json::Value>();
     client
@@ -696,7 +696,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(leave_payload.to_string().contains("Ok"));
+    assert!(leave_payload.to_string().contains("true") || leave_payload.to_string().contains("[true, null]"));
 
     client.disconnect().await.expect("Failed to disconnect");
     server.shutdown();

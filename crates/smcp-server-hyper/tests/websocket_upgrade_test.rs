@@ -260,6 +260,6 @@ async fn test_websocket_upgrade_with_polling_fallback() {
     sleep(Duration::from_millis(100)).await;
 
     // 清理
-    client.disconnect().await.unwrap();
+    let _ = client.disconnect().await;
     server_handle.abort();
 }

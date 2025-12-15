@@ -245,7 +245,7 @@ impl SmcpHandler {
         socket: SocketRef,
         data: EnterOfficeReq,
         state: ServerState,
-    ) -> Result<(bool, Option<String>), HandlerError> {
+    ) -> (bool, Option<String>) {
         info!("on_server_join_office called with data: {:?}", data);
         let sid = socket.id.to_string();
         let requested_role = ClientRole::from(data.role.clone());
@@ -256,14 +256,14 @@ impl SmcpHandler {
             Some(s) => {
                 // 检查角色/状态一致性
                 if s.role != requested_role {
-                    return Err(HandlerError::InvalidRequest(format!(
+                    return (false, Some(format!(
                         "Role mismatch: existing session has role {:?}, but requested {:?}",
                         s.role, requested_role
                     )));
                 }
 
                 if s.name != requested_name {
-                    return Err(HandlerError::InvalidRequest(format!(
+                    return (false, Some(format!(
                         "Name mismatch: existing session has name '{}', but requested '{}'",
                         s.name, requested_name
                     )));
@@ -275,20 +275,26 @@ impl SmcpHandler {
                 // 创建新会话
                 let new_session = SessionData::new(sid.clone(), requested_name, requested_role);
 
-                state
+                if let Err(e) = state
                     .session_manager
-                    .register_session(new_session.clone())?;
+                    .register_session(new_session.clone()) {
+                    return (false, Some(format!("Failed to register session: {}", e)));
+                }
                 new_session
             }
         };
 
         // 检查并加入房间
-        Self::handle_join_room(socket.clone(), &session, &data.office_id, &state).await?;
+        if let Err(e) = Self::handle_join_room(socket.clone(), &session, &data.office_id, &state).await {
+            return (false, Some(format!("Failed to join room: {}", e)));
+        }
 
         // 更新会话的办公室 ID（在成功加入房间后）
-        state
+        if let Err(e) = state
             .session_manager
-            .update_office_id(&sid, Some(data.office_id.clone()))?;
+            .update_office_id(&sid, Some(data.office_id.clone())) {
+            return (false, Some(format!("Failed to update office_id: {}", e)));
+        }
 
         // 构建通知数据
         let session_name = session.name.clone();
@@ -315,7 +321,7 @@ impl SmcpHandler {
             warn!("Failed to broadcast NOTIFY_ENTER_OFFICE: {}", e);
         }
 
-        Ok((true, None))
+        (true, None)
     }
 
     /// 处理离开办公室事件
@@ -323,14 +329,14 @@ impl SmcpHandler {
         socket: SocketRef,
         data: LeaveOfficeReq,
         state: ServerState,
-    ) -> Result<(bool, Option<String>), HandlerError> {
+    ) -> (bool, Option<String>) {
         let sid = socket.id.to_string();
 
         // 获取会话
-        let session = state
-            .session_manager
-            .get_session(&sid)
-            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+        let session = match state.session_manager.get_session(&sid) {
+            Some(s) => s,
+            None => return (false, Some(format!("Session not found: {}", sid))),
+        };
 
         // 构建离开通知
         let notification = if session.role == ClientRole::Computer {
@@ -354,10 +360,12 @@ impl SmcpHandler {
             .await;
 
         // 更新会话
-        state.session_manager.update_office_id(&sid, None)?;
+        if let Err(e) = state.session_manager.update_office_id(&sid, None) {
+            return (false, Some(format!("Failed to update office_id: {}", e)));
+        }
         socket.leave(data.office_id.clone());
 
-        Ok((true, None))
+        (true, None)
     }
 
     /// 处理工具调用取消事件
@@ -894,25 +902,38 @@ impl SmcpHandler {
         socket: SocketRef,
         data: ListRoomReq,
         state: ServerState,
-    ) -> Result<ListRoomRet, HandlerError> {
+    ) -> ListRoomRet {
         // 获取发起者会话信息
         let sid = socket.id.to_string();
-        let session = state
-            .session_manager
-            .get_session(&sid)
-            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+        let session = match state.session_manager.get_session(&sid) {
+            Some(s) => s,
+            None => {
+                warn!("List room from unknown session sid={}", sid);
+                return ListRoomRet {
+                    sessions: vec![],
+                    req_id: data.base.req_id,
+                };
+            }
+        };
 
         // 权限校验：只能查询自己所在的办公室
-        let session_office_id = session.office_id.ok_or_else(|| {
-            HandlerError::InvalidRequest(
-                "You must be in an office to list room members".to_string(),
-            )
-        })?;
+        let session_office_id = match session.office_id {
+            Some(id) => id,
+            None => {
+                warn!("Session {} not in any office", sid);
+                return ListRoomRet {
+                    sessions: vec![],
+                    req_id: data.base.req_id,
+                };
+            }
+        };
 
         if session_office_id != data.office_id {
-            return Err(HandlerError::InvalidRequest(
-                "You can only list members of your own office".to_string(),
-            ));
+            warn!("Session {} trying to list room {} but in office {}", sid, data.office_id, session_office_id);
+            return ListRoomRet {
+                sessions: vec![],
+                req_id: data.base.req_id,
+            };
         }
 
         // 获取指定办公室的所有会话
@@ -931,10 +952,10 @@ impl SmcpHandler {
             })
             .collect();
 
-        Ok(ListRoomRet {
+        ListRoomRet {
             sessions: session_infos,
             req_id: data.base.req_id,
-        })
+        }
     }
 
     /// 处理加入房间的逻辑
