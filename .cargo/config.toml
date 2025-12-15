@@ -1,0 +1,31 @@
+# Cargo 配置文件 / Cargo configuration file
+# 定义别名以简化常用命令 / Define aliases to simplify common commands
+
+[alias]
+# 测试相关别名 / Test aliases
+test = "test --workspace"
+test-all = "test --workspace --all-features"
+test-e2e = "test --workspace --features e2e -- --ignored"
+test-computer = "test -p smcp-computer"
+test-agent = "test -p smcp-agent"
+test-server = "test -p smcp-server-core"
+test-integration = "test -p smcp-computer --test mcp_clients_integration"
+test-e2e-playwright = "test -p smcp-computer --test playwright --features e2e"
+
+# 检查相关别名 / Check aliases
+check = "check --workspace"
+check-all = "check --workspace --all-features"
+
+# 构建相关别名 / Build aliases
+build = "build --workspace"
+build-all = "build --workspace --all-features"
+
+# 代码质量别名 / Code quality aliases
+fmt = "fmt --all"
+clippy = "clippy --workspace --all-targets --all-features -- -D warnings"
+clippy-loose = "clippy --workspace --all-targets --all-features"
+
+# 运行相关别名 / Run aliases
+run-server = "run -p smcp-server-hyper"
+run-agent = "run -p smcp-agent --bin agent"
+run-computer = "run -p smcp-computer --bin computer"

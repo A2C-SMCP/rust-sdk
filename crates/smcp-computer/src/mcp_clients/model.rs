@@ -384,10 +384,30 @@ pub struct Tool {
     /// 工具描述 / Tool description
     pub description: String,
     /// 输入模式 / Input schema
+    #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// 工具注解 / Tool annotations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
     /// 工具元数据 / Tool metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// 工具注解 / Tool annotations
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolAnnotations {
+    /// 标题 / Title
+    pub title: String,
+    /// 是否只读 / Read only hint
+    #[serde(rename = "readOnlyHint")]
+    pub read_only_hint: bool,
+    /// 是否破坏性 / Destructive hint
+    #[serde(rename = "destructiveHint")]
+    pub destructive_hint: bool,
+    /// 开放世界提示 / Open world hint
+    #[serde(rename = "openWorldHint")]
+    pub open_world_hint: bool,
 }
 
 /// 资源定义 / Resource definition
@@ -423,10 +443,13 @@ pub struct CallToolResult {
 #[serde(tag = "type")]
 pub enum Content {
     /// 文本内容 / Text content
+    #[serde(rename = "text")]
     Text { text: String },
     /// 图片内容 / Image content
+    #[serde(rename = "image")]
     Image { data: String, mime_type: String },
     /// 资源内容 / Resource content
+    #[serde(rename = "resource")]
     Resource { uri: String, mime_type: Option<String> },
 }
 

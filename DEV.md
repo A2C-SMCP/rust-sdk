@@ -75,7 +75,7 @@ cargo tree
 ## 运行测试
 
 ```bash
-# 运行所有测试
+# 运行所有测试（不包括E2E）
 cargo test --workspace
 
 # 运行特定 features 的测试
@@ -86,7 +86,31 @@ cargo test --test full_stack --features full
 
 # 运行单个 crate 的测试
 cargo test -p smcp-server-core
+
+# 运行 E2E 测试（需要 e2e feature）
+cargo test --features e2e -- --ignored
+
+# 运行所有测试包括 E2E
+cargo test --workspace --features e2e
+
+# 运行特定的 E2E 测试
+cargo test --features e2e test_playwright_mcp_server_basic_connection -- --ignored
 ```
+
+### E2E 测试说明
+
+E2E 测试用于验证与真实的 MCP 服务器的集成，目前包括：
+
+- **Playwright MCP Server 测试**：测试与 `npx @playwright/mcp@latest` 的集成
+- 使用 stdio 模式启动服务器
+- 测试包括基础连接、工具执行和错误处理
+
+运行 E2E 测试前确保：
+1. 已安装 Node.js 和 npm
+2. `npx` 命令可用
+3. 网络连接正常（用于下载 Playwright MCP 包）
+
+E2E 测试默认被忽略，需要使用 `--features e2e` 和 `-- --ignored` 参数运行。
 
 ## 代码覆盖率
 

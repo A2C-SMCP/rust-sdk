@@ -79,6 +79,25 @@ impl StdioMCPClient {
     }
 
     /// 发送JSON-RPC请求 / Send JSON-RPC request
+    /// 发送通知（不需要响应） / Send notification (no response expected)
+    async fn send_notification(&self, notification: &serde_json::Value) -> Result<(), MCPClientError> {
+        let mut child = self.child_process.lock().await;
+        if let Some(ref mut process) = *child {
+            if let Some(stdin) = process.stdin.as_mut() {
+                let notification_str = serde_json::to_string(notification)?;
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(notification_str.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.flush().await?;
+                
+                debug!("Sent notification: {}", notification_str);
+                info!("Sent notification to MCP server: {}", notification_str);
+                return Ok(());
+            }
+        }
+        Err(MCPClientError::ConnectionError("Process not available".to_string()))
+    }
+
     async fn send_request(&self, request: &serde_json::Value) -> Result<serde_json::Value, MCPClientError> {
         let mut child = self.child_process.lock().await;
         if let Some(ref mut process) = *child {
@@ -90,23 +109,33 @@ impl StdioMCPClient {
                 stdin.flush().await?;
                 
                 debug!("Sent request: {}", request_str);
+                info!("Sent request to MCP server: {}", request_str);
                 
                 // 读取响应 / Read response
                 if let Some(stdout) = process.stdout.as_mut() {
                     let mut reader = BufReader::new(stdout);
                     let mut line = String::new();
                     
+                    info!("Waiting for response from MCP server...");
+                    
                     // 添加超时以防止无限阻塞
                     return match tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(30),
                         reader.read_line(&mut line)
                     ).await {
                         Ok(Ok(0)) => {
+                            error!("Process closed stdout without response");
                             Err(MCPClientError::ConnectionError("Process closed stdout".to_string()))
                         }
                         Ok(Ok(_)) => {
+                            info!("Received raw response: {}", line.trim());
                             debug!("Received response: {}", line.trim());
-                            let response: serde_json::Value = serde_json::from_str(line.trim())?;
+                            let response: serde_json::Value = serde_json::from_str(line.trim())
+                                .map_err(|e| {
+                                    error!("Failed to parse JSON response: {}", e);
+                                    MCPClientError::ProtocolError(format!("Invalid JSON: {}", e))
+                                })?;
+                            info!("Parsed JSON response: {}", response);
                             Ok(response)
                         }
                         Ok(Err(e)) => {
@@ -161,7 +190,8 @@ impl StdioMCPClient {
             "method": "notifications/initialized"
         });
         
-        self.send_request(&initialized_notification).await?;
+        // 通知不需要响应 / Notifications don't need response
+        self.send_notification(&initialized_notification).await?;
         
         info!("Session initialized successfully");
         Ok(())
@@ -294,21 +324,31 @@ impl MCPClientProtocol for StdioMCPClient {
         });
         
         let response = self.send_request(&request).await?;
+        info!("Received list_tools response: {}", response);
         
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!("List tools error: {}", error)));
         }
         
         if let Some(result) = response.get("result") {
+            info!("Result field: {}", result);
             if let Some(tools) = result.get("tools").and_then(|v| v.as_array()) {
+                info!("Found {} tools", tools.len());
                 let mut tool_list = Vec::new();
-                for tool in tools {
+                for (i, tool) in tools.iter().enumerate() {
+                    info!("Tool {}: {}", i, tool);
                     if let Ok(parsed_tool) = serde_json::from_value::<Tool>(tool.clone()) {
                         tool_list.push(parsed_tool);
+                    } else {
+                        warn!("Failed to parse tool {}: {}", i, tool);
                     }
                 }
                 return Ok(tool_list);
+            } else {
+                warn!("No tools array found in result");
             }
+        } else {
+            warn!("No result field found in response");
         }
         
         Ok(vec![])
