@@ -2,6 +2,8 @@
 //!
 //! 测试真实的 HTTP/WebSocket 连接和 SMCP 协议交互
 
+mod test_server;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,24 +12,23 @@ use futures::FutureExt;
 use http::HeaderMap;
 use http_body_util::Full;
 use hyper::body::Bytes;
-use hyper::service::service_fn;
 use hyper::Request;
-use hyper_util::rt::TokioIo;
 use rust_socketio::{
     asynchronous::{Client, ClientBuilder},
-    Payload,
+    Payload, TransportType,
 };
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tower::ServiceBuilder;
+use tower::{Layer, Service};
 
 use smcp::events;
 use smcp_server_core::{
     auth::{AuthError, AuthenticationProvider},
-    SmcpServerBuilder,
 };
-use smcp_server_hyper::{handle_request, HyperServerBuilder};
+
+// 导入测试工具函数
+// ack_to_sender 函数定义在下面，因为无法从其他测试模块导入
 
 /// No-op authentication provider for tests
 #[derive(Debug)]
@@ -44,13 +45,11 @@ impl AuthenticationProvider for NoAuthProvider {
     }
 }
 
-/// 测试服务器配置
-struct TestServer {
-    addr: SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-}
+/// 测试服务器配置 - 使用 test_server 模块
+use test_server::TestServer;
 
+// 旧的 TestServer 实现 - 已被 test_server 模块替代
+/*
 impl TestServer {
     async fn new() -> Self {
         // 使用 tokio 直接绑定动态端口
@@ -60,9 +59,12 @@ impl TestServer {
         let addr = listener.local_addr().expect("Failed to get local address");
         println!("Test server will start on port: {}", addr.port());
 
-        // 构建服务器层（使用无认证的提供者）
+        // 构建服务器层（使用与 smcp-server-core 相同的认证提供者）
         let layer = SmcpServerBuilder::new()
-            .with_auth_provider(Arc::new(NoAuthProvider))
+            .with_auth_provider(Arc::new(DefaultAuthenticationProvider::new(
+                Some("test_secret".to_string()),
+                None,
+            )))
             .build_layer()
             .expect("Failed to build SMCP layer");
 
@@ -79,28 +81,8 @@ impl TestServer {
         let handle = tokio::spawn(async move {
             eprintln!("About to start server on {}", addr);
 
-            // 构建服务栈 - 恢复 Socket.IO layer
+            // 构建服务栈 - 使用与 SmcpTestServer 相同的模式
             let layer = server.layer.expect("SMCP layer not configured");
-            let service = ServiceBuilder::new()
-                .layer(layer.layer) // 恢复 Socket.IO layer
-                .service(service_fn(move |req: Request<hyper::body::Incoming>| {
-                    let io = layer.io.clone();
-                    async move {
-                        eprintln!("Handling request: {} {}", req.method(), req.uri());
-
-                        // 使用原始的 handle_request
-                        match handle_request(req, &io).await {
-                            Ok(resp) => {
-                                eprintln!("Request handled successfully");
-                                Ok(resp)
-                            }
-                            Err(e) => {
-                                eprintln!("Error handling request: {:?}", e);
-                                Err(e)
-                            }
-                        }
-                    }
-                }));
 
             // 使用已绑定的 listener 接受连接
             loop {
@@ -109,12 +91,26 @@ impl TestServer {
                         let (stream, remote_addr) = listener.accept().await?;
                         eprintln!("New connection from: {}", remote_addr);
 
-                        let service = service.clone();
+                        let layer = layer.clone();
                         tokio::spawn(async move {
                             let io = TokioIo::new(stream);
                             eprintln!("Starting to serve connection from {}", remote_addr);
+                            
+                            let svc = tower::service_fn(|req| {
+                                let layer = layer.clone();
+                                async move {
+                                    let svc = tower::service_fn(|_req| async move {
+                                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(hyper::body::Bytes::new())))
+                                    });
+                                    let mut svc = layer.layer.layer(svc);
+                                    svc.call(req).await
+                                }
+                            });
+
+                            let svc = hyper_util::service::TowerToHyperService::new(svc);
                             match hyper::server::conn::http1::Builder::new()
-                                .serve_connection(io, service)
+                                .serve_connection(io, svc)
+                                .with_upgrades()
                                 .await
                             {
                                 Ok(_) => {
@@ -199,22 +195,16 @@ impl TestServer {
         }
     }
 }
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        self.handle.abort();
-    }
-}
+*/
 
 /// 创建 Socket.IO 客户端连接
 async fn create_client(addr: SocketAddr, namespace: &str) -> Client {
     let url = format!("http://localhost:{}", addr.port());
 
     ClientBuilder::new(url)
+        .transport_type(TransportType::Websocket)
         .namespace(namespace)
+        .opening_header("x-api-key", "test_secret")
         .connect()
         .await
         .expect("Failed to connect client")
@@ -244,12 +234,71 @@ async fn emit_event(
     client
         .emit_with_ack(
             event,
-            Payload::Text(vec![data]),
+            Payload::Text(vec![data], None),
             Duration::from_secs(5),
             callback,
         )
         .await?;
     Ok(())
+}
+
+/// Helper function to emit event and validate ack response
+async fn emit_event_with_ack_validation(
+    client: &Client,
+    event: &str,
+    data: Value,
+    expect_success: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    client
+        .emit_with_ack(
+            event,
+            Payload::Text(vec![data], None),
+            Duration::from_secs(5),
+            ack_to_sender(tx, |p| match p {
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            }),
+        )
+        .await?;
+    
+    let response = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await?
+        .map_err(|e| format!("Failed to receive ack: {:?}", e))?;
+    
+    if expect_success {
+        // For successful join, we expect a response with session info
+        Ok(response)
+    } else {
+        // For failed join, we expect an error response
+        Ok(response)
+    }
+}
+
+/// 创建ACK回调函数
+pub fn ack_to_sender<T: Send + 'static>(
+    sender: tokio::sync::oneshot::Sender<T>,
+    f: impl Fn(Payload) -> T + Send + Sync + 'static,
+) -> impl FnMut(
+    Payload,
+    rust_socketio::asynchronous::Client,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+       + Send
+       + Sync {
+    let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
+    let f = Arc::new(f);
+    move |payload: Payload, _client| {
+        let sender = sender.clone();
+        let f = f.clone();
+        async move {
+            let result = f(payload);
+            if let Some(sender) = sender.lock().await.take() {
+                let _ = sender.send(result);
+            }
+        }
+        .boxed()
+    }
 }
 
 /// Create a client with event handlers
@@ -270,7 +319,9 @@ where
     // rust_socketio与socketioxide在namespace连接时可能不会触发connect事件
     // 直接连接并等待一小段时间确保连接建立
     let client = ClientBuilder::new(url)
+        .transport_type(TransportType::Websocket)
         .namespace(namespace)
+        .opening_header("x-api-key", "test_secret")
         .on(event, handler)
         .connect()
         .await
@@ -329,7 +380,7 @@ async fn test_server_basic_http_endpoints() {
         .expect("Failed to read response")
         .to_bytes();
     let health_json: Value =
-        serde_json::from_str(&String::from_utf8(health_body.to_vec()).unwrap())
+        serde_json::from_str(core::str::from_utf8(&health_body).unwrap())
             .expect("Failed to parse JSON");
     assert_eq!(health_json["status"], "ok");
 }
@@ -365,7 +416,7 @@ async fn test_agent_computer_join_office() {
             println!("!!! Agent received notify_enter_office event!");
             let events = events_clone.clone();
             Box::pin(async move {
-                if let Payload::Text(data) = payload {
+                if let Payload::Text(data, _) = payload {
                     if let Some(first) = data.first() {
                         events.lock().await.push(first.to_string());
                     }
@@ -394,6 +445,8 @@ async fn test_agent_computer_join_office() {
 
     // Computer 加入同一办公室
     let computer_client = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
     let computer_join_data = json!({
         "role": "computer",
         "name": "test-computer",
@@ -433,8 +486,14 @@ async fn test_list_room_sessions() {
 
     // 创建多个客户端
     let agent1 = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
     let computer1 = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
     let computer2 = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
 
     // Agent 加入办公室
     let join_data = json!({
@@ -474,12 +533,40 @@ async fn test_list_room_sessions() {
         "req_id": "test-req-1"
     });
 
-    emit_event(&agent1, "server:list_room", list_data)
+    // 列出房间会话并验证响应
+    let list_response = emit_event_with_ack_validation(&agent1, "server:list_room", list_data, true)
         .await
         .unwrap();
-
-    // 简化测试：只验证事件发送成功，不验证返回数据
-    // TODO: 添加 ack 响应验证后可以检查会话列表
+    
+    // 验证响应包含会话列表
+    if let Some(response_array) = list_response.as_array() {
+        if let Some(first_response) = response_array.first() {
+            if let Some(ok_data) = first_response.get("Ok") {
+                if let Some(sessions) = ok_data.get("sessions").and_then(|s| s.as_array()) {
+                    // 验证包含2个computer和1个agent
+                    assert_eq!(sessions.len(), 3, "Should have 3 sessions in the room");
+                    
+                    let computer_count = sessions.iter()
+                        .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("computer"))
+                        .count();
+                    let agent_count = sessions.iter()
+                        .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("agent"))
+                        .count();
+                    
+                    assert_eq!(computer_count, 2, "Should have 2 computers");
+                    assert_eq!(agent_count, 1, "Should have 1 agent");
+                } else {
+                    panic!("Response should contain sessions array");
+                }
+            } else {
+                panic!("Response should contain Ok data");
+            }
+        } else {
+            panic!("Response array should not be empty");
+        }
+    } else {
+        panic!("Response should be an array");
+    }
 }
 
 #[tokio::test]
@@ -488,42 +575,54 @@ async fn test_computer_name_conflict() {
 
     // 第一个 Computer 加入
     let computer1 = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
     let join_data1 = json!({
         "role": "computer",
         "name": "same-name",
         "office_id": "office-conflict-test"
     });
 
-    emit_event(&computer1, "server:join_office", join_data1)
+    // 第一个 Computer 应该成功加入
+    let response1 = emit_event_with_ack_validation(&computer1, "server:join_office", join_data1, true)
         .await
         .unwrap();
-    // TODO: 添加 ack 验证后检查返回值
+    // 验证响应包含会话信息
+    assert!(response1.get("Ok").is_some(), "First computer should join successfully");
 
     // 第二个 Computer 尝试使用相同名称加入
     let computer2 = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
     let join_data2 = json!({
         "role": "computer",
         "name": "same-name",
         "office_id": "office-conflict-test"
     });
 
-    emit_event(&computer2, "server:join_office", join_data2)
+    // 第二个 Computer 应该因为名称冲突而失败
+    let response2 = emit_event_with_ack_validation(&computer2, "server:join_office", join_data2, false)
         .await
         .unwrap();
-    // TODO: 添加 ack 验证后检查返回值是否为 false
+    // 验证返回错误
+    assert!(response2.get("Err").is_some(), "Second computer should fail due to name conflict");
 
     // 不同名称应该可以加入
     let computer3 = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
     let join_data3 = json!({
         "role": "computer",
         "name": "different-name",
         "office_id": "office-conflict-test"
     });
 
-    emit_event(&computer3, "server:join_office", join_data3)
+    // 不同名称应该可以成功加入
+    let response3 = emit_event_with_ack_validation(&computer3, "server:join_office", join_data3, true)
         .await
         .unwrap();
-    // TODO: 添加 ack 验证后检查返回值是否为 true
+    // 验证返回成功
+    assert!(response3.get("Ok").is_some(), "Third computer should join successfully with different name");
 }
 
 #[tokio::test]
@@ -542,7 +641,7 @@ async fn test_computer_leave_office_notification() {
         move |payload, _client| {
             let events = events_clone.clone();
             Box::pin(async move {
-                if let Payload::Text(data) = payload {
+                if let Payload::Text(data, _) = payload {
                     if let Some(first) = data.first() {
                         if let Ok(json) = serde_json::from_str::<Value>(&first.to_string()) {
                             events.lock().await.push(json);
@@ -566,6 +665,8 @@ async fn test_computer_leave_office_notification() {
 
     // Computer 加入办公室
     let computer = create_managed_client(server.addr, "/smcp").await;
+    // 等待连接建立
+    sleep(Duration::from_millis(100)).await;
     let comp_join = json!({
         "role": "computer",
         "name": "computer-leave",

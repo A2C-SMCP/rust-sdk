@@ -27,7 +27,7 @@ fn ack_to_sender<T: Send + 'static>(
         let f = f.clone();
         Box::pin(async move {
             let result = f(payload);
-            if let Some(mut sender) = sender.lock().await.take() {
+            if let Some(sender) = sender.lock().await.take() {
                 let _ = sender.send(result);
             }
         })
@@ -97,7 +97,7 @@ async fn test_websocket_upgrade() {
             join_req,
             timeout,
             ack_to_sender(tx, |payload| match payload {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -184,7 +184,7 @@ async fn test_websocket_upgrade_with_invalid_role() {
             join_req,
             timeout,
             ack_to_sender(tx, |payload| match payload {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )

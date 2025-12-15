@@ -117,12 +117,81 @@ cargo llvm-cov --workspace --lcov --output-path lcov.info
 ### 常用覆盖率组合命令
 
 ```bash
-# 一键运行测试并查看覆盖率摘要
-cargo llvm-cov --workspace --summary
-
 # 运行测试并打开 HTML 报告（macOS）
 cargo llvm-cov --workspace --html && open target/llvm-cov/html/index.html
 
 # 查看特定文件的覆盖率详情
 cargo llvm-cov --workspace --show-missing-lines --file src/lib.rs
+```
+
+## vendor/rust-socketio 修改说明 / Vendor rust-socketio Modifications
+
+### 主要修改 / Key Modifications
+
+本仓库使用的是修改版的 `rust-socketio`，主要增强并发 ACK 支持：
+
+1. **并发 ACK 支持 / Concurrent ACK Support**
+   - `Payload` 枚举变体新增可选 `ack_id` 字段
+   - `Payload::Text`、`Payload::Binary`、`Payload::String` 现在都支持 `ack_id`
+   - 新增 `ack_with_id()` 方法用于显式指定 ack_id
+   - 新增 `with_ack_id()`、`ack_id()`、`set_ack_id()` 辅助方法
+
+2. **测试增强 / Test Enhancements**
+   - 添加 `test_concurrent_ack.rs` 和 `test_async_concurrent_ack.rs`
+   - 验证并发 ACK 功能的正确性
+
+### 测试执行与覆盖 / Testing Execution & Coverage
+
+#### 运行 rust-socketio 测试
+
+```bash
+# 进入 vendor 目录
+cd vendor/rust-socketio
+
+# 运行所有测试
+cargo test
+
+# 运行特定模块测试
+cargo test test_concurrent_ack
+cargo test test_async_concurrent_ack
+
+# 运行带输出信息的测试
+cargo test -- --nocapture
+
+# 运行单个测试文件
+cargo test --lib test_concurrent_ack
+```
+
+#### 生成覆盖率报告
+
+```bash
+# 在 vendor/rust-socketio 目录下
+
+# 安装覆盖率工具（如果未安装）
+cargo install cargo-llvm-cov
+
+# 生成覆盖率报告
+cargo llvm-cov --html
+
+# 查看未覆盖的行
+cargo llvm-cov --show-missing-lines
+
+# 只对 socketio crate 生成覆盖率
+cargo llvm-cov -p socketio --show-missing-lines
+
+# 生成 LCOV 格式报告
+cargo llvm-cov --lcov --output-path lcov.info
+```
+
+#### 测试覆盖率最佳实践
+
+```bash
+# 一键运行测试并生成 HTML 报告
+cargo llvm-cov --workspace --html && open target/llvm-cov/html/index.html
+
+# 只运行修改相关测试并查看覆盖率
+cargo llvm-cov --files src/payload.rs src/client/client.rs
+
+# 持续监控覆盖率变化
+cargo llvm-cov --summary --output-file coverage.txt
 ```

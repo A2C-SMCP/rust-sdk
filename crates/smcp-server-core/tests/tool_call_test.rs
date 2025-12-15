@@ -88,7 +88,7 @@ async fn test_tool_call_roundtrip() {
             json!(tool_call_req),
             Duration::from_secs(1), // 使用短超时
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -181,7 +181,7 @@ async fn test_tool_call_computer_not_found() {
             json!(tool_call_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -257,7 +257,7 @@ async fn test_tool_call_cross_office_permission_denied() {
             json!(tool_call_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -347,7 +347,7 @@ async fn test_tool_call_timeout_handling() {
             json!(tool_call_req),
             Duration::from_secs(2), // 发送超时2秒
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )

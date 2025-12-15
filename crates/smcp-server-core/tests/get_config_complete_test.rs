@@ -142,7 +142,7 @@ async fn test_get_config_complete_flow() {
                 computer_received.store(true, Ordering::SeqCst);
 
                 // 解析请求
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(req) =
                         serde_json::from_value::<GetComputerConfigReq>(values[0].clone())
                     {
@@ -228,7 +228,7 @@ async fn test_get_config_complete_flow() {
             json!(get_config_req),
             Duration::from_secs(2),
             ack_to_sender(config_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -305,7 +305,7 @@ async fn test_get_config_computer_not_found() {
             json!(get_config_req),
             Duration::from_secs(2),
             ack_to_sender(config_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )

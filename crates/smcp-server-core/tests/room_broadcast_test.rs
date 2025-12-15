@@ -120,7 +120,7 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
         .on("notify:leave_office", move |payload: Payload, _client| {
             let leave_received = leave_received_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(text) = serde_json::to_string(&values[0]) {
                         if text.contains("computer1") && text.contains("office1") {
                             leave_received.store(true, Ordering::SeqCst);
@@ -133,7 +133,7 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
         .on("notify:enter_office", move |payload: Payload, _client| {
             let enter_received = enter_received_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(text) = serde_json::to_string(&values[0]) {
                         if text.contains("computer1") && text.contains("office2") {
                             enter_received.store(true, Ordering::SeqCst);
@@ -236,7 +236,7 @@ async fn test_join_office_broadcasts_only_to_room() {
         .on("notify:enter_office", move |payload: Payload, _client| {
             let office1_received = office1_received_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(text) = serde_json::to_string(&values[0]) {
                         if text.contains("computer1") && text.contains("office1") {
                             office1_received.store(true, Ordering::SeqCst);
@@ -260,7 +260,7 @@ async fn test_join_office_broadcasts_only_to_room() {
         .on("notify:enter_office", move |payload: Payload, _client| {
             let office2_received = office2_received_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(text) = serde_json::to_string(&values[0]) {
                         if text.contains("computer1") {
                             office2_received.store(true, Ordering::SeqCst);
@@ -284,7 +284,7 @@ async fn test_join_office_broadcasts_only_to_room() {
         .on("notify:enter_office", move |payload: Payload, _client| {
             let global_received = global_received_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(text) = serde_json::to_string(&values[0]) {
                         if text.contains("computer1") {
                             global_received.store(true, Ordering::SeqCst);

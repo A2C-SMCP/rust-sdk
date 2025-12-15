@@ -190,7 +190,7 @@ pub fn create_atomic_handler(
     move |payload: Payload, _client| {
         let flag = flag.clone();
         Box::pin(async move {
-            if let Payload::Text(_) = payload {
+            if let Payload::Text(_, _) = payload {
                 flag.store(true, Ordering::SeqCst);
             }
         })

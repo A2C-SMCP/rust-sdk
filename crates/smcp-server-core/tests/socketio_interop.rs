@@ -318,7 +318,7 @@ async fn test_update_notifications_and_role_checks() {
             }),
             Duration::from_secs(2),
             ack_to_sender(computer_join_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -379,7 +379,7 @@ async fn test_update_notifications_and_role_checks() {
             }),
             Duration::from_secs(2),
             ack_to_sender(agent_join_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -579,7 +579,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             }),
             Duration::from_secs(2),
             ack_to_sender(join_tx, |p| match p {
-                Payload::Text(mut values) => {
+                Payload::Text(mut values, _) => {
                     values.pop().unwrap_or_else(|| serde_json::Value::Null)
                 }
                 _ => serde_json::Value::Null,
@@ -604,7 +604,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             }),
             Duration::from_secs(2),
             ack_to_sender(list_tx, |p| match p {
-                Payload::Text(mut values) => match values.pop() {
+                Payload::Text(mut values, _) => match values.pop() {
                     Some(serde_json::Value::String(s)) => {
                         serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
                     }
@@ -656,7 +656,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             }),
             Duration::from_secs(2),
             ack_to_sender(get_tools_tx, |p| match p {
-                Payload::Text(mut values) => match values.pop() {
+                Payload::Text(mut values, _) => match values.pop() {
                     Some(v) => v,
                     None => serde_json::Value::Null,
                 },
@@ -684,7 +684,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             serde_json::json!({ "office_id": "office1" }),
             Duration::from_secs(2),
             ack_to_sender(leave_tx, |p| match p {
-                Payload::Text(mut values) => {
+                Payload::Text(mut values, _) => {
                     values.pop().unwrap_or_else(|| serde_json::Value::Null)
                 }
                 _ => serde_json::Value::Null,

@@ -38,7 +38,7 @@ async fn test_update_config_broadcast() {
         .on("notify:update_config", move |payload: Payload, _client| {
             let agent_received = agent_received_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(notification) =
                         serde_json::from_value::<UpdateMCPConfigNotification>(values[0].clone())
                     {
@@ -110,7 +110,7 @@ async fn test_update_config_broadcast_only_to_same_office() {
         .on("notify:update_config", move |payload: Payload, _client| {
             let office1_received = office1_received_clone.clone();
             async move {
-                if let Payload::Text(_) = payload {
+                if let Payload::Text(_, ..) = payload {
                     office1_received.store(true, Ordering::SeqCst);
                 }
             }
@@ -130,7 +130,7 @@ async fn test_update_config_broadcast_only_to_same_office() {
         .on("notify:update_config", move |payload: Payload, _client| {
             let office2_received = office2_received_clone.clone();
             async move {
-                if let Payload::Text(_) = payload {
+                if let Payload::Text(_, ..) = payload {
                     office2_received.store(true, Ordering::SeqCst);
                 }
             }
@@ -234,7 +234,7 @@ async fn test_update_config_multiple_computers() {
         .on("notify:update_config", move |payload: Payload, _client| {
             let notification_count = notification_count_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(_notification) =
                         serde_json::from_value::<UpdateMCPConfigNotification>(values[0].clone())
                     {
@@ -333,7 +333,7 @@ async fn test_update_config_notification_content() {
         .on("notify:update_config", move |payload: Payload, _client| {
             let received_notification = received_notification_clone.clone();
             async move {
-                if let Payload::Text(values) = payload {
+                if let Payload::Text(values, _) = payload {
                     if let Ok(notification) =
                         serde_json::from_value::<UpdateMCPConfigNotification>(values[0].clone())
                     {

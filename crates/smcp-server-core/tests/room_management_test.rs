@@ -52,7 +52,7 @@ async fn test_list_room_success() {
             json!(list_room_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -161,7 +161,7 @@ async fn test_list_room_empty_office() {
             json!(list_room_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -324,7 +324,7 @@ async fn test_list_room_cross_office_access_denied() {
             json!(list_room_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -419,7 +419,7 @@ async fn test_list_room_multiple_offices() {
                 json!(req),
                 Duration::from_secs(5),
                 ack_to_sender(result_tx, |p| match p {
-                    Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                    Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                     _ => serde_json::Value::Null,
                 }),
             )
@@ -517,7 +517,7 @@ async fn test_computer_duplicate_name_rejected() {
             json!(join_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -586,7 +586,7 @@ async fn test_computer_different_name_allowed() {
             json!(join_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -652,7 +652,7 @@ async fn test_computer_switch_room_with_same_name_allowed() {
             json!(join_req),
             Duration::from_secs(5),
             ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values) => values.pop().unwrap_or(serde_json::Value::Null),
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
