@@ -1,0 +1,3 @@
+[submodule "vendor/rust-socketio"]
+	path = vendor/rust-socketio
+	url = git@github.com:A2C-SMCP/rust-socketio.git

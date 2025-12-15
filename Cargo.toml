@@ -8,6 +8,9 @@ members = [
   "crates/smcp-server-hyper",
 ]
 
+[patch.crates-io]
+rust_socketio = { path = "vendor/rust-socketio/socketio" }
+
 [workspace.package]
 edition = "2021"
 license = "MIT"
