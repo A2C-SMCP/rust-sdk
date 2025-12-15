@@ -7,7 +7,6 @@
 * 依赖: rmcp, tokio, serde_json
 * 描述: 测试用的STDIO MCP服务器二进制 / Test STDIO MCP server binary
 */
-
 use rmcp::{
     ErrorData as McpError,
     handler::server::{
@@ -38,6 +37,12 @@ impl CalculatorServer {
             state: Arc::new(RwLock::new(0.0)),
             tool_router: Self::tool_router(),
         }
+    }
+}
+
+impl Default for CalculatorServer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -87,29 +92,25 @@ impl CalculatorServer {
 }
 
 impl ServerHandler for CalculatorServer {
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        async move {
-            Ok(ListToolsResult {
-                meta: None,
-                tools: self.tool_router.list_all(),
-                next_cursor: None,
-            })
-        }
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            meta: None,
+            tools: self.tool_router.list_all(),
+            next_cursor: None,
+        })
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParam,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
-        async move {
-            let tool_context = ToolCallContext::new(self, request, context);
-            self.tool_router.call(tool_context).await
-        }
+    ) -> Result<CallToolResult, McpError> {
+        let tool_context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tool_context).await
     }
 
     fn get_info(&self) -> rmcp::model::ServerInfo {

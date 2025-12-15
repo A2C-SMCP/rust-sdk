@@ -11,6 +11,7 @@ test-agent = "test -p smcp-agent"
 test-server = "test -p smcp-server-core"
 test-integration = "test -p smcp-computer --test mcp_clients_integration"
 test-e2e-playwright = "test -p smcp-computer --test playwright --features e2e"
+test-all-cov = "llvm-cov --workspace --all-features --no-fail-fast --text --summary-only"
 
 # 检查相关别名 / Check aliases
 check = "check --workspace"
@@ -22,7 +23,7 @@ build-all = "build --workspace --all-features"
 
 # 代码质量别名 / Code quality aliases
 fmt = "fmt --all"
-clippy = "clippy --workspace --all-targets --all-features -- -D warnings"
+clippy-workspace = "clippy --workspace --all-targets --all-features -- -D warnings"
 clippy-loose = "clippy --workspace --all-targets --all-features"
 
 # 运行相关别名 / Run aliases

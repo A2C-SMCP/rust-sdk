@@ -237,7 +237,7 @@ pub async fn join_office(
     
     // 验证加入成功
     let success = if let Some(arr) = result.as_array() {
-        arr.get(0).and_then(|v| v.as_bool()).unwrap_or(false)
+        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
     } else {
         false
     };

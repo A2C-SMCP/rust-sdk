@@ -12,7 +12,6 @@ use rust_socketio::asynchronous::ClientBuilder;
 use rust_socketio::Payload;
 use rust_socketio::TransportType;
 use serde_json::json;
-use socketioxide::extract::AckSender;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 

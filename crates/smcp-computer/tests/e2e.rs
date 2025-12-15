@@ -7,6 +7,5 @@
 * 依赖: tokio, smcp-computer
 * 描述: E2E测试入口文件 / E2E test entry file
 */
-
 // Include the playwright test module as a path
 mod playwright;

@@ -562,7 +562,7 @@ async fn test_computer_duplicate_name_rejected() {
     // 验证加入失败
     // 服务端返回 (bool, Option<String>) 元组，序列化为 [false, "error"] 格式
     let success = if let Some(arr) = result.as_array() {
-        arr.get(0).and_then(|v| v.as_bool()).unwrap_or(false)
+        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
     } else {
         false
     };
@@ -644,7 +644,7 @@ async fn test_computer_different_name_allowed() {
     // 验证加入成功
     // 服务端返回 (bool, Option<String>) 元组，序列化为 [true, null] 格式
     let success = if let Some(arr) = result.as_array() {
-        arr.get(0).and_then(|v| v.as_bool()).unwrap_or(false)
+        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
     } else {
         false
     };
@@ -722,7 +722,7 @@ async fn test_computer_switch_room_with_same_name_allowed() {
     // 验证切换成功
     // 服务端返回 (bool, Option<String>) 元组，序列化为 [true, null] 格式
     let success = if let Some(arr) = result.as_array() {
-        arr.get(0).and_then(|v| v.as_bool()).unwrap_or(false)
+        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
     } else {
         false
     };
