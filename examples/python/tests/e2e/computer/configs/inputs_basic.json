@@ -1,0 +1,9 @@
+[
+  {
+    "id": "SCRIPT",
+    "type": "promptString",
+    "description": "Path to direct execution server script",
+    "default": "tests/integration_tests/computer/mcp_servers/direct_execution.py",
+    "password": false
+  }
+]

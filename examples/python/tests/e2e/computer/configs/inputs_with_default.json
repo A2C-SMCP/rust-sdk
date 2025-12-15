@@ -1,0 +1,23 @@
+[
+  {
+    "id": "CLAUDE_CWD",
+    "type": "promptString",
+    "description": "Claude MCP server working directory",
+    "default": "/Users/huruize/PycharmProjects/TfrobotSceneTests",
+    "password": false
+  },
+  {
+    "id": "FEISHU_APP_ID",
+    "type": "promptString",
+    "description": "Feishu MCP App ID",
+    "default": "cli_a86666c7f478500e",
+    "password": false
+  },
+  {
+    "id": "FEISHU_APP_SECRET",
+    "type": "promptString",
+    "description": "Feishu MCP App Secret",
+    "default": "nxlKxbeKGcPGe1kNDa11EboJwUkYxFn6",
+    "password": true
+  }
+]

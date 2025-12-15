@@ -1,0 +1,17 @@
+{
+  "name": "e2e-test",
+  "type": "stdio",
+  "disabled": false,
+  "forbidden_tools": [],
+  "tool_meta": {},
+  "server_parameters": {
+    "command": "python",
+    "args": [
+      "tests/integration_tests/computer/mcp_servers/direct_execution.py"
+    ],
+    "env": null,
+    "cwd": null,
+    "encoding": "utf-8",
+    "encoding_error_handler": "strict"
+  }
+}

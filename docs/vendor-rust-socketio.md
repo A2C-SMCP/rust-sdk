@@ -17,8 +17,9 @@ description: 在 rust-sdk 中通过 git submodule + [patch.crates-io] vendor rus
 
 # 前置准备
 
-- 你们已经在组织内 fork 了上游仓库（例如 `1c3t3a/rust-socketio`），并将所需补丁合入 fork（比如 cherry-pick PR #493 的提交）。
-- 你们 fork 的仓库根目录应当是一个 Cargo crate（包含 `Cargo.toml`），crate 名称仍然为 `rust_socketio`。
+- 已经在组织内 fork 了上游仓库（例如 `1c3t3a/rust-socketio`），并将所需补丁合入 fork（比如 cherry-pick PR #493 的提交）。
+- fork 的仓库根目录应当是一个 Cargo crate（包含 `Cargo.toml`），crate 名称仍然为 `rust_socketio`。
+- Fork的子仓库的git地址为：git@github.com:A2C-SMCP/rust-socketio.git
 
 # 一、引入 git submodule
 
@@ -32,14 +33,14 @@ description: 在 rust-sdk 中通过 git submodule + [patch.crates-io] vendor rus
 
 ## 2. 添加 submodule
 
-将你们 fork 的 `rust-socketio` 作为 submodule 添加到：
+将 fork 的 `rust-socketio` 作为 submodule 添加到：
 
 - `vendor/rust-socketio`
 
 示例命令（请将 URL 换成你们自己的）：
 
 ```bash
-git submodule add <YOUR_FORK_GIT_URL> vendor/rust-socketio
+git submodule add git@github.com:A2C-SMCP/rust-socketio.git vendor/rust-socketio
 ```
 
 建议：

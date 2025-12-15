@@ -1,0 +1,17 @@
+{
+  "name": "e2e-inputs-test",
+  "type": "stdio",
+  "disabled": false,
+  "forbidden_tools": [],
+  "tool_meta": {},
+  "server_parameters": {
+    "command": "python",
+    "args": [
+      "${input:SCRIPT}"
+    ],
+    "env": null,
+    "cwd": null,
+    "encoding": "utf-8",
+    "encoding_error_handler": "strict"
+  }
+}
