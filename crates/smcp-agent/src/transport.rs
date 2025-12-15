@@ -19,7 +19,7 @@ use smcp::events::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, mpsc};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info};
 
 /// 事件处理器类型
@@ -79,10 +79,13 @@ impl SocketIoTransport {
             url, namespace
         );
 
-        Ok((Self {
-            client,
-            namespace: namespace.to_string(),
-        }, rx))
+        Ok((
+            Self {
+                client,
+                namespace: namespace.to_string(),
+            },
+            rx,
+        ))
     }
 
     /// 创建新的传输层实例并注册事件处理器
@@ -145,7 +148,8 @@ impl SocketIoTransport {
                                 >(value)
                                 {
                                     info!("Computer updated config: {:?}", notification);
-                                    let _ = tx.send(NotificationMessage::UpdateConfig(notification));
+                                    let _ =
+                                        tx.send(NotificationMessage::UpdateConfig(notification));
                                 }
                             }
                         }
@@ -153,11 +157,13 @@ impl SocketIoTransport {
                     NOTIFY_UPDATE_TOOL_LIST => {
                         if let Payload::Text(values, _) = payload {
                             if let Some(value) = values.into_iter().next() {
-                                if let Ok(notification) =
-                                    serde_json::from_value::<smcp::UpdateToolListNotification>(value)
+                                if let Ok(notification) = serde_json::from_value::<
+                                    smcp::UpdateToolListNotification,
+                                >(value)
                                 {
                                     info!("Computer updated tool list: {:?}", notification);
-                                    let _ = tx.send(NotificationMessage::UpdateToolList(notification));
+                                    let _ =
+                                        tx.send(NotificationMessage::UpdateToolList(notification));
                                 }
                             }
                         }
@@ -175,7 +181,9 @@ impl SocketIoTransport {
                                             "Desktop update notification for computer: {}",
                                             computer
                                         );
-                                        let _ = tx.send(NotificationMessage::UpdateDesktop(computer.to_string()));
+                                        let _ = tx.send(NotificationMessage::UpdateDesktop(
+                                            computer.to_string(),
+                                        ));
                                     }
                                 }
                             }
@@ -212,10 +220,13 @@ impl SocketIoTransport {
             url, namespace
         );
 
-        Ok((Self {
-            client,
-            namespace: namespace.to_string(),
-        }, rx))
+        Ok((
+            Self {
+                client,
+                namespace: namespace.to_string(),
+            },
+            rx,
+        ))
     }
 
     /// 发送事件（不等待响应）

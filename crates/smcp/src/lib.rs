@@ -315,4 +315,98 @@ mod tests {
             _ => panic!("unexpected notification"),
         }
     }
+
+    #[test]
+    fn test_tool_call_ret_mcp_format() {
+        // 测试成功的工具调用返回（MCP CallToolResult 格式）
+        let success_ret = ToolCallRet {
+            content: Some(vec![serde_json::json!({
+                "type": "text",
+                "text": "Operation completed successfully"
+            })]),
+            is_error: Some(false),
+            req_id: Some(ReqId::from_string("test123".to_string())),
+        };
+
+        let json = serde_json::to_string(&success_ret).unwrap();
+
+        // 验证 JSON 包含正确的 MCP 字段
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("content").is_some());
+        assert!(parsed.get("isError").is_some());
+        assert_eq!(parsed.get("isError").unwrap(), false);
+        assert_eq!(parsed.get("req_id").unwrap().as_str().unwrap(), "test123");
+
+        // 验证字段名是 camelCase（isError 而不是 is_error）
+        assert!(json.contains("isError"));
+        assert!(!json.contains("is_error"));
+        // 验证没有旧的 Rust 风格字段（检查字段名而不是整个字符串）
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("success").is_none());
+        assert!(parsed.get("result").is_none());
+        assert!(parsed.get("error").is_none());
+    }
+
+    #[test]
+    fn test_tool_call_ret_error_format() {
+        // 测试错误的工具调用返回
+        let error_ret = ToolCallRet {
+            content: Some(vec![serde_json::json!({
+                "type": "text",
+                "text": "Tool execution failed"
+            })]),
+            is_error: Some(true),
+            req_id: None,
+        };
+
+        let json = serde_json::to_string(&error_ret).unwrap();
+
+        // 验证 JSON 格式
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("content").is_some());
+        assert_eq!(parsed.get("isError").unwrap(), true);
+        assert!(parsed.get("req_id").is_none());
+
+        // 验证没有旧的 Rust 风格字段
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("success").is_none());
+        assert!(parsed.get("result").is_none());
+        assert!(parsed.get("error").is_none());
+    }
+
+    #[test]
+    fn test_tool_call_ret_minimal() {
+        // 测试最小化的工具调用返回
+        let minimal_ret = ToolCallRet {
+            content: None,
+            is_error: None,
+            req_id: None,
+        };
+
+        let json = serde_json::to_string(&minimal_ret).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // 空对象应该序列化为 {}
+        assert_eq!(parsed, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_tool_call_ret_roundtrip() {
+        // 测试序列化和反序列化的往返一致性
+        let original = ToolCallRet {
+            content: Some(vec![serde_json::json!({
+                "type": "text",
+                "text": "Test result"
+            })]),
+            is_error: Some(false),
+            req_id: Some(ReqId::new()),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: ToolCallRet = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original.content, deserialized.content);
+        assert_eq!(original.is_error, deserialized.is_error);
+        assert_eq!(original.req_id, deserialized.req_id);
+    }
 }

@@ -13,7 +13,7 @@ use crate::{
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
     events::AsyncAgentEventHandler,
-    transport::{SocketIoTransport, NotificationMessage},
+    transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
     events::*, AgentCallData, EnterOfficeReq, GetDesktopReq, GetToolsReq, LeaveOfficeReq,
@@ -59,18 +59,13 @@ impl AsyncSmcpAgent {
         let headers = self.auth_provider.get_connection_headers();
 
         // 创建transport并获取通知接收器
-        let (transport, mut notification_rx) = SocketIoTransport::connect_with_handlers(
-            url,
-            SMCP_NAMESPACE,
-            auth,
-            headers,
-        )
-        .await?;
+        let (transport, mut notification_rx) =
+            SocketIoTransport::connect_with_handlers(url, SMCP_NAMESPACE, auth, headers).await?;
 
         // 启动通知处理任务
         let event_handler = self.event_handler.clone();
         let agent_clone = self.clone();
-        
+
         let notification_task = tokio::spawn(async move {
             while let Some(notification) = notification_rx.recv().await {
                 match notification {
@@ -79,11 +74,13 @@ impl AsyncSmcpAgent {
                         if let Some(ref computer) = data.computer {
                             if let Ok(tools) = agent_clone.get_tools(computer).await {
                                 if let Some(ref handler) = event_handler {
-                                    let _ = handler.on_tools_received(computer, tools, &agent_clone).await;
+                                    let _ = handler
+                                        .on_tools_received(computer, tools, &agent_clone)
+                                        .await;
                                 }
                             }
                         }
-                        
+
                         if let Some(ref handler) = event_handler {
                             let _ = handler.on_computer_enter_office(data, &agent_clone).await;
                         }
@@ -97,10 +94,12 @@ impl AsyncSmcpAgent {
                         // Python 的自动行为：收到 update_config 后自动触发 get_tools
                         if let Ok(tools) = agent_clone.get_tools(&data.computer).await {
                             if let Some(ref handler) = event_handler {
-                                let _ = handler.on_tools_received(&data.computer, tools, &agent_clone).await;
+                                let _ = handler
+                                    .on_tools_received(&data.computer, tools, &agent_clone)
+                                    .await;
                             }
                         }
-                        
+
                         if let Some(ref handler) = event_handler {
                             let _ = handler.on_computer_update_config(data, &agent_clone).await;
                         }
@@ -109,7 +108,9 @@ impl AsyncSmcpAgent {
                         // Python 的自动行为：收到 update_tool_list 后自动触发 get_tools
                         if let Ok(tools) = agent_clone.get_tools(&data.computer).await {
                             if let Some(ref handler) = event_handler {
-                                let _ = handler.on_tools_received(&data.computer, tools, &agent_clone).await;
+                                let _ = handler
+                                    .on_tools_received(&data.computer, tools, &agent_clone)
+                                    .await;
                             }
                         }
                     }
@@ -117,7 +118,9 @@ impl AsyncSmcpAgent {
                         // Python 的自动行为：收到 update_desktop 后自动触发 get_desktop
                         if let Ok(desktops) = agent_clone.get_desktop(&computer, None, None).await {
                             if let Some(ref handler) = event_handler {
-                                let _ = handler.on_desktop_updated(&computer, desktops, &agent_clone).await;
+                                let _ = handler
+                                    .on_desktop_updated(&computer, desktops, &agent_clone)
+                                    .await;
                             }
                         }
                     }
