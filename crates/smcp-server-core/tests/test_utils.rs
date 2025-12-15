@@ -207,19 +207,49 @@ pub async fn join_office(
     office_id: &str,
     name: &str,
 ) {
-    let join_req = EnterOfficeReq {
-        office_id: office_id.to_string(),
-        role,
-        name: name.to_string(),
-    };
-
+    let join_req = json!({
+        "role": role.to_string(),
+        "office_id": office_id,
+        "name": name
+    });
+    
+    // 使用 emit_with_ack 确保服务器处理了请求
+    let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
+    
     client
-        .emit("server:join_office", json!(join_req))
+        .emit_with_ack(
+            "server:join_office",
+            json!(join_req),
+            Duration::from_secs(5),
+            ack_to_sender(result_tx, |p| match p {
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            }),
+        )
         .await
-        .expect("Failed to emit join_office");
+        .expect("join_office emit_with_ack failed");
 
-    // 等待加入完成，增加等待时间确保会话注册
-    sleep(Duration::from_millis(1000)).await;
+    // 等待响应
+    let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+        .await
+        .expect("join_office ack timeout")
+        .unwrap();
+    
+    // 验证加入成功
+    let success = if let Some(arr) = result.as_array() {
+        arr.get(0).and_then(|v| v.as_bool()).unwrap_or(false)
+    } else {
+        false
+    };
+    
+    if !success {
+        let error = if let Some(arr) = result.as_array() {
+            arr.get(1).and_then(|v| v.as_str()).unwrap_or("Unknown error")
+        } else {
+            "Invalid response format"
+        };
+        panic!("Failed to join office: {}", error);
+    }
 }
 
 /// 离开办公室的辅助函数

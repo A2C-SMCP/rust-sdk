@@ -24,7 +24,7 @@ lazy_static = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
 
 # MCP SDK / MCP SDK
-rmcp = { version = "0.11.0", features = ["client", "transport-child-process"] }
+rmcp = { version = "0.11.0", features = ["client", "server", "transport-child-process", "transport-io", "server-side-http", "transport-streamable-http-server"] }
 
 # HTTP客户端 / HTTP Client
 reqwest = { version = "0.11", features = ["json", "stream"] }
@@ -38,6 +38,8 @@ rpassword = "7.2"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+tokio-util = "0.7"
+axum = "0.7"
 
 [features]
 default = []

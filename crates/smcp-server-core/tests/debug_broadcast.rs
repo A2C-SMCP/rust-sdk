@@ -30,7 +30,7 @@ async fn debug_agent_receives_broadcast() {
     // 创建Agent客户端（监听所有事件）
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
-        .namespace("smcp")
+        .namespace(SMCP_NAMESPACE)
         .opening_header("x-api-key", "test_secret")
         .on("message", move |_payload, _client| {
             println!("Agent received message event");
@@ -59,7 +59,11 @@ async fn debug_agent_receives_broadcast() {
     sleep(Duration::from_millis(500)).await;
 
     // 创建Computer客户端
-    let computer_client = create_test_client(&server_url, "smcp").await;
+    let computer_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    
+    // 等待确保Computer客户端连接完全建立
+    sleep(Duration::from_millis(200)).await;
+    
     join_office(&computer_client, Role::Computer, "office1", "computer1").await;
 
     // 等待确保Computer也加入办公室
