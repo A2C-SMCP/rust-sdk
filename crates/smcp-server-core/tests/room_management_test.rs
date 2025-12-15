@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
-use smcp::{*, SMCP_NAMESPACE};
+use smcp::{SMCP_NAMESPACE, *};
 use test_utils::*;
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn test_list_room_empty_office() {
 
     // 创建Agent客户端
     let agent_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    
+
     // 等待namespace连接完全建立
     println!("Waiting for namespace connection to establish...");
     sleep(Duration::from_millis(500)).await;

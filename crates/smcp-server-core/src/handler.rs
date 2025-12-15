@@ -256,17 +256,23 @@ impl SmcpHandler {
             Some(s) => {
                 // 检查角色/状态一致性
                 if s.role != requested_role {
-                    return (false, Some(format!(
-                        "Role mismatch: existing session has role {:?}, but requested {:?}",
-                        s.role, requested_role
-                    )));
+                    return (
+                        false,
+                        Some(format!(
+                            "Role mismatch: existing session has role {:?}, but requested {:?}",
+                            s.role, requested_role
+                        )),
+                    );
                 }
 
                 if s.name != requested_name {
-                    return (false, Some(format!(
-                        "Name mismatch: existing session has name '{}', but requested '{}'",
-                        s.name, requested_name
-                    )));
+                    return (
+                        false,
+                        Some(format!(
+                            "Name mismatch: existing session has name '{}', but requested '{}'",
+                            s.name, requested_name
+                        )),
+                    );
                 }
 
                 s
@@ -275,9 +281,7 @@ impl SmcpHandler {
                 // 创建新会话
                 let new_session = SessionData::new(sid.clone(), requested_name, requested_role);
 
-                if let Err(e) = state
-                    .session_manager
-                    .register_session(new_session.clone()) {
+                if let Err(e) = state.session_manager.register_session(new_session.clone()) {
                     return (false, Some(format!("Failed to register session: {}", e)));
                 }
                 new_session
@@ -285,14 +289,17 @@ impl SmcpHandler {
         };
 
         // 检查并加入房间
-        if let Err(e) = Self::handle_join_room(socket.clone(), &session, &data.office_id, &state).await {
+        if let Err(e) =
+            Self::handle_join_room(socket.clone(), &session, &data.office_id, &state).await
+        {
             return (false, Some(format!("Failed to join room: {}", e)));
         }
 
         // 更新会话的办公室 ID（在成功加入房间后）
         if let Err(e) = state
             .session_manager
-            .update_office_id(&sid, Some(data.office_id.clone())) {
+            .update_office_id(&sid, Some(data.office_id.clone()))
+        {
             return (false, Some(format!("Failed to update office_id: {}", e)));
         }
 
@@ -929,7 +936,10 @@ impl SmcpHandler {
         };
 
         if session_office_id != data.office_id {
-            warn!("Session {} trying to list room {} but in office {}", sid, data.office_id, session_office_id);
+            warn!(
+                "Session {} trying to list room {} but in office {}",
+                sid, data.office_id, session_office_id
+            );
             return ListRoomRet {
                 sessions: vec![],
                 req_id: data.base.req_id,

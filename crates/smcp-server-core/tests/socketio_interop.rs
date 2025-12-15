@@ -579,9 +579,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             }),
             Duration::from_secs(2),
             ack_to_sender(join_tx, |p| match p {
-                Payload::Text(mut values, _) => {
-                    values.pop().unwrap_or(serde_json::Value::Null)
-                }
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -591,7 +589,10 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(join_payload.to_string().contains("true") || join_payload.to_string().contains("[true, null]"));
+    assert!(
+        join_payload.to_string().contains("true")
+            || join_payload.to_string().contains("[true, null]")
+    );
 
     let (list_tx, list_rx) = oneshot::channel::<serde_json::Value>();
     client
@@ -684,9 +685,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             serde_json::json!({ "office_id": "office1" }),
             Duration::from_secs(2),
             ack_to_sender(leave_tx, |p| match p {
-                Payload::Text(mut values, _) => {
-                    values.pop().unwrap_or(serde_json::Value::Null)
-                }
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }),
         )
@@ -696,7 +695,10 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(leave_payload.to_string().contains("true") || leave_payload.to_string().contains("[true, null]"));
+    assert!(
+        leave_payload.to_string().contains("true")
+            || leave_payload.to_string().contains("[true, null]")
+    );
 
     client.disconnect().await.expect("Failed to disconnect");
     server.shutdown();

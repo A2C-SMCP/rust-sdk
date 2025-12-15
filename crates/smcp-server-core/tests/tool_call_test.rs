@@ -96,20 +96,22 @@ async fn test_tool_call_roundtrip() {
         .expect("tool_call emit_with_ack failed");
 
     // 等待响应
-    let result = tokio::time::timeout(Duration::from_secs(2), result_rx)
-        .await;
-    
+    let result = tokio::time::timeout(Duration::from_secs(2), result_rx).await;
+
     // 验证Computer收到了请求
     assert!(
         computer_received.load(Ordering::SeqCst),
         "Computer should have received the request"
     );
-    
+
     // 验证响应内容（应该是超时或空响应）
     match result {
         Ok(Ok(response)) => {
-            println!("Tool call response: {}", serde_json::to_string_pretty(&response).unwrap());
-            
+            println!(
+                "Tool call response: {}",
+                serde_json::to_string_pretty(&response).unwrap()
+            );
+
             // 如果有响应，应该是错误
             let error_msg = if let Some(arr) = response.as_array() {
                 if let Some(first) = arr.first() {
@@ -123,11 +125,14 @@ async fn test_tool_call_roundtrip() {
             } else {
                 "Response is not an array"
             };
-            
+
             // 验证是错误响应
             assert!(
-                error_msg.contains("timeout") || error_msg.contains("timed out") || error_msg.contains("error"),
-                "Expected error response, got: {}", error_msg
+                error_msg.contains("timeout")
+                    || error_msg.contains("timed out")
+                    || error_msg.contains("error"),
+                "Expected error response, got: {}",
+                error_msg
             );
         }
         Ok(Err(e)) => {

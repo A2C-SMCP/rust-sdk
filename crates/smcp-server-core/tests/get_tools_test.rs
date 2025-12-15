@@ -155,7 +155,9 @@ async fn test_get_tools_success_same_office() {
                 }
             } else {
                 // 响应可能为空或错误，这是预期的，因为rust_socketio客户端无法在on回调中发送ACK响应
-                println!("Computer received request but couldn't send ACK response (expected behavior)");
+                println!(
+                    "Computer received request but couldn't send ACK response (expected behavior)"
+                );
             }
         }
         Ok(Err(e)) => {

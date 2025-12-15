@@ -13,10 +13,7 @@ use std::time::Duration;
 
 use http_body_util::Full;
 use hyper_util::rt::TokioIo;
-use smcp_server_core::{
-    auth::DefaultAuthenticationProvider,
-    SmcpServerBuilder,
-};
+use smcp_server_core::{auth::DefaultAuthenticationProvider, SmcpServerBuilder};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;

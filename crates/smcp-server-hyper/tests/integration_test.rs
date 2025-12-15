@@ -22,9 +22,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use smcp::{events, SMCP_NAMESPACE};
-use smcp_server_core::{
-    auth::{AuthError, AuthenticationProvider},
-};
+use smcp_server_core::auth::{AuthError, AuthenticationProvider};
 
 // 导入测试工具函数
 // ack_to_sender 函数定义在下面，因为无法从其他测试模块导入
@@ -95,7 +93,7 @@ impl TestServer {
                         tokio::spawn(async move {
                             let io = TokioIo::new(stream);
                             eprintln!("Starting to serve connection from {}", remote_addr);
-                            
+
                             let svc = tower::service_fn(|req| {
                                 let layer = layer.clone();
                                 async move {
@@ -250,7 +248,7 @@ async fn emit_event_with_ack_validation(
     expect_success: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    
+
     client
         .emit_with_ack(
             event,
@@ -262,11 +260,11 @@ async fn emit_event_with_ack_validation(
             }),
         )
         .await?;
-    
+
     let response = tokio::time::timeout(Duration::from_secs(5), rx)
         .await?
         .map_err(|e| format!("Failed to receive ack: {:?}", e))?;
-    
+
     if expect_success {
         // For successful join, we expect a response with session info
         Ok(response)
@@ -379,9 +377,8 @@ async fn test_server_basic_http_endpoints() {
         .await
         .expect("Failed to read response")
         .to_bytes();
-    let health_json: Value =
-        serde_json::from_str(core::str::from_utf8(&health_body).unwrap())
-            .expect("Failed to parse JSON");
+    let health_json: Value = serde_json::from_str(core::str::from_utf8(&health_body).unwrap())
+        .expect("Failed to parse JSON");
     assert_eq!(health_json["status"], "ok");
 }
 
@@ -511,18 +508,20 @@ async fn test_list_room_sessions() {
         "name": "computer-1",
         "office_id": "office-list-test"
     });
-    let _response = emit_event_with_ack_validation(&computer1, "server:join_office", comp1_data, true)
-        .await
-        .unwrap();
+    let _response =
+        emit_event_with_ack_validation(&computer1, "server:join_office", comp1_data, true)
+            .await
+            .unwrap();
 
     let comp2_data = json!({
         "role": "computer",
         "name": "computer-2",
         "office_id": "office-list-test"
     });
-    let _response = emit_event_with_ack_validation(&computer2, "server:join_office", comp2_data, true)
-        .await
-        .unwrap();
+    let _response =
+        emit_event_with_ack_validation(&computer2, "server:join_office", comp2_data, true)
+            .await
+            .unwrap();
 
     // 等待所有客户端加入完成
     sleep(Duration::from_millis(300)).await;
@@ -535,10 +534,11 @@ async fn test_list_room_sessions() {
     });
 
     // 列出房间会话并验证响应
-    let list_response = emit_event_with_ack_validation(&agent1, "server:list_room", list_data, true)
-        .await
-        .unwrap();
-    
+    let list_response =
+        emit_event_with_ack_validation(&agent1, "server:list_room", list_data, true)
+            .await
+            .unwrap();
+
     // 验证响应包含会话列表
     // 响应应该是一个包含ListRoomRet的数组
     if let Some(response_array) = list_response.as_array() {
@@ -546,14 +546,16 @@ async fn test_list_room_sessions() {
             if let Some(sessions) = list_room_ret.get("sessions").and_then(|s| s.as_array()) {
                 // 验证包含2个computer和1个agent
                 assert_eq!(sessions.len(), 3, "Should have 3 sessions in the room");
-                
-                let computer_count = sessions.iter()
+
+                let computer_count = sessions
+                    .iter()
                     .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("computer"))
                     .count();
-                let agent_count = sessions.iter()
+                let agent_count = sessions
+                    .iter()
                     .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("agent"))
                     .count();
-                
+
                 assert_eq!(computer_count, 2, "Should have 2 computers");
                 assert_eq!(agent_count, 1, "Should have 1 agent");
             } else {
@@ -582,17 +584,26 @@ async fn test_computer_name_conflict() {
     });
 
     // 第一个 Computer 应该成功加入
-    let response1 = emit_event_with_ack_validation(&computer1, "server:join_office", join_data1, true)
-        .await
-        .unwrap();
+    let response1 =
+        emit_event_with_ack_validation(&computer1, "server:join_office", join_data1, true)
+            .await
+            .unwrap();
     // 验证响应包含会话信息
     println!("DEBUG: response1 = {:?}", response1);
     // 响应应该是一个数组 [true, null]
     assert!(response1.is_array(), "Response should be an array");
     let response_array = response1.as_array().unwrap();
-    assert_eq!(response_array.len(), 2, "Response array should have 2 elements");
+    assert_eq!(
+        response_array.len(),
+        2,
+        "Response array should have 2 elements"
+    );
     assert_eq!(response_array[0], true, "First element should be true");
-    assert_eq!(response_array[1], serde_json::Value::Null, "Second element should be null");
+    assert_eq!(
+        response_array[1],
+        serde_json::Value::Null,
+        "Second element should be null"
+    );
 
     // 第二个 Computer 尝试使用相同名称加入
     let computer2 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
@@ -605,15 +616,23 @@ async fn test_computer_name_conflict() {
     });
 
     // 第二个 Computer 应该因为名称冲突而失败
-    let response2 = emit_event_with_ack_validation(&computer2, "server:join_office", join_data2, false)
-        .await
-        .unwrap();
+    let response2 =
+        emit_event_with_ack_validation(&computer2, "server:join_office", join_data2, false)
+            .await
+            .unwrap();
     // 验证返回错误
     assert!(response2.is_array(), "Response should be an array");
     let response2_array = response2.as_array().unwrap();
-    assert_eq!(response2_array.len(), 2, "Response array should have 2 elements");
+    assert_eq!(
+        response2_array.len(),
+        2,
+        "Response array should have 2 elements"
+    );
     assert_eq!(response2_array[0], false, "First element should be false");
-    assert!(response2_array[1].is_string(), "Second element should be an error message");
+    assert!(
+        response2_array[1].is_string(),
+        "Second element should be an error message"
+    );
 
     // 不同名称应该可以加入
     let computer3 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
@@ -626,15 +645,24 @@ async fn test_computer_name_conflict() {
     });
 
     // 不同名称应该可以成功加入
-    let response3 = emit_event_with_ack_validation(&computer3, "server:join_office", join_data3, true)
-        .await
-        .unwrap();
+    let response3 =
+        emit_event_with_ack_validation(&computer3, "server:join_office", join_data3, true)
+            .await
+            .unwrap();
     // 验证返回成功
     assert!(response3.is_array(), "Response should be an array");
     let response3_array = response3.as_array().unwrap();
-    assert_eq!(response3_array.len(), 2, "Response array should have 2 elements");
+    assert_eq!(
+        response3_array.len(),
+        2,
+        "Response array should have 2 elements"
+    );
     assert_eq!(response3_array[0], true, "First element should be true");
-    assert_eq!(response3_array[1], serde_json::Value::Null, "Second element should be null");
+    assert_eq!(
+        response3_array[1],
+        serde_json::Value::Null,
+        "Second element should be null"
+    );
 }
 
 #[tokio::test]

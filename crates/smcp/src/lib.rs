@@ -52,9 +52,9 @@ pub mod events {
 pub struct ReqId(pub String);
 
 impl ReqId {
-    /// 生成新的请求ID
+    /// 生成新的请求ID（使用hex格式以匹配Python的uuid.uuid4().hex）
     pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
+        Self(Uuid::new_v4().simple().to_string())
     }
 
     /// 从字符串创建请求ID

@@ -25,20 +25,8 @@ async fn test_get_computers_in_office() {
 
     // 所有客户端加入同一办公室
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
-    join_office(
-        &computer1_client,
-        Role::Computer,
-        "office1",
-        "computer1",
-    )
-    .await;
-    join_office(
-        &computer2_client,
-        Role::Computer,
-        "office1",
-        "computer2",
-    )
-    .await;
+    join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
+    join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
 
     // 等待所有客户端加入完成
     sleep(Duration::from_millis(300)).await;
@@ -67,20 +55,8 @@ async fn test_get_all_sessions_in_office() {
 
     // 所有客户端加入同一办公室
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
-    join_office(
-        &computer1_client,
-        Role::Computer,
-        "office1",
-        "computer1",
-    )
-    .await;
-    join_office(
-        &computer2_client,
-        Role::Computer,
-        "office1",
-        "computer2",
-    )
-    .await;
+    join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
+    join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
 
     // 等待所有客户端加入完成
     sleep(Duration::from_millis(300)).await;
