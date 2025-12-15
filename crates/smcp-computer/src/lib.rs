@@ -8,13 +8,9 @@
 * 描述: A2C-SMCP Computer模块的Rust实现 / Rust implementation of A2C-SMCP Computer module
 */
 
-pub mod cli;
-pub mod core;
 pub mod errors;
-pub mod inputs;
-pub mod manager;
 pub mod mcp_clients;
-pub mod transport;
+pub mod inputs;
 
 #[cfg(test)]
 pub use errors::{ComputerError, ComputerResult};

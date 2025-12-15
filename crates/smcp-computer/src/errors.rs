@@ -66,6 +66,18 @@ pub enum ComputerError {
     #[error("Runtime error: {0}")]
     /// 运行时错误 / Runtime error
     RuntimeError(String),
+
+    #[error("Permission error: {0}")]
+    /// 权限错误 / Permission error
+    PermissionError(String),
+
+    #[error("Timeout error: {0}")]
+    /// 超时错误 / Timeout error
+    TimeoutError(String),
+
+    #[error("Protocol error: {0}")]
+    /// 协议错误 / Protocol error
+    ProtocolError(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {
@@ -100,4 +112,24 @@ pub enum McpClientError {
     #[error("Process error: {0}")]
     /// 进程错误 / Process error
     ProcessError(String),
+
+    #[error("Timeout error: {0}")]
+    /// 超时错误 / Timeout error
+    TimeoutError(String),
+
+    #[error("Protocol error: {0}")]
+    /// 协议错误 / Protocol error
+    ProtocolError(String),
+
+    #[error("Tool error: {0}")]
+    /// 工具错误 / Tool error
+    ToolError(String),
+
+    #[error("Config error: {0}")]
+    /// 配置错误 / Config error
+    ConfigError(String),
+
+    #[error("Internal error: {0}")]
+    /// 内部错误 / Internal error
+    InternalError(String),
 }
