@@ -72,3 +72,23 @@ impl From<serde_json::Error> for SmcpAgentError {
 }
 
 pub type Result<T> = std::result::Result<T, SmcpAgentError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_types() {
+        let err = SmcpAgentError::invalid_event("notify:test");
+        assert!(matches!(err, SmcpAgentError::InvalidEvent { .. }));
+
+        let err = SmcpAgentError::authentication("Invalid token");
+        assert!(matches!(err, SmcpAgentError::Authentication(_)));
+
+        let err = SmcpAgentError::ReqIdMismatch {
+            expected: "abc".to_string(),
+            actual: "def".to_string(),
+        };
+        assert!(matches!(err, SmcpAgentError::ReqIdMismatch { .. }));
+    }
+}

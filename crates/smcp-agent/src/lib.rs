@@ -16,9 +16,6 @@ pub mod events;
 pub mod sync_agent;
 pub mod transport;
 
-#[cfg(test)]
-mod tests;
-
 // 重新导出主要类型
 pub use async_agent::AsyncSmcpAgent;
 pub use auth::{AuthProvider, DefaultAuthProvider};

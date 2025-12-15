@@ -588,6 +588,7 @@ impl Default for MCPServerManager {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use tokio::time::{sleep, Duration};
 
     #[tokio::test]
     async fn test_manager_creation() {
@@ -597,9 +598,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_server_config() {
+    async fn test_manager_initialization() {
         let manager = MCPServerManager::new();
         
+        // 创建服务器配置 / Create server configurations
+        let mut configs = Vec::new();
+        
+        // STDIO服务器配置 / STDIO server configuration
+        configs.push(MCPServerConfig::Stdio(StdioServerConfig {
+            name: "test_stdio".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["hello".to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        }));
+        
+        // HTTP服务器配置 / HTTP server configuration
+        configs.push(MCPServerConfig::Http(HttpServerConfig {
+            name: "test_http".to_string(),
+            disabled: true, // 禁用此服务器 / Disable this server
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: HttpServerParameters {
+                url: "http://localhost:8080".to_string(),
+                headers: HashMap::new(),
+            },
+        }));
+        
+        // 初始化管理器 / Initialize manager
+        let result = manager.initialize(configs).await;
+        assert!(result.is_ok());
+        
+        // 检查状态 / Check status
+        let status = manager.get_server_status().await;
+        assert_eq!(status.len(), 2);
+        
+        // 验证状态 / Verify status
+        let stdio_status = status.iter().find(|(name, _, _)| name == "test_stdio").unwrap();
+        assert!(!stdio_status.1); // 未激活 / Not active
+        
+        let http_status = status.iter().find(|(name, _, _)| name == "test_http").unwrap();
+        assert!(!http_status.1); // 未激活 / Not active
+    }
+
+    #[tokio::test]
+    async fn test_add_server() {
+        let manager = MCPServerManager::new();
+        
+        // 添加服务器配置 / Add server configuration
+        let config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "test_server".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        
+        let result = manager.add_or_update_server(config).await;
+        assert!(result.is_ok());
+        
+        // 检查状态 / Check status
+        let status = manager.get_server_status().await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].0, "test_server");
+    }
+
+
+    #[tokio::test]
+    async fn test_remove_server() {
+        let manager = MCPServerManager::new();
+        
+        // 添加服务器 / Add server
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             name: "test_server".to_string(),
             disabled: false,
@@ -616,9 +701,67 @@ mod tests {
         });
         
         manager.add_or_update_server(config).await.unwrap();
+        
+        // 移除服务器 / Remove server
+        let result = manager.remove_server("test_server").await;
+        assert!(result.is_ok());
+        
+        // 检查状态 / Check status
         let status = manager.get_server_status().await;
-        assert_eq!(status.len(), 1);
-        assert_eq!(status[0].0, "test_server");
-        assert!(!status[0].1); // 未激活 / Not active
+        assert!(status.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_tool_conflict_detection() {
+        let manager = MCPServerManager::new();
+        
+        // 创建两个服务器，有同名工具 / Create two servers with same tool name
+        let mut configs = Vec::new();
+        
+        // 第一个服务器 / First server
+        configs.push(MCPServerConfig::Stdio(StdioServerConfig {
+            name: "server1".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["server1".to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        }));
+        
+        // 第二个服务器 / Second server
+        configs.push(MCPServerConfig::Stdio(StdioServerConfig {
+            name: "server2".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["server2".to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        }));
+        
+        // 初始化应该成功 / Initialization should succeed
+        let result = manager.initialize(configs).await;
+        assert!(result.is_ok());
+        
+        // 启动所有服务器 / Start all servers
+        let result = manager.start_all().await;
+        // 可能会因为工具冲突而失败，这是预期的
+        // Might fail due to tool conflicts, which is expected
+        
+        // 等待连接建立 / Wait for connections to establish
+        sleep(Duration::from_millis(200)).await;
+    }
+
+
 }

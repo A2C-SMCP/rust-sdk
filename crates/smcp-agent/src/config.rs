@@ -65,3 +65,24 @@ impl SmcpAgentConfig {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_config() {
+        let config = SmcpAgentConfig::new()
+            .with_default_timeout(10)
+            .with_tool_call_timeout(30)
+            .with_auto_fetch_desktop(false)
+            .with_max_retries(5)
+            .with_reconnect_interval(2000);
+
+        assert_eq!(config.default_timeout, 10);
+        assert_eq!(config.tool_call_timeout, 30);
+        assert!(!config.auto_fetch_desktop);
+        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.reconnect_interval, 2000);
+    }
+}

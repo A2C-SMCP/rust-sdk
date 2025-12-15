@@ -258,6 +258,7 @@ impl Default for InputContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_input_value_display() {
@@ -268,14 +269,33 @@ mod tests {
     }
 
     #[test]
+    fn test_input_value_conversions() {
+        // 测试各种类型的转换 / Test conversions of various types
+        let string_val: InputValue = "test".into();
+        assert_eq!(string_val, InputValue::String("test".to_string()));
+        
+        let bool_val: InputValue = true.into();
+        assert_eq!(bool_val, InputValue::Bool(true));
+        
+        let number_val: InputValue = 42i64.into();
+        assert_eq!(number_val, InputValue::Number(42));
+        
+        let float_val: InputValue = 3.14f64.into();
+        assert_eq!(float_val, InputValue::Float(3.14));
+    }
+
+    #[test]
     fn test_input_context() {
         let ctx = InputContext::new()
             .with_server_name("test_server".to_string())
             .with_tool_name("test_tool".to_string())
-            .with_metadata("key".to_string(), "value".to_string());
+            .with_metadata("key1".to_string(), "value1".to_string())
+            .with_metadata("key2".to_string(), "value2".to_string());
         
         assert_eq!(ctx.server_name, Some("test_server".to_string()));
         assert_eq!(ctx.tool_name, Some("test_tool".to_string()));
-        assert_eq!(ctx.metadata.get("key"), Some(&"value".to_string()));
+        assert_eq!(ctx.metadata.len(), 2);
+        assert_eq!(ctx.metadata.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(ctx.metadata.get("key2"), Some(&"value2".to_string()));
     }
 }

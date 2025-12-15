@@ -72,3 +72,25 @@ impl AuthProvider for DefaultAuthProvider {
         self.api_key.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auth_provider() {
+        let auth = DefaultAuthProvider::new("test-agent".to_string(), "test-office".to_string());
+
+        let config = auth.get_agent_config();
+        assert_eq!(config.agent, "test-agent");
+        assert_eq!(config.office_id, "test-office");
+
+        // 测试带API key的版本 / Test with API key
+        let auth_with_key = auth.with_api_key("test-key".to_string());
+        assert_eq!(auth_with_key.get_api_key().unwrap(), "test-key");
+
+        // 测试头部生成 / Test header generation
+        let headers = auth_with_key.get_connection_headers();
+        assert_eq!(headers.get("x-api-key").unwrap(), "test-key");
+    }
+}
