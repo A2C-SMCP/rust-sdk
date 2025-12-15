@@ -20,7 +20,6 @@ use rust_socketio::{
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tower::{Layer, Service};
 
 use smcp::{events, SMCP_NAMESPACE};
 use smcp_server_core::{
@@ -32,6 +31,7 @@ use smcp_server_core::{
 
 /// No-op authentication provider for tests
 #[derive(Debug)]
+#[allow(dead_code)]
 struct NoAuthProvider;
 
 #[async_trait::async_trait]

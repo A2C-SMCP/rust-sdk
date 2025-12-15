@@ -24,17 +24,17 @@ async fn test_get_computers_in_office() {
     let computer2_client = create_test_client(&server_url, "smcp").await;
 
     // 所有客户端加入同一办公室
-    join_office(&agent_client, Role::Agent.into(), "office1", "agent1").await;
+    join_office(&agent_client, Role::Agent, "office1", "agent1").await;
     join_office(
         &computer1_client,
-        Role::Computer.into(),
+        Role::Computer,
         "office1",
         "computer1",
     )
     .await;
     join_office(
         &computer2_client,
-        Role::Computer.into(),
+        Role::Computer,
         "office1",
         "computer2",
     )
@@ -66,17 +66,17 @@ async fn test_get_all_sessions_in_office() {
     let computer2_client = create_test_client(&server_url, "smcp").await;
 
     // 所有客户端加入同一办公室
-    join_office(&agent_client, Role::Agent.into(), "office1", "agent1").await;
+    join_office(&agent_client, Role::Agent, "office1", "agent1").await;
     join_office(
         &computer1_client,
-        Role::Computer.into(),
+        Role::Computer,
         "office1",
         "computer1",
     )
     .await;
     join_office(
         &computer2_client,
-        Role::Computer.into(),
+        Role::Computer,
         "office1",
         "computer2",
     )
@@ -104,28 +104,28 @@ async fn test_session_manager_utils() {
     let agent_session = SessionData::new(
         "agent_sid".to_string(),
         "agent1".to_string(),
-        Role::Agent.into(),
+        ClientRole::Agent,
     )
     .with_office_id("office1".to_string());
 
     let computer1_session = SessionData::new(
         "computer1_sid".to_string(),
         "computer1".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 
     let computer2_session = SessionData::new(
         "computer2_sid".to_string(),
         "computer2".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 
     let other_computer_session = SessionData::new(
         "other_computer_sid".to_string(),
         "other_computer".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office2".to_string());
 
@@ -177,21 +177,21 @@ async fn test_get_computer_sid_in_office() {
     let computer1_office1 = SessionData::new(
         "comp1_sid".to_string(),
         "computer1".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 
     let computer1_office2 = SessionData::new(
         "comp2_sid".to_string(),
         "computer1".to_string(), // 相同名称，不同办公室
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office2".to_string());
 
     let computer2_office1 = SessionData::new(
         "comp3_sid".to_string(),
         "computer2".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 
@@ -237,14 +237,14 @@ async fn test_validate_agent_in_office() {
     let agent_session = SessionData::new(
         "agent_sid".to_string(),
         "agent1".to_string(),
-        Role::Agent.into(),
+        ClientRole::Agent,
     )
     .with_office_id("office1".to_string());
 
     let computer_session = SessionData::new(
         "computer_sid".to_string(),
         "computer1".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 
@@ -269,21 +269,21 @@ async fn test_get_agent_session_in_office() {
     let agent1_session = SessionData::new(
         "agent1_sid".to_string(),
         "agent1".to_string(),
-        Role::Agent.into(),
+        ClientRole::Agent,
     )
     .with_office_id("office1".to_string());
 
     let agent2_session = SessionData::new(
         "agent2_sid".to_string(),
         "agent2".to_string(),
-        Role::Agent.into(),
+        ClientRole::Agent,
     )
     .with_office_id("office2".to_string());
 
     let computer_session = SessionData::new(
         "computer_sid".to_string(),
         "computer1".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 
@@ -313,7 +313,7 @@ async fn test_remove_session_from_office() {
     let session = SessionData::new(
         "test_sid".to_string(),
         "test_name".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 
@@ -350,7 +350,7 @@ async fn test_update_session_office() {
     let session = SessionData::new(
         "test_sid".to_string(),
         "test_name".to_string(),
-        Role::Computer.into(),
+        ClientRole::Computer,
     )
     .with_office_id("office1".to_string());
 

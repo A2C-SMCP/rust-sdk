@@ -7,13 +7,11 @@
 * 依赖: None
 * 描述: Test server implementation for integration tests
 */
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::Full;
-use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use smcp_server_core::{
     auth::DefaultAuthenticationProvider,

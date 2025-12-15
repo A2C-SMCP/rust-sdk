@@ -44,7 +44,7 @@ async fn test_get_tools_success_same_office() {
                 if let Payload::Text(values, _) = payload {
                     if let Ok(req) = serde_json::from_value::<GetToolsReq>(values[0].clone()) {
                         // 构造工具列表响应
-                        let tools_response = json!({
+                        let _tools_response = json!({
                             "tools": [
                                 {
                                     "name": "echo",

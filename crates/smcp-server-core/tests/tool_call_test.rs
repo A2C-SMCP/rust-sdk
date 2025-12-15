@@ -34,7 +34,7 @@ async fn test_tool_call_roundtrip() {
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
         .opening_header("x-api-key", "test_secret")
-        .on("client:tool_call", move |payload: Payload, _client| {
+        .on("client:tool_call", move |_payload: Payload, _client| {
             let computer_received = computer_received_clone.clone();
             async move {
                 // 标记收到了请求
@@ -113,11 +113,10 @@ async fn test_tool_call_roundtrip() {
             // 如果有响应，应该是错误
             let error_msg = if let Some(arr) = response.as_array() {
                 if let Some(first) = arr.first() {
-                    if let Some(err) = first.get("Err").and_then(|e| e.as_str()) {
-                        err
-                    } else {
-                        "No error field found"
-                    }
+                    first
+                        .get("Err")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("No error field found")
                 } else {
                     "No response found"
                 }

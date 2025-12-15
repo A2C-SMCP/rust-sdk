@@ -32,7 +32,7 @@ async fn debug_agent_receives_broadcast() {
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
         .opening_header("x-api-key", "test_secret")
-        .on("message", move |payload, _client| {
+        .on("message", move |_payload, _client| {
             println!("Agent received message event");
             async move {}.boxed()
         })

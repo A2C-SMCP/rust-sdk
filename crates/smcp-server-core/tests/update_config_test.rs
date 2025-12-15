@@ -12,7 +12,6 @@ use rust_socketio::asynchronous::ClientBuilder;
 use rust_socketio::Payload;
 use rust_socketio::TransportType;
 use serde_json::json;
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use smcp::*;
@@ -110,7 +109,7 @@ async fn test_update_config_broadcast_only_to_same_office() {
         .on("notify:update_config", move |payload: Payload, _client| {
             let office1_received = office1_received_clone.clone();
             async move {
-                if let Payload::Text(_, ..) = payload {
+                if let Payload::Text(..) = payload {
                     office1_received.store(true, Ordering::SeqCst);
                 }
             }
@@ -130,7 +129,7 @@ async fn test_update_config_broadcast_only_to_same_office() {
         .on("notify:update_config", move |payload: Payload, _client| {
             let office2_received = office2_received_clone.clone();
             async move {
-                if let Payload::Text(_, ..) = payload {
+                if let Payload::Text(..) = payload {
                     office2_received.store(true, Ordering::SeqCst);
                 }
             }

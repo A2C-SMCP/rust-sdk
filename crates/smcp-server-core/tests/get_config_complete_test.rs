@@ -31,7 +31,7 @@ fn ack_to_sender<T: Send + 'static>(
         let f = f.clone();
         async move {
             let result = f(payload);
-            if let Some(mut sender) = sender.lock().await.take() {
+            if let Some(sender) = sender.lock().await.take() {
                 let _ = sender.send(result);
             }
         }

@@ -114,6 +114,7 @@ pub async fn find_available_port() -> u16 {
 }
 
 /// 创建ACK回调函数
+#[allow(dead_code)]
 pub fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
@@ -153,6 +154,7 @@ pub async fn create_test_client(
 }
 
 /// 创建带事件处理器的测试客户端
+#[allow(dead_code)]
 pub async fn create_client_with_handler<F>(
     server_url: &str,
     namespace: &str,
@@ -179,6 +181,7 @@ where
 }
 
 /// 创建原子布尔标记的处理器
+#[allow(dead_code)]
 pub fn create_atomic_handler(
     flag: Arc<AtomicBool>,
 ) -> impl FnMut(
@@ -220,6 +223,7 @@ pub async fn join_office(
 }
 
 /// 离开办公室的辅助函数
+#[allow(dead_code)]
 pub async fn leave_office(client: &rust_socketio::asynchronous::Client, office_id: &str) {
     let leave_req = json!({
         "office_id": office_id

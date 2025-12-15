@@ -580,7 +580,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             Duration::from_secs(2),
             ack_to_sender(join_tx, |p| match p {
                 Payload::Text(mut values, _) => {
-                    values.pop().unwrap_or_else(|| serde_json::Value::Null)
+                    values.pop().unwrap_or(serde_json::Value::Null)
                 }
                 _ => serde_json::Value::Null,
             }),
@@ -685,7 +685,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             Duration::from_secs(2),
             ack_to_sender(leave_tx, |p| match p {
                 Payload::Text(mut values, _) => {
-                    values.pop().unwrap_or_else(|| serde_json::Value::Null)
+                    values.pop().unwrap_or(serde_json::Value::Null)
                 }
                 _ => serde_json::Value::Null,
             }),

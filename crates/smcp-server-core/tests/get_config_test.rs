@@ -42,13 +42,6 @@ async fn test_get_config_event_registered() {
         io: Arc::new(io.clone()),
     };
     SmcpHandler::register_handlers(&io, state);
-
-    // 验证事件注册成功（通过创建socket连接来间接验证）
-    // CLIENT_GET_CONFIG事件应该已经注册到handler中
-    assert!(
-        true,
-        "CLIENT_GET_CONFIG event should be registered successfully"
-    );
 }
 
 #[tokio::test]
@@ -77,10 +70,6 @@ async fn test_get_config_unauthorized_role() {
     .with_office_id("office_1".to_string());
 
     session_manager.register_session(computer_session).unwrap();
-
-    // 验证Computer角色无法调用get_config
-    // 注意：这里需要实际的socket连接来测试，目前只验证逻辑
-    assert!(true, "Computer role should not be able to call get_config");
 }
 
 #[tokio::test]
