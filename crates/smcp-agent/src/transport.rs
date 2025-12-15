@@ -19,11 +19,21 @@ use smcp::events::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, mpsc};
 use tracing::{debug, error, info};
 
 /// 事件处理器类型
 pub type EventHandler = Box<dyn FnMut(Payload, Client) + Send + Sync>;
+
+/// 通知事件消息
+#[derive(Debug, Clone)]
+pub enum NotificationMessage {
+    EnterOffice(smcp::EnterOfficeNotification),
+    LeaveOffice(smcp::LeaveOfficeNotification),
+    UpdateConfig(smcp::UpdateMCPConfigNotification),
+    UpdateToolList(smcp::UpdateToolListNotification),
+    UpdateDesktop(String), // computer name
+}
 
 /// Socket.IO传输层
 pub struct SocketIoTransport {
@@ -38,7 +48,7 @@ impl SocketIoTransport {
         namespace: &str,
         auth: Option<Value>,
         headers: HashMap<String, String>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
         let mut builder = ClientBuilder::new(url);
 
         // 设置命名空间
@@ -56,6 +66,8 @@ impl SocketIoTransport {
             builder = builder.opening_header(key, value);
         }
 
+        let (_tx, rx) = mpsc::unbounded_channel();
+
         // 连接服务器
         let client = builder
             .connect()
@@ -67,10 +79,10 @@ impl SocketIoTransport {
             url, namespace
         );
 
-        Ok(Self {
+        Ok((Self {
             client,
             namespace: namespace.to_string(),
-        })
+        }, rx))
     }
 
     /// 创建新的传输层实例并注册事件处理器
@@ -79,16 +91,12 @@ impl SocketIoTransport {
         namespace: &str,
         auth: Option<Value>,
         headers: HashMap<String, String>,
-        event_handler: Option<Arc<dyn crate::events::AsyncAgentEventHandler>>,
-        config: crate::config::SmcpAgentConfig,
-        tools_cache: Arc<tokio::sync::RwLock<HashMap<String, Vec<smcp::SMCPTool>>>>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
         let mut builder = ClientBuilder::new(url);
 
         // 注册on_any处理器来捕获所有事件
-        let handler_clone = event_handler.clone();
-        let config_clone = config.clone();
-        let tools_cache_clone = tools_cache.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tx = Arc::new(tx);
 
         builder = builder.on_any(move |event, payload, _client| {
             let event_str = match event {
@@ -101,9 +109,7 @@ impl SocketIoTransport {
                 return Box::pin(async {});
             }
 
-            let handler = handler_clone.clone();
-            let config = config_clone.clone();
-            let _tools_cache = tools_cache_clone.clone();
+            let tx = tx.clone();
 
             Box::pin(async move {
                 match event_str.as_str() {
@@ -114,24 +120,7 @@ impl SocketIoTransport {
                                     serde_json::from_value::<smcp::EnterOfficeNotification>(value)
                                 {
                                     info!("Computer entered office: {:?}", notification);
-
-                                    // 调用事件处理器
-                                    if let Some(ref h) = handler {
-                                        // 创建一个临时的agent实例用于调用处理器
-                                        // 注意：这里简化处理，实际需要传递正确的agent引用
-                                        let _ = h
-                                            .on_computer_enter_office(
-                                                notification,
-                                                &crate::AsyncSmcpAgent::new(
-                                                    crate::auth::DefaultAuthProvider::new(
-                                                        "dummy".to_string(),
-                                                        "dummy".to_string(),
-                                                    ),
-                                                    config,
-                                                ),
-                                            )
-                                            .await;
-                                    }
+                                    let _ = tx.send(NotificationMessage::EnterOffice(notification));
                                 }
                             }
                         }
@@ -143,6 +132,7 @@ impl SocketIoTransport {
                                     serde_json::from_value::<smcp::LeaveOfficeNotification>(value)
                                 {
                                     info!("Computer left office: {:?}", notification);
+                                    let _ = tx.send(NotificationMessage::LeaveOffice(notification));
                                 }
                             }
                         }
@@ -155,6 +145,19 @@ impl SocketIoTransport {
                                 >(value)
                                 {
                                     info!("Computer updated config: {:?}", notification);
+                                    let _ = tx.send(NotificationMessage::UpdateConfig(notification));
+                                }
+                            }
+                        }
+                    }
+                    NOTIFY_UPDATE_TOOL_LIST => {
+                        if let Payload::Text(values, _) = payload {
+                            if let Some(value) = values.into_iter().next() {
+                                if let Ok(notification) =
+                                    serde_json::from_value::<smcp::UpdateToolListNotification>(value)
+                                {
+                                    info!("Computer updated tool list: {:?}", notification);
+                                    let _ = tx.send(NotificationMessage::UpdateToolList(notification));
                                 }
                             }
                         }
@@ -172,6 +175,7 @@ impl SocketIoTransport {
                                             "Desktop update notification for computer: {}",
                                             computer
                                         );
+                                        let _ = tx.send(NotificationMessage::UpdateDesktop(computer.to_string()));
                                     }
                                 }
                             }
@@ -208,10 +212,10 @@ impl SocketIoTransport {
             url, namespace
         );
 
-        Ok(Self {
+        Ok((Self {
             client,
             namespace: namespace.to_string(),
-        })
+        }, rx))
     }
 
     /// 发送事件（不等待响应）

@@ -13,7 +13,7 @@ use crate::{
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
     events::AsyncAgentEventHandler,
-    transport::SocketIoTransport,
+    transport::{SocketIoTransport, NotificationMessage},
 };
 use smcp::{
     events::*, AgentCallData, EnterOfficeReq, GetDesktopReq, GetToolsReq, LeaveOfficeReq,
@@ -31,6 +31,7 @@ pub struct AsyncSmcpAgent {
     event_handler: Option<Arc<dyn AsyncAgentEventHandler>>,
     config: SmcpAgentConfig,
     tools_cache: Arc<RwLock<HashMap<String, Vec<SMCPTool>>>>,
+    notification_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AsyncSmcpAgent {
@@ -42,6 +43,7 @@ impl AsyncSmcpAgent {
             event_handler: None,
             config,
             tools_cache: Arc::new(RwLock::new(HashMap::new())),
+            notification_task: None,
         }
     }
 
@@ -56,18 +58,74 @@ impl AsyncSmcpAgent {
         let auth = self.auth_provider.get_connection_auth();
         let headers = self.auth_provider.get_connection_headers();
 
-        // 创建transport并注册事件处理器
-        let transport = SocketIoTransport::connect_with_handlers(
+        // 创建transport并获取通知接收器
+        let (transport, mut notification_rx) = SocketIoTransport::connect_with_handlers(
             url,
             SMCP_NAMESPACE,
             auth,
             headers,
-            self.event_handler.clone(),
-            self.config.clone(),
-            self.tools_cache.clone(),
         )
         .await?;
 
+        // 启动通知处理任务
+        let event_handler = self.event_handler.clone();
+        let agent_clone = self.clone();
+        
+        let notification_task = tokio::spawn(async move {
+            while let Some(notification) = notification_rx.recv().await {
+                match notification {
+                    NotificationMessage::EnterOffice(data) => {
+                        // Python 的自动行为：收到 enter_office 后自动触发 get_tools
+                        if let Some(ref computer) = data.computer {
+                            if let Ok(tools) = agent_clone.get_tools(computer).await {
+                                if let Some(ref handler) = event_handler {
+                                    let _ = handler.on_tools_received(computer, tools, &agent_clone).await;
+                                }
+                            }
+                        }
+                        
+                        if let Some(ref handler) = event_handler {
+                            let _ = handler.on_computer_enter_office(data, &agent_clone).await;
+                        }
+                    }
+                    NotificationMessage::LeaveOffice(data) => {
+                        if let Some(ref handler) = event_handler {
+                            let _ = handler.on_computer_leave_office(data, &agent_clone).await;
+                        }
+                    }
+                    NotificationMessage::UpdateConfig(data) => {
+                        // Python 的自动行为：收到 update_config 后自动触发 get_tools
+                        if let Ok(tools) = agent_clone.get_tools(&data.computer).await {
+                            if let Some(ref handler) = event_handler {
+                                let _ = handler.on_tools_received(&data.computer, tools, &agent_clone).await;
+                            }
+                        }
+                        
+                        if let Some(ref handler) = event_handler {
+                            let _ = handler.on_computer_update_config(data, &agent_clone).await;
+                        }
+                    }
+                    NotificationMessage::UpdateToolList(data) => {
+                        // Python 的自动行为：收到 update_tool_list 后自动触发 get_tools
+                        if let Ok(tools) = agent_clone.get_tools(&data.computer).await {
+                            if let Some(ref handler) = event_handler {
+                                let _ = handler.on_tools_received(&data.computer, tools, &agent_clone).await;
+                            }
+                        }
+                    }
+                    NotificationMessage::UpdateDesktop(computer) => {
+                        // Python 的自动行为：收到 update_desktop 后自动触发 get_desktop
+                        if let Ok(desktops) = agent_clone.get_desktop(&computer, None, None).await {
+                            if let Some(ref handler) = event_handler {
+                                let _ = handler.on_desktop_updated(&computer, desktops, &agent_clone).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        self.notification_task = Some(notification_task);
         *self.transport.write().await = Some(transport);
 
         info!("Connected to SMCP server at {}", url);
@@ -353,6 +411,7 @@ impl Clone for AsyncSmcpAgent {
             event_handler: self.event_handler.clone(),
             config: self.config.clone(),
             tools_cache: self.tools_cache.clone(),
+            notification_task: None, // Note: 任务句柄不克隆，因为它是特定于实例的
         }
     }
 }

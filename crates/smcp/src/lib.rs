@@ -122,15 +122,15 @@ pub struct GetComputerConfigRet {
     pub servers: serde_json::Value,
 }
 
-/// 工具调用返回
+/// 工具调用返回（符合 MCP CallToolResult 标准）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRet {
-    pub req_id: ReqId,
-    pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
+    pub content: Option<Vec<serde_json::Value>>,
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub req_id: Option<ReqId>,
 }
 
 /// 获取工具请求
