@@ -53,11 +53,14 @@ impl TestServer {
                             let layer = layer.clone();
 
                             tokio::spawn(async move {
+                                // 创建一个服务，先尝试 socketioxide，如果它不处理则使用自定义路由
                                 let svc = tower::service_fn(|req| {
                                     let layer = layer.clone();
                                     async move {
-                                        let svc = tower::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
-                                            // 处理HTTP请求
+                                        // 先让 socketioxide layer 处理请求
+                                        // 它内部有一个 fallback 服务
+                                        let mut svc = layer.layer.layer(tower::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                                            // 这个 fallback 服务只处理 socketioxide 不处理的请求
                                             match (req.method(), req.uri().path()) {
                                                 (&hyper::Method::GET, "/") => {
                                                     Ok::<_, std::convert::Infallible>(
@@ -86,8 +89,7 @@ impl TestServer {
                                                     )
                                                 }
                                             }
-                                        });
-                                        let mut svc = layer.layer.layer(svc);
+                                        }));
                                         svc.call(req).await
                                     }
                                 });
