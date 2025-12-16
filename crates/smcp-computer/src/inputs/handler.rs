@@ -182,6 +182,28 @@ impl InputHandler {
         cache.insert(key, value);
     }
 
+    /// 获取所有缓存值 / Get all cached values
+    pub async fn get_all_cached_values(&self) -> HashMap<String, InputValue> {
+        let cache = self.cache.read().await;
+        cache.clone()
+    }
+
+    /// 设置缓存值 / Set cached value
+    pub async fn set_cached_value(&self, key: String, value: InputValue) {
+        self.cache_value(key, value).await;
+    }
+
+    /// 删除缓存值 / Remove cached value
+    pub async fn remove_cached_value(&self, key: &str) -> Option<InputValue> {
+        let mut cache = self.cache.write().await;
+        cache.remove(key)
+    }
+
+    /// 清空所有缓存 / Clear all cache
+    pub async fn clear_all_cache(&self) {
+        self.cache.write().await.clear();
+    }
+
     /// 从MCP服务器输入配置创建请求 / Create request from MCP server input configuration
     pub fn create_request_from_mcp_input(
         &self,

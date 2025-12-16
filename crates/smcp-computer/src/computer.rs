@@ -23,10 +23,42 @@ use crate::mcp_clients::{
 };
 use crate::inputs::handler::InputHandler;
 use crate::inputs::utils::run_command;
+use crate::inputs::model::InputValue;
 use crate::socketio_client::SmcpComputerClient;
 
 /// 确认回调函数类型 / Confirmation callback function type
 type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>;
+
+/// 将 InputValue 转换为 serde_json::Value / Convert InputValue to serde_json::Value
+fn input_value_to_json(value: InputValue) -> serde_json::Value {
+    match value {
+        InputValue::String(s) => serde_json::Value::String(s),
+        InputValue::Number(n) => serde_json::Value::Number(serde_json::Number::from(n)),
+        InputValue::Float(f) => serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0))),
+        InputValue::Bool(b) => serde_json::Value::Bool(b),
+    }
+}
+
+/// 将 serde_json::Value 转换为 InputValue / Convert serde_json::Value to InputValue
+fn json_to_input_value(value: serde_json::Value) -> ComputerResult<InputValue> {
+    match value {
+        serde_json::Value::String(s) => Ok(InputValue::String(s)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(InputValue::Number(i))
+            } else if let Some(u) = n.as_u64() {
+                Ok(InputValue::Number(u as i64))
+            } else if let Some(f) = n.as_f64() {
+                Ok(InputValue::Float(f))
+            } else {
+                Err(ComputerError::ValidationError("Invalid number value".to_string()))
+            }
+        }
+        serde_json::Value::Bool(b) => Ok(InputValue::Bool(b)),
+        serde_json::Value::Null => Err(ComputerError::ValidationError("Null value not supported".to_string())),
+        _ => Err(ComputerError::ValidationError("Unsupported value type".to_string())),
+    }
+}
 
 /// 工具调用历史记录 / Tool call history record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,14 +303,14 @@ impl<S: Session> Computer<S> {
 
     /// 添加或更新单个input / Add or update single input
     pub async fn add_or_update_input(&self, input: MCPServerInput) -> ComputerResult<()> {
-        let input_id = input.id();
+        let input_id = input.id().to_string();
         {
             let mut inputs = self.inputs.write().await;
-            inputs.insert(input_id.to_string(), input);
+            inputs.insert(input_id.clone(), input);
         }
         
         // 清除相关缓存 / Clear related cache
-        // TODO: 实现InputHandler的缓存清除功能
+        self.clear_input_values(Some(&input_id)).await?;
         
         Ok(())
     }
@@ -291,7 +323,8 @@ impl<S: Session> Computer<S> {
         };
         
         if removed {
-            // TODO: 清除缓存 / Clear cache
+            // 清除缓存 / Clear cache
+            self.clear_input_values(Some(input_id)).await?;
         }
         
         Ok(removed)
@@ -310,13 +343,29 @@ impl<S: Session> Computer<S> {
     }
 
     /// 获取输入值 / Get input value
-    pub async fn get_input_value(&self, _input_id: &str) -> ComputerResult<Option<serde_json::Value>> {
-        // TODO: 实现从InputHandler获取缓存值的功能
+    pub async fn get_input_value(&self, input_id: &str) -> ComputerResult<Option<serde_json::Value>> {
+        // 从 InputHandler 获取缓存值 / Get cached value from InputHandler
+        let handler = self.input_handler.read().await;
+        let cached_values = handler.get_all_cached_values().await;
+        
+        // 查找匹配的缓存项 / Find matching cached item
+        for (key, value) in cached_values {
+            // 缓存键格式: input_id[:server:tool[:metadata...]]
+            // Cache key format: input_id[:server:tool[:metadata...]]
+            if key.starts_with(input_id) {
+                // 提取 input_id 部分 / Extract input_id part
+                let parts: Vec<&str> = key.split(':').collect();
+                if !parts.is_empty() && parts[0] == input_id {
+                    return Ok(Some(input_value_to_json(value)));
+                }
+            }
+        }
+        
         Ok(None)
     }
 
     /// 设置输入值 / Set input value
-    pub async fn set_input_value(&self, input_id: &str, _value: serde_json::Value) -> ComputerResult<bool> {
+    pub async fn set_input_value(&self, input_id: &str, value: serde_json::Value) -> ComputerResult<bool> {
         // 检查input是否存在 / Check if input exists
         {
             let inputs = self.inputs.read().await;
@@ -325,26 +374,59 @@ impl<S: Session> Computer<S> {
             }
         }
         
-        // TODO: 实现InputHandler的缓存设置功能
+        // 设置缓存值 / Set cached value
+        let handler = self.input_handler.read().await;
+        let input_value = json_to_input_value(value)?;
+        handler.set_cached_value(input_id.to_string(), input_value).await;
         
         Ok(true)
     }
 
     /// 移除输入值 / Remove input value
-    pub async fn remove_input_value(&self, _input_id: &str) -> ComputerResult<bool> {
-        // TODO: 实现InputHandler的缓存删除功能
-        Ok(false)
+    pub async fn remove_input_value(&self, input_id: &str) -> ComputerResult<bool> {
+        let handler = self.input_handler.read().await;
+        let removed = handler.remove_cached_value(input_id).await.is_some();
+        Ok(removed)
     }
 
     /// 列出所有输入值 / List all input values
     pub async fn list_input_values(&self) -> ComputerResult<HashMap<String, serde_json::Value>> {
-        // TODO: 实现InputHandler的缓存列表功能
-        Ok(HashMap::new())
+        let handler = self.input_handler.read().await;
+        let cached_values = handler.get_all_cached_values().await;
+        
+        let mut result = HashMap::new();
+        for (key, value) in cached_values {
+            // 只返回简单的 input_id，不包含上下文信息
+            // Only return simple input_id, without context info
+            let parts: Vec<&str> = key.split(':').collect();
+            if !parts.is_empty() {
+                result.insert(parts[0].to_string(), input_value_to_json(value));
+            }
+        }
+        
+        Ok(result)
     }
 
     /// 清空输入值缓存 / Clear input value cache
-    pub async fn clear_input_values(&self, _input_id: Option<&str>) -> ComputerResult<()> {
-        // TODO: 实现InputHandler的缓存清除功能
+    pub async fn clear_input_values(&self, input_id: Option<&str>) -> ComputerResult<()> {
+        let handler = self.input_handler.read().await;
+        
+        if let Some(id) = input_id {
+            // 清除特定输入的所有缓存 / Clear all cache for specific input
+            let cached_values = handler.get_all_cached_values().await;
+            let keys_to_remove: Vec<String> = cached_values.keys()
+                .filter(|key| key.starts_with(id))
+                .cloned()
+                .collect();
+            
+            for key in keys_to_remove {
+                handler.remove_cached_value(&key).await;
+            }
+        } else {
+            // 清空所有缓存 / Clear all cache
+            handler.clear_all_cache().await;
+        }
+        
         Ok(())
     }
 
@@ -839,6 +921,204 @@ mod tests {
         
         let result = session.resolve_input(&command_input).await.unwrap();
         assert_eq!(result, serde_json::Value::String("hello world".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cache_operations() {
+        let session = SilentSession::new("test");
+        let computer = Computer::new(
+            "test_computer",
+            session,
+            None,
+            None,
+            true,
+            true,
+        );
+        
+        // 添加一个 input / Add an input
+        let input = MCPServerInput::PromptString(PromptStringInput {
+            id: "test_input".to_string(),
+            description: "Test input".to_string(),
+            default: Some("default".to_string()),
+            password: Some(false),
+        });
+        computer.add_or_update_input(input).await.unwrap();
+        
+        // 测试设置和获取缓存值 / Test setting and getting cache value
+        let test_value = serde_json::Value::String("cached_value".to_string());
+        let set_result = computer.set_input_value("test_input", test_value.clone()).await.unwrap();
+        assert!(set_result);
+        
+        let retrieved = computer.get_input_value("test_input").await.unwrap();
+        assert_eq!(retrieved, Some(test_value));
+        
+        // 测试设置不存在的 input / Test setting non-existent input
+        let invalid_result = computer.set_input_value("nonexistent", serde_json::Value::String("value".to_string())).await.unwrap();
+        assert!(!invalid_result);
+        
+        // 测试获取不存在的缓存 / Test getting non-existent cache
+        let not_found = computer.get_input_value("nonexistent").await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_remove_and_clear() {
+        let session = SilentSession::new("test");
+        let computer = Computer::new(
+            "test_computer",
+            session,
+            None,
+            None,
+            true,
+            true,
+        );
+        
+        // 添加 inputs / Add inputs
+        let input1 = MCPServerInput::PromptString(PromptStringInput {
+            id: "input1".to_string(),
+            description: "Input 1".to_string(),
+            default: None,
+            password: Some(false),
+        });
+        let input2 = MCPServerInput::PromptString(PromptStringInput {
+            id: "input2".to_string(),
+            description: "Input 2".to_string(),
+            default: None,
+            password: Some(false),
+        });
+        computer.add_or_update_input(input1).await.unwrap();
+        computer.add_or_update_input(input2).await.unwrap();
+        
+        // 设置缓存值 / Set cache values
+        computer.set_input_value("input1", serde_json::Value::String("value1".to_string())).await.unwrap();
+        computer.set_input_value("input2", serde_json::Value::String("value2".to_string())).await.unwrap();
+        
+        // 测试删除特定缓存 / Test removing specific cache
+        let removed = computer.remove_input_value("input1").await.unwrap();
+        assert!(removed);
+        
+        let retrieved = computer.get_input_value("input1").await.unwrap();
+        assert!(retrieved.is_none());
+        
+        let still_exists = computer.get_input_value("input2").await.unwrap();
+        assert!(still_exists.is_some());
+        
+        // 测试清空所有缓存 / Test clearing all cache
+        computer.clear_input_values(None).await.unwrap();
+        let cleared1 = computer.get_input_value("input1").await.unwrap();
+        let cleared2 = computer.get_input_value("input2").await.unwrap();
+        assert!(cleared1.is_none());
+        assert!(cleared2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_list_values() {
+        let session = SilentSession::new("test");
+        let computer = Computer::new(
+            "test_computer",
+            session,
+            None,
+            None,
+            true,
+            true,
+        );
+        
+        // 添加 inputs / Add inputs
+        let input1 = MCPServerInput::PromptString(PromptStringInput {
+            id: "input1".to_string(),
+            description: "Input 1".to_string(),
+            default: None,
+            password: Some(false),
+        });
+        let input2 = MCPServerInput::PromptString(PromptStringInput {
+            id: "input2".to_string(),
+            description: "Input 2".to_string(),
+            default: None,
+            password: Some(false),
+        });
+        computer.add_or_update_input(input1).await.unwrap();
+        computer.add_or_update_input(input2).await.unwrap();
+        
+        // 设置不同类型的值 / Set different types of values
+        computer.set_input_value("input1", serde_json::Value::String("string_value".to_string())).await.unwrap();
+        computer.set_input_value("input2", serde_json::Value::Number(serde_json::Number::from(42))).await.unwrap();
+        
+        // 列出所有值 / List all values
+        let values = computer.list_input_values().await.unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.get("input1"), Some(&serde_json::Value::String("string_value".to_string())));
+        assert_eq!(values.get("input2"), Some(&serde_json::Value::Number(serde_json::Number::from(42))));
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear_on_input_update() {
+        let session = SilentSession::new("test");
+        let computer = Computer::new(
+            "test_computer",
+            session,
+            None,
+            None,
+            true,
+            true,
+        );
+        
+        // 添加 input / Add input
+        let input = MCPServerInput::PromptString(PromptStringInput {
+            id: "test_input".to_string(),
+            description: "Test input".to_string(),
+            default: None,
+            password: Some(false),
+        });
+        computer.add_or_update_input(input).await.unwrap();
+        
+        // 设置缓存 / Set cache
+        computer.set_input_value("test_input", serde_json::Value::String("cached".to_string())).await.unwrap();
+        assert!(computer.get_input_value("test_input").await.unwrap().is_some());
+        
+        // 更新 input（应该清除缓存）/ Update input (should clear cache)
+        let updated_input = MCPServerInput::PromptString(PromptStringInput {
+            id: "test_input".to_string(),
+            description: "Updated input".to_string(),
+            default: Some("new_default".to_string()),
+            password: Some(true),
+        });
+        computer.add_or_update_input(updated_input).await.unwrap();
+        
+        // 缓存应该被清除 / Cache should be cleared
+        assert!(computer.get_input_value("test_input").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear_on_input_remove() {
+        let session = SilentSession::new("test");
+        let computer = Computer::new(
+            "test_computer",
+            session,
+            None,
+            None,
+            true,
+            true,
+        );
+        
+        // 添加 input / Add input
+        let input = MCPServerInput::PromptString(PromptStringInput {
+            id: "test_input".to_string(),
+            description: "Test input".to_string(),
+            default: None,
+            password: Some(false),
+        });
+        computer.add_or_update_input(input).await.unwrap();
+        
+        // 设置缓存 / Set cache
+        computer.set_input_value("test_input", serde_json::Value::String("cached".to_string())).await.unwrap();
+        assert!(computer.get_input_value("test_input").await.unwrap().is_some());
+        
+        // 移除 input（应该清除缓存）/ Remove input (should clear cache)
+        let removed = computer.remove_input("test_input").await.unwrap();
+        assert!(removed);
+        
+        // 缓存应该被清除 / Cache should be cleared
+        assert!(computer.get_input_value("test_input").await.unwrap().is_none());
     }
 
     #[tokio::test]
