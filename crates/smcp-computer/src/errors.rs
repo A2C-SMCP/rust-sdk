@@ -86,6 +86,10 @@ pub enum ComputerError {
     #[error("Validation error: {0}")]
     /// 验证错误 / Validation error
     ValidationError(String),
+
+    #[error("Invalid state: {0}")]
+    /// 无效状态 / Invalid state
+    InvalidState(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {

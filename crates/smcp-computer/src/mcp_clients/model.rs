@@ -21,7 +21,7 @@ pub type ServerName = String;
 pub type ToolName = String;
 
 /// MCP工具元数据 / MCP tool metadata
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolMeta {
     /// 是否自动使用 / Whether to auto-apply
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,7 +56,7 @@ impl Default for ToolMeta {
 }
 
 /// MCP服务器配置基类 / Base MCP server configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum MCPServerConfig {
     /// STDIO类型服务器 / STDIO type server
@@ -124,7 +124,7 @@ impl MCPServerConfig {
 }
 
 /// STDIO服务器配置 / STDIO server configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StdioServerConfig {
     /// 服务器名称 / Server name
     pub name: ServerName,
@@ -147,7 +147,7 @@ pub struct StdioServerConfig {
 }
 
 /// SSE服务器配置 / SSE server configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SseServerConfig {
     /// 服务器名称 / Server name
     pub name: ServerName,
@@ -170,7 +170,7 @@ pub struct SseServerConfig {
 }
 
 /// HTTP服务器配置 / HTTP server configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpServerConfig {
     /// 服务器名称 / Server name
     pub name: ServerName,
@@ -193,7 +193,7 @@ pub struct HttpServerConfig {
 }
 
 /// STDIO服务器参数 / STDIO server parameters
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StdioServerParameters {
     /// 命令 / Command
     pub command: String,
@@ -209,7 +209,7 @@ pub struct StdioServerParameters {
 }
 
 /// SSE服务器参数 / SSE server parameters
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SseServerParameters {
     /// URL / URL
     pub url: String,
@@ -219,7 +219,7 @@ pub struct SseServerParameters {
 }
 
 /// HTTP服务器参数 / HTTP server parameters
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpServerParameters {
     /// URL / URL
     pub url: String,
@@ -229,7 +229,7 @@ pub struct HttpServerParameters {
 }
 
 /// MCP服务器输入项基类 / Base MCP server input configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum MCPServerInput {
     /// 字符串输入 / String input
@@ -261,7 +261,7 @@ impl MCPServerInput {
 }
 
 /// 字符串输入类型 / String input type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptStringInput {
     /// 输入ID / Input ID
     pub id: String,
@@ -276,7 +276,7 @@ pub struct PromptStringInput {
 }
 
 /// 选择输入类型 / Pick string input type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PickStringInput {
     /// 输入ID / Input ID
     pub id: String,
@@ -291,7 +291,7 @@ pub struct PickStringInput {
 }
 
 /// 命令输入类型 / Command input type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandInput {
     /// 输入ID / Input ID
     pub id: String,
