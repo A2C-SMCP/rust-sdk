@@ -185,7 +185,7 @@ async fn test_get_tools_computer_not_found() {
 
     // 创建Agent客户端
     let agent_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
 
@@ -259,18 +259,18 @@ async fn test_get_tools_cross_office_permission_denied() {
 
     // 创建Computer客户端（在office1）
     let computer_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保Computer客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&computer_client, Role::Computer, "office1", "computer1").await;
 
     // 创建Agent客户端（在office2）
     let agent_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保Agent客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&agent_client, Role::Agent, "office2", "agent1").await;
 
     // Agent尝试获取不同办公室的Computer的工具列表
@@ -348,12 +348,12 @@ async fn test_get_tools_multiple_computers() {
 
     // 创建多个Computer客户端
     let computer1_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保第一个Computer客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     let computer2_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保第二个Computer客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
 
@@ -363,10 +363,10 @@ async fn test_get_tools_multiple_computers() {
 
     // 创建Agent客户端
     let agent_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保Agent客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
 
     // Agent分别获取两个Computer的工具列表
@@ -433,10 +433,10 @@ async fn test_get_tools_computer_not_in_office() {
 
     // 创建Agent客户端
     let agent_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保Agent客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
 
     // Agent尝试获取未加入办公室的Computer的工具列表

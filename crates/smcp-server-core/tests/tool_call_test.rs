@@ -159,7 +159,7 @@ async fn test_tool_call_computer_not_found() {
 
     // 创建Agent客户端
     let agent_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
 
@@ -236,15 +236,15 @@ async fn test_tool_call_cross_office_permission_denied() {
 
     // 创建Computer客户端（在office1）
     let computer_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保Computer客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&computer_client, Role::Computer, "office1", "computer1").await;
 
     // 创建Agent客户端（在office2）
     let agent_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保Agent客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
     join_office(&agent_client, Role::Agent, "office2", "agent1").await;
@@ -333,18 +333,18 @@ async fn test_tool_call_timeout_handling() {
         .connect()
         .await
         .expect("Failed to connect computer");
-    
+
     // 等待确保Computer客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&computer_client, Role::Computer, "office1", "computer1").await;
 
     // 创建Agent客户端
     let agent_client = create_test_client(&server_url, "smcp").await;
-    
+
     // 等待确保Agent客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
 
     // Agent发送tool_call请求（短超时）

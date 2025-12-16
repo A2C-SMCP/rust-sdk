@@ -41,7 +41,7 @@ impl HttpMCPClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
-            
+
         Self {
             base: BaseMCPClient::new(params),
             http_client,
@@ -50,57 +50,60 @@ impl HttpMCPClient {
     }
 
     /// 发送JSON-RPC请求 / Send JSON-RPC request
-    async fn send_request(&self, method: &str, params: Option<serde_json::Value>) -> Result<serde_json::Value, MCPClientError> {
+    async fn send_request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, MCPClientError> {
         let url = &self.base.params.url;
-        
+
         let mut request_body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
         });
-        
+
         if let Some(p) = params {
             request_body["params"] = p;
         }
-        
+
         // 添加请求ID / Add request ID
         request_body["id"] = serde_json::Value::Number(serde_json::Number::from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs() as i64
+                .as_secs() as i64,
         ));
-        
+
         debug!("Sending HTTP request to {}: {}", url, request_body);
-        
+
         let mut request = self.http_client.post(url);
-        
+
         // 添加headers / Add headers
         for (key, value) in &self.base.params.headers {
             request = request.header(key, value);
         }
-        
+
         // 添加content-type / Add content-type
         request = request.header("Content-Type", "application/json");
-        
-        let response = request
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| MCPClientError::ConnectionError(format!("HTTP request failed: {}", e)))?;
-        
+
+        let response =
+            request.json(&request_body).send().await.map_err(|e| {
+                MCPClientError::ConnectionError(format!("HTTP request failed: {}", e))
+            })?;
+
         if !response.status().is_success() {
-            return Err(MCPClientError::ConnectionError(
-                format!("HTTP error: {}", response.status())
-            ));
+            return Err(MCPClientError::ConnectionError(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
         }
-        
-        let response_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| MCPClientError::ProtocolError(format!("Failed to parse response: {}", e)))?;
-        
+
+        let response_body: serde_json::Value = response.json().await.map_err(|e| {
+            MCPClientError::ProtocolError(format!("Failed to parse response: {}", e))
+        })?;
+
         debug!("Received HTTP response: {}", response_body);
-        
+
         Ok(response_body)
     }
 
@@ -117,23 +120,26 @@ impl HttpMCPClient {
                 "version": "0.1.0"
             }
         });
-        
+
         let response = self.send_request("initialize", Some(params)).await?;
-        
+
         // 检查响应 / Check response
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("Initialize error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "Initialize error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
                 *self.session_id.lock().await = Some(session_id.to_string());
             }
         }
-        
+
         // 发送initialized通知 / Send initialized notification
         self.send_request("notifications/initialized", None).await?;
-        
+
         info!("HTTP session initialized successfully");
         Ok(())
     }
@@ -148,46 +154,48 @@ impl MCPClientProtocol for HttpMCPClient {
     async fn connect(&self) -> Result<(), MCPClientError> {
         // 检查是否可以连接 / Check if can connect
         if !self.base.can_connect().await {
-            return Err(MCPClientError::ConnectionError(
-                format!("Cannot connect in state: {}", self.base.get_state().await)
-            ));
+            return Err(MCPClientError::ConnectionError(format!(
+                "Cannot connect in state: {}",
+                self.base.get_state().await
+            )));
         }
 
         // 初始化会话 / Initialize session
         self.initialize_session().await?;
-        
+
         // 更新状态 / Update state
         self.base.update_state(ClientState::Connected).await;
         info!("HTTP client connected successfully");
-        
+
         Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), MCPClientError> {
         // 检查是否可以断开 / Check if can disconnect
         if !self.base.can_disconnect().await {
-            return Err(MCPClientError::ConnectionError(
-                format!("Cannot disconnect in state: {}", self.base.get_state().await)
-            ));
+            return Err(MCPClientError::ConnectionError(format!(
+                "Cannot disconnect in state: {}",
+                self.base.get_state().await
+            )));
         }
 
         // 尝试优雅关闭 / Try graceful shutdown
         if let Err(e) = self.send_request("shutdown", None).await {
             warn!("Failed to send shutdown request: {}", e);
         }
-        
+
         // 发送exit通知 / Send exit notification
         if let Err(e) = self.send_request("exit", None).await {
             warn!("Failed to send exit notification: {}", e);
         }
-        
+
         // 清理会话ID / Clear session ID
         *self.session_id.lock().await = None;
-        
+
         // 更新状态 / Update state
         self.base.update_state(ClientState::Disconnected).await;
         info!("HTTP client disconnected successfully");
-        
+
         Ok(())
     }
 
@@ -197,11 +205,14 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         let response = self.send_request("tools/list", None).await?;
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("List tools error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "List tools error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             if let Some(tools) = result.get("tools").and_then(|v| v.as_array()) {
                 let mut tool_list = Vec::new();
@@ -213,11 +224,15 @@ impl MCPClientProtocol for HttpMCPClient {
                 return Ok(tool_list);
             }
         }
-        
+
         Ok(vec![])
     }
 
-    async fn call_tool(&self, tool_name: &str, params: serde_json::Value) -> Result<CallToolResult, MCPClientError> {
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<CallToolResult, MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -226,19 +241,24 @@ impl MCPClientProtocol for HttpMCPClient {
             "name": tool_name,
             "arguments": params
         });
-        
+
         let response = self.send_request("tools/call", Some(call_params)).await?;
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("Call tool error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "Call tool error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             let call_result: CallToolResult = serde_json::from_value(result.clone())?;
             return Ok(call_result);
         }
-        
-        Err(MCPClientError::ProtocolError("Invalid response".to_string()))
+
+        Err(MCPClientError::ProtocolError(
+            "Invalid response".to_string(),
+        ))
     }
 
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
@@ -247,27 +267,35 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         let response = self.send_request("resources/list", None).await?;
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("List resources error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "List resources error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             if let Some(resources) = result.get("resources").and_then(|v| v.as_array()) {
                 let mut resource_list = Vec::new();
                 for resource in resources {
-                    if let Ok(parsed_resource) = serde_json::from_value::<Resource>(resource.clone()) {
+                    if let Ok(parsed_resource) =
+                        serde_json::from_value::<Resource>(resource.clone())
+                    {
                         resource_list.push(parsed_resource);
                     }
                 }
                 return Ok(resource_list);
             }
         }
-        
+
         Ok(vec![])
     }
 
-    async fn get_window_detail(&self, resource: Resource) -> Result<ReadResourceResult, MCPClientError> {
+    async fn get_window_detail(
+        &self,
+        resource: Resource,
+    ) -> Result<ReadResourceResult, MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -275,27 +303,32 @@ impl MCPClientProtocol for HttpMCPClient {
         let params = serde_json::json!({
             "uri": resource.uri
         });
-        
+
         let response = self.send_request("resources/read", Some(params)).await?;
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("Read resource error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "Read resource error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             let read_result: ReadResourceResult = serde_json::from_value(result.clone())?;
             return Ok(read_result);
         }
-        
-        Err(MCPClientError::ProtocolError("Invalid response".to_string()))
+
+        Err(MCPClientError::ProtocolError(
+            "Invalid response".to_string(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_http_client_creation() {
@@ -303,7 +336,7 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
         assert_eq!(client.state(), ClientState::Initialized);
         assert_eq!(client.base.params.url, "http://localhost:8080");
@@ -314,14 +347,17 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer token123".to_string());
         headers.insert("Content-Type".to_string(), "application/json".to_string());
-        
+
         let params = HttpServerParameters {
             url: "http://localhost:8080".to_string(),
             headers,
         };
-        
+
         let client = HttpMCPClient::new(params);
-        assert_eq!(client.base.params.headers.get("Authorization"), Some(&"Bearer token123".to_string()));
+        assert_eq!(
+            client.base.params.headers.get("Authorization"),
+            Some(&"Bearer token123".to_string())
+        );
     }
 
     #[tokio::test]
@@ -330,14 +366,14 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 初始会话ID应该为空 / Initial session ID should be None
         let session_id = client.session_id.lock().await;
         assert!(session_id.is_none());
         drop(session_id);
-        
+
         // 设置会话ID / Set session ID
         *client.session_id.lock().await = Some("session123".to_string());
         let session_id = client.session_id.lock().await;
@@ -350,22 +386,25 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 注意：这个测试需要一个 mock HTTP 服务器来实际验证请求格式
         // Note: This test would need a mock HTTP server to actually verify request format
         // 这里我们只验证请求构建逻辑不会 panic
         // Here we only verify that request building doesn't panic
-        
+
         let method = "test/method";
         let params = Some(json!({"param1": "value1"}));
-        
+
         // 由于没有实际的服务器，这个测试会失败，但我们可以验证错误处理
         // Since there's no actual server, this test will fail, but we can verify error handling
         let result = client.send_request(method, params).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -374,14 +413,17 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 在已连接状态下尝试连接应该失败
         client.base.update_state(ClientState::Connected).await;
         let result = client.connect().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -390,13 +432,16 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 在未连接状态下尝试断开应该失败
         let result = client.disconnect().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -405,13 +450,16 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 未连接状态下调用 list_tools 应该失败
         let result = client.list_tools().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -420,13 +468,16 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 未连接状态下调用 call_tool 应该失败
         let result = client.call_tool("test_tool", json!({})).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -435,13 +486,16 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 未连接状态下调用 list_windows 应该失败
         let result = client.list_windows().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -450,20 +504,23 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         let resource = Resource {
             uri: "window://123".to_string(),
             name: "Test Window".to_string(),
             description: None,
             mime_type: None,
         };
-        
+
         // 未连接状态下调用 get_window_detail 应该失败
         let result = client.get_window_detail(resource).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -472,9 +529,9 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 由于没有实际服务器，初始化会失败，但我们可以验证请求格式
         let result = client.initialize_session().await;
         assert!(result.is_err());
@@ -486,22 +543,22 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 设置会话ID
         *client.session_id.lock().await = Some("session123".to_string());
-        
+
         // 设置为已连接状态
         client.base.update_state(ClientState::Connected).await;
-        
+
         // 断开连接（即使失败也应该清理会话ID）
         let _ = client.disconnect().await;
-        
+
         // 验证会话ID被清理
         let session_id = client.session_id.lock().await;
         assert!(session_id.is_none());
-        
+
         // 验证状态变为已断开
         assert_eq!(client.base.get_state().await, ClientState::Disconnected);
     }
@@ -512,12 +569,12 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 模拟已连接状态
         client.base.update_state(ClientState::Connected).await;
-        
+
         // 尝试列出工具（会因为连接失败而返回错误）
         let result = client.list_tools().await;
         assert!(result.is_err());
@@ -529,14 +586,16 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 模拟已连接状态
         client.base.update_state(ClientState::Connected).await;
-        
+
         // 尝试调用工具（会因为连接失败而返回错误）
-        let result = client.call_tool("test_tool", json!({"param": "value"})).await;
+        let result = client
+            .call_tool("test_tool", json!({"param": "value"}))
+            .await;
         assert!(result.is_err());
     }
 
@@ -546,9 +605,9 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
-        
+
         let client = HttpMCPClient::new(params);
-        
+
         // 验证 Debug trait 实现
         let debug_str = format!("{:?}", client);
         assert!(debug_str.contains("HttpMCPClient"));

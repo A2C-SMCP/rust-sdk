@@ -247,7 +247,7 @@ impl SmcpHandler {
         state: ServerState,
     ) -> (bool, Option<String>) {
         info!("on_server_join_office called with data: {:?}", data);
-        
+
         let sid = socket.id.to_string();
         let requested_role = ClientRole::from(data.role.clone());
         let requested_name = data.name.clone();

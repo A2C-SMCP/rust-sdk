@@ -1,3 +1,4 @@
+use smcp_computer::inputs::*;
 /**
 * 文件名: integration_tests
 * 作者: JQQ
@@ -7,9 +8,7 @@
 * 依赖: tokio, async-trait
 * 描述: 集成测试，验证整个系统的协同工作
 */
-
 use smcp_computer::mcp_clients::*;
-use smcp_computer::inputs::*;
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 
@@ -18,10 +17,10 @@ use tokio::time::{sleep, Duration};
 async fn test_complete_workflow() {
     // 1. 创建管理器 / Create manager
     let manager = MCPServerManager::new();
-    
+
     // 2. 准备服务器配置 / Prepare server configurations
     let mut configs = Vec::new();
-    
+
     // STDIO服务器配置 / STDIO server configuration
     configs.push(MCPServerConfig::Stdio(StdioServerConfig {
         name: "calculator_server".to_string(),
@@ -57,7 +56,7 @@ async fn test_complete_workflow() {
             cwd: None,
         },
     }));
-    
+
     // HTTP服务器配置 / HTTP server configuration
     configs.push(MCPServerConfig::Http(HttpServerConfig {
         name: "http_server".to_string(),
@@ -71,43 +70,61 @@ async fn test_complete_workflow() {
             headers: HashMap::new(),
         },
     }));
-    
+
     // 3. 初始化管理器 / Initialize manager
     let result = manager.initialize(configs).await;
-    assert!(result.is_ok(), "Failed to initialize manager: {:?}", result.err());
-    
+    assert!(
+        result.is_ok(),
+        "Failed to initialize manager: {:?}",
+        result.err()
+    );
+
     // 4. 检查初始状态 / Check initial status
     let status = manager.get_server_status().await;
     assert_eq!(status.len(), 2);
-    
+
     // 5. 启动所有服务器 / Start all servers
     let result = manager.start_all().await;
-    assert!(result.is_ok(), "Failed to start servers: {:?}", result.err());
-    
+    assert!(
+        result.is_ok(),
+        "Failed to start servers: {:?}",
+        result.err()
+    );
+
     // 6. 等待连接建立 / Wait for connections to establish
     sleep(Duration::from_millis(200)).await;
-    
+
     // 7. 检查运行状态 / Check running status
     let status = manager.get_server_status().await;
-    let calc_status = status.iter().find(|(name, _, _)| name == "calculator_server").unwrap();
+    let calc_status = status
+        .iter()
+        .find(|(name, _, _)| name == "calculator_server")
+        .unwrap();
     assert!(calc_status.1); // calculator_server 应该已激活 / calculator_server should be active
-    
-    let http_status = status.iter().find(|(name, _, _)| name == "http_server").unwrap();
+
+    let http_status = status
+        .iter()
+        .find(|(name, _, _)| name == "http_server")
+        .unwrap();
     assert!(!http_status.1); // http_server 应该未激活（被禁用）/ http_server should not be active (disabled)
-    
+
     // 8. 停止所有服务器 / Stop all servers
     let result = manager.stop_all().await;
     assert!(result.is_ok(), "Failed to stop servers: {:?}", result.err());
-    
+
     // 9. 检查最终状态 / Check final status
     let status = manager.get_server_status().await;
     for (_, active, _) in status {
         assert!(!active); // 所有服务器都应该未激活 / All servers should be inactive
     }
-    
+
     // 10. 关闭管理器 / Close manager
     let result = manager.close().await;
-    assert!(result.is_ok(), "Failed to close manager: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to close manager: {:?}",
+        result.err()
+    );
 }
 
 /// 测试输入系统集成 / Test input system integration
@@ -118,34 +135,37 @@ async fn test_input_system_integration() {
         .with_server_name("test_server".to_string())
         .with_tool_name("test_tool".to_string())
         .with_metadata("env".to_string(), "test".to_string());
-    
+
     // 测试环境变量输入提供者 / Test environment variable input provider
-    let provider = EnvironmentInputProvider::new()
-        .with_prefix("TEST_".to_string());
-    
+    let provider = EnvironmentInputProvider::new().with_prefix("TEST_".to_string());
+
     // 设置测试环境变量 / Set test environment variables
     // 环境变量名格式: TEST_ + request.id + server_name + tool_name
     std::env::set_var("TEST_TEST_INPUT_TEST_SERVER_TEST_TOOL", "test_value");
-    
+
     // 创建输入请求 / Create input request
     let request = InputRequest {
         id: "test_input".to_string(),
-        input_type: InputType::String { password: None, min_length: None, max_length: None },
+        input_type: InputType::String {
+            password: None,
+            min_length: None,
+            max_length: None,
+        },
         title: "Test Input".to_string(),
         description: "Test input description".to_string(),
         default: None,
         required: false,
         validation: None,
     };
-    
+
     // 获取输入值 / Get input values
     let response = provider.get_input(&request, &ctx).await;
-    
+
     // 验证结果 / Verify results
     assert!(response.is_ok());
     // 环境变量提供者应该返回环境变量的值
     // The environment provider should return the environment variable value
-    
+
     // 清理环境变量 / Clean up environment variables
     std::env::remove_var("TEST_TEST_INPUT_TEST_SERVER_TEST_TOOL");
 }
@@ -154,16 +174,16 @@ async fn test_input_system_integration() {
 #[tokio::test]
 async fn test_error_handling() {
     let manager = MCPServerManager::new();
-    
+
     // 尝试启动不存在的服务器 / Try to start non-existent server
     let result = manager.start_client("non_existent").await;
     assert!(result.is_err());
-    
+
     // 尝试停止不存在的服务器 - 应该成功（幂等操作）
     // Try to stop non-existent server - should succeed (idempotent operation)
     let result = manager.stop_client("non_existent").await;
     assert!(result.is_ok());
-    
+
     // 尝试移除不存在的服务器 - 应该成功（幂等操作）
     // Try to remove non-existent server - should succeed (idempotent operation)
     let result = manager.remove_server("non_existent").await;
@@ -174,10 +194,10 @@ async fn test_error_handling() {
 #[tokio::test]
 async fn test_concurrent_operations() {
     let manager = std::sync::Arc::new(MCPServerManager::new());
-    
+
     // 添加多个服务器 / Add multiple servers
     let mut handles = Vec::new();
-    
+
     for i in 0..5 {
         let manager_clone = manager.clone();
         let handle = tokio::spawn(async move {
@@ -210,36 +230,34 @@ async fn test_concurrent_operations() {
                     cwd: None,
                 },
             });
-            
+
             manager_clone.add_or_update_server(config).await
         });
-        
+
         handles.push(handle);
     }
-    
+
     // 等待所有操作完成 / Wait for all operations to complete
     for handle in handles {
         let result = handle.await.unwrap();
         assert!(result.is_ok());
     }
-    
+
     // 检查状态 / Check status
     let status = manager.get_server_status().await;
     assert_eq!(status.len(), 5);
-    
+
     // 并发启动 / Concurrent start
     let mut handles = Vec::new();
-    
+
     for i in 0..5 {
         let manager_clone = manager.clone();
         let server_name = format!("calculator_{}", i);
-        let handle = tokio::spawn(async move {
-            manager_clone.start_client(&server_name).await
-        });
-        
+        let handle = tokio::spawn(async move { manager_clone.start_client(&server_name).await });
+
         handles.push(handle);
     }
-    
+
     // 等待所有启动完成 / Wait for all starts to complete
     for (i, handle) in handles.into_iter().enumerate() {
         let result = handle.await.unwrap();
@@ -249,10 +267,10 @@ async fn test_concurrent_operations() {
             // Some servers might fail to start, which is acceptable
         }
     }
-    
+
     // 等待连接建立 / Wait for connections to establish
     sleep(Duration::from_millis(200)).await;
-    
+
     // 关闭管理器 / Close manager
     manager.close().await.unwrap();
 }

@@ -9,11 +9,11 @@
 */
 // 模块声明 / Module declarations
 pub mod base_client;
+pub mod http_client;
 pub mod manager;
 pub mod model;
-pub mod stdio_client;
-pub mod http_client;
 pub mod sse_client;
+pub mod stdio_client;
 pub mod utils;
 
 // 重新导出核心类型 / Re-export core types

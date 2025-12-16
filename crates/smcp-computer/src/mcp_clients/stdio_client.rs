@@ -49,38 +49,45 @@ impl StdioMCPClient {
     }
 
     /// 启动子进程 / Start child process
-    async fn start_child_process(&self, params: &StdioServerParameters) -> Result<Child, MCPClientError> {
+    async fn start_child_process(
+        &self,
+        params: &StdioServerParameters,
+    ) -> Result<Child, MCPClientError> {
         let mut cmd = Command::new(&params.command);
-        
+
         // 设置参数 / Set arguments
         cmd.args(&params.args);
-        
+
         // 设置环境变量 / Set environment variables
         for (key, value) in &params.env {
             cmd.env(key, value);
         }
-        
+
         // 设置工作目录 / Set working directory
         if let Some(cwd) = &params.cwd {
             cmd.current_dir(cwd);
         }
-        
+
         // 配置stdio / Configure stdio
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        
+
         debug!("Starting command: {} {:?}", params.command, params.args);
-        
-        let child = cmd.spawn()
-            .map_err(|e| MCPClientError::ConnectionError(format!("Failed to start process: {}", e)))?;
-        
+
+        let child = cmd.spawn().map_err(|e| {
+            MCPClientError::ConnectionError(format!("Failed to start process: {}", e))
+        })?;
+
         Ok(child)
     }
 
     /// 发送JSON-RPC请求 / Send JSON-RPC request
     /// 发送通知（不需要响应） / Send notification (no response expected)
-    async fn send_notification(&self, notification: &serde_json::Value) -> Result<(), MCPClientError> {
+    async fn send_notification(
+        &self,
+        notification: &serde_json::Value,
+    ) -> Result<(), MCPClientError> {
         let mut child = self.child_process.lock().await;
         if let Some(ref mut process) = *child {
             if let Some(stdin) = process.stdin.as_mut() {
@@ -89,16 +96,21 @@ impl StdioMCPClient {
                 stdin.write_all(notification_str.as_bytes()).await?;
                 stdin.write_all(b"\n").await?;
                 stdin.flush().await?;
-                
+
                 debug!("Sent notification: {}", notification_str);
                 info!("Sent notification to MCP server: {}", notification_str);
                 return Ok(());
             }
         }
-        Err(MCPClientError::ConnectionError("Process not available".to_string()))
+        Err(MCPClientError::ConnectionError(
+            "Process not available".to_string(),
+        ))
     }
 
-    async fn send_request(&self, request: &serde_json::Value) -> Result<serde_json::Value, MCPClientError> {
+    async fn send_request(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, MCPClientError> {
         let mut child = self.child_process.lock().await;
         if let Some(ref mut process) = *child {
             if let Some(stdin) = process.stdin.as_mut() {
@@ -107,25 +119,29 @@ impl StdioMCPClient {
                 stdin.write_all(request_str.as_bytes()).await?;
                 stdin.write_all(b"\n").await?;
                 stdin.flush().await?;
-                
+
                 debug!("Sent request: {}", request_str);
                 info!("Sent request to MCP server: {}", request_str);
-                
+
                 // 读取响应 / Read response
                 if let Some(stdout) = process.stdout.as_mut() {
                     let mut reader = BufReader::new(stdout);
                     let mut line = String::new();
-                    
+
                     info!("Waiting for response from MCP server...");
-                    
+
                     // 添加超时以防止无限阻塞
                     return match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
-                        reader.read_line(&mut line)
-                    ).await {
+                        reader.read_line(&mut line),
+                    )
+                    .await
+                    {
                         Ok(Ok(0)) => {
                             error!("Process closed stdout without response");
-                            Err(MCPClientError::ConnectionError("Process closed stdout".to_string()))
+                            Err(MCPClientError::ConnectionError(
+                                "Process closed stdout".to_string(),
+                            ))
                         }
                         Ok(Ok(_)) => {
                             info!("Received raw response: {}", line.trim());
@@ -138,18 +154,21 @@ impl StdioMCPClient {
                             info!("Parsed JSON response: {}", response);
                             Ok(response)
                         }
-                        Ok(Err(e)) => {
-                            Err(MCPClientError::ConnectionError(format!("Failed to read response: {}", e)))
-                        }
-                        Err(_) => {
-                            Err(MCPClientError::TimeoutError("No response received within timeout".to_string()))
-                        }
-                    }
+                        Ok(Err(e)) => Err(MCPClientError::ConnectionError(format!(
+                            "Failed to read response: {}",
+                            e
+                        ))),
+                        Err(_) => Err(MCPClientError::TimeoutError(
+                            "No response received within timeout".to_string(),
+                        )),
+                    };
                 }
             }
         }
-        
-        Err(MCPClientError::ConnectionError("Process not running".to_string()))
+
+        Err(MCPClientError::ConnectionError(
+            "Process not running".to_string(),
+        ))
     }
 
     /// 初始化会话 / Initialize session
@@ -170,29 +189,32 @@ impl StdioMCPClient {
                 }
             }
         });
-        
+
         let response = self.send_request(&init_request).await?;
-        
+
         // 检查响应 / Check response
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("Initialize error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "Initialize error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
                 *self.session_id.lock().await = Some(session_id.to_string());
             }
         }
-        
+
         // 发送initialized通知 / Send initialized notification
         let initialized_notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        
+
         // 通知不需要响应 / Notifications don't need response
         self.send_notification(&initialized_notification).await?;
-        
+
         info!("Session initialized successfully");
         Ok(())
     }
@@ -207,34 +229,36 @@ impl MCPClientProtocol for StdioMCPClient {
     async fn connect(&self) -> Result<(), MCPClientError> {
         // 检查是否可以连接 / Check if can connect
         if !self.base.can_connect().await {
-            return Err(MCPClientError::ConnectionError(
-                format!("Cannot connect in state: {}", self.base.get_state().await)
-            ));
+            return Err(MCPClientError::ConnectionError(format!(
+                "Cannot connect in state: {}",
+                self.base.get_state().await
+            )));
         }
 
         // 获取参数 / Get parameters
         let params = self.base.params.clone();
-        
+
         // 启动子进程 / Start child process
         let child = self.start_child_process(&params).await?;
         *self.child_process.lock().await = Some(child);
-        
+
         // 初始化会话 / Initialize session
         self.initialize_session().await?;
-        
+
         // 更新状态 / Update state
         self.base.update_state(ClientState::Connected).await;
         info!("STDIO client connected successfully");
-        
+
         Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), MCPClientError> {
         // 检查是否可以断开 / Check if can disconnect
         if !self.base.can_disconnect().await {
-            return Err(MCPClientError::ConnectionError(
-                format!("Cannot disconnect in state: {}", self.base.get_state().await)
-            ));
+            return Err(MCPClientError::ConnectionError(format!(
+                "Cannot disconnect in state: {}",
+                self.base.get_state().await
+            )));
         }
 
         // 停止子进程 / Stop child process
@@ -246,7 +270,7 @@ impl MCPClientProtocol for StdioMCPClient {
                 "id": 2,
                 "method": "shutdown"
             });
-            
+
             // 直接写入而不调用 send_request 以避免死锁
             if let Some(stdin) = process.stdin.as_mut() {
                 let request_str = serde_json::to_string(&shutdown_request)?;
@@ -258,13 +282,13 @@ impl MCPClientProtocol for StdioMCPClient {
                     let _ = stdin.flush().await;
                 }
             }
-            
+
             // 发送exit通知 / Send exit notification
             let exit_notification = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "exit"
             });
-            
+
             if let Some(stdin) = process.stdin.as_mut() {
                 let request_str = serde_json::to_string(&exit_notification)?;
                 use tokio::io::AsyncWriteExt;
@@ -275,15 +299,12 @@ impl MCPClientProtocol for StdioMCPClient {
                     let _ = stdin.flush().await;
                 }
             }
-            
+
             // 释放锁，然后等待进程退出
             drop(child);
-            
+
             // 等待进程退出或强制杀死 / Wait for process exit or force kill
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                process.wait()
-            ).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), process.wait()).await {
                 Ok(Ok(status)) => {
                     debug!("Process exited with status: {}", status);
                 }
@@ -301,14 +322,14 @@ impl MCPClientProtocol for StdioMCPClient {
             // 没有进程时也要释放锁
             drop(child);
         }
-        
+
         // 清理会话ID / Clear session ID
         *self.session_id.lock().await = None;
-        
+
         // 更新状态 / Update state
         self.base.update_state(ClientState::Disconnected).await;
         info!("STDIO client disconnected successfully");
-        
+
         Ok(())
     }
 
@@ -322,14 +343,17 @@ impl MCPClientProtocol for StdioMCPClient {
             "id": 3,
             "method": "tools/list"
         });
-        
+
         let response = self.send_request(&request).await?;
         info!("Received list_tools response: {}", response);
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("List tools error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "List tools error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             info!("Result field: {}", result);
             if let Some(tools) = result.get("tools").and_then(|v| v.as_array()) {
@@ -350,11 +374,15 @@ impl MCPClientProtocol for StdioMCPClient {
         } else {
             warn!("No result field found in response");
         }
-        
+
         Ok(vec![])
     }
 
-    async fn call_tool(&self, tool_name: &str, params: serde_json::Value) -> Result<CallToolResult, MCPClientError> {
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<CallToolResult, MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -368,19 +396,24 @@ impl MCPClientProtocol for StdioMCPClient {
                 "arguments": params
             }
         });
-        
+
         let response = self.send_request(&request).await?;
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("Call tool error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "Call tool error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             let call_result: CallToolResult = serde_json::from_value(result.clone())?;
             return Ok(call_result);
         }
-        
-        Err(MCPClientError::ProtocolError("Invalid response".to_string()))
+
+        Err(MCPClientError::ProtocolError(
+            "Invalid response".to_string(),
+        ))
     }
 
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
@@ -393,29 +426,37 @@ impl MCPClientProtocol for StdioMCPClient {
             "id": 5,
             "method": "resources/list"
         });
-        
+
         let response = self.send_request(&request).await?;
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("List resources error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "List resources error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             if let Some(resources) = result.get("resources").and_then(|v| v.as_array()) {
                 let mut resource_list = Vec::new();
                 for resource in resources {
-                    if let Ok(parsed_resource) = serde_json::from_value::<Resource>(resource.clone()) {
+                    if let Ok(parsed_resource) =
+                        serde_json::from_value::<Resource>(resource.clone())
+                    {
                         resource_list.push(parsed_resource);
                     }
                 }
                 return Ok(resource_list);
             }
         }
-        
+
         Ok(vec![])
     }
 
-    async fn get_window_detail(&self, resource: Resource) -> Result<ReadResourceResult, MCPClientError> {
+    async fn get_window_detail(
+        &self,
+        resource: Resource,
+    ) -> Result<ReadResourceResult, MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -428,28 +469,33 @@ impl MCPClientProtocol for StdioMCPClient {
                 "uri": resource.uri
             }
         });
-        
+
         let response = self.send_request(&request).await?;
-        
+
         if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!("Read resource error: {}", error)));
+            return Err(MCPClientError::ProtocolError(format!(
+                "Read resource error: {}",
+                error
+            )));
         }
-        
+
         if let Some(result) = response.get("result") {
             let read_result: ReadResourceResult = serde_json::from_value(result.clone())?;
             return Ok(read_result);
         }
-        
-        Err(MCPClientError::ProtocolError("Invalid response".to_string()))
+
+        Err(MCPClientError::ProtocolError(
+            "Invalid response".to_string(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::HashMap;
     use tokio::time::{sleep, Duration};
-    use serde_json::json;
 
     #[tokio::test]
     async fn test_stdio_client_creation() {
@@ -459,7 +505,7 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
         assert_eq!(client.state(), ClientState::Initialized);
         assert_eq!(client.base.params.command, "echo");
@@ -470,16 +516,19 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("TEST_VAR".to_string(), "test_value".to_string());
         env.insert("PATH".to_string(), "/usr/bin".to_string());
-        
+
         let params = StdioServerParameters {
             command: "echo".to_string(),
             args: vec!["test".to_string()],
             env,
             cwd: Some("/tmp".to_string()),
         };
-        
+
         let client = StdioMCPClient::new(params);
-        assert_eq!(client.base.params.env.get("TEST_VAR"), Some(&"test_value".to_string()));
+        assert_eq!(
+            client.base.params.env.get("TEST_VAR"),
+            Some(&"test_value".to_string())
+        );
         assert_eq!(client.base.params.cwd, Some("/tmp".to_string()));
     }
 
@@ -491,14 +540,14 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 初始会话ID应该为空 / Initial session ID should be None
         let session_id = client.session_id.lock().await;
         assert!(session_id.is_none());
         drop(session_id);
-        
+
         // 设置会话ID / Set session ID
         *client.session_id.lock().await = Some("session123".to_string());
         let session_id = client.session_id.lock().await;
@@ -513,19 +562,19 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 启动子进程
         let result = client.start_child_process(&client.base.params).await;
         assert!(result.is_ok());
-        
+
         // 子进程应该成功启动
         let mut child = result.unwrap();
-        
+
         // 等待一小段时间让进程运行
         sleep(Duration::from_millis(100)).await;
-        
+
         // 尝试杀死进程（清理）
         let _ = child.kill().await;
     }
@@ -538,13 +587,16 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params.clone());
-        
+
         // 启动不存在的命令应该失败
         let result = client.start_child_process(&params).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -555,14 +607,17 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 没有进程时发送请求应该失败
         let request = json!({"jsonrpc": "2.0", "method": "test"});
         let result = client.send_request(&request).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -573,14 +628,17 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 在已连接状态下尝试连接应该失败
         client.base.update_state(ClientState::Connected).await;
         let result = client.connect().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -591,13 +649,16 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 在未连接状态下尝试断开应该失败
         let result = client.disconnect().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -608,13 +669,16 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 未连接状态下调用 list_tools 应该失败
         let result = client.list_tools().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -625,13 +689,16 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 未连接状态下调用 call_tool 应该失败
         let result = client.call_tool("test_tool", json!({})).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -642,13 +709,16 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 未连接状态下调用 list_windows 应该失败
         let result = client.list_windows().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -659,20 +729,23 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         let resource = Resource {
             uri: "window://123".to_string(),
             name: "Test Window".to_string(),
             description: None,
             mime_type: None,
         };
-        
+
         // 未连接状态下调用 get_window_detail 应该失败
         let result = client.get_window_detail(resource).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
@@ -683,9 +756,9 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 由于 echo 不会返回有效的 JSON-RPC 响应，初始化会失败
         let result = client.initialize_session().await;
         assert!(result.is_err());
@@ -699,22 +772,22 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 设置会话ID
         *client.session_id.lock().await = Some("session123".to_string());
-        
+
         // 设置为已连接状态
         client.base.update_state(ClientState::Connected).await;
-        
+
         // 断开连接（即使失败也应该清理会话ID）
         let _ = client.disconnect().await;
-        
+
         // 验证会话ID被清理
         let session_id = client.session_id.lock().await;
         assert!(session_id.is_none());
-        
+
         // 验证状态变为已断开
         assert_eq!(client.base.get_state().await, ClientState::Disconnected);
     }
@@ -727,24 +800,24 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params.clone());
-        
+
         // 启动一个长时间运行的进程
         let child = client.start_child_process(&params).await.unwrap();
         *client.child_process.lock().await = Some(child);
-        
+
         // 设置为已连接状态（这样 disconnect 才会清理进程）
         client.base.update_state(ClientState::Connected).await;
-        
+
         // 验证进程正在运行
         let child_guard = client.child_process.lock().await;
         assert!(child_guard.is_some());
         drop(child_guard);
-        
+
         // 断开连接应该清理进程
         let _ = client.disconnect().await;
-        
+
         // 验证进程被清理
         let child_guard = client.child_process.lock().await;
         assert!(child_guard.is_none());
@@ -758,12 +831,12 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 模拟已连接状态
         client.base.update_state(ClientState::Connected).await;
-        
+
         // 尝试列出工具（会因为没有有效的 MCP 服务器而返回错误）
         let result = client.list_tools().await;
         assert!(result.is_err());
@@ -777,14 +850,16 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 模拟已连接状态
         client.base.update_state(ClientState::Connected).await;
-        
+
         // 尝试调用工具（会因为没有有效的 MCP 服务器而返回错误）
-        let result = client.call_tool("test_tool", json!({"param": "value"})).await;
+        let result = client
+            .call_tool("test_tool", json!({"param": "value"}))
+            .await;
         assert!(result.is_err());
     }
 
@@ -796,15 +871,15 @@ mod tests {
             env: HashMap::new(),
             cwd: Some("/tmp".to_string()),
         };
-        
+
         let client = StdioMCPClient::new(params.clone());
-        
+
         // 启动子进程并设置工作目录
         let result = client.start_child_process(&params).await;
         assert!(result.is_ok());
-        
+
         let mut child = result.unwrap();
-        
+
         // 等待进程完成
         let _ = child.wait().await;
     }
@@ -817,9 +892,9 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
         };
-        
+
         let client = StdioMCPClient::new(params);
-        
+
         // 验证 Debug trait 实现
         let debug_str = format!("{:?}", client);
         assert!(debug_str.contains("StdioMCPClient"));

@@ -287,12 +287,11 @@ async fn test_list_room_computer_permission_denied() {
                 0
             }
         }
-        serde_json::Value::Object(obj) => {
-            obj.get("sessions")
-                .and_then(|s| s.as_array())
-                .map(|s| s.len())
-                .unwrap_or(0)
-        }
+        serde_json::Value::Object(obj) => obj
+            .get("sessions")
+            .and_then(|s| s.as_array())
+            .map(|s| s.len())
+            .unwrap_or(0),
         _ => 0,
     };
 
@@ -313,10 +312,10 @@ async fn test_list_room_cross_office_access_denied() {
 
     // 创建Agent客户端（在office1）
     let agent_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    
+
     // 等待连接完全建立
     sleep(Duration::from_millis(200)).await;
-    
+
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
 
     // Agent尝试列出不同办公室的会话
@@ -364,17 +363,19 @@ async fn test_list_room_cross_office_access_denied() {
                 0
             }
         }
-        serde_json::Value::Object(obj) => {
-            obj.get("sessions")
-                .and_then(|s| s.as_array())
-                .map(|s| s.len())
-                .unwrap_or(0)
-        }
+        serde_json::Value::Object(obj) => obj
+            .get("sessions")
+            .and_then(|s| s.as_array())
+            .map(|s| s.len())
+            .unwrap_or(0),
         _ => 0,
     };
 
     // 验证返回空会话列表（权限被拒绝）
-    assert_eq!(sessions_count, 0, "Cross-office access should return empty sessions");
+    assert_eq!(
+        sessions_count, 0,
+        "Cross-office access should return empty sessions"
+    );
 
     // 清理
     agent_client.disconnect().await.unwrap();
@@ -503,7 +504,7 @@ async fn test_computer_duplicate_name_rejected() {
 
     // 创建第一个Computer客户端
     let computer1_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    
+
     // 等待连接完全建立
     sleep(Duration::from_millis(200)).await;
 
@@ -519,7 +520,7 @@ async fn test_computer_duplicate_name_rejected() {
     // 创建第二个Computer客户端
     println!("Creating second computer client...");
     let computer2_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    
+
     // 等待连接完全建立
     sleep(Duration::from_millis(200)).await;
 
@@ -529,7 +530,7 @@ async fn test_computer_duplicate_name_rejected() {
         role: Role::Computer,
         name: "duplicate_comp".to_string(),
     };
-    
+
     println!("Sending join_office request from second computer...");
 
     // 创建channel接收响应
@@ -598,7 +599,7 @@ async fn test_computer_different_name_allowed() {
 
     // 创建第一个Computer客户端
     let computer1_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    
+
     // 等待连接完全建立
     sleep(Duration::from_millis(200)).await;
 
@@ -607,7 +608,7 @@ async fn test_computer_different_name_allowed() {
 
     // 创建第二个Computer客户端
     let computer2_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    
+
     // 等待连接完全建立
     sleep(Duration::from_millis(200)).await;
 
@@ -676,7 +677,7 @@ async fn test_computer_switch_room_with_same_name_allowed() {
 
     // 创建Computer客户端
     let computer_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    
+
     // 等待连接完全建立
     sleep(Duration::from_millis(200)).await;
 

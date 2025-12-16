@@ -418,4 +418,3 @@ impl Clone for AsyncSmcpAgent {
         }
     }
 }
-

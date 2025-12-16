@@ -11,7 +11,7 @@ use super::model::*;
 use crate::errors::ComputerError;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
@@ -32,16 +32,16 @@ pub struct BaseMCPClient<P> {
     state_change_callback: Option<Box<dyn Fn(ClientState, ClientState) + Send + Sync>>,
 }
 
-impl<P> BaseMCPClient<P> 
-where 
-    P: Send + Sync + 'static + std::clone::Clone 
+impl<P> BaseMCPClient<P>
+where
+    P: Send + Sync + 'static + std::clone::Clone,
 {
     /// 创建新的基础客户端 / Create new base client
     pub fn new(params: P) -> Self {
         let (state_tx, _) = watch::channel(ClientState::Initialized);
         let state = Arc::new(RwLock::new(ClientState::Initialized));
         let (shutdown_tx, _) = watch::channel(false);
-        
+
         Self {
             params,
             state,
@@ -53,9 +53,9 @@ where
     }
 
     /// 设置状态变化回调 / Set state change callback
-    pub fn set_state_change_callback<F>(&mut self, callback: F) 
-    where 
-        F: Fn(ClientState, ClientState) + Send + Sync + 'static 
+    pub fn set_state_change_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(ClientState, ClientState) + Send + Sync + 'static,
     {
         self.state_change_callback = Some(Box::new(callback));
     }
@@ -75,34 +75,34 @@ where
         let mut state = self.state.write().await;
         let old_state = *state;
         *state = new_state;
-        
+
         // 通知状态变化 / Notify state change
         let _ = self.state_notifier.send(new_state);
-        
+
         // 调用回调 / Call callback
         if let Some(ref callback) = self.state_change_callback {
             callback(old_state, new_state);
         }
-        
+
         debug!("State transition: {} -> {}", old_state, new_state);
     }
 
     /// 启动会话保持任务 / Start session keep-alive task
     #[allow(dead_code)]
     async fn start_keep_alive<T>(&self, session_creator: impl Fn(P) -> T + Send + Sync + 'static)
-    where 
+    where
         T: std::future::Future<Output = Result<(), MCPClientError>> + Send + 'static,
     {
         let params = self.params.clone();
         let mut shutdown_rx = self.create_shutdown_receiver().await;
         let state = self.state.clone();
-        
+
         let handle = tokio::spawn(async move {
             debug!("Session keep-alive task started");
-            
+
             // 创建会话 / Create session
             let session_future = session_creator(params);
-            
+
             tokio::select! {
                 result = session_future => {
                     match result {
@@ -122,10 +122,10 @@ where
                     }
                 }
             }
-            
+
             debug!("Session keep-alive task ended");
         });
-        
+
         *self.keep_alive_handle.lock().await = Some(handle);
     }
 
@@ -136,7 +136,7 @@ where
         if let Some(tx) = shutdown_tx.take() {
             let _ = tx.send(true);
         }
-        
+
         // 等待任务结束 / Wait for task to end
         let mut handle = self.keep_alive_handle.lock().await;
         if let Some(h) = handle.take() {
@@ -145,11 +145,11 @@ where
                 Err(e) => warn!("Keep-alive task stopped with error: {}", e),
             }
         }
-        
+
         // 重新创建关闭信号 / Recreate shutdown signal
         let (tx, _) = watch::channel(false);
         *shutdown_tx = Some(tx);
-        
+
         Ok(())
     }
 
@@ -162,7 +162,10 @@ where
 
     /// 检查是否可以连接 / Check if can connect
     pub async fn can_connect(&self) -> bool {
-        matches!(self.get_state().await, ClientState::Initialized | ClientState::Disconnected)
+        matches!(
+            self.get_state().await,
+            ClientState::Initialized | ClientState::Disconnected
+        )
     }
 
     /// 检查是否可以断开 / Check if can disconnect
@@ -172,20 +175,27 @@ where
 
     /// 执行带超时的操作 / Execute operation with timeout
     #[allow(dead_code)]
-    async fn execute_with_timeout<F, T>(&self, future: F, timeout_secs: u64) -> Result<T, MCPClientError>
-    where 
+    async fn execute_with_timeout<F, T>(
+        &self,
+        future: F,
+        timeout_secs: u64,
+    ) -> Result<T, MCPClientError>
+    where
         F: std::future::Future<Output = Result<T, MCPClientError>>,
     {
         match timeout(Duration::from_secs(timeout_secs), future).await {
             Ok(result) => result,
-            Err(_) => Err(MCPClientError::TimeoutError(format!("Operation timed out after {} seconds", timeout_secs))),
+            Err(_) => Err(MCPClientError::TimeoutError(format!(
+                "Operation timed out after {} seconds",
+                timeout_secs
+            ))),
         }
     }
 }
 
 #[async_trait]
 impl<P> MCPClientProtocol for BaseMCPClient<P>
-where 
+where
     P: Send + Sync + Clone + 'static,
 {
     fn state(&self) -> ClientState {
@@ -196,18 +206,17 @@ where
             // 如果锁被占用，返回一个默认值或尝试阻塞读取
             // 在测试环境中，我们通常可以假设锁不会被长时间占用
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    self.get_state().await
-                })
+                tokio::runtime::Handle::current().block_on(async { self.get_state().await })
             })
         }
     }
 
     async fn connect(&self) -> Result<(), MCPClientError> {
         if !self.can_connect().await {
-            return Err(MCPClientError::ConnectionError(
-                format!("Cannot connect in state: {}", self.get_state().await)
-            ));
+            return Err(MCPClientError::ConnectionError(format!(
+                "Cannot connect in state: {}",
+                self.get_state().await
+            )));
         }
 
         self.update_state(ClientState::Connected).await;
@@ -217,12 +226,15 @@ where
 
     async fn disconnect(&self) -> Result<(), MCPClientError> {
         if !self.can_disconnect().await {
-            return Err(MCPClientError::ConnectionError(
-                format!("Cannot disconnect in state: {}", self.get_state().await)
-            ));
+            return Err(MCPClientError::ConnectionError(format!(
+                "Cannot disconnect in state: {}",
+                self.get_state().await
+            )));
         }
 
-        self.stop_keep_alive().await.map_err(|e| MCPClientError::Other(e.to_string()))?;
+        self.stop_keep_alive()
+            .await
+            .map_err(|e| MCPClientError::Other(e.to_string()))?;
         self.update_state(ClientState::Disconnected).await;
         info!("Disconnected successfully");
         Ok(())
@@ -237,7 +249,11 @@ where
         Ok(vec![])
     }
 
-    async fn call_tool(&self, _tool_name: &str, _params: serde_json::Value) -> Result<CallToolResult, MCPClientError> {
+    async fn call_tool(
+        &self,
+        _tool_name: &str,
+        _params: serde_json::Value,
+    ) -> Result<CallToolResult, MCPClientError> {
         if self.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -255,7 +271,10 @@ where
         Ok(vec![])
     }
 
-    async fn get_window_detail(&self, _resource: Resource) -> Result<ReadResourceResult, MCPClientError> {
+    async fn get_window_detail(
+        &self,
+        _resource: Resource,
+    ) -> Result<ReadResourceResult, MCPClientError> {
         if self.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -277,14 +296,15 @@ pub enum StateTransition {
 impl StateTransition {
     /// 检查状态转换是否有效 / Check if state transition is valid
     pub fn is_valid(from: ClientState, to: ClientState) -> bool {
-        matches!((from, to), 
-        (ClientState::Initialized, ClientState::Connected) |
-        (ClientState::Connected, ClientState::Disconnected) |
-        (_, ClientState::Error) |
-        (ClientState::Error, ClientState::Initialized) |
-        (ClientState::Disconnected, ClientState::Connected) |
-        (ClientState::Disconnected, ClientState::Initialized)
-    )
+        matches!(
+            (from, to),
+            (ClientState::Initialized, ClientState::Connected)
+                | (ClientState::Connected, ClientState::Disconnected)
+                | (_, ClientState::Error)
+                | (ClientState::Error, ClientState::Initialized)
+                | (ClientState::Disconnected, ClientState::Connected)
+                | (ClientState::Disconnected, ClientState::Initialized)
+        )
     }
 }
 
@@ -296,18 +316,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_transition_validity() {
-        assert!(StateTransition::is_valid(ClientState::Initialized, ClientState::Connected));
-        assert!(StateTransition::is_valid(ClientState::Connected, ClientState::Disconnected));
-        assert!(StateTransition::is_valid(ClientState::Connected, ClientState::Error));
-        assert!(StateTransition::is_valid(ClientState::Error, ClientState::Initialized));
-        assert!(!StateTransition::is_valid(ClientState::Connected, ClientState::Initialized));
+        assert!(StateTransition::is_valid(
+            ClientState::Initialized,
+            ClientState::Connected
+        ));
+        assert!(StateTransition::is_valid(
+            ClientState::Connected,
+            ClientState::Disconnected
+        ));
+        assert!(StateTransition::is_valid(
+            ClientState::Connected,
+            ClientState::Error
+        ));
+        assert!(StateTransition::is_valid(
+            ClientState::Error,
+            ClientState::Initialized
+        ));
+        assert!(!StateTransition::is_valid(
+            ClientState::Connected,
+            ClientState::Initialized
+        ));
     }
 
     #[tokio::test]
     async fn test_base_client_state_management() {
         let client = BaseMCPClient::new("test");
         assert_eq!(client.get_state().await, ClientState::Initialized);
-        
+
         // Test state change notification
         let mut rx = client.get_state_notifier();
         assert_eq!(*rx.borrow_and_update(), ClientState::Initialized);
@@ -318,17 +353,17 @@ mod tests {
         let mut client = BaseMCPClient::new("test");
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
-        
+
         client.set_state_change_callback(move |from, to| {
             call_count_clone.fetch_add(1, Ordering::SeqCst);
             println!("State changed from {} to {}", from, to);
         });
-        
+
         // 触发状态变化 / Trigger state change
         client.update_state(ClientState::Connected).await;
         assert_eq!(client.get_state().await, ClientState::Connected);
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
-        
+
         // 再次触发状态变化 / Trigger another state change
         client.update_state(ClientState::Disconnected).await;
         assert_eq!(client.get_state().await, ClientState::Disconnected);
@@ -338,18 +373,18 @@ mod tests {
     #[tokio::test]
     async fn test_can_connect() {
         let client = BaseMCPClient::new("test");
-        
+
         // 初始状态可以连接 / Can connect in initial state
         assert!(client.can_connect().await);
-        
+
         // 连接后不能再次连接 / Cannot connect after connected
         client.update_state(ClientState::Connected).await;
         assert!(!client.can_connect().await);
-        
+
         // 断开后可以重新连接 / Can reconnect after disconnect
         client.update_state(ClientState::Disconnected).await;
         assert!(client.can_connect().await);
-        
+
         // 错误状态下不能连接 / Cannot connect in error state
         client.update_state(ClientState::Error).await;
         assert!(!client.can_connect().await);
@@ -358,14 +393,14 @@ mod tests {
     #[tokio::test]
     async fn test_can_disconnect() {
         let client = BaseMCPClient::new("test");
-        
+
         // 初始状态不能断开 / Cannot disconnect in initial state
         assert!(!client.can_disconnect().await);
-        
+
         // 连接后可以断开 / Can disconnect after connected
         client.update_state(ClientState::Connected).await;
         assert!(client.can_disconnect().await);
-        
+
         // 断开后不能再次断开 / Cannot disconnect after disconnected
         client.update_state(ClientState::Disconnected).await;
         assert!(!client.can_disconnect().await);
@@ -374,13 +409,13 @@ mod tests {
     #[tokio::test]
     async fn test_create_shutdown_receiver() {
         let client = BaseMCPClient::new("test");
-        
+
         // 创建关闭信号接收器 / Create shutdown signal receiver
         let mut rx = client.create_shutdown_receiver().await;
-        
+
         // 初始值应该是 false / Initial value should be false
         assert!(!*rx.borrow_and_update());
-        
+
         // 发送关闭信号 / Send shutdown signal
         {
             let shutdown_tx = client.shutdown_tx.lock().await;
@@ -388,7 +423,7 @@ mod tests {
                 let _ = tx.send(true);
             }
         }
-        
+
         // 等待信号传播 / Wait for signal propagation
         sleep(Duration::from_millis(100)).await;
         assert!(rx.has_changed().unwrap_or(false));
@@ -397,13 +432,13 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_timeout_success() {
         let client = BaseMCPClient::new("test");
-        
+
         // 测试成功的操作 / Test successful operation
         let future = async {
             sleep(Duration::from_millis(100)).await;
             Ok::<String, MCPClientError>("success".to_string())
         };
-        
+
         let result = client.execute_with_timeout(future, 1).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "success");
@@ -412,34 +447,37 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_timeout_failure() {
         let client = BaseMCPClient::new("test");
-        
+
         // 测试超时的操作 / Test timeout operation
         let future = async {
             sleep(Duration::from_secs(2)).await;
             Ok::<String, MCPClientError>("success".to_string())
         };
-        
+
         let result = client.execute_with_timeout(future, 1).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::TimeoutError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::TimeoutError(_)
+        ));
     }
 
     #[tokio::test]
     async fn test_start_keep_alive() {
         let client = BaseMCPClient::new("test");
-        
+
         // 创建一个模拟的会话创建器 / Create a mock session creator
         let session_creator = |_params: &str| async {
             sleep(Duration::from_millis(100)).await;
             Ok::<(), MCPClientError>(())
         };
-        
+
         // 启动会话保持任务 / Start keep-alive task
         client.start_keep_alive(session_creator).await;
-        
+
         // 等待一小段时间让任务运行 / Wait a bit for task to run
         sleep(Duration::from_millis(50)).await;
-        
+
         // 停止会话保持任务 / Stop keep-alive task
         client.stop_keep_alive().await.unwrap();
     }
@@ -447,21 +485,23 @@ mod tests {
     #[tokio::test]
     async fn test_start_keep_alive_with_error() {
         let client = BaseMCPClient::new("test");
-        
+
         // 创建一个会失败的会话创建器 / Create a failing session creator
         let session_creator = |_params: &str| async {
-            Err::<(), MCPClientError>(MCPClientError::ConnectionError("Failed to create session".to_string()))
+            Err::<(), MCPClientError>(MCPClientError::ConnectionError(
+                "Failed to create session".to_string(),
+            ))
         };
-        
+
         // 启动会话保持任务 / Start keep-alive task
         client.start_keep_alive(session_creator).await;
-        
+
         // 等待任务完成 / Wait for task to complete
         sleep(Duration::from_millis(100)).await;
-        
+
         // 检查状态是否变为错误 / Check if state changed to error
         assert_eq!(client.get_state().await, ClientState::Error);
-        
+
         // 停止会话保持任务 / Stop keep-alive task
         client.stop_keep_alive().await.unwrap();
     }
@@ -469,52 +509,64 @@ mod tests {
     #[tokio::test]
     async fn test_protocol_connect_state_check() {
         let client = BaseMCPClient::new("test");
-        
+
         // 在已连接状态下尝试连接应该失败 / Should fail if already connected
         client.update_state(ClientState::Connected).await;
         let result = client.connect().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
     async fn test_protocol_disconnect_state_check() {
         let client = BaseMCPClient::new("test");
-        
+
         // 在未连接状态下尝试断开应该失败 / Should fail if not connected
         let result = client.disconnect().await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MCPClientError::ConnectionError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MCPClientError::ConnectionError(_)
+        ));
     }
 
     #[tokio::test]
     async fn test_protocol_methods_require_connection() {
         let client = BaseMCPClient::new("test");
-        
+
         // 所有方法都应该在未连接状态下失败 / All methods should fail when not connected
         assert!(client.list_tools().await.is_err());
-        assert!(client.call_tool("test", serde_json::json!({})).await.is_err());
+        assert!(client
+            .call_tool("test", serde_json::json!({}))
+            .await
+            .is_err());
         assert!(client.list_windows().await.is_err());
-        assert!(client.get_window_detail(crate::mcp_clients::Resource {
-            uri: "test://".to_string(),
-            name: "test".to_string(),
-            description: None,
-            mime_type: None,
-        }).await.is_err());
+        assert!(client
+            .get_window_detail(crate::mcp_clients::Resource {
+                uri: "test://".to_string(),
+                name: "test".to_string(),
+                description: None,
+                mime_type: None,
+            })
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn test_multiple_state_change_listeners() {
         let client = BaseMCPClient::new("test");
-        
+
         // 创建多个监听器 / Create multiple listeners
         let mut rx1 = client.get_state_notifier();
         let mut rx2 = client.get_state_notifier();
         let mut rx3 = client.get_state_notifier();
-        
+
         // 更新状态 / Update state
         client.update_state(ClientState::Connected).await;
-        
+
         // 所有监听器都应该收到通知 / All listeners should receive notification
         assert_eq!(*rx1.borrow_and_update(), ClientState::Connected);
         assert_eq!(*rx2.borrow_and_update(), ClientState::Connected);

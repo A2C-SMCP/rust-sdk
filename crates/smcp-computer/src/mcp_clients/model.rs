@@ -309,24 +309,31 @@ pub struct CommandInput {
 pub trait MCPClientProtocol: Send + Sync {
     /// 获取客户端状态 / Get client state
     fn state(&self) -> ClientState;
-    
+
     /// 连接MCP服务器 / Connect to MCP server
     async fn connect(&self) -> Result<(), MCPClientError>;
-    
+
     /// 断开连接 / Disconnect
     async fn disconnect(&self) -> Result<(), MCPClientError>;
-    
+
     /// 获取可用工具列表 / Get available tools list
     async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError>;
-    
+
     /// 调用工具 / Call tool
-    async fn call_tool(&self, tool_name: &str, params: serde_json::Value) -> Result<CallToolResult, MCPClientError>;
-    
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<CallToolResult, MCPClientError>;
+
     /// 列出窗口资源 / List window resources
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError>;
-    
+
     /// 获取窗口详情 / Get window detail
-    async fn get_window_detail(&self, resource: Resource) -> Result<ReadResourceResult, MCPClientError>;
+    async fn get_window_detail(
+        &self,
+        resource: Resource,
+    ) -> Result<ReadResourceResult, MCPClientError>;
 }
 
 /// 客户端状态 / Client state
@@ -450,7 +457,10 @@ pub enum Content {
     Image { data: String, mime_type: String },
     /// 资源内容 / Resource content
     #[serde(rename = "resource")]
-    Resource { uri: String, mime_type: Option<String> },
+    Resource {
+        uri: String,
+        mime_type: Option<String>,
+    },
 }
 
 /// 读取资源结果 / Read resource result

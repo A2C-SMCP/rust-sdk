@@ -1,3 +1,4 @@
+use super::http_client::HttpMCPClient;
 /**
 * 文件名: utils
 * 作者: JQQ
@@ -8,9 +9,8 @@
 * 描述: MCP客户端工具函数
 */
 use super::model::*;
-use super::stdio_client::StdioMCPClient;
-use super::http_client::HttpMCPClient;
 use super::sse_client::SseMCPClient;
+use super::stdio_client::StdioMCPClient;
 use std::sync::Arc as StdArc;
 
 /// 根据配置创建客户端 / Create client based on configuration
@@ -19,12 +19,8 @@ pub fn client_factory(config: MCPServerConfig) -> StdArc<dyn MCPClientProtocol> 
         MCPServerConfig::Stdio(config) => {
             StdArc::new(StdioMCPClient::new(config.server_parameters))
         }
-        MCPServerConfig::Sse(config) => {
-            StdArc::new(SseMCPClient::new(config.server_parameters))
-        }
-        MCPServerConfig::Http(config) => {
-            StdArc::new(HttpMCPClient::new(config.server_parameters))
-        }
+        MCPServerConfig::Sse(config) => StdArc::new(SseMCPClient::new(config.server_parameters)),
+        MCPServerConfig::Http(config) => StdArc::new(HttpMCPClient::new(config.server_parameters)),
     }
 }
 
@@ -49,7 +45,7 @@ mod tests {
                 cwd: None,
             },
         });
-        
+
         let client = client_factory(config);
         assert_eq!(client.state(), ClientState::Initialized);
     }
@@ -68,7 +64,7 @@ mod tests {
                 headers: HashMap::new(),
             },
         });
-        
+
         let client = client_factory(config);
         assert_eq!(client.state(), ClientState::Initialized);
     }
@@ -87,7 +83,7 @@ mod tests {
                 headers: HashMap::new(),
             },
         });
-        
+
         let client = client_factory(config);
         assert_eq!(client.state(), ClientState::Initialized);
     }

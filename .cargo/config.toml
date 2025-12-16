@@ -14,7 +14,7 @@ test-e2e-playwright = "test -p smcp-computer --test playwright --features e2e"
 test-all-cov = "llvm-cov --workspace --all-features --no-fail-fast --text --summary-only"
 
 # 检查相关别名 / Check aliases
-check = "check --workspace"
+check-workspace = "check --workspace"
 check-all = "check --workspace --all-features"
 
 # 构建相关别名 / Build aliases
@@ -22,7 +22,7 @@ build = "build --workspace"
 build-all = "build --workspace --all-features"
 
 # 代码质量别名 / Code quality aliases
-fmt = "fmt --all"
+format = "fmt --all"
 clippy-workspace = "clippy --workspace --all-targets --all-features -- -D warnings"
 clippy-loose = "clippy --workspace --all-targets --all-features"
 

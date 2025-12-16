@@ -8,7 +8,9 @@
 * 描述: 输入处理器，负责协调各种输入提供者
 */
 use super::model::*;
-use super::providers::{CliInputProvider, CompositeInputProvider, EnvironmentInputProvider, InputProvider};
+use super::providers::{
+    CliInputProvider, CompositeInputProvider, EnvironmentInputProvider, InputProvider,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,9 +34,9 @@ impl InputHandler {
         let provider: Box<dyn InputProvider> = Box::new(
             CompositeInputProvider::new()
                 .add_provider(Box::new(EnvironmentInputProvider::new()))
-                .add_provider(Box::new(CliInputProvider::new()))
+                .add_provider(Box::new(CliInputProvider::new())),
         );
-        
+
         Self {
             provider: Arc::from(provider),
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -43,8 +45,8 @@ impl InputHandler {
     }
 
     /// 使用自定义提供者创建输入处理器 / Create input handler with custom provider
-    pub fn with_provider<P>(provider: P) -> Self 
-    where 
+    pub fn with_provider<P>(provider: P) -> Self
+    where
         P: InputProvider + 'static,
     {
         Self {
@@ -61,9 +63,13 @@ impl InputHandler {
     }
 
     /// 获取单个输入 / Get single input
-    pub async fn get_input(&self, request: InputRequest, context: InputContext) -> InputResult<InputResponse> {
+    pub async fn get_input(
+        &self,
+        request: InputRequest,
+        context: InputContext,
+    ) -> InputResult<InputResponse> {
         debug!("Getting input for: {} (context: {:?})", request.id, context);
-        
+
         // 检查缓存 / Check cache
         if self.enable_cache {
             let cache_key = self.build_cache_key(&request.id, &context);
@@ -76,10 +82,10 @@ impl InputHandler {
                 });
             }
         }
-        
+
         // 从提供者获取输入 / Get input from provider
         let mut response = self.provider.get_input(&request, &context).await;
-        
+
         // 如果获取失败且有默认值，返回默认值
         // If failed and has default value, return default value
         if response.is_err() && request.default.is_some() && !request.required {
@@ -90,7 +96,7 @@ impl InputHandler {
                 cancelled: false,
             });
         }
-        
+
         // 缓存结果 / Cache result
         if self.enable_cache {
             if let Ok(ref resp) = response {
@@ -100,7 +106,7 @@ impl InputHandler {
                 }
             }
         }
-        
+
         response
     }
 
@@ -111,7 +117,7 @@ impl InputHandler {
         context: InputContext,
     ) -> InputResult<Vec<InputResponse>> {
         let mut responses = Vec::new();
-        
+
         for request in requests {
             match self.get_input(request, context.clone()).await {
                 Ok(response) => responses.push(response),
@@ -121,7 +127,7 @@ impl InputHandler {
                 }
             }
         }
-        
+
         Ok(responses)
     }
 
@@ -142,25 +148,25 @@ impl InputHandler {
     /// 构建缓存键 / Build cache key
     fn build_cache_key(&self, id: &str, context: &InputContext) -> String {
         let mut key = id.to_string();
-        
+
         if let Some(server) = &context.server_name {
             key = format!("{}:{}", key, server);
         }
-        
+
         if let Some(tool) = &context.tool_name {
             key = format!("{}:{}", key, tool);
         }
-        
+
         // 添加其他元数据 / Add other metadata
         if !context.metadata.is_empty() {
             let mut metadata_pairs: Vec<_> = context.metadata.iter().collect();
             metadata_pairs.sort_by(|(k1, _), (k2, _)| k1.cmp(k2)); // 确保顺序一致 / Ensure consistent order
-            
+
             for (k, v) in metadata_pairs {
                 key = format!("{}:{}={}", key, k, v);
             }
         }
-        
+
         key
     }
 
@@ -212,7 +218,9 @@ impl InputHandler {
                 id: input.id.clone(),
                 input_type: InputType::Command {
                     command: input.command.clone(),
-                    args: input.args.as_ref()
+                    args: input
+                        .args
+                        .as_ref()
                         .map(|m| m.values().cloned().collect())
                         .unwrap_or_default(),
                 },
@@ -233,21 +241,21 @@ impl InputHandler {
     ) -> InputResult<HashMap<String, InputValue>> {
         let mut results = HashMap::new();
         let mut requests = Vec::new();
-        
+
         // 创建请求 / Create requests
         for input in inputs {
             let request = self.create_request_from_mcp_input(input, None);
             requests.push(request);
         }
-        
+
         // 获取输入 / Get inputs
         let responses = self.get_inputs(requests, context).await?;
-        
+
         // 收集结果 / Collect results
         for response in responses {
             results.insert(response.id, response.value);
         }
-        
+
         Ok(results)
     }
 }
@@ -275,7 +283,7 @@ mod tests {
         let context = InputContext::new()
             .with_server_name("test_server".to_string())
             .with_tool_name("test_tool".to_string());
-        
+
         let key = handler.build_cache_key("test_input", &context);
         assert_eq!(key, "test_input:test_server:test_tool");
     }
@@ -284,35 +292,35 @@ mod tests {
     async fn test_cache_operations() {
         let handler = InputHandler::new();
         let _context = InputContext::new();
-        
+
         // 测试缓存设置和获取 / Test cache set and get
         let key = "test_key";
         let value = InputValue::String("test_value".to_string());
-        
+
         handler.cache_value(key.to_string(), value.clone()).await;
         let cached = handler.get_cached_value(key).await;
-        
+
         assert_eq!(cached, Some(value));
     }
 
     #[tokio::test]
     async fn test_create_request_from_mcp_input() {
         let handler = InputHandler::new();
-        
+
         let mcp_input = MCPServerInput::PromptString(PromptStringInput {
             id: "test_input".to_string(),
             description: "Test input".to_string(),
             default: Some("default".to_string()),
             password: Some(false),
         });
-        
+
         let request = handler.create_request_from_mcp_input(&mcp_input, None);
-        
+
         assert_eq!(request.id, "test_input");
         assert_eq!(request.title, "Test input");
         assert_eq!(request.description, "Test input");
         assert!(request.required);
-        
+
         match request.input_type {
             InputType::String { password, .. } => {
                 assert_eq!(password, Some(false));

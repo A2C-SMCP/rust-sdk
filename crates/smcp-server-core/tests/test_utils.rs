@@ -212,10 +212,10 @@ pub async fn join_office(
         "office_id": office_id,
         "name": name
     });
-    
+
     // 使用 emit_with_ack 确保服务器处理了请求
     let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
-    
+
     client
         .emit_with_ack(
             "server:join_office",
@@ -234,17 +234,19 @@ pub async fn join_office(
         .await
         .expect("join_office ack timeout")
         .unwrap();
-    
+
     // 验证加入成功
     let success = if let Some(arr) = result.as_array() {
         arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
     } else {
         false
     };
-    
+
     if !success {
         let error = if let Some(arr) = result.as_array() {
-            arr.get(1).and_then(|v| v.as_str()).unwrap_or("Unknown error")
+            arr.get(1)
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error")
         } else {
             "Invalid response format"
         };
