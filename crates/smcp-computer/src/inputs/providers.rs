@@ -267,15 +267,36 @@ impl InputProvider for CliInputProvider {
             }
             InputType::Command { command, args } => {
                 debug!("Executing command: {} {:?}", command, args);
-                let output = Command::new(command)
-                    .args(args)
-                    .output()
-                    .map_err(|e| InputError::Other(format!("Command execution failed: {}", e)))?;
+                let output = if cfg!(target_os = "windows") {
+                    // Windows: Use cmd /C for shell mode
+                    let mut cmd = Command::new("cmd");
+                    cmd.arg("/C");
+                    cmd.arg(&command);
+                    for arg in args {
+                        cmd.arg(arg);
+                    }
+                    cmd.output()
+                } else {
+                    // Unix: Use sh -c for shell mode
+                    let mut cmd = Command::new("sh");
+                    cmd.arg("-c");
+                    // Combine command and args into a single shell string
+                    let shell_cmd = if args.is_empty() {
+                        command.clone()
+                    } else {
+                        format!("{} {}", command, args.join(" "))
+                    };
+                    cmd.arg(&shell_cmd);
+                    cmd.output()
+                }
+                .map_err(|e| InputError::Other(format!("Command execution failed: {}", e)))?;
 
                 if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
                     return Err(InputError::Other(format!(
-                        "Command failed: {:?}",
-                        output.stderr
+                        "Command failed with exit code {}: {}",
+                        output.status.code().unwrap_or(-1),
+                        stderr
                     )));
                 }
 

@@ -3,7 +3,7 @@
 
 [alias]
 # 测试相关别名 / Test aliases
-test = "test --workspace"
+test-ws = "test --workspace"
 test-all = "test --workspace --all-features"
 test-e2e = "test --workspace --features e2e -- --ignored"
 test-computer = "test -p smcp-computer"
@@ -18,11 +18,11 @@ check-workspace = "check --workspace"
 check-all = "check --workspace --all-features"
 
 # 构建相关别名 / Build aliases
-build = "build --workspace"
+build-ws = "build --workspace"
 build-all = "build --workspace --all-features"
 
 # 代码质量别名 / Code quality aliases
-format = "fmt --all"
+fmt-all = "fmt --all"
 clippy-workspace = "clippy --workspace --all-targets --all-features -- -D warnings"
 clippy-loose = "clippy --workspace --all-targets --all-features"
 

@@ -12,12 +12,15 @@ pub mod base_client;
 pub mod http_client;
 pub mod manager;
 pub mod model;
+pub mod render;
 pub mod sse_client;
 pub mod stdio_client;
 pub mod utils;
+pub mod vrl_runtime;
 
 // 重新导出核心类型 / Re-export core types
 pub use base_client::BaseMCPClient;
 pub use manager::{MCPServerManager, ToolNameDuplicatedError};
 pub use model::*;
+pub use render::{ConfigRender, RenderError};
 pub use utils::client_factory;

@@ -16,6 +16,7 @@ uuid.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
+async-recursion = "1.0"
 
 rust_socketio.workspace = true
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -45,7 +46,7 @@ tokio-util = "0.7"
 axum = "0.7"
 
 [features]
-default = []
+default = ["vrl"]
 vrl = ["dep:vrl"]
 cli = ["dep:clap", "dep:crossterm", "dep:console"]
 e2e = []

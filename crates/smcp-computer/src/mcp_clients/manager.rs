@@ -9,7 +9,9 @@
 */
 use super::model::*;
 use super::utils::client_factory;
+use super::vrl_runtime::VrlRuntime;
 use crate::errors::ComputerError;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Arc as StdArc;
@@ -495,6 +497,44 @@ impl MCPServerManager {
                         A2C_TOOL_META.to_string(),
                         serde_json::to_value(tool_meta).unwrap(),
                     );
+                }
+            }
+
+            // VRL转换 / VRL transformation
+            if let Some(vrl_script) = config.vrl() {
+                // 获取原始参数用于VRL处理
+                // Note: 这里需要从调用栈获取原始参数，暂时使用空对象
+                let parameters = serde_json::json!({});
+                
+                // 创建VRL事件，包含工具调用结果和元数据
+                let mut event = serde_json::to_value(&result).unwrap_or_default();
+                if let Value::Object(ref mut map) = event {
+                    map.insert("tool_name".to_string(), Value::String(tool_name.to_string()));
+                    map.insert("parameters".to_string(), parameters);
+                }
+                
+                // 执行VRL转换
+                let mut runtime = VrlRuntime::new();
+                match runtime.run(vrl_script, event, "UTC") {
+                    Ok(vrl_result) => {
+                        // 将转换后的结果存储到meta中
+                        if result.meta.is_none() {
+                            result.meta = Some(std::collections::HashMap::new());
+                        }
+                        if let Some(ref mut meta) = result.meta {
+                            // 将转换后的结果序列化为JSON字符串
+                            if let Ok(transformed_json) = serde_json::to_string(&vrl_result.processed_event) {
+                                meta.insert(A2C_VRL_TRANSFORMED.to_string(), Value::String(transformed_json));
+                            }
+                        }
+                        debug!("VRL转换成功 / VRL transformation succeeded for tool '{}'", tool_name);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "VRL转换失败 / VRL transformation failed for tool '{}': {}. 原始结果将正常返回 / Original result will be returned normally.",
+                            tool_name, e
+                        );
+                    }
                 }
             }
         }
