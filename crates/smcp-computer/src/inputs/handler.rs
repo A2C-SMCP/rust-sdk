@@ -243,7 +243,11 @@ impl InputHandler {
                     args: input
                         .args
                         .as_ref()
-                        .map(|m| m.values().cloned().collect())
+                        .map(|m| {
+                            let mut sorted_pairs: Vec<_> = m.iter().collect();
+                            sorted_pairs.sort_by_key(|(k, _)| *k);
+                            sorted_pairs.into_iter().map(|(_, v)| v.clone()).collect()
+                        })
                         .unwrap_or_default(),
                 },
                 title: input.description.clone(),

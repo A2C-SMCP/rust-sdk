@@ -7,7 +7,6 @@
 * 依赖: tokio, serde_json, std::collections::HashMap
 * 描述: 缓存功能的集成测试
 */
-
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::mcp_clients::model::{MCPServerInput, PromptStringInput, PickStringInput, CommandInput};
 use tokio::time::{timeout, Duration};
@@ -195,7 +194,7 @@ async fn test_cache_with_complex_values() {
         })),
     ];
     
-    for (id, input) in inputs {
+    for (_id, input) in inputs {
         computer.add_or_update_input(input).await.unwrap();
     }
     
@@ -203,7 +202,7 @@ async fn test_cache_with_complex_values() {
     let complex_values = vec![
         ("string_input", serde_json::Value::String("complex string with spaces".to_string())),
         ("number_input", serde_json::Value::Number(serde_json::Number::from(123456789))),
-        ("float_input", serde_json::Value::Number(serde_json::Number::from_f64(3.14159).unwrap())),
+        ("float_input", serde_json::Value::Number(serde_json::Number::from_f64(std::f64::consts::PI).unwrap())),
         ("bool_input", serde_json::Value::Bool(true)),
     ];
     
@@ -225,7 +224,7 @@ async fn test_cache_with_complex_values() {
     );
     assert_eq!(
         values.get("float_input"),
-        Some(&serde_json::Value::Number(serde_json::Number::from_f64(3.14159).unwrap()))
+        Some(&serde_json::Value::Number(serde_json::Number::from_f64(std::f64::consts::PI).unwrap()))
     );
     assert_eq!(
         values.get("bool_input"),

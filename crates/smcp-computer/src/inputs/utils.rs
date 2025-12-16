@@ -29,7 +29,7 @@ use crate::errors::ComputerError;
 /// 
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let output = run_command("echo", &["hello"]).await?;
+///     let output = run_command("echo", &["hello".to_string()]).await?;
 ///     assert_eq!(output, "hello");
 ///     Ok(())
 /// }

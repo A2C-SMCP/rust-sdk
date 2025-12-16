@@ -239,7 +239,7 @@ async fn test_computer_input_value_management() {
     // 测试移除输入值
     // Test removing input value
     let removed = computer.remove_input_value("test_input").await.unwrap();
-    assert!(!removed); // 当前功能未实现，返回false / Feature not implemented yet, returns false
+    assert!(removed); // 成功移除输入值 / Successfully removed input value
     
     // 测试清空输入值
     // Test clearing input values
