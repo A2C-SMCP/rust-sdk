@@ -548,6 +548,56 @@ impl<S: Session> Computer<S> {
         Ok(history.clone())
     }
 
+    /// 获取服务器状态列表 / Get server status list
+    pub async fn get_server_status(&self) -> Vec<(String, bool, String)> {
+        let manager_guard = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager_guard {
+            manager.get_server_status().await
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 列出 MCP 服务器配置 / List MCP server configurations
+    pub async fn list_mcp_servers(&self) -> Vec<MCPServerConfig> {
+        let servers = self.mcp_servers.read().await;
+        servers.values().cloned().collect()
+    }
+
+    /// 启动 MCP 客户端 / Start MCP client
+    pub async fn start_mcp_client(&self, server_name: &str) -> ComputerResult<()> {
+        let manager_guard = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager_guard {
+            if server_name == "all" {
+                manager.start_all().await
+            } else {
+                manager.start_client(server_name).await
+            }
+        } else {
+            Err(ComputerError::InvalidState("MCP Manager not initialized".to_string()))
+        }
+    }
+
+    /// 停止 MCP 客户端 / Stop MCP client
+    pub async fn stop_mcp_client(&self, server_name: &str) -> ComputerResult<()> {
+        let manager_guard = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager_guard {
+            if server_name == "all" {
+                manager.stop_all().await
+            } else {
+                manager.stop_client(server_name).await
+            }
+        } else {
+            Err(ComputerError::InvalidState("MCP Manager not initialized".to_string()))
+        }
+    }
+
+    /// 检查 MCP Manager 是否已初始化 / Check if MCP Manager is initialized
+    pub async fn is_mcp_manager_initialized(&self) -> bool {
+        let manager_guard = self.mcp_manager.read().await;
+        manager_guard.is_some()
+    }
+
     /// 设置Socket.IO客户端 / Set Socket.IO client
     pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) {
         let mut socketio_ref = self.socketio_client.write().await;

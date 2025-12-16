@@ -15,6 +15,9 @@ pub mod inputs;
 pub mod mcp_clients;
 pub mod socketio_client;
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 #[cfg(test)]
 pub use errors::{ComputerError, ComputerResult};
 
