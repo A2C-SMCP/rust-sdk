@@ -78,6 +78,14 @@ pub enum ComputerError {
     #[error("Protocol error: {0}")]
     /// 协议错误 / Protocol error
     ProtocolError(String),
+
+    #[error("Socket.IO error: {0}")]
+    /// Socket.IO错误 / Socket.IO error
+    SocketIoError(String),
+
+    #[error("Validation error: {0}")]
+    /// 验证错误 / Validation error
+    ValidationError(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {

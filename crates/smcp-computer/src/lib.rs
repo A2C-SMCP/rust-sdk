@@ -12,6 +12,7 @@ pub mod desktop;
 pub mod errors;
 pub mod inputs;
 pub mod mcp_clients;
+pub mod socketio_client;
 
 #[cfg(test)]
 pub use errors::{ComputerError, ComputerResult};

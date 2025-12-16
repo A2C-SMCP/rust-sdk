@@ -4,6 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+smcp-server-core = { path = "../smcp-server-core" }
+tracing-subscriber = "0.3"
+hyper = { version = "1.0", features = ["full"] }
+tower = "0.4"
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
 [dependencies]
 smcp = { path = "../smcp" }
 
@@ -39,11 +47,6 @@ url = "2.5"
 
 # 密码输入 / Password input
 rpassword = "7.2"
-
-[dev-dependencies]
-tracing-subscriber = "0.3"
-tokio-util = "0.7"
-axum = "0.7"
 
 [features]
 default = ["vrl"]
