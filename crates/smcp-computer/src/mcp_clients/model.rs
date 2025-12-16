@@ -258,6 +258,23 @@ impl MCPServerInput {
             MCPServerInput::Command(input) => &input.description,
         }
     }
+
+    /// 获取默认值 / Get default value
+    pub fn default(&self) -> Option<serde_json::Value> {
+        match self {
+            MCPServerInput::PromptString(input) => {
+                input.default.as_ref().map(|s| serde_json::Value::String(s.clone()))
+            }
+            MCPServerInput::PickString(input) => {
+                input.default.as_ref().map(|s| serde_json::Value::String(s.clone()))
+            }
+            MCPServerInput::Command(_input) => {
+                // Command 类型不支持默认值
+                // Command type doesn't support default values
+                None
+            }
+        }
+    }
 }
 
 /// 字符串输入类型 / String input type

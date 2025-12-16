@@ -655,6 +655,109 @@ impl<S: Session> Computer<S> {
         *socketio_ref = Some(Arc::downgrade(&client));
     }
 
+    /// 连接Socket.IO服务器 / Connect to Socket.IO server
+    pub async fn connect_socketio(
+        &self,
+        url: &str,
+        namespace: &str,
+        auth: &Option<String>,
+        headers: &Option<String>,
+    ) -> ComputerResult<()> {
+        // 确保管理器已初始化 / Ensure manager is initialized
+        let _manager_check = {
+            let manager_guard = self.mcp_manager.read().await;
+            match manager_guard.as_ref() {
+                Some(_m) => {
+                    // Manager 已初始化
+                    // Manager is initialized
+                    true
+                }
+                None => {
+                    return Err(ComputerError::InvalidState(
+                        "MCP Manager not initialized. Please add and start servers first.".to_string(),
+                    ));
+                }
+            }
+        };
+
+        // 由于类型不匹配，我们需要创建一个新的manager实例
+        // Due to type mismatch, we need to create a new manager instance
+        // TODO: 这里应该重新设计以共享同一个manager实例
+        // TODO: Should redesign to share the same manager instance
+        let new_manager = MCPServerManager::new();
+
+        // 创建Socket.IO客户端 / Create Socket.IO client
+        let client = SmcpComputerClient::new(
+            url,
+            Arc::new(RwLock::new(Some(new_manager))),
+            self.name.clone(),
+        ).await?;
+
+        // 设置客户端到Computer / Set client to Computer
+        let client_arc = Arc::new(client);
+        self.set_socketio_client(client_arc.clone()).await;
+
+        info!(
+            "Connected to SMCP server at {} with computer name: {}",
+            url, self.name
+        );
+
+        Ok(())
+    }
+
+    /// 断开Socket.IO连接 / Disconnect Socket.IO
+    pub async fn disconnect_socketio(&self) -> ComputerResult<()> {
+        let mut socketio_ref = self.socketio_client.write().await;
+        *socketio_ref = None;
+        info!("Disconnected from server");
+        Ok(())
+    }
+
+    /// 加入办公室 / Join office
+    pub async fn join_office(&self, office_id: &str, computer_name: &str) -> ComputerResult<()> {
+        let socketio_ref = self.socketio_client.read().await;
+        if let Some(ref weak_client) = *socketio_ref {
+            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
+                client.join_office(office_id).await?;
+                return Ok(());
+            }
+        }
+        Err(ComputerError::InvalidState(
+            "Socket.IO client not connected".to_string(),
+        ))
+    }
+
+    /// 离开办公室 / Leave office
+    pub async fn leave_office(&self) -> ComputerResult<()> {
+        let socketio_ref = self.socketio_client.read().await;
+        if let Some(ref weak_client) = *socketio_ref {
+            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
+                // 获取当前 office_id 并离开
+                // Get current office_id and leave
+                let current_office_id = client.get_current_office_id().await?;
+                client.leave_office(&current_office_id).await?;
+                return Ok(());
+            }
+        }
+        Err(ComputerError::InvalidState(
+            "Socket.IO client not connected".to_string(),
+        ))
+    }
+
+    /// 发送配置更新通知 / Emit config update notification
+    pub async fn emit_update_config(&self) -> ComputerResult<()> {
+        let socketio_ref = self.socketio_client.read().await;
+        if let Some(ref weak_client) = *socketio_ref {
+            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
+                client.emit_update_config().await?;
+                return Ok(());
+            }
+        }
+        Err(ComputerError::InvalidState(
+            "Socket.IO client not connected".to_string(),
+        ))
+    }
+
     /// 关闭Computer / Shutdown computer
     pub async fn shutdown(&self) -> ComputerResult<()> {
         info!("Shutting down Computer: {}", self.name);

@@ -51,6 +51,10 @@ impl CommandHandler {
         println!("  start <name>|all          启动客户端 / start client(s)");
         println!("  stop <name>|all           停止客户端 / stop client(s)");
         println!("  inputs load <@file>       从文件加载 inputs 定义 / load inputs");
+        println!("  inputs add <json|@file>   添加 input 定义 / add input definition");
+        println!("  inputs update <json|@file> 更新 input 定义 / update input definition");
+        println!("  inputs rm <id>            移除 input 定义 / remove input definition");
+        println!("  inputs get <id>           获取 input 定义 / get input definition");
         println!("  inputs list               查看当前inputs的定义 / show inputs");
         println!("  inputs value list         列出当前 inputs 的缓存值 / list current cached input values");
         println!("  inputs value get <id>     获取指定 id 的值 / get cached value by id");
@@ -277,12 +281,19 @@ impl CommandHandler {
     pub async fn connect_socketio(
         &mut self,
         url: &str,
-        _namespace: &str,
-        _auth: &Option<String>,
-        _headers: &Option<String>,
+        namespace: &str,
+        auth: &Option<String>,
+        headers: &Option<String>,
     ) -> Result<(), CommandError> {
-        // TODO: 实现 SocketIO 连接 - 需要等待 SmcpComputerClient 实现
+        self.computer.connect_socketio(url, namespace, auth, headers).await?;
         println!("✅ 已连接到 Socket.IO: {} / Connected to Socket.IO", url);
+        Ok(())
+    }
+
+    /// 断开 SocketIO 连接 / Disconnect SocketIO
+    pub async fn disconnect_socketio(&mut self) -> Result<(), CommandError> {
+        self.computer.disconnect_socketio().await?;
+        println!("✅ 已断开 Socket.IO 连接 / Disconnected from Socket.IO");
         Ok(())
     }
 
@@ -364,6 +375,209 @@ impl CommandHandler {
             }
         }
 
+        Ok(())
+    }
+
+    /// 获取输入定义 / Get input definition
+    pub async fn get_input_definition(&self, id: &str) -> Result<Option<MCPServerInput>, CommandError> {
+        Ok(self.computer.get_input(id).await?)
+    }
+
+    /// 列出所有输入值 / List all input values
+    pub async fn list_input_values(&self) -> Result<HashMap<String, serde_json::Value>, CommandError> {
+        Ok(self.computer.list_input_values().await?)
+    }
+
+    /// 获取输入值 / Get input value
+    pub async fn get_input_value(&self, id: &str) -> Result<Option<serde_json::Value>, CommandError> {
+        Ok(self.computer.get_input_value(id).await?)
+    }
+
+    /// 设置输入值 / Set input value
+    pub async fn set_input_value(&self, id: &str, value: &serde_json::Value) -> Result<(), CommandError> {
+        Ok(self.computer.set_input_value(id, value).await?)
+    }
+
+    /// 删除输入值 / Remove input value
+    pub async fn remove_input_value(&self, id: &str) -> Result<bool, CommandError> {
+        Ok(self.computer.remove_input_value(id).await?)
+    }
+
+    /// 测试渲染（占位符解析）
+    pub async fn render_config(&self, config_str: &str) -> Result<(), CommandError> {
+        use crate::mcp_clients::render::ConfigRender;
+        
+        // 解析配置
+        let config: Value = if let Some(path) = config_str.strip_prefix('@') {
+            let content = std::fs::read_to_string(path)?;
+            serde_json::from_str(&content)?
+        } else {
+            serde_json::from_str(config_str)?
+        };
+        
+        // 创建渲染器
+        let render = ConfigRender::default();
+        
+        // 创建解析器函数
+        let resolver = |id: String| async move {
+            match self.computer.get_input_value(&id).await {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => Err(crate::mcp_clients::render::RenderError::InputNotFound(id)),
+                Err(e) => Err(crate::mcp_clients::render::RenderError::InputNotFound(id)),
+            }
+        };
+        
+        // 执行渲染
+        match render.render(config, resolver).await {
+            Ok(rendered) => {
+                println!("渲染结果 / Rendered result:");
+                println!("{}", serde_json::to_string_pretty(&rendered)?);
+            }
+            Err(e) => {
+                eprintln!("渲染失败 / Render failed: {}", e);
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 工具调用调试 / Tool call debug
+    pub async fn debug_tool_call(&self, tool_call_str: &str) -> Result<(), CommandError> {
+        // 解析工具调用请求
+        let tool_call: Value = if let Some(path) = tool_call_str.strip_prefix('@') {
+            let content = std::fs::read_to_string(path)?;
+            serde_json::from_str(&content)?
+        } else {
+            serde_json::from_str(tool_call_str)?
+        };
+        
+        // 提取必需字段
+        let req_id = tool_call.get("req_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CommandError::InvalidCommand("缺少 req_id 字段 / Missing req_id field".to_string()))?;
+            
+        let tool_name = tool_call.get("tool_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CommandError::InvalidCommand("缺少 tool_name 字段 / Missing tool_name field".to_string()))?;
+            
+        let parameters = tool_call.get("params").unwrap_or(&Value::Object(serde_json::Map::new())).clone();
+        
+        let timeout = tool_call.get("timeout")
+            .and_then(|v| v.as_f64());
+        
+        // 检查 MCP Manager 是否已初始化
+        if !self.computer.is_mcp_manager_initialized().await {
+            println!("警告 / Warning: MCP 管理器未初始化。请先添加并启动服务器 (server add/start) / MCP manager not initialized. Add and start a server first.");
+            return Ok(());
+        }
+        
+        // 执行工具调用
+        match self.computer.execute_tool(req_id, tool_name, parameters, timeout).await {
+            Ok(result) => {
+                println!("工具调用成功 / Tool call succeeded:");
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            Err(e) => {
+                eprintln!("工具调用失败 / Tool call failed: {}", e);
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// 加入 Socket.IO 房间 / Join Socket.IO room
+    pub async fn join_socket_room(&self, office_id: &str, computer_name: &str) -> Result<(), CommandError> {
+        self.computer.join_office(office_id, computer_name).await?;
+        println!("✅ 已加入房间 / Joined office: {}", office_id);
+        Ok(())
+    }
+
+    /// 离开 Socket.IO 房间 / Leave Socket.IO room
+    pub async fn leave_socket_room(&self) -> Result<(), CommandError> {
+        self.computer.leave_office().await?;
+        println!("✅ 已离开房间 / Left office");
+        Ok(())
+    }
+
+    /// 发送配置更新通知 / Send config update notification
+    pub async fn notify_config_update(&self) -> Result<(), CommandError> {
+        self.computer.emit_update_config().await?;
+        println!("✅ 配置更新通知已发送 / Config update notification sent");
+        Ok(())
+    }
+
+    /// 添加或更新输入 / Add or update input
+    pub async fn add_input(&mut self, input_str: &str) -> Result<(), CommandError> {
+        // 解析输入
+        let input_value: Value = if let Some(path) = input_str.strip_prefix('@') {
+            let content = std::fs::read_to_string(path)?;
+            serde_json::from_str(&content)?
+        } else {
+            serde_json::from_str(input_str)?
+        };
+        
+        // 支持单个或数组
+        if let Some(array) = input_value.as_array() {
+            for item in array {
+                let input: MCPServerInput = serde_json::from_value(item.clone())?;
+                self.computer.add_or_update_input(input).await?;
+            }
+        } else {
+            let input: MCPServerInput = serde_json::from_value(input_value)?;
+            self.computer.add_or_update_input(input).await?;
+        }
+        
+        println!("Input(s) 已添加/更新 / Added/Updated");
+        Ok(())
+    }
+
+    /// 更新输入 / Update input
+    pub async fn update_input(&mut self, input_str: &str) -> Result<(), CommandError> {
+        // 解析输入
+        let input_value: Value = if let Some(path) = input_str.strip_prefix('@') {
+            let content = std::fs::read_to_string(path)?;
+            serde_json::from_str(&content)?
+        } else {
+            serde_json::from_str(input_str)?
+        };
+        
+        // 支持单个或数组
+        if let Some(array) = input_value.as_array() {
+            for item in array {
+                let input: MCPServerInput = serde_json::from_value(item.clone())?;
+                self.computer.add_or_update_input(input).await?;
+            }
+        } else {
+            let input: MCPServerInput = serde_json::from_value(input_value)?;
+            self.computer.add_or_update_input(input).await?;
+        }
+        
+        println!("Input(s) 已添加/更新 / Added/Updated");
+        Ok(())
+    }
+
+    /// 移除输入定义 / Remove input definition
+    pub async fn remove_input_def(&mut self, id: &str) -> Result<bool, CommandError> {
+        let removed = self.computer.remove_input(id).await?;
+        if removed {
+            println!("已移除 / Removed");
+        } else {
+            println!("不存在的 id / Not found");
+        }
+        Ok(removed)
+    }
+
+    /// 获取输入定义 / Get input definition
+    pub async fn get_input_def(&self, id: &str) -> Result<(), CommandError> {
+        match self.computer.get_input(id).await? {
+            Some(input) => {
+                println!("Input '{}':", id);
+                println!("{}", serde_json::to_string_pretty(&input)?);
+            }
+            None => {
+                println!("不存在的 id / Not found: {}", id);
+            }
+        }
         Ok(())
     }
 }

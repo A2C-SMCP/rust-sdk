@@ -125,20 +125,46 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
             match parts[1] {
                 "load" => {
                     if parts.len() < 3 {
-                        return Err(CommandError::InvalidCommand("缺少文件路径".to_string()));
+                        return Err(CommandError::InvalidCommand("缺少文件路径 / Missing file path".to_string()));
                     }
                     let path = std::path::Path::new(&parts[2][1..]);
                     handler.load_inputs(path).await?;
+                }
+                "add" => {
+                    if parts.len() < 3 {
+                        return Err(CommandError::InvalidCommand("用法: inputs add <json|@file.json> / Usage: inputs add <json|@file.json>".to_string()));
+                    }
+                    let input_str = line.splitn(3, ' ').nth(2).unwrap();
+                    handler.add_input(input_str).await?;
+                }
+                "update" => {
+                    if parts.len() < 3 {
+                        return Err(CommandError::InvalidCommand("用法: inputs update <json|@file.json> / Usage: inputs update <json|@file.json>".to_string()));
+                    }
+                    let input_str = line.splitn(3, ' ').nth(2).unwrap();
+                    handler.update_input(input_str).await?;
+                }
+                "rm" | "remove" => {
+                    if parts.len() < 3 {
+                        return Err(CommandError::InvalidCommand("用法: inputs rm <id> / Usage: inputs rm <id>".to_string()));
+                    }
+                    handler.remove_input_def(parts[2]).await?;
+                }
+                "get" => {
+                    if parts.len() < 3 {
+                        return Err(CommandError::InvalidCommand("用法: inputs get <id> / Usage: inputs get <id>".to_string()));
+                    }
+                    handler.get_input_def(parts[2]).await?;
                 }
                 "list" => {
                     handler.list_inputs().await?;
                 }
                 "value" => {
-                    handle_inputs_value(handler, &parts).await?;
+                    handle_inputs_value(handler, &parts, line).await?;
                 }
                 _ => {
                     return Err(CommandError::InvalidCommand(format!(
-                        "未知的 inputs 子命令: {}",
+                        "未知的 inputs 子命令: {} / Unknown inputs subcommand: {}",
                         parts[1]
                     )));
                 }
@@ -186,12 +212,15 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                     handler.connect_socketio(url, "/smcp", &None, &None).await?;
                 }
                 "join" => {
-                    // TODO: 实现 join room
-                    println!("加入房间功能暂未实现 / Join room not implemented yet");
+                    if parts.len() < 4 {
+                        return Err(CommandError::InvalidCommand(
+                            "用法: socket join <office_id> <computer_name> / Usage: socket join <office_id> <computer_name>".to_string(),
+                        ));
+                    }
+                    handler.join_socket_room(parts[2], parts[3]).await?;
                 }
                 "leave" => {
-                    // TODO: 实现 leave room
-                    println!("离开房间功能暂未实现 / Leave room not implemented yet");
+                    handler.leave_socket_room().await?;
                 }
                 _ => {
                     return Err(CommandError::InvalidCommand(format!(
@@ -208,23 +237,22 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                 ));
             }
             if parts[1] == "update" {
-                // TODO: 实现通知更新
-                println!("配置更新通知已发送 / Config update notification sent");
+                handler.notify_config_update().await?;
             }
         }
         "render" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("缺少渲染参数".to_string()));
+                return Err(CommandError::InvalidCommand("缺少渲染参数 / Missing render parameter".to_string()));
             }
-            // TODO: 实现渲染功能
-            println!("渲染功能暂未实现 / Render not implemented yet");
+            let config_str = line.splitn(3, ' ').nth(2).unwrap();
+            handler.render_config(config_str).await?;
         }
         "tc" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("缺少调试参数".to_string()));
+                return Err(CommandError::InvalidCommand("缺少调试参数 / Missing debug parameter".to_string()));
             }
-            // TODO: 实现工具调用调试
-            println!("工具调试功能暂未实现 / Tool debug not implemented yet");
+            let tool_call_str = line.splitn(3, ' ').nth(2).unwrap();
+            handler.debug_tool_call(tool_call_str).await?;
         }
         "quit" | "exit" => {
             std::process::exit(0);
@@ -238,8 +266,9 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
 }
 
 async fn handle_inputs_value(
-    _handler: &mut CommandHandler,
+    handler: &mut CommandHandler,
     parts: &[&str],
+    line: &str,
 ) -> Result<(), CommandError> {
     if parts.len() < 3 {
         return Err(CommandError::InvalidCommand(

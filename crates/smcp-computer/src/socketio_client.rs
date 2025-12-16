@@ -26,7 +26,7 @@ use smcp::{
     GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
 };
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 /// SMCP Computer Socket.IO客户端
@@ -45,7 +45,7 @@ impl SmcpComputerClient {
     /// Create a new Socket.IO client
     pub async fn new(
         url: &str,
-        manager: Arc<Mutex<MCPServerManager>>,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
     ) -> ComputerResult<Self> {
         let office_id = Arc::new(RwLock::new(None));
@@ -295,6 +295,17 @@ impl SmcpComputerClient {
         }
     }
 
+    /// 获取当前Office ID / Get current Office ID
+    pub async fn get_current_office_id(&self) -> ComputerResult<String> {
+        let office_id = self.office_id.read().await;
+        match office_id.as_ref() {
+            Some(id) => Ok(id.clone()),
+            None => Err(ComputerError::InvalidState(
+                "Not currently in any office".to_string(),
+            )),
+        }
+    }
+
     /// 离开Office
     /// Leave an Office
     pub async fn leave_office(&self, office_id: &str) -> ComputerResult<()> {
@@ -436,7 +447,7 @@ impl SmcpComputerClient {
     /// Handle tool call event (with ACK response)
     async fn handle_tool_call_with_ack(
         payload: Payload,
-        manager: Arc<Mutex<MCPServerManager>>,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
@@ -461,14 +472,22 @@ impl SmcpComputerClient {
 
         // 执行工具调用 / Execute tool call
         let result = {
-            let manager = manager.lock().await;
-            manager
-                .execute_tool(
-                    &req.tool_name,
-                    req.params,
-                    Some(std::time::Duration::from_secs(req.timeout as u64)),
-                )
-                .await?
+            let manager_guard = manager.read().await;
+            match manager_guard.as_ref() {
+                Some(mgr) => {
+                    mgr.execute_tool(
+                        &req.tool_name,
+                        req.params,
+                        Some(std::time::Duration::from_secs(req.timeout as u64)),
+                    )
+                    .await?
+                }
+                None => {
+                    return Err(ComputerError::InvalidState(
+                        "MCP Manager not initialized".to_string(),
+                    ));
+                }
+            }
         };
 
         let result_value =
@@ -482,7 +501,7 @@ impl SmcpComputerClient {
     /// Handle get tools event (with ACK response)
     async fn handle_get_tools_with_ack(
         payload: Payload,
-        manager: Arc<Mutex<MCPServerManager>>,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
@@ -507,20 +526,29 @@ impl SmcpComputerClient {
 
         // 获取工具列表 / Get tools list
         let tools: Vec<smcp::SMCPTool> = {
-            let manager = manager.lock().await;
-            // 转换Tool为SMCPTool
-            // Convert Tool to SMCPTool
-            let tool_list = manager.list_available_tools().await;
-            tool_list
-                .into_iter()
-                .map(|tool| smcp::SMCPTool {
-                    name: tool.name,
-                    description: tool.description,
-                    params_schema: tool.input_schema,
-                    return_schema: None,
-                    meta: None,
-                })
-                .collect()
+            let manager_guard = manager.read().await;
+            match manager_guard.as_ref() {
+                Some(mgr) => {
+                    // 转换Tool为SMCPTool
+                    // Convert Tool to SMCPTool
+                    let tool_list = mgr.list_available_tools().await;
+                    tool_list
+                        .into_iter()
+                        .map(|tool| smcp::SMCPTool {
+                            name: tool.name,
+                            description: tool.description,
+                            params_schema: tool.input_schema,
+                            return_schema: None,
+                            meta: None,
+                        })
+                        .collect()
+                }
+                None => {
+                    return Err(ComputerError::InvalidState(
+                        "MCP Manager not initialized".to_string(),
+                    ));
+                }
+            }
         };
 
         let response = GetToolsRet {
@@ -540,7 +568,7 @@ impl SmcpComputerClient {
     /// Handle get config event (with ACK response)
     async fn handle_get_config_with_ack(
         payload: Payload,
-        manager: Arc<Mutex<MCPServerManager>>,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
@@ -565,11 +593,20 @@ impl SmcpComputerClient {
 
         // 获取配置 / Get config
         let servers = {
-            let manager = manager.lock().await;
-            // 获取服务器状态并转换为配置格式
-            // Get server status and convert to config format
-            let status = manager.get_server_status().await;
-            serde_json::json!(status)
+            let manager_guard = manager.read().await;
+            match manager_guard.as_ref() {
+                Some(mgr) => {
+                    // 获取服务器状态并转换为配置格式
+                    // Get server status and convert to config format
+                    let status = mgr.get_server_status().await;
+                    serde_json::json!(status)
+                }
+                None => {
+                    return Err(ComputerError::InvalidState(
+                        "MCP Manager not initialized".to_string(),
+                    ));
+                }
+            }
         };
         let inputs = None; // 暂时返回None / Return None for now
 
@@ -583,7 +620,7 @@ impl SmcpComputerClient {
     /// Handle get desktop event (with ACK response)
     async fn handle_get_desktop_with_ack(
         payload: Payload,
-        _manager: Arc<Mutex<MCPServerManager>>,
+        _manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         office_id: Arc<RwLock<Option<String>>>,
         _client: Client,

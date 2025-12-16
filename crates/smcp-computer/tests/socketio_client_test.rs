@@ -21,7 +21,7 @@ mod tests {
     use smcp_server_core::SmcpServerBuilder;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, RwLock};
     use tokio::time::{sleep, Duration};
     use tower::service_fn;
     use tower::Layer;
@@ -144,7 +144,7 @@ mod tests {
         let server_url = start_test_server().await;
 
         // 创建MCP管理器
-        let manager = Arc::new(Mutex::new(MCPServerManager::new()));
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
         let client =
@@ -174,7 +174,7 @@ mod tests {
         let server_url = start_test_server().await;
 
         // 创建MCP管理器
-        let manager = Arc::new(Mutex::new(MCPServerManager::new()));
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
         let client =
@@ -215,7 +215,7 @@ mod tests {
         let server_url = start_test_server().await;
 
         // 创建MCP管理器
-        let manager = Arc::new(Mutex::new(MCPServerManager::new()));
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
         let client =
@@ -253,7 +253,7 @@ mod tests {
         let server_url = start_test_server().await;
 
         // 创建MCP管理器
-        let manager = Arc::new(Mutex::new(MCPServerManager::new()));
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
         let client =
@@ -295,7 +295,7 @@ mod tests {
         let mut clients = Vec::new();
 
         for i in 0..3 {
-            let manager = Arc::new(Mutex::new(MCPServerManager::new()));
+            let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
             let client =
                 SmcpComputerClient::new(&server_url, manager, format!("test_computer_{}", i))
                     .await?;
@@ -333,7 +333,7 @@ mod tests {
         let server_url = start_test_server().await;
 
         // 创建第一个MCP管理器
-        let manager1 = Arc::new(Mutex::new(MCPServerManager::new()));
+        let manager1 = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建第一个客户端连接
         let client1 =
@@ -354,7 +354,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 创建新的MCP管理器和客户端重新连接（使用同一个服务器）
-        let manager2 = Arc::new(Mutex::new(MCPServerManager::new()));
+        let manager2 = Arc::new(RwLock::new(Some(MCPServerManager::new())));
         let client2 = SmcpComputerClient::new(
             &server_url,
             manager2.clone(),
