@@ -17,10 +17,11 @@ use std::str::FromStr;
 const PROMPT: &str = "a2c> ";
 
 pub async fn run_interactive_loop(mut handler: CommandHandler) -> Result<(), CommandError> {
-    let mut rl = Editor::<(), rustyline::history::DefaultHistory>::new().map_err(|e| CommandError::ComputerError(ComputerError::TransportError(e.to_string())))?;
-    
+    let mut rl = Editor::<(), rustyline::history::DefaultHistory>::new()
+        .map_err(|e| CommandError::ComputerError(ComputerError::TransportError(e.to_string())))?;
+
     println!("进入交互模式，输入 help 查看命令 / Enter interactive mode, type 'help' for commands");
-    
+
     loop {
         match rl.readline(PROMPT) {
             Ok(line) => {
@@ -28,9 +29,9 @@ pub async fn run_interactive_loop(mut handler: CommandHandler) -> Result<(), Com
                 if line.is_empty() {
                     continue;
                 }
-                
+
                 rl.add_history_entry(line).ok();
-                
+
                 if let Err(e) = handle_command(&mut handler, line).await {
                     eprintln!("命令执行失败: {}", e);
                 }
@@ -44,11 +45,13 @@ pub async fn run_interactive_loop(mut handler: CommandHandler) -> Result<(), Com
                 break;
             }
             Err(err) => {
-                return Err(CommandError::ComputerError(ComputerError::TransportError(err.to_string())));
+                return Err(CommandError::ComputerError(ComputerError::TransportError(
+                    err.to_string(),
+                )));
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -57,9 +60,9 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
     if parts.is_empty() {
         return Ok(());
     }
-    
+
     let cmd = parts[0].to_lowercase();
-    
+
     match cmd.as_str() {
         "help" | "?" => {
             handler.show_help();
@@ -75,7 +78,9 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
         }
         "server" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("server 子命令缺失".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "server 子命令缺失".to_string(),
+                ));
             }
             match parts[1] {
                 "add" => {
@@ -92,7 +97,10 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                     handler.remove_server(parts[2]).await?;
                 }
                 _ => {
-                    return Err(CommandError::InvalidCommand(format!("未知的 server 子命令: {}", parts[1])));
+                    return Err(CommandError::InvalidCommand(format!(
+                        "未知的 server 子命令: {}",
+                        parts[1]
+                    )));
                 }
             }
         }
@@ -110,7 +118,9 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
         }
         "inputs" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("inputs 子命令缺失".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "inputs 子命令缺失".to_string(),
+                ));
             }
             match parts[1] {
                 "load" => {
@@ -127,14 +137,17 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                     handle_inputs_value(handler, &parts).await?;
                 }
                 _ => {
-                    return Err(CommandError::InvalidCommand(format!("未知的 inputs 子命令: {}", parts[1])));
+                    return Err(CommandError::InvalidCommand(format!(
+                        "未知的 inputs 子命令: {}",
+                        parts[1]
+                    )));
                 }
             }
         }
         "desktop" => {
             let mut size: Option<u32> = None;
             let mut uri: Option<&str> = None;
-            
+
             for arg in parts.iter().skip(1) {
                 if size.is_none() {
                     if let Ok(s) = u32::from_str(arg) {
@@ -146,7 +159,7 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                     uri = Some(arg);
                 }
             }
-            
+
             handler.get_desktop(size, uri).await?;
         }
         "history" => {
@@ -159,11 +172,17 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
         }
         "socket" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("socket 子命令缺失".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "socket 子命令缺失".to_string(),
+                ));
             }
             match parts[1] {
                 "connect" => {
-                    let url = if parts.len() > 2 { parts[2] } else { "http://localhost:3000" };
+                    let url = if parts.len() > 2 {
+                        parts[2]
+                    } else {
+                        "http://localhost:3000"
+                    };
                     handler.connect_socketio(url, "/smcp", &None, &None).await?;
                 }
                 "join" => {
@@ -175,13 +194,18 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                     println!("离开房间功能暂未实现 / Leave room not implemented yet");
                 }
                 _ => {
-                    return Err(CommandError::InvalidCommand(format!("未知的 socket 子命令: {}", parts[1])));
+                    return Err(CommandError::InvalidCommand(format!(
+                        "未知的 socket 子命令: {}",
+                        parts[1]
+                    )));
                 }
             }
         }
         "notify" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("notify 子命令缺失".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "notify 子命令缺失".to_string(),
+                ));
             }
             if parts[1] == "update" {
                 // TODO: 实现通知更新
@@ -209,49 +233,146 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
             return Err(CommandError::InvalidCommand(format!("未知命令: {}", cmd)));
         }
     }
-    
+
     Ok(())
 }
 
-async fn handle_inputs_value(handler: &mut CommandHandler, parts: &[&str]) -> Result<(), CommandError> {
+async fn handle_inputs_value(
+    _handler: &mut CommandHandler,
+    parts: &[&str],
+) -> Result<(), CommandError> {
     if parts.len() < 3 {
-        return Err(CommandError::InvalidCommand("inputs value 子命令缺失".to_string()));
+        return Err(CommandError::InvalidCommand(
+            "inputs value 子命令缺失".to_string(),
+        ));
     }
-    
+
     match parts[2] {
         "list" => {
-            // TODO: 实现 list values
-            println!("列出 values 功能暂未实现 / List values not implemented yet");
+            // 列出当前 inputs 的缓存值 / List current cached input values
+            match handler.list_input_values().await {
+                Ok(values) => {
+                    if values.is_empty() {
+                        println!("(暂无缓存值 / No cached values)");
+                    } else {
+                        println!("当前 inputs 缓存值 / Current input values:");
+                        println!("{}", serde_json::to_string_pretty(&values)?);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("获取缓存值失败: {} / Failed to get cached values: {}", e, e);
+                }
+            }
         }
         "get" => {
             if parts.len() < 4 {
-                return Err(CommandError::InvalidCommand("缺少 id 参数".to_string()));
+                return Err(CommandError::InvalidCommand("缺少 id 参数 / Missing id parameter".to_string()));
             }
-            // TODO: 实现 get value
-            println!("获取 value {} 功能暂未实现 / Get value not implemented yet", parts[3]);
+            // 获取指定 id 的值 / Get value by id
+            match handler.get_input_value(parts[3]).await {
+                Ok(Some(value)) => {
+                    println!("Input '{}' 的值 / Value of '{}':", parts[3]);
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                }
+                Ok(None) => {
+                    println!("未找到或尚未解析: {} / Not found or not resolved yet: {}", parts[3], parts[3]);
+                }
+                Err(e) => {
+                    eprintln!("获取值失败: {} / Failed to get value: {}", e, e);
+                }
+            }
         }
         "set" => {
             if parts.len() < 4 {
-                return Err(CommandError::InvalidCommand("缺少 id 参数".to_string()));
+                return Err(CommandError::InvalidCommand("缺少 id 参数 / Missing id parameter".to_string()));
             }
-            // TODO: 实现 set value
-            println!("设置 value {} 功能暂未实现 / Set value not implemented yet", parts[3]);
+            // 设置指定 id 的值 / Set value by id
+            let input_id = parts[3];
+            
+            // 如果只提供了 id，尝试使用 default 值 / If only id provided, try to use default value
+            let value = if parts.len() == 4 {
+                // 获取 input 定义以获取 default 值 / Get input definition to get default value
+                match handler.get_input_definition(input_id).await {
+                    Ok(Some(input)) => {
+                        if let Some(default_val) = input.default() {
+                            println!("使用 default 值 / Using default value: {}", default_val);
+                            default_val.clone()
+                        } else {
+                            return Err(CommandError::InvalidCommand(
+                                format!("Input '{}' 没有 default 值 / has no default value", input_id)
+                            ));
+                        }
+                    }
+                    Ok(None) => {
+                        return Err(CommandError::InvalidCommand(
+                            format!("不存在的 id / Not found: {}", input_id)
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(CommandError::ComputerError(e));
+                    }
+                }
+            } else {
+                // 解析提供的值 / Parse provided value
+                let value_str = line.splitn(5, ' ').nth(4).unwrap();
+                match serde_json::from_str(value_str) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // 如果不是 JSON，当作字符串处理 / If not JSON, treat as string
+                        serde_json::Value::String(value_str.to_string())
+                    }
+                }
+            };
+            
+            match handler.set_input_value(input_id, &value).await {
+                Ok(_) => {
+                    println!("已设置 / Set successfully");
+                }
+                Err(e) => {
+                    eprintln!("设置值失败: {} / Failed to set value: {}", e, e);
+                }
+            }
         }
         "rm" => {
             if parts.len() < 4 {
-                return Err(CommandError::InvalidCommand("缺少 id 参数".to_string()));
+                return Err(CommandError::InvalidCommand("缺少 id 参数 / Missing id parameter".to_string()));
             }
-            // TODO: 实现 remove value
-            println!("删除 value {} 功能暂未实现 / Remove value not implemented yet", parts[3]);
+            // 删除指定 id 的值 / Remove value by id
+            match handler.remove_input_value(parts[3]).await {
+                Ok(true) => {
+                    println!("已删除 / Removed successfully");
+                }
+                Ok(false) => {
+                    println!("无此缓存 / No such cached value");
+                }
+                Err(e) => {
+                    eprintln!("删除值失败: {} / Failed to remove value: {}", e, e);
+                }
+            }
         }
         "clear" => {
-            // TODO: 实现 clear values
-            println!("清空 values 功能暂未实现 / Clear values not implemented yet");
+            // 清空全部或指定 id 的缓存 / Clear all or specific cached value
+            let target_id = if parts.len() >= 4 { Some(parts[3]) } else { None };
+            match handler.clear_input_values(target_id).await {
+                Ok(_) => {
+                    if let Some(id) = target_id {
+                        println!("已清空 '{}' 的缓存 / Cleared cache for '{}'", id, id);
+                    } else {
+                        println!("已清空所有缓存 / Cleared all cached values");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("清空缓存失败: {} / Failed to clear cache: {}", e, e);
+                }
+            }
         }
         _ => {
-            return Err(CommandError::InvalidCommand(format!("未知的 inputs value 子命令: {}", parts[2])));
+            return Err(CommandError::InvalidCommand(format!(
+                "未知的 inputs value 子命令: {}",
+                parts[2]
+            )));
         }
     }
-    
+
     Ok(())
 }

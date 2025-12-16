@@ -17,15 +17,13 @@ use rust_socketio::{
 };
 use serde_json::Value;
 use smcp::{
-    SMCP_NAMESPACE,
     events::{
-        CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_TOOLS, 
-        SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, 
-        CLIENT_TOOL_CALL, SERVER_UPDATE_CONFIG,
-        SERVER_UPDATE_DESKTOP, SERVER_UPDATE_TOOL_LIST,
+        CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_TOOLS, CLIENT_TOOL_CALL,
+        SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG, SERVER_UPDATE_DESKTOP,
+        SERVER_UPDATE_TOOL_LIST,
     },
-    GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet,
-    GetToolsReq, GetToolsRet, ToolCallReq,
+    GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetToolsReq,
+    GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
 };
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -75,9 +73,17 @@ impl SmcpComputerClient {
                         let office_id = office_id_clone.clone();
                         let client_clone = client.clone();
                         let payload_clone = payload.clone();
-                        
+
                         async move {
-                            match Self::handle_tool_call_with_ack(payload, manager, computer_name, office_id, client_clone).await {
+                            match Self::handle_tool_call_with_ack(
+                                payload,
+                                manager,
+                                computer_name,
+                                office_id,
+                                client_clone,
+                            )
+                            .await
+                            {
                                 Ok((ack_id, response)) => {
                                     if let Some(id) = ack_id {
                                         if let Err(e) = client.ack_with_id(id, response).await {
@@ -101,16 +107,25 @@ impl SmcpComputerClient {
                                     }
                                 }
                             }
-                        }.boxed()
+                        }
+                        .boxed()
                     }
                     CLIENT_GET_TOOLS => {
                         let manager = manager_clone.clone();
                         let computer_name = computer_name_clone.clone();
                         let office_id = office_id_clone.clone();
                         let client_clone = client.clone();
-                        
+
                         async move {
-                            match Self::handle_get_tools_with_ack(payload, manager, computer_name, office_id, client_clone).await {
+                            match Self::handle_get_tools_with_ack(
+                                payload,
+                                manager,
+                                computer_name,
+                                office_id,
+                                client_clone,
+                            )
+                            .await
+                            {
                                 Ok((ack_id, response)) => {
                                     if let Some(id) = ack_id {
                                         if let Err(e) = client.ack_with_id(id, response).await {
@@ -122,16 +137,25 @@ impl SmcpComputerClient {
                                     error!("Error handling get tools: {}", e);
                                 }
                             }
-                        }.boxed()
+                        }
+                        .boxed()
                     }
                     CLIENT_GET_CONFIG => {
                         let manager = manager_clone.clone();
                         let computer_name = computer_name_clone.clone();
                         let office_id = office_id_clone.clone();
                         let client_clone = client.clone();
-                        
+
                         async move {
-                            match Self::handle_get_config_with_ack(payload, manager, computer_name, office_id, client_clone).await {
+                            match Self::handle_get_config_with_ack(
+                                payload,
+                                manager,
+                                computer_name,
+                                office_id,
+                                client_clone,
+                            )
+                            .await
+                            {
                                 Ok((ack_id, response)) => {
                                     if let Some(id) = ack_id {
                                         if let Err(e) = client.ack_with_id(id, response).await {
@@ -143,16 +167,25 @@ impl SmcpComputerClient {
                                     error!("Error handling get config: {}", e);
                                 }
                             }
-                        }.boxed()
+                        }
+                        .boxed()
                     }
                     CLIENT_GET_DESKTOP => {
                         let manager = manager_clone.clone();
                         let computer_name = computer_name_clone.clone();
                         let office_id = office_id_clone.clone();
                         let client_clone = client.clone();
-                        
+
                         async move {
-                            match Self::handle_get_desktop_with_ack(payload, manager, computer_name, office_id, client_clone).await {
+                            match Self::handle_get_desktop_with_ack(
+                                payload,
+                                manager,
+                                computer_name,
+                                office_id,
+                                client_clone,
+                            )
+                            .await
+                            {
                                 Ok((ack_id, response)) => {
                                     if let Some(id) = ack_id {
                                         if let Err(e) = client.ack_with_id(id, response).await {
@@ -164,7 +197,8 @@ impl SmcpComputerClient {
                                     error!("Error handling get desktop: {}", e);
                                 }
                             }
-                        }.boxed()
+                        }
+                        .boxed()
                     }
                     _ => {
                         debug!("Unhandled event: {}", event_str);
@@ -192,7 +226,7 @@ impl SmcpComputerClient {
     /// Join an Office (Socket.IO Room)
     pub async fn join_office(&self, office_id: &str) -> ComputerResult<()> {
         debug!("Joining office: {}", office_id);
-        
+
         // 先设置office_id
         // Set office_id first
         *self.office_id.write().await = Some(office_id.to_string());
@@ -210,7 +244,7 @@ impl SmcpComputerClient {
                 // 服务器返回的是 (bool, Option<String>) 元组序列化后的数组
                 // Server returns serialized array of (bool, Option<String>) tuple
                 debug!("Join office response: {:?}", response);
-                
+
                 // 检查响应是否包含嵌套数组
                 // Check if response contains nested array
                 let actual_response = if response.len() == 1 {
@@ -222,7 +256,7 @@ impl SmcpComputerClient {
                 } else {
                     response
                 };
-                
+
                 if !actual_response.is_empty() {
                     if let Some(success) = actual_response.first().and_then(|v| v.as_bool()) {
                         if success {
@@ -231,18 +265,27 @@ impl SmcpComputerClient {
                         } else {
                             // 加入失败，重置office_id / Reset office_id on failure
                             *self.office_id.write().await = None;
-                            let error_msg = actual_response.get(1)
+                            let error_msg = actual_response
+                                .get(1)
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Unknown error");
-                            Err(ComputerError::SocketIoError(format!("Failed to join office: {}", error_msg)))
+                            Err(ComputerError::SocketIoError(format!(
+                                "Failed to join office: {}",
+                                error_msg
+                            )))
                         }
                     } else {
                         *self.office_id.write().await = None;
-                        Err(ComputerError::SocketIoError(format!("Invalid response format from server: {:?}", actual_response)))
+                        Err(ComputerError::SocketIoError(format!(
+                            "Invalid response format from server: {:?}",
+                            actual_response
+                        )))
                     }
                 } else {
                     *self.office_id.write().await = None;
-                    Err(ComputerError::SocketIoError("Empty response from server".to_string()))
+                    Err(ComputerError::SocketIoError(
+                        "Empty response from server".to_string(),
+                    ))
                 }
             }
             Err(e) => {
@@ -256,14 +299,14 @@ impl SmcpComputerClient {
     /// Leave an Office
     pub async fn leave_office(&self, office_id: &str) -> ComputerResult<()> {
         debug!("Leaving office: {}", office_id);
-        
+
         let req_data = serde_json::json!({
             "office_id": office_id
         });
 
         self.emit(SERVER_LEAVE_OFFICE, req_data).await?;
         *self.office_id.write().await = None;
-        
+
         info!("Left office: {}", office_id);
         Ok(())
     }
@@ -314,7 +357,7 @@ impl SmcpComputerClient {
     /// Emit event without waiting for response
     async fn emit(&self, event: &str, data: Value) -> ComputerResult<()> {
         debug!("Emitting event: {}", event);
-        
+
         self.client
             .emit(event, Payload::Text(vec![data], None))
             .await
@@ -323,10 +366,15 @@ impl SmcpComputerClient {
 
     /// 发送事件并等待响应
     /// Emit event and wait for response
-    async fn call(&self, event: &str, data: Value, timeout_secs: Option<u64>) -> ComputerResult<Vec<Value>> {
+    async fn call(
+        &self,
+        event: &str,
+        data: Value,
+        timeout_secs: Option<u64>,
+    ) -> ComputerResult<Vec<Value>> {
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
         debug!("Calling event: {} with timeout {:?}", event, timeout);
-        
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
 
@@ -338,14 +386,11 @@ impl SmcpComputerClient {
         };
 
         self.client
-            .emit_with_ack(
-                event,
-                Payload::Text(vec![data], None),
-                timeout,
-                callback,
-            )
+            .emit_with_ack(event, Payload::Text(vec![data], None), timeout, callback)
             .await
-            .map_err(|e| ComputerError::SocketIoError(format!("Failed to call {}: {}", event, e)))?;
+            .map_err(|e| {
+                ComputerError::SocketIoError(format!("Failed to call {}: {}", event, e))
+            })?;
 
         // 使用 tokio::time::timeout 来确保 rx.await 不会无限期等待
         // Use tokio::time::timeout to ensure rx.await doesn't wait forever
@@ -356,28 +401,33 @@ impl SmcpComputerClient {
                     Payload::Text(values, _) => {
                         debug!("Received response: {:?}", values);
                         Ok(values)
-                    },
+                    }
                     #[allow(deprecated)]
                     Payload::String(s, _) => {
                         // 尝试解析字符串为JSON数组
                         // Try to parse string as JSON array
-                        let parsed: Vec<Value> = serde_json::from_str(&s)
-                            .map_err(|e| ComputerError::SocketIoError(format!("Failed to parse response: {}", e)))?;
+                        let parsed: Vec<Value> = serde_json::from_str(&s).map_err(|e| {
+                            ComputerError::SocketIoError(format!("Failed to parse response: {}", e))
+                        })?;
                         debug!("Received parsed response: {:?}", parsed);
                         Ok(parsed)
                     }
-                    Payload::Binary(_, _) => {
-                        Err(ComputerError::SocketIoError("Binary response not supported".to_string()))
-                    }
+                    Payload::Binary(_, _) => Err(ComputerError::SocketIoError(
+                        "Binary response not supported".to_string(),
+                    )),
                 }
             }
             Ok(Err(_)) => {
                 error!("Channel closed while calling event: {}", event);
-                Err(ComputerError::SocketIoError("Channel closed while waiting for response".to_string()))
+                Err(ComputerError::SocketIoError(
+                    "Channel closed while waiting for response".to_string(),
+                ))
             }
             Err(_) => {
                 error!("Timeout while calling event: {}", event);
-                Err(ComputerError::SocketIoError("Timeout while waiting for response".to_string()))
+                Err(ComputerError::SocketIoError(
+                    "Timeout while waiting for response".to_string(),
+                ))
             }
         }
     }
@@ -392,7 +442,7 @@ impl SmcpComputerClient {
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<ToolCallReq>(payload)?;
-        
+
         // 验证office_id和computer_name
         // Validate office_id and computer_name
         let current_office_id = office_id.read().await;
@@ -412,15 +462,17 @@ impl SmcpComputerClient {
         // 执行工具调用 / Execute tool call
         let result = {
             let manager = manager.lock().await;
-            manager.execute_tool(
-                &req.tool_name,
-                req.params,
-                Some(std::time::Duration::from_secs(req.timeout as u64)),
-            ).await?
+            manager
+                .execute_tool(
+                    &req.tool_name,
+                    req.params,
+                    Some(std::time::Duration::from_secs(req.timeout as u64)),
+                )
+                .await?
         };
 
-        let result_value = serde_json::to_value(result)
-            .map_err(ComputerError::SerializationError)?;
+        let result_value =
+            serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
 
         info!("Tool call executed successfully: {}", req.tool_name);
         Ok((ack_id, result_value))
@@ -436,7 +488,7 @@ impl SmcpComputerClient {
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetToolsReq>(payload)?;
-        
+
         // 验证office_id和computer_name
         // Validate office_id and computer_name
         let current_office_id = office_id.read().await;
@@ -459,13 +511,16 @@ impl SmcpComputerClient {
             // 转换Tool为SMCPTool
             // Convert Tool to SMCPTool
             let tool_list = manager.list_available_tools().await;
-            tool_list.into_iter().map(|tool| smcp::SMCPTool {
-                name: tool.name,
-                description: tool.description,
-                params_schema: tool.input_schema,
-                return_schema: None,
-                meta: None,
-            }).collect()
+            tool_list
+                .into_iter()
+                .map(|tool| smcp::SMCPTool {
+                    name: tool.name,
+                    description: tool.description,
+                    params_schema: tool.input_schema,
+                    return_schema: None,
+                    meta: None,
+                })
+                .collect()
         };
 
         let response = GetToolsRet {
@@ -473,7 +528,11 @@ impl SmcpComputerClient {
             req_id: req.base.req_id,
         };
 
-        info!("Returned {} tools for agent {}", tools.len(), req.base.agent);
+        info!(
+            "Returned {} tools for agent {}",
+            tools.len(),
+            req.base.agent
+        );
         Ok((ack_id, serde_json::to_value(response)?))
     }
 
@@ -487,7 +546,7 @@ impl SmcpComputerClient {
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetComputerConfigReq>(payload)?;
-        
+
         // 验证office_id和computer_name
         // Validate office_id and computer_name
         let current_office_id = office_id.read().await;
@@ -514,10 +573,7 @@ impl SmcpComputerClient {
         };
         let inputs = None; // 暂时返回None / Return None for now
 
-        let response = GetComputerConfigRet {
-            servers,
-            inputs,
-        };
+        let response = GetComputerConfigRet { servers, inputs };
 
         info!("Returned config for agent {}", req.base.agent);
         Ok((ack_id, serde_json::to_value(response)?))
@@ -533,7 +589,7 @@ impl SmcpComputerClient {
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetDesktopReq>(payload)?;
-        
+
         // 验证office_id和computer_name
         // Validate office_id and computer_name
         let current_office_id = office_id.read().await;
@@ -572,8 +628,8 @@ impl SmcpComputerClient {
         match payload {
             Payload::Text(mut values, ack_id) => {
                 if let Some(value) = values.pop() {
-                    let req = serde_json::from_value(value)
-                        .map_err(ComputerError::SerializationError)?;
+                    let req =
+                        serde_json::from_value(value).map_err(ComputerError::SerializationError)?;
                     Ok((ack_id, req))
                 } else {
                     Err(ComputerError::ProtocolError("Empty payload".to_string()))
@@ -581,13 +637,12 @@ impl SmcpComputerClient {
             }
             #[allow(deprecated)]
             Payload::String(s, ack_id) => {
-                let req = serde_json::from_str(&s)
-                    .map_err(ComputerError::SerializationError)?;
+                let req = serde_json::from_str(&s).map_err(ComputerError::SerializationError)?;
                 Ok((ack_id, req))
             }
-            Payload::Binary(_, _) => {
-                Err(ComputerError::SocketIoError("Binary payload not supported".to_string()))
-            }
+            Payload::Binary(_, _) => Err(ComputerError::SocketIoError(
+                "Binary payload not supported".to_string(),
+            )),
         }
     }
 

@@ -9,11 +9,11 @@
 */
 
 use crate::computer::{Computer, SilentSession};
-use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
 use crate::errors::ComputerError;
+use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
 use serde_json::{json, Value};
-use std::path::Path;
 use std::collections::HashMap;
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -42,7 +42,7 @@ impl CommandHandler {
     /// 显示帮助信息
     pub fn show_help(&self) {
         println!("可用命令 / Commands:");
-        println!("");
+        println!();
         println!("  status                    查看服务器状态 / show server status");
         println!("  tools                     列出可用工具 / list tools");
         println!("  mcp                       显示当前 MCP 配置 / show current MCP config");
@@ -71,22 +71,29 @@ impl CommandHandler {
     /// 显示服务器状态
     pub async fn show_status(&self) -> Result<(), CommandError> {
         println!("服务器状态 / Server Status:");
-        
+
         // 获取 MCP Manager 状态
         if self.computer.is_mcp_manager_initialized().await {
             // 获取服务器状态列表
             let server_status = self.computer.get_server_status().await;
-            let active_count = server_status.iter().filter(|(_, active, _)| *active).count();
-            
+            let active_count = server_status
+                .iter()
+                .filter(|(_, active, _)| *active)
+                .count();
+
             println!("  MCP Manager: 已初始化 / Initialized");
             println!("  Active Servers: {}", active_count);
-            
+
             // 显示每个服务器的状态
             for (name, active, state) in server_status {
-                let status = if active { "运行中 / Running" } else { "已停止 / Stopped" };
+                let status = if active {
+                    "运行中 / Running"
+                } else {
+                    "已停止 / Stopped"
+                };
                 println!("    - {}: {} ({})", name, status, state);
             }
-            
+
             // 获取可用工具数量
             match self.computer.get_available_tools().await {
                 Ok(tools) => println!("  Available Tools: {}", tools.len()),
@@ -97,7 +104,7 @@ impl CommandHandler {
             println!("  Active Servers: 0");
             println!("  Available Tools: 0");
         }
-        
+
         Ok(())
     }
 
@@ -111,7 +118,9 @@ impl CommandHandler {
                 }
             }
             Err(e) => {
-                return Err(CommandError::ComputerError(ComputerError::TransportError(e.to_string())));
+                return Err(CommandError::ComputerError(ComputerError::TransportError(
+                    e.to_string(),
+                )));
             }
         }
         Ok(())
@@ -121,25 +130,24 @@ impl CommandHandler {
     pub async fn show_mcp_config(&self) -> Result<(), CommandError> {
         // 获取服务器配置
         let servers = self.computer.list_mcp_servers().await;
-        
+
         // 获取 inputs
         let inputs = self.computer.list_inputs().await?;
-        
+
         let config = json!({
             "servers": servers,
             "inputs": inputs
         });
-        
+
         println!("当前 MCP 配置 / Current MCP Config:");
         println!("{}", serde_json::to_string_pretty(&config)?);
-        
+
         Ok(())
     }
 
     /// 添加或更新服务器配置
     pub async fn add_server(&mut self, config_str: &str) -> Result<(), CommandError> {
-        let config: Value = if config_str.starts_with('@') {
-            let path = &config_str[1..];
+        let config: Value = if let Some(path) = config_str.strip_prefix('@') {
             let content = std::fs::read_to_string(path)?;
             serde_json::from_str(&content)?
         } else {
@@ -148,19 +156,18 @@ impl CommandHandler {
 
         // 将 JSON 转换为 MCPServerConfig
         let server_config: MCPServerConfig = serde_json::from_value(config)?;
-        
+
         // 添加或更新服务器配置
         self.computer.add_or_update_server(server_config).await?;
-        
+
         println!("✅ 服务器配置已添加/更新 / Server config added/updated");
-        
+
         Ok(())
     }
 
     #[cfg(test)]
     pub async fn add_server_debug(&mut self, config_str: &str) -> Result<(), CommandError> {
-        let config: Value = if config_str.starts_with('@') {
-            let path = &config_str[1..];
+        let config: Value = if let Some(path) = config_str.strip_prefix('@') {
             let content = std::fs::read_to_string(path)?;
             serde_json::from_str(&content)?
         } else {
@@ -180,7 +187,7 @@ impl CommandHandler {
                 return Err(CommandError::JsonError(e));
             }
         }
-        
+
         Ok(())
     }
 
@@ -199,7 +206,10 @@ impl CommandHandler {
                 if target == "all" {
                     println!("✅ 所有服务器启动完成 / All servers started");
                 } else {
-                    println!("✅ 服务器 '{}' 启动完成 / Server '{}' started", target, target);
+                    println!(
+                        "✅ 服务器 '{}' 启动完成 / Server '{}' started",
+                        target, target
+                    );
                 }
             }
             Err(e) => {
@@ -216,7 +226,10 @@ impl CommandHandler {
                 if target == "all" {
                     println!("✅ 所有服务器停止完成 / All servers stopped");
                 } else {
-                    println!("✅ 服务器 '{}' 停止完成 / Server '{}' stopped", target, target);
+                    println!(
+                        "✅ 服务器 '{}' 停止完成 / Server '{}' stopped",
+                        target, target
+                    );
                 }
             }
             Err(e) => {
@@ -230,33 +243,33 @@ impl CommandHandler {
     pub async fn load_inputs(&mut self, path: &Path) -> Result<(), CommandError> {
         let content = std::fs::read_to_string(path)?;
         let inputs_value: Value = serde_json::from_str(&content)?;
-        
+
         // 将 JSON 转换为 Vec<MCPServerInput>
         let inputs_array: Vec<Value> = serde_json::from_value(inputs_value)?;
         let mut inputs_map = HashMap::new();
-        
+
         for input_value in inputs_array {
             let input: MCPServerInput = serde_json::from_value(input_value)?;
             inputs_map.insert(input.id().to_string(), input);
         }
-        
+
         // 更新 inputs
         self.computer.update_inputs(inputs_map).await?;
-        
+
         println!("✅ 已加载 Inputs 配置 / Inputs loaded");
-        
+
         Ok(())
     }
 
     /// 列出 inputs 定义
     pub async fn list_inputs(&self) -> Result<(), CommandError> {
         let inputs = self.computer.list_inputs().await?;
-        
+
         println!("当前 Inputs 定义 / Current Inputs:");
         for input in inputs {
             println!("  - {}", input.id());
         }
-        
+
         Ok(())
     }
 
@@ -264,9 +277,9 @@ impl CommandHandler {
     pub async fn connect_socketio(
         &mut self,
         url: &str,
-        namespace: &str,
-        auth: &Option<String>,
-        headers: &Option<String>,
+        _namespace: &str,
+        _auth: &Option<String>,
+        _headers: &Option<String>,
     ) -> Result<(), CommandError> {
         // TODO: 实现 SocketIO 连接 - 需要等待 SmcpComputerClient 实现
         println!("✅ 已连接到 Socket.IO: {} / Connected to Socket.IO", url);
@@ -277,7 +290,7 @@ impl CommandHandler {
     pub async fn load_config(&mut self, path: &Path) -> Result<(), CommandError> {
         let content = std::fs::read_to_string(path)?;
         let config: Value = serde_json::from_str(&content)?;
-        
+
         // 解析服务器配置数组
         if let Some(servers_array) = config.get("servers").and_then(|v| v.as_array()) {
             for server_value in servers_array {
@@ -285,7 +298,7 @@ impl CommandHandler {
                 self.computer.add_or_update_server(server_config).await?;
             }
         }
-        
+
         // 解析 inputs 配置
         if let Some(inputs_array) = config.get("inputs").and_then(|v| v.as_array()) {
             let mut inputs_map = HashMap::new();
@@ -295,21 +308,25 @@ impl CommandHandler {
             }
             self.computer.update_inputs(inputs_map).await?;
         }
-        
+
         println!("✅ 已加载 Servers 配置 / Servers loaded");
-        
+
         Ok(())
     }
 
     /// 获取桌面信息
-    pub async fn get_desktop(&self, size: Option<u32>, uri: Option<&str>) -> Result<(), CommandError> {
+    pub async fn get_desktop(
+        &self,
+        size: Option<u32>,
+        uri: Option<&str>,
+    ) -> Result<(), CommandError> {
         // TODO: 实现获取桌面信息 - 需要等待 desktop 模块实现
         let desktop = json!({
             "windows": [],
             "size": size,
             "uri": uri
         });
-        
+
         println!("{}", serde_json::to_string_pretty(&desktop)?);
         Ok(())
     }
@@ -317,15 +334,15 @@ impl CommandHandler {
     /// 显示历史记录
     pub async fn show_history(&self, n: Option<usize>) -> Result<(), CommandError> {
         let history = self.computer.get_tool_history().await?;
-        
+
         println!("最近工具调用历史 / Recent Tool Call History:");
-        
+
         if history.is_empty() {
             println!("  (暂无记录 / No records yet)");
         } else {
             let limit = n.unwrap_or(10).min(history.len());
             let start_idx = history.len().saturating_sub(limit);
-            
+
             for (i, record) in history.iter().skip(start_idx).enumerate() {
                 println!(
                     "  {}. [{}] {}::{} - {}{}",
@@ -333,7 +350,11 @@ impl CommandHandler {
                     record.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
                     record.server,
                     record.tool,
-                    if record.success { "成功 / Success" } else { "失败 / Failed" },
+                    if record.success {
+                        "成功 / Success"
+                    } else {
+                        "失败 / Failed"
+                    },
                     if let Some(ref error) = record.error {
                         format!(" - {}", error)
                     } else {
@@ -342,7 +363,7 @@ impl CommandHandler {
                 );
             }
         }
-        
+
         Ok(())
     }
 }
@@ -351,10 +372,8 @@ impl CommandHandler {
 mod tests {
     use super::*;
     use crate::computer::SilentSession;
-    use crate::mcp_clients::model::{StdioServerConfig, StdioServerParameters, PromptStringInput, MCPServerConfig};
-    use std::collections::HashMap;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     /// 创建测试用的 Computer 实例 / Create test Computer instance
     async fn create_test_computer() -> Computer<SilentSession> {
@@ -372,7 +391,7 @@ mod tests {
     async fn test_show_help() {
         let computer = create_test_computer().await;
         let handler = CommandHandler::new(computer);
-        
+
         // 测试帮助信息不会崩溃 / Test help doesn't crash
         handler.show_help();
     }
@@ -381,7 +400,7 @@ mod tests {
     async fn test_show_status_uninitialized() {
         let computer = create_test_computer().await;
         let handler = CommandHandler::new(computer);
-        
+
         // 测试未初始化状态 / Test uninitialized state
         let result = handler.show_status().await;
         assert!(result.is_ok());
@@ -391,7 +410,7 @@ mod tests {
     async fn test_add_server_with_json() {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         // 测试添加服务器配置 / Test adding server config
         let json_config = r#"
 {
@@ -410,7 +429,7 @@ mod tests {
     }
 }
 "#;
-        
+
         let result = handler.add_server_debug(json_config).await;
         assert!(result.is_ok());
     }
@@ -419,10 +438,10 @@ mod tests {
     async fn test_add_server_invalid_json() {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         // 测试无效 JSON / Test invalid JSON
         let invalid_json = "{ invalid json }";
-        
+
         let result = handler.add_server(invalid_json).await;
         assert!(result.is_err());
         matches!(result.unwrap_err(), CommandError::JsonError(_));
@@ -432,31 +451,34 @@ mod tests {
     async fn test_add_server_from_file() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         // 创建临时配置文件 / Create temp config file
         let mut temp_file = NamedTempFile::new()?;
-        writeln!(temp_file, r#"
-{
+        writeln!(
+            temp_file,
+            r#"
+{{
     "type": "Stdio",
     "name": "test_from_file",
     "disabled": false,
     "forbidden_tools": [],
-    "tool_meta": {},
+    "tool_meta": {{}},
     "default_tool_meta": null,
     "vrl": null,
-    "server_parameters": {
+    "server_parameters": {{
         "command": "echo",
         "args": ["hello"],
-        "env": {},
+        "env": {{}},
         "cwd": null
-    }
-}
-        "#)?;
-        
+    }}
+}}
+        "#
+        )?;
+
         let config_path = format!("@{}", temp_file.path().display());
         let result = handler.add_server(&config_path).await;
         assert!(result.is_ok());
-        
+
         Ok(())
     }
 
@@ -464,7 +486,7 @@ mod tests {
     async fn test_remove_server() {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         // 测试移除服务器（即使不存在也应该成功） / Test removing server
         let result = handler.remove_server("non_existent").await;
         assert!(result.is_ok());
@@ -474,11 +496,11 @@ mod tests {
     async fn test_start_stop_client_uninitialized() {
         let computer = create_test_computer().await;
         let handler = CommandHandler::new(computer);
-        
+
         // 测试未初始化时启动客户端 / Test starting client when uninitialized
         let result = handler.start_client("test").await;
         assert!(result.is_ok());
-        
+
         // 测试停止所有客户端 / Test stopping all clients
         let result = handler.stop_client("all").await;
         assert!(result.is_ok());
@@ -488,24 +510,27 @@ mod tests {
     async fn test_load_inputs() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         // 创建临时 inputs 文件 / Create temp inputs file
         let mut temp_file = NamedTempFile::new()?;
-        writeln!(temp_file, r#"
+        writeln!(
+            temp_file,
+            r#"
 [
-    {
+    {{
         "type": "PromptString",
         "id": "test_input",
         "description": "Test input",
         "default": "default_value",
         "password": false
-    }
+    }}
 ]
-        "#)?;
-        
+        "#
+        )?;
+
         let result = handler.load_inputs(temp_file.path()).await;
         assert!(result.is_ok());
-        
+
         Ok(())
     }
 
@@ -513,7 +538,7 @@ mod tests {
     async fn test_list_inputs_empty() {
         let computer = create_test_computer().await;
         let handler = CommandHandler::new(computer);
-        
+
         // 测试列出空的 inputs / Test listing empty inputs
         let result = handler.list_inputs().await;
         assert!(result.is_ok());
@@ -523,7 +548,7 @@ mod tests {
     async fn test_show_history_empty() {
         let computer = create_test_computer().await;
         let handler = CommandHandler::new(computer);
-        
+
         // 测试显示空历史 / Test showing empty history
         let result = handler.show_history(Some(5)).await;
         assert!(result.is_ok());
@@ -533,7 +558,7 @@ mod tests {
     async fn test_get_desktop() {
         let computer = create_test_computer().await;
         let handler = CommandHandler::new(computer);
-        
+
         // 测试获取桌面信息 / Test getting desktop info
         let result = handler.get_desktop(Some(10), Some("test://uri")).await;
         assert!(result.is_ok());
@@ -543,14 +568,16 @@ mod tests {
     async fn test_connect_socketio() {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         // 测试 SocketIO 连接 / Test SocketIO connection
-        let result = handler.connect_socketio(
-            "http://localhost:3000",
-            "/test",
-            &Some("auth_token".to_string()),
-            &Some("header:value".to_string()),
-        ).await;
+        let result = handler
+            .connect_socketio(
+                "http://localhost:3000",
+                "/test",
+                &Some("auth_token".to_string()),
+                &Some("header:value".to_string()),
+            )
+            .await;
         assert!(result.is_ok());
     }
 
@@ -558,43 +585,46 @@ mod tests {
     async fn test_load_config() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         // 创建完整配置文件 / Create complete config file
         let mut temp_file = NamedTempFile::new()?;
-        writeln!(temp_file, r#"
-{
+        writeln!(
+            temp_file,
+            r#"
+{{
     "servers": [
-        {
+        {{
             "type": "Stdio",
             "name": "test_server",
             "disabled": false,
             "forbidden_tools": [],
-            "tool_meta": {},
+            "tool_meta": {{}},
             "default_tool_meta": null,
             "vrl": null,
-            "server_parameters": {
+            "server_parameters": {{
                 "command": "echo",
                 "args": ["test"],
-                "env": {},
+                "env": {{}},
                 "cwd": null
-            }
-        }
+            }}
+        }}
     ],
     "inputs": [
-        {
+        {{
             "type": "PromptString",
             "id": "test_input",
             "description": "Test input",
             "default": "default",
             "password": false
-        }
+        }}
     ]
-}
-        "#)?;
-        
+}}
+        "#
+        )?;
+
         let result = handler.load_config(temp_file.path()).await;
         assert!(result.is_ok());
-        
+
         Ok(())
     }
 
@@ -603,15 +633,27 @@ mod tests {
     async fn test_add_server_validation() {
         let computer = create_test_computer().await;
         let mut handler = CommandHandler::new(computer);
-        
+
         let test_cases = vec![
             // (json, should_succeed, description)
-            (r#"{"type": "Stdio", "name": "test"}"#, false, "Missing required fields"),
-            (r#"{"type": "Invalid", "name": "test"}"#, false, "Invalid server type"),
+            (
+                r#"{"type": "Stdio", "name": "test"}"#,
+                false,
+                "Missing required fields",
+            ),
+            (
+                r#"{"type": "Invalid", "name": "test"}"#,
+                false,
+                "Invalid server type",
+            ),
             (r#""not a json""#, false, "Not a JSON object"),
-            (r#"{"type": "Stdio", "name": "", "server_parameters": {}}"#, false, "Empty name"),
+            (
+                r#"{"type": "Stdio", "name": "", "server_parameters": {}}"#,
+                false,
+                "Empty name",
+            ),
         ];
-        
+
         for (json, should_succeed, description) in test_cases {
             let result = handler.add_server(json).await;
             if should_succeed {

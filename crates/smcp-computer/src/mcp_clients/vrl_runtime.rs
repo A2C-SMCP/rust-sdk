@@ -14,8 +14,8 @@ use {
     serde_json::Value,
     vrl::{
         compiler::{self, runtime::Runtime, TargetValue, TimeZone},
-        value::{Value as VrlValue, Secrets},
         stdlib,
+        value::{Secrets, Value as VrlValue},
     },
 };
 
@@ -71,7 +71,7 @@ impl VrlRuntime {
 
         // 转换JSON事件到VRL Value
         let vrl_value = self.json_to_vrl_value(event)?;
-        
+
         // 创建TargetValue作为执行目标
         let mut target = TargetValue {
             value: vrl_value,
@@ -94,7 +94,7 @@ impl VrlRuntime {
 
         // 获取转换后的值
         let processed = target.value;
-        
+
         // 转换回JSON
         let processed_event = self.vrl_value_to_json(processed)?;
 
@@ -223,18 +223,18 @@ mod tests {
     #[test]
     fn test_vrl_runtime_basic() {
         let mut runtime = VrlRuntime::new();
-        
+
         let script = r#"
             .processed = true
             .status = "ok"
         "#;
-        
+
         let event = json!({
             "original": "value"
         });
-        
+
         let result = runtime.run(script, event, "UTC").unwrap();
-        
+
         // 简化实现目前返回原始事件
         assert_eq!(result.processed_event["original"], "value");
     }
@@ -243,21 +243,21 @@ mod tests {
     #[test]
     fn test_vrl_runtime_complex_event() {
         let mut runtime = VrlRuntime::new();
-        
+
         let script = r#"
             .metadata.transformed = true
             .count = 3
         "#;
-        
+
         let event = json!({
             "items": [1, 2, 3],
             "nested": {
                 "value": 42
             }
         });
-        
+
         let result = runtime.run(script, event, "UTC").unwrap();
-        
+
         // 验证原始数据保持不变
         assert_eq!(result.processed_event["items"].as_array().unwrap().len(), 3);
         assert_eq!(result.processed_event["nested"]["value"], 42);
@@ -267,11 +267,11 @@ mod tests {
     #[test]
     fn test_vrl_runtime_error_handling() {
         let mut runtime = VrlRuntime::new();
-        
+
         // 无效脚本
         let script = ".field =";
         let event = json!({"test": "value"});
-        
+
         assert!(runtime.run(script, event, "UTC").is_err());
     }
 
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn test_json_to_vrl_value_conversion() {
         let runtime = VrlRuntime::new();
-        
+
         // 测试各种JSON类型
         let test_cases = vec![
             (json!(null), "null"),
@@ -289,7 +289,7 @@ mod tests {
             (json!([1, 2, 3]), "array"),
             (json!({"key": "value"}), "object"),
         ];
-        
+
         for (value, description) in test_cases {
             let vrl_value = runtime.json_to_vrl_value(value.clone()).unwrap();
             // 转换回JSON应该保持一致
@@ -300,14 +300,13 @@ mod tests {
 
     #[test]
     fn test_vrl_disabled_feature() {
-
         // 当feature未启用时，所有操作应该返回NotEnabled错误或原始值
         #[cfg(not(feature = "vrl"))]
         assert!(matches!(
             VrlRuntime::check_syntax(".field = 1"),
             Err(VrlError::NotEnabled)
         ));
-        
+
         #[cfg(feature = "vrl")]
         {
             let mut runtime = VrlRuntime::new();
@@ -323,11 +322,17 @@ mod tests {
     #[test]
     fn test_vrl_error_display() {
         let compilation_error = VrlError::Compilation("test error".to_string());
-        assert_eq!(compilation_error.to_string(), "VRL compilation error: test error");
-        
+        assert_eq!(
+            compilation_error.to_string(),
+            "VRL compilation error: test error"
+        );
+
         let runtime_error = VrlError::Runtime("test runtime error".to_string());
-        assert_eq!(runtime_error.to_string(), "VRL runtime error: test runtime error");
-        
+        assert_eq!(
+            runtime_error.to_string(),
+            "VRL runtime error: test runtime error"
+        );
+
         let timezone_error = VrlError::InvalidTimezone("UTC+25".to_string());
         assert_eq!(timezone_error.to_string(), "Invalid timezone: UTC+25");
     }
@@ -338,7 +343,7 @@ mod tests {
         let result = VrlResult {
             processed_event: json!({"test": "value"}),
         };
-        
+
         let debug_str = format!("{:?}", result);
         assert!(debug_str.contains("VrlResult"));
         assert!(debug_str.contains("processed_event"));
@@ -355,17 +360,15 @@ mod tests {
     async fn test_vrl_async_context() {
         // 测试在异步上下文中使用VRL
         let mut runtime = VrlRuntime::new();
-        
+
         let script = ".async_test = true";
         let event = json!({"original": "value"});
-        
-        let result = tokio::task::spawn_blocking(move || {
-            runtime.run(script, event, "UTC")
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        
+
+        let result = tokio::task::spawn_blocking(move || runtime.run(script, event, "UTC"))
+            .await
+            .unwrap()
+            .unwrap();
+
         assert_eq!(result.processed_event["original"], "value");
     }
 }

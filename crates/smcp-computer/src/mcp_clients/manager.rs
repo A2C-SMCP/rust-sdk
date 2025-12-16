@@ -505,14 +505,17 @@ impl MCPServerManager {
                 // 获取原始参数用于VRL处理
                 // Note: 这里需要从调用栈获取原始参数，暂时使用空对象
                 let parameters = serde_json::json!({});
-                
+
                 // 创建VRL事件，包含工具调用结果和元数据
                 let mut event = serde_json::to_value(&result).unwrap_or_default();
                 if let Value::Object(ref mut map) = event {
-                    map.insert("tool_name".to_string(), Value::String(tool_name.to_string()));
+                    map.insert(
+                        "tool_name".to_string(),
+                        Value::String(tool_name.to_string()),
+                    );
                     map.insert("parameters".to_string(), parameters);
                 }
-                
+
                 // 执行VRL转换
                 let mut runtime = VrlRuntime::new();
                 match runtime.run(vrl_script, event, "UTC") {
@@ -523,11 +526,19 @@ impl MCPServerManager {
                         }
                         if let Some(ref mut meta) = result.meta {
                             // 将转换后的结果序列化为JSON字符串
-                            if let Ok(transformed_json) = serde_json::to_string(&vrl_result.processed_event) {
-                                meta.insert(A2C_VRL_TRANSFORMED.to_string(), Value::String(transformed_json));
+                            if let Ok(transformed_json) =
+                                serde_json::to_string(&vrl_result.processed_event)
+                            {
+                                meta.insert(
+                                    A2C_VRL_TRANSFORMED.to_string(),
+                                    Value::String(transformed_json),
+                                );
                             }
                         }
-                        debug!("VRL转换成功 / VRL transformation succeeded for tool '{}'", tool_name);
+                        debug!(
+                            "VRL转换成功 / VRL transformation succeeded for tool '{}'",
+                            tool_name
+                        );
                     }
                     Err(e) => {
                         warn!(

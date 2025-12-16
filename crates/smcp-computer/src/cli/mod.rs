@@ -8,10 +8,9 @@
 * 描述: CLI模块的入口 / CLI module entry point
 */
 
+use crate::computer::{Computer, SilentSession};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use crate::computer::{Computer, SilentSession};
-use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
 
 pub mod commands;
 mod interactive;
@@ -72,7 +71,7 @@ pub enum Commands {
 
 pub fn main() {
     let args = Args::parse();
-    
+
     // 设置颜色控制
     if args.no_color {
         console::set_colors_enabled(false);
@@ -80,7 +79,7 @@ pub fn main() {
 
     // 创建 tokio runtime
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    
+
     rt.block_on(async {
         // Extract needed fields before the match to avoid borrow issues
         let auto_connect = args.auto_connect;
@@ -89,32 +88,53 @@ pub fn main() {
         let namespace = args.namespace.clone();
         let auth = args.auth.clone();
         let headers = args.headers.clone();
-        let no_color = args.no_color;
-        
+
         if let Some(ref command) = args.command {
             match command {
                 Commands::Run { config, inputs } => {
-                    run_command(auto_connect, auto_reconnect, url, namespace, auth, headers, no_color, config.clone(), inputs.clone()).await;
+                    let cli_config = CliConfig {
+                        auto_connect,
+                        auto_reconnect,
+                        url,
+                        namespace,
+                        auth,
+                        headers,
+                        config: config.clone(),
+                        inputs: inputs.clone(),
+                    };
+                    run_command(cli_config).await;
                 }
             }
         } else {
             // 默认执行 run 命令
-            run_command(auto_connect, auto_reconnect, url, namespace, auth, headers, no_color, None, None).await;
+            let cli_config = CliConfig {
+                auto_connect,
+                auto_reconnect,
+                url,
+                namespace,
+                auth,
+                headers,
+                config: None,
+                inputs: None,
+            };
+            run_command(cli_config).await;
         }
     });
 }
 
-async fn run_command(
+/// CLI 运行时配置 / CLI runtime configuration
+struct CliConfig {
     auto_connect: bool,
     auto_reconnect: bool,
     url: Option<String>,
     namespace: String,
     auth: Option<String>,
     headers: Option<String>,
-    _no_color: bool,
     config: Option<PathBuf>,
     inputs: Option<PathBuf>,
-) {
+}
+
+async fn run_command(config: CliConfig) {
     // 创建 Computer 实例
     let session = SilentSession::new("cli-session");
     let computer = Computer::new(
@@ -122,29 +142,32 @@ async fn run_command(
         session,
         None, // inputs
         None, // mcp_servers
-        auto_connect,
-        auto_reconnect,
+        config.auto_connect,
+        config.auto_reconnect,
     );
 
     // 创建命令处理器
     let mut handler = CommandHandler::new(computer);
-    
+
     // 加载配置
-    if let Some(inputs_path) = inputs {
+    if let Some(inputs_path) = config.inputs {
         if let Err(e) = handler.load_inputs(&inputs_path).await {
             eprintln!("加载 inputs 失败: {}", e);
         }
     }
-    
-    if let Some(config_path) = config {
+
+    if let Some(config_path) = config.config {
         if let Err(e) = handler.load_config(&config_path).await {
             eprintln!("加载 config 失败: {}", e);
         }
     }
 
     // 连接 SocketIO（如果提供了 URL）
-    if let Some(url) = &url {
-        if let Err(e) = handler.connect_socketio(url, &namespace, &auth, &headers).await {
+    if let Some(url) = &config.url {
+        if let Err(e) = handler
+            .connect_socketio(url, &config.namespace, &config.auth, &config.headers)
+            .await
+        {
             eprintln!("连接 SocketIO 失败: {}", e);
         }
     }

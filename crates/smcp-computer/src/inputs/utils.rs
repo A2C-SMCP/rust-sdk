@@ -8,25 +8,25 @@
 * 描述: 输入处理相关的工具函数
 */
 
-use std::process::Command;
 use crate::errors::ComputerError;
+use std::process::Command;
 
 /// 执行 shell 命令并返回输出 / Execute shell command and return output
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `command` - 要执行的命令 / Command to execute
 /// * `args` - 命令参数 / Command arguments
-/// 
+///
 /// # Returns
-/// 
+///
 /// 返回命令的标准输出（去除首尾空白） / Returns command stdout (trimmed)
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```
 /// use smcp_computer::inputs::utils::run_command;
-/// 
+///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let output = run_command("echo", &["hello".to_string()]).await?;

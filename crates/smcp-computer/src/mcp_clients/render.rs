@@ -38,11 +38,7 @@ impl ConfigRender {
     }
 
     /// 渲染配置值
-    pub async fn render<F, Fut>(
-        &self,
-        data: Value,
-        resolver: F,
-    ) -> Result<Value, RenderError>
+    pub async fn render<F, Fut>(&self, data: Value, resolver: F) -> Result<Value, RenderError>
     where
         F: Fn(String) -> Fut + Copy + Send + Sync,
         Fut: std::future::Future<Output = Result<Value, RenderError>> + Send,
@@ -95,15 +91,19 @@ impl ConfigRender {
         Fut: std::future::Future<Output = Result<Value, RenderError>> + Send,
     {
         let matches: Vec<_> = self.placeholder_regex.find_iter(&s).collect();
-        
+
         if matches.is_empty() {
             return Ok(Value::String(s));
         }
 
         // 如果字符串是单个占位符，直接返回解析后的值（可能不是字符串）
         if matches.len() == 1 && matches[0].start() == 0 && matches[0].end() == s.len() {
-            let input_id = matches[0].as_str().strip_prefix("${input:").unwrap()
-                .strip_suffix('}').unwrap();
+            let input_id = matches[0]
+                .as_str()
+                .strip_prefix("${input:")
+                .unwrap()
+                .strip_suffix('}')
+                .unwrap();
             return match resolver(input_id.to_string()).await {
                 Ok(value) => Ok(value),
                 Err(RenderError::InputNotFound(_)) => {
@@ -111,17 +111,21 @@ impl ConfigRender {
                     Ok(Value::String(s))
                 }
                 Err(e) => Err(e),
-            }
+            };
         }
 
         // 处理字符串中的多个占位符
         let mut result = s.clone();
         let mut offset: isize = 0;
-        
+
         for m in matches {
-            let input_id = m.as_str().strip_prefix("${input:").unwrap()
-                .strip_suffix('}').unwrap();
-            
+            let input_id = m
+                .as_str()
+                .strip_prefix("${input:")
+                .unwrap()
+                .strip_suffix('}')
+                .unwrap();
+
             let replacement = match resolver(input_id.to_string()).await {
                 Ok(value) => match value {
                     Value::String(s) => s,
@@ -133,13 +137,13 @@ impl ConfigRender {
                 }
                 Err(e) => return Err(e),
             };
-            
+
             let start = (m.start() as isize + offset) as usize;
             let end = (m.end() as isize + offset) as usize;
             result.replace_range(start..end, &replacement);
             offset += replacement.len() as isize - (m.end() - m.start()) as isize;
         }
-        
+
         Ok(Value::String(result))
     }
 }
@@ -153,7 +157,7 @@ impl Default for ConfigRender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     async fn mock_resolver(id: String) -> Result<Value, RenderError> {
         match id.as_str() {
             "test" => Ok(Value::String("resolved".to_string())),
@@ -162,7 +166,7 @@ mod tests {
             _ => Ok(Value::String(format!("resolved_{}", id))),
         }
     }
-    
+
     #[tokio::test]
     async fn test_simple_placeholder() {
         let render = ConfigRender::default();
@@ -170,15 +174,18 @@ mod tests {
         let result = render.render(input, mock_resolver).await.unwrap();
         assert_eq!(result, Value::String("resolved".to_string()));
     }
-    
+
     #[tokio::test]
     async fn test_multiple_placeholders() {
         let render = ConfigRender::default();
         let input = Value::String("Hello ${input:test} and ${input:world}".to_string());
         let result = render.render(input, mock_resolver).await.unwrap();
-        assert_eq!(result, Value::String("Hello resolved and resolved_world".to_string()));
+        assert_eq!(
+            result,
+            Value::String("Hello resolved and resolved_world".to_string())
+        );
     }
-    
+
     #[tokio::test]
     async fn test_missing_input() {
         let render = ConfigRender::default();
@@ -186,19 +193,28 @@ mod tests {
         let result = render.render(input, mock_resolver).await.unwrap();
         assert_eq!(result, Value::String("${input:missing}".to_string()));
     }
-    
+
     #[tokio::test]
     async fn test_object_render() {
         let render = ConfigRender::default();
         let mut obj = serde_json::Map::new();
-        obj.insert("key".to_string(), Value::String("${input:test}".to_string()));
+        obj.insert(
+            "key".to_string(),
+            Value::String("${input:test}".to_string()),
+        );
         obj.insert("nested".to_string(), Value::String("value".to_string()));
         let input = Value::Object(obj);
         let result = render.render(input, mock_resolver).await.unwrap();
-        
+
         if let Value::Object(map) = result {
-            assert_eq!(map.get("key").unwrap(), &Value::String("resolved".to_string()));
-            assert_eq!(map.get("nested").unwrap(), &Value::String("value".to_string()));
+            assert_eq!(
+                map.get("key").unwrap(),
+                &Value::String("resolved".to_string())
+            );
+            assert_eq!(
+                map.get("nested").unwrap(),
+                &Value::String("value".to_string())
+            );
         } else {
             panic!("Expected object");
         }
