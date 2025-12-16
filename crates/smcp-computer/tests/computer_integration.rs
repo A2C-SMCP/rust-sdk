@@ -7,7 +7,6 @@
 * 依赖: tokio, smcp-computer
 * 描述: Computer模块集成测试
 */
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -53,7 +52,7 @@ impl Session for TestSession {
             match input {
                 MCPServerInput::PromptString(input) => {
                     Ok(serde_json::Value::String(
-                        input.default.clone().unwrap_or_else(|| String::new())
+                        input.default.clone().unwrap_or_default()
                     ))
                 }
                 MCPServerInput::PickString(input) => {
@@ -375,7 +374,7 @@ async fn test_computer_tool_history() {
     // Tool execution adds history (needs actual server)
     computer.boot_up().await.unwrap();
     
-    let result = computer.execute_tool(
+    let _result = computer.execute_tool(
         "test_req",
         "non_existent_tool",
         serde_json::json!({}),

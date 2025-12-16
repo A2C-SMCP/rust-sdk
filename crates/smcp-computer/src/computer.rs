@@ -24,6 +24,9 @@ use crate::mcp_clients::{
 use crate::inputs::handler::InputHandler;
 use crate::socketio_client::SmcpComputerClient;
 
+/// 确认回调函数类型 / Confirmation callback function type
+type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>;
+
 /// 工具调用历史记录 / Tool call history record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -75,7 +78,7 @@ impl Session for SilentSession {
         match input {
             MCPServerInput::PromptString(input) => {
                 Ok(serde_json::Value::String(
-                    input.default.clone().unwrap_or_else(|| String::new())
+                    input.default.clone().unwrap_or_default()
                 ))
             }
             MCPServerInput::PickString(input) => {
@@ -120,7 +123,7 @@ pub struct Computer<S: Session> {
     /// Socket.IO客户端引用 / Socket.IO client reference
     socketio_client: Arc<RwLock<Option<Weak<SmcpComputerClient>>>>,
     /// 确认回调函数 / Confirmation callback function
-    confirm_callback: Option<Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>>,
+    confirm_callback: Option<ConfirmCallbackType>,
 }
 
 impl<S: Session> Computer<S> {
@@ -299,13 +302,13 @@ impl<S: Session> Computer<S> {
     }
 
     /// 获取输入值 / Get input value
-    pub async fn get_input_value(&self, input_id: &str) -> ComputerResult<Option<serde_json::Value>> {
+    pub async fn get_input_value(&self, _input_id: &str) -> ComputerResult<Option<serde_json::Value>> {
         // TODO: 实现从InputHandler获取缓存值的功能
         Ok(None)
     }
 
     /// 设置输入值 / Set input value
-    pub async fn set_input_value(&self, input_id: &str, value: serde_json::Value) -> ComputerResult<bool> {
+    pub async fn set_input_value(&self, input_id: &str, _value: serde_json::Value) -> ComputerResult<bool> {
         // 检查input是否存在 / Check if input exists
         {
             let inputs = self.inputs.read().await;
@@ -320,7 +323,7 @@ impl<S: Session> Computer<S> {
     }
 
     /// 移除输入值 / Remove input value
-    pub async fn remove_input_value(&self, input_id: &str) -> ComputerResult<bool> {
+    pub async fn remove_input_value(&self, _input_id: &str) -> ComputerResult<bool> {
         // TODO: 实现InputHandler的缓存删除功能
         Ok(false)
     }
@@ -332,7 +335,7 @@ impl<S: Session> Computer<S> {
     }
 
     /// 清空输入值缓存 / Clear input value cache
-    pub async fn clear_input_values(&self, input_id: Option<&str>) -> ComputerResult<()> {
+    pub async fn clear_input_values(&self, _input_id: Option<&str>) -> ComputerResult<()> {
         // TODO: 实现InputHandler的缓存清除功能
         Ok(())
     }
@@ -382,7 +385,7 @@ impl<S: Session> Computer<S> {
                 if let Some(ref callback) = self.confirm_callback {
                     let confirmed = callback(req_id, &server_name, &tool_name, &parameters);
                     if confirmed {
-                        let timeout_duration = timeout.map(|t| std::time::Duration::from_secs_f64(t));
+                        let timeout_duration = timeout.map(std::time::Duration::from_secs_f64);
                         result = manager.call_tool(&server_name, &tool_name, parameters_for_call, timeout_duration).await?;
                         success = !result.is_error;
                     } else {
@@ -405,7 +408,7 @@ impl<S: Session> Computer<S> {
                     error_msg = Some("No confirmation callback".to_string());
                 }
             } else {
-                let timeout_duration = timeout.map(|t| std::time::Duration::from_secs_f64(t));
+                let timeout_duration = timeout.map(std::time::Duration::from_secs_f64);
                 result = manager.call_tool(&server_name, &tool_name, parameters_for_call, timeout_duration).await?;
                 success = !result.is_error;
             }
@@ -527,7 +530,7 @@ impl<S: Session> ManagerChangeHandler for Computer<S> {
                     }
                 }
             }
-            ManagerChangeMessage::ResourceListChanged { windows } => {
+            ManagerChangeMessage::ResourceListChanged { windows: _ } => {
                 debug!("Resource list changed, checking for window updates");
                 // TODO: 实现窗口变更检测逻辑 / TODO: Implement window change detection logic
             }
@@ -866,7 +869,7 @@ mod tests {
         let callback_called = Arc::new(Mutex::new(false));
         let callback_called_clone = callback_called.clone();
         
-        let computer = computer.with_confirm_callback(move |_req_id, _server, _tool, _params| {
+        let _computer = computer.with_confirm_callback(move |_req_id, _server, _tool, _params| {
             // 使用tokio::block_on在同步回调中执行异步操作
             // Use tokio::block_in_async to execute async operations in sync callback
             let rt = tokio::runtime::Handle::current();
