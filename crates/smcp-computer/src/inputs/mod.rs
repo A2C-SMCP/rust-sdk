@@ -1,4 +1,4 @@
-/**
+/*!
 * 文件名: mod
 * 作者: JQQ
 * 创建日期: 2025/12/15
@@ -10,8 +10,10 @@
 pub mod handler;
 pub mod model;
 pub mod providers;
+pub mod utils;
 
 // 重新导出核心类型 / Re-export core types
 pub use handler::InputHandler;
 pub use model::*;
 pub use providers::{CliInputProvider, EnvironmentInputProvider, InputProvider};
+pub use utils::run_command;

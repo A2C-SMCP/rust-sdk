@@ -22,6 +22,7 @@ use crate::mcp_clients::{
     model::{MCPServerConfig, MCPServerInput, CallToolResult, Tool},
 };
 use crate::inputs::handler::InputHandler;
+use crate::inputs::utils::run_command;
 use crate::socketio_client::SmcpComputerClient;
 
 /// 确认回调函数类型 / Confirmation callback function type
@@ -88,9 +89,16 @@ impl Session for SilentSession {
                     })
                 ))
             }
-            MCPServerInput::Command(_input) => {
-                // 命令输入在静默模式下返回空 / Command input returns empty in silent mode
-                Ok(serde_json::Value::Null)
+            MCPServerInput::Command(input) => {
+                // 静默Session执行命令并返回输出 / Silent session executes command and returns output
+                let args: Vec<String> = input.args
+                    .as_ref()
+                    .map(|m| m.values().cloned().collect())
+                    .unwrap_or_default();
+                match run_command(&input.command, &args).await {
+                    Ok(output) => Ok(serde_json::Value::String(output)),
+                    Err(e) => Err(ComputerError::RuntimeError(format!("Failed to execute command '{}': {}", input.command, e)))
+                }
             }
         }
     }
@@ -825,12 +833,12 @@ mod tests {
         let command_input = MCPServerInput::Command(CommandInput {
             id: "cmd".to_string(),
             description: "Command".to_string(),
-            command: "echo".to_string(),
+            command: "echo hello world".to_string(),
             args: None,
         });
         
         let result = session.resolve_input(&command_input).await.unwrap();
-        assert_eq!(result, serde_json::Value::Null);
+        assert_eq!(result, serde_json::Value::String("hello world".to_string()));
     }
 
     #[tokio::test]
