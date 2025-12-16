@@ -13,7 +13,7 @@ use crate::mcp_clients::manager::MCPServerManager;
 use futures_util::FutureExt;
 use rust_socketio::{
     asynchronous::{Client, ClientBuilder},
-    Event, Payload,
+    Event, Payload, TransportType,
 };
 use serde_json::Value;
 use smcp::{
@@ -36,8 +36,6 @@ use tracing::{debug, error, info};
 pub struct SmcpComputerClient {
     /// Socket.IO客户端实例 / Socket.IO client instance
     client: Client,
-    /// MCP服务器管理器 / MCP server manager
-    manager: Arc<Mutex<MCPServerManager>>,
     /// Computer名称 / Computer name
     computer_name: String,
     /// 当前所在的office ID / Current office ID
@@ -61,6 +59,7 @@ impl SmcpComputerClient {
         // Use ClientBuilder to register event handlers
         let client = ClientBuilder::new(url)
             .namespace(SMCP_NAMESPACE)
+            .transport_type(TransportType::Websocket)
             .on_any(move |event, payload, client| {
                 // 只处理自定义事件
                 // Only handle custom events
@@ -186,7 +185,6 @@ impl SmcpComputerClient {
 
         Ok(Self {
             client,
-            manager,
             computer_name,
             office_id,
         })
@@ -211,20 +209,42 @@ impl SmcpComputerClient {
         // Use call method to wait for server response
         match self.call(SERVER_JOIN_OFFICE, req_data, Some(10)).await {
             Ok(response) => {
-                // 检查响应格式 / Check response format
-                if let Some(success) = response.get(0).and_then(|v| v.as_bool()) {
-                    if success {
-                        info!("Successfully joined office: {}", office_id);
-                        Ok(())
+                // 服务器返回的是 (bool, Option<String>) 元组序列化后的数组
+                // Server returns serialized array of (bool, Option<String>) tuple
+                debug!("Join office response: {:?}", response);
+                
+                // 检查响应是否包含嵌套数组
+                // Check if response contains nested array
+                let actual_response = if response.len() == 1 {
+                    if let Some(arr) = response.get(0).and_then(|v| v.as_array()) {
+                        arr.to_vec()
                     } else {
-                        // 加入失败，重置office_id / Reset office_id on failure
+                        response
+                    }
+                } else {
+                    response
+                };
+                
+                if actual_response.len() >= 1 {
+                    if let Some(success) = actual_response.get(0).and_then(|v| v.as_bool()) {
+                        if success {
+                            info!("Successfully joined office: {}", office_id);
+                            Ok(())
+                        } else {
+                            // 加入失败，重置office_id / Reset office_id on failure
+                            *self.office_id.write().await = None;
+                            let error_msg = actual_response.get(1)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown error");
+                            Err(ComputerError::SocketIoError(format!("Failed to join office: {}", error_msg)))
+                        }
+                    } else {
                         *self.office_id.write().await = None;
-                        let error_msg = response.get(1).and_then(|v| v.as_str()).unwrap_or("Unknown error");
-                        Err(ComputerError::SocketIoError(format!("Failed to join office: {}", error_msg)))
+                        Err(ComputerError::SocketIoError(format!("Invalid response format from server: {:?}", actual_response)))
                     }
                 } else {
                     *self.office_id.write().await = None;
-                    Err(ComputerError::SocketIoError("Invalid response format from server".to_string()))
+                    Err(ComputerError::SocketIoError("Empty response from server".to_string()))
                 }
             }
             Err(e) => {
@@ -298,7 +318,7 @@ impl SmcpComputerClient {
         debug!("Emitting event: {}", event);
         
         self.client
-            .emit(event, Payload::from(vec![data]))
+            .emit(event, Payload::Text(vec![data], None))
             .await
             .map_err(|e| ComputerError::SocketIoError(format!("Failed to emit {}: {}", event, e)))
     }
@@ -322,29 +342,40 @@ impl SmcpComputerClient {
         self.client
             .emit_with_ack(
                 event,
-                Payload::from(vec![data]),
+                Payload::Text(vec![data], None),
                 timeout,
                 callback,
             )
             .await
             .map_err(|e| ComputerError::SocketIoError(format!("Failed to call {}: {}", event, e)))?;
 
-        match rx.await {
-            Ok(response) => {
+        // 使用 tokio::time::timeout 来确保 rx.await 不会无限期等待
+        // Use tokio::time::timeout to ensure rx.await doesn't wait forever
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => {
                 // 从响应中提取JSON数据 / Extract JSON data from response
                 match response {
-                    Payload::Text(values, _) => Ok(values),
+                    Payload::Text(values, _) => {
+                        debug!("Received response: {:?}", values);
+                        Ok(values)
+                    },
                     #[allow(deprecated)]
                     Payload::String(s, _) => {
                         // 尝试解析字符串为JSON数组
                         // Try to parse string as JSON array
-                        serde_json::from_str(&s)
-                            .map_err(|e| ComputerError::SocketIoError(format!("Failed to parse response: {}", e)))
+                        let parsed: Vec<Value> = serde_json::from_str(&s)
+                            .map_err(|e| ComputerError::SocketIoError(format!("Failed to parse response: {}", e)))?;
+                        debug!("Received parsed response: {:?}", parsed);
+                        Ok(parsed)
                     }
                     Payload::Binary(_, _) => {
                         Err(ComputerError::SocketIoError("Binary response not supported".to_string()))
                     }
                 }
+            }
+            Ok(Err(_)) => {
+                error!("Channel closed while calling event: {}", event);
+                Err(ComputerError::SocketIoError("Channel closed while waiting for response".to_string()))
             }
             Err(_) => {
                 error!("Timeout while calling event: {}", event);
