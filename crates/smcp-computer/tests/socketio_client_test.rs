@@ -26,7 +26,6 @@ mod tests {
     use hyper::HeaderMap;
     use tower::service_fn;
     use tower::Layer;
-    use tower::Service;
 
     /// 测试用的无操作认证提供者 - 不进行任何认证检查
     /// No-op authentication provider for tests - performs no authentication checks

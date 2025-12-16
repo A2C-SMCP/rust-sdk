@@ -1,4 +1,4 @@
-/**
+/*！
 * 文件名: python_rust_alignment
 * 作者: JQQ
 * 创建日期: 2025/12/16

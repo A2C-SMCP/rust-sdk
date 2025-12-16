@@ -88,18 +88,16 @@ impl SmcpComputerClient {
                                 Err(e) => {
                                     error!("Error handling tool call: {}", e);
                                     // 尝试返回错误响应 / Try to return error response
-                                    if let Ok((ack_id, _)) = Self::extract_ack_id(payload_clone) {
-                                        if let Some(id) = ack_id {
-                                            let error_response = serde_json::json!({
-                                                "isError": true,
-                                                "content": [],
-                                                "structuredContent": {
-                                                    "error": e.to_string(),
-                                                    "error_type": "ComputerError"
-                                                }
-                                            });
-                                            let _ = client.ack_with_id(id, error_response).await;
-                                        }
+                                    if let Ok((Some(id), _)) = Self::extract_ack_id(payload_clone) {
+                                        let error_response = serde_json::json!({
+                                            "isError": true,
+                                            "content": [],
+                                            "structuredContent": {
+                                                "error": e.to_string(),
+                                                "error_type": "ComputerError"
+                                            }
+                                        });
+                                        let _ = client.ack_with_id(id, error_response).await;
                                     }
                                 }
                             }
@@ -216,7 +214,7 @@ impl SmcpComputerClient {
                 // 检查响应是否包含嵌套数组
                 // Check if response contains nested array
                 let actual_response = if response.len() == 1 {
-                    if let Some(arr) = response.get(0).and_then(|v| v.as_array()) {
+                    if let Some(arr) = response.first().and_then(|v| v.as_array()) {
                         arr.to_vec()
                     } else {
                         response
@@ -225,8 +223,8 @@ impl SmcpComputerClient {
                     response
                 };
                 
-                if actual_response.len() >= 1 {
-                    if let Some(success) = actual_response.get(0).and_then(|v| v.as_bool()) {
+                if !actual_response.is_empty() {
+                    if let Some(success) = actual_response.first().and_then(|v| v.as_bool()) {
                         if success {
                             info!("Successfully joined office: {}", office_id);
                             Ok(())
@@ -422,7 +420,7 @@ impl SmcpComputerClient {
         };
 
         let result_value = serde_json::to_value(result)
-            .map_err(|e| ComputerError::SerializationError(e))?;
+            .map_err(ComputerError::SerializationError)?;
 
         info!("Tool call executed successfully: {}", req.tool_name);
         Ok((ack_id, result_value))
@@ -575,7 +573,7 @@ impl SmcpComputerClient {
             Payload::Text(mut values, ack_id) => {
                 if let Some(value) = values.pop() {
                     let req = serde_json::from_value(value)
-                        .map_err(|e| ComputerError::SerializationError(e))?;
+                        .map_err(ComputerError::SerializationError)?;
                     Ok((ack_id, req))
                 } else {
                     Err(ComputerError::ProtocolError("Empty payload".to_string()))
@@ -584,7 +582,7 @@ impl SmcpComputerClient {
             #[allow(deprecated)]
             Payload::String(s, ack_id) => {
                 let req = serde_json::from_str(&s)
-                    .map_err(|e| ComputerError::SerializationError(e))?;
+                    .map_err(ComputerError::SerializationError)?;
                 Ok((ack_id, req))
             }
             Payload::Binary(_, _) => {

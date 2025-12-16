@@ -271,7 +271,7 @@ impl InputProvider for CliInputProvider {
                     // Windows: Use cmd /C for shell mode
                     let mut cmd = Command::new("cmd");
                     cmd.arg("/C");
-                    cmd.arg(&command);
+                    cmd.arg(command);
                     for arg in args {
                         cmd.arg(arg);
                     }
