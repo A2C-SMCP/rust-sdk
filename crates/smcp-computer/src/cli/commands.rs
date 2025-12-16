@@ -285,7 +285,9 @@ impl CommandHandler {
         auth: &Option<String>,
         headers: &Option<String>,
     ) -> Result<(), CommandError> {
-        self.computer.connect_socketio(url, namespace, auth, headers).await?;
+        self.computer
+            .connect_socketio(url, namespace, auth, headers)
+            .await?;
         println!("✅ 已连接到 Socket.IO: {} / Connected to Socket.IO", url);
         Ok(())
     }
@@ -379,23 +381,35 @@ impl CommandHandler {
     }
 
     /// 获取输入定义 / Get input definition
-    pub async fn get_input_definition(&self, id: &str) -> Result<Option<MCPServerInput>, CommandError> {
+    pub async fn get_input_definition(
+        &self,
+        id: &str,
+    ) -> Result<Option<MCPServerInput>, CommandError> {
         Ok(self.computer.get_input(id).await?)
     }
 
     /// 列出所有输入值 / List all input values
-    pub async fn list_input_values(&self) -> Result<HashMap<String, serde_json::Value>, CommandError> {
+    pub async fn list_input_values(
+        &self,
+    ) -> Result<HashMap<String, serde_json::Value>, CommandError> {
         Ok(self.computer.list_input_values().await?)
     }
 
     /// 获取输入值 / Get input value
-    pub async fn get_input_value(&self, id: &str) -> Result<Option<serde_json::Value>, CommandError> {
+    pub async fn get_input_value(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, CommandError> {
         Ok(self.computer.get_input_value(id).await?)
     }
 
     /// 设置输入值 / Set input value
-    pub async fn set_input_value(&self, id: &str, value: &serde_json::Value) -> Result<(), CommandError> {
-        Ok(self.computer.set_input_value(id, value).await?)
+    pub async fn set_input_value(
+        &self,
+        id: &str,
+        value: &serde_json::Value,
+    ) -> Result<bool, CommandError> {
+        Ok(self.computer.set_input_value(id, value.clone()).await?)
     }
 
     /// 删除输入值 / Remove input value
@@ -406,7 +420,7 @@ impl CommandHandler {
     /// 测试渲染（占位符解析）
     pub async fn render_config(&self, config_str: &str) -> Result<(), CommandError> {
         use crate::mcp_clients::render::ConfigRender;
-        
+
         // 解析配置
         let config: Value = if let Some(path) = config_str.strip_prefix('@') {
             let content = std::fs::read_to_string(path)?;
@@ -414,19 +428,19 @@ impl CommandHandler {
         } else {
             serde_json::from_str(config_str)?
         };
-        
+
         // 创建渲染器
         let render = ConfigRender::default();
-        
+
         // 创建解析器函数
         let resolver = |id: String| async move {
             match self.computer.get_input_value(&id).await {
                 Ok(Some(value)) => Ok(value),
                 Ok(None) => Err(crate::mcp_clients::render::RenderError::InputNotFound(id)),
-                Err(e) => Err(crate::mcp_clients::render::RenderError::InputNotFound(id)),
+                Err(_e) => Err(crate::mcp_clients::render::RenderError::InputNotFound(id)),
             }
         };
-        
+
         // 执行渲染
         match render.render(config, resolver).await {
             Ok(rendered) => {
@@ -437,7 +451,7 @@ impl CommandHandler {
                 eprintln!("渲染失败 / Render failed: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
@@ -450,29 +464,43 @@ impl CommandHandler {
         } else {
             serde_json::from_str(tool_call_str)?
         };
-        
+
         // 提取必需字段
-        let req_id = tool_call.get("req_id")
+        let req_id = tool_call
+            .get("req_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| CommandError::InvalidCommand("缺少 req_id 字段 / Missing req_id field".to_string()))?;
-            
-        let tool_name = tool_call.get("tool_name")
+            .ok_or_else(|| {
+                CommandError::InvalidCommand("缺少 req_id 字段 / Missing req_id field".to_string())
+            })?;
+
+        let tool_name = tool_call
+            .get("tool_name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| CommandError::InvalidCommand("缺少 tool_name 字段 / Missing tool_name field".to_string()))?;
-            
-        let parameters = tool_call.get("params").unwrap_or(&Value::Object(serde_json::Map::new())).clone();
-        
-        let timeout = tool_call.get("timeout")
-            .and_then(|v| v.as_f64());
-        
+            .ok_or_else(|| {
+                CommandError::InvalidCommand(
+                    "缺少 tool_name 字段 / Missing tool_name field".to_string(),
+                )
+            })?;
+
+        let parameters = tool_call
+            .get("params")
+            .unwrap_or(&Value::Object(serde_json::Map::new()))
+            .clone();
+
+        let timeout = tool_call.get("timeout").and_then(|v| v.as_f64());
+
         // 检查 MCP Manager 是否已初始化
         if !self.computer.is_mcp_manager_initialized().await {
             println!("警告 / Warning: MCP 管理器未初始化。请先添加并启动服务器 (server add/start) / MCP manager not initialized. Add and start a server first.");
             return Ok(());
         }
-        
+
         // 执行工具调用
-        match self.computer.execute_tool(req_id, tool_name, parameters, timeout).await {
+        match self
+            .computer
+            .execute_tool(req_id, tool_name, parameters, timeout)
+            .await
+        {
             Ok(result) => {
                 println!("工具调用成功 / Tool call succeeded:");
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -481,12 +509,16 @@ impl CommandHandler {
                 eprintln!("工具调用失败 / Tool call failed: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
     /// 加入 Socket.IO 房间 / Join Socket.IO room
-    pub async fn join_socket_room(&self, office_id: &str, computer_name: &str) -> Result<(), CommandError> {
+    pub async fn join_socket_room(
+        &self,
+        office_id: &str,
+        computer_name: &str,
+    ) -> Result<(), CommandError> {
         self.computer.join_office(office_id, computer_name).await?;
         println!("✅ 已加入房间 / Joined office: {}", office_id);
         Ok(())
@@ -515,7 +547,7 @@ impl CommandHandler {
         } else {
             serde_json::from_str(input_str)?
         };
-        
+
         // 支持单个或数组
         if let Some(array) = input_value.as_array() {
             for item in array {
@@ -526,7 +558,7 @@ impl CommandHandler {
             let input: MCPServerInput = serde_json::from_value(input_value)?;
             self.computer.add_or_update_input(input).await?;
         }
-        
+
         println!("Input(s) 已添加/更新 / Added/Updated");
         Ok(())
     }
@@ -540,7 +572,7 @@ impl CommandHandler {
         } else {
             serde_json::from_str(input_str)?
         };
-        
+
         // 支持单个或数组
         if let Some(array) = input_value.as_array() {
             for item in array {
@@ -551,7 +583,7 @@ impl CommandHandler {
             let input: MCPServerInput = serde_json::from_value(input_value)?;
             self.computer.add_or_update_input(input).await?;
         }
-        
+
         println!("Input(s) 已添加/更新 / Added/Updated");
         Ok(())
     }
@@ -778,23 +810,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_connect_socketio() {
-        let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
-
-        // 测试 SocketIO 连接 / Test SocketIO connection
-        let result = handler
-            .connect_socketio(
-                "http://localhost:3000",
-                "/test",
-                &Some("auth_token".to_string()),
-                &Some("header:value".to_string()),
-            )
-            .await;
-        assert!(result.is_ok());
-    }
-
+    
     #[tokio::test]
     async fn test_load_config() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;

@@ -659,9 +659,9 @@ impl<S: Session> Computer<S> {
     pub async fn connect_socketio(
         &self,
         url: &str,
-        namespace: &str,
-        auth: &Option<String>,
-        headers: &Option<String>,
+        _namespace: &str,
+        _auth: &Option<String>,
+        _headers: &Option<String>,
     ) -> ComputerResult<()> {
         // 确保管理器已初始化 / Ensure manager is initialized
         let _manager_check = {
@@ -674,7 +674,8 @@ impl<S: Session> Computer<S> {
                 }
                 None => {
                     return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized. Please add and start servers first.".to_string(),
+                        "MCP Manager not initialized. Please add and start servers first."
+                            .to_string(),
                     ));
                 }
             }
@@ -691,7 +692,8 @@ impl<S: Session> Computer<S> {
             url,
             Arc::new(RwLock::new(Some(new_manager))),
             self.name.clone(),
-        ).await?;
+        )
+        .await?;
 
         // 设置客户端到Computer / Set client to Computer
         let client_arc = Arc::new(client);
@@ -714,7 +716,7 @@ impl<S: Session> Computer<S> {
     }
 
     /// 加入办公室 / Join office
-    pub async fn join_office(&self, office_id: &str, computer_name: &str) -> ComputerResult<()> {
+    pub async fn join_office(&self, office_id: &str, _computer_name: &str) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
         if let Some(ref weak_client) = *socketio_ref {
             if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {

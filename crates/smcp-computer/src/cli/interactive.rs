@@ -125,7 +125,9 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
             match parts[1] {
                 "load" => {
                     if parts.len() < 3 {
-                        return Err(CommandError::InvalidCommand("缺少文件路径 / Missing file path".to_string()));
+                        return Err(CommandError::InvalidCommand(
+                            "缺少文件路径 / Missing file path".to_string(),
+                        ));
                     }
                     let path = std::path::Path::new(&parts[2][1..]);
                     handler.load_inputs(path).await?;
@@ -146,13 +148,17 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                 }
                 "rm" | "remove" => {
                     if parts.len() < 3 {
-                        return Err(CommandError::InvalidCommand("用法: inputs rm <id> / Usage: inputs rm <id>".to_string()));
+                        return Err(CommandError::InvalidCommand(
+                            "用法: inputs rm <id> / Usage: inputs rm <id>".to_string(),
+                        ));
                     }
                     handler.remove_input_def(parts[2]).await?;
                 }
                 "get" => {
                     if parts.len() < 3 {
-                        return Err(CommandError::InvalidCommand("用法: inputs get <id> / Usage: inputs get <id>".to_string()));
+                        return Err(CommandError::InvalidCommand(
+                            "用法: inputs get <id> / Usage: inputs get <id>".to_string(),
+                        ));
                     }
                     handler.get_input_def(parts[2]).await?;
                 }
@@ -165,7 +171,7 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                 _ => {
                     return Err(CommandError::InvalidCommand(format!(
                         "未知的 inputs 子命令: {} / Unknown inputs subcommand: {}",
-                        parts[1]
+                        parts[1], parts[1]
                     )));
                 }
             }
@@ -242,14 +248,18 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
         }
         "render" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("缺少渲染参数 / Missing render parameter".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "缺少渲染参数 / Missing render parameter".to_string(),
+                ));
             }
             let config_str = line.splitn(3, ' ').nth(2).unwrap();
             handler.render_config(config_str).await?;
         }
         "tc" => {
             if parts.len() < 2 {
-                return Err(CommandError::InvalidCommand("缺少调试参数 / Missing debug parameter".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "缺少调试参数 / Missing debug parameter".to_string(),
+                ));
             }
             let tool_call_str = line.splitn(3, ' ').nth(2).unwrap();
             handler.debug_tool_call(tool_call_str).await?;
@@ -295,16 +305,21 @@ async fn handle_inputs_value(
         }
         "get" => {
             if parts.len() < 4 {
-                return Err(CommandError::InvalidCommand("缺少 id 参数 / Missing id parameter".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "缺少 id 参数 / Missing id parameter".to_string(),
+                ));
             }
             // 获取指定 id 的值 / Get value by id
             match handler.get_input_value(parts[3]).await {
                 Ok(Some(value)) => {
-                    println!("Input '{}' 的值 / Value of '{}':", parts[3]);
+                    println!("Input '{}' 的值 / Value of '{}':", parts[3], parts[3]);
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 }
                 Ok(None) => {
-                    println!("未找到或尚未解析: {} / Not found or not resolved yet: {}", parts[3], parts[3]);
+                    println!(
+                        "未找到或尚未解析: {} / Not found or not resolved yet: {}",
+                        parts[3], parts[3]
+                    );
                 }
                 Err(e) => {
                     eprintln!("获取值失败: {} / Failed to get value: {}", e, e);
@@ -313,11 +328,13 @@ async fn handle_inputs_value(
         }
         "set" => {
             if parts.len() < 4 {
-                return Err(CommandError::InvalidCommand("缺少 id 参数 / Missing id parameter".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "缺少 id 参数 / Missing id parameter".to_string(),
+                ));
             }
             // 设置指定 id 的值 / Set value by id
             let input_id = parts[3];
-            
+
             // 如果只提供了 id，尝试使用 default 值 / If only id provided, try to use default value
             let value = if parts.len() == 4 {
                 // 获取 input 定义以获取 default 值 / Get input definition to get default value
@@ -327,18 +344,20 @@ async fn handle_inputs_value(
                             println!("使用 default 值 / Using default value: {}", default_val);
                             default_val.clone()
                         } else {
-                            return Err(CommandError::InvalidCommand(
-                                format!("Input '{}' 没有 default 值 / has no default value", input_id)
-                            ));
+                            return Err(CommandError::InvalidCommand(format!(
+                                "Input '{}' 没有 default 值 / has no default value",
+                                input_id
+                            )));
                         }
                     }
                     Ok(None) => {
-                        return Err(CommandError::InvalidCommand(
-                            format!("不存在的 id / Not found: {}", input_id)
-                        ));
+                        return Err(CommandError::InvalidCommand(format!(
+                            "不存在的 id / Not found: {}",
+                            input_id
+                        )));
                     }
                     Err(e) => {
-                        return Err(CommandError::ComputerError(e));
+                        return Err(e);
                     }
                 }
             } else {
@@ -352,7 +371,7 @@ async fn handle_inputs_value(
                     }
                 }
             };
-            
+
             match handler.set_input_value(input_id, &value).await {
                 Ok(_) => {
                     println!("已设置 / Set successfully");
@@ -364,7 +383,9 @@ async fn handle_inputs_value(
         }
         "rm" => {
             if parts.len() < 4 {
-                return Err(CommandError::InvalidCommand("缺少 id 参数 / Missing id parameter".to_string()));
+                return Err(CommandError::InvalidCommand(
+                    "缺少 id 参数 / Missing id parameter".to_string(),
+                ));
             }
             // 删除指定 id 的值 / Remove value by id
             match handler.remove_input_value(parts[3]).await {
@@ -381,8 +402,12 @@ async fn handle_inputs_value(
         }
         "clear" => {
             // 清空全部或指定 id 的缓存 / Clear all or specific cached value
-            let target_id = if parts.len() >= 4 { Some(parts[3]) } else { None };
-            match handler.clear_input_values(target_id).await {
+            let target_id = if parts.len() >= 4 {
+                Some(parts[3])
+            } else {
+                None
+            };
+            match handler.computer.clear_input_values(target_id).await {
                 Ok(_) => {
                     if let Some(id) = target_id {
                         println!("已清空 '{}' 的缓存 / Cleared cache for '{}'", id, id);

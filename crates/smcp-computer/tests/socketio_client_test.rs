@@ -21,7 +21,7 @@ mod tests {
     use smcp_server_core::SmcpServerBuilder;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use tokio::sync::{Mutex, RwLock};
+    use tokio::sync::RwLock;
     use tokio::time::{sleep, Duration};
     use tower::service_fn;
     use tower::Layer;
