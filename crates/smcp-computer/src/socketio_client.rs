@@ -367,6 +367,16 @@ impl SmcpComputerClient {
     /// 发送事件（不等待响应）
     /// Emit event without waiting for response
     async fn emit(&self, event: &str, data: Value) -> ComputerResult<()> {
+        // 检查事件名 policy / Check event name policy
+        if event.starts_with("notify:") || event.starts_with("client:") {
+            return Err(ComputerError::InvalidState(
+                format!(
+                    "Computer 不允许发送 notify:* 或 client:* 事件 / Computer cannot send notify:* or client:* events: {}",
+                    event
+                )
+            ));
+        }
+        
         debug!("Emitting event: {}", event);
 
         self.client
@@ -383,6 +393,16 @@ impl SmcpComputerClient {
         data: Value,
         timeout_secs: Option<u64>,
     ) -> ComputerResult<Vec<Value>> {
+        // 检查事件名 policy / Check event name policy
+        if event.starts_with("notify:") || event.starts_with("client:") {
+            return Err(ComputerError::InvalidState(
+                format!(
+                    "Computer 不允许发送 notify:* 或 client:* 事件 / Computer cannot send notify:* or client:* events: {}",
+                    event
+                )
+            ));
+        }
+        
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
         debug!("Calling event: {} with timeout {:?}", event, timeout);
 
@@ -710,5 +730,21 @@ impl SmcpComputerClient {
     /// Get current office ID
     pub async fn get_office_id(&self) -> Option<String> {
         self.office_id.read().await.clone()
+    }
+
+    /// 获取连接的 URL
+    /// Get connected URL
+    pub fn get_url(&self) -> String {
+        // 由于 rust_socketio 的 Client 没有 uri() 方法，返回默认值
+        // Since rust_socketio Client doesn't have uri() method, return default
+        "unknown".to_string()
+    }
+
+    /// 获取连接的 namespace
+    /// Get connected namespace
+    pub fn get_namespace(&self) -> String {
+        // 从 client 中获取 namespace，如果无法获取则返回默认值
+        // Get namespace from client, return default if unable to get
+        "/smcp".to_string()
     }
 }

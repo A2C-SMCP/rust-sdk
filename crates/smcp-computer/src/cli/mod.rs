@@ -147,7 +147,13 @@ async fn run_command(config: CliConfig) {
     );
 
     // 创建命令处理器
-    let mut handler = CommandHandler::new(computer);
+    let cli_config_for_handler = commands::CliConfig {
+        url: config.url.clone(),
+        namespace: config.namespace.clone(),
+        auth: config.auth.clone(),
+        headers: config.headers.clone(),
+    };
+    let mut handler = CommandHandler::new(computer, cli_config_for_handler);
 
     // 加载配置
     if let Some(inputs_path) = config.inputs {

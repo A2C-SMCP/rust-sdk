@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
 
-use smcp_computer::cli::commands::CommandHandler;
+use smcp_computer::cli::commands::{CommandHandler, CliConfig};
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig, StdioServerParameters,
@@ -165,7 +165,13 @@ pub fn create_test_complete_config_file() -> NamedTempFile {
 /// 创建 CommandHandler 实例 / Create CommandHandler instance
 pub async fn create_command_handler() -> CommandHandler {
     let computer = create_test_computer_with_servers().await;
-    CommandHandler::new(computer)
+    let cli_config = CliConfig {
+        url: None,
+        namespace: "test_namespace".to_string(),
+        auth: None,
+        headers: None,
+    };
+    CommandHandler::new(computer, cli_config)
 }
 
 /// 创建未初始化的 CommandHandler 实例 / Create uninitialized CommandHandler instance
@@ -178,5 +184,11 @@ pub async fn create_uninitialized_command_handler() -> CommandHandler {
         false,
         false,
     );
-    CommandHandler::new(computer)
+    let cli_config = CliConfig {
+        url: None,
+        namespace: "test_namespace".to_string(),
+        auth: None,
+        headers: None,
+    };
+    CommandHandler::new(computer, cli_config)
 }

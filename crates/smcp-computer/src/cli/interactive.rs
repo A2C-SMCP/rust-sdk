@@ -210,12 +210,18 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
             }
             match parts[1] {
                 "connect" => {
+                    // 先克隆所有需要的配置值以避免借用冲突
+                    // First clone all needed config values to avoid borrow conflicts
+                    let cli_config = handler.cli_config.clone();
+                    
                     let url = if parts.len() > 2 {
                         parts[2]
                     } else {
-                        "http://localhost:3000"
+                        // 使用 CLI 配置中的默认 URL，或回退到 localhost
+                        cli_config.url.as_deref().unwrap_or("http://localhost:3000")
                     };
-                    handler.connect_socketio(url, "/smcp", &None, &None).await?;
+                    
+                    handler.connect_socketio(url, &cli_config.namespace, &cli_config.auth, &cli_config.headers).await?;
                 }
                 "join" => {
                     if parts.len() < 4 {
@@ -340,9 +346,17 @@ async fn handle_inputs_value(
                 // 获取 input 定义以获取 default 值 / Get input definition to get default value
                 match handler.get_input_definition(input_id).await {
                     Ok(Some(input)) => {
+                        // 检查是否为 Command 类型 / Check if it's Command type
+                        if matches!(input, crate::mcp_clients::model::MCPServerInput::Command(_)) {
+                            return Err(CommandError::InvalidCommand(format!(
+                                "Input '{}' 是 command 类型，不支持 default 值 / is command type, no default support",
+                                input_id
+                            )));
+                        }
+                        
                         if let Some(default_val) = input.default() {
                             println!("使用 default 值 / Using default value: {}", default_val);
-                            default_val.clone()
+                            default_val
                         } else {
                             return Err(CommandError::InvalidCommand(format!(
                                 "Input '{}' 没有 default 值 / has no default value",

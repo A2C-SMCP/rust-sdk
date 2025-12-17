@@ -11,10 +11,21 @@
 use crate::computer::{Computer, SilentSession};
 use crate::errors::ComputerError;
 use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
+use crate::socketio_client::SmcpComputerClient;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
+
+/// CLI 运行时配置 / CLI runtime configuration
+#[derive(Clone, Debug)]
+pub struct CliConfig {
+    pub url: Option<String>,
+    pub namespace: String,
+    pub auth: Option<String>,
+    pub headers: Option<String>,
+}
 
 #[derive(Error, Debug)]
 pub enum CommandError {
@@ -32,11 +43,12 @@ pub enum CommandError {
 
 pub struct CommandHandler {
     pub computer: Computer<SilentSession>,
+    pub cli_config: CliConfig,
 }
 
 impl CommandHandler {
-    pub fn new(computer: Computer<SilentSession>) -> Self {
-        Self { computer }
+    pub fn new(computer: Computer<SilentSession>, cli_config: CliConfig) -> Self {
+        Self { computer, cli_config }
     }
 
     /// 显示帮助信息
@@ -75,6 +87,27 @@ impl CommandHandler {
     /// 显示服务器状态
     pub async fn show_status(&self) -> Result<(), CommandError> {
         println!("服务器状态 / Server Status:");
+
+        // 获取 Socket.IO 状态
+        let socketio_client = self.computer.get_socketio_client();
+        let socketio_ref = socketio_client.read().await;
+        if let Some(ref weak_client) = *socketio_ref {
+            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
+                println!("  Socket.IO: 已连接 / Connected");
+                println!("    URL: {}", client.get_url());
+                println!("    Namespace: {}", client.get_namespace());
+                if let Some(office_id) = client.get_office_id().await {
+                    println!("    Office ID: {}", office_id);
+                    println!("    Computer Name: {}", self.computer.name());
+                } else {
+                    println!("    Office: 未加入 / Not joined");
+                }
+            } else {
+                println!("  Socket.IO: 已断开 / Disconnected");
+            }
+        } else {
+            println!("  Socket.IO: 未连接 / Not connected");
+        }
 
         // 获取 MCP Manager 状态
         if self.computer.is_mcp_manager_initialized().await {
@@ -633,10 +666,21 @@ mod tests {
         )
     }
 
+    /// 创建测试用的 CommandHandler 实例 / Create test CommandHandler instance
+    fn create_test_handler(computer: Computer<SilentSession>) -> CommandHandler {
+        let cli_config = CliConfig {
+            url: None,
+            namespace: "/smcp".to_string(),
+            auth: None,
+            headers: None,
+        };
+        CommandHandler::new(computer, cli_config)
+    }
+
     #[tokio::test]
     async fn test_show_help() {
         let computer = create_test_computer().await;
-        let handler = CommandHandler::new(computer);
+        let handler = create_test_handler(computer);
 
         // 测试帮助信息不会崩溃 / Test help doesn't crash
         handler.show_help();
@@ -645,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn test_show_status_uninitialized() {
         let computer = create_test_computer().await;
-        let handler = CommandHandler::new(computer);
+        let handler = create_test_handler(computer);
 
         // 测试未初始化状态 / Test uninitialized state
         let result = handler.show_status().await;
@@ -655,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_server_with_json() {
         let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
+        let mut handler = create_test_handler(computer);
 
         // 测试添加服务器配置 / Test adding server config
         let json_config = r#"
@@ -683,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_server_invalid_json() {
         let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
+        let mut handler = create_test_handler(computer);
 
         // 测试无效 JSON / Test invalid JSON
         let invalid_json = "{ invalid json }";
@@ -696,7 +740,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_server_from_file() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
+        let mut handler = create_test_handler(computer);
 
         // 创建临时配置文件 / Create temp config file
         let mut temp_file = NamedTempFile::new()?;
@@ -731,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_server() {
         let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
+        let mut handler = create_test_handler(computer);
 
         // 测试移除服务器（即使不存在也应该成功） / Test removing server
         let result = handler.remove_server("non_existent").await;
@@ -741,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_stop_client_uninitialized() {
         let computer = create_test_computer().await;
-        let handler = CommandHandler::new(computer);
+        let handler = create_test_handler(computer);
 
         // 测试未初始化时启动客户端 / Test starting client when uninitialized
         let result = handler.start_client("test").await;
@@ -755,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_inputs() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
+        let mut handler = create_test_handler(computer);
 
         // 创建临时 inputs 文件 / Create temp inputs file
         let mut temp_file = NamedTempFile::new()?;
@@ -783,7 +827,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_inputs_empty() {
         let computer = create_test_computer().await;
-        let handler = CommandHandler::new(computer);
+        let handler = create_test_handler(computer);
 
         // 测试列出空的 inputs / Test listing empty inputs
         let result = handler.list_inputs().await;
@@ -793,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn test_show_history_empty() {
         let computer = create_test_computer().await;
-        let handler = CommandHandler::new(computer);
+        let handler = create_test_handler(computer);
 
         // 测试显示空历史 / Test showing empty history
         let result = handler.show_history(Some(5)).await;
@@ -803,7 +847,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_desktop() {
         let computer = create_test_computer().await;
-        let handler = CommandHandler::new(computer);
+        let handler = create_test_handler(computer);
 
         // 测试获取桌面信息 / Test getting desktop info
         let result = handler.get_desktop(Some(10), Some("test://uri")).await;
@@ -814,7 +858,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_config() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
+        let mut handler = create_test_handler(computer);
 
         // 创建完整配置文件 / Create complete config file
         let mut temp_file = NamedTempFile::new()?;
@@ -862,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_server_validation() {
         let computer = create_test_computer().await;
-        let mut handler = CommandHandler::new(computer);
+        let mut handler = create_test_handler(computer);
 
         let test_cases = vec![
             // (json, should_succeed, description)

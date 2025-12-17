@@ -217,6 +217,16 @@ impl<S: Session> Computer<S> {
         self
     }
 
+    /// 获取计算机名称 / Get computer name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 获取 Socket.IO 客户端引用 / Get Socket.IO client reference
+    pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Weak<SmcpComputerClient>>>> {
+        self.socketio_client.clone()
+    }
+
     /// 启动Computer / Boot up the computer
     pub async fn boot_up(&self) -> ComputerResult<()> {
         info!("Starting Computer: {}", self.name);
@@ -289,6 +299,9 @@ impl<S: Session> Computer<S> {
             servers.insert(server.name().to_string(), server);
         }
 
+        // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
+        let _ = self.emit_update_config().await;
+
         Ok(())
     }
 
@@ -305,6 +318,9 @@ impl<S: Session> Computer<S> {
             servers.remove(server_name);
         }
 
+        // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
+        let _ = self.emit_update_config().await;
+
         Ok(())
     }
 
@@ -317,9 +333,12 @@ impl<S: Session> Computer<S> {
 
         // 重新创建输入处理器 / Recreate input handler
         {
-            let mut handler = self.input_handler.write().await;
-            *handler = InputHandler::new();
+            let mut input_handler = self.input_handler.write().await;
+            *input_handler = InputHandler::new();
         }
+
+        // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
+        let _ = self.emit_update_config().await;
 
         Ok(())
     }
@@ -335,6 +354,9 @@ impl<S: Session> Computer<S> {
         // 清除相关缓存 / Clear related cache
         self.clear_input_values(Some(&input_id)).await?;
 
+        // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
+        let _ = self.emit_update_config().await;
+
         Ok(())
     }
 
@@ -348,6 +370,9 @@ impl<S: Session> Computer<S> {
         if removed {
             // 清除缓存 / Clear cache
             self.clear_input_values(Some(input_id)).await?;
+            
+            // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
+            let _ = self.emit_update_config().await;
         }
 
         Ok(removed)
