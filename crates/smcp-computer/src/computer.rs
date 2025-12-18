@@ -370,7 +370,7 @@ impl<S: Session> Computer<S> {
         if removed {
             // 清除缓存 / Clear cache
             self.clear_input_values(Some(input_id)).await?;
-            
+
             // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
             let _ = self.emit_update_config().await;
         }

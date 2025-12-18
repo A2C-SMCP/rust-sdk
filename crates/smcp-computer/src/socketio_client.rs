@@ -376,7 +376,7 @@ impl SmcpComputerClient {
                 )
             ));
         }
-        
+
         debug!("Emitting event: {}", event);
 
         self.client
@@ -402,7 +402,7 @@ impl SmcpComputerClient {
                 )
             ));
         }
-        
+
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
         debug!("Calling event: {} with timeout {:?}", event, timeout);
 

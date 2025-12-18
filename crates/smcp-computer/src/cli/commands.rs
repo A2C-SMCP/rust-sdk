@@ -48,7 +48,10 @@ pub struct CommandHandler {
 
 impl CommandHandler {
     pub fn new(computer: Computer<SilentSession>, cli_config: CliConfig) -> Self {
-        Self { computer, cli_config }
+        Self {
+            computer,
+            cli_config,
+        }
     }
 
     /// 显示帮助信息
@@ -147,6 +150,16 @@ impl CommandHandler {
 
     /// 列出可用工具
     pub async fn list_tools(&self) -> Result<(), CommandError> {
+        if !self.computer.is_mcp_manager_initialized().await {
+            println!("MCP 管理器未初始化 / MCP manager not initialized");
+            println!("请先添加并启动 MCP server，然后再执行 tools / Please add and start an MCP server before running 'tools'");
+            println!();
+            println!("示例 / Example:");
+            println!("  server add @./config.json");
+            println!("  start all");
+            return Ok(());
+        }
+
         match self.computer.get_available_tools().await {
             Ok(tools) => {
                 println!("可用工具 / Available Tools:");
@@ -155,9 +168,7 @@ impl CommandHandler {
                 }
             }
             Err(e) => {
-                return Err(CommandError::ComputerError(ComputerError::TransportError(
-                    e.to_string(),
-                )));
+                return Err(CommandError::ComputerError(e));
             }
         }
         Ok(())
@@ -854,7 +865,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    
     #[tokio::test]
     async fn test_load_config() -> Result<(), std::io::Error> {
         let computer = create_test_computer().await;

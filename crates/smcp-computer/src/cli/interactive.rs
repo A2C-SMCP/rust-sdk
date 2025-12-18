@@ -213,15 +213,22 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
                     // 先克隆所有需要的配置值以避免借用冲突
                     // First clone all needed config values to avoid borrow conflicts
                     let cli_config = handler.cli_config.clone();
-                    
+
                     let url = if parts.len() > 2 {
                         parts[2]
                     } else {
                         // 使用 CLI 配置中的默认 URL，或回退到 localhost
                         cli_config.url.as_deref().unwrap_or("http://localhost:3000")
                     };
-                    
-                    handler.connect_socketio(url, &cli_config.namespace, &cli_config.auth, &cli_config.headers).await?;
+
+                    handler
+                        .connect_socketio(
+                            url,
+                            &cli_config.namespace,
+                            &cli_config.auth,
+                            &cli_config.headers,
+                        )
+                        .await?;
                 }
                 "join" => {
                     if parts.len() < 4 {
@@ -353,7 +360,7 @@ async fn handle_inputs_value(
                                 input_id
                             )));
                         }
-                        
+
                         if let Some(default_val) = input.default() {
                             println!("使用 default 值 / Using default value: {}", default_val);
                             default_val

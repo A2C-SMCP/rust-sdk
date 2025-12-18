@@ -60,10 +60,13 @@ impl Default for ToolMeta {
 #[serde(tag = "type")]
 pub enum MCPServerConfig {
     /// STDIO类型服务器 / STDIO type server
+    #[serde(alias = "stdio", alias = "STDIO")]
     Stdio(StdioServerConfig),
     /// SSE类型服务器 / SSE type server
+    #[serde(alias = "sse", alias = "SSE")]
     Sse(SseServerConfig),
     /// HTTP类型服务器 / HTTP type server
+    #[serde(alias = "http", alias = "HTTP")]
     Http(HttpServerConfig),
 }
 
@@ -192,6 +195,14 @@ pub struct HttpServerConfig {
     pub server_parameters: HttpServerParameters,
 }
 
+fn null_to_empty_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<HashMap<String, String>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 /// STDIO服务器参数 / STDIO server parameters
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StdioServerParameters {
@@ -201,7 +212,7 @@ pub struct StdioServerParameters {
     #[serde(default)]
     pub args: Vec<String>,
     /// 环境变量 / Environment variables
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_map")]
     pub env: HashMap<String, String>,
     /// 工作目录 / Working directory
     #[serde(skip_serializing_if = "Option::is_none")]

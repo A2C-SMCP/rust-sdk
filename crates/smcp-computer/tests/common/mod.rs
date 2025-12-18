@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
 
-use smcp_computer::cli::commands::{CommandHandler, CliConfig};
+use smcp_computer::cli::commands::{CliConfig, CommandHandler};
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig, StdioServerParameters,
