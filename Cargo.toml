@@ -56,32 +56,69 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 # Testing utilities
-tokio-test = "0.4"
-tempfile = "3"
-rmcp = { version = "0.11.0", features = ["server", "transport-io"] }
-tracing-subscriber = { workspace = true }
+tokio-test.workspace = true
+tempfile.workspace = true
+rmcp.workspace = true
+tracing-subscriber.workspace = true
 
 [workspace.dependencies]
+# 核心运行时 / Core runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal", "process"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# 序列化 / Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# 错误处理 / Error handling
 thiserror = "2"
+
+# 日志追踪 / Logging & tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
 
+# 工具类 / Utilities
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+async-recursion = "1.0"
+dashmap = "5.5"
+futures = "0.3"
+futures-util = "0.3"
+regex = "1.10"
+lazy_static = "1.4"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2.5"
+
+# Socket.IO / Socket.IO
 socketioxide = { version = "0.16.3", features = ["state"] }
 rust_socketio = { version = "0.6", features = ["async"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
-tower = "0.5"
-futures-util = "0.3"
+
+# HTTP服务器 / HTTP server
+hyper = { version = "1", features = ["server", "http1", "http2", "full"] }
+hyper-util = { version = "0.1", features = ["tokio", "service", "full"] }
+tower = { version = "0.5", features = ["util"] }
+http = "1.0"
 http-body-util = "0.1"
 hyper-tungstenite = "0.17"
 
-# 新增的workspace依赖
-async-trait = "0.1"
-dashmap = "5.5"
-http = "1.0"
-reqwest = { version = "0.12", features = ["json"] }
-futures = "0.3"
+# HTTP客户端 / HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+eventsource-client = "0.11"
+
+# MCP SDK
+rmcp = { version = "0.11.0", features = ["client", "server", "transport-child-process", "transport-io", "server-side-http", "transport-streamable-http-server"] }
+
+# CLI相关 / CLI related
+clap = { version = "4.4", features = ["derive"] }
+crossterm = "0.29.0"
+console = "0.16.1"
+rustyline = { version = "14.0", features = ["derive"] }
+rustyline-derive = "0.10"
+rpassword = "7.2"
+
+# VRL
+vrl = "0.29.0"
+
+# 测试 / Testing
+tempfile = "3.8"
+tokio-test = "0.4"

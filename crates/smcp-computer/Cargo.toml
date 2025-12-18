@@ -6,12 +6,12 @@ license.workspace = true
 
 [dev-dependencies]
 smcp-server-core = { path = "../smcp-server-core" }
-tracing-subscriber = "0.3"
-hyper = { version = "1.0", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
-hyper-util = { version = "0.1", features = ["full"] }
-http-body-util = "0.1"
-tempfile = "3.8"
+tracing-subscriber.workspace = true
+hyper.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+tempfile.workspace = true
 
 [dependencies]
 smcp = { path = "../smcp" }
@@ -25,29 +25,29 @@ uuid.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
-async-recursion = "1.0"
+async-recursion.workspace = true
 
 rust_socketio.workspace = true
-tokio-util = { version = "0.7", features = ["codec"] }
-regex = "1.10"
-lazy_static = "1.4"
-chrono = { version = "0.4", features = ["serde"] }
+tokio-util.workspace = true
+regex.workspace = true
+lazy_static.workspace = true
+chrono.workspace = true
 
 # MCP SDK / MCP SDK
-rmcp = { version = "0.11.0", features = ["client", "server", "transport-child-process", "transport-io", "server-side-http", "transport-streamable-http-server"] }
+rmcp.workspace = true
 
 # HTTP客户端 / HTTP Client
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest.workspace = true
 
 # SSE客户端 / SSE Client
-eventsource-client = "0.11"
-futures = "0.3"
+eventsource-client.workspace = true
+futures.workspace = true
 
 # URL解析 / URL parsing
-url = "2.5"
+url.workspace = true
 
 # 密码输入 / Password input
-rpassword = "7.2"
+rpassword.workspace = true
 
 [features]
 default = ["vrl"]
@@ -56,29 +56,27 @@ cli = ["dep:clap", "dep:crossterm", "dep:console", "dep:rustyline", "dep:rustyli
 e2e = []
 
 [dependencies.vrl]
-version = "0.29.0"
+workspace = true
 optional = true
 
 [dependencies.clap]
-version = "4.4"
-features = ["derive"]
+workspace = true
 optional = true
 
 [dependencies.crossterm]
-version = "0.29.0"
+workspace = true
 optional = true
 
 [dependencies.console]
-version = "0.16.1"
+workspace = true
 optional = true
 
 [dependencies.rustyline]
-version = "14.0"
-features = ["derive"]
+workspace = true
 optional = true
 
 [dependencies.rustyline-derive]
-version = "0.10"
+workspace = true
 optional = true
 
 [[bin]]

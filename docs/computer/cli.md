@@ -44,11 +44,14 @@ cargo build -p smcp-computer --features cli
 - 或 `target/release/smcp-computer`（加 `--release`）
 
 ---
-
 ## 2. 全局参数（启动参数）
 
 `smcp-computer` 支持以下参数（均为 `--long` 形式）：
 
+- `--ui <plain|tui>`
+  - UI 模式（默认值见下方“UI 模式优先级”）
+  - `plain`：纯文本交互（兼容现有行为）
+  - `tui`：全屏 TUI（后续改造完成后生效）
 - `--auto-connect <bool>`
   - 是否自动连接（默认 `true`）
 - `--auto-reconnect <bool>`
@@ -63,6 +66,33 @@ cargo build -p smcp-computer --features cli
   - 请求头参数（可选），格式：`key:value,foo:bar`
 - `--no-color`
   - 关闭彩色输出
+
+### 2.1 UI 模式优先级
+
+`smcp-computer` 的 UI 模式支持“启动默认 + 子命令覆盖”，用于灰度发布与降级。
+
+生效优先级（从高到低）：
+
+- 子命令显式指定的 `--ui <plain|tui>`（例如 `run --ui plain`）
+- 启动参数 `--ui <plain|tui>`（例如 `smcp-computer --ui tui ...`）
+- 环境变量 `A2C_RUST_UI`（值为 `plain` 或 `tui`）
+- 程序内置默认值（当前以实现为准；建议改造期默认 `plain`）
+
+示例：
+
+```bash
+# 中文: 设置启动默认 UI 为 tui（未来 TUI 上线后常用）
+# English: Set the default UI to tui
+cargo run -p smcp-computer --features cli -- --ui tui
+
+# 中文: 全局默认 tui，但 run 子命令强制 plain（用于单命令降级）
+# English: Global default tui, but override to plain for the run command
+cargo run -p smcp-computer --features cli -- --ui tui run --ui plain
+
+# 中文: 通过环境变量指定默认 UI
+# English: Use env var to set default UI
+A2C_RUST_UI=plain cargo run -p smcp-computer --features cli
+```
 
 示例：
 
