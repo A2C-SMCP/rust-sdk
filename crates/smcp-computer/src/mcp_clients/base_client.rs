@@ -282,6 +282,30 @@ where
         // Base implementation returns error, subclasses need to override
         Err(MCPClientError::ProtocolError("Not implemented".to_string()))
     }
+
+    async fn subscribe_window(
+        &self,
+        _resource: Resource,
+    ) -> Result<(), MCPClientError> {
+        if self.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+        // 基础实现返回错误，子类需要重写
+        // Base implementation returns error, subclasses need to override
+        Err(MCPClientError::ProtocolError("Not implemented".to_string()))
+    }
+
+    async fn unsubscribe_window(
+        &self,
+        _resource: Resource,
+    ) -> Result<(), MCPClientError> {
+        if self.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+        // 基础实现返回错误，子类需要重写
+        // Base implementation returns error, subclasses need to override
+        Err(MCPClientError::ProtocolError("Not implemented".to_string()))
+    }
 }
 
 /// 客户端状态机 / Client state machine

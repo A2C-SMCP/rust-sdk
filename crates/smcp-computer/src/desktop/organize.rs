@@ -7,7 +7,8 @@
 * 依赖: None
 * 描述: 桌面组织策略实现 / Desktop organizing strategy implementation
 */
-use super::model::{ServerName, ToolCallRecord, WindowInfo, WindowURI};
+use super::model::{ServerName, ToolCallRecord, WindowInfo};
+use super::window_uri::WindowURI;
 use super::Desktop;
 use crate::mcp_clients::model::{ReadResourceResult, Resource, TextResourceContents};
 use std::collections::{HashMap, HashSet};
@@ -52,8 +53,8 @@ pub fn organize_desktop(
         }
 
         // 解析 WindowURI / Parse WindowURI
-        let (priority, fullscreen) = match WindowURI::parse(&window.resource.uri) {
-            Ok(uri) => (uri.priority.unwrap_or(0), uri.fullscreen.unwrap_or(false)),
+        let (priority, fullscreen) = match WindowURI::new(&window.resource.uri) {
+            Ok(uri) => (uri.priority().unwrap_or(0), uri.fullscreen().unwrap_or(false)),
             Err(_) => {
                 // 解析失败的资源，跳过 / Skip resources that failed to parse
                 continue;

@@ -2,7 +2,7 @@
 * 文件名: mod.rs
 * 作者: JQQ
 * 创建日期: 2025/12/16
-* 最后修改日期: 2025/12/16
+* 最后修改日期: 2025/12/18
 * 版权: 2023 JQQ. All rights reserved.
 * 依赖: serde
 * 描述: Desktop模块入口 / Desktop module entry point
@@ -10,9 +10,12 @@
 
 pub mod model;
 pub mod organize;
+pub mod window_uri;
 
 pub use model::*;
 pub use organize::*;
+// Re-export window_uri types with explicit names to avoid conflicts
+pub use window_uri::{WindowURI as WindowURIWrapper, WindowURIError as WindowURIErrorWrapper, is_window_uri};
 
 /// 桌面内容类型 / Desktop content type
 pub type Desktop = String;

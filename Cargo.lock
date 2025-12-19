@@ -3933,6 +3933,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "lazy_static",
+ "percent-encoding",
  "regex",
  "reqwest",
  "rmcp",

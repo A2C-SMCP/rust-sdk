@@ -45,6 +45,7 @@ futures.workspace = true
 
 # URL解析 / URL parsing
 url.workspace = true
+percent-encoding = "2.3"
 
 # 密码输入 / Password input
 rpassword.workspace = true

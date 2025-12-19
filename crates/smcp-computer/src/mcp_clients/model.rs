@@ -364,6 +364,18 @@ pub trait MCPClientProtocol: Send + Sync {
         &self,
         resource: Resource,
     ) -> Result<ReadResourceResult, MCPClientError>;
+
+    /// 订阅窗口资源更新 / Subscribe to window resource updates
+    async fn subscribe_window(
+        &self,
+        resource: Resource,
+    ) -> Result<(), MCPClientError>;
+
+    /// 取消订阅窗口资源更新 / Unsubscribe from window resource updates
+    async fn unsubscribe_window(
+        &self,
+        resource: Resource,
+    ) -> Result<(), MCPClientError>;
 }
 
 /// 客户端状态 / Client state
@@ -510,4 +522,14 @@ pub struct TextResourceContents {
     /// MIME类型 / MIME type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+}
+
+/// 列出资源结果 / List resources result（支持分页）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListResourcesResult {
+    /// 资源列表 / Resource list
+    pub resources: Vec<Resource>,
+    /// 下一页游标 / Next page cursor
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }

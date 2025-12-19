@@ -9,6 +9,7 @@
 */
 use super::base_client::BaseMCPClient;
 use super::model::*;
+use crate::desktop::window_uri::{WindowURI, is_window_uri};
 use async_trait::async_trait;
 use es::Client as EsClient;
 use eventsource_client as es;
@@ -365,6 +366,8 @@ impl MCPClientProtocol for SseMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
+        // SSE 客户端目前不支持分页，直接获取所有资源
+        // SSE client doesn't support pagination currently, get all resources directly
         let response = self.send_request("resources/list", None).await?;
 
         if let Some(error) = response.get("error") {
@@ -374,21 +377,40 @@ impl MCPClientProtocol for SseMCPClient {
             )));
         }
 
+        let mut all_resources = Vec::new();
         if let Some(result) = response.get("result") {
             if let Some(resources) = result.get("resources").and_then(|v| v.as_array()) {
-                let mut resource_list = Vec::new();
                 for resource in resources {
-                    if let Ok(parsed_resource) =
-                        serde_json::from_value::<Resource>(resource.clone())
-                    {
-                        resource_list.push(parsed_resource);
+                    if let Ok(parsed_resource) = serde_json::from_value::<Resource>(resource.clone()) {
+                        all_resources.push(parsed_resource);
                     }
                 }
-                return Ok(resource_list);
             }
         }
 
-        Ok(vec![])
+        // 过滤 window:// 资源并按 priority 排序 / Filter window:// resources and sort by priority
+        let mut filtered_resources: Vec<(Resource, i32)> = Vec::new();
+        
+        for resource in all_resources {
+            if !is_window_uri(&resource.uri) {
+                continue;
+            }
+
+            // 解析 priority / Parse priority
+            let priority = if let Ok(uri) = WindowURI::new(&resource.uri) {
+                uri.priority().unwrap_or(0)
+            } else {
+                0
+            };
+
+            filtered_resources.push((resource, priority));
+        }
+
+        // 按 priority 降序排序 / Sort by priority in descending order
+        filtered_resources.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // 返回仅包含 Resource 的列表 / Return list containing only Resource
+        Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
     }
 
     async fn get_window_detail(
@@ -420,6 +442,54 @@ impl MCPClientProtocol for SseMCPClient {
         Err(MCPClientError::ProtocolError(
             "Invalid response".to_string(),
         ))
+    }
+
+    async fn subscribe_window(
+        &self,
+        resource: Resource,
+    ) -> Result<(), MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+
+        let params = serde_json::json!({
+            "uri": resource.uri
+        });
+
+        let response = self.send_request("resources/subscribe", Some(params)).await?;
+
+        if let Some(error) = response.get("error") {
+            return Err(MCPClientError::ProtocolError(format!(
+                "Subscribe resource error: {}",
+                error
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn unsubscribe_window(
+        &self,
+        resource: Resource,
+    ) -> Result<(), MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+
+        let params = serde_json::json!({
+            "uri": resource.uri
+        });
+
+        let response = self.send_request("resources/unsubscribe", Some(params)).await?;
+
+        if let Some(error) = response.get("error") {
+            return Err(MCPClientError::ProtocolError(format!(
+                "Unsubscribe resource error: {}",
+                error
+            )));
+        }
+
+        Ok(())
     }
 }
 
