@@ -283,10 +283,7 @@ where
         Err(MCPClientError::ProtocolError("Not implemented".to_string()))
     }
 
-    async fn subscribe_window(
-        &self,
-        _resource: Resource,
-    ) -> Result<(), MCPClientError> {
+    async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
         if self.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -295,10 +292,7 @@ where
         Err(MCPClientError::ProtocolError("Not implemented".to_string()))
     }
 
-    async fn unsubscribe_window(
-        &self,
-        _resource: Resource,
-    ) -> Result<(), MCPClientError> {
+    async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
         if self.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }

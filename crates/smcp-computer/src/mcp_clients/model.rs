@@ -366,16 +366,10 @@ pub trait MCPClientProtocol: Send + Sync {
     ) -> Result<ReadResourceResult, MCPClientError>;
 
     /// 订阅窗口资源更新 / Subscribe to window resource updates
-    async fn subscribe_window(
-        &self,
-        resource: Resource,
-    ) -> Result<(), MCPClientError>;
+    async fn subscribe_window(&self, resource: Resource) -> Result<(), MCPClientError>;
 
     /// 取消订阅窗口资源更新 / Unsubscribe from window resource updates
-    async fn unsubscribe_window(
-        &self,
-        resource: Resource,
-    ) -> Result<(), MCPClientError>;
+    async fn unsubscribe_window(&self, resource: Resource) -> Result<(), MCPClientError>;
 }
 
 /// 客户端状态 / Client state

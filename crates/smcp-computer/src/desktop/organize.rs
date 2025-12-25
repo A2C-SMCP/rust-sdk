@@ -54,7 +54,10 @@ pub fn organize_desktop(
 
         // 解析 WindowURI / Parse WindowURI
         let (priority, fullscreen) = match WindowURI::new(&window.resource.uri) {
-            Ok(uri) => (uri.priority().unwrap_or(0), uri.fullscreen().unwrap_or(false)),
+            Ok(uri) => (
+                uri.priority().unwrap_or(0),
+                uri.fullscreen().unwrap_or(false),
+            ),
             Err(_) => {
                 // 解析失败的资源，跳过 / Skip resources that failed to parse
                 continue;

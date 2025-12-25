@@ -15,7 +15,9 @@ pub mod window_uri;
 pub use model::*;
 pub use organize::*;
 // Re-export window_uri types with explicit names to avoid conflicts
-pub use window_uri::{WindowURI as WindowURIWrapper, WindowURIError as WindowURIErrorWrapper, is_window_uri};
+pub use window_uri::{
+    is_window_uri, WindowURI as WindowURIWrapper, WindowURIError as WindowURIErrorWrapper,
+};
 
 /// 桌面内容类型 / Desktop content type
 pub type Desktop = String;

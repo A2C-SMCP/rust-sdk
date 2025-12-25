@@ -9,7 +9,7 @@
 */
 use super::base_client::BaseMCPClient;
 use super::model::*;
-use crate::desktop::window_uri::{WindowURI, is_window_uri};
+use crate::desktop::window_uri::{is_window_uri, WindowURI};
 use async_trait::async_trait;
 use es::Client as EsClient;
 use eventsource_client as es;
@@ -381,7 +381,9 @@ impl MCPClientProtocol for SseMCPClient {
         if let Some(result) = response.get("result") {
             if let Some(resources) = result.get("resources").and_then(|v| v.as_array()) {
                 for resource in resources {
-                    if let Ok(parsed_resource) = serde_json::from_value::<Resource>(resource.clone()) {
+                    if let Ok(parsed_resource) =
+                        serde_json::from_value::<Resource>(resource.clone())
+                    {
                         all_resources.push(parsed_resource);
                     }
                 }
@@ -390,7 +392,7 @@ impl MCPClientProtocol for SseMCPClient {
 
         // 过滤 window:// 资源并按 priority 排序 / Filter window:// resources and sort by priority
         let mut filtered_resources: Vec<(Resource, i32)> = Vec::new();
-        
+
         for resource in all_resources {
             if !is_window_uri(&resource.uri) {
                 continue;
@@ -444,10 +446,7 @@ impl MCPClientProtocol for SseMCPClient {
         ))
     }
 
-    async fn subscribe_window(
-        &self,
-        resource: Resource,
-    ) -> Result<(), MCPClientError> {
+    async fn subscribe_window(&self, resource: Resource) -> Result<(), MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -456,7 +455,9 @@ impl MCPClientProtocol for SseMCPClient {
             "uri": resource.uri
         });
 
-        let response = self.send_request("resources/subscribe", Some(params)).await?;
+        let response = self
+            .send_request("resources/subscribe", Some(params))
+            .await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(
@@ -468,10 +469,7 @@ impl MCPClientProtocol for SseMCPClient {
         Ok(())
     }
 
-    async fn unsubscribe_window(
-        &self,
-        resource: Resource,
-    ) -> Result<(), MCPClientError> {
+    async fn unsubscribe_window(&self, resource: Resource) -> Result<(), MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
@@ -480,7 +478,9 @@ impl MCPClientProtocol for SseMCPClient {
             "uri": resource.uri
         });
 
-        let response = self.send_request("resources/unsubscribe", Some(params)).await?;
+        let response = self
+            .send_request("resources/unsubscribe", Some(params))
+            .await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(

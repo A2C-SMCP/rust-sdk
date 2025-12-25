@@ -9,7 +9,7 @@
 */
 
 use std::collections::HashMap;
-use url::{Url};
+use url::Url;
 
 /// Window URI 解析器 / Window URI parser
 /// 对应 Python 侧的 WindowURI 类
@@ -28,17 +28,18 @@ impl WindowURI {
     pub fn new(uri: &str) -> Result<Self, WindowURIError> {
         let url = Url::parse(uri)
             .map_err(|e| WindowURIError::InvalidURI(format!("Failed to parse URI: {}", e)))?;
-        
+
         if url.scheme() != "window" {
             return Err(WindowURIError::InvalidScheme(url.scheme().to_string()));
         }
-        
+
         if url.host().is_none() || url.host_str().unwrap().is_empty() {
             return Err(WindowURIError::MissingHost);
         }
 
         // 解析路径段 / Parse path segments
-        let windows = url.path()
+        let windows = url
+            .path()
             .trim_start_matches('/')
             .split('/')
             .filter(|s| !s.is_empty())
@@ -46,28 +47,32 @@ impl WindowURI {
                 percent_encoding::percent_decode_str(s)
                     .decode_utf8()
                     .map(|s| s.to_string())
-                    .map_err(|e| WindowURIError::InvalidPath(format!("Failed to decode path segment: {}", e)))
+                    .map_err(|e| {
+                        WindowURIError::InvalidPath(format!("Failed to decode path segment: {}", e))
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         // 解析查询参数 / Parse query parameters
-        let params: HashMap<String, String> = url.query_pairs()
-            .into_owned()
-            .collect();
+        let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
 
         // 验证查询参数 / Validate query parameters
-        let uri = Self { url, windows, params };
-        
+        let uri = Self {
+            url,
+            windows,
+            params,
+        };
+
         // 验证 priority / Validate priority
         if let Some(priority) = uri.priority() {
             if !(0..=100).contains(&priority) {
                 return Err(WindowURIError::InvalidPriority(priority));
             }
         }
-        
+
         // 验证 fullscreen / Validate fullscreen
         let _ = uri.fullscreen(); // Will error if invalid
-        
+
         Ok(uri)
     }
 
@@ -83,19 +88,17 @@ impl WindowURI {
 
     /// 获取优先级 / Get priority (0-100)
     pub fn priority(&self) -> Option<i32> {
-        self.params.get("priority")
-            .and_then(|s| s.parse().ok())
+        self.params.get("priority").and_then(|s| s.parse().ok())
     }
 
     /// 获取全屏标志 / Get fullscreen flag
     pub fn fullscreen(&self) -> Option<bool> {
-        self.params.get("fullscreen")
-            .and_then(|s| {
-                match s.to_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => Some(true),
-                    "0" | "false" | "no" | "off" => Some(false),
-                    _ => None,
-                }
+        self.params
+            .get("fullscreen")
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
             })
     }
 
@@ -115,32 +118,38 @@ impl WindowURI {
 
         // 添加路径段 / Add path segments
         if !windows.is_empty() {
-            let encoded_path: Vec<String> = windows.iter()
-                .map(|w| percent_encoding::utf8_percent_encode(w, percent_encoding::NON_ALPHANUMERIC).to_string())
+            let encoded_path: Vec<String> = windows
+                .iter()
+                .map(|w| {
+                    percent_encoding::utf8_percent_encode(w, percent_encoding::NON_ALPHANUMERIC)
+                        .to_string()
+                })
                 .collect();
             url.set_path(&encoded_path.join("/"));
         }
 
         // 添加查询参数 / Add query parameters
         let mut query_pairs = Vec::new();
-        
+
         if let Some(p) = priority {
             if !(0..=100).contains(&p) {
                 return Err(WindowURIError::InvalidPriority(p));
             }
             query_pairs.push(("priority", p.to_string()));
         }
-        
+
         if let Some(f) = fullscreen {
             query_pairs.push(("fullscreen", if f { "true" } else { "false" }.to_string()));
         }
 
         if !query_pairs.is_empty() {
-            url.set_query(Some(&query_pairs
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<_>>()
-                .join("&")));
+            url.set_query(Some(
+                &query_pairs
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            ));
         }
 
         Ok(url.to_string())
@@ -158,19 +167,19 @@ impl std::fmt::Display for WindowURI {
 pub enum WindowURIError {
     #[error("Invalid URI: {0}")]
     InvalidURI(String),
-    
+
     #[error("Invalid scheme: {0}, expected 'window'")]
     InvalidScheme(String),
-    
+
     #[error("Missing host (MCP ID)")]
     MissingHost,
-    
+
     #[error("Invalid path: {0}")]
     InvalidPath(String),
-    
+
     #[error("Invalid priority: {0}, must be between 0 and 100")]
     InvalidPriority(i32),
-    
+
     #[error("Invalid fullscreen value")]
     InvalidFullscreen,
 }
@@ -202,7 +211,8 @@ mod tests {
 
     #[test]
     fn test_parse_with_query_params() {
-        let uri = WindowURI::new("window://com.example.mcp/page?priority=90&fullscreen=true").unwrap();
+        let uri =
+            WindowURI::new("window://com.example.mcp/page?priority=90&fullscreen=true").unwrap();
         assert_eq!(uri.windows(), &["page"]);
         assert_eq!(uri.priority(), Some(90));
         assert_eq!(uri.fullscreen(), Some(true));
@@ -242,8 +252,9 @@ mod tests {
             &["dashboard".to_string(), "main".to_string()],
             Some(80),
             Some(false),
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         assert!(uri.starts_with("window://com.example.mcp/dashboard/main"));
         assert!(uri.contains("priority=80"));
         assert!(uri.contains("fullscreen=false"));
