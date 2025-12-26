@@ -9,10 +9,12 @@
 */
 use super::base_client::BaseMCPClient;
 use super::model::*;
+use super::{ResourceCache, SubscriptionManager};
 use crate::desktop::window_uri::{is_window_uri, WindowURI};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// HTTP MCP客户端 / HTTP MCP client
@@ -23,6 +25,10 @@ pub struct HttpMCPClient {
     http_client: Client,
     /// 会话ID / Session ID
     session_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    /// 订阅管理器 / Subscription manager
+    subscription_manager: SubscriptionManager,
+    /// 资源缓存 / Resource cache
+    resource_cache: ResourceCache,
 }
 
 impl std::fmt::Debug for HttpMCPClient {
@@ -47,6 +53,8 @@ impl HttpMCPClient {
             base: BaseMCPClient::new(params),
             http_client,
             session_id: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            subscription_manager: SubscriptionManager::new(),
+            resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
         }
     }
 
@@ -143,6 +151,55 @@ impl HttpMCPClient {
 
         info!("HTTP session initialized successfully");
         Ok(())
+    }
+
+    // ========== 订阅管理 API / Subscription Management API ==========
+
+    /// 检查是否已订阅指定资源
+    pub async fn is_subscribed(&self, uri: &str) -> bool {
+        self.subscription_manager.is_subscribed(uri).await
+    }
+
+    /// 获取所有订阅的 URI 列表
+    pub async fn get_subscriptions(&self) -> Vec<String> {
+        self.subscription_manager.get_subscriptions().await
+    }
+
+    /// 获取订阅数量
+    pub async fn subscription_count(&self) -> usize {
+        self.subscription_manager.subscription_count().await
+    }
+
+    // ========== 资源缓存 API / Resource Cache API ==========
+
+    /// 获取缓存的资源数据
+    pub async fn get_cached_resource(&self, uri: &str) -> Option<serde_json::Value> {
+        self.resource_cache.get(uri).await
+    }
+
+    /// 检查是否有缓存
+    pub async fn has_cache(&self, uri: &str) -> bool {
+        self.resource_cache.contains(uri).await
+    }
+
+    /// 获取缓存大小
+    pub async fn cache_size(&self) -> usize {
+        self.resource_cache.size().await
+    }
+
+    /// 清理过期缓存
+    pub async fn cleanup_cache(&self) -> usize {
+        self.resource_cache.cleanup_expired().await
+    }
+
+    /// 获取所有缓存的 URI 列表
+    pub async fn cache_keys(&self) -> Vec<String> {
+        self.resource_cache.keys().await
+    }
+
+    /// 清空所有缓存
+    pub async fn clear_cache(&self) {
+        self.resource_cache.clear().await
     }
 }
 
@@ -385,6 +442,24 @@ impl MCPClientProtocol for HttpMCPClient {
             )));
         }
 
+        // 订阅成功后，更新本地订阅状态
+        let _ = self.subscription_manager.add_subscription(resource.uri.clone()).await;
+
+        // 立即获取并缓存资源数据
+        match self.get_window_detail(resource.clone()).await {
+            Ok(result) => {
+                if !result.contents.is_empty() {
+                    if let Ok(json_value) = serde_json::to_value(&result.contents[0]) {
+                        self.resource_cache.set(resource.uri.clone(), json_value, None).await;
+                        info!("Subscribed and cached: {}", resource.uri);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch resource data after subscription: {:?}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -407,6 +482,13 @@ impl MCPClientProtocol for HttpMCPClient {
                 error
             )));
         }
+
+        // 取消订阅成功后，移除本地订阅状态
+        let _ = self.subscription_manager.remove_subscription(&resource.uri).await;
+
+        // 清理缓存
+        self.resource_cache.remove(&resource.uri).await;
+        info!("Unsubscribed and removed cache: {}", resource.uri);
 
         Ok(())
     }

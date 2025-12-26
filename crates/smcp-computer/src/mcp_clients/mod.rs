@@ -13,8 +13,10 @@ pub mod http_client;
 pub mod manager;
 pub mod model;
 pub mod render;
+pub mod resource_cache;
 pub mod sse_client;
 pub mod stdio_client;
+pub mod subscription_manager;
 pub mod utils;
 pub mod vrl_runtime;
 
@@ -23,4 +25,6 @@ pub use base_client::BaseMCPClient;
 pub use manager::{MCPServerManager, ToolNameDuplicatedError};
 pub use model::*;
 pub use render::{ConfigRender, RenderError};
+pub use resource_cache::{CachedResource, ResourceCache};
+pub use subscription_manager::{Subscription, SubscriptionManager};
 pub use utils::client_factory;

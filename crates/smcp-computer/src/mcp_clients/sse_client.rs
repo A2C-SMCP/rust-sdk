@@ -9,6 +9,7 @@
 */
 use super::base_client::BaseMCPClient;
 use super::model::*;
+use super::{ResourceCache, SubscriptionManager};
 use crate::desktop::window_uri::{is_window_uri, WindowURI};
 use async_trait::async_trait;
 use es::Client as EsClient;
@@ -17,6 +18,7 @@ use futures::stream::{Stream, StreamExt};
 use serde_json;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
@@ -33,6 +35,23 @@ pub struct SseMCPClient {
     response_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<serde_json::Value>>>>,
     /// 会话ID / Session ID
     session_id: Arc<Mutex<Option<String>>>,
+    /// 订阅管理器 / Subscription manager
+    subscription_manager: SubscriptionManager,
+    /// 资源缓存 / Resource cache
+    resource_cache: ResourceCache,
+    /// 资源更新通知发送器 / Resource update notification sender
+    update_tx: Arc<Mutex<Option<mpsc::UnboundedSender<ResourceUpdate>>>>,
+}
+
+/// 资源更新通知
+#[derive(Debug, Clone)]
+pub struct ResourceUpdate {
+    /// 资源 URI
+    pub uri: String,
+    /// 新数据
+    pub data: serde_json::Value,
+    /// 版本号
+    pub version: u64,
 }
 
 impl std::fmt::Debug for SseMCPClient {
@@ -59,6 +78,9 @@ impl SseMCPClient {
             request_tx: Arc::new(Mutex::new(None)),
             response_rx: Arc::new(Mutex::new(None)),
             session_id: Arc::new(Mutex::new(None)),
+            subscription_manager: SubscriptionManager::new(),
+            resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
+            update_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -147,6 +169,10 @@ impl SseMCPClient {
         *self.request_tx.lock().await = Some(request_tx);
         *self.response_rx.lock().await = Some(response_rx);
 
+        // 克隆资源缓存和更新通知发送器，用于 SSE 事件处理
+        let resource_cache = self.resource_cache.clone();
+        let update_tx = self.update_tx.clone();
+
         // 启动SSE事件处理任务 / Start SSE event handling task
         let stream: Pin<Box<dyn Stream<Item = Result<es::SSE, es::Error>> + Send + Sync>> =
             es_client.stream();
@@ -167,8 +193,41 @@ impl SseMCPClient {
                                 // Pattern match on SSE enum variants
                                 match event {
                                     es::SSE::Event(event_data) => {
-                                        if let Ok(response) = serde_json::from_str::<serde_json::Value>(&event_data.data) {
-                                            let _ = response_tx.send(response);
+                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event_data.data) {
+                                            // 区分消息类型 / Distinguish message types
+
+                                            // 检查是否是资源更新通知
+                                            // 资源更新通知通常包含 "method" = "resources/update"
+                                            if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
+                                                if method == "resources/update" || method.contains("update") {
+                                                    debug!("Received resource update notification");
+
+                                                    // 提取 URI 和数据
+                                                    if let Some(params) = value.get("params") {
+                                                        if let Some(uri) = params.get("uri").and_then(|u| u.as_str()) {
+                                                            // 刷新缓存
+                                                            if let Some(data) = params.get("data") {
+                                                                let _ = resource_cache.refresh(uri, data.clone()).await;
+
+                                                                // 发送更新通知
+                                                                if let Some(tx) = update_tx.lock().await.as_ref() {
+                                                                    let _ = tx.send(ResourceUpdate {
+                                                                        uri: uri.to_string(),
+                                                                        data: data.clone(),
+                                                                        version: 1, // TODO: 从缓存获取版本号
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    // 其他通知，也发送到 response channel
+                                                    let _ = response_tx.send(value);
+                                                }
+                                            } else {
+                                                // JSON-RPC 响应
+                                                let _ = response_tx.send(value);
+                                            }
                                         }
                                     }
                                     es::SSE::Comment(_) => {
@@ -236,6 +295,61 @@ impl SseMCPClient {
 
         info!("SSE session initialized successfully");
         Ok(())
+    }
+
+    // ========== 订阅管理 API / Subscription Management API ==========
+
+    /// 检查是否已订阅指定资源
+    pub async fn is_subscribed(&self, uri: &str) -> bool {
+        self.subscription_manager.is_subscribed(uri).await
+    }
+
+    /// 获取所有订阅的 URI 列表
+    pub async fn get_subscriptions(&self) -> Vec<String> {
+        self.subscription_manager.get_subscriptions().await
+    }
+
+    /// 获取订阅数量
+    pub async fn subscription_count(&self) -> usize {
+        self.subscription_manager.subscription_count().await
+    }
+
+    // ========== 资源缓存 API / Resource Cache API ==========
+
+    /// 获取缓存的资源数据
+    pub async fn get_cached_resource(&self, uri: &str) -> Option<serde_json::Value> {
+        self.resource_cache.get(uri).await
+    }
+
+    /// 检查资源是否已缓存
+    pub async fn has_cache(&self, uri: &str) -> bool {
+        self.resource_cache.contains(uri).await
+    }
+
+    /// 获取缓存大小
+    pub async fn cache_size(&self) -> usize {
+        self.resource_cache.size().await
+    }
+
+    /// 清理过期的缓存
+    pub async fn cleanup_cache(&self) -> usize {
+        self.resource_cache.cleanup_expired().await
+    }
+
+    /// 获取所有缓存的 URI 列表
+    pub async fn cache_keys(&self) -> Vec<String> {
+        self.resource_cache.keys().await
+    }
+
+    // ========== 资源更新订阅 API / Resource Update Subscription API ==========
+
+    /// 订阅资源更新通知
+    ///
+    /// 返回一个 receiver，可以用于接收资源更新通知
+    pub async fn subscribe_to_updates(&self) -> mpsc::UnboundedReceiver<ResourceUpdate> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.update_tx.lock().await = Some(tx);
+        rx
     }
 }
 
@@ -466,6 +580,31 @@ impl MCPClientProtocol for SseMCPClient {
             )));
         }
 
+        // 订阅成功后，更新本地订阅状态
+        let _ = self
+            .subscription_manager
+            .add_subscription(resource.uri.clone())
+            .await;
+
+        // 立即获取并缓存资源数据
+        match self.get_window_detail(resource.clone()).await {
+            Ok(result) => {
+                // 将 contents 转换为 JSON Value
+                if !result.contents.is_empty() {
+                    // 取第一个内容并转换为 JSON
+                    if let Ok(json_value) = serde_json::to_value(&result.contents[0]) {
+                        self.resource_cache
+                            .set(resource.uri.clone(), json_value, None)
+                            .await;
+                        info!("Subscribed and cached: {}", resource.uri);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch resource data after subscription: {:?}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -488,6 +627,16 @@ impl MCPClientProtocol for SseMCPClient {
                 error
             )));
         }
+
+        // 取消订阅成功后，移除本地订阅状态
+        let _ = self
+            .subscription_manager
+            .remove_subscription(&resource.uri)
+            .await;
+
+        // 清理缓存
+        self.resource_cache.remove(&resource.uri).await;
+        info!("Unsubscribed and removed cache: {}", resource.uri);
 
         Ok(())
     }
