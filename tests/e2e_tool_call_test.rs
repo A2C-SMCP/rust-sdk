@@ -10,7 +10,6 @@ use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::mcp_clients::model::MCPServerConfig;
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Test tool call with echo server
 #[tokio::test]
@@ -76,8 +75,8 @@ async fn test_tool_call_with_echo_server() {
 
     // Connect agent
     let agent_name = generate_agent_name();
-    let auth = DefaultAuthProvider::new(agent_name, office_id)
-        .with_api_key("test_secret".to_string());
+    let auth =
+        DefaultAuthProvider::new(agent_name, office_id).with_api_key("test_secret".to_string());
     let config = SmcpAgentConfig::default();
     let mut agent = AsyncSmcpAgent::new(auth, config);
 
@@ -157,8 +156,8 @@ async fn test_concurrent_tool_calls() {
         .expect("Failed to join");
 
     let agent_name = generate_agent_name();
-    let auth = DefaultAuthProvider::new(agent_name, office_id)
-        .with_api_key("test_secret".to_string());
+    let auth =
+        DefaultAuthProvider::new(agent_name, office_id).with_api_key("test_secret".to_string());
     let config = SmcpAgentConfig::default();
     let mut agent = AsyncSmcpAgent::new(auth, config);
 
@@ -214,12 +213,14 @@ async fn test_tool_call_timeout() {
         .await
         .expect("Failed to join");
 
-    let mut config = SmcpAgentConfig::default();
-    config.tool_call_timeout = 1; // 1 second timeout (u64)
+    let config = SmcpAgentConfig {
+        tool_call_timeout: 1,
+        ..Default::default()
+    };
 
     let agent_name = generate_agent_name();
-    let auth = DefaultAuthProvider::new(agent_name, office_id)
-        .with_api_key("test_secret".to_string());
+    let auth =
+        DefaultAuthProvider::new(agent_name, office_id).with_api_key("test_secret".to_string());
     let mut agent = AsyncSmcpAgent::new(auth, config);
 
     agent

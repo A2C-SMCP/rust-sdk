@@ -83,7 +83,7 @@ async fn test_basic_three_component_integration() {
             server.url(),
             "/smcp",
             &auth_secret, // API key for authentication
-            &None, // No custom headers
+            &None,        // No custom headers
         )
         .await
         .expect("Failed to connect computer to server");
@@ -156,8 +156,8 @@ async fn test_tool_call_flow() {
 
     // Connect agent
     let agent_name = generate_agent_name();
-    let auth = DefaultAuthProvider::new(agent_name, office_id)
-        .with_api_key("test_secret".to_string());
+    let auth =
+        DefaultAuthProvider::new(agent_name, office_id).with_api_key("test_secret".to_string());
     let config = SmcpAgentConfig::default();
     let mut agent = AsyncSmcpAgent::new(auth, config);
 

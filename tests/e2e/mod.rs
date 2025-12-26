@@ -13,7 +13,10 @@ pub mod mock_agent;
 pub mod mock_minimal;
 pub mod test_server;
 
-pub use helpers::*;
-pub use mock_agent::*;
-pub use mock_minimal::*;
+// Re-export for test convenience
+// These are used by test files, not in this module
+#[allow(unused_imports)]
+pub use helpers::{generate_agent_name, generate_computer_name, generate_office_id};
+#[allow(unused_imports)]
+pub use mock_agent::MockEventHandler;
 pub use test_server::*;

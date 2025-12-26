@@ -3,19 +3,25 @@
 // Provides a mock implementation of AsyncAgentEventHandler
 // that captures and records events for verification
 
-use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+// Clippy false positive - async_trait is used for the attribute macro
+#[allow(unused_imports)]
+use async_trait::async_trait;
+
 use smcp::{
-    events::*, EnterOfficeNotification, LeaveOfficeNotification, ReqId, Role, SMCPTool,
-    UpdateMCPConfigNotification,
+    EnterOfficeNotification, LeaveOfficeNotification, SMCPTool, UpdateMCPConfigNotification,
 };
 use smcp_agent::{AsyncAgentEventHandler, Result as AgentResult};
 
+// Type aliases to reduce complexity
+type ToolsReceived = Arc<RwLock<Vec<(String, Vec<SMCPTool>)>>>;
+type DesktopUpdated = Arc<RwLock<Vec<(String, Vec<String>)>>>;
+
 /// Mock event handler that records all events
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct MockEventHandler {
     /// Recorded enter_office events
     pub enter_office_events: Arc<RwLock<Vec<EnterOfficeNotification>>>,
@@ -24,15 +30,16 @@ pub struct MockEventHandler {
     /// Recorded update_config events
     pub update_config_events: Arc<RwLock<Vec<UpdateMCPConfigNotification>>>,
     /// Recorded tools received events: (computer, tools)
-    pub tools_received: Arc<RwLock<Vec<(String, Vec<SMCPTool>)>>>,
+    pub tools_received: ToolsReceived,
     /// Recorded update_desktop events
     pub update_desktop_events: Arc<RwLock<Vec<String>>>,
     /// Recorded desktop updated events: (computer, desktops)
-    pub desktop_updated: Arc<RwLock<Vec<(String, Vec<String>)>>>,
+    pub desktop_updated: DesktopUpdated,
     /// Recorded tool call results: (computer, tool, result)
     pub tool_call_results: Arc<RwLock<Vec<(String, String, serde_json::Value)>>>,
 }
 
+#[allow(dead_code)]
 impl MockEventHandler {
     /// Create a new mock event handler
     pub fn new() -> Self {
@@ -127,7 +134,7 @@ impl Default for MockEventHandler {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl AsyncAgentEventHandler for MockEventHandler {
     /// Handle computer enter office event
     async fn on_computer_enter_office(
@@ -135,7 +142,10 @@ impl AsyncAgentEventHandler for MockEventHandler {
         data: EnterOfficeNotification,
         _agent: &smcp_agent::AsyncSmcpAgent,
     ) -> AgentResult<()> {
-        println!("MockEventHandler: on_computer_enter_office called: {:?}", data);
+        println!(
+            "MockEventHandler: on_computer_enter_office called: {:?}",
+            data
+        );
         self.enter_office_events.write().await.push(data);
         Ok(())
     }

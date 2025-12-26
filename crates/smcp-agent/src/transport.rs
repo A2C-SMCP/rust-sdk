@@ -49,7 +49,10 @@ impl SocketIoTransport {
         auth: Option<Value>,
         headers: HashMap<String, String>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
-        info!("Connecting to SMCP server at {} with namespace {}", url, namespace);
+        info!(
+            "Connecting to SMCP server at {} with namespace {}",
+            url, namespace
+        );
 
         let mut builder = ClientBuilder::new(url);
 
@@ -105,7 +108,10 @@ impl SocketIoTransport {
         auth: Option<Value>,
         headers: HashMap<String, String>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
-        info!("Connecting to SMCP server at {} with namespace {}", url, namespace);
+        info!(
+            "Connecting to SMCP server at {} with namespace {}",
+            url, namespace
+        );
 
         let mut builder = ClientBuilder::new(url);
 
@@ -139,11 +145,14 @@ impl SocketIoTransport {
                                     serde_json::from_value::<smcp::EnterOfficeNotification>(value)
                                 {
                                     info!("Computer entered office: {:?}", notification);
-                                    let send_result = tx.send(NotificationMessage::EnterOffice(notification));
+                                    let send_result =
+                                        tx.send(NotificationMessage::EnterOffice(notification));
                                     if let Err(e) = send_result {
                                         error!("Failed to send EnterOffice notification: {:?}", e);
                                     } else {
-                                        info!("Successfully sent EnterOffice notification to agent");
+                                        info!(
+                                            "Successfully sent EnterOffice notification to agent"
+                                        );
                                     }
                                 }
                             }

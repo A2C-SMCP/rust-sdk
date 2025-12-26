@@ -131,11 +131,6 @@ impl TestServer {
         })
     }
 
-    /// Get the server address
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
     /// Get the server URL for client connections
     pub fn url(&self) -> &str {
         &self.server_url

@@ -86,7 +86,10 @@ impl AsyncSmcpAgent {
                         //     }
                         // }
 
-                        info!("Checking event_handler: is_some = {}", event_handler.is_some());
+                        info!(
+                            "Checking event_handler: is_some = {}",
+                            event_handler.is_some()
+                        );
                         if let Some(ref handler) = event_handler {
                             info!("Calling on_computer_enter_office handler");
                             let _ = handler.on_computer_enter_office(data, &agent_clone).await;

@@ -69,6 +69,10 @@ tower.workspace = true
 http-body-util.workspace = true
 socketioxide.workspace = true
 
+# Server components for E2E tests (when server feature is enabled)
+smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.0" }
+smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.0" }
+
 [workspace.dependencies]
 # 核心运行时 / Core runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal", "process"] }

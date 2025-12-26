@@ -11,11 +11,9 @@
 use crate::computer::{Computer, SilentSession};
 use crate::errors::ComputerError;
 use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
-use crate::socketio_client::SmcpComputerClient;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use thiserror::Error;
 
 /// CLI 运行时配置 / CLI runtime configuration

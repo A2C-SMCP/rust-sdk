@@ -1,7 +1,6 @@
 // Helper functions and utilities for E2E testing
 
 use std::time::Duration;
-use tokio::time::timeout;
 
 // Simple UUID generator using timestamp and random
 fn generate_uuid_segment() -> String {
@@ -14,12 +13,15 @@ fn generate_uuid_segment() -> String {
 }
 
 /// Default timeout for E2E test operations
+#[allow(dead_code)]
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for tool call operations
+#[allow(dead_code)]
 pub const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for joining office
+#[allow(dead_code)]
 pub const JOIN_OFFICE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wait for a condition to become true with timeout

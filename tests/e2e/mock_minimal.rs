@@ -1,9 +1,9 @@
 // Minimal mock event handler for testing
 
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-use smcp::EnterOfficeNotification;
 
 /// Simple mock event handler that tracks computer entry
 #[derive(Clone)]

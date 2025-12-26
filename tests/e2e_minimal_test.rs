@@ -5,12 +5,11 @@ mod e2e;
 use e2e::*;
 use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
 use smcp_computer::computer::{Computer, SilentSession};
-use std::time::Duration;
 use tracing::info;
 
 /// Test basic server startup
 #[tokio::test]
-#[cfg(all(feature = "server"))]
+#[cfg(feature = "server")]
 async fn test_minimal_server_startup() {
     tracing_subscriber::fmt()
         .with_test_writer()

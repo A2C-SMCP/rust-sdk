@@ -38,8 +38,8 @@ async fn test_desktop_info_retrieval() {
         .expect("Failed to join");
 
     let agent_name = generate_agent_name();
-    let auth = DefaultAuthProvider::new(agent_name, office_id)
-        .with_api_key("test_secret".to_string());
+    let auth =
+        DefaultAuthProvider::new(agent_name, office_id).with_api_key("test_secret".to_string());
     let config = SmcpAgentConfig::default();
     let event_handler = MockEventHandler::new();
     let mut agent = AsyncSmcpAgent::new(auth, config).with_event_handler(event_handler.clone());
@@ -112,8 +112,8 @@ async fn test_desktop_update_notifications() {
         .expect("Failed to join");
 
     let agent_name = generate_agent_name();
-    let auth = DefaultAuthProvider::new(agent_name, office_id)
-        .with_api_key("test_secret".to_string());
+    let auth =
+        DefaultAuthProvider::new(agent_name, office_id).with_api_key("test_secret".to_string());
     let config = SmcpAgentConfig::default();
     let event_handler = MockEventHandler::new();
     let mut agent = AsyncSmcpAgent::new(auth, config).with_event_handler(event_handler.clone());
