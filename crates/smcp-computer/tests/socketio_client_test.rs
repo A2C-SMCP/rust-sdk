@@ -147,9 +147,13 @@ mod tests {
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -177,9 +181,13 @@ mod tests {
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -218,9 +226,13 @@ mod tests {
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -256,9 +268,13 @@ mod tests {
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -297,7 +313,7 @@ mod tests {
         for i in 0..3 {
             let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
             let client =
-                SmcpComputerClient::new(&server_url, manager, format!("test_computer_{}", i))
+                SmcpComputerClient::new(&server_url, manager, format!("test_computer_{}", i), None)
                     .await?;
 
             // 等待一小段时间确保连接稳定
@@ -336,9 +352,13 @@ mod tests {
         let manager1 = Arc::new(RwLock::new(Some(MCPServerManager::new())));
 
         // 创建第一个客户端连接
-        let client1 =
-            SmcpComputerClient::new(&server_url, manager1.clone(), "test_computer".to_string())
-                .await?;
+        let client1 = SmcpComputerClient::new(
+            &server_url,
+            manager1.clone(),
+            "test_computer".to_string(),
+            None,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -359,6 +379,7 @@ mod tests {
             &server_url,
             manager2.clone(),
             "test_computer_reconnected".to_string(),
+            None,
         )
         .await?;
 

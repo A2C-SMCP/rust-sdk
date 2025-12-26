@@ -67,22 +67,31 @@ impl AsyncSmcpAgent {
         let agent_clone = self.clone();
 
         let notification_task = tokio::spawn(async move {
+            info!("Notification processing task started");
             while let Some(notification) = notification_rx.recv().await {
+                info!("Agent received notification in task: {:?}", notification);
                 match notification {
                     NotificationMessage::EnterOffice(data) => {
-                        // Python 的自动行为：收到 enter_office 后自动触发 get_tools
-                        if let Some(ref computer) = data.computer {
-                            if let Ok(tools) = agent_clone.get_tools(computer).await {
-                                if let Some(ref handler) = event_handler {
-                                    let _ = handler
-                                        .on_tools_received(computer, tools, &agent_clone)
-                                        .await;
-                                }
-                            }
-                        }
+                        info!("Processing EnterOffice event: {:?}", data);
 
+                        // TODO: Python 的自动行为：收到 enter_office 后自动触发 get_tools
+                        // 暂时禁用，因为 get_tools 可能会阻塞
+                        // if let Some(ref computer) = data.computer {
+                        //     if let Ok(tools) = agent_clone.get_tools(computer).await {
+                        //         if let Some(ref handler) = event_handler {
+                        //             let _ = handler
+                        //                 .on_tools_received(computer, tools, &agent_clone)
+                        //                 .await;
+                        //         }
+                        //     }
+                        // }
+
+                        info!("Checking event_handler: is_some = {}", event_handler.is_some());
                         if let Some(ref handler) = event_handler {
+                            info!("Calling on_computer_enter_office handler");
                             let _ = handler.on_computer_enter_office(data, &agent_clone).await;
+                        } else {
+                            info!("No event handler configured for on_computer_enter_office");
                         }
                     }
                     NotificationMessage::LeaveOffice(data) => {

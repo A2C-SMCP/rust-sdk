@@ -60,6 +60,14 @@ tokio-test.workspace = true
 tempfile.workspace = true
 rmcp.workspace = true
 tracing-subscriber.workspace = true
+async-trait.workspace = true
+
+# HTTP server dependencies for E2E tests
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+socketioxide.workspace = true
 
 [workspace.dependencies]
 # 核心运行时 / Core runtime

@@ -47,6 +47,7 @@ impl SmcpComputerClient {
         url: &str,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
+        auth_secret: Option<String>,
     ) -> ComputerResult<Self> {
         let office_id = Arc::new(RwLock::new(None));
         let manager_clone = manager.clone();
@@ -55,9 +56,17 @@ impl SmcpComputerClient {
 
         // 使用ClientBuilder注册事件处理器
         // Use ClientBuilder to register event handlers
-        let client = ClientBuilder::new(url)
+        let mut builder = ClientBuilder::new(url)
             .namespace(SMCP_NAMESPACE)
-            .transport_type(TransportType::Websocket)
+            .transport_type(TransportType::Websocket);
+
+        // 如果提供了认证密钥，添加到请求头
+        // If auth secret is provided, add to request headers
+        if let Some(secret) = auth_secret {
+            builder = builder.opening_header("x-api-key", secret.as_str());
+        }
+
+        let client = builder
             .on_any(move |event, payload, client| {
                 // 只处理自定义事件
                 // Only handle custom events
@@ -209,6 +218,14 @@ impl SmcpComputerClient {
             .connect()
             .await
             .map_err(|e| ComputerError::SocketIoError(format!("Failed to connect: {}", e)))?;
+
+        // 等待一小段时间确保 Socket.IO namespace 连接完全建立
+        // Wait a short time to ensure Socket.IO namespace connection is fully established
+        // Socket.IO 有两个连接阶段：Transport 层和 Namespace 层
+        // Socket.IO has two connection phases: Transport layer and Namespace layer
+        // connect() 只保证 Transport 层连接，namespace 连接是异步的
+        // connect() only guarantees Transport layer connection, namespace connection is async
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         info!(
             "Connected to SMCP server at {} with computer name: {}",

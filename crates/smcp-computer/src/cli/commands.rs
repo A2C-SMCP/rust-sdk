@@ -94,19 +94,15 @@ impl CommandHandler {
         // 获取 Socket.IO 状态
         let socketio_client = self.computer.get_socketio_client();
         let socketio_ref = socketio_client.read().await;
-        if let Some(ref weak_client) = *socketio_ref {
-            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                println!("  Socket.IO: 已连接 / Connected");
-                println!("    URL: {}", client.get_url());
-                println!("    Namespace: {}", client.get_namespace());
-                if let Some(office_id) = client.get_office_id().await {
-                    println!("    Office ID: {}", office_id);
-                    println!("    Computer Name: {}", self.computer.name());
-                } else {
-                    println!("    Office: 未加入 / Not joined");
-                }
+        if let Some(ref client) = *socketio_ref {
+            println!("  Socket.IO: 已连接 / Connected");
+            println!("    URL: {}", client.get_url());
+            println!("    Namespace: {}", client.get_namespace());
+            if let Some(office_id) = client.get_office_id().await {
+                println!("    Office ID: {}", office_id);
+                println!("    Computer Name: {}", self.computer.name());
             } else {
-                println!("  Socket.IO: 已断开 / Disconnected");
+                println!("    Office: 未加入 / Not joined");
             }
         } else {
             println!("  Socket.IO: 未连接 / Not connected");

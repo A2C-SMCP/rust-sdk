@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 
@@ -174,7 +174,9 @@ pub struct Computer<S: Session> {
     /// Session实例 / Session instance
     session: S,
     /// Socket.IO客户端引用 / Socket.IO client reference
-    socketio_client: Arc<RwLock<Option<Weak<SmcpComputerClient>>>>,
+    /// 使用 Arc 而不是 Weak 以确保 client 生命周期
+    /// Using Arc instead of Weak to ensure client lifetime
+    socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
     /// 确认回调函数 / Confirmation callback function
     confirm_callback: Option<ConfirmCallbackType>,
 }
@@ -223,7 +225,9 @@ impl<S: Session> Computer<S> {
     }
 
     /// 获取 Socket.IO 客户端引用 / Get Socket.IO client reference
-    pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Weak<SmcpComputerClient>>>> {
+    /// 返回 Arc 包装的客户端，确保其生命周期
+    /// Returns Arc-wrapped client, ensuring its lifetime
+    pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Arc<SmcpComputerClient>>>> {
         self.socketio_client.clone()
     }
 
@@ -675,9 +679,13 @@ impl<S: Session> Computer<S> {
     }
 
     /// 设置Socket.IO客户端 / Set Socket.IO client
+    /// 此方法会替换现有的 client（如果有）并保持强引用
+    /// This method replaces existing client (if any) and keeps strong reference
     pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) {
         let mut socketio_ref = self.socketio_client.write().await;
-        *socketio_ref = Some(Arc::downgrade(&client));
+        // 替换旧的 client（如果有），旧的会被自动 drop
+        // Replace old client (if any), old one will be dropped automatically
+        *socketio_ref = Some(client);
     }
 
     /// 连接Socket.IO服务器 / Connect to Socket.IO server
@@ -685,7 +693,7 @@ impl<S: Session> Computer<S> {
         &self,
         url: &str,
         _namespace: &str,
-        _auth: &Option<String>,
+        auth: &Option<String>,
         _headers: &Option<String>,
     ) -> ComputerResult<()> {
         // 确保管理器已初始化 / Ensure manager is initialized
@@ -713,10 +721,12 @@ impl<S: Session> Computer<S> {
         let new_manager = MCPServerManager::new();
 
         // 创建Socket.IO客户端 / Create Socket.IO client
+        // 传递认证密钥（如果提供） / Pass auth secret (if provided)
         let client = SmcpComputerClient::new(
             url,
             Arc::new(RwLock::new(Some(new_manager))),
             self.name.clone(),
+            auth.clone(),
         )
         .await?;
 
@@ -743,11 +753,11 @@ impl<S: Session> Computer<S> {
     /// 加入办公室 / Join office
     pub async fn join_office(&self, office_id: &str, _computer_name: &str) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
-        if let Some(ref weak_client) = *socketio_ref {
-            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                client.join_office(office_id).await?;
-                return Ok(());
-            }
+        if let Some(ref client) = *socketio_ref {
+            // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+            // Use Arc<SmcpComputerClient> directly, no need to upgrade
+            client.join_office(office_id).await?;
+            return Ok(());
         }
         Err(ComputerError::InvalidState(
             "Socket.IO client not connected".to_string(),
@@ -757,14 +767,12 @@ impl<S: Session> Computer<S> {
     /// 离开办公室 / Leave office
     pub async fn leave_office(&self) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
-        if let Some(ref weak_client) = *socketio_ref {
-            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                // 获取当前 office_id 并离开
-                // Get current office_id and leave
-                let current_office_id = client.get_current_office_id().await?;
-                client.leave_office(&current_office_id).await?;
-                return Ok(());
-            }
+        if let Some(ref client) = *socketio_ref {
+            // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+            // Use Arc<SmcpComputerClient> directly, no need to upgrade
+            let current_office_id = client.get_current_office_id().await?;
+            client.leave_office(&current_office_id).await?;
+            return Ok(());
         }
         Err(ComputerError::InvalidState(
             "Socket.IO client not connected".to_string(),
@@ -774,11 +782,11 @@ impl<S: Session> Computer<S> {
     /// 发送配置更新通知 / Emit config update notification
     pub async fn emit_update_config(&self) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
-        if let Some(ref weak_client) = *socketio_ref {
-            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                client.emit_update_config().await?;
-                return Ok(());
-            }
+        if let Some(ref client) = *socketio_ref {
+            // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+            // Use Arc<SmcpComputerClient> directly, no need to upgrade
+            client.emit_update_config().await?;
+            return Ok(());
         }
         Err(ComputerError::InvalidState(
             "Socket.IO client not connected".to_string(),
@@ -849,10 +857,10 @@ impl<S: Session> ManagerChangeHandler for Computer<S> {
             ManagerChangeMessage::ToolListChanged => {
                 debug!("Tool list changed, notifying Socket.IO client");
                 let socketio_ref = self.socketio_client.read().await;
-                if let Some(ref weak_client) = *socketio_ref {
-                    if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                        client.emit_update_tool_list().await?;
-                    }
+                if let Some(ref client) = *socketio_ref {
+                    // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+                    // Use Arc<SmcpComputerClient> directly, no need to upgrade
+                    client.emit_update_tool_list().await?;
                 }
             }
             ManagerChangeMessage::ResourceListChanged { windows: _ } => {
