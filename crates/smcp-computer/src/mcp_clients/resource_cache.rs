@@ -19,7 +19,6 @@
 *
 * ================================================================================
 */
-
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -250,9 +249,7 @@ mod tests {
         let cache = ResourceCache::new(Duration::from_millis(100)); // 100ms TTL
 
         let data = Value::String("test data".to_string());
-        cache
-            .set("window://test".to_string(), data, None)
-            .await;
+        cache.set("window://test".to_string(), data, None).await;
 
         // 立即获取应该成功
         assert!(cache.get("window://test").await.is_some());
@@ -277,10 +274,7 @@ mod tests {
         assert_eq!(entry.version, 1);
 
         let data2 = Value::String("version 2".to_string());
-        cache
-            .refresh("window://test", data2.clone())
-            .await
-            .unwrap();
+        cache.refresh("window://test", data2.clone()).await.unwrap();
 
         let entry = cache.get_entry("window://test").await.unwrap();
         assert_eq!(entry.version, 2);

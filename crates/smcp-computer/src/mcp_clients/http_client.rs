@@ -443,14 +443,19 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         // 订阅成功后，更新本地订阅状态
-        let _ = self.subscription_manager.add_subscription(resource.uri.clone()).await;
+        let _ = self
+            .subscription_manager
+            .add_subscription(resource.uri.clone())
+            .await;
 
         // 立即获取并缓存资源数据
         match self.get_window_detail(resource.clone()).await {
             Ok(result) => {
                 if !result.contents.is_empty() {
                     if let Ok(json_value) = serde_json::to_value(&result.contents[0]) {
-                        self.resource_cache.set(resource.uri.clone(), json_value, None).await;
+                        self.resource_cache
+                            .set(resource.uri.clone(), json_value, None)
+                            .await;
                         info!("Subscribed and cached: {}", resource.uri);
                     }
                 }
@@ -484,7 +489,10 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         // 取消订阅成功后，移除本地订阅状态
-        let _ = self.subscription_manager.remove_subscription(&resource.uri).await;
+        let _ = self
+            .subscription_manager
+            .remove_subscription(&resource.uri)
+            .await;
 
         // 清理缓存
         self.resource_cache.remove(&resource.uri).await;

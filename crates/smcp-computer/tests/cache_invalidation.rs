@@ -90,8 +90,7 @@ async fn test_cache_initialization_on_subscribe() {
             info!("测试资源: {}", resource.uri);
 
             // 验证订阅前缓存为空
-            assert!(!client.has_cache(&resource.uri).await,
-                "订阅前不应该有缓存");
+            assert!(!client.has_cache(&resource.uri).await, "订阅前不应该有缓存");
             info!("✅ 订阅前缓存为空");
 
             // 订阅资源（会自动初始化缓存）
@@ -102,13 +101,14 @@ async fn test_cache_initialization_on_subscribe() {
                     info!("✅ 订阅成功");
 
                     // 验证缓存已创建
-                    assert!(client.has_cache(&resource.uri).await,
-                        "订阅后应该自动创建缓存");
+                    assert!(
+                        client.has_cache(&resource.uri).await,
+                        "订阅后应该自动创建缓存"
+                    );
 
                     // 读取缓存数据
                     let cached = client.get_cached_resource(&resource.uri).await;
-                    assert!(cached.is_some(),
-                        "应该能读取到缓存数据");
+                    assert!(cached.is_some(), "应该能读取到缓存数据");
 
                     let data = cached.unwrap();
                     info!("✅ 缓存数据: {:?}", data);
@@ -202,8 +202,7 @@ async fn test_cache_refresh_on_realtime_update() {
 
                     // 获取初始缓存数据
                     let initial_cache = client.get_cached_resource(&resource.uri).await;
-                    assert!(initial_cache.is_some(),
-                        "应该有初始缓存");
+                    assert!(initial_cache.is_some(), "应该有初始缓存");
 
                     info!("✅ 初始缓存已创建");
 
@@ -306,14 +305,19 @@ async fn test_cache_cleanup_on_unsubscribe() {
                 // 验证缓存
                 let cache_size = client.cache_size().await;
                 info!("订阅后缓存大小: {}", cache_size);
-                assert!(cache_size >= subscribed_count,
-                    "应该至少有 {} 个缓存", subscribed_count);
+                assert!(
+                    cache_size >= subscribed_count,
+                    "应该至少有 {} 个缓存",
+                    subscribed_count
+                );
 
                 // 取消订阅第 1 个资源
                 let resource_to_unsub = window_resources[0];
                 info!("取消订阅: {}", resource_to_unsub.uri);
 
-                let unsubscribe_result = client.unsubscribe_window((*resource_to_unsub).clone()).await;
+                let unsubscribe_result = client
+                    .unsubscribe_window((*resource_to_unsub).clone())
+                    .await;
 
                 match unsubscribe_result {
                     Ok(_) => {
@@ -321,12 +325,13 @@ async fn test_cache_cleanup_on_unsubscribe() {
                         let new_cache_size = client.cache_size().await;
                         info!("取消订阅后缓存大小: {}", new_cache_size);
 
-                        assert_eq!(new_cache_size, cache_size - 1,
-                            "缓存应该减少 1");
+                        assert_eq!(new_cache_size, cache_size - 1, "缓存应该减少 1");
 
                         // 验证特定资源的缓存已清理
-                        assert!(!client.has_cache(&resource_to_unsub.uri).await,
-                            "取消订阅后不应该有该资源的缓存");
+                        assert!(
+                            !client.has_cache(&resource_to_unsub.uri).await,
+                            "取消订阅后不应该有该资源的缓存"
+                        );
 
                         info!("✅ 缓存清理测试通过");
                     }
@@ -374,9 +379,9 @@ async fn test_cache_ttl_management() {
 
     info!("=== 测试 4: 缓存 TTL 管理 ===");
 
+    use smcp_computer::mcp_clients::resource_cache::ResourceCache;
     use smcp_computer::mcp_clients::stdio_client::StdioMCPClient;
     use smcp_computer::mcp_clients::MCPClientProtocol;
-    use smcp_computer::mcp_clients::resource_cache::ResourceCache;
     use std::time::Duration;
 
     // 测试 ResourceCache 的 TTL 功能
@@ -389,7 +394,9 @@ async fn test_cache_ttl_management() {
     let test_data = serde_json::json!({"test": "data", "value": 123});
 
     // 设置缓存
-    cache.set(test_uri.to_string(), test_data.clone(), None).await;
+    cache
+        .set(test_uri.to_string(), test_data.clone(), None)
+        .await;
 
     // 立即读取，验证缓存有效
     let cached = cache.get(test_uri).await;
@@ -415,8 +422,20 @@ async fn test_cache_ttl_management() {
 
     // 测试 cleanup_expired 功能
     // 设置两个缓存，一个短期，一个长期
-    cache.set("short://term".to_string(), serde_json::json!({"short": true}), None).await;
-    cache.set("long://term".to_string(), serde_json::json!({"long": true}), Some(Duration::from_secs(10))).await;
+    cache
+        .set(
+            "short://term".to_string(),
+            serde_json::json!({"short": true}),
+            None,
+        )
+        .await;
+    cache
+        .set(
+            "long://term".to_string(),
+            serde_json::json!({"long": true}),
+            Some(Duration::from_secs(10)),
+        )
+        .await;
 
     // 注意: 第一个缓存已过期，但还在存储中（cleanup_expired 前不会自动移除）
     let size_before_cleanup = cache.size().await;
@@ -463,8 +482,7 @@ async fn test_cache_ttl_management() {
 
             if client.subscribe_window((*resource).clone()).await.is_ok() {
                 // 验证缓存存在
-                assert!(client.has_cache(&resource.uri).await,
-                    "订阅后应该有缓存");
+                assert!(client.has_cache(&resource.uri).await, "订阅后应该有缓存");
 
                 info!("✅ 客户端使用默认 TTL (60秒)");
 
@@ -690,8 +708,7 @@ async fn test_input_cache_invalidation() {
             // 验证缓存 API 可用
             let resource = &resources[0];
             if client.subscribe_window((*resource).clone()).await.is_ok() {
-                assert!(client.has_cache(&resource.uri).await,
-                    "订阅后应该有缓存");
+                assert!(client.has_cache(&resource.uri).await, "订阅后应该有缓存");
                 info!("✅ 资源缓存功能正常");
 
                 // 清理
@@ -787,7 +804,6 @@ async fn test_input_cache_invalidation() {
 /// - 缓存统计和监控
 ///
 /// ================================================================================
-
 #[cfg(test)]
 mod test_summary {
     // 测试总结模块

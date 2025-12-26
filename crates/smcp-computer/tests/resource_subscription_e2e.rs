@@ -54,8 +54,11 @@ async fn test_subscribe_to_window_resources() {
                     info!("尝试订阅资源: {}", resource.uri);
 
                     // 订阅前检查状态
-                    assert!(!client.is_subscribed(&resource.uri).await,
-                        "订阅前不应该已订阅: {}", resource.uri);
+                    assert!(
+                        !client.is_subscribed(&resource.uri).await,
+                        "订阅前不应该已订阅: {}",
+                        resource.uri
+                    );
 
                     // 当前实现：会发送请求并返回结果，同时自动保存订阅状态
                     let subscribe_result = client.subscribe_window((*resource).clone()).await;
@@ -65,17 +68,26 @@ async fn test_subscribe_to_window_resources() {
                             info!("✅ 订阅请求成功: {}", resource.uri);
 
                             // 验证订阅状态已保存
-                            assert!(client.is_subscribed(&resource.uri).await,
-                                "订阅后应该能查询到订阅状态: {}", resource.uri);
+                            assert!(
+                                client.is_subscribed(&resource.uri).await,
+                                "订阅后应该能查询到订阅状态: {}",
+                                resource.uri
+                            );
 
                             // 验证缓存已创建
-                            assert!(client.has_cache(&resource.uri).await,
-                                "订阅后应该自动缓存资源数据: {}", resource.uri);
+                            assert!(
+                                client.has_cache(&resource.uri).await,
+                                "订阅后应该自动缓存资源数据: {}",
+                                resource.uri
+                            );
 
                             info!("✅ 订阅状态验证通过: {}", resource.uri);
                         }
                         Err(e) => {
-                            warn!("⚠️  订阅失败（可能 server 不支持）: {} - {:?}", resource.uri, e);
+                            warn!(
+                                "⚠️  订阅失败（可能 server 不支持）: {} - {:?}",
+                                resource.uri, e
+                            );
                         }
                     }
                 }
@@ -85,8 +97,11 @@ async fn test_subscribe_to_window_resources() {
                 info!("当前订阅数量: {}", subscriptions.len());
                 info!("订阅列表: {:?}", subscriptions);
 
-                assert_eq!(subscriptions.len(), window_resources.len(),
-                    "订阅列表长度应该与订阅的资源数量一致");
+                assert_eq!(
+                    subscriptions.len(),
+                    window_resources.len(),
+                    "订阅列表长度应该与订阅的资源数量一致"
+                );
             }
         }
         Err(e) => {
@@ -139,12 +154,13 @@ async fn test_unsubscribe_from_window_resources() {
             let _ = client.subscribe_window((*resource).clone()).await;
 
             // 验证订阅成功
-            assert!(client.is_subscribed(&resource.uri).await,
-                "订阅后应该能查询到订阅状态");
+            assert!(
+                client.is_subscribed(&resource.uri).await,
+                "订阅后应该能查询到订阅状态"
+            );
 
             // 验证缓存存在
-            assert!(client.has_cache(&resource.uri).await,
-                "订阅后应该有缓存");
+            assert!(client.has_cache(&resource.uri).await, "订阅后应该有缓存");
 
             // 取消订阅状态管理验证
             // unsubscribe_window 方法现在会：
@@ -161,12 +177,16 @@ async fn test_unsubscribe_from_window_resources() {
                     info!("✅ 取消订阅请求成功: {}", resource.uri);
 
                     // 验证订阅状态已移除
-                    assert!(!client.is_subscribed(&resource.uri).await,
-                        "取消订阅后不应该能查询到订阅状态");
+                    assert!(
+                        !client.is_subscribed(&resource.uri).await,
+                        "取消订阅后不应该能查询到订阅状态"
+                    );
 
                     // 验证缓存已清理
-                    assert!(!client.has_cache(&resource.uri).await,
-                        "取消订阅后应该清理缓存");
+                    assert!(
+                        !client.has_cache(&resource.uri).await,
+                        "取消订阅后应该清理缓存"
+                    );
 
                     info!("✅ 取消订阅状态验证通过: {}", resource.uri);
                 }
@@ -219,8 +239,7 @@ async fn test_realtime_resource_updates() {
 
             info!("订阅资源: {}", resource.uri);
             // 订阅前验证无缓存
-            assert!(!client.has_cache(&resource.uri).await,
-                "订阅前不应该有缓存");
+            assert!(!client.has_cache(&resource.uri).await, "订阅前不应该有缓存");
 
             // 订阅资源（会自动缓存）
             let subscribe_result = client.subscribe_window((*resource).clone()).await;
@@ -230,13 +249,14 @@ async fn test_realtime_resource_updates() {
                     info!("✅ 订阅成功");
 
                     // 验证缓存已创建
-                    assert!(client.has_cache(&resource.uri).await,
-                        "订阅后应该自动缓存资源");
+                    assert!(
+                        client.has_cache(&resource.uri).await,
+                        "订阅后应该自动缓存资源"
+                    );
 
                     // 验证可以读取缓存数据
                     let cached = client.get_cached_resource(&resource.uri).await;
-                    assert!(cached.is_some(),
-                        "应该能读取到缓存数据");
+                    assert!(cached.is_some(), "应该能读取到缓存数据");
 
                     info!("✅ 缓存验证通过: {:?}", cached.unwrap());
 
@@ -245,8 +265,7 @@ async fn test_realtime_resource_updates() {
                     sleep(Duration::from_secs(3)).await;
 
                     // 再次检查缓存是否仍然存在
-                    assert!(client.has_cache(&resource.uri).await,
-                        "缓存应该持续存在");
+                    assert!(client.has_cache(&resource.uri).await, "缓存应该持续存在");
                 }
                 Err(e) => {
                     warn!("⚠️  订阅失败（可能 server 不支持）: {:?}", e);
@@ -301,10 +320,8 @@ async fn test_resource_cache_invalidation() {
             info!("测试资源: {}", resource.uri);
 
             // 1. 订阅前，缓存为空
-            assert!(!client.has_cache(&resource.uri).await,
-                "订阅前不应该有缓存");
-            assert_eq!(client.cache_size().await, 0,
-                "初始缓存大小应该为0");
+            assert!(!client.has_cache(&resource.uri).await, "订阅前不应该有缓存");
+            assert_eq!(client.cache_size().await, 0, "初始缓存大小应该为0");
             info!("✅ 订阅前缓存为空");
 
             // 2. 订阅后，应该缓存资源
@@ -312,12 +329,13 @@ async fn test_resource_cache_invalidation() {
 
             match subscribe_result {
                 Ok(_) => {
-                    assert!(client.has_cache(&resource.uri).await,
-                        "订阅后应该自动缓存资源");
+                    assert!(
+                        client.has_cache(&resource.uri).await,
+                        "订阅后应该自动缓存资源"
+                    );
 
                     let cached = client.get_cached_resource(&resource.uri).await;
-                    assert!(cached.is_some(),
-                        "应该能读取到缓存数据");
+                    assert!(cached.is_some(), "应该能读取到缓存数据");
 
                     info!("✅ 订阅后缓存已创建: {:?}", cached.unwrap());
 
@@ -326,8 +344,10 @@ async fn test_resource_cache_invalidation() {
                     let cache_keys = client.cache_keys().await;
 
                     assert!(cache_size > 0, "缓存大小应该大于0");
-                    assert!(cache_keys.contains(&resource.uri),
-                        "缓存键列表应该包含订阅的资源URI");
+                    assert!(
+                        cache_keys.contains(&resource.uri),
+                        "缓存键列表应该包含订阅的资源URI"
+                    );
 
                     info!("✅ 缓存大小: {}, 键列表: {:?}", cache_size, cache_keys);
 
@@ -336,11 +356,16 @@ async fn test_resource_cache_invalidation() {
 
                     match unsubscribe_result {
                         Ok(_) => {
-                            assert!(!client.has_cache(&resource.uri).await,
-                                "取消订阅后应该清理缓存");
+                            assert!(
+                                !client.has_cache(&resource.uri).await,
+                                "取消订阅后应该清理缓存"
+                            );
 
                             let final_cache_size = client.cache_size().await;
-                            info!("✅ 取消订阅后缓存已清理，最终缓存大小: {}", final_cache_size);
+                            info!(
+                                "✅ 取消订阅后缓存已清理，最终缓存大小: {}",
+                                final_cache_size
+                            );
                         }
                         Err(e) => {
                             warn!("⚠️  取消订阅失败: {:?}", e);
@@ -410,23 +435,29 @@ async fn test_subscription_recovery_after_reconnect() {
 
             // 验证订阅状态
             let current_subscriptions = client.get_subscriptions().await;
-            assert_eq!(current_subscriptions.len(), subscriptions.len(),
-                "订阅数量应该匹配");
+            assert_eq!(
+                current_subscriptions.len(),
+                subscriptions.len(),
+                "订阅数量应该匹配"
+            );
 
             for resource in &subscriptions {
-                assert!(client.is_subscribed(&resource.uri).await,
-                    "应该已订阅: {}", resource.uri);
-                assert!(client.has_cache(&resource.uri).await,
-                    "应该有缓存: {}", resource.uri);
+                assert!(
+                    client.is_subscribed(&resource.uri).await,
+                    "应该已订阅: {}",
+                    resource.uri
+                );
+                assert!(
+                    client.has_cache(&resource.uri).await,
+                    "应该有缓存: {}",
+                    resource.uri
+                );
             }
 
             info!("✅ 订阅状态验证通过");
 
             // 保存订阅列表用于后续重新订阅
-            let saved_uris: Vec<String> = subscriptions
-                .iter()
-                .map(|r| r.uri.clone())
-                .collect();
+            let saved_uris: Vec<String> = subscriptions.iter().map(|r| r.uri.clone()).collect();
 
             // 模拟断线
             info!("模拟断线...");
@@ -451,10 +482,12 @@ async fn test_subscription_recovery_after_reconnect() {
             // 注意：由于创建了新的 client 实例，之前的订阅状态不会保留
             // 这是 StdioClient 的正常行为（子进程已终止）
             // 验证新实例的订阅状态为空
-            assert_eq!(client.subscription_count().await, 0,
-                "新实例不应该保留旧实例的订阅状态");
-            assert_eq!(client.cache_size().await, 0,
-                "新实例不应该保留旧实例的缓存");
+            assert_eq!(
+                client.subscription_count().await,
+                0,
+                "新实例不应该保留旧实例的订阅状态"
+            );
+            assert_eq!(client.cache_size().await, 0, "新实例不应该保留旧实例的缓存");
 
             info!("✅ 验证通过：新实例订阅状态为空（预期行为）");
 
@@ -472,7 +505,11 @@ async fn test_subscription_recovery_after_reconnect() {
                         }
                     }
                 }
-                info!("订阅恢复完成：{}/{} 资源已重新订阅", restored_count, saved_uris.len());
+                info!(
+                    "订阅恢复完成：{}/{} 资源已重新订阅",
+                    restored_count,
+                    saved_uris.len()
+                );
             }
         }
     } else {
@@ -512,10 +549,8 @@ async fn test_desktop_update_notification() {
     info!("验证缓存和订阅管理 API...");
 
     // 验证初始状态
-    assert_eq!(client.subscription_count().await, 0,
-        "初始订阅数量应该为0");
-    assert_eq!(client.cache_size().await, 0,
-        "初始缓存大小应该为0");
+    assert_eq!(client.subscription_count().await, 0, "初始订阅数量应该为0");
+    assert_eq!(client.cache_size().await, 0, "初始缓存大小应该为0");
     info!("✅ 初始状态验证通过");
 
     // 获取资源列表
@@ -524,9 +559,7 @@ async fn test_desktop_update_notification() {
     if let Ok(resources) = resources_result {
         if !resources.is_empty() {
             // 订阅几个资源
-            let to_subscribe: Vec<_> = resources.iter()
-                .take(3)
-                .collect();
+            let to_subscribe: Vec<_> = resources.iter().take(3).collect();
 
             for resource in &to_subscribe {
                 let _ = client.subscribe_window((*resource).clone()).await;
@@ -554,8 +587,7 @@ async fn test_desktop_update_notification() {
             // 演示清空所有缓存
             info!("演示清空所有缓存...");
             client.clear_cache().await;
-            assert_eq!(client.cache_size().await, 0,
-                "清空后缓存大小应该为0");
+            assert_eq!(client.cache_size().await, 0, "清空后缓存大小应该为0");
             info!("✅ 缓存已清空");
 
             info!("✅ 缓存和订阅管理 API 验证通过");

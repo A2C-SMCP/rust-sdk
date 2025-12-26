@@ -45,11 +45,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use http_body_util::Full;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::time::{interval, sleep};
@@ -106,7 +106,7 @@ impl MockSSEServer {
             let io = TokioIo::new(stream);
 
             tokio::spawn(async move {
-                let service = service_fn(move |req| handle_request(req));
+                let service = service_fn(handle_request);
 
                 if let Err(err) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
@@ -564,7 +564,6 @@ async fn test_sse_reconnect_and_subscription_recovery() {
 /// - 缓存持久化
 ///
 /// ================================================================================
-
 #[cfg(test)]
 mod test_summary {
     // 测试总结模块

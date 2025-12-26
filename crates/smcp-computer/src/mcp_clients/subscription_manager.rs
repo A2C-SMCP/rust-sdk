@@ -19,7 +19,6 @@
 *
 * ================================================================================
 */
-
 use crate::mcp_clients::model::Resource;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -185,7 +184,10 @@ mod tests {
     async fn test_remove_subscription() {
         let manager = SubscriptionManager::new();
 
-        manager.add_subscription("window://test".to_string()).await.unwrap();
+        manager
+            .add_subscription("window://test".to_string())
+            .await
+            .unwrap();
         assert!(manager.is_subscribed("window://test").await);
 
         // 移除订阅
