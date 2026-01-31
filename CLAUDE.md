@@ -46,7 +46,6 @@ cargo build --release --workspace --all-features
 rust-sdk/
 ├── src/              # 主包入口（基于 feature re-export）
 ├── tests/            # 跨 crate 集成测试
-├── examples/         # 示例代码和 Python SDK 参考
 └── crates/
     ├── smcp/               # 核心协议类型定义
     ├── smcp-agent/         # Agent 实现（客户端）
@@ -113,3 +112,17 @@ Computer 支持三种 MCP 传输方式：
 
 - `rust_socketio` 使用本地 patch: `vendor/rust-socketio/socketio`
 - E2E 测试需要 `e2e` feature 才能运行（`--ignored`）
+
+## 协议规范与参考实现
+
+- **协议规范仓库**: [a2c-smcp-protocol](https://github.com/A2C-SMCP/a2c-smcp-protocol)（当前版本: 0.1.2-rc1）
+- **Python 参考实现**: `/Users/jqq/A2C-SMCP/python-sdk`（已添加到工作空间）
+
+### 核心模块对应关系
+
+| Python 模块          | Rust 模块             | 说明                       |
+|---------------------|----------------------|----------------------------|
+| `a2c_smcp/smcp.py`  | `crates/smcp/`       | 协议定义（事件、数据结构） |
+| `a2c_smcp/server/`  | `crates/smcp-server-core/` | Server 端实现        |
+| `a2c_smcp/agent/`   | `crates/smcp-agent/` | Agent 客户端               |
+| `a2c_smcp/computer/`| `crates/smcp-computer/` | Computer 端实现         |
