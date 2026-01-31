@@ -23,6 +23,7 @@ use crate::inputs::utils::run_command;
 use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{CallToolResult, MCPServerConfig, MCPServerInput, Tool},
+    ConfigRender, RenderError,
 };
 use crate::socketio_client::SmcpComputerClient;
 
@@ -160,7 +161,9 @@ pub struct Computer<S: Session> {
     /// MCP服务器管理器 / MCP server manager
     mcp_manager: Arc<RwLock<Option<MCPServerManager>>>,
     /// 输入定义映射 / Input definitions map (id -> input)
-    inputs: RwLock<HashMap<String, MCPServerInput>>,
+    /// 使用 Arc 以便与 Socket.IO 客户端共享
+    /// Using Arc to share with Socket.IO client
+    inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
     /// MCP服务器配置映射 / MCP server configurations map (name -> config)
     mcp_servers: RwLock<HashMap<String, MCPServerConfig>>,
     /// 输入处理器 / Input handler
@@ -198,7 +201,7 @@ impl<S: Session> Computer<S> {
         Self {
             name,
             mcp_manager: Arc::new(RwLock::new(None)),
-            inputs: RwLock::new(inputs),
+            inputs: Arc::new(RwLock::new(inputs)),
             mcp_servers: RwLock::new(mcp_servers),
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
@@ -268,14 +271,65 @@ impl<S: Session> Computer<S> {
     }
 
     /// 渲染服务器配置 / Render server configuration
+    /// 解析配置中的 ${input:xxx} 占位符，通过 Session 获取输入值
+    /// Parse ${input:xxx} placeholders in config, get input values through Session
     async fn render_server_config(
         &self,
         config: &MCPServerConfig,
     ) -> ComputerResult<MCPServerConfig> {
-        // TODO: 实现配置渲染逻辑 / TODO: Implement config rendering logic
-        // 这里需要实现类似Python版本的配置渲染功能
-        // This needs to implement config rendering similar to Python version
-        Ok(config.clone())
+        // 将配置序列化为 JSON / Serialize config to JSON
+        let config_json = serde_json::to_value(config)?;
+
+        // 创建渲染器 / Create renderer
+        let renderer = ConfigRender::default();
+
+        // 获取 inputs 的引用以便在闭包中使用 / Get inputs reference for use in closure
+        let inputs = self.inputs.read().await;
+        let inputs_clone: std::collections::HashMap<String, MCPServerInput> = inputs.clone();
+        drop(inputs); // 释放读锁 / Release read lock
+
+        // 首先预解析所有输入值 / Pre-resolve all input values first
+        // 这样可以在闭包中使用解析后的值
+        // This allows using resolved values in the closure
+        let mut resolved_values: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for (input_id, input) in inputs_clone.iter() {
+            match self.session.resolve_input(input).await {
+                Ok(value) => {
+                    resolved_values.insert(input_id.clone(), value);
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to resolve input '{}': {}, will use default",
+                        input_id, e
+                    );
+                    // 使用默认值作为回退 / Use default value as fallback
+                    if let Some(default) = input.default() {
+                        resolved_values.insert(input_id.clone(), default);
+                    }
+                }
+            }
+        }
+
+        // 创建输入解析闭包 / Create input resolver closure
+        let resolver = |input_id: String| {
+            let values = resolved_values.clone();
+            async move {
+                if let Some(value) = values.get(&input_id) {
+                    Ok(value.clone())
+                } else {
+                    Err(RenderError::InputNotFound(input_id))
+                }
+            }
+        };
+
+        // 渲染配置 / Render config
+        let rendered_json = renderer.render(config_json, resolver).await?;
+
+        // 反序列化回配置类型 / Deserialize back to config type
+        let rendered_config: MCPServerConfig = serde_json::from_value(rendered_json)?;
+
+        Ok(rendered_config)
     }
 
     /// 动态添加或更新服务器配置 / Add or update server configuration dynamically
@@ -727,6 +781,7 @@ impl<S: Session> Computer<S> {
             Arc::new(RwLock::new(Some(new_manager))),
             self.name.clone(),
             auth.clone(),
+            self.inputs.clone(),
         )
         .await?;
 
@@ -819,7 +874,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
         Self {
             name: self.name.clone(),
             mcp_manager: Arc::clone(&self.mcp_manager),
-            inputs: RwLock::new(HashMap::new()), // Note: 不复制运行时状态 / Don't copy runtime state
+            inputs: Arc::new(RwLock::new(HashMap::new())), // Note: 不复制运行时状态 / Don't copy runtime state
             mcp_servers: RwLock::new(HashMap::new()),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
@@ -1426,5 +1481,101 @@ mod tests {
         // 测试关闭已初始化的Computer / Test shutting down initialized computer
         computer.boot_up().await.unwrap();
         computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_config_render() {
+        let session = SilentSession::new("test");
+
+        // 创建带有输入定义的 inputs / Create inputs with input definitions
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "api_key".to_string(),
+            MCPServerInput::PromptString(PromptStringInput {
+                id: "api_key".to_string(),
+                description: "API Key".to_string(),
+                default: Some("test-api-key-12345".to_string()),
+                password: Some(true),
+            }),
+        );
+        inputs.insert(
+            "server_url".to_string(),
+            MCPServerInput::PromptString(PromptStringInput {
+                id: "server_url".to_string(),
+                description: "Server URL".to_string(),
+                default: Some("https://api.example.com".to_string()),
+                password: Some(false),
+            }),
+        );
+
+        let computer = Computer::new("test_computer", session, Some(inputs), None, true, true);
+
+        // 创建带有占位符的服务器配置 / Create server config with placeholders
+        let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "test_server".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: std::collections::HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["${input:api_key}".to_string()],
+                env: {
+                    let mut env = std::collections::HashMap::new();
+                    env.insert("API_URL".to_string(), "${input:server_url}".to_string());
+                    env
+                },
+                cwd: None,
+            },
+        });
+
+        // 渲染配置 / Render config
+        let rendered = computer.render_server_config(&server_config).await.unwrap();
+
+        // 验证占位符已被替换 / Verify placeholders are replaced
+        match rendered {
+            MCPServerConfig::Stdio(config) => {
+                assert_eq!(config.server_parameters.args[0], "test-api-key-12345");
+                assert_eq!(
+                    config.server_parameters.env.get("API_URL"),
+                    Some(&"https://api.example.com".to_string())
+                );
+            }
+            _ => panic!("Expected Stdio config"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_config_render_missing_input() {
+        let session = SilentSession::new("test");
+        let computer = Computer::new("test_computer", session, None, None, true, true);
+
+        // 创建带有不存在输入的配置 / Create config with non-existent input
+        let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "test_server".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: std::collections::HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["${input:missing_input}".to_string()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+            },
+        });
+
+        // 渲染配置应该保留原占位符 / Render should preserve original placeholder
+        let rendered = computer.render_server_config(&server_config).await.unwrap();
+
+        match rendered {
+            MCPServerConfig::Stdio(config) => {
+                // 未找到的输入应该保留原占位符 / Missing input should preserve placeholder
+                assert_eq!(config.server_parameters.args[0], "${input:missing_input}");
+            }
+            _ => panic!("Expected Stdio config"),
+        }
     }
 }

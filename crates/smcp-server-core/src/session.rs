@@ -26,6 +26,20 @@ pub enum SessionError {
     InvalidState(String),
 }
 
+impl SessionError {
+    /// 获取错误码 / Get error code
+    pub fn error_code(&self) -> i32 {
+        match self {
+            SessionError::NotFound(_) => smcp::error_codes::NOT_FOUND,
+            SessionError::NameAlreadyRegistered(_) => smcp::error_codes::FORBIDDEN,
+            SessionError::AgentAlreadyInRoom(_) => smcp::error_codes::FORBIDDEN,
+            SessionError::AgentAlreadyExists => smcp::error_codes::ROOM_FULL,
+            SessionError::ComputerAlreadyExists(_, _) => smcp::error_codes::FORBIDDEN,
+            SessionError::InvalidState(_) => smcp::error_codes::BAD_REQUEST,
+        }
+    }
+}
+
 /// 客户端角色
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientRole {

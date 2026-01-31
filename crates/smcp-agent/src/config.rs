@@ -17,6 +17,9 @@ pub struct SmcpAgentConfig {
     pub tool_call_timeout: u64,
     /// 是否在收到桌面更新通知时自动拉取桌面
     pub auto_fetch_desktop: bool,
+    /// 是否在 Computer 进入办公室时自动获取工具列表
+    /// When true, agent will automatically fetch tools when a computer enters the office
+    pub auto_fetch_tools: bool,
     /// 连接重试次数
     pub max_retries: u32,
     /// 重连间隔（毫秒）
@@ -29,6 +32,7 @@ impl Default for SmcpAgentConfig {
             default_timeout: 20,
             tool_call_timeout: 60,
             auto_fetch_desktop: true,
+            auto_fetch_tools: true,
             max_retries: 3,
             reconnect_interval: 1000,
         }
@@ -55,6 +59,11 @@ impl SmcpAgentConfig {
         self
     }
 
+    pub fn with_auto_fetch_tools(mut self, auto_fetch: bool) -> Self {
+        self.auto_fetch_tools = auto_fetch;
+        self
+    }
+
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
@@ -76,13 +85,27 @@ mod tests {
             .with_default_timeout(10)
             .with_tool_call_timeout(30)
             .with_auto_fetch_desktop(false)
+            .with_auto_fetch_tools(false)
             .with_max_retries(5)
             .with_reconnect_interval(2000);
 
         assert_eq!(config.default_timeout, 10);
         assert_eq!(config.tool_call_timeout, 30);
         assert!(!config.auto_fetch_desktop);
+        assert!(!config.auto_fetch_tools);
         assert_eq!(config.max_retries, 5);
         assert_eq!(config.reconnect_interval, 2000);
+    }
+
+    #[test]
+    fn test_agent_config_defaults() {
+        let config = SmcpAgentConfig::default();
+
+        assert_eq!(config.default_timeout, 20);
+        assert_eq!(config.tool_call_timeout, 60);
+        assert!(config.auto_fetch_desktop);
+        assert!(config.auto_fetch_tools); // 默认开启 / Default enabled
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.reconnect_interval, 1000);
     }
 }

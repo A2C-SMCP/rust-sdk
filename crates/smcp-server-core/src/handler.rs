@@ -28,12 +28,31 @@ pub enum HandlerError {
     InvalidRequest(String),
 }
 
+impl HandlerError {
+    /// 获取错误码 / Get error code
+    pub fn error_code(&self) -> i32 {
+        match self {
+            HandlerError::Auth(_) => smcp::error_codes::UNAUTHORIZED,
+            HandlerError::Session(e) => e.error_code(),
+            HandlerError::Json(_) => smcp::error_codes::BAD_REQUEST,
+            HandlerError::Timeout(_) => smcp::error_codes::TIMEOUT,
+            HandlerError::InvalidRequest(_) => smcp::error_codes::BAD_REQUEST,
+        }
+    }
+
+    /// 转换为标准错误响应 / Convert to standard error response
+    pub fn to_error_response(&self) -> smcp::ErrorResponse {
+        smcp::ErrorResponse::new(self.error_code(), self.to_string())
+    }
+}
+
 impl serde::Serialize for HandlerError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        // 使用标准错误响应格式 / Use standard error response format
+        self.to_error_response().serialize(serializer)
     }
 }
 

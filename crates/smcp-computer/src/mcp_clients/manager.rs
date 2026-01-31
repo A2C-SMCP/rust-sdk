@@ -44,6 +44,14 @@ pub struct MCPServerManager {
     auto_connect: Arc<RwLock<bool>>,
     /// 状态变化通知器 / State change notifier
     state_notifier: watch::Sender<ManagerState>,
+    /// 健康检查配置 / Health check configuration
+    health_check_config: Arc<RwLock<HealthCheckConfig>>,
+    /// 重连策略 / Reconnect policy
+    reconnect_policy: Arc<RwLock<ReconnectPolicy>>,
+    /// 健康监控任务句柄 / Health monitor task handle
+    health_monitor_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// 重试计数器（服务器名 -> 重试次数）/ Retry counters (server name -> retry count)
+    retry_counts: Arc<RwLock<HashMap<ServerName, u32>>>,
 }
 
 /// 管理器状态 / Manager state
@@ -73,6 +81,33 @@ impl MCPServerManager {
             auto_reconnect: Arc::new(RwLock::new(true)),
             auto_connect: Arc::new(RwLock::new(false)),
             state_notifier: state_tx,
+            health_check_config: Arc::new(RwLock::new(HealthCheckConfig::default())),
+            reconnect_policy: Arc::new(RwLock::new(ReconnectPolicy::default())),
+            health_monitor_handle: Arc::new(RwLock::new(None)),
+            retry_counts: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// 使用自定义配置创建管理器 / Create manager with custom configuration
+    pub fn with_config(
+        health_check_config: HealthCheckConfig,
+        reconnect_policy: ReconnectPolicy,
+    ) -> Self {
+        let (state_tx, _) = watch::channel(ManagerState::Uninitialized);
+
+        Self {
+            servers_config: Arc::new(RwLock::new(HashMap::new())),
+            active_clients: Arc::new(RwLock::new(HashMap::new())),
+            tool_mapping: Arc::new(RwLock::new(HashMap::new())),
+            alias_mapping: Arc::new(RwLock::new(HashMap::new())),
+            disabled_tools: Arc::new(RwLock::new(HashSet::new())),
+            auto_reconnect: Arc::new(RwLock::new(reconnect_policy.enabled)),
+            auto_connect: Arc::new(RwLock::new(false)),
+            state_notifier: state_tx,
+            health_check_config: Arc::new(RwLock::new(health_check_config)),
+            reconnect_policy: Arc::new(RwLock::new(reconnect_policy)),
+            health_monitor_handle: Arc::new(RwLock::new(None)),
+            retry_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -588,6 +623,93 @@ impl MCPServerManager {
             .collect()
     }
 
+    /// 获取所有服务器配置（用于 GetComputerConfigRet）
+    /// Get all server configurations (for GetComputerConfigRet)
+    /// 返回格式：{ server_name: { type, status, disabled, ... } }
+    /// Returns format: { server_name: { type, status, disabled, ... } }
+    pub async fn get_server_configs(&self) -> serde_json::Value {
+        let configs = self.servers_config.read().await;
+        let clients = self.active_clients.read().await;
+
+        let mut result = serde_json::Map::new();
+
+        for (name, config) in configs.iter() {
+            let is_active = clients.contains_key(name);
+            let state = if is_active {
+                clients
+                    .get(name)
+                    .map(|c| c.state().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            } else {
+                "pending".to_string()
+            };
+
+            // 构建服务器配置信息 / Build server config info
+            let mut server_info = serde_json::Map::new();
+
+            // 添加类型信息 / Add type info
+            let server_type = match config {
+                MCPServerConfig::Stdio(_) => "stdio",
+                MCPServerConfig::Sse(_) => "sse",
+                MCPServerConfig::Http(_) => "http",
+            };
+            server_info.insert("type".to_string(), serde_json::Value::String(server_type.to_string()));
+
+            // 添加状态信息 / Add status info
+            server_info.insert("status".to_string(), serde_json::Value::String(state));
+            server_info.insert("is_active".to_string(), serde_json::Value::Bool(is_active));
+            server_info.insert("disabled".to_string(), serde_json::Value::Bool(config.disabled()));
+
+            // 添加禁用工具列表 / Add forbidden tools list
+            let forbidden_tools: Vec<serde_json::Value> = config
+                .forbidden_tools()
+                .iter()
+                .map(|t| serde_json::Value::String(t.clone()))
+                .collect();
+            server_info.insert("forbidden_tools".to_string(), serde_json::Value::Array(forbidden_tools));
+
+            // 添加工具元数据 / Add tool metadata
+            if let Ok(tool_meta_json) = serde_json::to_value(config.tool_meta()) {
+                server_info.insert("tool_meta".to_string(), tool_meta_json);
+            }
+
+            // 添加默认工具元数据 / Add default tool metadata
+            if let Some(default_meta) = config.default_tool_meta() {
+                if let Ok(default_meta_json) = serde_json::to_value(default_meta) {
+                    server_info.insert("default_tool_meta".to_string(), default_meta_json);
+                }
+            }
+
+            // 添加 VRL 脚本（如果有）/ Add VRL script if present
+            if let Some(vrl) = config.vrl() {
+                server_info.insert("vrl".to_string(), serde_json::Value::String(vrl.to_string()));
+            }
+
+            // 添加服务器参数（根据类型）/ Add server parameters based on type
+            match config {
+                MCPServerConfig::Stdio(stdio_config) => {
+                    if let Ok(params_json) = serde_json::to_value(&stdio_config.server_parameters) {
+                        server_info.insert("server_parameters".to_string(), params_json);
+                    }
+                }
+                MCPServerConfig::Sse(sse_config) => {
+                    if let Ok(params_json) = serde_json::to_value(&sse_config.server_parameters) {
+                        server_info.insert("server_parameters".to_string(), params_json);
+                    }
+                }
+                MCPServerConfig::Http(http_config) => {
+                    if let Ok(params_json) = serde_json::to_value(&http_config.server_parameters) {
+                        server_info.insert("server_parameters".to_string(), params_json);
+                    }
+                }
+            }
+
+            result.insert(name.clone(), serde_json::Value::Object(server_info));
+        }
+
+        serde_json::Value::Object(result)
+    }
+
     /// 获取可用工具列表 / Get available tools list
     pub async fn list_available_tools(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
@@ -669,6 +791,228 @@ impl MCPServerManager {
     /// 禁用自动重连 / Disable auto reconnect
     pub async fn disable_auto_reconnect(&self) {
         *self.auto_reconnect.write().await = false;
+    }
+
+    /// 设置健康检查配置 / Set health check configuration
+    pub async fn set_health_check_config(&self, config: HealthCheckConfig) {
+        *self.health_check_config.write().await = config;
+    }
+
+    /// 获取健康检查配置 / Get health check configuration
+    pub async fn get_health_check_config(&self) -> HealthCheckConfig {
+        self.health_check_config.read().await.clone()
+    }
+
+    /// 设置重连策略 / Set reconnect policy
+    pub async fn set_reconnect_policy(&self, policy: ReconnectPolicy) {
+        *self.reconnect_policy.write().await = policy;
+    }
+
+    /// 获取重连策略 / Get reconnect policy
+    pub async fn get_reconnect_policy(&self) -> ReconnectPolicy {
+        self.reconnect_policy.read().await.clone()
+    }
+
+    /// 启动健康监控 / Start health monitoring
+    /// 定期检查所有活动客户端的健康状态，并在检测到故障时自动重连
+    /// Periodically checks health of all active clients and auto-reconnects on failure
+    pub async fn start_health_monitor(&self) {
+        // 先停止现有的监控任务 / Stop existing monitor task first
+        self.stop_health_monitor().await;
+
+        let health_config = self.health_check_config.clone();
+        let reconnect_policy = self.reconnect_policy.clone();
+        let active_clients = self.active_clients.clone();
+        let _servers_config = self.servers_config.clone();
+        let retry_counts = self.retry_counts.clone();
+        let auto_reconnect = self.auto_reconnect.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let config = health_config.read().await.clone();
+                if !config.enabled {
+                    // 健康检查禁用，等待一段时间后重新检查配置
+                    // Health check disabled, wait and re-check config
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    continue;
+                }
+
+                // 获取所有活动客户端 / Get all active clients
+                let clients: Vec<(String, StdArc<dyn MCPClientProtocol>)> = {
+                    let clients_guard = active_clients.read().await;
+                    clients_guard
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                };
+
+                // 对每个客户端执行健康检查 / Perform health check on each client
+                for (server_name, client) in clients {
+                    let check_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(config.timeout_secs),
+                        client.health_check(),
+                    )
+                    .await;
+
+                    let is_healthy = match check_result {
+                        Ok(result) => result.is_healthy,
+                        Err(_) => {
+                            warn!("Health check timed out for server: {}", server_name);
+                            false
+                        }
+                    };
+
+                    if !is_healthy {
+                        warn!("Server {} is unhealthy", server_name);
+
+                        // 检查是否启用自动重连 / Check if auto-reconnect is enabled
+                        let should_reconnect = *auto_reconnect.read().await;
+                        if !should_reconnect {
+                            continue;
+                        }
+
+                        let policy = reconnect_policy.read().await.clone();
+                        let mut retries = retry_counts.write().await;
+                        let retry_count = retries.entry(server_name.clone()).or_insert(0);
+
+                        if policy.should_retry(*retry_count) {
+                            let delay = policy.calculate_delay(*retry_count);
+                            info!(
+                                "Attempting to reconnect {} (retry {}/{}), delay {:?}",
+                                server_name,
+                                *retry_count + 1,
+                                if policy.max_retries == 0 {
+                                    "∞".to_string()
+                                } else {
+                                    policy.max_retries.to_string()
+                                },
+                                delay
+                            );
+
+                            tokio::time::sleep(delay).await;
+
+                            // 尝试断开并重新连接 / Try disconnect and reconnect
+                            if let Err(e) = client.disconnect().await {
+                                warn!("Failed to disconnect {}: {}", server_name, e);
+                            }
+
+                            match client.connect().await {
+                                Ok(_) => {
+                                    info!("Successfully reconnected to {}", server_name);
+                                    // 重置重试计数 / Reset retry count
+                                    *retry_count = 0;
+                                }
+                                Err(e) => {
+                                    error!("Failed to reconnect to {}: {}", server_name, e);
+                                    *retry_count += 1;
+                                }
+                            }
+                        } else {
+                            error!(
+                                "Max retries ({}) reached for server {}. Giving up.",
+                                policy.max_retries, server_name
+                            );
+                            // 可以考虑从活动客户端中移除 / Consider removing from active clients
+                        }
+                    } else {
+                        // 健康检查通过，重置重试计数 / Health check passed, reset retry count
+                        let mut retries = retry_counts.write().await;
+                        retries.remove(&server_name);
+                        debug!("Server {} is healthy", server_name);
+                    }
+                }
+
+                // 等待下一次健康检查 / Wait for next health check
+                tokio::time::sleep(std::time::Duration::from_secs(config.interval_secs)).await;
+            }
+        });
+
+        *self.health_monitor_handle.write().await = Some(handle);
+        info!("Health monitor started");
+    }
+
+    /// 停止健康监控 / Stop health monitoring
+    pub async fn stop_health_monitor(&self) {
+        if let Some(handle) = self.health_monitor_handle.write().await.take() {
+            handle.abort();
+            info!("Health monitor stopped");
+        }
+    }
+
+    /// 检查单个服务器的健康状态 / Check health of a single server
+    pub async fn check_server_health(&self, server_name: &str) -> Option<HealthCheckResult> {
+        let clients = self.active_clients.read().await;
+        if let Some(client) = clients.get(server_name) {
+            let config = self.health_check_config.read().await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(config.timeout_secs),
+                client.health_check(),
+            )
+            .await;
+
+            match result {
+                Ok(health_result) => Some(health_result),
+                Err(_) => Some(HealthCheckResult {
+                    is_healthy: false,
+                    checked_at: std::time::Instant::now(),
+                    error: Some("Health check timed out".to_string()),
+                    response_time_ms: None,
+                }),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 检查所有服务器的健康状态 / Check health of all servers
+    pub async fn check_all_health(&self) -> HashMap<String, HealthCheckResult> {
+        let mut results = HashMap::new();
+        let clients: Vec<(String, StdArc<dyn MCPClientProtocol>)> = {
+            let clients_guard = self.active_clients.read().await;
+            clients_guard
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let config = self.health_check_config.read().await.clone();
+
+        for (server_name, client) in clients {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(config.timeout_secs),
+                client.health_check(),
+            )
+            .await;
+
+            let health_result = match result {
+                Ok(hr) => hr,
+                Err(_) => HealthCheckResult {
+                    is_healthy: false,
+                    checked_at: std::time::Instant::now(),
+                    error: Some("Health check timed out".to_string()),
+                    response_time_ms: None,
+                },
+            };
+
+            results.insert(server_name, health_result);
+        }
+
+        results
+    }
+
+    /// 获取重试计数 / Get retry counts
+    pub async fn get_retry_counts(&self) -> HashMap<String, u32> {
+        self.retry_counts.read().await.clone()
+    }
+
+    /// 重置特定服务器的重试计数 / Reset retry count for a specific server
+    pub async fn reset_retry_count(&self, server_name: &str) {
+        self.retry_counts.write().await.remove(server_name);
+    }
+
+    /// 重置所有重试计数 / Reset all retry counts
+    pub async fn reset_all_retry_counts(&self) {
+        self.retry_counts.write().await.clear();
     }
 }
 
@@ -858,5 +1202,125 @@ mod tests {
 
         // 等待连接建立 / Wait for connections to establish
         sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn test_health_check_config() {
+        let manager = MCPServerManager::new();
+
+        // 验证默认配置 / Verify default config
+        let config = manager.get_health_check_config().await;
+        assert_eq!(config.interval_secs, 30);
+        assert_eq!(config.timeout_secs, 5);
+        assert!(config.enabled);
+
+        // 更新配置 / Update config
+        let new_config = HealthCheckConfig {
+            interval_secs: 60,
+            timeout_secs: 10,
+            enabled: false,
+        };
+        manager.set_health_check_config(new_config.clone()).await;
+
+        let updated = manager.get_health_check_config().await;
+        assert_eq!(updated.interval_secs, 60);
+        assert_eq!(updated.timeout_secs, 10);
+        assert!(!updated.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_policy() {
+        let manager = MCPServerManager::new();
+
+        // 验证默认策略 / Verify default policy
+        let policy = manager.get_reconnect_policy().await;
+        assert!(policy.enabled);
+        assert_eq!(policy.max_retries, 5);
+        assert_eq!(policy.initial_delay_ms, 1000);
+        assert_eq!(policy.max_delay_ms, 30000);
+        assert_eq!(policy.backoff_factor, 2.0);
+
+        // 测试延迟计算 / Test delay calculation
+        assert_eq!(policy.calculate_delay(0).as_millis(), 1000);
+        assert_eq!(policy.calculate_delay(1).as_millis(), 2000);
+        assert_eq!(policy.calculate_delay(2).as_millis(), 4000);
+        assert_eq!(policy.calculate_delay(3).as_millis(), 8000);
+
+        // 测试 should_retry / Test should_retry
+        assert!(policy.should_retry(0));
+        assert!(policy.should_retry(4));
+        assert!(!policy.should_retry(5)); // max is 5
+
+        // 测试无限重试 / Test infinite retry
+        let infinite_policy = ReconnectPolicy {
+            enabled: true,
+            max_retries: 0,
+            ..Default::default()
+        };
+        assert!(infinite_policy.should_retry(100));
+    }
+
+    #[tokio::test]
+    async fn test_retry_counts() {
+        let manager = MCPServerManager::new();
+
+        // 初始应该为空 / Should be empty initially
+        let counts = manager.get_retry_counts().await;
+        assert!(counts.is_empty());
+
+        // 通过内部操作添加重试计数 / Add retry counts through internal operation
+        {
+            manager
+                .retry_counts
+                .write()
+                .await
+                .insert("server1".to_string(), 3);
+            manager
+                .retry_counts
+                .write()
+                .await
+                .insert("server2".to_string(), 5);
+        }
+
+        let counts = manager.get_retry_counts().await;
+        assert_eq!(counts.get("server1"), Some(&3));
+        assert_eq!(counts.get("server2"), Some(&5));
+
+        // 重置单个服务器 / Reset single server
+        manager.reset_retry_count("server1").await;
+        let counts = manager.get_retry_counts().await;
+        assert!(!counts.contains_key("server1"));
+        assert_eq!(counts.get("server2"), Some(&5));
+
+        // 重置所有 / Reset all
+        manager.reset_all_retry_counts().await;
+        let counts = manager.get_retry_counts().await;
+        assert!(counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_manager_with_custom_config() {
+        let health_config = HealthCheckConfig {
+            interval_secs: 15,
+            timeout_secs: 3,
+            enabled: true,
+        };
+        let reconnect_policy = ReconnectPolicy {
+            enabled: true,
+            max_retries: 10,
+            initial_delay_ms: 500,
+            max_delay_ms: 60000,
+            backoff_factor: 1.5,
+        };
+
+        let manager = MCPServerManager::with_config(health_config.clone(), reconnect_policy.clone());
+
+        let got_health = manager.get_health_check_config().await;
+        assert_eq!(got_health.interval_secs, 15);
+        assert_eq!(got_health.timeout_secs, 3);
+
+        let got_reconnect = manager.get_reconnect_policy().await;
+        assert_eq!(got_reconnect.max_retries, 10);
+        assert_eq!(got_reconnect.initial_delay_ms, 500);
     }
 }
