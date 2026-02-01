@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use rust_socketio::asynchronous::ClientBuilder;
-use rust_socketio::Payload;
-use rust_socketio::TransportType;
 use socketioxide::extract::Data;
 use socketioxide::extract::SocketRef;
 use socketioxide::SocketIo;
+use tf_rust_socketio::asynchronous::ClientBuilder;
+use tf_rust_socketio::Payload;
+use tf_rust_socketio::TransportType;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Notify};
 use tokio::time::{sleep, timeout};
@@ -28,7 +28,7 @@ async fn find_available_port() -> u16 {
 fn counter_handler(
     counter: Arc<AtomicUsize>,
     notify: Option<Arc<Notify>>,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
 {
     move |_payload: Payload, _client| {
         let counter = counter.clone();
@@ -189,7 +189,7 @@ impl SmcpTestServer {
 }
 
 #[tokio::test]
-async fn test_socketioxide_and_rust_socketio_interop() {
+async fn test_socketioxide_and_tf_rust_socketio_interop() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let server = TestServer::start().await;
@@ -524,7 +524,7 @@ async fn test_update_notifications_and_role_checks() {
 fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
 {
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);

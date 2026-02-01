@@ -44,11 +44,11 @@ cargo tree
 - `crates/smcp-agent/`
   - Agent 客户端 SDK：connect/auth、join_office、tool_call（ack + timeout + cancel）、订阅 `notify:*`。
   - 包含 Agent 专属类型（如 `AgentEventHandler`）。
-  - 依赖 `rust_socketio` 作为 Socket.IO 客户端。
+  - 依赖 `tf-rust-socketio` 作为 Socket.IO 客户端。
 - `crates/smcp-computer/`
   - Computer 客户端 SDK：注册 handler trait，处理 `client:get_tools`/`client:tool_call`/`client:get_desktop`，并支持上报 `server:update_*`。
   - 包含 Computer 专属配置类型（如 `MCPServerConfig`、`MCPServerStdioConfig` 等）。
-  - 依赖 `rust_socketio` 作为 Socket.IO 客户端。
+  - 依赖 `tf-rust-socketio` 作为 Socket.IO 客户端。
 - `crates/smcp-server-core/`
   - Server 核心逻辑（会话/路由/鉴权/转发/广播），紧绑定 `socketioxide`。
 - `crates/smcp-server-hyper/`

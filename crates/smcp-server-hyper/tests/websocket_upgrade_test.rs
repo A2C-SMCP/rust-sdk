@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rust_socketio::asynchronous::ClientBuilder;
-use rust_socketio::payload::Payload;
-use rust_socketio::TransportType;
 use serde_json::json;
 use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 use smcp_server_hyper::HyperServerBuilder;
+use tf_rust_socketio::asynchronous::ClientBuilder;
+use tf_rust_socketio::payload::Payload;
+use tf_rust_socketio::TransportType;
 use tokio::time::sleep;
 
 fn ack_to_sender<T: Send + 'static>(
@@ -16,7 +16,7 @@ fn ack_to_sender<T: Send + 'static>(
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
 ) -> impl FnMut(
     Payload,
-    rust_socketio::asynchronous::Client,
+    tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
        + Send
        + Sync {

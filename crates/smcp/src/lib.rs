@@ -52,7 +52,11 @@ impl ErrorDetail {
     }
 
     /// 添加详情字段 / Add detail field
-    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn with_detail(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         let details = self.details.get_or_insert_with(HashMap::new);
         details.insert(key.into(), value.into());
         self
@@ -82,7 +86,11 @@ impl ErrorResponse {
     }
 
     /// 添加详情字段 / Add detail field
-    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn with_detail(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         self.error = self.error.with_detail(key, value);
         self
     }
@@ -122,8 +130,11 @@ impl ErrorResponse {
     /// Tool Not Found 错误 / Tool Not Found error
     pub fn tool_not_found(tool_name: impl Into<String>) -> Self {
         let name = tool_name.into();
-        Self::new(error_codes::TOOL_NOT_FOUND, format!("Tool '{}' not found", name))
-            .with_detail("tool_name", serde_json::Value::String(name))
+        Self::new(
+            error_codes::TOOL_NOT_FOUND,
+            format!("Tool '{}' not found", name),
+        )
+        .with_detail("tool_name", serde_json::Value::String(name))
     }
 
     /// Tool Execution Failed 错误 / Tool Execution Failed error
@@ -133,15 +144,24 @@ impl ErrorResponse {
 
     /// Tool Timeout 错误 / Tool Timeout error
     pub fn tool_timeout(timeout_secs: u64) -> Self {
-        Self::new(error_codes::TOOL_TIMEOUT, format!("Tool execution timed out after {} seconds", timeout_secs))
-            .with_detail("timeout", serde_json::Value::Number(serde_json::Number::from(timeout_secs)))
+        Self::new(
+            error_codes::TOOL_TIMEOUT,
+            format!("Tool execution timed out after {} seconds", timeout_secs),
+        )
+        .with_detail(
+            "timeout",
+            serde_json::Value::Number(serde_json::Number::from(timeout_secs)),
+        )
     }
 
     /// Room Full 错误 / Room Full error
     pub fn room_full(office_id: impl Into<String>) -> Self {
         let id = office_id.into();
-        Self::new(error_codes::ROOM_FULL, format!("Room '{}' already has an agent", id))
-            .with_detail("office_id", serde_json::Value::String(id))
+        Self::new(
+            error_codes::ROOM_FULL,
+            format!("Room '{}' already has an agent", id),
+        )
+        .with_detail("office_id", serde_json::Value::String(id))
     }
 
     /// Not In Room 错误 / Not In Room error
@@ -591,7 +611,12 @@ mod tests {
 
         let error = parsed.get("error").unwrap();
         assert_eq!(error.get("code").unwrap(), error_codes::TOOL_NOT_FOUND);
-        assert!(error.get("message").unwrap().as_str().unwrap().contains("my_tool"));
+        assert!(error
+            .get("message")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("my_tool"));
         assert!(error.get("details").is_some());
         assert_eq!(
             error.get("details").unwrap().get("tool_name").unwrap(),

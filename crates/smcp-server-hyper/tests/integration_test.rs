@@ -13,11 +13,11 @@ use http::HeaderMap;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::Request;
-use rust_socketio::{
+use serde_json::{json, Value};
+use tf_rust_socketio::{
     asynchronous::{Client, ClientBuilder},
     Payload, TransportType,
 };
-use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
@@ -280,7 +280,7 @@ pub fn ack_to_sender<T: Send + 'static>(
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
 ) -> impl FnMut(
     Payload,
-    rust_socketio::asynchronous::Client,
+    tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
        + Send
        + Sync {
@@ -314,7 +314,7 @@ where
 {
     let url = format!("http://localhost:{}", addr.port());
 
-    // rust_socketio与socketioxide在namespace连接时可能不会触发connect事件
+    // tf_rust_socketio与socketioxide在namespace连接时可能不会触发connect事件
     // 直接连接并等待一小段时间确保连接建立
     let client = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)

@@ -4,7 +4,7 @@
 * 创建日期: 2025/12/16
 * 最后修改日期: 2025/12/16
 * 版权: 2023 JQQ. All rights reserved.
-* 依赖: rust_socketio, tokio, serde
+* 依赖: tf_rust_socketio, tokio, serde
 * 描述: SMCP Computer的Socket.IO客户端实现 / Socket.IO client implementation for SMCP Computer
 */
 
@@ -12,10 +12,6 @@ use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
 use crate::mcp_clients::model::MCPServerInput;
 use futures_util::FutureExt;
-use rust_socketio::{
-    asynchronous::{Client, ClientBuilder},
-    Event, Payload, TransportType,
-};
 use serde_json::Value;
 use smcp::{
     events::{
@@ -28,6 +24,10 @@ use smcp::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use tf_rust_socketio::{
+    asynchronous::{Client, ClientBuilder},
+    Event, Payload, TransportType,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -756,8 +756,8 @@ impl SmcpComputerClient {
     /// 获取连接的 URL
     /// Get connected URL
     pub fn get_url(&self) -> String {
-        // 由于 rust_socketio 的 Client 没有 uri() 方法，返回默认值
-        // Since rust_socketio Client doesn't have uri() method, return default
+        // 由于 tf_rust_socketio 的 Client 没有 uri() 方法，返回默认值
+        // Since tf_rust_socketio Client doesn't have uri() method, return default
         "unknown".to_string()
     }
 

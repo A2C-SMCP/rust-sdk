@@ -60,7 +60,7 @@ rust-sdk/
     - AI 智能体客户端，连接到 SMCP Server
     - 调用 Computer 上的工具
     - 支持异步 (`AsyncSmcpAgent`) 和同步 (`SyncSmcpAgent`) API
-    - 基于 `rust_socketio` 实现客户端通信
+    - 基于 `tf-rust-socketio` 实现客户端通信
 
 2. **Computer (`smcp-computer`)**
     - 管理多个 MCP Servers (stdio/SSE/HTTP)
@@ -95,7 +95,7 @@ Computer 支持三种 MCP 传输方式：
 
 ## 关键设计决策
 
-1. **Socket.IO 紧绑定**: 使用 `socketioxide` (Server) 和 `rust_socketio` (Client)
+1. **Socket.IO 紧绑定**: 使用 `socketioxide` (Server) 和 `tf-rust-socketio` (Client)
 2. **HTTP 承载层可插拔**: 通过 Tower Layer/Service 模式，默认使用 Hyper
 3. **仅支持 JSON**: 不支持二进制消息，未来通过独立通道支持资源流
 4. **异步优先**: 基于 Tokio 运行时
@@ -110,7 +110,7 @@ Computer 支持三种 MCP 传输方式：
 
 ## 依赖注意事项
 
-- `rust_socketio` 使用本地 patch: `vendor/rust-socketio/socketio`
+- Socket.IO 客户端使用自研的 `tf-rust-socketio` (crates.io)，基于 `rust_socketio` 增加了 ACK 响应支持
 - E2E 测试需要 `e2e` feature 才能运行（`--ignored`）
 
 ## 协议规范与参考实现

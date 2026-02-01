@@ -653,12 +653,18 @@ impl MCPServerManager {
                 MCPServerConfig::Sse(_) => "sse",
                 MCPServerConfig::Http(_) => "http",
             };
-            server_info.insert("type".to_string(), serde_json::Value::String(server_type.to_string()));
+            server_info.insert(
+                "type".to_string(),
+                serde_json::Value::String(server_type.to_string()),
+            );
 
             // 添加状态信息 / Add status info
             server_info.insert("status".to_string(), serde_json::Value::String(state));
             server_info.insert("is_active".to_string(), serde_json::Value::Bool(is_active));
-            server_info.insert("disabled".to_string(), serde_json::Value::Bool(config.disabled()));
+            server_info.insert(
+                "disabled".to_string(),
+                serde_json::Value::Bool(config.disabled()),
+            );
 
             // 添加禁用工具列表 / Add forbidden tools list
             let forbidden_tools: Vec<serde_json::Value> = config
@@ -666,7 +672,10 @@ impl MCPServerManager {
                 .iter()
                 .map(|t| serde_json::Value::String(t.clone()))
                 .collect();
-            server_info.insert("forbidden_tools".to_string(), serde_json::Value::Array(forbidden_tools));
+            server_info.insert(
+                "forbidden_tools".to_string(),
+                serde_json::Value::Array(forbidden_tools),
+            );
 
             // 添加工具元数据 / Add tool metadata
             if let Ok(tool_meta_json) = serde_json::to_value(config.tool_meta()) {
@@ -682,7 +691,10 @@ impl MCPServerManager {
 
             // 添加 VRL 脚本（如果有）/ Add VRL script if present
             if let Some(vrl) = config.vrl() {
-                server_info.insert("vrl".to_string(), serde_json::Value::String(vrl.to_string()));
+                server_info.insert(
+                    "vrl".to_string(),
+                    serde_json::Value::String(vrl.to_string()),
+                );
             }
 
             // 添加服务器参数（根据类型）/ Add server parameters based on type
@@ -1313,7 +1325,8 @@ mod tests {
             backoff_factor: 1.5,
         };
 
-        let manager = MCPServerManager::with_config(health_config.clone(), reconnect_policy.clone());
+        let manager =
+            MCPServerManager::with_config(health_config.clone(), reconnect_policy.clone());
 
         let got_health = manager.get_health_check_config().await;
         assert_eq!(got_health.interval_secs, 15);

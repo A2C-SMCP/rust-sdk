@@ -14,7 +14,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum SmcpAgentError {
     #[error("网络错误: {0}")]
-    Network(#[from] Box<rust_socketio::Error>),
+    Network(#[from] Box<tf_rust_socketio::Error>),
 
     #[error("超时错误")]
     Timeout,
@@ -59,8 +59,8 @@ impl SmcpAgentError {
 }
 
 // 手动实现From trait以保持兼容性 / Manual From implementations for compatibility
-impl From<rust_socketio::Error> for SmcpAgentError {
-    fn from(err: rust_socketio::Error) -> Self {
+impl From<tf_rust_socketio::Error> for SmcpAgentError {
+    fn from(err: tf_rust_socketio::Error) -> Self {
         Self::Network(Box::new(err))
     }
 }

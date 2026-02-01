@@ -3382,49 +3382,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_engineio"
-version = "0.6.0"
-dependencies = [
- "adler32",
- "async-stream",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "http 1.4.0",
- "native-tls",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.21.0",
- "tungstenite 0.21.0",
- "url",
-]
-
-[[package]]
-name = "rust_socketio"
-version = "0.6.0"
-dependencies = [
- "adler32",
- "async-stream",
- "backoff",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "log",
- "native-tls",
- "rand 0.8.5",
- "rust_engineio",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3909,11 +3866,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
- "rust_socketio",
  "serde",
  "serde_json",
  "smcp",
  "smcp-server-core",
+ "tf-rust-socketio",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -3944,7 +3901,6 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rpassword",
- "rust_socketio",
  "rustyline",
  "rustyline-derive",
  "serde",
@@ -3952,6 +3908,7 @@ dependencies = [
  "smcp",
  "smcp-server-core",
  "tempfile",
+ "tf-rust-socketio",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",
@@ -3975,11 +3932,11 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-tungstenite",
  "hyper-util",
- "rust_socketio",
  "serde",
  "serde_json",
  "smcp",
  "socketioxide",
+ "tf-rust-socketio",
  "thiserror 2.0.17",
  "tokio",
  "tower",
@@ -3999,11 +3956,11 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "reqwest",
- "rust_socketio",
  "serde_json",
  "smcp",
  "smcp-server-core",
  "socketioxide",
+ "tf-rust-socketio",
  "tokio",
  "tower",
  "tracing",
@@ -4308,6 +4265,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "tf-rust-engineio"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e34149fcb6a0790edd3bd1f8cc463c1722ad39be82df8b657ca2df179744366"
+dependencies = [
+ "adler32",
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "http 1.4.0",
+ "native-tls",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tungstenite 0.21.0",
+ "url",
+]
+
+[[package]]
+name = "tf-rust-socketio"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f4a973c57c7158d0392cc7f6544da63220f0253e7a11ae6d225b0136c3f133e"
+dependencies = [
+ "adler32",
+ "async-stream",
+ "backoff",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "log",
+ "native-tls",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tf-rust-engineio",
+ "thiserror 1.0.69",
+ "tokio",
+ "url",
 ]
 
 [[package]]

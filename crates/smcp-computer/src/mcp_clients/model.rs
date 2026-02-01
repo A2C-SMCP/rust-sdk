@@ -503,12 +503,7 @@ pub trait MCPClientProtocol: Send + Sync {
         }
 
         // 尝试调用 list_tools 来验证连接 / Try calling list_tools to verify connection
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.list_tools(),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.list_tools()).await {
             Ok(Ok(_)) => {
                 let elapsed = start.elapsed();
                 HealthCheckResult {

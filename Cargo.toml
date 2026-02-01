@@ -1,15 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/smcp",
-  "crates/smcp-agent",
-  "crates/smcp-computer",
-  "crates/smcp-server-core",
-  "crates/smcp-server-hyper",
+    "crates/smcp",
+    "crates/smcp-agent",
+    "crates/smcp-computer",
+    "crates/smcp-server-core",
+    "crates/smcp-server-hyper",
 ]
-
-[patch.crates-io]
-rust_socketio = { path = "vendor/rust-socketio/socketio" }
 
 [workspace.package]
 edition = "2021"
@@ -103,7 +100,7 @@ url = "2.5"
 
 # Socket.IO / Socket.IO
 socketioxide = { version = "0.16.3", features = ["state"] }
-rust_socketio = { version = "0.6", features = ["async"] }
+tf-rust-socketio = { version = "0.7.0", features = ["async"] }
 
 # HTTP服务器 / HTTP server
 hyper = { version = "1", features = ["server", "http1", "http2", "full"] }

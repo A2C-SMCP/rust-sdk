@@ -20,7 +20,7 @@ tower.workspace = true
 [dev-dependencies]
 smcp = { path = "../smcp" }
 reqwest.workspace = true
-rust_socketio = { workspace = true }
+tf-rust-socketio = { workspace = true }
 serde_json = { workspace = true }
 futures.workspace = true
 async-trait.workspace = true

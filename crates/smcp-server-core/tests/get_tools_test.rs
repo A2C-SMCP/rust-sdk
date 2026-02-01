@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use rust_socketio::asynchronous::ClientBuilder;
-use rust_socketio::Payload;
-use rust_socketio::TransportType;
 use serde_json::json;
+use tf_rust_socketio::asynchronous::ClientBuilder;
+use tf_rust_socketio::Payload;
+use tf_rust_socketio::TransportType;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
@@ -79,7 +79,7 @@ async fn test_get_tools_success_same_office() {
                         });
 
                         // 注意：这里应该通过ACK返回响应
-                        // 但rust_socketio的emit_with_ack回调机制需要在连接时设置
+                        // 但tf_rust_socketio的emit_with_ack回调机制需要在连接时设置
                     }
                 }
             }
@@ -154,14 +154,14 @@ async fn test_get_tools_success_same_office() {
                     );
                 }
             } else {
-                // 响应可能为空或错误，这是预期的，因为rust_socketio客户端无法在on回调中发送ACK响应
+                // 响应可能为空或错误，这是预期的，因为tf_rust_socketio客户端无法在on回调中发送ACK响应
                 println!(
                     "Computer received request but couldn't send ACK response (expected behavior)"
                 );
             }
         }
         Ok(Err(e)) => {
-            // 超时错误是预期的，因为rust_socketio客户端无法在on回调中发送ACK响应
+            // 超时错误是预期的，因为tf_rust_socketio客户端无法在on回调中发送ACK响应
             println!("Timeout error (expected): {}", e);
         }
         Err(_) => {
@@ -400,7 +400,7 @@ async fn test_get_tools_multiple_computers() {
         let result = tokio::time::timeout(Duration::from_secs(5), result_rx).await;
 
         // 验证收到了响应（即使Computer没有实际返回工具列表）
-        // rust_socketio 客户端无法在 on 回调中发送 ACK 响应，所以超时是预期的
+        // tf_rust_socketio 客户端无法在 on 回调中发送 ACK 响应，所以超时是预期的
         match result {
             Ok(Ok(_response)) => {
                 // 如果意外收到响应，那也可以

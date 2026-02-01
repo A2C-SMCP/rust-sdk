@@ -150,7 +150,7 @@ impl ComputerError {
             ComputerError::McpClientError(e) => e.error_code(),
 
             // IO和序列化错误 / IO and serialization errors
-            ComputerError::IoError(_) => 500,            // INTERNAL_ERROR
+            ComputerError::IoError(_) => 500, // INTERNAL_ERROR
             ComputerError::SerializationError(_) => 400, // BAD_REQUEST
 
             // 运行时错误 / Runtime errors

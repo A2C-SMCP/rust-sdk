@@ -20,7 +20,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
-rust_socketio.workspace = true
+tf-rust-socketio.workspace = true
 
 [dev-dependencies]
 smcp-server-core = { path = "../smcp-server-core" }
