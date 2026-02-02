@@ -3,6 +3,10 @@ name = "smcp-computer"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+description = "A2C-SMCP Computer client for MCP server management"
+repository = "https://github.com/A2C-SMCP/rust-sdk"
+keywords = ["smcp", "computer", "mcp", "tool"]
+categories = ["network-programming", "development-tools"]
 
 [dev-dependencies]
 smcp-server-core = { path = "../smcp-server-core" }
@@ -14,7 +18,7 @@ http-body-util.workspace = true
 tempfile.workspace = true
 
 [dependencies]
-smcp = { path = "../smcp" }
+smcp = { path = "../smcp", version = "0.1.0" }
 
 tokio.workspace = true
 serde.workspace = true
