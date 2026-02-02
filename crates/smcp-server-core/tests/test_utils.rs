@@ -235,10 +235,12 @@ pub async fn join_office(
     // 等待响应
     let result = tokio::time::timeout(ack_timeout, result_rx)
         .await
-        .unwrap_or_else(|_| panic!(
-            "join_office ack timeout after {:?} for role={:?}, office={}, name={}",
-            ack_timeout, role, office_id, name
-        ))
+        .unwrap_or_else(|_| {
+            panic!(
+                "join_office ack timeout after {:?} for role={:?}, office={}, name={}",
+                ack_timeout, role, office_id, name
+            )
+        })
         .unwrap();
 
     // 验证加入成功
