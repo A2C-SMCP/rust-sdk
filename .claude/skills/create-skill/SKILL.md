@@ -7,6 +7,16 @@ description: Creates new Claude Skills with proper structure, SKILL.md templates
 
 帮助创建符合 Claude Code 规范的新 Skill。
 
+## 重点
+
+### 能引用当前现成的代码示例的，就不要在SKILL中摘录，而是直接使用 Markdown 链接到文件，代码胜于文档
+
+### SKILL 最重要的是阐述模式与概念及最佳实践，首先要讲清为何如此来做，其次介绍最佳实践，至于如何操作的具体步骤，参考上述表达，引用示例文件即可
+
+### 如果待创建的 SKILL 在当前项目中尚无示例文档，那说明这个SKILL尚未经过当前项目实践验证，它不具备独立成为SKILL的必要条件，应该拒绝创建
+
+### SKILL 主体内容应该是分步描述当前这个 SKILL 如何执行，在每一步可以参考哪些文件，输出结果应该是什么样子。如此一来，模式的表达自然会渗透其中，而不是一味地堆砌参考，导致文档臃肿，空而无物，华而不实。
+
 ## Quick start
 
 创建最简 Skill 结构（30 秒）：
@@ -91,36 +101,6 @@ data_processing     # 不要下划线
 skill-data-process  # 不要前缀 "skill-"
 ```
 
-## Advanced usage
-
-### 添加资源文件
-
-```bash
-# 创建参考文档
-cat > .claude/skills/my-skill/resources/reference.md << 'EOF'
-# API Reference
-
-## Function signature
-\```python
-function_name(param1: str, param2: int) -> dict
-\```
-
-## Parameters
-- param1: Description
-- param2: Description
-\```
-
-# 创建示例代码
-cat > .claude/skills/my-skill/resources/examples.md << 'EOF'
-# Examples
-
-## Example 1: Basic usage
-\```python
-# 完整示例
-\```
-EOF
-```
-
 ### MCP 工具集成
 
 如果 Skill 需要 MCP 工具，在文档中注明：
@@ -133,7 +113,9 @@ EOF
 
 使用示例：
 \```python
+
 # Tool reference format: ServerName:tool_name
+
 result = filesystem:read_file(path="config.json")
 \```
 ```
@@ -158,19 +140,24 @@ EOF
 ### 内容组织（渐进式披露）
 
 ```markdown
-## Quick start        # 80% 的常见用例
-## Basic usage        # 标准用法
-## Advanced usage     # 复杂场景
-## Edge cases         # 边缘情况
+## Quick start # 80% 的常见用例
+
+## Basic usage # 标准用法
+
+## Advanced usage # 复杂场景
+
+## Edge cases # 边缘情况
 ```
 
 ### 路径引用规范
 
 ```markdown
 # ✅ 正确：使用正斜杠和 {baseDir}
+
 path: "{baseDir}/resources/config.json"
 
 # ❌ 错误：Windows 风格反斜杠
+
 path: "resources\\config.json"
 ```
 
@@ -185,29 +172,10 @@ path: "resources\\config.json"
 - **混合环境**：可以同时提供中英文描述（英文在前，中文在后）
 
 **为什么这样要求？**
+
 - Claude Code 会根据 description 匹配和调用 Skill
 - 使用与用户交互语言一致的 description 可以提高匹配准确度
 - 母语描述更容易让用户理解 Skill 的功能和使用场景
-
-#### 中文描述示例
-
-```yaml
-# ✅ 中文环境 - 使用中文描述
----
-name: csv-analyzer
-description: 分析 CSV 文件，生成统计报告，识别数据模式和异常值。当用户需要分析表格数据、生成统计摘要或探索数据集时使用。
----
-```
-
-#### 英文描述示例
-
-```yaml
-# ✅ 英文环境 - 使用英文描述
----
-name: csv-analyzer
-description: Analyzes CSV files, generates statistics, identifies patterns and anomalies. Use when users need to analyze tabular data, generate statistical summaries, or explore datasets.
----
-```
 
 #### 中英双语示例
 
@@ -217,22 +185,6 @@ description: Analyzes CSV files, generates statistics, identifies patterns and a
 name: create-skill
 description: Creates new Claude Skills with proper structure and templates. 创建符合规范的新 Claude Skill，提供完整结构和模板。当需要创建新 skill 或添加功能时使用。
 ---
-```
-
-#### 描述质量标准
-
-```yaml
-# ✅ 好的描述（中文）
-description: "分析 CSV 文件，生成描述性统计，识别数据模式，创建可视化图表。当用户需要探索、汇总或理解表格数据时使用。"
-# 特点：清晰说明功能、明确触发场景、具体可操作
-
-# ❌ 不好的描述（太模糊）
-description: "一个数据处理工具。"
-# 问题：未说明具体功能，无法判断何时使用
-
-# ❌ 不好的描述（太冗长）
-description: "本 skill 提供全面的数据分析功能，包括但不限于统计分析、数据可视化、数据清洗、数据转换以及各种其他数据相关操作，适用于多种场景..."
-# 问题：冗长啰嗦，缺乏重点
 ```
 
 ### 职责单一原则
@@ -249,12 +201,12 @@ data-tool          # 太宽泛，混合多种功能
 
 ## 常见错误
 
-| 错误 | 解决方案 |
-|------|---------|
-| `Invalid YAML frontmatter` | 确保 `---` 包围 YAML 块 |
-| `name exceeds 64 chars` | 缩短 name 字段 |
-| `Skill not found` | 检查目录结构：`.claude/skills/your-skill/SKILL.md` |
-| `Resources not loading` | 使用 `{baseDir}` 变量和正斜杠 |
+| 错误                         | 解决方案                                        |
+|----------------------------|---------------------------------------------|
+| `Invalid YAML frontmatter` | 确保 `---` 包围 YAML 块                          |
+| `name exceeds 64 chars`    | 缩短 name 字段                                  |
+| `Skill not found`          | 检查目录结构：`.claude/skills/your-skill/SKILL.md` |
+| `Resources not loading`    | 使用 `{baseDir}` 变量和正斜杠                       |
 
 ## 验证清单
 
