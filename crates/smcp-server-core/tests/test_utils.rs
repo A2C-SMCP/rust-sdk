@@ -220,7 +220,7 @@ pub async fn join_office(
         .emit_with_ack(
             "server:join_office",
             json!(join_req),
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             ack_to_sender(result_tx, |p| match p {
                 Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
@@ -230,7 +230,7 @@ pub async fn join_office(
         .expect("join_office emit_with_ack failed");
 
     // 等待响应
-    let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+    let result = tokio::time::timeout(Duration::from_secs(15), result_rx)
         .await
         .expect("join_office ack timeout")
         .unwrap();
