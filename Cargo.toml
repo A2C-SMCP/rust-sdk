@@ -99,7 +99,7 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"
 
 # Socket.IO / Socket.IO
-socketioxide = { version = "0.16.3", features = ["state"] }
+socketioxide = { version = "0.18.1", features = ["state"] }
 tf-rust-socketio = { version = "0.7.0", features = ["async"] }
 
 # HTTP服务器 / HTTP server
