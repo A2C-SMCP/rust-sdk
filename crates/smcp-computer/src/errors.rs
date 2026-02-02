@@ -90,11 +90,91 @@ pub enum ComputerError {
     #[error("Invalid state: {0}")]
     /// 无效状态 / Invalid state
     InvalidState(String),
+
+    #[error("Render error: {0}")]
+    /// 渲染错误 / Render error
+    RenderError(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         ComputerError::RuntimeError(err.to_string())
+    }
+}
+
+impl From<crate::mcp_clients::RenderError> for ComputerError {
+    fn from(err: crate::mcp_clients::RenderError) -> Self {
+        ComputerError::RenderError(err.to_string())
+    }
+}
+
+impl ComputerError {
+    /// 获取错误码 / Get error code
+    /// 参考 A2C-SMCP 协议错误码规范 / Reference A2C-SMCP protocol error code spec
+    pub fn error_code(&self) -> i32 {
+        match self {
+            // 工具相关错误 / Tool related errors
+            ComputerError::ToolNameDuplicated { .. } => 4002, // TOOL_DISABLED
+            ComputerError::ToolExecutionTimeout { .. } => 4004, // TOOL_TIMEOUT
+
+            // 输入相关错误 / Input related errors
+            ComputerError::InputNotFound { .. } => 404, // NOT_FOUND
+
+            // 服务器相关错误 / Server related errors
+            ComputerError::ServerNotActive { .. } => 404, // NOT_FOUND
+
+            // 语法/验证错误 / Syntax/Validation errors
+            ComputerError::VrlSyntaxError { .. } => 400, // BAD_REQUEST
+            ComputerError::ValidationError(_) => 400,    // BAD_REQUEST
+            ComputerError::InvalidConfiguration(_) => 400, // BAD_REQUEST
+            ComputerError::RenderError(_) => 400,        // BAD_REQUEST
+
+            // 连接错误 / Connection errors
+            ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR
+            ComputerError::TransportError(_) => 500,  // INTERNAL_ERROR
+            ComputerError::SocketIoError(_) => 500,   // INTERNAL_ERROR
+
+            // 超时错误 / Timeout errors
+            ComputerError::TimeoutError(_) => 408, // TIMEOUT
+
+            // 权限错误 / Permission errors
+            ComputerError::PermissionError(_) => 403, // FORBIDDEN
+
+            // 协议错误 / Protocol errors
+            ComputerError::ProtocolError(_) => 500, // INTERNAL_ERROR
+
+            // 状态错误 / State errors
+            ComputerError::InvalidState(_) => 400, // BAD_REQUEST
+
+            // MCP客户端错误 / MCP client errors
+            ComputerError::McpClientError(e) => e.error_code(),
+
+            // IO和序列化错误 / IO and serialization errors
+            ComputerError::IoError(_) => 500, // INTERNAL_ERROR
+            ComputerError::SerializationError(_) => 400, // BAD_REQUEST
+
+            // 运行时错误 / Runtime errors
+            ComputerError::RuntimeError(_) => 500, // INTERNAL_ERROR
+        }
+    }
+}
+
+impl McpClientError {
+    /// 获取错误码 / Get error code
+    pub fn error_code(&self) -> i32 {
+        match self {
+            McpClientError::NotConnected => 500,        // INTERNAL_ERROR
+            McpClientError::ConnectionFailed(_) => 500, // INTERNAL_ERROR
+            McpClientError::ConnectionError(_) => 500,  // INTERNAL_ERROR
+            McpClientError::ToolCallFailed(_) => 4003,  // TOOL_EXECUTION_FAILED
+            McpClientError::InvalidState(_) => 400,     // BAD_REQUEST
+            McpClientError::ProcessError(_) => 500,     // INTERNAL_ERROR
+            McpClientError::TimeoutError(_) => 408,     // TIMEOUT
+            McpClientError::ProtocolError(_) => 500,    // INTERNAL_ERROR
+            McpClientError::ToolError(_) => 4003,       // TOOL_EXECUTION_FAILED
+            McpClientError::ConfigError(_) => 400,      // BAD_REQUEST
+            McpClientError::InternalError(_) => 500,    // INTERNAL_ERROR
+        }
     }
 }
 

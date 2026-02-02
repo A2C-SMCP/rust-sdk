@@ -29,7 +29,7 @@ default = []
 hyper = ["dep:tower", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [dev-dependencies]
-rust_socketio.workspace = true
+tf-rust-socketio.workspace = true
 futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

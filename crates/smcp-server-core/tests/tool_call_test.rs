@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use rust_socketio::asynchronous::ClientBuilder;
-use rust_socketio::Payload;
-use rust_socketio::TransportType;
 use serde_json::json;
+use tf_rust_socketio::asynchronous::ClientBuilder;
+use tf_rust_socketio::Payload;
+use tf_rust_socketio::TransportType;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
@@ -39,7 +39,7 @@ async fn test_tool_call_roundtrip() {
             async move {
                 // 标记收到了请求
                 computer_received.store(true, Ordering::SeqCst);
-                // 注意：rust_socketio客户端无法在on回调中发送ACK响应
+                // 注意：tf_rust_socketio客户端无法在on回调中发送ACK响应
                 // 所以服务器会收到超时错误
                 println!("Computer received tool_call request but cannot send ACK response");
             }

@@ -5,8 +5,8 @@ mod test_utils;
 
 use std::time::Duration;
 
-use rust_socketio::Payload;
 use serde_json::json;
+use tf_rust_socketio::Payload;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 

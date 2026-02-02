@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 
@@ -23,6 +23,7 @@ use crate::inputs::utils::run_command;
 use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{CallToolResult, MCPServerConfig, MCPServerInput, Tool},
+    ConfigRender, RenderError,
 };
 use crate::socketio_client::SmcpComputerClient;
 
@@ -160,7 +161,9 @@ pub struct Computer<S: Session> {
     /// MCP服务器管理器 / MCP server manager
     mcp_manager: Arc<RwLock<Option<MCPServerManager>>>,
     /// 输入定义映射 / Input definitions map (id -> input)
-    inputs: RwLock<HashMap<String, MCPServerInput>>,
+    /// 使用 Arc 以便与 Socket.IO 客户端共享
+    /// Using Arc to share with Socket.IO client
+    inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
     /// MCP服务器配置映射 / MCP server configurations map (name -> config)
     mcp_servers: RwLock<HashMap<String, MCPServerConfig>>,
     /// 输入处理器 / Input handler
@@ -174,7 +177,9 @@ pub struct Computer<S: Session> {
     /// Session实例 / Session instance
     session: S,
     /// Socket.IO客户端引用 / Socket.IO client reference
-    socketio_client: Arc<RwLock<Option<Weak<SmcpComputerClient>>>>,
+    /// 使用 Arc 而不是 Weak 以确保 client 生命周期
+    /// Using Arc instead of Weak to ensure client lifetime
+    socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
     /// 确认回调函数 / Confirmation callback function
     confirm_callback: Option<ConfirmCallbackType>,
 }
@@ -196,7 +201,7 @@ impl<S: Session> Computer<S> {
         Self {
             name,
             mcp_manager: Arc::new(RwLock::new(None)),
-            inputs: RwLock::new(inputs),
+            inputs: Arc::new(RwLock::new(inputs)),
             mcp_servers: RwLock::new(mcp_servers),
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
@@ -223,7 +228,9 @@ impl<S: Session> Computer<S> {
     }
 
     /// 获取 Socket.IO 客户端引用 / Get Socket.IO client reference
-    pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Weak<SmcpComputerClient>>>> {
+    /// 返回 Arc 包装的客户端，确保其生命周期
+    /// Returns Arc-wrapped client, ensuring its lifetime
+    pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Arc<SmcpComputerClient>>>> {
         self.socketio_client.clone()
     }
 
@@ -264,14 +271,65 @@ impl<S: Session> Computer<S> {
     }
 
     /// 渲染服务器配置 / Render server configuration
+    /// 解析配置中的 ${input:xxx} 占位符，通过 Session 获取输入值
+    /// Parse ${input:xxx} placeholders in config, get input values through Session
     async fn render_server_config(
         &self,
         config: &MCPServerConfig,
     ) -> ComputerResult<MCPServerConfig> {
-        // TODO: 实现配置渲染逻辑 / TODO: Implement config rendering logic
-        // 这里需要实现类似Python版本的配置渲染功能
-        // This needs to implement config rendering similar to Python version
-        Ok(config.clone())
+        // 将配置序列化为 JSON / Serialize config to JSON
+        let config_json = serde_json::to_value(config)?;
+
+        // 创建渲染器 / Create renderer
+        let renderer = ConfigRender::default();
+
+        // 获取 inputs 的引用以便在闭包中使用 / Get inputs reference for use in closure
+        let inputs = self.inputs.read().await;
+        let inputs_clone: std::collections::HashMap<String, MCPServerInput> = inputs.clone();
+        drop(inputs); // 释放读锁 / Release read lock
+
+        // 首先预解析所有输入值 / Pre-resolve all input values first
+        // 这样可以在闭包中使用解析后的值
+        // This allows using resolved values in the closure
+        let mut resolved_values: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for (input_id, input) in inputs_clone.iter() {
+            match self.session.resolve_input(input).await {
+                Ok(value) => {
+                    resolved_values.insert(input_id.clone(), value);
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to resolve input '{}': {}, will use default",
+                        input_id, e
+                    );
+                    // 使用默认值作为回退 / Use default value as fallback
+                    if let Some(default) = input.default() {
+                        resolved_values.insert(input_id.clone(), default);
+                    }
+                }
+            }
+        }
+
+        // 创建输入解析闭包 / Create input resolver closure
+        let resolver = |input_id: String| {
+            let values = resolved_values.clone();
+            async move {
+                if let Some(value) = values.get(&input_id) {
+                    Ok(value.clone())
+                } else {
+                    Err(RenderError::InputNotFound(input_id))
+                }
+            }
+        };
+
+        // 渲染配置 / Render config
+        let rendered_json = renderer.render(config_json, resolver).await?;
+
+        // 反序列化回配置类型 / Deserialize back to config type
+        let rendered_config: MCPServerConfig = serde_json::from_value(rendered_json)?;
+
+        Ok(rendered_config)
     }
 
     /// 动态添加或更新服务器配置 / Add or update server configuration dynamically
@@ -675,9 +733,13 @@ impl<S: Session> Computer<S> {
     }
 
     /// 设置Socket.IO客户端 / Set Socket.IO client
+    /// 此方法会替换现有的 client（如果有）并保持强引用
+    /// This method replaces existing client (if any) and keeps strong reference
     pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) {
         let mut socketio_ref = self.socketio_client.write().await;
-        *socketio_ref = Some(Arc::downgrade(&client));
+        // 替换旧的 client（如果有），旧的会被自动 drop
+        // Replace old client (if any), old one will be dropped automatically
+        *socketio_ref = Some(client);
     }
 
     /// 连接Socket.IO服务器 / Connect to Socket.IO server
@@ -685,7 +747,7 @@ impl<S: Session> Computer<S> {
         &self,
         url: &str,
         _namespace: &str,
-        _auth: &Option<String>,
+        auth: &Option<String>,
         _headers: &Option<String>,
     ) -> ComputerResult<()> {
         // 确保管理器已初始化 / Ensure manager is initialized
@@ -713,10 +775,13 @@ impl<S: Session> Computer<S> {
         let new_manager = MCPServerManager::new();
 
         // 创建Socket.IO客户端 / Create Socket.IO client
+        // 传递认证密钥（如果提供） / Pass auth secret (if provided)
         let client = SmcpComputerClient::new(
             url,
             Arc::new(RwLock::new(Some(new_manager))),
             self.name.clone(),
+            auth.clone(),
+            self.inputs.clone(),
         )
         .await?;
 
@@ -743,11 +808,11 @@ impl<S: Session> Computer<S> {
     /// 加入办公室 / Join office
     pub async fn join_office(&self, office_id: &str, _computer_name: &str) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
-        if let Some(ref weak_client) = *socketio_ref {
-            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                client.join_office(office_id).await?;
-                return Ok(());
-            }
+        if let Some(ref client) = *socketio_ref {
+            // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+            // Use Arc<SmcpComputerClient> directly, no need to upgrade
+            client.join_office(office_id).await?;
+            return Ok(());
         }
         Err(ComputerError::InvalidState(
             "Socket.IO client not connected".to_string(),
@@ -757,14 +822,12 @@ impl<S: Session> Computer<S> {
     /// 离开办公室 / Leave office
     pub async fn leave_office(&self) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
-        if let Some(ref weak_client) = *socketio_ref {
-            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                // 获取当前 office_id 并离开
-                // Get current office_id and leave
-                let current_office_id = client.get_current_office_id().await?;
-                client.leave_office(&current_office_id).await?;
-                return Ok(());
-            }
+        if let Some(ref client) = *socketio_ref {
+            // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+            // Use Arc<SmcpComputerClient> directly, no need to upgrade
+            let current_office_id = client.get_current_office_id().await?;
+            client.leave_office(&current_office_id).await?;
+            return Ok(());
         }
         Err(ComputerError::InvalidState(
             "Socket.IO client not connected".to_string(),
@@ -774,11 +837,11 @@ impl<S: Session> Computer<S> {
     /// 发送配置更新通知 / Emit config update notification
     pub async fn emit_update_config(&self) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
-        if let Some(ref weak_client) = *socketio_ref {
-            if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                client.emit_update_config().await?;
-                return Ok(());
-            }
+        if let Some(ref client) = *socketio_ref {
+            // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+            // Use Arc<SmcpComputerClient> directly, no need to upgrade
+            client.emit_update_config().await?;
+            return Ok(());
         }
         Err(ComputerError::InvalidState(
             "Socket.IO client not connected".to_string(),
@@ -811,7 +874,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
         Self {
             name: self.name.clone(),
             mcp_manager: Arc::clone(&self.mcp_manager),
-            inputs: RwLock::new(HashMap::new()), // Note: 不复制运行时状态 / Don't copy runtime state
+            inputs: Arc::new(RwLock::new(HashMap::new())), // Note: 不复制运行时状态 / Don't copy runtime state
             mcp_servers: RwLock::new(HashMap::new()),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
@@ -849,10 +912,10 @@ impl<S: Session> ManagerChangeHandler for Computer<S> {
             ManagerChangeMessage::ToolListChanged => {
                 debug!("Tool list changed, notifying Socket.IO client");
                 let socketio_ref = self.socketio_client.read().await;
-                if let Some(ref weak_client) = *socketio_ref {
-                    if let Some(client) = weak_client.upgrade() as Option<Arc<SmcpComputerClient>> {
-                        client.emit_update_tool_list().await?;
-                    }
+                if let Some(ref client) = *socketio_ref {
+                    // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
+                    // Use Arc<SmcpComputerClient> directly, no need to upgrade
+                    client.emit_update_tool_list().await?;
                 }
             }
             ManagerChangeMessage::ResourceListChanged { windows: _ } => {
@@ -1418,5 +1481,101 @@ mod tests {
         // 测试关闭已初始化的Computer / Test shutting down initialized computer
         computer.boot_up().await.unwrap();
         computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_config_render() {
+        let session = SilentSession::new("test");
+
+        // 创建带有输入定义的 inputs / Create inputs with input definitions
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "api_key".to_string(),
+            MCPServerInput::PromptString(PromptStringInput {
+                id: "api_key".to_string(),
+                description: "API Key".to_string(),
+                default: Some("test-api-key-12345".to_string()),
+                password: Some(true),
+            }),
+        );
+        inputs.insert(
+            "server_url".to_string(),
+            MCPServerInput::PromptString(PromptStringInput {
+                id: "server_url".to_string(),
+                description: "Server URL".to_string(),
+                default: Some("https://api.example.com".to_string()),
+                password: Some(false),
+            }),
+        );
+
+        let computer = Computer::new("test_computer", session, Some(inputs), None, true, true);
+
+        // 创建带有占位符的服务器配置 / Create server config with placeholders
+        let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "test_server".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: std::collections::HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["${input:api_key}".to_string()],
+                env: {
+                    let mut env = std::collections::HashMap::new();
+                    env.insert("API_URL".to_string(), "${input:server_url}".to_string());
+                    env
+                },
+                cwd: None,
+            },
+        });
+
+        // 渲染配置 / Render config
+        let rendered = computer.render_server_config(&server_config).await.unwrap();
+
+        // 验证占位符已被替换 / Verify placeholders are replaced
+        match rendered {
+            MCPServerConfig::Stdio(config) => {
+                assert_eq!(config.server_parameters.args[0], "test-api-key-12345");
+                assert_eq!(
+                    config.server_parameters.env.get("API_URL"),
+                    Some(&"https://api.example.com".to_string())
+                );
+            }
+            _ => panic!("Expected Stdio config"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_config_render_missing_input() {
+        let session = SilentSession::new("test");
+        let computer = Computer::new("test_computer", session, None, None, true, true);
+
+        // 创建带有不存在输入的配置 / Create config with non-existent input
+        let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "test_server".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: std::collections::HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["${input:missing_input}".to_string()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+            },
+        });
+
+        // 渲染配置应该保留原占位符 / Render should preserve original placeholder
+        let rendered = computer.render_server_config(&server_config).await.unwrap();
+
+        match rendered {
+            MCPServerConfig::Stdio(config) => {
+                // 未找到的输入应该保留原占位符 / Missing input should preserve placeholder
+                assert_eq!(config.server_parameters.args[0], "${input:missing_input}");
+            }
+            _ => panic!("Expected Stdio config"),
+        }
     }
 }

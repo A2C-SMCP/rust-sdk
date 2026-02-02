@@ -1,8 +1,174 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// SMCP协议的命名空间
 pub const SMCP_NAMESPACE: &str = "/smcp";
+
+/// 标准错误码模块 / Standard error codes module
+pub mod error_codes {
+    // 通用错误码 / General error codes
+    pub const BAD_REQUEST: i32 = 400;
+    pub const UNAUTHORIZED: i32 = 401;
+    pub const FORBIDDEN: i32 = 403;
+    pub const NOT_FOUND: i32 = 404;
+    pub const TIMEOUT: i32 = 408;
+    pub const INTERNAL_ERROR: i32 = 500;
+
+    // 工具调用错误码 / Tool call error codes
+    pub const TOOL_NOT_FOUND: i32 = 4001;
+    pub const TOOL_DISABLED: i32 = 4002;
+    pub const TOOL_EXECUTION_FAILED: i32 = 4003;
+    pub const TOOL_TIMEOUT: i32 = 4004;
+    pub const TOOL_REQUIRES_CONFIRMATION: i32 = 4005;
+
+    // 房间管理错误码 / Room management error codes
+    pub const ROOM_FULL: i32 = 4101;
+    pub const ROOM_NOT_FOUND: i32 = 4102;
+    pub const NOT_IN_ROOM: i32 = 4103;
+    pub const CROSS_ROOM_ACCESS: i32 = 4104;
+}
+
+/// 错误详情结构 / Error detail structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    /// 错误码 / Error code
+    pub code: i32,
+    /// 人类可读的错误描述 / Human readable error message
+    pub message: String,
+    /// 结构化调试信息（可选）/ Structured debug info (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl ErrorDetail {
+    /// 创建新的错误详情 / Create new error detail
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    /// 添加详情字段 / Add detail field
+    pub fn with_detail(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        let details = self.details.get_or_insert_with(HashMap::new);
+        details.insert(key.into(), value.into());
+        self
+    }
+
+    /// 添加多个详情字段 / Add multiple detail fields
+    pub fn with_details(mut self, details: HashMap<String, serde_json::Value>) -> Self {
+        self.details = Some(details);
+        self
+    }
+}
+
+/// 标准错误响应格式 / Standard error response format
+/// 格式: { "error": { "code": i32, "message": str, "details": object? } }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    /// 错误详情 / Error detail
+    pub error: ErrorDetail,
+}
+
+impl ErrorResponse {
+    /// 创建新的错误响应 / Create new error response
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorDetail::new(code, message),
+        }
+    }
+
+    /// 添加详情字段 / Add detail field
+    pub fn with_detail(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.error = self.error.with_detail(key, value);
+        self
+    }
+
+    // 便捷构造方法 / Convenience constructors
+
+    /// Bad Request 错误 / Bad Request error
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(error_codes::BAD_REQUEST, message)
+    }
+
+    /// Unauthorized 错误 / Unauthorized error
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(error_codes::UNAUTHORIZED, message)
+    }
+
+    /// Forbidden 错误 / Forbidden error
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(error_codes::FORBIDDEN, message)
+    }
+
+    /// Not Found 错误 / Not Found error
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(error_codes::NOT_FOUND, message)
+    }
+
+    /// Timeout 错误 / Timeout error
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new(error_codes::TIMEOUT, message)
+    }
+
+    /// Internal Error 错误 / Internal Error error
+    pub fn internal_error(message: impl Into<String>) -> Self {
+        Self::new(error_codes::INTERNAL_ERROR, message)
+    }
+
+    /// Tool Not Found 错误 / Tool Not Found error
+    pub fn tool_not_found(tool_name: impl Into<String>) -> Self {
+        let name = tool_name.into();
+        Self::new(
+            error_codes::TOOL_NOT_FOUND,
+            format!("Tool '{}' not found", name),
+        )
+        .with_detail("tool_name", serde_json::Value::String(name))
+    }
+
+    /// Tool Execution Failed 错误 / Tool Execution Failed error
+    pub fn tool_execution_failed(message: impl Into<String>) -> Self {
+        Self::new(error_codes::TOOL_EXECUTION_FAILED, message)
+    }
+
+    /// Tool Timeout 错误 / Tool Timeout error
+    pub fn tool_timeout(timeout_secs: u64) -> Self {
+        Self::new(
+            error_codes::TOOL_TIMEOUT,
+            format!("Tool execution timed out after {} seconds", timeout_secs),
+        )
+        .with_detail(
+            "timeout",
+            serde_json::Value::Number(serde_json::Number::from(timeout_secs)),
+        )
+    }
+
+    /// Room Full 错误 / Room Full error
+    pub fn room_full(office_id: impl Into<String>) -> Self {
+        let id = office_id.into();
+        Self::new(
+            error_codes::ROOM_FULL,
+            format!("Room '{}' already has an agent", id),
+        )
+        .with_detail("office_id", serde_json::Value::String(id))
+    }
+
+    /// Not In Room 错误 / Not In Room error
+    pub fn not_in_room() -> Self {
+        Self::new(error_codes::NOT_IN_ROOM, "Session is not in any room")
+    }
+}
 
 /// SMCP事件常量定义
 pub mod events {
@@ -417,5 +583,77 @@ mod tests {
         assert_eq!(original.content, deserialized.content);
         assert_eq!(original.is_error, deserialized.is_error);
         assert_eq!(original.req_id, deserialized.req_id);
+    }
+
+    #[test]
+    fn test_error_response_format() {
+        // 测试标准错误响应格式 / Test standard error response format
+        let error_resp = ErrorResponse::new(404, "Resource not found");
+
+        let json = serde_json::to_string(&error_resp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // 验证格式: { "error": { "code": 404, "message": "..." } }
+        assert!(parsed.get("error").is_some());
+        let error = parsed.get("error").unwrap();
+        assert_eq!(error.get("code").unwrap(), 404);
+        assert_eq!(error.get("message").unwrap(), "Resource not found");
+        assert!(error.get("details").is_none()); // 没有 details 时不序列化
+    }
+
+    #[test]
+    fn test_error_response_with_details() {
+        // 测试带详情的错误响应 / Test error response with details
+        let error_resp = ErrorResponse::tool_not_found("my_tool");
+
+        let json = serde_json::to_string(&error_resp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let error = parsed.get("error").unwrap();
+        assert_eq!(error.get("code").unwrap(), error_codes::TOOL_NOT_FOUND);
+        assert!(error
+            .get("message")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("my_tool"));
+        assert!(error.get("details").is_some());
+        assert_eq!(
+            error.get("details").unwrap().get("tool_name").unwrap(),
+            "my_tool"
+        );
+    }
+
+    #[test]
+    fn test_error_response_convenience_constructors() {
+        // 测试便捷构造方法 / Test convenience constructors
+        assert_eq!(ErrorResponse::bad_request("test").error.code, 400);
+        assert_eq!(ErrorResponse::unauthorized("test").error.code, 401);
+        assert_eq!(ErrorResponse::forbidden("test").error.code, 403);
+        assert_eq!(ErrorResponse::not_found("test").error.code, 404);
+        assert_eq!(ErrorResponse::timeout("test").error.code, 408);
+        assert_eq!(ErrorResponse::internal_error("test").error.code, 500);
+        assert_eq!(ErrorResponse::tool_not_found("t").error.code, 4001);
+        assert_eq!(ErrorResponse::tool_execution_failed("t").error.code, 4003);
+        assert_eq!(ErrorResponse::tool_timeout(30).error.code, 4004);
+        assert_eq!(ErrorResponse::room_full("office1").error.code, 4101);
+        assert_eq!(ErrorResponse::not_in_room().error.code, 4103);
+    }
+
+    #[test]
+    fn test_error_response_roundtrip() {
+        // 测试序列化和反序列化往返 / Test serialization roundtrip
+        let original = ErrorResponse::new(500, "Internal error")
+            .with_detail("trace_id", serde_json::Value::String("abc123".to_string()));
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: ErrorResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original.error.code, deserialized.error.code);
+        assert_eq!(original.error.message, deserialized.error.message);
+        assert_eq!(
+            original.error.details.as_ref().unwrap().get("trace_id"),
+            deserialized.error.details.as_ref().unwrap().get("trace_id")
+        );
     }
 }

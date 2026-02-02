@@ -4,17 +4,14 @@
 * 创建日期: 2025/12/16
 * 最后修改日期: 2025/12/16
 * 版权: 2023 JQQ. All rights reserved.
-* 依赖: rust_socketio, tokio, serde
+* 依赖: tf_rust_socketio, tokio, serde
 * 描述: SMCP Computer的Socket.IO客户端实现 / Socket.IO client implementation for SMCP Computer
 */
 
 use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
+use crate::mcp_clients::model::MCPServerInput;
 use futures_util::FutureExt;
-use rust_socketio::{
-    asynchronous::{Client, ClientBuilder},
-    Event, Payload, TransportType,
-};
 use serde_json::Value;
 use smcp::{
     events::{
@@ -25,7 +22,12 @@ use smcp::{
     GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetToolsReq,
     GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use tf_rust_socketio::{
+    asynchronous::{Client, ClientBuilder},
+    Event, Payload, TransportType,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -38,6 +40,9 @@ pub struct SmcpComputerClient {
     computer_name: String,
     /// 当前所在的office ID / Current office ID
     office_id: Arc<RwLock<Option<String>>>,
+    /// 输入定义映射 / Input definitions map
+    #[allow(dead_code)]
+    inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
 }
 
 impl SmcpComputerClient {
@@ -47,17 +52,28 @@ impl SmcpComputerClient {
         url: &str,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
+        auth_secret: Option<String>,
+        inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
     ) -> ComputerResult<Self> {
         let office_id = Arc::new(RwLock::new(None));
         let manager_clone = manager.clone();
         let computer_name_clone = computer_name.clone();
         let office_id_clone = office_id.clone();
+        let inputs_clone = inputs.clone();
 
         // 使用ClientBuilder注册事件处理器
         // Use ClientBuilder to register event handlers
-        let client = ClientBuilder::new(url)
+        let mut builder = ClientBuilder::new(url)
             .namespace(SMCP_NAMESPACE)
-            .transport_type(TransportType::Websocket)
+            .transport_type(TransportType::Websocket);
+
+        // 如果提供了认证密钥，添加到请求头
+        // If auth secret is provided, add to request headers
+        if let Some(secret) = auth_secret {
+            builder = builder.opening_header("x-api-key", secret.as_str());
+        }
+
+        let client = builder
             .on_any(move |event, payload, client| {
                 // 只处理自定义事件
                 // Only handle custom events
@@ -145,6 +161,7 @@ impl SmcpComputerClient {
                         let computer_name = computer_name_clone.clone();
                         let office_id = office_id_clone.clone();
                         let client_clone = client.clone();
+                        let inputs = inputs_clone.clone();
 
                         async move {
                             match Self::handle_get_config_with_ack(
@@ -153,6 +170,7 @@ impl SmcpComputerClient {
                                 computer_name,
                                 office_id,
                                 client_clone,
+                                inputs,
                             )
                             .await
                             {
@@ -210,6 +228,14 @@ impl SmcpComputerClient {
             .await
             .map_err(|e| ComputerError::SocketIoError(format!("Failed to connect: {}", e)))?;
 
+        // 等待一小段时间确保 Socket.IO namespace 连接完全建立
+        // Wait a short time to ensure Socket.IO namespace connection is fully established
+        // Socket.IO 有两个连接阶段：Transport 层和 Namespace 层
+        // Socket.IO has two connection phases: Transport layer and Namespace layer
+        // connect() 只保证 Transport 层连接，namespace 连接是异步的
+        // connect() only guarantees Transport layer connection, namespace connection is async
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
         info!(
             "Connected to SMCP server at {} with computer name: {}",
             url, computer_name
@@ -219,6 +245,7 @@ impl SmcpComputerClient {
             client,
             computer_name,
             office_id,
+            inputs,
         })
     }
 
@@ -469,20 +496,13 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
-        office_id: Arc<RwLock<Option<String>>>,
+        _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<ToolCallReq>(payload)?;
 
-        // 验证office_id和computer_name
-        // Validate office_id and computer_name
-        let current_office_id = office_id.read().await;
-        if current_office_id.as_ref() != Some(&req.base.agent) {
-            return Err(ComputerError::ValidationError(format!(
-                "Office ID mismatch: expected {:?}, got {}",
-                current_office_id, req.base.agent
-            )));
-        }
+        // 验证 computer_name（Server 路由已保证请求来自同一 office，无需验证 agent 字段）
+        // Validate computer_name (Server routing ensures request is from same office, no need to validate agent field)
         if computer_name != req.computer {
             return Err(ComputerError::ValidationError(format!(
                 "Computer name mismatch: expected {}, got {}",
@@ -523,20 +543,13 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
-        office_id: Arc<RwLock<Option<String>>>,
+        _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetToolsReq>(payload)?;
 
-        // 验证office_id和computer_name
-        // Validate office_id and computer_name
-        let current_office_id = office_id.read().await;
-        if current_office_id.as_ref() != Some(&req.base.agent) {
-            return Err(ComputerError::ValidationError(format!(
-                "Office ID mismatch: expected {:?}, got {}",
-                current_office_id, req.base.agent
-            )));
-        }
+        // 验证 computer_name（Server 路由已保证请求来自同一 office，无需验证 agent 字段）
+        // Validate computer_name (Server routing ensures request is from same office, no need to validate agent field)
         if computer_name != req.computer {
             return Err(ComputerError::ValidationError(format!(
                 "Computer name mismatch: expected {}, got {}",
@@ -590,20 +603,14 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
-        office_id: Arc<RwLock<Option<String>>>,
+        _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
+        inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetComputerConfigReq>(payload)?;
 
-        // 验证office_id和computer_name
-        // Validate office_id and computer_name
-        let current_office_id = office_id.read().await;
-        if current_office_id.as_ref() != Some(&req.base.agent) {
-            return Err(ComputerError::ValidationError(format!(
-                "Office ID mismatch: expected {:?}, got {}",
-                current_office_id, req.base.agent
-            )));
-        }
+        // 验证 computer_name（Server 路由已保证请求来自同一 office，无需验证 agent 字段）
+        // Validate computer_name (Server routing ensures request is from same office, no need to validate agent field)
         if computer_name != req.computer {
             return Err(ComputerError::ValidationError(format!(
                 "Computer name mismatch: expected {}, got {}",
@@ -616,10 +623,9 @@ impl SmcpComputerClient {
             let manager_guard = manager.read().await;
             match manager_guard.as_ref() {
                 Some(mgr) => {
-                    // 获取服务器状态并转换为配置格式
-                    // Get server status and convert to config format
-                    let status = mgr.get_server_status().await;
-                    serde_json::json!(status)
+                    // 获取完整服务器配置（不只是状态）
+                    // Get complete server configurations (not just status)
+                    mgr.get_server_configs().await
                 }
                 None => {
                     return Err(ComputerError::InvalidState(
@@ -628,9 +634,31 @@ impl SmcpComputerClient {
                 }
             }
         };
-        let inputs = None; // 暂时返回None / Return None for now
 
-        let response = GetComputerConfigRet { servers, inputs };
+        // 获取输入定义 / Get input definitions
+        // 将 HashMap<String, MCPServerInput> 转换为 Vec<serde_json::Value>
+        // Convert HashMap<String, MCPServerInput> to Vec<serde_json::Value>
+        let inputs_data = {
+            let inputs_guard = inputs.read().await;
+            if inputs_guard.is_empty() {
+                None
+            } else {
+                let inputs_vec: Vec<serde_json::Value> = inputs_guard
+                    .values()
+                    .filter_map(|input| serde_json::to_value(input).ok())
+                    .collect();
+                if inputs_vec.is_empty() {
+                    None
+                } else {
+                    Some(inputs_vec)
+                }
+            }
+        };
+
+        let response = GetComputerConfigRet {
+            servers,
+            inputs: inputs_data,
+        };
 
         info!("Returned config for agent {}", req.base.agent);
         Ok((ack_id, serde_json::to_value(response)?))
@@ -642,20 +670,13 @@ impl SmcpComputerClient {
         payload: Payload,
         _manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
-        office_id: Arc<RwLock<Option<String>>>,
+        _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetDesktopReq>(payload)?;
 
-        // 验证office_id和computer_name
-        // Validate office_id and computer_name
-        let current_office_id = office_id.read().await;
-        if current_office_id.as_ref() != Some(&req.base.agent) {
-            return Err(ComputerError::ValidationError(format!(
-                "Office ID mismatch: expected {:?}, got {}",
-                current_office_id, req.base.agent
-            )));
-        }
+        // 验证 computer_name（Server 路由已保证请求来自同一 office，无需验证 agent 字段）
+        // Validate computer_name (Server routing ensures request is from same office, no need to validate agent field)
         if computer_name != req.computer {
             return Err(ComputerError::ValidationError(format!(
                 "Computer name mismatch: expected {}, got {}",
@@ -735,8 +756,8 @@ impl SmcpComputerClient {
     /// 获取连接的 URL
     /// Get connected URL
     pub fn get_url(&self) -> String {
-        // 由于 rust_socketio 的 Client 没有 uri() 方法，返回默认值
-        // Since rust_socketio Client doesn't have uri() method, return default
+        // 由于 tf_rust_socketio 的 Client 没有 uri() 方法，返回默认值
+        // Since tf_rust_socketio Client doesn't have uri() method, return default
         "unknown".to_string()
     }
 

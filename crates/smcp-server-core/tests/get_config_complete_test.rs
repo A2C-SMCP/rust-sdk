@@ -7,11 +7,11 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use http_body_util::Full;
-use rust_socketio::asynchronous::ClientBuilder;
-use rust_socketio::Payload;
-use rust_socketio::TransportType;
 use serde_json::json;
 use smcp::*;
+use tf_rust_socketio::asynchronous::ClientBuilder;
+use tf_rust_socketio::Payload;
+use tf_rust_socketio::TransportType;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
@@ -22,7 +22,7 @@ use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
 {
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);

@@ -4,21 +4,21 @@
 * 创建日期: 2025/12/15
 * 最后修改日期: 2025/12/15
 * 版权: 2023 JQQ. All rights reserved.
-* 依赖: rust_socketio, tokio
+* 依赖: tf_rust_socketio, tokio
 * 描述: SMCP Agent传输层实现 / SMCP Agent transport layer implementation
 */
 
 use crate::error::{Result, SmcpAgentError};
 use futures_util::FutureExt;
-use rust_socketio::{
-    asynchronous::{Client, ClientBuilder},
-    Event, Payload,
-};
 use serde_json::Value;
 use smcp::events::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tf_rust_socketio::{
+    asynchronous::{Client, ClientBuilder},
+    Event, Payload,
+};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info};
 
@@ -49,7 +49,16 @@ impl SocketIoTransport {
         auth: Option<Value>,
         headers: HashMap<String, String>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
+        info!(
+            "Connecting to SMCP server at {} with namespace {}",
+            url, namespace
+        );
+
         let mut builder = ClientBuilder::new(url);
+
+        // 启用 WebSocket 传输以避免 polling 问题
+        // Enable WebSocket transport to avoid polling issues
+        builder = builder.transport_type(tf_rust_socketio::TransportType::Websocket);
 
         // 设置命名空间
         if !namespace.is_empty() {
@@ -74,6 +83,10 @@ impl SocketIoTransport {
             .await
             .map_err(|e| SmcpAgentError::connection(format!("Failed to connect: {}", e)))?;
 
+        // 等待一小段时间确保 Socket.IO namespace 连接完全建立
+        // Wait for Socket.IO namespace connection to be fully established
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
         info!(
             "Connected to SMCP server at {} with namespace {}",
             url, namespace
@@ -95,7 +108,16 @@ impl SocketIoTransport {
         auth: Option<Value>,
         headers: HashMap<String, String>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
+        info!(
+            "Connecting to SMCP server at {} with namespace {}",
+            url, namespace
+        );
+
         let mut builder = ClientBuilder::new(url);
+
+        // 启用 WebSocket 传输以避免 polling 问题
+        // Enable WebSocket transport to avoid polling issues
+        builder = builder.transport_type(tf_rust_socketio::TransportType::Websocket);
 
         // 注册on_any处理器来捕获所有事件
         let (tx, rx) = mpsc::unbounded_channel();
@@ -123,7 +145,15 @@ impl SocketIoTransport {
                                     serde_json::from_value::<smcp::EnterOfficeNotification>(value)
                                 {
                                     info!("Computer entered office: {:?}", notification);
-                                    let _ = tx.send(NotificationMessage::EnterOffice(notification));
+                                    let send_result =
+                                        tx.send(NotificationMessage::EnterOffice(notification));
+                                    if let Err(e) = send_result {
+                                        error!("Failed to send EnterOffice notification: {:?}", e);
+                                    } else {
+                                        info!(
+                                            "Successfully sent EnterOffice notification to agent"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -214,6 +244,10 @@ impl SocketIoTransport {
             .connect()
             .await
             .map_err(|e| SmcpAgentError::connection(format!("Failed to connect: {}", e)))?;
+
+        // 等待一小段时间确保 Socket.IO namespace 连接完全建立
+        // Wait for Socket.IO namespace connection to be fully established
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         info!(
             "Connected to SMCP server at {} with namespace {} and handlers",

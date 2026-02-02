@@ -334,6 +334,121 @@ pub struct CommandInput {
     pub args: Option<HashMap<String, String>>,
 }
 
+/// 健康检查配置 / Health check configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthCheckConfig {
+    /// 健康检查间隔（秒）/ Health check interval in seconds
+    #[serde(default = "default_health_check_interval")]
+    pub interval_secs: u64,
+    /// 超时时间（秒）/ Timeout in seconds
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout_secs: u64,
+    /// 是否启用健康检查 / Whether to enable health check
+    #[serde(default = "default_health_check_enabled")]
+    pub enabled: bool,
+}
+
+fn default_health_check_interval() -> u64 {
+    30
+}
+
+fn default_health_check_timeout() -> u64 {
+    5
+}
+
+fn default_health_check_enabled() -> bool {
+    true
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 30,
+            timeout_secs: 5,
+            enabled: true,
+        }
+    }
+}
+
+/// 重连策略 / Reconnect policy
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReconnectPolicy {
+    /// 是否启用自动重连 / Whether to enable auto reconnect
+    #[serde(default = "default_reconnect_enabled")]
+    pub enabled: bool,
+    /// 最大重试次数（0表示无限重试）/ Max retry count (0 means infinite)
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// 初始延迟时间（毫秒）/ Initial delay in milliseconds
+    #[serde(default = "default_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    /// 最大延迟时间（毫秒）/ Max delay in milliseconds
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+    /// 退避因子（延迟时间乘数）/ Backoff factor (delay multiplier)
+    #[serde(default = "default_backoff_factor")]
+    pub backoff_factor: f64,
+}
+
+fn default_reconnect_enabled() -> bool {
+    true
+}
+
+fn default_max_retries() -> u32 {
+    5
+}
+
+fn default_initial_delay_ms() -> u64 {
+    1000
+}
+
+fn default_max_delay_ms() -> u64 {
+    30000
+}
+
+fn default_backoff_factor() -> f64 {
+    2.0
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retries: 5,
+            initial_delay_ms: 1000,
+            max_delay_ms: 30000,
+            backoff_factor: 2.0,
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// 计算下次重试的延迟时间 / Calculate delay for next retry
+    pub fn calculate_delay(&self, retry_count: u32) -> std::time::Duration {
+        let delay_ms = (self.initial_delay_ms as f64 * self.backoff_factor.powi(retry_count as i32))
+            .min(self.max_delay_ms as f64) as u64;
+        std::time::Duration::from_millis(delay_ms)
+    }
+
+    /// 检查是否应该继续重试 / Check if should continue retry
+    pub fn should_retry(&self, retry_count: u32) -> bool {
+        self.enabled && (self.max_retries == 0 || retry_count < self.max_retries)
+    }
+}
+
+/// 健康检查结果 / Health check result
+#[derive(Debug, Clone)]
+pub struct HealthCheckResult {
+    /// 是否健康 / Is healthy
+    pub is_healthy: bool,
+    /// 检查时间 / Check time
+    pub checked_at: std::time::Instant,
+    /// 错误信息（如果有）/ Error message if any
+    pub error: Option<String>,
+    /// 响应时间（毫秒）/ Response time in milliseconds
+    pub response_time_ms: Option<u64>,
+}
+
 /// MCP客户端协议trait / MCP client protocol trait
 #[async_trait::async_trait]
 pub trait MCPClientProtocol: Send + Sync {
@@ -370,6 +485,48 @@ pub trait MCPClientProtocol: Send + Sync {
 
     /// 取消订阅窗口资源更新 / Unsubscribe from window resource updates
     async fn unsubscribe_window(&self, resource: Resource) -> Result<(), MCPClientError>;
+
+    /// 执行健康检查 / Perform health check
+    /// 默认实现通过检查状态和尝试 list_tools 来验证连接
+    /// Default implementation checks state and tries list_tools to verify connection
+    async fn health_check(&self) -> HealthCheckResult {
+        let start = std::time::Instant::now();
+
+        // 首先检查状态 / First check state
+        if self.state() != ClientState::Connected {
+            return HealthCheckResult {
+                is_healthy: false,
+                checked_at: start,
+                error: Some(format!("Client state is {:?}, not Connected", self.state())),
+                response_time_ms: None,
+            };
+        }
+
+        // 尝试调用 list_tools 来验证连接 / Try calling list_tools to verify connection
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.list_tools()).await {
+            Ok(Ok(_)) => {
+                let elapsed = start.elapsed();
+                HealthCheckResult {
+                    is_healthy: true,
+                    checked_at: start,
+                    error: None,
+                    response_time_ms: Some(elapsed.as_millis() as u64),
+                }
+            }
+            Ok(Err(e)) => HealthCheckResult {
+                is_healthy: false,
+                checked_at: start,
+                error: Some(format!("Health check failed: {}", e)),
+                response_time_ms: None,
+            },
+            Err(_) => HealthCheckResult {
+                is_healthy: false,
+                checked_at: start,
+                error: Some("Health check timed out".to_string()),
+                response_time_ms: None,
+            },
+        }
+    }
 }
 
 /// 客户端状态 / Client state

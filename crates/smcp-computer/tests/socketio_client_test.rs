@@ -16,9 +16,11 @@ mod tests {
     use hyper::HeaderMap;
     use smcp_computer::errors::ComputerResult;
     use smcp_computer::mcp_clients::manager::MCPServerManager;
+    use smcp_computer::mcp_clients::model::MCPServerInput;
     use smcp_computer::socketio_client::SmcpComputerClient;
     use smcp_server_core::auth::{AuthError, AuthenticationProvider};
     use smcp_server_core::SmcpServerBuilder;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -143,13 +145,20 @@ mod tests {
         // 启动测试服务器
         let server_url = start_test_server().await;
 
-        // 创建MCP管理器
+        // 创建MCP管理器和空输入
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+            inputs,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -173,13 +182,20 @@ mod tests {
         // 启动测试服务器
         let server_url = start_test_server().await;
 
-        // 创建MCP管理器
+        // 创建MCP管理器和空输入
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+            inputs,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -214,13 +230,20 @@ mod tests {
         // 启动测试服务器
         let server_url = start_test_server().await;
 
-        // 创建MCP管理器
+        // 创建MCP管理器和空输入
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+            inputs,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -252,13 +275,20 @@ mod tests {
         // 启动测试服务器
         let server_url = start_test_server().await;
 
-        // 创建MCP管理器
+        // 创建MCP管理器和空输入
         let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client =
-            SmcpComputerClient::new(&server_url, manager.clone(), "test_computer".to_string())
-                .await?;
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer".to_string(),
+            None,
+            inputs,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -296,9 +326,16 @@ mod tests {
 
         for i in 0..3 {
             let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
-            let client =
-                SmcpComputerClient::new(&server_url, manager, format!("test_computer_{}", i))
-                    .await?;
+            let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+                Arc::new(RwLock::new(HashMap::new()));
+            let client = SmcpComputerClient::new(
+                &server_url,
+                manager,
+                format!("test_computer_{}", i),
+                None,
+                inputs,
+            )
+            .await?;
 
             // 等待一小段时间确保连接稳定
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -332,13 +369,20 @@ mod tests {
         // 启动测试服务器 - 只启动一次
         let server_url = start_test_server().await;
 
-        // 创建第一个MCP管理器
+        // 创建第一个MCP管理器和空输入
         let manager1 = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs1: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // 创建第一个客户端连接
-        let client1 =
-            SmcpComputerClient::new(&server_url, manager1.clone(), "test_computer".to_string())
-                .await?;
+        let client1 = SmcpComputerClient::new(
+            &server_url,
+            manager1.clone(),
+            "test_computer".to_string(),
+            None,
+            inputs1,
+        )
+        .await?;
 
         // 等待一小段时间确保连接稳定
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -355,10 +399,14 @@ mod tests {
 
         // 创建新的MCP管理器和客户端重新连接（使用同一个服务器）
         let manager2 = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs2: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let client2 = SmcpComputerClient::new(
             &server_url,
             manager2.clone(),
             "test_computer_reconnected".to_string(),
+            None,
+            inputs2,
         )
         .await?;
 

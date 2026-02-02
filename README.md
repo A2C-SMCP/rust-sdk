@@ -26,9 +26,20 @@ a2c-smcp = { version = "0.1.0", features = ["full"] }
 ## 📦 Features
 
 - **agent** - Agent client for connecting to SMCP servers and calling tools
-- **computer** - Computer client for managing MCP servers and desktop resources  
+- **computer** - Computer client for managing MCP servers and desktop resources
 - **server** - Server implementation with Socket.IO support
 - **full** - Enables all features
+
+## 📜 协议规范
+
+A2C-SMCP 协议规范已拆分为独立仓库，支持多语言 SDK 开发。
+
+- **协议仓库**: [a2c-smcp-protocol](https://github.com/A2C-SMCP/a2c-smcp-protocol)
+- **当前协议版本**: 0.1.2-rc1
+
+开发时参考路径：
+- 协议规范：`a2c-smcp-protocol/specification/`
+- Python 参考实现：`python-sdk/a2c_smcp/`
 
 ## 📋 Project Structure
 
@@ -106,8 +117,8 @@ Agent/Computer 需要连接 Server，并支持：
 
 Rust 侧采用：
 
-- **rust_socketio（客户端）**
- - 注意：`socketioxide` 是纯 Server 端实现，不提供客户端功能。Agent/Computer 作为客户端需要使用 `rust_socketio` crate。
+- **tf-rust-socketio（客户端）**
+ - 注意：`socketioxide` 是纯 Server 端实现，不提供客户端功能。Agent/Computer 作为客户端使用 `tf-rust-socketio` crate（基于 `rust_socketio` 增加了 ACK 响应支持）。
   - 支持点（来自 docs.rs）：
     - **namespace**：`ClientBuilder::namespace("/smcp")`；但**一个 socket 只能连接一个 namespace**，多 namespace 需要多个 socket。
     - **ack + timeout**：`emit_with_ack(event, data, Duration, callback)`，可按每次调用设置超时。
@@ -118,7 +129,7 @@ Rust 侧采用：
     - **headers/auth**：支持 `opening_header(k, v)` 与 `auth(json!)`，可对齐 Python 端的 header api-key 与 auth payload。
   - 注意点：
     - async 版本需要开启 feature `async`，且文档标注当前 async 实现处于 beta，接口可能变化。
-   - 需要在正式开发前验证 `rust_socketio` 与 `socketioxide` 的互通性（见 `tests/e2e/`）。
+   - 需要在正式开发前验证 `tf-rust-socketio` 与 `socketioxide` 的互通性（见 `tests/e2e/`）。
 
 
 ### 2.4 序列化 / 类型校验
@@ -307,7 +318,7 @@ Rust 端先把 SMCP 的“信令与工具调用转发”跑通；MCP Server 管�
 - ✅ emit_tool_call（带 timeout + cancel）
 - ✅ 订阅 `notify:*` 事件并提供回调接口
 - ✅ 完整的配置、认证、事件处理系统
-- ✅ 基于 `rust_socketio` 的传输层实现
+- ✅ 基于 `tf-rust-socketio` 的传输层实现
 
 **Milestone 4：Computer 客户端最小实现** - 100% 完成
 - ✅ `smcp-computer` crate：完整实现

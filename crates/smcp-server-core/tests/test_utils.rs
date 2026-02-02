@@ -15,11 +15,11 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use http_body_util::Full;
 use hyper_util::rt::TokioIo;
-use rust_socketio::asynchronous::ClientBuilder;
-use rust_socketio::Payload;
-use rust_socketio::TransportType;
 use serde_json::json;
 use smcp::*;
+use tf_rust_socketio::asynchronous::ClientBuilder;
+use tf_rust_socketio::Payload;
+use tf_rust_socketio::TransportType;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
@@ -120,7 +120,7 @@ pub fn ack_to_sender<T: Send + 'static>(
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
 ) -> impl FnMut(
     Payload,
-    rust_socketio::asynchronous::Client,
+    tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
        + Send
        + Sync {
@@ -143,7 +143,7 @@ pub fn ack_to_sender<T: Send + 'static>(
 pub async fn create_test_client(
     server_url: &str,
     namespace: &str,
-) -> rust_socketio::asynchronous::Client {
+) -> tf_rust_socketio::asynchronous::Client {
     ClientBuilder::new(server_url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
@@ -160,11 +160,11 @@ pub async fn create_client_with_handler<F>(
     namespace: &str,
     event: &str,
     handler: F,
-) -> rust_socketio::asynchronous::Client
+) -> tf_rust_socketio::asynchronous::Client
 where
     F: FnMut(
             Payload,
-            rust_socketio::asynchronous::Client,
+            tf_rust_socketio::asynchronous::Client,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + 'static
         + Send
@@ -186,7 +186,7 @@ pub fn create_atomic_handler(
     flag: Arc<AtomicBool>,
 ) -> impl FnMut(
     Payload,
-    rust_socketio::asynchronous::Client,
+    tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
        + Send
        + Sync {
@@ -202,7 +202,7 @@ pub fn create_atomic_handler(
 
 /// 加入办公室的辅助函数
 pub async fn join_office(
-    client: &rust_socketio::asynchronous::Client,
+    client: &tf_rust_socketio::asynchronous::Client,
     role: Role,
     office_id: &str,
     name: &str,
@@ -256,7 +256,7 @@ pub async fn join_office(
 
 /// 离开办公室的辅助函数
 #[allow(dead_code)]
-pub async fn leave_office(client: &rust_socketio::asynchronous::Client, office_id: &str) {
+pub async fn leave_office(client: &tf_rust_socketio::asynchronous::Client, office_id: &str) {
     let leave_req = json!({
         "office_id": office_id
     });

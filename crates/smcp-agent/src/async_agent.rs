@@ -65,24 +65,53 @@ impl AsyncSmcpAgent {
         // 启动通知处理任务
         let event_handler = self.event_handler.clone();
         let agent_clone = self.clone();
+        let auto_fetch_tools = self.config.auto_fetch_tools;
 
         let notification_task = tokio::spawn(async move {
+            info!("Notification processing task started");
             while let Some(notification) = notification_rx.recv().await {
+                info!("Agent received notification in task: {:?}", notification);
                 match notification {
                     NotificationMessage::EnterOffice(data) => {
+                        info!("Processing EnterOffice event: {:?}", data);
+
                         // Python 的自动行为：收到 enter_office 后自动触发 get_tools
-                        if let Some(ref computer) = data.computer {
-                            if let Ok(tools) = agent_clone.get_tools(computer).await {
-                                if let Some(ref handler) = event_handler {
-                                    let _ = handler
-                                        .on_tools_received(computer, tools, &agent_clone)
-                                        .await;
+                        // Auto behavior: fetch tools when computer enters office
+                        if auto_fetch_tools {
+                            if let Some(ref computer) = data.computer {
+                                debug!("Auto fetching tools for computer: {}", computer);
+                                match agent_clone.get_tools(computer).await {
+                                    Ok(tools) => {
+                                        info!(
+                                            "Auto fetched {} tools for computer: {}",
+                                            tools.len(),
+                                            computer
+                                        );
+                                        if let Some(ref handler) = event_handler {
+                                            let _ = handler
+                                                .on_tools_received(computer, tools, &agent_clone)
+                                                .await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to auto fetch tools for computer {}: {}",
+                                            computer, e
+                                        );
+                                    }
                                 }
                             }
                         }
 
+                        info!(
+                            "Checking event_handler: is_some = {}",
+                            event_handler.is_some()
+                        );
                         if let Some(ref handler) = event_handler {
+                            info!("Calling on_computer_enter_office handler");
                             let _ = handler.on_computer_enter_office(data, &agent_clone).await;
+                        } else {
+                            info!("No event handler configured for on_computer_enter_office");
                         }
                     }
                     NotificationMessage::LeaveOffice(data) => {
@@ -92,11 +121,27 @@ impl AsyncSmcpAgent {
                     }
                     NotificationMessage::UpdateConfig(data) => {
                         // Python 的自动行为：收到 update_config 后自动触发 get_tools
-                        if let Ok(tools) = agent_clone.get_tools(&data.computer).await {
-                            if let Some(ref handler) = event_handler {
-                                let _ = handler
-                                    .on_tools_received(&data.computer, tools, &agent_clone)
-                                    .await;
+                        // Auto behavior: fetch tools when config is updated
+                        if auto_fetch_tools {
+                            match agent_clone.get_tools(&data.computer).await {
+                                Ok(tools) => {
+                                    debug!(
+                                        "Auto fetched {} tools on config update for: {}",
+                                        tools.len(),
+                                        data.computer
+                                    );
+                                    if let Some(ref handler) = event_handler {
+                                        let _ = handler
+                                            .on_tools_received(&data.computer, tools, &agent_clone)
+                                            .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to auto fetch tools on config update for {}: {}",
+                                        data.computer, e
+                                    );
+                                }
                             }
                         }
 
@@ -106,11 +151,27 @@ impl AsyncSmcpAgent {
                     }
                     NotificationMessage::UpdateToolList(data) => {
                         // Python 的自动行为：收到 update_tool_list 后自动触发 get_tools
-                        if let Ok(tools) = agent_clone.get_tools(&data.computer).await {
-                            if let Some(ref handler) = event_handler {
-                                let _ = handler
-                                    .on_tools_received(&data.computer, tools, &agent_clone)
-                                    .await;
+                        // Auto behavior: fetch tools when tool list is updated
+                        if auto_fetch_tools {
+                            match agent_clone.get_tools(&data.computer).await {
+                                Ok(tools) => {
+                                    debug!(
+                                        "Auto fetched {} tools on tool list update for: {}",
+                                        tools.len(),
+                                        data.computer
+                                    );
+                                    if let Some(ref handler) = event_handler {
+                                        let _ = handler
+                                            .on_tools_received(&data.computer, tools, &agent_clone)
+                                            .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to auto fetch tools on tool list update for {}: {}",
+                                        data.computer, e
+                                    );
+                                }
                             }
                         }
                     }
