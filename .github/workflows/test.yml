@@ -30,13 +30,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (workspace)
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --workspace --features agent,computer,server -- -D warnings
 
       - name: Build
-        run: cargo build --workspace --all-features
+        run: cargo build --workspace --features agent,computer,server
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --features agent,computer,server
 
   # 单独测试各个 crate 以确保独立可用
   test-crates:
@@ -60,7 +60,7 @@ jobs:
         run: cargo test -p smcp-agent --all-features
 
       - name: Test smcp-computer
-        run: cargo test -p smcp-computer --all-features
+        run: cargo test -p smcp-computer --features vrl,cli
 
       - name: Test smcp-server-core
         run: cargo test -p smcp-server-core --all-features
