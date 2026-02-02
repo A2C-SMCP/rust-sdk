@@ -252,12 +252,18 @@ async fn test_update_config_multiple_computers() {
     // Agent加入办公室
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
 
-    // 创建多个Computer客户端
+    // 创建 Computer1 客户端并等待连接稳定
     let computer1_client = create_test_client(&server_url, "smcp").await;
-    let computer2_client = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(100)).await;
 
-    // Computers加入同一办公室
+    // Computer1 加入办公室
     join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
+
+    // 创建 Computer2 客户端并等待连接稳定
+    let computer2_client = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(100)).await;
+
+    // Computer2 加入办公室
     join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
 
     // 重置通知标记

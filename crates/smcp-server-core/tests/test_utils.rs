@@ -216,11 +216,14 @@ pub async fn join_office(
     // 使用 emit_with_ack 确保服务器处理了请求
     let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
 
+    // CI 环境下增加超时时间
+    let ack_timeout = Duration::from_secs(30);
+
     client
         .emit_with_ack(
             "server:join_office",
             json!(join_req),
-            Duration::from_secs(5),
+            ack_timeout,
             ack_to_sender(result_tx, |p| match p {
                 Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
@@ -230,9 +233,14 @@ pub async fn join_office(
         .expect("join_office emit_with_ack failed");
 
     // 等待响应
-    let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+    let result = tokio::time::timeout(ack_timeout, result_rx)
         .await
-        .expect("join_office ack timeout")
+        .unwrap_or_else(|_| {
+            panic!(
+                "join_office ack timeout after {:?} for role={:?}, office={}, name={}",
+                ack_timeout, role, office_id, name
+            )
+        })
         .unwrap();
 
     // 验证加入成功

@@ -88,13 +88,15 @@ impl InputHandler {
 
         // 如果获取失败且有默认值，返回默认值
         // If failed and has default value, return default value
-        if response.is_err() && request.default.is_some() && !request.required {
-            info!("Using default value for: {}", request.id);
-            response = Ok(InputResponse {
-                id: request.id.clone(),
-                value: request.default.unwrap().clone(),
-                cancelled: false,
-            });
+        if response.is_err() && !request.required {
+            if let Some(default) = &request.default {
+                info!("Using default value for: {}", request.id);
+                response = Ok(InputResponse {
+                    id: request.id.clone(),
+                    value: default.clone(),
+                    cancelled: false,
+                });
+            }
         }
 
         // 缓存结果 / Cache result
