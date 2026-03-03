@@ -27,7 +27,6 @@ pub struct SseMCPClient {
     /// 基础客户端 / Base client
     base: BaseMCPClient<SseServerParameters>,
     /// HTTP客户端 / HTTP client
-    #[allow(dead_code)]
     http_client: reqwest::Client,
     /// 请求发送器 / Request sender
     request_tx: Arc<Mutex<Option<mpsc::UnboundedSender<serde_json::Value>>>>,
@@ -35,6 +34,8 @@ pub struct SseMCPClient {
     response_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<serde_json::Value>>>>,
     /// 会话ID / Session ID
     session_id: Arc<Mutex<Option<String>>>,
+    /// SSE 服务器告知的 POST 端点 URL
+    endpoint_url: Arc<Mutex<Option<String>>>,
     /// 订阅管理器 / Subscription manager
     subscription_manager: SubscriptionManager,
     /// 资源缓存 / Resource cache
@@ -78,6 +79,7 @@ impl SseMCPClient {
             request_tx: Arc::new(Mutex::new(None)),
             response_rx: Arc::new(Mutex::new(None)),
             session_id: Arc::new(Mutex::new(None)),
+            endpoint_url: Arc::new(Mutex::new(None)),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
             update_tx: Arc::new(Mutex::new(None)),
@@ -106,6 +108,9 @@ impl SseMCPClient {
             .as_secs() as i64;
         request_body["id"] = serde_json::Value::Number(serde_json::Number::from(request_id));
 
+        // 通知类消息不需要等待响应 / Notifications don't need a response
+        let is_notification = method.starts_with("notifications/");
+
         debug!("Sending SSE request: {}", request_body);
 
         // 通过SSE发送请求 / Send request via SSE
@@ -119,17 +124,25 @@ impl SseMCPClient {
                 "SSE connection not established".to_string(),
             ));
         }
+        drop(tx);
 
-        // 等待响应 / Wait for response
+        if is_notification {
+            return Ok(serde_json::json!({}));
+        }
+
+        // 等待响应（带超时）/ Wait for response (with timeout)
         let mut rx = self.response_rx.lock().await;
         if let Some(ref mut receiver) = *rx {
-            match receiver.recv().await {
-                Some(response) => {
+            match tokio::time::timeout(Duration::from_secs(30), receiver.recv()).await {
+                Ok(Some(response)) => {
                     debug!("Received SSE response: {}", response);
                     Ok(response)
                 }
-                None => Err(MCPClientError::ConnectionError(
+                Ok(None) => Err(MCPClientError::ConnectionError(
                     "Response channel closed".to_string(),
+                )),
+                Err(_) => Err(MCPClientError::TimeoutError(
+                    "SSE response timed out after 30s".to_string(),
                 )),
             }
         } else {
@@ -143,14 +156,8 @@ impl SseMCPClient {
     async fn start_sse_connection(&self) -> Result<(), MCPClientError> {
         let url = &self.base.params.url;
 
-        // 构建SSE URL / Build SSE URL
-        let sse_url = if url.contains('?') {
-            format!("{}&events=true", url)
-        } else {
-            format!("{}?events=true", url)
-        };
-
-        let mut builder = es::ClientBuilder::for_url(&sse_url)
+        // 直接使用原始 URL，不拼接 ?events=true
+        let mut builder = es::ClientBuilder::for_url(url)
             .map_err(|e| MCPClientError::ConnectionError(format!("Invalid SSE URL: {:?}", e)))?;
 
         // 添加headers / Add headers
@@ -172,6 +179,10 @@ impl SseMCPClient {
         // 克隆资源缓存和更新通知发送器，用于 SSE 事件处理
         let resource_cache = self.resource_cache.clone();
         let update_tx = self.update_tx.clone();
+        let endpoint_url = self.endpoint_url.clone();
+        let base_url = url.clone();
+        let http_client = self.http_client.clone();
+        let headers = self.base.params.headers.clone();
 
         // 启动SSE事件处理任务 / Start SSE event handling task
         let stream: Pin<Box<dyn Stream<Item = Result<es::SSE, es::Error>> + Send + Sync>> =
@@ -189,15 +200,22 @@ impl SseMCPClient {
                             Ok(event) => {
                                 debug!("Received SSE event: {:?}", event);
 
-                                // 尝试解析JSON-RPC响应 / Try to parse JSON-RPC response
-                                // Pattern match on SSE enum variants
                                 match event {
                                     es::SSE::Event(event_data) => {
+                                        // 处理 endpoint 事件 / Handle endpoint event
+                                        if event_data.event_type == "endpoint" {
+                                            let endpoint = event_data.data.trim();
+                                            // 支持相对路径 / Support relative paths
+                                            let resolved = resolve_endpoint_url(&base_url, endpoint);
+                                            info!("SSE endpoint resolved: {}", resolved);
+                                            *endpoint_url.lock().await = Some(resolved);
+                                            continue;
+                                        }
+
                                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event_data.data) {
                                             // 区分消息类型 / Distinguish message types
 
                                             // 检查是否是资源更新通知
-                                            // 资源更新通知通常包含 "method" = "resources/update"
                                             if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                                                 if method == "resources/update" || method.contains("update") {
                                                     debug!("Received resource update notification");
@@ -214,7 +232,7 @@ impl SseMCPClient {
                                                                     let _ = tx.send(ResourceUpdate {
                                                                         uri: uri.to_string(),
                                                                         data: data.clone(),
-                                                                        version: 1, // TODO: 从缓存获取版本号
+                                                                        version: 1,
                                                                     });
                                                                 }
                                                             }
@@ -242,20 +260,59 @@ impl SseMCPClient {
                         }
                     }
 
-                    // 处理请求发送 / Handle request sending
+                    // 处理请求发送 / Handle request sending via HTTP POST
                     Some(request) = request_rx.recv() => {
-                        debug!("Sending request via SSE: {}", request);
-                        // 在实际实现中，这里需要通过HTTP POST发送请求
-                        // In actual implementation, this needs to send request via HTTP POST
-                        // 这里简化处理，实际需要根据SSE协议实现
-                        // This is simplified, actual implementation needed according to SSE protocol
+                        debug!("Sending request via HTTP POST: {}", request);
+
+                        let post_url = match endpoint_url.lock().await.clone() {
+                            Some(url) => url,
+                            None => {
+                                error!("No endpoint URL available for POST request");
+                                continue;
+                            }
+                        };
+
+                        let mut req = http_client.post(&post_url)
+                            .header("Content-Type", "application/json");
+
+                        // 添加用户配置的 headers
+                        for (key, value) in &headers {
+                            req = req.header(key, value);
+                        }
+
+                        match req.json(&request).send().await {
+                            Ok(resp) => {
+                                if resp.status().is_success() {
+                                    // 检查 Content-Type，如果是 JSON 直接解析为响应
+                                    let ct = resp.headers()
+                                        .get("content-type")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or("")
+                                        .to_string();
+
+                                    if ct.contains("application/json") {
+                                        match resp.json::<serde_json::Value>().await {
+                                            Ok(json_resp) => {
+                                                let _ = response_tx.send(json_resp);
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to parse POST JSON response: {}", e);
+                                            }
+                                        }
+                                    }
+                                    // 如果是 SSE 响应，数据会通过 SSE stream 返回，无需在此处理
+                                } else {
+                                    error!("POST request failed with status: {}", resp.status());
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to send POST request: {}", e);
+                            }
+                        }
                     }
                 }
             }
         });
-
-        // Note: es_client is not stored since it's not object-safe
-        // The stream is managed within the task above
 
         Ok(())
     }
@@ -353,6 +410,22 @@ impl SseMCPClient {
     }
 }
 
+/// 解析 endpoint URL，支持相对路径
+fn resolve_endpoint_url(base_url: &str, endpoint: &str) -> String {
+    // 如果是绝对 URL 直接返回
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return endpoint.to_string();
+    }
+    // 用 url crate 解析相对路径
+    if let Ok(base) = url::Url::parse(base_url) {
+        if let Ok(resolved) = base.join(endpoint) {
+            return resolved.to_string();
+        }
+    }
+    // fallback: 简单拼接
+    format!("{}{}", base_url.trim_end_matches('/'), endpoint)
+}
+
 #[async_trait]
 impl MCPClientProtocol for SseMCPClient {
     fn state(&self) -> ClientState {
@@ -370,6 +443,20 @@ impl MCPClientProtocol for SseMCPClient {
 
         // 启动SSE连接 / Start SSE connection
         self.start_sse_connection().await?;
+
+        // 等待 endpoint URL 就绪 / Wait for endpoint URL to be ready
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.endpoint_url.lock().await.is_some() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(MCPClientError::TimeoutError(
+                    "Timed out waiting for SSE endpoint event".to_string(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         // 初始化会话 / Initialize session
         self.initialize_session().await?;
@@ -405,6 +492,9 @@ impl MCPClientProtocol for SseMCPClient {
 
         // 清理会话ID / Clear session ID
         *self.session_id.lock().await = None;
+
+        // 清理 endpoint URL
+        *self.endpoint_url.lock().await = None;
 
         // 更新状态 / Update state
         self.base.update_state(ClientState::Disconnected).await;
@@ -481,7 +571,6 @@ impl MCPClientProtocol for SseMCPClient {
         }
 
         // SSE 客户端目前不支持分页，直接获取所有资源
-        // SSE client doesn't support pagination currently, get all resources directly
         let response = self.send_request("resources/list", None).await?;
 
         if let Some(error) = response.get("error") {
@@ -504,7 +593,7 @@ impl MCPClientProtocol for SseMCPClient {
             }
         }
 
-        // 过滤 window:// 资源并按 priority 排序 / Filter window:// resources and sort by priority
+        // 过滤 window:// 资源并按 priority 排序
         let mut filtered_resources: Vec<(Resource, i32)> = Vec::new();
 
         for resource in all_resources {
@@ -512,7 +601,6 @@ impl MCPClientProtocol for SseMCPClient {
                 continue;
             }
 
-            // 解析 priority / Parse priority
             let priority = if let Ok(uri) = WindowURI::new(&resource.uri) {
                 uri.priority().unwrap_or(0)
             } else {
@@ -522,10 +610,8 @@ impl MCPClientProtocol for SseMCPClient {
             filtered_resources.push((resource, priority));
         }
 
-        // 按 priority 降序排序 / Sort by priority in descending order
         filtered_resources.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // 返回仅包含 Resource 的列表 / Return list containing only Resource
         Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
     }
 
@@ -580,18 +666,14 @@ impl MCPClientProtocol for SseMCPClient {
             )));
         }
 
-        // 订阅成功后，更新本地订阅状态
         let _ = self
             .subscription_manager
             .add_subscription(resource.uri.clone())
             .await;
 
-        // 立即获取并缓存资源数据
         match self.get_window_detail(resource.clone()).await {
             Ok(result) => {
-                // 将 contents 转换为 JSON Value
                 if !result.contents.is_empty() {
-                    // 取第一个内容并转换为 JSON
                     if let Ok(json_value) = serde_json::to_value(&result.contents[0]) {
                         self.resource_cache
                             .set(resource.uri.clone(), json_value, None)
@@ -628,13 +710,11 @@ impl MCPClientProtocol for SseMCPClient {
             )));
         }
 
-        // 取消订阅成功后，移除本地订阅状态
         let _ = self
             .subscription_manager
             .remove_subscription(&resource.uri)
             .await;
 
-        // 清理缓存
         self.resource_cache.remove(&resource.uri).await;
         info!("Unsubscribed and removed cache: {}", resource.uri);
 
@@ -647,6 +727,27 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_resolve_endpoint_url_absolute() {
+        let result = resolve_endpoint_url(
+            "http://localhost:8081/sse",
+            "https://other.example.com/messages",
+        );
+        assert_eq!(result, "https://other.example.com/messages");
+    }
+
+    #[test]
+    fn test_resolve_endpoint_url_relative() {
+        let result = resolve_endpoint_url("http://localhost:8081/sse", "/messages");
+        assert_eq!(result, "http://localhost:8081/messages");
+    }
+
+    #[test]
+    fn test_resolve_endpoint_url_relative_path() {
+        let result = resolve_endpoint_url("http://localhost:8081/api/sse", "messages");
+        assert_eq!(result, "http://localhost:8081/api/messages");
+    }
 
     #[tokio::test]
     async fn test_sse_client_creation() {
@@ -687,15 +788,35 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 初始会话ID应该为空 / Initial session ID should be None
+        // 初始会话ID应该为空
         let session_id = client.session_id.lock().await;
         assert!(session_id.is_none());
         drop(session_id);
 
-        // 设置会话ID / Set session ID
+        // 设置会话ID
         *client.session_id.lock().await = Some("session123".to_string());
         let session_id = client.session_id.lock().await;
         assert_eq!(session_id.as_ref().unwrap(), "session123");
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_url_management() {
+        let params = SseServerParameters {
+            url: "http://localhost:8081".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let client = SseMCPClient::new(params);
+
+        // 初始 endpoint URL 应该为空
+        assert!(client.endpoint_url.lock().await.is_none());
+
+        // 设置 endpoint URL
+        *client.endpoint_url.lock().await = Some("http://localhost:8081/messages".to_string());
+        assert_eq!(
+            client.endpoint_url.lock().await.as_ref().unwrap(),
+            "http://localhost:8081/messages"
+        );
     }
 
     #[tokio::test]
@@ -707,7 +828,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 没有建立连接时发送请求应该失败
         let method = "test/method";
         let params = Some(json!({"param1": "value1"}));
 
@@ -765,7 +885,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 未连接状态下调用 list_tools 应该失败
         let result = client.list_tools().await;
         assert!(result.is_err());
         assert!(matches!(
@@ -783,7 +902,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 未连接状态下调用 call_tool 应该失败
         let result = client.call_tool("test_tool", json!({})).await;
         assert!(result.is_err());
         assert!(matches!(
@@ -801,7 +919,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 未连接状态下调用 list_windows 应该失败
         let result = client.list_windows().await;
         assert!(result.is_err());
         assert!(matches!(
@@ -826,7 +943,6 @@ mod tests {
             mime_type: None,
         };
 
-        // 未连接状态下调用 get_window_detail 应该失败
         let result = client.get_window_detail(resource).await;
         assert!(result.is_err());
         assert!(matches!(
@@ -844,8 +960,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // start_sse_connection 会创建通道并返回 Ok，即使没有实际服务器
-        // 它只是启动了任务，实际的连接错误会在后续操作中体现
         let result = client.start_sse_connection().await;
         assert!(result.is_ok());
 
@@ -866,11 +980,9 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 测试带查询参数的URL格式化
         let result = client.start_sse_connection().await;
         assert!(result.is_ok());
 
-        // 验证通道已创建
         let request_tx = client.request_tx.lock().await;
         assert!(request_tx.is_some());
 
@@ -887,20 +999,18 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 设置会话ID
+        // 设置会话ID 和 endpoint URL
         *client.session_id.lock().await = Some("session123".to_string());
+        *client.endpoint_url.lock().await = Some("http://localhost:8081/messages".to_string());
 
         // 设置为已连接状态
         client.base.update_state(ClientState::Connected).await;
 
-        // 断开连接（即使失败也应该清理会话ID）
         let _ = client.disconnect().await;
 
-        // 验证会话ID被清理
-        let session_id = client.session_id.lock().await;
-        assert!(session_id.is_none());
-
-        // 验证状态变为已断开
+        // 验证清理
+        assert!(client.session_id.lock().await.is_none());
+        assert!(client.endpoint_url.lock().await.is_none());
         assert_eq!(client.base.get_state().await, ClientState::Disconnected);
     }
 
@@ -913,7 +1023,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 初始状态下通道应该为空
         let request_tx = client.request_tx.lock().await;
         assert!(request_tx.is_none());
         drop(request_tx);
@@ -931,7 +1040,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 由于没有实际服务器，初始化会失败，但我们可以验证请求格式
         let result = client.initialize_session().await;
         assert!(result.is_err());
     }
@@ -945,10 +1053,8 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 模拟已连接状态
         client.base.update_state(ClientState::Connected).await;
 
-        // 尝试列出工具（会因为连接失败而返回错误）
         let result = client.list_tools().await;
         assert!(result.is_err());
     }
@@ -962,10 +1068,8 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 模拟已连接状态
         client.base.update_state(ClientState::Connected).await;
 
-        // 尝试调用工具（会因为连接失败而返回错误）
         let result = client
             .call_tool("test_tool", json!({"param": "value"}))
             .await;
@@ -981,7 +1085,6 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        // 验证 Debug trait 实现
         let debug_str = format!("{:?}", client);
         assert!(debug_str.contains("SseMCPClient"));
     }

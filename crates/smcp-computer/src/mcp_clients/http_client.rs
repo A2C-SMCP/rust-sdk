@@ -17,6 +17,7 @@ use serde_json;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+
 /// HTTP MCP客户端 / HTTP MCP client
 pub struct HttpMCPClient {
     /// 基础客户端 / Base client
@@ -94,22 +95,60 @@ impl HttpMCPClient {
 
         // 添加content-type / Add content-type
         request = request.header("Content-Type", "application/json");
+        request = request.header("Accept", "application/json, text/event-stream");
+
+        // 添加会话ID / Add session ID
+        if let Some(ref sid) = *self.session_id.lock().await {
+            request = request.header("Mcp-Session-Id", sid.as_str());
+        }
 
         let response =
             request.json(&request_body).send().await.map_err(|e| {
                 MCPClientError::ConnectionError(format!("HTTP request failed: {}", e))
             })?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+
+        // 202/204 表示通知类请求，无响应体 / 202/204 means notification, no response body
+        if status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(serde_json::json!({}));
+        }
+
+        if !status.is_success() {
             return Err(MCPClientError::ConnectionError(format!(
                 "HTTP error: {}",
-                response.status()
+                status
             )));
         }
 
-        let response_body: serde_json::Value = response.json().await.map_err(|e| {
-            MCPClientError::ProtocolError(format!("Failed to parse response: {}", e))
-        })?;
+        // 从响应头提取 Mcp-Session-Id / Extract Mcp-Session-Id from response headers
+        if let Some(sid) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *self.session_id.lock().await = Some(sid.to_string());
+        }
+
+        // 根据 Content-Type 分支处理 / Branch by Content-Type
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let response_body: serde_json::Value = if content_type.contains("text/event-stream") {
+            // 解析 SSE 响应体，提取 data: 行中的 JSON-RPC
+            let text = response.text().await.map_err(|e| {
+                MCPClientError::ProtocolError(format!("Failed to read SSE response: {}", e))
+            })?;
+            parse_sse_response(&text)?
+        } else {
+            response.json().await.map_err(|e| {
+                MCPClientError::ProtocolError(format!("Failed to parse response: {}", e))
+            })?
+        };
 
         debug!("Received HTTP response: {}", response_body);
 
@@ -141,8 +180,11 @@ impl HttpMCPClient {
         }
 
         if let Some(result) = response.get("result") {
-            if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
-                *self.session_id.lock().await = Some(session_id.to_string());
+            // session_id 从 header 提取为主，body 中的 sessionId 作为 fallback
+            if self.session_id.lock().await.is_none() {
+                if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
+                    *self.session_id.lock().await = Some(session_id.to_string());
+                }
             }
         }
 
@@ -502,11 +544,58 @@ impl MCPClientProtocol for HttpMCPClient {
     }
 }
 
+/// 从 SSE 响应体中提取最后一个 JSON-RPC 消息
+/// Parse the last JSON-RPC message from SSE response body `data:` lines
+fn parse_sse_response(text: &str) -> Result<serde_json::Value, MCPClientError> {
+    let mut last_json = None;
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
+            if !data.is_empty() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                    // 取包含 "result" 或 "error" 的 JSON-RPC 响应，否则取最后一个
+                    if value.get("result").is_some() || value.get("error").is_some() {
+                        return Ok(value);
+                    }
+                    last_json = Some(value);
+                }
+            }
+        }
+    }
+    last_json.ok_or_else(|| {
+        MCPClientError::ProtocolError(format!(
+            "No JSON-RPC message found in SSE response: {}",
+            text.chars().take(200).collect::<String>()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_parse_sse_response_basic() {
+        let sse =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let result = parse_sse_response(sse).unwrap();
+        assert!(result.get("result").is_some());
+    }
+
+    #[test]
+    fn test_parse_sse_response_multiple_data_lines() {
+        let sse = "data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let result = parse_sse_response(sse).unwrap();
+        assert_eq!(result["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn test_parse_sse_response_no_data() {
+        let sse = "event: endpoint\n: comment\n\n";
+        assert!(parse_sse_response(sse).is_err());
+    }
 
     #[tokio::test]
     async fn test_http_client_creation() {
