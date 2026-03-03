@@ -350,7 +350,8 @@ impl SseMCPClient {
         }
 
         // 发送initialized通知 / Send initialized notification
-        self.send_request("notifications/initialized", Some(serde_json::json!({}))).await?;
+        self.send_request("notifications/initialized", Some(serde_json::json!({})))
+            .await?;
 
         info!("SSE session initialized successfully");
         Ok(())
@@ -510,7 +511,9 @@ impl MCPClientProtocol for SseMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let response = self.send_request("tools/list", Some(serde_json::json!({}))).await?;
+        let response = self
+            .send_request("tools/list", Some(serde_json::json!({})))
+            .await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(
@@ -573,7 +576,9 @@ impl MCPClientProtocol for SseMCPClient {
         }
 
         // SSE 客户端目前不支持分页，直接获取所有资源
-        let response = self.send_request("resources/list", Some(serde_json::json!({}))).await?;
+        let response = self
+            .send_request("resources/list", Some(serde_json::json!({})))
+            .await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(

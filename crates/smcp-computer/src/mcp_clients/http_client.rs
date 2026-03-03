@@ -193,7 +193,8 @@ impl HttpMCPClient {
         }
 
         // 发送initialized通知 / Send initialized notification
-        self.send_request("notifications/initialized", Some(serde_json::json!({}))).await?;
+        self.send_request("notifications/initialized", Some(serde_json::json!({})))
+            .await?;
 
         info!("HTTP session initialized successfully");
         Ok(())
@@ -308,7 +309,9 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let response = self.send_request("tools/list", Some(serde_json::json!({}))).await?;
+        let response = self
+            .send_request("tools/list", Some(serde_json::json!({})))
+            .await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(

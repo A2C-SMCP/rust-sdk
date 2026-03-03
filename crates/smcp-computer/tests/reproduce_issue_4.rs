@@ -57,11 +57,7 @@ fn jsonrpc_response(id: &serde_json::Value, result: serde_json::Value) -> serde_
     })
 }
 
-fn jsonrpc_error(
-    id: &serde_json::Value,
-    code: i64,
-    message: &str,
-) -> serde_json::Value {
+fn jsonrpc_error(id: &serde_json::Value, code: i64, message: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -174,11 +170,7 @@ async fn strict_sse_handler(
         // 这模拟了 Python MCP SDK 的真实行为
         if is_notification && has_id {
             let id = body.get("id").cloned().unwrap_or(serde_json::json!(null));
-            let error_resp = jsonrpc_error(
-                &id,
-                -32602,
-                "Notification should not have an id",
-            );
+            let error_resp = jsonrpc_error(&id, -32602, "Notification should not have an id");
             // 将错误通过 SSE 推送 — 这会污染 response channel
             let sse_event = format!(
                 "event: message\ndata: {}\n\n",
