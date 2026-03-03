@@ -36,13 +36,13 @@ full = ["agent", "computer", "server"]
 
 [dependencies]
 # Core protocol types (always included)
-smcp = { path = "crates/smcp", version = "0.1.0" }
+smcp.workspace = true
 
 # Optional components
-smcp-agent = { path = "crates/smcp-agent", version = "0.1.0", optional = true }
-smcp-computer = { path = "crates/smcp-computer", version = "0.1.0", optional = true }
-smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.0", optional = true }
-smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.0", optional = true }
+smcp-agent = { workspace = true, optional = true }
+smcp-computer = { workspace = true, optional = true }
+smcp-server-core = { workspace = true, optional = true }
+smcp-server-hyper = { workspace = true, optional = true }
 
 # Re-export commonly used dependencies for convenience
 tokio = { workspace = true }
@@ -67,8 +67,8 @@ http-body-util.workspace = true
 socketioxide.workspace = true
 
 # Server components for E2E tests (when server feature is enabled)
-smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.0" }
-smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.0" }
+smcp-server-core.workspace = true
+smcp-server-hyper.workspace = true
 
 [workspace.dependencies]
 # 核心运行时 / Core runtime
@@ -128,6 +128,21 @@ rpassword = "7.2"
 # VRL
 vrl = "0.29.0"
 
+# 内部 crate / Internal crates
+smcp = { path = "crates/smcp", version = "0.1.0" }
+smcp-agent = { path = "crates/smcp-agent", version = "0.1.0" }
+smcp-computer = { path = "crates/smcp-computer", version = "0.1.0" }
+smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.0" }
+smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.0" }
+
 # 测试 / Testing
 tempfile = "3.8"
 tokio-test = "0.4"
+
+[workspace.metadata.release]
+shared-version = "workspace"
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore: release v{{version}}"
+tag-message = "v{{version}}"
+publish = true
+push = true

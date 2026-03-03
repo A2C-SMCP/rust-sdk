@@ -1,6 +1,6 @@
 [package]
 name = "smcp-agent"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "A2C-SMCP Agent client implementation"
@@ -14,7 +14,7 @@ async = []
 sync = ["async"]
 
 [dependencies]
-smcp = { path = "../smcp", version = "0.1.0" }
+smcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,4 +27,4 @@ async-trait.workspace = true
 tf-rust-socketio.workspace = true
 
 [dev-dependencies]
-smcp-server-core = { path = "../smcp-server-core" }
+smcp-server-core.workspace = true

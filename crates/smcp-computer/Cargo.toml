@@ -1,6 +1,6 @@
 [package]
 name = "smcp-computer"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "A2C-SMCP Computer client for MCP server management"
@@ -9,16 +9,17 @@ keywords = ["smcp", "computer", "mcp", "tool"]
 categories = ["network-programming", "development-tools"]
 
 [dev-dependencies]
-smcp-server-core = { path = "../smcp-server-core" }
+smcp-server-core.workspace = true
 tracing-subscriber.workspace = true
 hyper.workspace = true
 tower.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
+futures-util.workspace = true
 
 [dependencies]
-smcp = { path = "../smcp", version = "0.1.0" }
+smcp.workspace = true
 
 tokio.workspace = true
 serde.workspace = true
