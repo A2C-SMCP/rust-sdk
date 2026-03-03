@@ -17,7 +17,6 @@ use serde_json;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-
 /// HTTP MCP客户端 / HTTP MCP client
 pub struct HttpMCPClient {
     /// 基础客户端 / Base client

@@ -66,9 +66,11 @@ tower.workspace = true
 http-body-util.workspace = true
 socketioxide.workspace = true
 
-# Server components for E2E tests (when server feature is enabled)
+# Server components for E2E tests
 smcp-server-core.workspace = true
 smcp-server-hyper.workspace = true
+smcp-agent.workspace = true
+smcp-computer.workspace = true
 
 [workspace.dependencies]
 # 核心运行时 / Core runtime
