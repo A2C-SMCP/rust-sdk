@@ -75,13 +75,18 @@ impl HttpMCPClient {
             request_body["params"] = p;
         }
 
-        // 添加请求ID / Add request ID
-        request_body["id"] = serde_json::Value::Number(serde_json::Number::from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-        ));
+        // 通知类消息不需要等待响应 / Notifications don't need a response
+        let is_notification = method.starts_with("notifications/");
+
+        // 仅非 notification 时添加请求ID / Only add request ID for non-notifications
+        if !is_notification {
+            request_body["id"] = serde_json::Value::Number(serde_json::Number::from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+            ));
+        }
 
         debug!("Sending HTTP request to {}: {}", url, request_body);
 
@@ -188,7 +193,7 @@ impl HttpMCPClient {
         }
 
         // 发送initialized通知 / Send initialized notification
-        self.send_request("notifications/initialized", None).await?;
+        self.send_request("notifications/initialized", Some(serde_json::json!({}))).await?;
 
         info!("HTTP session initialized successfully");
         Ok(())
@@ -303,7 +308,7 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let response = self.send_request("tools/list", None).await?;
+        let response = self.send_request("tools/list", Some(serde_json::json!({}))).await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(
@@ -370,7 +375,10 @@ impl MCPClientProtocol for HttpMCPClient {
         let mut cursor: Option<String> = None;
 
         loop {
-            let params = cursor.as_ref().map(|c| serde_json::json!({ "cursor": c }));
+            let params = Some(match cursor.as_ref() {
+                Some(c) => serde_json::json!({ "cursor": c }),
+                None => serde_json::json!({}),
+            });
 
             let response = self.send_request("resources/list", params).await?;
 

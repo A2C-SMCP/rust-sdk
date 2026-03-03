@@ -101,15 +101,17 @@ impl SseMCPClient {
             request_body["params"] = p;
         }
 
-        // 添加请求ID / Add request ID
-        let request_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        request_body["id"] = serde_json::Value::Number(serde_json::Number::from(request_id));
-
         // 通知类消息不需要等待响应 / Notifications don't need a response
         let is_notification = method.starts_with("notifications/");
+
+        // 仅非 notification 时添加请求ID / Only add request ID for non-notifications
+        if !is_notification {
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            request_body["id"] = serde_json::Value::Number(serde_json::Number::from(request_id));
+        }
 
         debug!("Sending SSE request: {}", request_body);
 
@@ -348,7 +350,7 @@ impl SseMCPClient {
         }
 
         // 发送initialized通知 / Send initialized notification
-        self.send_request("notifications/initialized", None).await?;
+        self.send_request("notifications/initialized", Some(serde_json::json!({}))).await?;
 
         info!("SSE session initialized successfully");
         Ok(())
@@ -508,7 +510,7 @@ impl MCPClientProtocol for SseMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let response = self.send_request("tools/list", None).await?;
+        let response = self.send_request("tools/list", Some(serde_json::json!({}))).await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(
@@ -571,7 +573,7 @@ impl MCPClientProtocol for SseMCPClient {
         }
 
         // SSE 客户端目前不支持分页，直接获取所有资源
-        let response = self.send_request("resources/list", None).await?;
+        let response = self.send_request("resources/list", Some(serde_json::json!({}))).await?;
 
         if let Some(error) = response.get("error") {
             return Err(MCPClientError::ProtocolError(format!(
