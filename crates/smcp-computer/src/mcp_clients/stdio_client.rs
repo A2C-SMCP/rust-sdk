@@ -147,9 +147,30 @@ impl StdioMCPClient {
                     .await
                     {
                         Ok(Ok(0)) => {
-                            error!("Process closed stdout without response");
+                            // Try to read stderr for diagnostic info
+                            let mut stderr_output = String::new();
+                            if let Some(stderr) = process.stderr.as_mut() {
+                                let mut stderr_reader = BufReader::new(stderr);
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    async {
+                                        loop {
+                                            let mut buf = String::new();
+                                            match stderr_reader.read_line(&mut buf).await {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(_) => stderr_output.push_str(&buf),
+                                            }
+                                        }
+                                    },
+                                ).await;
+                            }
+                            if stderr_output.is_empty() {
+                                error!("Process closed stdout without response (no stderr output)");
+                            } else {
+                                error!("Process closed stdout without response. stderr: {}", stderr_output.trim());
+                            }
                             Err(MCPClientError::ConnectionError(
-                                "Process closed stdout".to_string(),
+                                format!("Process closed stdout. stderr: {}", stderr_output.trim()),
                             ))
                         }
                         Ok(Ok(_)) => {
