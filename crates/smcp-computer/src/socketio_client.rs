@@ -567,13 +567,7 @@ impl SmcpComputerClient {
                     let tool_list = mgr.list_available_tools().await;
                     tool_list
                         .into_iter()
-                        .map(|tool| smcp::SMCPTool {
-                            name: tool.name,
-                            description: tool.description,
-                            params_schema: tool.input_schema,
-                            return_schema: None,
-                            meta: None,
-                        })
+                        .map(convert_tool_to_smcp_tool)
                         .collect()
                 }
                 None => {
@@ -767,5 +761,141 @@ impl SmcpComputerClient {
         // 从 client 中获取 namespace，如果无法获取则返回默认值
         // Get namespace from client, return default if unable to get
         "/smcp".to_string()
+    }
+}
+
+/// 将内部 Tool 转换为协议类型 SMCPTool
+/// Convert internal Tool to protocol type SMCPTool
+pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -> smcp::SMCPTool {
+    let mut meta_map = serde_json::Map::new();
+
+    // 传递 tool.meta 中的所有键值（如 a2c_tool_meta）
+    // 值需要序列化为 JSON 字符串，与 Python SDK 对齐
+    if let Some(existing_meta) = &tool.meta {
+        for (k, v) in existing_meta {
+            let str_val = if v.is_string() {
+                v.as_str().unwrap().to_string()
+            } else {
+                serde_json::to_string(v).unwrap_or_default()
+            };
+            meta_map.insert(k.clone(), serde_json::Value::String(str_val));
+        }
+    }
+
+    // 添加 MCP_TOOL_ANNOTATION
+    if let Some(annotations) = &tool.annotations {
+        if let Ok(json_str) = serde_json::to_string(annotations) {
+            meta_map.insert(
+                "MCP_TOOL_ANNOTATION".to_string(),
+                serde_json::Value::String(json_str),
+            );
+        }
+    }
+
+    let meta = if meta_map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(meta_map))
+    };
+
+    smcp::SMCPTool {
+        name: tool.name,
+        description: tool.description,
+        params_schema: tool.input_schema,
+        return_schema: None,
+        meta,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp_clients::model::{Tool, ToolAnnotations};
+    use serde_json::json;
+
+    fn make_tool(
+        meta: Option<HashMap<String, serde_json::Value>>,
+        annotations: Option<ToolAnnotations>,
+    ) -> Tool {
+        Tool {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            input_schema: json!({"type": "object"}),
+            annotations,
+            meta,
+        }
+    }
+
+    #[test]
+    fn test_tool_to_smcp_tool_with_meta_and_annotations() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            "a2c_tool_meta".to_string(),
+            json!({"tags": ["browser"], "priority": 1}),
+        );
+        let annotations = ToolAnnotations {
+            title: "Test".to_string(),
+            read_only_hint: false,
+            destructive_hint: false,
+            open_world_hint: false,
+        };
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)));
+
+        let meta_obj = smcp_tool.meta.unwrap();
+        let meta_map = meta_obj.as_object().unwrap();
+        assert!(meta_map.contains_key("a2c_tool_meta"));
+        assert!(meta_map.contains_key("MCP_TOOL_ANNOTATION"));
+        // Values should be JSON strings
+        assert!(meta_map["a2c_tool_meta"].is_string());
+        assert!(meta_map["MCP_TOOL_ANNOTATION"].is_string());
+    }
+
+    #[test]
+    fn test_tool_to_smcp_tool_only_meta() {
+        let mut meta = HashMap::new();
+        meta.insert("a2c_tool_meta".to_string(), json!({"tags": ["fs"]}));
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None));
+
+        let meta_obj = smcp_tool.meta.unwrap();
+        let meta_map = meta_obj.as_object().unwrap();
+        assert_eq!(meta_map.len(), 1);
+        assert!(meta_map.contains_key("a2c_tool_meta"));
+    }
+
+    #[test]
+    fn test_tool_to_smcp_tool_only_annotations() {
+        let annotations = ToolAnnotations {
+            title: "My Tool".to_string(),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
+        };
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, Some(annotations)));
+
+        let meta_obj = smcp_tool.meta.unwrap();
+        let meta_map = meta_obj.as_object().unwrap();
+        assert_eq!(meta_map.len(), 1);
+        assert!(meta_map.contains_key("MCP_TOOL_ANNOTATION"));
+    }
+
+    #[test]
+    fn test_tool_to_smcp_tool_no_meta_no_annotations() {
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, None));
+        assert!(smcp_tool.meta.is_none());
+    }
+
+    #[test]
+    fn test_tool_to_smcp_tool_string_value_not_double_serialized() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            "simple_key".to_string(),
+            serde_json::Value::String("already_a_string".to_string()),
+        );
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None));
+
+        let meta_obj = smcp_tool.meta.unwrap();
+        let meta_map = meta_obj.as_object().unwrap();
+        // Should be the raw string, not "\"already_a_string\""
+        assert_eq!(meta_map["simple_key"].as_str().unwrap(), "already_a_string");
     }
 }
