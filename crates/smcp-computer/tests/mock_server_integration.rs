@@ -624,7 +624,9 @@ async fn spawn_sse_mock_post_error(status_code: StatusCode) -> u16 {
 
                         // SSE GET endpoint works normally
                         if method == Method::GET && path == "/sse" {
-                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, Infallible>>();
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                                Result<Frame<Bytes>, Infallible>,
+                            >();
                             let endpoint_event = "event: endpoint\ndata: /messages\n\n";
                             let _ = tx.send(Ok(Frame::data(Bytes::from(endpoint_event))));
                             // Keep the channel alive so SSE stream stays open
@@ -636,12 +638,14 @@ async fn spawn_sse_mock_post_error(status_code: StatusCode) -> u16 {
                             let body = StreamBody::new(stream);
                             let boxed: BoxBody = http_body_util::BodyExt::boxed(body);
 
-                            return Ok::<_, Infallible>(Response::builder()
-                                .status(StatusCode::OK)
-                                .header("Content-Type", "text/event-stream")
-                                .header("Cache-Control", "no-cache")
-                                .body(boxed)
-                                .unwrap());
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Content-Type", "text/event-stream")
+                                    .header("Cache-Control", "no-cache")
+                                    .body(boxed)
+                                    .unwrap(),
+                            );
                         }
 
                         // POST always returns error status
