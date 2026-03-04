@@ -253,6 +253,9 @@ impl SseMCPClient {
                                     es::SSE::Comment(_) => {
                                         debug!("Received SSE comment");
                                     }
+                                    es::SSE::Connected(_) => {
+                                        debug!("SSE connection established");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -299,16 +302,51 @@ impl SseMCPClient {
                                             }
                                             Err(e) => {
                                                 error!("Failed to parse POST JSON response: {}", e);
+                                                let error_json = serde_json::json!({
+                                                    "jsonrpc": "2.0",
+                                                    "error": {
+                                                        "code": -32603,
+                                                        "message": format!("Failed to parse POST JSON response: {}", e)
+                                                    }
+                                                });
+                                                let _ = response_tx.send(error_json);
                                             }
                                         }
                                     }
                                     // 如果是 SSE 响应，数据会通过 SSE stream 返回，无需在此处理
                                 } else {
-                                    error!("POST request failed with status: {}", resp.status());
+                                    let status = resp.status();
+                                    error!("POST request failed with status: {}", status);
+                                    let error_json = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {
+                                            "code": -32603,
+                                            "message": format!("POST request failed with status: {}", status)
+                                        }
+                                    });
+                                    let _ = response_tx.send(error_json);
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to send POST request: {}", e);
+                                // Log full error chain
+                                let mut error_msg = format!("Failed to send POST request: {}", e);
+                                {
+                                    use std::error::Error as StdError;
+                                    let mut source = e.source();
+                                    while let Some(cause) = source {
+                                        error_msg.push_str(&format!("\n  Caused by: {}", cause));
+                                        source = cause.source();
+                                    }
+                                }
+                                error!("{}", error_msg);
+                                let error_json = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "error": {
+                                        "code": -32603,
+                                        "message": error_msg
+                                    }
+                                });
+                                let _ = response_tx.send(error_json);
                             }
                         }
                     }

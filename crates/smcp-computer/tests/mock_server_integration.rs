@@ -599,3 +599,117 @@ async fn test_sse_resource_update_push() {
 
     client.disconnect().await.unwrap();
 }
+
+// ============================================================
+// Test 7: SSE POST failure returns error immediately (not 30s timeout)
+// ============================================================
+
+/// Mock SSE server where POST /messages returns a configurable error status
+async fn spawn_sse_mock_post_error(status_code: StatusCode) -> u16 {
+    let (listener, port) = bind_random().await;
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let io = TokioIo::new(stream);
+            let sc = status_code;
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    async move {
+                        let method = req.method().clone();
+                        let path = req.uri().path().to_string();
+
+                        // SSE GET endpoint works normally
+                        if method == Method::GET && path == "/sse" {
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, Infallible>>();
+                            let endpoint_event = "event: endpoint\ndata: /messages\n\n";
+                            let _ = tx.send(Ok(Frame::data(Bytes::from(endpoint_event))));
+                            // Keep the channel alive so SSE stream stays open
+                            std::mem::forget(tx);
+
+                            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                                rx.recv().await.map(|item| (item, rx))
+                            });
+                            let body = StreamBody::new(stream);
+                            let boxed: BoxBody = http_body_util::BodyExt::boxed(body);
+
+                            return Ok::<_, Infallible>(Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "text/event-stream")
+                                .header("Cache-Control", "no-cache")
+                                .body(boxed)
+                                .unwrap());
+                        }
+
+                        // POST always returns error status
+                        if method == Method::POST && path == "/messages" {
+                            let _ = req.into_body().collect().await;
+                            return Ok(Response::builder()
+                                .status(sc)
+                                .body(full_body("error"))
+                                .unwrap());
+                        }
+
+                        Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(full_body("not found"))
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+
+    port
+}
+
+#[tokio::test]
+async fn test_sse_post_failure_returns_error_immediately() {
+    let port = spawn_sse_mock_post_error(StatusCode::INTERNAL_SERVER_ERROR).await;
+
+    let client = SseMCPClient::new(SseServerParameters {
+        url: format!("http://127.0.0.1:{}/sse", port),
+        headers: HashMap::new(),
+    });
+
+    let start = std::time::Instant::now();
+    let result = client.connect().await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "Expected error, got Ok");
+    assert!(
+        elapsed.as_secs() < 5,
+        "Should fail quickly, not timeout. Took {:?}",
+        elapsed
+    );
+}
+
+// ============================================================
+// Test 8: SSE POST 403 returns error (not timeout)
+// ============================================================
+#[tokio::test]
+async fn test_sse_post_non_success_status_returns_error() {
+    let port = spawn_sse_mock_post_error(StatusCode::FORBIDDEN).await;
+
+    let client = SseMCPClient::new(SseServerParameters {
+        url: format!("http://127.0.0.1:{}/sse", port),
+        headers: HashMap::new(),
+    });
+
+    let start = std::time::Instant::now();
+    let result = client.connect().await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "Expected error, got Ok");
+    assert!(
+        elapsed.as_secs() < 5,
+        "Should fail quickly, not timeout. Took {:?}",
+        elapsed
+    );
+}
