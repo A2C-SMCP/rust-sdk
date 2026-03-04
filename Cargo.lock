@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a2c-smcp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "http-body-util",
@@ -3845,7 +3845,7 @@ dependencies = [
 
 [[package]]
 name = "smcp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -3855,7 +3855,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-agent"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3873,7 +3873,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-computer"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -3915,7 +3915,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-server-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3940,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-server-hyper"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
