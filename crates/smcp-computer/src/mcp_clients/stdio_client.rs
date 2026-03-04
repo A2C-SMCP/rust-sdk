@@ -162,16 +162,21 @@ impl StdioMCPClient {
                                             }
                                         }
                                     },
-                                ).await;
+                                )
+                                .await;
                             }
                             if stderr_output.is_empty() {
                                 error!("Process closed stdout without response (no stderr output)");
                             } else {
-                                error!("Process closed stdout without response. stderr: {}", stderr_output.trim());
+                                error!(
+                                    "Process closed stdout without response. stderr: {}",
+                                    stderr_output.trim()
+                                );
                             }
-                            Err(MCPClientError::ConnectionError(
-                                format!("Process closed stdout. stderr: {}", stderr_output.trim()),
-                            ))
+                            Err(MCPClientError::ConnectionError(format!(
+                                "Process closed stdout. stderr: {}",
+                                stderr_output.trim()
+                            )))
                         }
                         Ok(Ok(_)) => {
                             info!("Received raw response: {}", line.trim());
