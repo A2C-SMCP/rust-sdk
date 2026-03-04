@@ -747,6 +747,27 @@ impl MCPServerManager {
                         // 更新工具名称为显示名称 / Update tool name to display name
                         let mut display_tool = tool;
                         display_tool.name = display_name.clone();
+
+                        // 合并工具元数据 / Merge tool metadata
+                        let config = {
+                            let configs = self.servers_config.read().await;
+                            configs.get(server_name).cloned()
+                        };
+                        if let Some(config) = config {
+                            if let Some(tool_meta) = self.merged_tool_meta(&config, &original_name)
+                            {
+                                if display_tool.meta.is_none() {
+                                    display_tool.meta = Some(HashMap::new());
+                                }
+                                if let Some(ref mut meta) = display_tool.meta {
+                                    meta.insert(
+                                        A2C_TOOL_META.to_string(),
+                                        serde_json::to_value(tool_meta).unwrap(),
+                                    );
+                                }
+                            }
+                        }
+
                         tools.push(display_tool);
                     }
                 }
@@ -1335,5 +1356,111 @@ mod tests {
         let got_reconnect = manager.get_reconnect_policy().await;
         assert_eq!(got_reconnect.max_retries, 10);
         assert_eq!(got_reconnect.initial_delay_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn test_merged_tool_meta() {
+        let manager = MCPServerManager::new();
+
+        // Case 1: specific only
+        let config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "s".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::from([(
+                "tool_a".to_string(),
+                ToolMeta {
+                    auto_apply: Some(true),
+                    alias: None,
+                    tags: Some(vec!["tag1".to_string()]),
+                    ret_object_mapper: None,
+                },
+            )]),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        let meta = manager.merged_tool_meta(&config, "tool_a").unwrap();
+        assert_eq!(meta.auto_apply, Some(true));
+        assert_eq!(meta.tags, Some(vec!["tag1".to_string()]));
+
+        // Case 2: default only
+        let config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "s".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: Some(ToolMeta {
+                auto_apply: Some(false),
+                alias: None,
+                tags: Some(vec!["default_tag".to_string()]),
+                ret_object_mapper: None,
+            }),
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        let meta = manager.merged_tool_meta(&config, "any_tool").unwrap();
+        assert_eq!(meta.auto_apply, Some(false));
+        assert_eq!(meta.tags, Some(vec!["default_tag".to_string()]));
+
+        // Case 3: specific + default merge (specific wins)
+        let config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "s".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::from([(
+                "tool_a".to_string(),
+                ToolMeta {
+                    auto_apply: Some(true),
+                    alias: None,
+                    tags: None,
+                    ret_object_mapper: None,
+                },
+            )]),
+            default_tool_meta: Some(ToolMeta {
+                auto_apply: Some(false),
+                alias: Some("default_alias".to_string()),
+                tags: Some(vec!["default_tag".to_string()]),
+                ret_object_mapper: None,
+            }),
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        let meta = manager.merged_tool_meta(&config, "tool_a").unwrap();
+        assert_eq!(meta.auto_apply, Some(true)); // specific wins
+        assert_eq!(meta.alias, Some("default_alias".to_string())); // from default
+        assert_eq!(meta.tags, Some(vec!["default_tag".to_string()])); // from default
+
+        // Case 4: no config
+        let config = MCPServerConfig::Stdio(StdioServerConfig {
+            name: "s".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        assert!(manager.merged_tool_meta(&config, "tool_a").is_none());
     }
 }
