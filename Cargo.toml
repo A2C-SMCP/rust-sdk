@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.1.5"
+version = "0.1.6"
 
 [package]
 name = "a2c-smcp"
@@ -131,11 +131,11 @@ rpassword = "7.2"
 vrl = "0.29.0"
 
 # 内部 crate / Internal crates
-smcp = { path = "crates/smcp", version = "0.1.5" }
-smcp-agent = { path = "crates/smcp-agent", version = "0.1.5" }
-smcp-computer = { path = "crates/smcp-computer", version = "0.1.5" }
-smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.5" }
-smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.5" }
+smcp = { path = "crates/smcp", version = "0.1.6" }
+smcp-agent = { path = "crates/smcp-agent", version = "0.1.6" }
+smcp-computer = { path = "crates/smcp-computer", version = "0.1.6" }
+smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.6" }
+smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.6" }
 
 # 测试 / Testing
 tempfile = "3.8"
