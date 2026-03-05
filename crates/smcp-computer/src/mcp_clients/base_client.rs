@@ -563,12 +563,9 @@ mod tests {
             .is_err());
         assert!(client.list_windows().await.is_err());
         assert!(client
-            .get_window_detail(crate::mcp_clients::Resource {
-                uri: "test://".to_string(),
-                name: "test".to_string(),
-                description: None,
-                mime_type: None,
-            })
+            .get_window_detail(crate::mcp_clients::model::make_resource(
+                "test://", "test", None, None,
+            ))
             .await
             .is_err());
     }

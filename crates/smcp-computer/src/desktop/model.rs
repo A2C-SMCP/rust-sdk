@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // 重新导出mcp_clients中的类型 / Re-export types from mcp_clients
-pub use crate::mcp_clients::model::{ReadResourceResult, Resource, TextResourceContents};
+pub use crate::mcp_clients::model::{ReadResourceResult, Resource, ResourceContents};
 
 /// 服务器名称类型 / Server name type
 pub type ServerName = String;
@@ -62,19 +62,18 @@ mod tests {
 
     #[test]
     fn test_window_info() {
-        let resource = Resource {
-            uri: "window://test.mcp.com/window1".to_string(),
-            name: "Test Window".to_string(),
-            description: Some("Test window".to_string()),
-            mime_type: None,
-        };
+        let resource = crate::mcp_clients::model::make_resource(
+            "window://test.mcp.com/window1",
+            "Test Window",
+            Some("Test window".to_string()),
+            None,
+        );
 
         let read_result = ReadResourceResult {
-            contents: vec![TextResourceContents {
-                uri: "window://test.mcp.com/window1".to_string(),
-                text: "Test content".to_string(),
-                mime_type: None,
-            }],
+            contents: vec![ResourceContents::text(
+                "Test content",
+                "window://test.mcp.com/window1",
+            )],
         };
 
         let window_info = WindowInfo::new("test_server".to_string(), resource, read_result);

@@ -10,7 +10,7 @@
 use super::model::{ServerName, ToolCallRecord, WindowInfo};
 use super::window_uri::WindowURI;
 use super::Desktop;
-use crate::mcp_clients::model::{ReadResourceResult, Resource, TextResourceContents};
+use crate::mcp_clients::model::{resource_contents_as_text, ReadResourceResult, Resource};
 use std::collections::{HashMap, HashSet};
 
 /// 组织桌面内容 / Organize desktop content
@@ -156,9 +156,10 @@ fn render_desktop_item(resource: &Resource, read_result: &ReadResourceResult) ->
     let mut parts: Vec<String> = Vec::new();
 
     for content in &read_result.contents {
-        let TextResourceContents { text, .. } = content;
-        if !text.is_empty() {
-            parts.push(text.clone());
+        if let Some(text) = resource_contents_as_text(content) {
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
         }
     }
 
@@ -174,6 +175,7 @@ fn render_desktop_item(resource: &Resource, read_result: &ReadResourceResult) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_clients::model::{make_resource, ResourceContents};
 
     fn create_test_window(
         server: &str,
@@ -196,18 +198,14 @@ mod tests {
         }
         WindowInfo {
             server_name: server.to_string(),
-            resource: Resource {
-                uri: final_uri.clone(),
-                name: format!("Window {}", final_uri),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource(
+                final_uri.clone(),
+                format!("Window {}", final_uri),
+                None,
+                None,
+            ),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: final_uri.clone(),
-                    text: content.to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(content, final_uri.clone())],
             },
         }
     }
@@ -375,12 +373,7 @@ mod tests {
     fn test_organize_desktop_empty_content() {
         let windows = vec![WindowInfo {
             server_name: "server1".to_string(),
-            resource: Resource {
-                uri: "window://server1.mcp.com/window1".to_string(),
-                name: "Window 1".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window://server1.mcp.com/window1", "Window 1", None, None),
             read_result: ReadResourceResult {
                 contents: Vec::new(),
             },
@@ -413,18 +406,9 @@ mod tests {
         let windows = vec![
             WindowInfo {
                 server_name: "server1".to_string(),
-                resource: Resource {
-                    uri: ":::this_is_not_a_uri".to_string(),
-                    name: "Bad Window".to_string(),
-                    description: None,
-                    mime_type: None,
-                },
+                resource: make_resource(":::this_is_not_a_uri", "Bad Window", None, None),
                 read_result: ReadResourceResult {
-                    contents: vec![TextResourceContents {
-                        uri: ":::this_is_not_a_uri".to_string(),
-                        text: "bad".to_string(),
-                        mime_type: None,
-                    }],
+                    contents: vec![ResourceContents::text("bad", ":::this_is_not_a_uri")],
                 },
             },
             create_test_window("server1", "window://server1.mcp.com/good", "good", 0, false),

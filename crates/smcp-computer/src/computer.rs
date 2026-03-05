@@ -22,7 +22,10 @@ use crate::inputs::model::InputValue;
 use crate::inputs::utils::run_command;
 use crate::mcp_clients::{
     manager::MCPServerManager,
-    model::{CallToolResult, MCPServerConfig, MCPServerInput, Tool},
+    model::{
+        content_as_text, is_call_tool_error, CallToolResult, Content, MCPServerConfig,
+        MCPServerInput, Tool,
+    },
     ConfigRender, RenderError,
 };
 use crate::socketio_client::SmcpComputerClient;
@@ -603,24 +606,16 @@ impl<S: Session> Computer<S> {
                                 timeout_duration,
                             )
                             .await?;
-                        success = !result.is_error;
+                        success = !is_call_tool_error(&result);
                     } else {
-                        result = CallToolResult {
-                            content: vec![crate::mcp_clients::model::Content::Text {
-                                text: "工具调用二次确认被拒绝，请稍后再试".to_string(),
-                            }],
-                            is_error: false,
-                            meta: None,
-                        };
+                        result = CallToolResult::success(vec![Content::text(
+                            "工具调用二次确认被拒绝，请稍后再试",
+                        )]);
                     }
                 } else {
-                    result = CallToolResult {
-                        content: vec![crate::mcp_clients::model::Content::Text {
-                            text: "当前工具需要调用前进行二次确认，但客户端目前没有实现二次确认回调方法".to_string(),
-                        }],
-                        is_error: true,
-                        meta: None,
-                    };
+                    result = CallToolResult::error(vec![Content::text(
+                        "当前工具需要调用前进行二次确认，但客户端目前没有实现二次确认回调方法",
+                    )]);
                     error_msg = Some("No confirmation callback".to_string());
                 }
             } else {
@@ -633,14 +628,14 @@ impl<S: Session> Computer<S> {
                         timeout_duration,
                     )
                     .await?;
-                success = !result.is_error;
+                success = !is_call_tool_error(&result);
             }
 
-            if result.is_error {
-                error_msg = result.content.iter().find_map(|c| match c {
-                    crate::mcp_clients::model::Content::Text { text } => Some(text.clone()),
-                    _ => None,
-                });
+            if is_call_tool_error(&result) {
+                error_msg = result
+                    .content
+                    .iter()
+                    .find_map(|c| content_as_text(c).map(|t| t.to_string()));
             }
 
             // 记录历史 / Record history

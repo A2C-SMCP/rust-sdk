@@ -388,14 +388,15 @@ impl MCPServerManager {
                         // 确定最终显示的工具名 / Determine final display name
                         let display_name = tool_meta
                             .and_then(|meta| meta.alias)
-                            .unwrap_or_else(|| original_tool_name.clone());
+                            .unwrap_or_else(|| original_tool_name.to_string());
 
                         // 如果使用别名，更新别名映射 / Update alias mapping if using alias
-                        if display_name != original_tool_name {
+                        let original_tool_name_str = original_tool_name.to_string();
+                        if display_name != original_tool_name_str {
                             let mut alias_map = self.alias_mapping.write().await;
                             alias_map.insert(
                                 display_name.clone(),
-                                (server_name.clone(), original_tool_name.clone()),
+                                (server_name.clone(), original_tool_name_str.clone()),
                             );
                         }
 
@@ -408,7 +409,7 @@ impl MCPServerManager {
                         // 检查是否为禁用工具 / Check if disabled tool
                         let forbidden_tools = config.forbidden_tools();
                         if forbidden_tools.contains(&display_name)
-                            || forbidden_tools.contains(&original_tool_name)
+                            || forbidden_tools.contains(&original_tool_name_str)
                         {
                             let mut disabled = self.disabled_tools.write().await;
                             disabled.insert(display_name);
@@ -525,7 +526,7 @@ impl MCPServerManager {
         if let Some(config) = config {
             if let Some(tool_meta) = self.merged_tool_meta(&config, tool_name) {
                 if result.meta.is_none() {
-                    result.meta = Some(std::collections::HashMap::new());
+                    result.meta = Some(rmcp::model::Meta::new());
                 }
                 if let Some(ref mut meta) = result.meta {
                     meta.insert(
@@ -557,7 +558,7 @@ impl MCPServerManager {
                     Ok(vrl_result) => {
                         // 将转换后的结果存储到meta中
                         if result.meta.is_none() {
-                            result.meta = Some(std::collections::HashMap::new());
+                            result.meta = Some(rmcp::model::Meta::new());
                         }
                         if let Some(ref mut meta) = result.meta {
                             // 将转换后的结果序列化为JSON字符串
@@ -746,7 +747,7 @@ impl MCPServerManager {
                     if let Some(tool) = tool_list.into_iter().find(|t| t.name == original_name) {
                         // 更新工具名称为显示名称 / Update tool name to display name
                         let mut display_tool = tool;
-                        display_tool.name = display_name.clone();
+                        display_tool.name = display_name.clone().into();
 
                         // 合并工具元数据 / Merge tool metadata
                         let config = {
@@ -757,7 +758,7 @@ impl MCPServerManager {
                             if let Some(tool_meta) = self.merged_tool_meta(&config, &original_name)
                             {
                                 if display_tool.meta.is_none() {
-                                    display_tool.meta = Some(HashMap::new());
+                                    display_tool.meta = Some(rmcp::model::Meta::new());
                                 }
                                 if let Some(ref mut meta) = display_tool.meta {
                                     meta.insert(

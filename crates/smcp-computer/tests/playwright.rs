@@ -53,7 +53,7 @@ async fn test_playwright_mcp_server_basic_connection() {
     info!("可用工具数量: {}", tools.len());
 
     // 验证Playwright特有的工具存在
-    let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    let tool_names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     assert!(
         tool_names.contains(&"browser_navigate".to_string()),
         "Expected browser_navigate tool not found"
@@ -96,7 +96,10 @@ async fn test_playwright_mcp_server_tool_execution() {
     );
 
     let response = result.unwrap();
-    assert!(!response.is_error, "Navigation should succeed");
+    assert!(
+        !response.is_error.unwrap_or(false),
+        "Navigation should succeed"
+    );
     info!("导航响应: {:?}", response.content);
 
     // 清理

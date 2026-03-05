@@ -784,12 +784,7 @@ mod tests {
 
         let client = HttpMCPClient::new(params);
 
-        let resource = Resource {
-            uri: "window://123".to_string(),
-            name: "Test Window".to_string(),
-            description: None,
-            mime_type: None,
-        };
+        let resource = make_resource("window://123", "Test Window", None, None);
 
         // 未连接状态下调用 get_window_detail 应该失败
         let result = client.get_window_detail(resource).await;

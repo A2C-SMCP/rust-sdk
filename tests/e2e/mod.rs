@@ -19,4 +19,5 @@ pub mod test_server;
 pub use helpers::{generate_agent_name, generate_computer_name, generate_office_id};
 #[allow(unused_imports)]
 pub use mock_agent::MockEventHandler;
+#[allow(unused_imports)]
 pub use test_server::*;

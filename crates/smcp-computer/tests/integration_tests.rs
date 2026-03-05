@@ -51,7 +51,7 @@ async fn test_complete_workflow() {
         vrl: None,
         server_parameters: StdioServerParameters {
             command: "sh".to_string(),
-            args: vec!["-c".to_string(), "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":true}}}}'; cat".to_string()],
+            args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
             env: HashMap::new(),
             cwd: None,
         },
@@ -225,7 +225,7 @@ async fn test_concurrent_operations() {
                 vrl: None,
                 server_parameters: StdioServerParameters {
                     command: "sh".to_string(),
-                    args: vec!["-c".to_string(), "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":true}}}}'; cat".to_string()],
+                    args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
                     env: HashMap::new(),
                     cwd: None,
                 },

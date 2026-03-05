@@ -409,10 +409,13 @@ async fn test_http_happy_path_json() {
         .await
         .unwrap();
     assert_eq!(result.content.len(), 1);
-    match &result.content[0] {
-        Content::Text { text } => assert_eq!(text, "hello"),
-        _ => panic!("expected text content"),
-    }
+    assert_eq!(
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text,
+        "hello"
+    );
 
     // disconnect
     client.disconnect().await.unwrap();
@@ -441,10 +444,13 @@ async fn test_http_happy_path_sse_response() {
         .call_tool("add", serde_json::json!({"a": 3, "b": 4}))
         .await
         .unwrap();
-    match &result.content[0] {
-        Content::Text { text } => assert_eq!(text, "7"),
-        _ => panic!("expected text content"),
-    }
+    assert_eq!(
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text,
+        "7"
+    );
 
     client.disconnect().await.unwrap();
 }
@@ -508,10 +514,13 @@ async fn test_sse_happy_path() {
         .call_tool("echo", serde_json::json!({"message": "sse-test"}))
         .await
         .unwrap();
-    match &result.content[0] {
-        Content::Text { text } => assert_eq!(text, "sse-test"),
-        _ => panic!("expected text content"),
-    }
+    assert_eq!(
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text,
+        "sse-test"
+    );
 
     client.disconnect().await.unwrap();
     assert_eq!(client.state(), ClientState::Disconnected);
@@ -539,10 +548,13 @@ async fn test_sse_post_json_response() {
         .call_tool("add", serde_json::json!({"a": 10, "b": 20}))
         .await
         .unwrap();
-    match &result.content[0] {
-        Content::Text { text } => assert_eq!(text, "30"),
-        _ => panic!("expected text content"),
-    }
+    assert_eq!(
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text,
+        "30"
+    );
 
     client.disconnect().await.unwrap();
 }

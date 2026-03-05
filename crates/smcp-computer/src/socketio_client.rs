@@ -772,7 +772,7 @@ pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -
     // 传递 tool.meta 中的所有键值（如 a2c_tool_meta）
     // 值需要序列化为 JSON 字符串，与 Python SDK 对齐
     if let Some(existing_meta) = &tool.meta {
-        for (k, v) in existing_meta {
+        for (k, v) in existing_meta.iter() {
             let str_val = if v.is_string() {
                 v.as_str().unwrap().to_string()
             } else {
@@ -798,10 +798,12 @@ pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -
         Some(serde_json::Value::Object(meta_map))
     };
 
+    let description = tool.description.as_deref().unwrap_or("").to_string();
+    let params_schema = tool.schema_as_json_value();
     smcp::SMCPTool {
-        name: tool.name,
-        description: tool.description,
-        params_schema: tool.input_schema,
+        name: tool.name.to_string(),
+        description,
+        params_schema,
         return_schema: None,
         meta,
     }
@@ -814,30 +816,37 @@ mod tests {
     use serde_json::json;
 
     fn make_tool(
-        meta: Option<HashMap<String, serde_json::Value>>,
+        meta: Option<serde_json::Map<String, serde_json::Value>>,
         annotations: Option<ToolAnnotations>,
     ) -> Tool {
+        use std::sync::Arc;
+        let input_schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(json!({"type": "object"})).unwrap();
         Tool {
-            name: "test_tool".to_string(),
-            description: "A test tool".to_string(),
-            input_schema: json!({"type": "object"}),
+            name: "test_tool".into(),
+            title: None,
+            description: Some("A test tool".into()),
+            input_schema: Arc::new(input_schema),
+            output_schema: None,
             annotations,
-            meta,
+            icons: None,
+            meta: meta.map(rmcp::model::Meta),
         }
     }
 
     #[test]
     fn test_tool_to_smcp_tool_with_meta_and_annotations() {
-        let mut meta = HashMap::new();
+        let mut meta = serde_json::Map::new();
         meta.insert(
             "a2c_tool_meta".to_string(),
             json!({"tags": ["browser"], "priority": 1}),
         );
         let annotations = ToolAnnotations {
-            title: "Test".to_string(),
-            read_only_hint: false,
-            destructive_hint: false,
-            open_world_hint: false,
+            title: Some("Test".to_string()),
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: None,
+            open_world_hint: Some(false),
         };
         let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)));
 
@@ -852,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_tool_to_smcp_tool_only_meta() {
-        let mut meta = HashMap::new();
+        let mut meta = serde_json::Map::new();
         meta.insert("a2c_tool_meta".to_string(), json!({"tags": ["fs"]}));
         let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None));
 
@@ -865,10 +874,11 @@ mod tests {
     #[test]
     fn test_tool_to_smcp_tool_only_annotations() {
         let annotations = ToolAnnotations {
-            title: "My Tool".to_string(),
-            read_only_hint: true,
-            destructive_hint: false,
-            open_world_hint: false,
+            title: Some("My Tool".to_string()),
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: None,
+            open_world_hint: Some(false),
         };
         let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, Some(annotations)));
 
@@ -886,7 +896,7 @@ mod tests {
 
     #[test]
     fn test_tool_to_smcp_tool_string_value_not_double_serialized() {
-        let mut meta = HashMap::new();
+        let mut meta = serde_json::Map::new();
         meta.insert(
             "simple_key".to_string(),
             serde_json::Value::String("already_a_string".to_string()),

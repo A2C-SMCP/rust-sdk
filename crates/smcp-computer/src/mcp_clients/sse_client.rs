@@ -981,12 +981,7 @@ mod tests {
 
         let client = SseMCPClient::new(params);
 
-        let resource = Resource {
-            uri: "window://123".to_string(),
-            name: "Test Window".to_string(),
-            description: None,
-            mime_type: None,
-        };
+        let resource = make_resource("window://123", "Test Window", None, None);
 
         let result = client.get_window_detail(resource).await;
         assert!(result.is_err());

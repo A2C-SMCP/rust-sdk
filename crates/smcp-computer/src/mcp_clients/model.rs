@@ -12,6 +12,12 @@ use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
 
+// Re-export MCP protocol types from rmcp
+pub use rmcp::model::{
+    Annotated, CallToolResult, Content, RawContent, RawResource, RawTextContent,
+    ReadResourceResult, Resource, ResourceContents, Tool, ToolAnnotations,
+};
+
 // 常量定义 / Constants definition
 pub const A2C_TOOL_META: &str = "a2c_tool_meta";
 pub const A2C_VRL_TRANSFORMED: &str = "a2c_vrl_transformed";
@@ -576,111 +582,82 @@ pub enum MCPClientError {
     Other(String),
 }
 
-/// MCP工具定义 / MCP tool definition
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Tool {
-    /// 工具名称 / Tool name
-    pub name: String,
-    /// 工具描述 / Tool description
-    pub description: String,
-    /// 输入模式 / Input schema
-    #[serde(rename = "inputSchema")]
-    pub input_schema: serde_json::Value,
-    /// 工具注解 / Tool annotations
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<ToolAnnotations>,
-    /// 工具元数据 / Tool metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta: Option<HashMap<String, serde_json::Value>>,
+/// 便捷函数：创建 Resource / Convenience: create a Resource
+pub fn make_resource(
+    uri: impl Into<String>,
+    name: impl Into<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+) -> Resource {
+    use rmcp::model::AnnotateAble;
+    let mut raw = RawResource::new(uri, name);
+    raw.description = description;
+    raw.mime_type = mime_type;
+    raw.no_annotation()
 }
 
-/// 工具注解 / Tool annotations
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolAnnotations {
-    /// 标题 / Title
-    pub title: String,
-    /// 是否只读 / Read only hint
-    #[serde(rename = "readOnlyHint")]
-    pub read_only_hint: bool,
-    /// 是否破坏性 / Destructive hint
-    #[serde(rename = "destructiveHint")]
-    pub destructive_hint: bool,
-    /// 开放世界提示 / Open world hint
-    #[serde(rename = "openWorldHint")]
-    pub open_world_hint: bool,
+/// 便捷函数：检查 CallToolResult 是否为错误 / Convenience: check if CallToolResult is error
+pub fn is_call_tool_error(result: &CallToolResult) -> bool {
+    result.is_error.unwrap_or(false)
 }
 
-/// 资源定义 / Resource definition
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Resource {
-    /// URI / URI
-    pub uri: String,
-    /// 名称 / Name
-    pub name: String,
-    /// 描述 / Description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// MIME类型 / MIME type
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
+/// 便捷函数：从 Content 中提取文本 / Convenience: extract text from Content
+pub fn content_as_text(content: &Content) -> Option<&str> {
+    content.as_text().map(|t| t.text.as_str())
 }
 
-/// 工具调用结果 / Tool call result
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CallToolResult {
-    /// 内容 / Content
-    pub content: Vec<Content>,
-    /// 是否为错误 / Is error
-    #[serde(default)]
-    pub is_error: bool,
-    /// 元数据 / Metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta: Option<HashMap<String, serde_json::Value>>,
+/// 便捷函数：从 ResourceContents 中提取文本 / Convenience: extract text from ResourceContents
+pub fn resource_contents_as_text(rc: &ResourceContents) -> Option<&str> {
+    match rc {
+        ResourceContents::TextResourceContents { text, .. } => Some(text.as_str()),
+        _ => None,
+    }
 }
 
-/// 内容块 / Content block
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub enum Content {
-    /// 文本内容 / Text content
-    #[serde(rename = "text")]
-    Text { text: String },
-    /// 图片内容 / Image content
-    #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
-    /// 资源内容 / Resource content
-    #[serde(rename = "resource")]
-    Resource {
-        uri: String,
-        mime_type: Option<String>,
-    },
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// 读取资源结果 / Read resource result
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ReadResourceResult {
-    /// 内容 / Contents
-    pub contents: Vec<TextResourceContents>,
-}
+    #[test]
+    fn test_is_call_tool_error() {
+        let ok_result = CallToolResult::success(vec![Content::text("ok")]);
+        assert!(!is_call_tool_error(&ok_result));
 
-/// 文本资源内容 / Text resource contents
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TextResourceContents {
-    /// URI / URI
-    pub uri: String,
-    /// 文本内容 / Text content
-    pub text: String,
-    /// MIME类型 / MIME type
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-}
+        let err_result = CallToolResult::error(vec![Content::text("fail")]);
+        assert!(is_call_tool_error(&err_result));
+    }
 
-/// 列出资源结果 / List resources result（支持分页）
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ListResourcesResult {
-    /// 资源列表 / Resource list
-    pub resources: Vec<Resource>,
-    /// 下一页游标 / Next page cursor
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+    #[test]
+    fn test_content_as_text() {
+        let content = Content::text("hello");
+        assert_eq!(content_as_text(&content), Some("hello"));
+    }
+
+    #[test]
+    fn test_resource_contents_as_text() {
+        let rc = ResourceContents::TextResourceContents {
+            uri: "test://uri".to_string(),
+            mime_type: None,
+            text: "some text".to_string(),
+            meta: None,
+        };
+        assert_eq!(resource_contents_as_text(&rc), Some("some text"));
+
+        let blob = ResourceContents::BlobResourceContents {
+            uri: "test://uri".to_string(),
+            mime_type: None,
+            blob: "base64data".to_string(),
+            meta: None,
+        };
+        assert_eq!(resource_contents_as_text(&blob), None);
+    }
+
+    #[test]
+    fn test_make_resource() {
+        let resource = make_resource("window://test", "Test", Some("desc".into()), None);
+        assert_eq!(resource.raw.uri, "window://test");
+        assert_eq!(resource.raw.name, "Test");
+        assert_eq!(resource.raw.description, Some("desc".into()));
+        assert!(resource.raw.mime_type.is_none());
+    }
 }

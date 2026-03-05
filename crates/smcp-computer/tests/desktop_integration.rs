@@ -10,7 +10,7 @@
 mod common;
 
 use smcp_computer::desktop::{organize_desktop, ToolCallRecord, WindowInfo};
-use smcp_computer::mcp_clients::model::{ReadResourceResult, Resource, TextResourceContents};
+use smcp_computer::mcp_clients::model::{make_resource, ReadResourceResult, ResourceContents};
 use std::collections::HashMap;
 
 /// 测试desktop模块与mcp_clients类型的集成 / Test integration between desktop and mcp_clients types
@@ -20,34 +20,32 @@ fn test_desktop_with_mcp_clients_types() {
     let windows = vec![
         WindowInfo {
             server_name: "test_server".to_string(),
-            resource: Resource {
-                uri: "window://test.mcp.com/window1?priority=10".to_string(),
-                name: "Test Window 1".to_string(),
-                description: Some("A test window".to_string()),
-                mime_type: Some("text/plain".to_string()),
-            },
+            resource: make_resource(
+                "window://test.mcp.com/window1?priority=10",
+                "Test Window 1",
+                Some("A test window".to_string()),
+                Some("text/plain".to_string()),
+            ),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://test.mcp.com/window1?priority=10".to_string(),
-                    text: "Test content 1".to_string(),
-                    mime_type: Some("text/plain".to_string()),
-                }],
+                contents: vec![ResourceContents::text(
+                    "Test content 1",
+                    "window://test.mcp.com/window1?priority=10",
+                )],
             },
         },
         WindowInfo {
             server_name: "test_server".to_string(),
-            resource: Resource {
-                uri: "window://test.mcp.com/window2?fullscreen=true".to_string(),
-                name: "Test Window 2".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource(
+                "window://test.mcp.com/window2?fullscreen=true",
+                "Test Window 2",
+                None,
+                None,
+            ),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://test.mcp.com/window2?fullscreen=true".to_string(),
-                    text: "Fullscreen content".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "Fullscreen content",
+                    "window://test.mcp.com/window2?fullscreen=true",
+                )],
             },
         },
     ];
@@ -66,50 +64,37 @@ fn test_multi_server_organization() {
     let windows = vec![
         WindowInfo {
             server_name: "server_a".to_string(),
-            resource: Resource {
-                uri: "window://server_a.mcp.com/window1".to_string(),
-                name: "Window A1".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window://server_a.mcp.com/window1", "Window A1", None, None),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://server_a.mcp.com/window1".to_string(),
-                    text: "Content A1".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "Content A1",
+                    "window://server_a.mcp.com/window1",
+                )],
             },
         },
         WindowInfo {
             server_name: "server_b".to_string(),
-            resource: Resource {
-                uri: "window://server_b.mcp.com/window1".to_string(),
-                name: "Window B1".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window://server_b.mcp.com/window1", "Window B1", None, None),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://server_b.mcp.com/window1".to_string(),
-                    text: "Content B1".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "Content B1",
+                    "window://server_b.mcp.com/window1",
+                )],
             },
         },
         WindowInfo {
             server_name: "server_a".to_string(),
-            resource: Resource {
-                uri: "window://server_a.mcp.com/window2?priority=50".to_string(),
-                name: "Window A2".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource(
+                "window://server_a.mcp.com/window2?priority=50",
+                "Window A2",
+                None,
+                None,
+            ),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://server_a.mcp.com/window2?priority=50".to_string(),
-                    text: "Content A2".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "Content A2",
+                    "window://server_a.mcp.com/window2?priority=50",
+                )],
             },
         },
     ];
@@ -136,24 +121,19 @@ fn test_multi_server_organization() {
 fn test_complex_content_rendering() {
     let windows = vec![WindowInfo {
         server_name: "server".to_string(),
-        resource: Resource {
-            uri: "window://server.mcp.com/complex".to_string(),
-            name: "Complex Window".to_string(),
-            description: None,
-            mime_type: None,
-        },
+        resource: make_resource(
+            "window://server.mcp.com/complex",
+            "Complex Window",
+            None,
+            None,
+        ),
         read_result: ReadResourceResult {
             contents: vec![
-                TextResourceContents {
-                    uri: "window://server.mcp.com/complex".to_string(),
-                    text: "First paragraph\nwith multiple lines".to_string(),
-                    mime_type: Some("text/plain".to_string()),
-                },
-                TextResourceContents {
-                    uri: "window://server.mcp.com/complex".to_string(),
-                    text: "Second paragraph".to_string(),
-                    mime_type: Some("text/markdown".to_string()),
-                },
+                ResourceContents::text(
+                    "First paragraph\nwith multiple lines",
+                    "window://server.mcp.com/complex",
+                ),
+                ResourceContents::text("Second paragraph", "window://server.mcp.com/complex"),
             ],
         },
     }];
@@ -174,50 +154,32 @@ fn test_size_limit_across_servers() {
     let windows = vec![
         WindowInfo {
             server_name: "server_a".to_string(),
-            resource: Resource {
-                uri: "window://server_a.mcp.com/window1".to_string(),
-                name: "Window A1".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window://server_a.mcp.com/window1", "Window A1", None, None),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://server_a.mcp.com/window1".to_string(),
-                    text: "A1".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "A1",
+                    "window://server_a.mcp.com/window1",
+                )],
             },
         },
         WindowInfo {
             server_name: "server_a".to_string(),
-            resource: Resource {
-                uri: "window://server_a.mcp.com/window2".to_string(),
-                name: "Window A2".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window://server_a.mcp.com/window2", "Window A2", None, None),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://server_a.mcp.com/window2".to_string(),
-                    text: "A2".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "A2",
+                    "window://server_a.mcp.com/window2",
+                )],
             },
         },
         WindowInfo {
             server_name: "server_b".to_string(),
-            resource: Resource {
-                uri: "window://server_b.mcp.com/window1".to_string(),
-                name: "Window B1".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window://server_b.mcp.com/window1", "Window B1", None, None),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://server_b.mcp.com/window1".to_string(),
-                    text: "B1".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "B1",
+                    "window://server_b.mcp.com/window1",
+                )],
             },
         },
     ];
@@ -244,52 +206,36 @@ fn test_window_uri_parsing_errors() {
         // 有效的窗口
         WindowInfo {
             server_name: "server".to_string(),
-            resource: Resource {
-                uri: "window://server.mcp.com/valid".to_string(),
-                name: "Valid Window".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window://server.mcp.com/valid", "Valid Window", None, None),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window://server.mcp.com/valid".to_string(),
-                    text: "Valid".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "Valid",
+                    "window://server.mcp.com/valid",
+                )],
             },
         },
         // 无效scheme的窗口
         WindowInfo {
             server_name: "server".to_string(),
-            resource: Resource {
-                uri: "http://server.mcp.com/invalid".to_string(),
-                name: "Invalid Window".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource(
+                "http://server.mcp.com/invalid",
+                "Invalid Window",
+                None,
+                None,
+            ),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "http://server.mcp.com/invalid".to_string(),
-                    text: "Invalid".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text(
+                    "Invalid",
+                    "http://server.mcp.com/invalid",
+                )],
             },
         },
         // 缺少host的窗口
         WindowInfo {
             server_name: "server".to_string(),
-            resource: Resource {
-                uri: "window:///nohost".to_string(),
-                name: "No Host Window".to_string(),
-                description: None,
-                mime_type: None,
-            },
+            resource: make_resource("window:///nohost", "No Host Window", None, None),
             read_result: ReadResourceResult {
-                contents: vec![TextResourceContents {
-                    uri: "window:///nohost".to_string(),
-                    text: "No Host".to_string(),
-                    mime_type: None,
-                }],
+                contents: vec![ResourceContents::text("No Host", "window:///nohost")],
             },
         },
     ];
