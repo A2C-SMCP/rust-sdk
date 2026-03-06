@@ -26,6 +26,10 @@ use tokio::process::{ChildStderr, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+/// STDIO 客户端连接超时时间（秒）
+/// Connect timeout for STDIO client (seconds)
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+
 /// STDIO MCP客户端 / STDIO MCP client
 pub struct StdioMCPClient {
     /// 基础客户端 / Base client
@@ -177,10 +181,18 @@ impl MCPClientProtocol for StdioMCPClient {
             },
         };
 
-        let service = client_info
-            .serve(transport)
-            .await
-            .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
+        let service = tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            client_info.serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            MCPClientError::TimeoutError(format!(
+                "STDIO connect timed out after {}s",
+                CONNECT_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
 
         *self.running_service.lock().await = Some(service);
         self.base.update_state(ClientState::Connected).await;
