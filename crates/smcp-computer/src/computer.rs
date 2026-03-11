@@ -24,7 +24,7 @@ use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{
         content_as_text, is_call_tool_error, CallToolResult, Content, MCPServerConfig,
-        MCPServerInput, Tool,
+        MCPServerInput, ReadResourceResult, Resource, Tool,
     },
     ConfigRender, RenderError,
 };
@@ -558,6 +558,52 @@ impl<S: Session> Computer<S> {
             // 这里需要实现工具格式转换
             // This needs to implement tool format conversion
             Ok(tools)
+        } else {
+            Err(ComputerError::InvalidState(
+                "Computer not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// 列出所有窗口资源 / List all window resources
+    pub async fn list_all_windows(
+        &self,
+        window_uri: Option<&str>,
+    ) -> ComputerResult<Vec<(String, Resource)>> {
+        let manager = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager {
+            Ok(manager.list_all_windows(window_uri).await)
+        } else {
+            Err(ComputerError::InvalidState(
+                "Computer not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// 获取所有窗口资源的详情 / Get details of all window resources
+    pub async fn get_windows_details(
+        &self,
+        window_uri: Option<&str>,
+    ) -> ComputerResult<Vec<(String, Resource, ReadResourceResult)>> {
+        let manager = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager {
+            Ok(manager.get_windows_details(window_uri).await)
+        } else {
+            Err(ComputerError::InvalidState(
+                "Computer not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// 获取单个窗口资源的详情 / Get detail of a single window resource
+    pub async fn get_window_detail(
+        &self,
+        server_name: &str,
+        resource: Resource,
+    ) -> ComputerResult<ReadResourceResult> {
+        let manager = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager {
+            manager.get_window_detail(server_name, resource).await
         } else {
             Err(ComputerError::InvalidState(
                 "Computer not initialized".to_string(),

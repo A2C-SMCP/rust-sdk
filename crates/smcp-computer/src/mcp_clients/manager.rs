@@ -778,6 +778,91 @@ impl MCPServerManager {
         tools
     }
 
+    /// 列出所有窗口资源 / List all window resources
+    /// 聚合所有活动客户端的 window:// 资源，可选按 URI 完全匹配过滤
+    /// Aggregates window:// resources from all active clients, optionally filtered by exact URI match
+    pub async fn list_all_windows(&self, window_uri: Option<&str>) -> Vec<(ServerName, Resource)> {
+        let clients: Vec<(String, StdArc<dyn MCPClientProtocol>)> = {
+            let clients_guard = self.active_clients.read().await;
+            clients_guard
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let mut results = Vec::new();
+        for (server_name, client) in clients {
+            match client.list_windows().await {
+                Ok(windows) => {
+                    for resource in windows {
+                        if let Some(uri_filter) = window_uri {
+                            if resource.uri.as_str() != uri_filter {
+                                continue;
+                            }
+                        }
+                        results.push((server_name.clone(), resource));
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to list windows from server '{}': {}",
+                        server_name, e
+                    );
+                }
+            }
+        }
+        results
+    }
+
+    /// 获取所有窗口资源的详情 / Get details of all window resources
+    /// 复用 list_all_windows 聚合窗口列表，再逐个获取内容
+    /// Reuses list_all_windows to aggregate window list, then fetches each detail
+    pub async fn get_windows_details(
+        &self,
+        window_uri: Option<&str>,
+    ) -> Vec<(ServerName, Resource, ReadResourceResult)> {
+        let windows = self.list_all_windows(window_uri).await;
+
+        let clients = self.active_clients.read().await;
+        let mut results = Vec::new();
+        for (server_name, resource) in windows {
+            if let Some(client) = clients.get(&server_name) {
+                match client.get_window_detail(resource.clone()).await {
+                    Ok(detail) => {
+                        results.push((server_name, resource, detail));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to get window detail for '{}' from server '{}': {}",
+                            resource.uri, server_name, e
+                        );
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// 获取单个窗口资源的详情 / Get detail of a single window resource
+    /// 通过 server_name 定位客户端，委托调用 get_window_detail
+    /// Locates client by server_name and delegates to get_window_detail
+    pub async fn get_window_detail(
+        &self,
+        server_name: &str,
+        resource: Resource,
+    ) -> Result<ReadResourceResult, ComputerError> {
+        let client = {
+            let clients = self.active_clients.read().await;
+            clients.get(server_name).cloned().ok_or_else(|| {
+                ComputerError::InvalidState(format!("Server '{}' not connected", server_name))
+            })?
+        };
+        client
+            .get_window_detail(resource)
+            .await
+            .map_err(|e| ComputerError::ProtocolError(format!("Get window detail error: {}", e)))
+    }
+
     /// 合并工具元数据 / Merge tool metadata
     fn merged_tool_meta(&self, config: &MCPServerConfig, tool_name: &str) -> Option<ToolMeta> {
         let specific = config.tool_meta().get(tool_name);
@@ -1463,5 +1548,32 @@ mod tests {
             },
         });
         assert!(manager.merged_tool_meta(&config, "tool_a").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_windows_empty_manager() {
+        let manager = MCPServerManager::new();
+        let windows = manager.list_all_windows(None).await;
+        assert!(windows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_window_detail_server_not_connected() {
+        use super::make_resource;
+        let manager = MCPServerManager::new();
+        let resource = make_resource(
+            "window://test/status",
+            "Test",
+            None,
+            Some("text/plain".into()),
+        );
+        let result = manager.get_window_detail("unknown_server", resource).await;
+        assert!(result.is_err());
+        match result {
+            Err(ComputerError::InvalidState(msg)) => {
+                assert!(msg.contains("not connected"));
+            }
+            other => panic!("Expected InvalidState, got {:?}", other),
+        }
     }
 }

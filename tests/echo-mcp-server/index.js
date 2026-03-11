@@ -28,6 +28,18 @@ const TOOLS = [
   },
 ];
 
+const RESOURCES = [
+  { uri: "window://echo.mcp.test/status?priority=10", name: "Status Window", mimeType: "text/plain" },
+  { uri: "window://echo.mcp.test/logs?priority=5", name: "Log Window", mimeType: "text/plain" },
+  { uri: "file://echo.mcp.test/readme", name: "Readme File", mimeType: "text/plain" },
+];
+
+const RESOURCE_CONTENTS = {
+  "window://echo.mcp.test/status?priority=10": "System status: OK",
+  "window://echo.mcp.test/logs?priority=5": "Log entry 1\nLog entry 2",
+  "file://echo.mcp.test/readme": "This is the readme content",
+};
+
 function handleRequest(request) {
   const { id, method, params } = request;
 
@@ -38,7 +50,10 @@ function handleRequest(request) {
         id,
         result: {
           protocolVersion: "2025-03-26",
-          capabilities: { tools: { listChanged: false } },
+          capabilities: {
+            tools: { listChanged: false },
+            resources: { subscribe: true, listChanged: false },
+          },
           serverInfo: SERVER_INFO,
         },
       };
@@ -53,6 +68,36 @@ function handleRequest(request) {
         id,
         result: { tools: TOOLS },
       };
+
+    case "resources/list":
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: { resources: RESOURCES },
+      };
+
+    case "resources/read": {
+      const uri = params?.uri;
+      const content = RESOURCE_CONTENTS[uri];
+      if (content !== undefined) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            contents: [{ uri, mimeType: "text/plain", text: content }],
+          },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32602, message: `Resource not found: ${uri}` },
+      };
+    }
+
+    case "resources/subscribe":
+    case "resources/unsubscribe":
+      return { jsonrpc: "2.0", id, result: {} };
 
     case "tools/call": {
       const toolName = params?.name;
