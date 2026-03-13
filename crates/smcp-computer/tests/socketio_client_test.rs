@@ -22,6 +22,7 @@ mod tests {
     use smcp_server_core::SmcpServerBuilder;
     use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use tokio::time::{sleep, Duration};
@@ -157,6 +158,7 @@ mod tests {
             "test_computer".to_string(),
             None,
             inputs,
+            None,
         )
         .await?;
 
@@ -194,6 +196,7 @@ mod tests {
             "test_computer".to_string(),
             None,
             inputs,
+            None,
         )
         .await?;
 
@@ -242,6 +245,7 @@ mod tests {
             "test_computer".to_string(),
             None,
             inputs,
+            None,
         )
         .await?;
 
@@ -287,6 +291,7 @@ mod tests {
             "test_computer".to_string(),
             None,
             inputs,
+            None,
         )
         .await?;
 
@@ -334,6 +339,7 @@ mod tests {
                 format!("test_computer_{}", i),
                 None,
                 inputs,
+                None,
             )
             .await?;
 
@@ -381,6 +387,7 @@ mod tests {
             "test_computer".to_string(),
             None,
             inputs1,
+            None,
         )
         .await?;
 
@@ -407,6 +414,7 @@ mod tests {
             "test_computer_reconnected".to_string(),
             None,
             inputs2,
+            None,
         )
         .await?;
 
@@ -423,6 +431,117 @@ mod tests {
         // 断开连接
         client2.disconnect().await?;
 
+        Ok(())
+    }
+
+    /// 检查自定义 header 的认证提供者
+    /// Auth provider that verifies custom headers are present
+    #[derive(Debug)]
+    struct HeaderCheckAuthProvider {
+        header_received: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AuthenticationProvider for HeaderCheckAuthProvider {
+        async fn authenticate(
+            &self,
+            headers: &HeaderMap,
+            _auth: Option<&serde_json::Value>,
+        ) -> Result<(), AuthError> {
+            if let Some(value) = headers.get("x-tenant-id") {
+                if value == "test-tenant-123" {
+                    self.header_received.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// 启动带 header 检查的测试服务器
+    /// Start test server with header checking auth provider
+    async fn start_header_check_server(header_received: Arc<AtomicBool>) -> String {
+        let layer = SmcpServerBuilder::new()
+            .with_auth_provider(Arc::new(HeaderCheckAuthProvider { header_received }))
+            .build_layer()
+            .expect("Failed to build SMCP layer");
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<u16>();
+
+        let layer_clone = layer.clone();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("Failed to bind");
+            let local_addr = listener.local_addr().expect("Failed to get local addr");
+            let _ = tx.send(local_addr.port());
+
+            let fallback_service =
+                service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::NOT_FOUND)
+                            .body(Full::<Bytes>::from("Not found"))
+                            .unwrap(),
+                    )
+                });
+            let service = layer_clone.layer.layer(fallback_service);
+
+            loop {
+                let (stream, _) = listener.accept().await.expect("Failed to accept");
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let stream = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper_util::service::TowerToHyperService::new(service);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(stream, svc)
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+
+        let port = rx.await.expect("Failed to receive port");
+        sleep(Duration::from_millis(100)).await;
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    #[tokio::test]
+    async fn test_socketio_client_with_custom_headers() -> ComputerResult<()> {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        // 启动带 header 检查的服务器
+        let header_received = Arc::new(AtomicBool::new(false));
+        let server_url = start_header_check_server(header_received.clone()).await;
+
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // 构造自定义 headers
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert("x-tenant-id".to_string(), "test-tenant-123".to_string());
+
+        // 使用自定义 headers 创建客户端
+        let client = SmcpComputerClient::new(
+            &server_url,
+            manager.clone(),
+            "test_computer_headers".to_string(),
+            None,
+            inputs,
+            Some(custom_headers),
+        )
+        .await?;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 验证服务端收到了自定义 header
+        assert!(
+            header_received.load(Ordering::SeqCst),
+            "Server should have received the x-tenant-id header"
+        );
+
+        client.disconnect().await?;
         Ok(())
     }
 }

@@ -33,6 +33,23 @@ use crate::socketio_client::SmcpComputerClient;
 /// 确认回调函数类型 / Confirmation callback function type
 type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>;
 
+/// 解析 "key:value,foo:bar" 格式的 headers 字符串为 HashMap
+/// Parse "key:value,foo:bar" format headers string into HashMap
+fn parse_headers_string(headers: &str) -> HashMap<String, String> {
+    headers
+        .split(',')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, ':');
+            match (parts.next(), parts.next()) {
+                (Some(k), Some(v)) if !k.trim().is_empty() => {
+                    Some((k.trim().to_string(), v.trim().to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// 将 InputValue 转换为 serde_json::Value / Convert InputValue to serde_json::Value
 fn input_value_to_json(value: InputValue) -> serde_json::Value {
     match value {
@@ -787,9 +804,9 @@ impl<S: Session> Computer<S> {
     pub async fn connect_socketio(
         &self,
         url: &str,
-        _namespace: &str,
+        #[allow(unused_variables)] namespace: &str,
         auth: &Option<String>,
-        _headers: &Option<String>,
+        headers: &Option<String>,
     ) -> ComputerResult<()> {
         // 确保管理器已初始化 / Ensure manager is initialized
         let _manager_check = {
@@ -815,6 +832,9 @@ impl<S: Session> Computer<S> {
         // TODO: Should redesign to share the same manager instance
         let new_manager = MCPServerManager::new();
 
+        // 解析 headers 字符串为 HashMap / Parse headers string into HashMap
+        let parsed_headers = headers.as_deref().map(parse_headers_string);
+
         // 创建Socket.IO客户端 / Create Socket.IO client
         // 传递认证密钥（如果提供） / Pass auth secret (if provided)
         let client = SmcpComputerClient::new(
@@ -823,6 +843,7 @@ impl<S: Session> Computer<S> {
             self.name.clone(),
             auth.clone(),
             self.inputs.clone(),
+            parsed_headers,
         )
         .await?;
 
@@ -1618,5 +1639,41 @@ mod tests {
             }
             _ => panic!("Expected Stdio config"),
         }
+    }
+
+    #[test]
+    fn test_parse_headers_string_normal() {
+        let result = parse_headers_string("x-tenant-id:abc123,x-custom:value");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["x-tenant-id"], "abc123");
+        assert_eq!(result["x-custom"], "value");
+    }
+
+    #[test]
+    fn test_parse_headers_string_with_spaces() {
+        let result = parse_headers_string(" x-tenant-id : abc123 , x-custom : value ");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["x-tenant-id"], "abc123");
+        assert_eq!(result["x-custom"], "value");
+    }
+
+    #[test]
+    fn test_parse_headers_string_empty() {
+        let result = parse_headers_string("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_headers_string_missing_value() {
+        let result = parse_headers_string("key-only,x-valid:ok");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["x-valid"], "ok");
+    }
+
+    #[test]
+    fn test_parse_headers_string_value_with_colon() {
+        let result = parse_headers_string("Authorization:Bearer:token123");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["Authorization"], "Bearer:token123");
     }
 }

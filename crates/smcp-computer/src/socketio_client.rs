@@ -54,6 +54,7 @@ impl SmcpComputerClient {
         computer_name: String,
         auth_secret: Option<String>,
         inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
+        headers: Option<HashMap<String, String>>,
     ) -> ComputerResult<Self> {
         let office_id = Arc::new(RwLock::new(None));
         let manager_clone = manager.clone();
@@ -71,6 +72,17 @@ impl SmcpComputerClient {
         // If auth secret is provided, add to request headers
         if let Some(secret) = auth_secret {
             builder = builder.opening_header("x-api-key", secret.as_str());
+        }
+
+        // 添加自定义 HTTP headers / Add custom HTTP headers
+        // Safety: opening_header 底层使用 http::HeaderValue::from_bytes() 做 RFC 7230 校验，
+        // 会拒绝包含 \r\n 等控制字符的恶意输入，无需额外防御 header injection。
+        // Safety: opening_header internally uses http::HeaderValue::from_bytes() for RFC 7230
+        // validation, rejecting \r\n and other control characters. No extra injection defense needed.
+        if let Some(custom_headers) = headers {
+            for (key, value) in custom_headers {
+                builder = builder.opening_header(key.as_str(), value.as_str());
+            }
         }
 
         let client = builder
