@@ -1,6 +1,7 @@
 ---
 name: release
 description: 管理 workspace 统一版本号、cargo-release 升版和 git-cliff 生成 CHANGELOG。当用户需要升版、发布 crate 或生成变更日志时使用。
+arguments-hint: "<patch|minor|major> <release|rc> — 第一个参数: 升级策略 patch(bug fix)/minor(新功能)/major(破坏性变更); 第二个参数: release(正式版)/rc(预发版)"
 ---
 
 # Release — Workspace 版本管理
@@ -82,6 +83,21 @@ gh workflow run "Publish to crates.io"
 ```bash
 cargo publish --dry-run -p smcp
 ```
+
+## 第 5 步：等待发布结果
+
+触发发布后，必须轮询 workflow 运行状态直到完成：
+
+```bash
+# 查看最近的 workflow 运行
+gh run list --workflow=publish.yml --limit=1
+
+# 监视运行状态（会阻塞直到完成）
+gh run watch <run-id>
+```
+
+- 若发布**成功**，向用户确认发布完成并附上 Release 链接。
+- 若发布**失败**，使用 `gh run view <run-id> --log-failed` 获取失败日志，分析原因并报告给用户。
 
 ## 新增子 crate 时的检查清单
 

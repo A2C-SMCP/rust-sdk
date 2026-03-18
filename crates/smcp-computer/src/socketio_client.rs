@@ -8,6 +8,7 @@
 * 描述: SMCP Computer的Socket.IO客户端实现 / Socket.IO client implementation for SMCP Computer
 */
 
+use crate::desktop::{organize_desktop, WindowInfo};
 use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
 use crate::mcp_clients::model::MCPServerInput;
@@ -674,7 +675,7 @@ impl SmcpComputerClient {
     /// Handle get desktop event (with ACK response)
     async fn handle_get_desktop_with_ack(
         payload: Payload,
-        _manager: Arc<RwLock<Option<MCPServerManager>>>,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
@@ -690,10 +691,22 @@ impl SmcpComputerClient {
             )));
         }
 
-        // 获取桌面 / Get desktop
-        // TODO: 实现实际的桌面捕获逻辑
-        // TODO: Implement actual desktop capture logic
-        let desktops = Vec::<String>::new(); // 暂时返回空列表 / Return empty list for now
+        // 获取桌面窗口信息 / Get desktop window info
+        let desktops = {
+            let mgr_guard = manager.read().await;
+            if let Some(mgr) = mgr_guard.as_ref() {
+                let raw_windows = mgr.get_windows_details(req.window.as_deref()).await;
+                let windows: Vec<WindowInfo> = raw_windows
+                    .into_iter()
+                    .map(|(server_name, resource, read_result)| {
+                        WindowInfo::new(server_name, resource, read_result)
+                    })
+                    .collect();
+                organize_desktop(windows, req.desktop_size.map(|s| s as usize), &[])
+            } else {
+                Vec::new()
+            }
+        };
 
         let response = GetDesktopRet {
             desktops: Some(desktops),
