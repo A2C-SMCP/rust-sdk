@@ -107,3 +107,46 @@ $ARGUMENTS
 5. 如果修改涉及协议类型，确认 serde 序列化结果与 Python SDK 兼容
 
 **重要：测试是修复的必要组成部分，没有测试覆盖的修复不算完成。**
+
+---
+
+**第六步：回复来源 Issue（如适用）**
+
+如果输入中包含在线 Issue 链接或 ID（GitHub Issue、Jira、CNB Issue 等），验证全部通过后，**必须回复该 Issue**。
+
+### 识别 Issue 来源
+
+从 `$ARGUMENTS` 中提取 Issue 链接或编号，判断平台：
+
+| 特征 | 平台 | 使用的 MCP 工具 |
+|------|------|----------------|
+| `github.com/*/issues/*` 或 `owner/repo#N` | GitHub | `mcp__plugin_github_github__add_issue_comment` |
+| Jira URL 或 `PROJECT-N` 格式 | Jira | `mcp__atlassian__addCommentToJiraIssue` |
+| CNB Issue | CNB | `mcp__cnb__cnb_create_issue_comment` |
+
+### 回复内容规范
+
+回复需包含以下要素（简洁，不超过 300 字）：
+
+```markdown
+## 修复说明
+
+**根因**：[一句话说明 bug 根因]
+
+**修复内容**：
+- [具体修改点 1]
+- [具体修改点 2]
+
+**版本**：已在 `vX.Y.Z` 中发布修复（如已发版）
+或
+**状态**：修复已合并至 `main`，将在下个版本发布
+
+**验证**：新增测试用例 `[test_name]` 覆盖此场景，全量测试通过。
+```
+
+### 注意事项
+
+- 如果修复伴随新版本发布（通过 `/release` 执行），回复中必须注明版本号，让用户知道升级到哪个版本可以获得修复
+- 如果尚未发版，说明"已合并，待发版"，不要承诺具体时间
+- 回复使用 Issue 的语言（Issue 用中文则中文回复，英文同理）
+- 不要在回复中暴露内部文件路径或架构细节，面向外部用户友好表达
