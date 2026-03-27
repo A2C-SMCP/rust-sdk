@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### Bug Fixes
+
+- *(ci)* Increase crates.io index wait time and tolerate already-published crates
+- *(ci)* Replace fixed sleep with polling for crates.io index readiness
+- *(computer)* Drain child stderr pipe to prevent deadlock on heavy output
+
+### Documentation
+
+- Update CHANGELOG for v0.1.12
+
 ## [0.1.12] - 2026-03-18
 
 ### Bug Fixes
