@@ -18,6 +18,15 @@ fn echo_server_path() -> String {
     format!("{}/../../tests/echo-mcp-server/index.js", manifest_dir)
 }
 
+/// Path to the stderr-flood MCP server relative to workspace root
+fn stderr_flood_server_path() -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    format!(
+        "{}/../../tests/stderr-flood-mcp-server/index.js",
+        manifest_dir
+    )
+}
+
 #[tokio::test]
 #[ignore] // Requires Node.js
 async fn test_stdio_client_lifecycle() {
@@ -83,4 +92,40 @@ async fn test_stdio_connect_timeout_with_bad_server() {
         Ok(Ok(())) => panic!("expected connect to fail with cat"),
         Err(_) => panic!("outer timeout fired, inner timeout should have fired first"),
     }
+}
+
+/// Regression test for https://github.com/A2C-SMCP/rust-sdk/issues/10
+///
+/// Verifies that a child process writing >128 KB to stderr does NOT deadlock
+/// the connect() call. Before the fix, the pipe buffer (typically 64 KB) would
+/// fill up, blocking the child's write() syscall and stalling the entire
+/// async event loop.
+#[tokio::test]
+#[ignore] // Requires Node.js
+async fn test_stdio_stderr_flood_no_deadlock() {
+    let params = StdioServerParameters {
+        command: "node".to_string(),
+        args: vec![stderr_flood_server_path()],
+        env: HashMap::new(),
+        cwd: None,
+    };
+
+    let client = StdioMCPClient::new(params);
+    assert_eq!(client.state(), ClientState::Initialized);
+
+    // This would hang (and eventually timeout) before the fix because the
+    // child blocks on stderr write and never responds to MCP initialize.
+    let connect_result = tokio::time::timeout(Duration::from_secs(15), client.connect()).await;
+    let connect_result =
+        connect_result.expect("connect timed out — stderr pipe is likely blocked (Issue #10)");
+    connect_result.expect("connect failed");
+    assert_eq!(client.state(), ClientState::Connected);
+
+    // Verify the server is functional after the stderr flood
+    let tools = client.list_tools().await.expect("list_tools failed");
+    assert!(tools.is_empty(), "stderr-flood server has no tools");
+
+    // Clean disconnect
+    client.disconnect().await.expect("disconnect failed");
+    assert_eq!(client.state(), ClientState::Disconnected);
 }

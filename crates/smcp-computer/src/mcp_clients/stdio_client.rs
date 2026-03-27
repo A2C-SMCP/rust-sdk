@@ -22,8 +22,9 @@ use rmcp::RoleClient;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::{ChildStderr, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 /// STDIO 客户端连接超时时间（秒）
@@ -36,8 +37,8 @@ pub struct StdioMCPClient {
     base: BaseMCPClient<StdioServerParameters>,
     /// rmcp 运行服务 / rmcp running service
     running_service: Arc<Mutex<Option<RunningService<RoleClient, ClientInfo>>>>,
-    /// 子进程 stderr / Child process stderr
-    child_stderr: Arc<Mutex<Option<ChildStderr>>>,
+    /// stderr 消费任务 / Background task draining child stderr
+    stderr_drain_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// 订阅管理器 / Subscription manager
     subscription_manager: SubscriptionManager,
     /// 资源缓存 / Resource cache
@@ -60,7 +61,7 @@ impl StdioMCPClient {
         Self {
             base: BaseMCPClient::new(params),
             running_service: Arc::new(Mutex::new(None)),
-            child_stderr: Arc::new(Mutex::new(None)),
+            stderr_drain_task: Arc::new(Mutex::new(None)),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)),
         }
@@ -167,7 +168,19 @@ impl MCPClientProtocol for StdioMCPClient {
                 MCPClientError::ConnectionError(format!("Failed to start process: {}", e))
             })?;
 
-        *self.child_stderr.lock().await = stderr;
+        // Spawn background task to drain stderr, preventing pipe buffer deadlock
+        let stderr_task = stderr.map(|stderr| {
+            let cmd_name = params.command.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    debug!(target: "mcp_stderr", "[{}] {}", cmd_name, line);
+                }
+            })
+        });
+        *self.stderr_drain_task.lock().await = stderr_task;
 
         let client_info = ClientInfo {
             protocol_version: Default::default(),
@@ -221,8 +234,10 @@ impl MCPClientProtocol for StdioMCPClient {
             }
         }
 
-        // 清理 stderr handle
-        *self.child_stderr.lock().await = None;
+        // 终止 stderr 消费任务 / Abort stderr drain task
+        if let Some(handle) = self.stderr_drain_task.lock().await.take() {
+            handle.abort();
+        }
 
         self.base.update_state(ClientState::Disconnected).await;
         info!("STDIO client disconnected successfully");
@@ -582,6 +597,11 @@ mod tests {
 
         // 验证 running_service 被清理
         let guard = client.running_service.lock().await;
+        assert!(guard.is_none());
+        drop(guard);
+
+        // 验证 stderr_drain_task 被清理
+        let guard = client.stderr_drain_task.lock().await;
         assert!(guard.is_none());
         drop(guard);
 
