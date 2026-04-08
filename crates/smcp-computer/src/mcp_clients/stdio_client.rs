@@ -31,6 +31,18 @@ use tracing::{debug, error, info, warn};
 /// Connect timeout for STDIO client (seconds)
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 
+/// 库级别默认 cwd 子目录名 / Library-level default cwd subdirectory name
+const DEFAULT_CWD_DIR_NAME: &str = ".a2c-smcp";
+
+/// 解析子进程工作目录：优先使用显式配置，否则 fallback 到 ~/.a2c-smcp
+/// Resolve child process cwd: use explicit value if provided, otherwise fallback to ~/.a2c-smcp
+fn resolve_cwd(explicit_cwd: Option<&String>) -> Option<std::path::PathBuf> {
+    if let Some(cwd) = explicit_cwd {
+        return Some(std::path::PathBuf::from(cwd));
+    }
+    dirs::home_dir().map(|home| home.join(DEFAULT_CWD_DIR_NAME))
+}
+
 /// STDIO MCP客户端 / STDIO MCP client
 pub struct StdioMCPClient {
     /// 基础客户端 / Base client
@@ -155,8 +167,14 @@ impl MCPClientProtocol for StdioMCPClient {
         for (key, value) in &params.env {
             cmd.env(key, value);
         }
-        if let Some(cwd) = &params.cwd {
-            cmd.current_dir(cwd);
+        if let Some(cwd) = resolve_cwd(params.cwd.as_ref()) {
+            if !cwd.exists() {
+                if let Err(e) = std::fs::create_dir_all(&cwd) {
+                    warn!("Failed to create default cwd {:?}: {}", cwd, e);
+                }
+            }
+            cmd.current_dir(&cwd);
+            debug!("Child process cwd: {:?}", cwd);
         }
 
         debug!("Starting command: {} {:?}", params.command, params.args);
@@ -607,6 +625,34 @@ mod tests {
 
         // 验证状态变为已断开
         assert_eq!(client.base.get_state().await, ClientState::Disconnected);
+    }
+
+    #[test]
+    fn test_resolve_cwd_explicit_value() {
+        let explicit = "/tmp/my-cwd".to_string();
+        let result = resolve_cwd(Some(&explicit));
+        assert_eq!(result, Some(std::path::PathBuf::from("/tmp/my-cwd")));
+    }
+
+    #[test]
+    fn test_resolve_cwd_defaults_to_a2c_smcp() {
+        let result = resolve_cwd(None);
+        assert!(result.is_some(), "resolve_cwd(None) should return Some");
+        let path = result.unwrap();
+        assert!(
+            path.ends_with(DEFAULT_CWD_DIR_NAME),
+            "default cwd should end with {}, got {:?}",
+            DEFAULT_CWD_DIR_NAME,
+            path
+        );
+    }
+
+    #[test]
+    fn test_resolve_cwd_returns_path_under_home() {
+        let result = resolve_cwd(None);
+        let home = dirs::home_dir().expect("HOME should be available in test");
+        let path = result.unwrap();
+        assert_eq!(path, home.join(DEFAULT_CWD_DIR_NAME));
     }
 
     #[tokio::test]
