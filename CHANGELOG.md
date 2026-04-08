@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- *(computer)* Default stdio child cwd to ~/.a2c-smcp when unset (#11)
+
+### Features
+
+- *(skills)* Add rust-learn skill and enhance fix-issue with online issue reply
+
+## [unreleased]
+
+### Bug Fixes
+
 - *(ci)* Increase crates.io index wait time and tolerate already-published crates
 - *(ci)* Replace fixed sleep with polling for crates.io index readiness
 - *(computer)* Drain child stderr pipe to prevent deadlock on heavy output
