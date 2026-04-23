@@ -2,17 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [0.1.15] - 2026-04-23
+
+### Features
+
+- *(handshake)* [**breaking**] Make Socket.IO auth header and namespace configurable
+
+## [0.1.14] - 2026-04-08
 
 ### Bug Fixes
 
 - *(computer)* Default stdio child cwd to ~/.a2c-smcp when unset (#11)
 
+### Documentation
+
+- Update CHANGELOG for v0.1.14
+
 ### Features
 
 - *(skills)* Add rust-learn skill and enhance fix-issue with online issue reply
 
-## [unreleased]
+### Miscellaneous Tasks
+
+- Add claude code plugin settings
+- Release v0.1.14
+
+## [0.1.13] - 2026-03-27
 
 ### Bug Fixes
 
@@ -23,6 +38,11 @@ All notable changes to this project will be documented in this file.
 ### Documentation
 
 - Update CHANGELOG for v0.1.12
+- Update CHANGELOG for v0.1.13
+
+### Miscellaneous Tasks
+
+- Release v0.1.13
 
 ## [0.1.12] - 2026-03-18
 
