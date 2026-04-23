@@ -17,6 +17,7 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
 futures-util.workspace = true
+socketioxide.workspace = true
 
 [dependencies]
 smcp.workspace = true

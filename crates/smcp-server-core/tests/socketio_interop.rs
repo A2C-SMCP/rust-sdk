@@ -280,7 +280,7 @@ async fn test_update_notifications_and_role_checks() {
     let computer_client = ClientBuilder::new(&server_url)
         .namespace(smcp::SMCP_NAMESPACE)
         .transport_type(TransportType::Websocket)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on(
             smcp::events::NOTIFY_UPDATE_CONFIG,
             counter_handler(computer_update_config_count.clone(), None),
@@ -332,7 +332,7 @@ async fn test_update_notifications_and_role_checks() {
     let agent_client = ClientBuilder::new(&server_url)
         .namespace(smcp::SMCP_NAMESPACE)
         .transport_type(TransportType::Websocket)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on(
             smcp::events::NOTIFY_UPDATE_CONFIG,
             counter_handler(
@@ -554,7 +554,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
     let client = ClientBuilder::new(&server_url)
         .namespace(smcp::SMCP_NAMESPACE)
         .transport_type(TransportType::Websocket)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on("connect", move |_payload: Payload, _client| {
             let connected_notify = connected_notify_clone.clone();
             async move {

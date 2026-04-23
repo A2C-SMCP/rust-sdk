@@ -31,7 +31,7 @@ async fn debug_agent_receives_broadcast() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace(SMCP_NAMESPACE)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on("message", move |_payload, _client| {
             println!("Agent received message event");
             async move {}.boxed()

@@ -35,6 +35,14 @@ pub trait AuthenticationProvider: Send + Sync + 'static + std::fmt::Debug {
     ) -> Result<(), AuthError>;
 }
 
+/// 默认鉴权 HTTP header 键名 / Default auth HTTP header key name.
+///
+/// 与 client 侧 `smcp-computer` / `smcp-agent` 默认值保持一致；
+/// A2C-SMCP 协议 auth-agnostic，部署方可显式覆盖 `api_key_name`。
+/// Aligned with the client-side defaults in `smcp-computer` / `smcp-agent`;
+/// A2C-SMCP is auth-agnostic — operators may override `api_key_name`.
+pub const DEFAULT_AUTH_HEADER_NAME: &str = "access_token";
+
 /// 默认认证提供者，提供基础的认证逻辑实现
 /// Default authentication provider, provides basic authentication logic implementation
 #[derive(Debug, Clone)]
@@ -51,11 +59,13 @@ impl DefaultAuthenticationProvider {
     ///
     /// # Arguments
     /// * `admin_secret` - 管理员密钥 / Admin secret
-    /// * `api_key_name` - API 密钥字段名，默认为 "x-api-key" / API key field name, defaults to "x-api-key"
+    /// * `api_key_name` - API 密钥字段名，默认为 [`DEFAULT_AUTH_HEADER_NAME`]
+    ///   (`access_token`) / API key field name, defaults to
+    ///   [`DEFAULT_AUTH_HEADER_NAME`] (`access_token`)
     pub fn new(admin_secret: Option<String>, api_key_name: Option<String>) -> Self {
         Self {
             admin_secret,
-            api_key_name: api_key_name.unwrap_or_else(|| "x-api-key".to_string()),
+            api_key_name: api_key_name.unwrap_or_else(|| DEFAULT_AUTH_HEADER_NAME.to_string()),
         }
     }
 }
@@ -99,7 +109,7 @@ mod tests {
     async fn test_default_auth_success() {
         let auth = DefaultAuthenticationProvider::new(Some("secret123".to_string()), None);
         let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("secret123"));
+        headers.insert("access_token", HeaderValue::from_static("secret123"));
 
         let result = auth.authenticate(&headers, None).await;
         assert!(result.is_ok());
@@ -118,7 +128,7 @@ mod tests {
     async fn test_default_auth_invalid_key() {
         let auth = DefaultAuthenticationProvider::new(Some("secret123".to_string()), None);
         let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("wrong"));
+        headers.insert("access_token", HeaderValue::from_static("wrong"));
 
         let result = auth.authenticate(&headers, None).await;
         assert!(matches!(result, Err(AuthError::InvalidApiKey)));
@@ -128,7 +138,7 @@ mod tests {
     async fn test_default_auth_no_admin_secret() {
         let auth = DefaultAuthenticationProvider::new(None, None);
         let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("anykey"));
+        headers.insert("access_token", HeaderValue::from_static("anykey"));
 
         let result = auth.authenticate(&headers, None).await;
         assert!(matches!(result, Err(AuthError::InvalidApiKey)));

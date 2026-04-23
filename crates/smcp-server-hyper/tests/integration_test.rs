@@ -202,7 +202,7 @@ async fn create_client(addr: SocketAddr, namespace: &str) -> Client {
     ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .connect()
         .await
         .expect("Failed to connect client")
@@ -319,7 +319,7 @@ where
     let client = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on(event, handler)
         .connect()
         .await

@@ -26,7 +26,7 @@ async fn test_agent_auth_provider_headers() {
 
     // 验证请求头
     let headers = auth.get_connection_headers();
-    assert_eq!(headers.get("x-api-key"), Some(&api_key.to_string()));
+    assert_eq!(headers.get("access_token"), Some(&api_key.to_string()));
 
     // 验证Agent配置
     let config = auth.get_agent_config();
@@ -52,7 +52,7 @@ async fn test_agent_auth_provider_custom_headers() {
 
     // 验证基本请求头（仅API密钥）
     let headers = auth.get_connection_headers();
-    assert_eq!(headers.get("x-api-key"), Some(&api_key.to_string()));
+    assert_eq!(headers.get("access_token"), Some(&api_key.to_string()));
     // 注意：自定义请求头功能暂未实现
 }
 

@@ -33,7 +33,7 @@ async fn test_update_config_broadcast() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on("notify:update_config", move |payload: Payload, _client| {
             let agent_received = agent_received_clone.clone();
             async move {
@@ -105,7 +105,7 @@ async fn test_update_config_broadcast_only_to_same_office() {
     let agent1_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on("notify:update_config", move |payload: Payload, _client| {
             let office1_received = office1_received_clone.clone();
             async move {
@@ -125,7 +125,7 @@ async fn test_update_config_broadcast_only_to_same_office() {
     let agent2_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on("notify:update_config", move |payload: Payload, _client| {
             let office2_received = office2_received_clone.clone();
             async move {
@@ -229,7 +229,7 @@ async fn test_update_config_multiple_computers() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on("notify:update_config", move |payload: Payload, _client| {
             let notification_count = notification_count_clone.clone();
             async move {
@@ -334,7 +334,7 @@ async fn test_update_config_notification_content() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on("notify:update_config", move |payload: Payload, _client| {
             let received_notification = received_notification_clone.clone();
             async move {

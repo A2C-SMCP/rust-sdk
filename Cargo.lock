@@ -3948,6 +3948,7 @@ dependencies = [
  "serde_json",
  "smcp",
  "smcp-server-core",
+ "socketioxide",
  "tempfile",
  "tf-rust-socketio",
  "thiserror 2.0.17",

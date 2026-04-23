@@ -108,9 +108,14 @@ fn test_auth_provider_headers_format() {
 
     let headers = auth.get_connection_headers();
 
-    // 应该使用x-api-key，不是Authorization
-    assert_eq!(headers.get("x-api-key"), Some(&"test-api-key".to_string()));
+    // 应该使用 access_token（默认），不是 Authorization 或旧版 x-api-key /
+    // Should use access_token (default), not Authorization or legacy x-api-key
+    assert_eq!(
+        headers.get("access_token"),
+        Some(&"test-api-key".to_string())
+    );
     assert!(!headers.contains_key("Authorization"));
+    assert!(!headers.contains_key("x-api-key"));
 }
 
 #[test]

@@ -28,7 +28,7 @@ use crate::mcp_clients::{
     },
     ConfigRender, RenderError,
 };
-use crate::socketio_client::SmcpComputerClient;
+use crate::socketio_client::{SmcpComputerClient, SmcpComputerClientBuilder};
 
 /// 确认回调函数类型 / Confirmation callback function type
 type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>;
@@ -804,7 +804,7 @@ impl<S: Session> Computer<S> {
     pub async fn connect_socketio(
         &self,
         url: &str,
-        #[allow(unused_variables)] namespace: &str,
+        namespace: &str,
         auth: &Option<String>,
         headers: &Option<String>,
     ) -> ComputerResult<()> {
@@ -835,17 +835,22 @@ impl<S: Session> Computer<S> {
         // 解析 headers 字符串为 HashMap / Parse headers string into HashMap
         let parsed_headers = headers.as_deref().map(parse_headers_string);
 
-        // 创建Socket.IO客户端 / Create Socket.IO client
-        // 传递认证密钥（如果提供） / Pass auth secret (if provided)
-        let client = SmcpComputerClient::new(
+        // 创建Socket.IO客户端：通过 Builder 串联可配置项（含 namespace）
+        // Create Socket.IO client via Builder (threading namespace through)
+        let mut builder = SmcpComputerClientBuilder::new(
             url,
             Arc::new(RwLock::new(Some(new_manager))),
             self.name.clone(),
-            auth.clone(),
             self.inputs.clone(),
-            parsed_headers,
         )
-        .await?;
+        .namespace(namespace);
+        if let Some(secret) = auth.clone() {
+            builder = builder.auth_secret(secret);
+        }
+        if let Some(h) = parsed_headers {
+            builder = builder.headers(h);
+        }
+        let client = builder.connect().await?;
 
         // 设置客户端到Computer / Set client to Computer
         let client_arc = Arc::new(client);

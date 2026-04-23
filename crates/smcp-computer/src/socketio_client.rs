@@ -32,6 +32,101 @@ use tf_rust_socketio::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
+/// 默认鉴权 HTTP header 键名 /
+/// Default auth HTTP header key name.
+///
+/// 与 A2C-SMCP 协议 auth-agnostic 立场一致：部署方自行决定 header 名；
+/// 此处默认值匹配 TuringFocus 生态（`access_token`，下划线）。
+/// Aligns with A2C-SMCP's auth-agnostic stance; default matches the
+/// TuringFocus deployment (`access_token`, underscored).
+pub const DEFAULT_AUTH_HEADER_NAME: &str = "access_token";
+
+/// SMCP Computer Socket.IO客户端 Builder /
+/// Builder for the SMCP Computer Socket.IO client.
+///
+/// 通过 Builder 配置握手期的 namespace、鉴权 header 名、自定义 HTTP headers 等。
+/// Configure handshake-time namespace, auth header name, custom headers, etc.
+pub struct SmcpComputerClientBuilder {
+    url: String,
+    manager: Arc<RwLock<Option<MCPServerManager>>>,
+    computer_name: String,
+    inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
+    auth_secret: Option<String>,
+    auth_header_name: Option<String>,
+    namespace: Option<String>,
+    headers: Option<HashMap<String, String>>,
+}
+
+impl SmcpComputerClientBuilder {
+    /// 创建 Builder（必填项） / Create a new builder (required fields).
+    pub fn new(
+        url: impl Into<String>,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
+        computer_name: impl Into<String>,
+        inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            manager,
+            computer_name: computer_name.into(),
+            inputs,
+            auth_secret: None,
+            auth_header_name: None,
+            namespace: None,
+            headers: None,
+        }
+    }
+
+    /// 鉴权密钥（写入 `auth_header_name` 指定的 header）。
+    /// Auth secret (written into the header named by `auth_header_name`).
+    pub fn auth_secret(mut self, secret: impl Into<String>) -> Self {
+        self.auth_secret = Some(secret.into());
+        self
+    }
+
+    /// 自定义鉴权 HTTP header 名；未设置时默认 [`DEFAULT_AUTH_HEADER_NAME`]。
+    /// Customize the auth HTTP header name; defaults to
+    /// [`DEFAULT_AUTH_HEADER_NAME`] when not set.
+    pub fn auth_header_name(mut self, name: impl Into<String>) -> Self {
+        self.auth_header_name = Some(name.into());
+        self
+    }
+
+    /// 自定义 Socket.IO 应用层 namespace；未设置时默认 [`SMCP_NAMESPACE`] (`/smcp`)。
+    /// Customize the Socket.IO application-layer namespace; defaults to
+    /// [`SMCP_NAMESPACE`] (`/smcp`) when not set.
+    pub fn namespace(mut self, ns: impl Into<String>) -> Self {
+        self.namespace = Some(ns.into());
+        self
+    }
+
+    /// 附加任意 HTTP upgrade header（如 TF 生态路由 `X-TF-RobotId`）。
+    /// Attach arbitrary HTTP upgrade headers (e.g. TF ecosystem routing headers).
+    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
+    /// 建立 Socket.IO 连接。 / Establish the Socket.IO connection.
+    pub async fn connect(self) -> ComputerResult<SmcpComputerClient> {
+        let namespace = self.namespace.unwrap_or_else(|| SMCP_NAMESPACE.to_string());
+        let auth_header_name = self
+            .auth_header_name
+            .unwrap_or_else(|| DEFAULT_AUTH_HEADER_NAME.to_string());
+        SmcpComputerClient::connect_internal(
+            self.url,
+            self.manager,
+            self.computer_name,
+            self.inputs,
+            self.auth_secret,
+            auth_header_name,
+            namespace,
+            self.headers,
+        )
+        .await
+    }
+}
+
 /// SMCP Computer Socket.IO客户端
 /// SMCP Computer Socket.IO client
 pub struct SmcpComputerClient {
@@ -44,17 +139,52 @@ pub struct SmcpComputerClient {
     /// 输入定义映射 / Input definitions map
     #[allow(dead_code)]
     inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
+    /// 实际握手使用的 Socket.IO namespace / Socket.IO namespace used during handshake
+    namespace: String,
+    /// 实际写入 HTTP header 的鉴权 key 名 / Auth HTTP header key name used on the wire
+    auth_header_name: String,
 }
 
 impl SmcpComputerClient {
-    /// 创建新的Socket.IO客户端
-    /// Create a new Socket.IO client
+    /// 创建新的Socket.IO客户端（向后兼容入口） /
+    /// Create a new Socket.IO client (backward-compatible entry point).
+    ///
+    /// 内部委托给 [`SmcpComputerClientBuilder`]，默认 `auth_header_name = "access_token"`，
+    /// `namespace = "/smcp"`。需要自定义这两项的调用方请直接使用 Builder。
+    /// Internally delegates to [`SmcpComputerClientBuilder`]; callers needing
+    /// to customize these fields should use the Builder directly.
     pub async fn new(
         url: &str,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         auth_secret: Option<String>,
         inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
+        headers: Option<HashMap<String, String>>,
+    ) -> ComputerResult<Self> {
+        let mut b = SmcpComputerClientBuilder::new(url, manager, computer_name, inputs);
+        if let Some(secret) = auth_secret {
+            b = b.auth_secret(secret);
+        }
+        if let Some(h) = headers {
+            b = b.headers(h);
+        }
+        b.connect().await
+    }
+
+    /// 真正的连接实现 / Actual connection implementation.
+    ///
+    /// 私有 helper，参数已由 [`SmcpComputerClientBuilder::connect`] 解析过默认值。
+    /// Private helper; defaults already resolved by
+    /// [`SmcpComputerClientBuilder::connect`].
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_internal(
+        url: String,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
+        computer_name: String,
+        inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
+        auth_secret: Option<String>,
+        auth_header_name: String,
+        namespace: String,
         headers: Option<HashMap<String, String>>,
     ) -> ComputerResult<Self> {
         let office_id = Arc::new(RwLock::new(None));
@@ -65,14 +195,14 @@ impl SmcpComputerClient {
 
         // 使用ClientBuilder注册事件处理器
         // Use ClientBuilder to register event handlers
-        let mut builder = ClientBuilder::new(url)
-            .namespace(SMCP_NAMESPACE)
+        let mut builder = ClientBuilder::new(&url)
+            .namespace(namespace.clone())
             .transport_type(TransportType::Websocket);
 
-        // 如果提供了认证密钥，添加到请求头
-        // If auth secret is provided, add to request headers
+        // 如果提供了认证密钥，添加到请求头（header key 由调用方配置，默认 access_token）
+        // If auth secret is provided, add to request headers (header key configurable; defaults to access_token)
         if let Some(secret) = auth_secret {
-            builder = builder.opening_header("x-api-key", secret.as_str());
+            builder = builder.opening_header(auth_header_name.as_str(), secret.as_str());
         }
 
         // 添加自定义 HTTP headers / Add custom HTTP headers
@@ -259,6 +389,8 @@ impl SmcpComputerClient {
             computer_name,
             office_id,
             inputs,
+            namespace,
+            auth_header_name,
         })
     }
 
@@ -780,12 +912,18 @@ impl SmcpComputerClient {
         "unknown".to_string()
     }
 
-    /// 获取连接的 namespace
-    /// Get connected namespace
+    /// 获取握手时使用的 Socket.IO namespace（实际配置值，非字面量）。
+    /// Get the Socket.IO namespace used at handshake time (the actual
+    /// configured value, not a hardcoded literal).
     pub fn get_namespace(&self) -> String {
-        // 从 client 中获取 namespace，如果无法获取则返回默认值
-        // Get namespace from client, return default if unable to get
-        "/smcp".to_string()
+        self.namespace.clone()
+    }
+
+    /// 获取实际写入 HTTP header 的鉴权 key 名（默认 [`DEFAULT_AUTH_HEADER_NAME`]）。
+    /// Get the auth HTTP header key name actually used on the wire (defaults to
+    /// [`DEFAULT_AUTH_HEADER_NAME`]).
+    pub fn get_auth_header_name(&self) -> &str {
+        &self.auth_header_name
     }
 }
 

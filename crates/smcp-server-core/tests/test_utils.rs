@@ -147,7 +147,7 @@ pub async fn create_test_client(
     ClientBuilder::new(server_url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .connect()
         .await
         .expect("Failed to connect client")
@@ -173,7 +173,7 @@ where
     ClientBuilder::new(server_url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
-        .opening_header("x-api-key", "test_secret")
+        .opening_header("access_token", "test_secret")
         .on(event, handler)
         .connect()
         .await
