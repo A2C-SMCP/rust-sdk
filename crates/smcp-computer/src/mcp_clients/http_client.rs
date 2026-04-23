@@ -437,7 +437,7 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         // 按 priority 降序排序 / Sort by priority in descending order
-        filtered_resources.sort_by(|a, b| b.1.cmp(&a.1));
+        filtered_resources.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // 返回仅包含 Resource 的列表 / Return list containing only Resource
         Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())

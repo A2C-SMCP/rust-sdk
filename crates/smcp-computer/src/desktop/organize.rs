@@ -98,7 +98,7 @@ pub fn organize_desktop(
 
     // 3) 每个服务器内按 priority 降序排序
     for items in grouped.values_mut() {
-        items.sort_by(|a, b| b.priority.cmp(&a.priority));
+        items.sort_by_key(|b| std::cmp::Reverse(b.priority));
     }
 
     // 4) 组装按服务器顺序的窗口列表，处理 fullscreen 规则

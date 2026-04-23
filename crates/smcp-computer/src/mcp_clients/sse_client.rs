@@ -655,7 +655,7 @@ impl MCPClientProtocol for SseMCPClient {
             filtered_resources.push((resource, priority));
         }
 
-        filtered_resources.sort_by(|a, b| b.1.cmp(&a.1));
+        filtered_resources.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
     }

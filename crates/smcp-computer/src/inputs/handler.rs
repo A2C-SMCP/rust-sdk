@@ -162,7 +162,7 @@ impl InputHandler {
         // 添加其他元数据 / Add other metadata
         if !context.metadata.is_empty() {
             let mut metadata_pairs: Vec<_> = context.metadata.iter().collect();
-            metadata_pairs.sort_by(|(k1, _), (k2, _)| k1.cmp(k2)); // 确保顺序一致 / Ensure consistent order
+            metadata_pairs.sort_by_key(|(k1, _)| *k1); // 确保顺序一致 / Ensure consistent order
 
             for (k, v) in metadata_pairs {
                 key = format!("{}:{}={}", key, k, v);
