@@ -43,7 +43,14 @@ impl HandlerError {
     /// 转换为 flat 错误负载 / Convert to a flat error payload
     ///
     /// 协议 0.2.2：所有 ack 路由统一为 flat [`smcp::ErrorPayload`]（顶层 `code`/`message`），
-    /// 禁止嵌套 `{"error": {...}}` envelope。完整 ack 路由改造见 SRV-01。
+    /// 禁止嵌套 `{"error": {...}}` envelope。
+    ///
+    /// ⚠️ 注意码空间收敛（待 SRV-01 #47 落地）：本方法当前用 [`smcp::error_codes`]
+    /// （传输/管理层码，如 400/401/500/4101），但协议谓词 [`smcp::is_protocol_error_payload`]
+    /// 只识别 [`smcp::ErrorCode`] 闭集（404/4006–4018），二者仅 404 重合。一旦 SRV-01 把这些
+    /// 错误投递到 `client:*` ack 且 Agent 端按谓词判定，非 `ErrorCode` 码会被误判为"非协议错误"。
+    /// 因此投递到 `client:*` ack 的错误 **MUST** 映射到 `ErrorCode` 值——该收敛归 SRV-01 #47；
+    /// 当前序列化形态仅为编译过渡。
     pub fn to_error_payload(&self) -> smcp::ErrorPayload {
         smcp::ErrorPayload::new(i64::from(self.error_code()), self.to_string())
     }
@@ -1163,10 +1170,16 @@ mod tests {
 
     #[test]
     fn test_handler_error_serialize() {
+        // 协议 0.2.2：HandlerError 序列化为 flat ErrorPayload（顶层 code/message），
+        // 禁止嵌套 {"error":{...}} envelope。断言 flat 形态，使回退到嵌套时测试失败。
         let err = HandlerError::InvalidRequest("bad".to_string());
-        let json = serde_json::to_string(&err).unwrap();
-        assert!(json.contains("Invalid request"));
-        assert!(json.contains("bad"));
+        let v: serde_json::Value = serde_json::to_value(&err).unwrap();
+
+        assert_eq!(v["code"], smcp::error_codes::BAD_REQUEST); // InvalidRequest → 400
+        let message = v["message"].as_str().expect("message 应为顶层字符串");
+        assert!(message.contains("Invalid request"));
+        assert!(message.contains("bad"));
+        assert!(v.get("error").is_none(), "禁止嵌套 envelope"); // 回退到 {"error":{...}} 即失败
     }
 
     #[test]

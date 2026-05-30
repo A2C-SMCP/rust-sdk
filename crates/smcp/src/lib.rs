@@ -18,6 +18,13 @@ pub const SMCP_NAMESPACE: &str = "/smcp";
 pub const PROTOCOL_VERSION: &str = "0.2.0";
 
 /// 标准错误码模块 / Standard error codes module
+///
+/// ⚠️ 与 [`ErrorCode`] 枚举是**两套有意不合并的命名空间**（对齐 Python `a2c_smcp/smcp.py`，
+/// 其 `ErrorCode` 同样不含 4001–4005 / 4101–4104，合并会偏离参考实现）：
+/// - 本模块 = **传输/管理层码** + 工具/房间码（400–500、4001–4005、4101–4104）。
+/// - [`ErrorCode`] = **协议级闭集**（404、4006–4018），是 [`is_protocol_error_payload`] 识别的集合，
+///   也是 `client:*` ack 协议级错误必用的码。
+/// - 两者仅 `404` 重合。
 pub mod error_codes {
     // 通用错误码 / General error codes
     pub const BAD_REQUEST: i32 = 400;
@@ -77,6 +84,9 @@ pub const WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: i32 = 4900;
 ///
 /// 镜像 Python 参考实现 `a2c_smcp/smcp.py::ErrorCode`，**序列化 / 反序列化均为整数**
 /// （与协议 `ErrorPayload.code` 的线格式一致）。协议依据 / Protocol: error-handling.md。
+///
+/// ⚠️ 与 [`error_codes`] 模块区分：本枚举是**协议级闭集**（[`is_protocol_error_payload`] 识别 +
+/// `client:*` ack 必用）；[`error_codes`] 是传输/管理层与工具/房间码。两者仅 `404` 重合，有意不合并。
 ///
 /// 语义要点 / Semantics:
 /// - [`ErrorCode::NotFound`]（`404`）：通用「资源不存在」。本 SDK 用于 `client:*` 路由层
@@ -169,6 +179,13 @@ impl<'de> Deserialize<'de> for ErrorCode {
 ///
 /// 协议依据 / Protocol: `a2c-smcp-protocol` error-handling.md（flat ErrorPayload，禁止二次 unwrap）。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py` 的 `ErrorPayload`。
+///
+/// 🚧 待补（latent 跨-SDK 漂移，随对应码的代码路径落地）：Python `ErrorPayload`（smcp.py:484，
+/// `total=False` TypedDict）对特定码在顶层平铺**分流字段**——4008 → `server_version` / `client_version` /
+/// `min_supported` / `max_supported`（HS-01 #21 / HS-02 #22）；4014 / 4015 → `mcp_server_name` / `capability`
+/// （SRV-01 #47 / AUTH-01 #23）。本结构当前仅 `code` / `message` / `details`，且无 `#[serde(flatten)]`
+/// 兜底，反序列化会静默丢弃这些顶层字段。在握手 / SKILL / blob 代码路径落地前不补齐，以免半实现
+/// （flatten 兜底后又被 typed 字段替换）造成 churn。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorPayload {
     /// 错误码（协议 `ErrorCode` 取值；线格式为裸整数）/ Error code (a protocol `ErrorCode` value; bare int on the wire)
