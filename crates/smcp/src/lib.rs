@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// 基础设施工具模块 / Infrastructure utilities（原子 IO / 环境变量 / 路径；治理层 SET/SKL 共用）。
+pub mod utils;
+
+/// SKILL name 解析与合成（段数消歧 lexer）/ SKILL name parse & synthesis (segment-count lexer)。
+pub mod skill_name;
+pub use skill_name::{
+    is_valid_skill_name, normalize_mcp_server_segment, parse_skill_name,
+    synthesize_marketplace_name, synthesize_mcp_name, synthesize_user_name, ParsedSkillName,
+    SkillNameError, SkillNameKind,
+};
+
+/// 协议版本解析与兼容性判定 / Protocol version parse & compatibility。
+pub mod version;
+pub use version::{is_compatible, ProtocolVersion, ProtocolVersionParseError};
+
 /// SMCP协议的命名空间
 pub const SMCP_NAMESPACE: &str = "/smcp";
 
@@ -275,6 +290,8 @@ pub mod events {
     pub const CLIENT_GET_DESKTOP: &str = "client:get_desktop";
     /// 客户端工具调用请求
     pub const CLIENT_TOOL_CALL: &str = "client:tool_call";
+    /// 客户端通用二进制拉取请求（v0.2.1）/ Generic binary pull (v0.2.1)。
+    pub const CLIENT_GET_BLOB: &str = "client:get_blob";
 
     /// 服务器加入办公室请求
     pub const SERVER_JOIN_OFFICE: &str = "server:join_office";
@@ -393,6 +410,11 @@ pub struct GetComputerConfigRet {
 }
 
 /// 工具调用返回（符合 MCP CallToolResult 标准）
+///
+/// `meta` 为**结果级**元数据（线上 key 为 `meta`），承载 0.2.2 的 `a2c_*` 取消/超时标记
+/// （[`tool_meta`] + [`ToolCallRet::mark_cancelled`] / [`ToolCallRet::mark_timeout`]）。
+/// 二进制旁路句柄属**子级**标记，落在 content item 的 `_meta`（见 [`set_content_blob_sideband`]），
+/// **不**放结果级 `meta`——区分见 data-structures.md §结果级 meta vs 子级 _meta。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRet {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,6 +423,153 @@ pub struct ToolCallRet {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub req_id: Option<ReqId>,
+    /// 结果级 meta（承载 `a2c_cancelled` / `a2c_cancel_reason` / `a2c_timeout` 等）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+/// CallToolResult 的 A2C 标记键 / A2C marker keys for CallToolResult。
+///
+/// 落位规则（data-structures.md §结果级 meta vs 子级 _meta）：
+/// - **结果级**（`CallToolResult.meta`）：取消 / 超时标记 `a2c_cancelled` / `a2c_cancel_reason` / `a2c_timeout`。
+/// - **子级**（content item `_meta`）：二进制旁路 `a2c_blob_handle` / `a2c_total_size` / `a2c_sha256`。
+///
+/// 对标 Python `a2c_smcp`（agent `_blob_sideband` / computer `socketio/client`）的同名键。
+pub mod tool_meta {
+    /// 结果级：取消标记（取消时 MUST = `true`）。
+    pub const A2C_CANCELLED_KEY: &str = "a2c_cancelled";
+    /// 结果级：取消原因（SHOULD，可选；当前恒为 [`A2C_DEFAULT_CANCEL_REASON`]）。
+    pub const A2C_CANCEL_REASON_KEY: &str = "a2c_cancel_reason";
+    /// 结果级：超时标记（超时时 SHOULD = `true`）。
+    pub const A2C_TIMEOUT_KEY: &str = "a2c_timeout";
+    /// `a2c_cancel_reason` 的现阶段恒定取值 / The current fixed cancel reason。
+    pub const A2C_DEFAULT_CANCEL_REASON: &str = "agent_requested";
+    /// 子级（content item `_meta`）：二进制旁路句柄。
+    pub const A2C_BLOB_HANDLE_KEY: &str = "a2c_blob_handle";
+    /// 子级：旁路资源总字节数。
+    pub const A2C_TOTAL_SIZE_KEY: &str = "a2c_total_size";
+    /// 子级：旁路资源全量 sha256（十六进制）。
+    pub const A2C_SHA256_KEY: &str = "a2c_sha256";
+}
+
+impl ToolCallRet {
+    fn meta_object_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+        if !matches!(self.meta, Some(serde_json::Value::Object(_))) {
+            self.meta = Some(serde_json::Value::Object(serde_json::Map::new()));
+        }
+        match self.meta.as_mut() {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => unreachable!("meta 刚被规整为对象"),
+        }
+    }
+
+    /// 标记取消（结果级 `meta.a2c_cancelled = true` + `a2c_cancel_reason`）。
+    ///
+    /// 取消语义 MUST `a2c_cancelled=true`；`reason` 缺省 [`tool_meta::A2C_DEFAULT_CANCEL_REASON`]。
+    pub fn mark_cancelled(&mut self, reason: Option<&str>) {
+        let reason = reason
+            .unwrap_or(tool_meta::A2C_DEFAULT_CANCEL_REASON)
+            .to_string();
+        let map = self.meta_object_mut();
+        map.insert(tool_meta::A2C_CANCELLED_KEY.to_string(), true.into());
+        map.insert(tool_meta::A2C_CANCEL_REASON_KEY.to_string(), reason.into());
+    }
+
+    /// 标记超时（结果级 `meta.a2c_timeout = true`）/ 超时语义 SHOULD `a2c_timeout=true`。
+    pub fn mark_timeout(&mut self) {
+        self.meta_object_mut()
+            .insert(tool_meta::A2C_TIMEOUT_KEY.to_string(), true.into());
+    }
+
+    /// 是否被取消（读结果级 `meta.a2c_cancelled`）/ Whether cancelled。
+    pub fn is_cancelled(&self) -> bool {
+        meta_bool(self.meta.as_ref(), tool_meta::A2C_CANCELLED_KEY)
+    }
+
+    /// 取消原因（读结果级 `meta.a2c_cancel_reason`）/ Cancel reason if present。
+    pub fn cancel_reason(&self) -> Option<&str> {
+        self.meta
+            .as_ref()
+            .and_then(|m| m.get(tool_meta::A2C_CANCEL_REASON_KEY))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// 是否超时（读结果级 `meta.a2c_timeout`）/ Whether timed out。
+    pub fn is_timeout(&self) -> bool {
+        meta_bool(self.meta.as_ref(), tool_meta::A2C_TIMEOUT_KEY)
+    }
+}
+
+fn meta_bool(meta: Option<&serde_json::Value>, key: &str) -> bool {
+    meta.and_then(|m| m.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// content item 的二进制旁路三元组 / The binary-sideband triple on a content item。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobSideband {
+    /// 旁路句柄 / sideband handle（`_meta.a2c_blob_handle`）。
+    pub blob_handle: BlobHandle,
+    /// 全量字节数 / total bytes（`_meta.a2c_total_size`，可选）。
+    pub total_size: Option<u64>,
+    /// 全量 sha256 / full-content sha256（`_meta.a2c_sha256`，可选）。
+    pub sha256: Option<String>,
+}
+
+/// 在 content item 上写入二进制旁路 / Write the binary sideband onto a content item。
+///
+/// 写 `item._meta.a2c_blob_handle`（+ 可选 `a2c_total_size` / `a2c_sha256`）。`item` 非对象时不动。
+/// 对标 Python computer `socketio/client.py` 的旁路写入。
+pub fn set_content_blob_sideband(
+    item: &mut serde_json::Value,
+    blob_handle: &str,
+    total_size: Option<u64>,
+    sha256: Option<&str>,
+) {
+    let serde_json::Value::Object(obj) = item else {
+        return;
+    };
+    let meta = obj
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        *meta = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let serde_json::Value::Object(meta) = meta {
+        meta.insert(
+            tool_meta::A2C_BLOB_HANDLE_KEY.to_string(),
+            blob_handle.into(),
+        );
+        if let Some(size) = total_size {
+            meta.insert(tool_meta::A2C_TOTAL_SIZE_KEY.to_string(), size.into());
+        }
+        if let Some(hash) = sha256 {
+            meta.insert(tool_meta::A2C_SHA256_KEY.to_string(), hash.into());
+        }
+    }
+}
+
+/// 读取 content item 的二进制旁路 / Read the binary sideband off a content item。
+///
+/// 命中 `item._meta.a2c_blob_handle`（非空字符串）→ `Some`；否则 `None`。对标 Python agent
+/// `_blob_sideband.py` 的旁路枚举。
+pub fn read_content_blob_sideband(item: &serde_json::Value) -> Option<BlobSideband> {
+    let meta = item.get("_meta")?;
+    let blob_handle = meta
+        .get(tool_meta::A2C_BLOB_HANDLE_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    Some(BlobSideband {
+        blob_handle: blob_handle.to_string(),
+        total_size: meta
+            .get(tool_meta::A2C_TOTAL_SIZE_KEY)
+            .and_then(serde_json::Value::as_u64),
+        sha256: meta
+            .get(tool_meta::A2C_SHA256_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 /// 获取工具请求
@@ -430,7 +599,7 @@ pub struct GetToolsRet {
 }
 
 /// 代理调用数据（基类）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentCallData {
     pub agent: String,
     pub req_id: ReqId,
@@ -541,6 +710,70 @@ pub enum Notification {
     UpdateDesktop,
 }
 
+// ── 通用二进制传输 / Generic binary transfer (v0.2.1) ──────────────────────
+// 协议依据 / Protocol: blob-transfer.md（句柄契约 / 生产者-消费者模型 / 安全模型）；
+// data-structures.md §GetBlobReq / §GetBlobRet。任何通道把大/二进制内容以句柄旁路，Agent 经
+// 统一 `client:get_blob` 无状态分块拉取，`sha256` 自证完整性。
+// Python 参考 / reference: a2c_smcp/smcp.py（BlobHandle / GetBlobReq / GetBlobRet）。
+
+/// `client:get_blob` 事件名 / event name（顶层别名，等于 [`events::CLIENT_GET_BLOB`]）。
+///
+/// 对齐 Python `a2c_smcp.smcp.GET_BLOB_EVENT`。
+pub const GET_BLOB_EVENT: &str = events::CLIENT_GET_BLOB;
+
+/// 不透明、Computer 铸造、无状态可重解析的 blob 句柄（类型别名）。
+/// Opaque, Computer-minted, stateless-reparseable blob handle (type alias)。
+///
+/// Agent **MUST** 视为不透明字符串：**MUST NOT** 解析 / 拼接 / 伪造 / 跨 Computer 复用
+/// （blob-transfer.md §1）。
+pub type BlobHandle = String;
+
+/// 通用二进制拉取请求 / Generic binary pull request（`client:get_blob`）。
+///
+/// Computer 无服务端状态、幂等可并行（`chunk_offset` 为资源**解码后字节**的绝对偏移）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBlobReq {
+    #[serde(flatten)]
+    pub base: AgentCallData,
+    /// 目标 Computer 名 / target Computer name。
+    pub computer: String,
+    /// 来自某通道响应的不透明句柄 / opaque handle from a producer response。
+    pub blob_handle: BlobHandle,
+    /// 资源字节绝对偏移；**缺省 0**（无状态幂等 → 可续传 / 重试 / 并行）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_offset: Option<u64>,
+    /// 客户建议单块上限（字节）；**缺省时由 Computer clamp 决定**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chunk_bytes: Option<u64>,
+}
+
+/// 通用二进制拉取响应 / Generic binary pull response（`GetBlobRet`）。
+///
+/// 完整性铁律：`eof` ⟺ `chunk_offset + len(decode(blob)) == total_size`；`eof` 后 Agent SHOULD
+/// 校验重组 `sha256`；一次逻辑读取内 `sha256` / `total_size` MUST 稳定。空资源 = `total_size=0`，
+/// 单响应 `eof=true`、`blob=""`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBlobRet {
+    /// 回显的句柄 / echoed handle。
+    pub blob_handle: BlobHandle,
+    /// 资源 MIME（可选）/ resource MIME (optional)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// 资源总字节数（首块即知；一次读取内恒定）/ total bytes。
+    pub total_size: u64,
+    /// 全量资源 sha256 十六进制（跨块恒定）/ full-content sha256 (hex)。
+    pub sha256: String,
+    /// 本块起始字节偏移 / this chunk's start byte offset。
+    pub chunk_offset: u64,
+    /// 末块标记 / end-of-file marker（⟺ `chunk_offset + 本块字节数 == total_size`）。
+    pub eof: bool,
+    /// 本块字节的 base64 编码 / base64 of this chunk's bytes。
+    pub blob: String,
+    /// 回显的请求 id（可选）/ echoed request id (optional)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_id: Option<ReqId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +829,7 @@ mod tests {
             })]),
             is_error: Some(false),
             req_id: Some(ReqId::from_string("test123".to_string())),
+            meta: None,
         };
 
         let json = serde_json::to_string(&success_ret).unwrap();
@@ -627,6 +861,7 @@ mod tests {
             })]),
             is_error: Some(true),
             req_id: None,
+            meta: None,
         };
 
         let json = serde_json::to_string(&error_ret).unwrap();
@@ -651,6 +886,7 @@ mod tests {
             content: None,
             is_error: None,
             req_id: None,
+            meta: None,
         };
 
         let json = serde_json::to_string(&minimal_ret).unwrap();
@@ -670,6 +906,7 @@ mod tests {
             })]),
             is_error: Some(false),
             req_id: Some(ReqId::new()),
+            meta: None,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -870,5 +1107,179 @@ mod tests {
             error_codes::TOOL_NOT_FOUND,
             error_codes::TOOL_EXECUTION_FAILED
         );
+    }
+
+    // ── #39 通用二进制传输 / Generic binary transfer ──────────────────────
+
+    #[test]
+    fn test_get_blob_event_constant() {
+        // GET_BLOB_EVENT 字符串精确匹配，且与 events 模块同源
+        assert_eq!(GET_BLOB_EVENT, "client:get_blob");
+        assert_eq!(GET_BLOB_EVENT, events::CLIENT_GET_BLOB);
+    }
+
+    fn sample_blob_req(chunk_offset: Option<u64>, max_chunk_bytes: Option<u64>) -> GetBlobReq {
+        GetBlobReq {
+            base: AgentCallData {
+                agent: "agent-1".to_string(),
+                req_id: ReqId::from_string("r1".to_string()),
+            },
+            computer: "comp-1".to_string(),
+            blob_handle: "opaque-handle".to_string(),
+            chunk_offset,
+            max_chunk_bytes,
+        }
+    }
+
+    #[test]
+    fn test_get_blob_req_with_offset_serde() {
+        let req = sample_blob_req(Some(1024), Some(65536));
+        let v = serde_json::to_value(&req).unwrap();
+        // flatten base（agent / req_id）+ computer + blob_handle 平铺在顶层
+        assert_eq!(v["agent"], "agent-1");
+        assert_eq!(v["req_id"], "r1");
+        assert_eq!(v["computer"], "comp-1");
+        assert_eq!(v["blob_handle"], "opaque-handle");
+        assert_eq!(v["chunk_offset"], 1024);
+        assert_eq!(v["max_chunk_bytes"], 65536);
+        let back: GetBlobReq = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn test_get_blob_req_without_offset_omits_optional_keys() {
+        let req = sample_blob_req(None, None);
+        let v = serde_json::to_value(&req).unwrap();
+        // 可选字段 None → skip_serializing_if 不出现在线格式
+        assert!(
+            v.get("chunk_offset").is_none(),
+            "缺省 chunk_offset 不应序列化"
+        );
+        assert!(
+            v.get("max_chunk_bytes").is_none(),
+            "缺省 max_chunk_bytes 不应序列化"
+        );
+        // 反序列化缺省 → None（缺省 offset 语义 = 0，由消费方解释）
+        let back: GetBlobReq = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+        assert!(back.chunk_offset.is_none());
+    }
+
+    #[test]
+    fn test_get_blob_ret_first_and_last_chunk_roundtrip() {
+        // 首块（eof=false）
+        let first = GetBlobRet {
+            blob_handle: "h".to_string(),
+            mime_type: Some("application/octet-stream".to_string()),
+            total_size: 10,
+            sha256: "abc123".to_string(),
+            chunk_offset: 0,
+            eof: false,
+            blob: "aGVsbG8=".to_string(), // base64("hello")
+            req_id: Some(ReqId::from_string("r1".to_string())),
+        };
+        let back: GetBlobRet =
+            serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(back, first);
+        assert!(!back.eof);
+
+        // 末块（eof=true）+ 省略 mime_type / req_id（可选）
+        let last = GetBlobRet {
+            blob_handle: "h".to_string(),
+            mime_type: None,
+            total_size: 10,
+            sha256: "abc123".to_string(),
+            chunk_offset: 5,
+            eof: true,
+            blob: "d29ybGQ=".to_string(),
+            req_id: None,
+        };
+        let v = serde_json::to_value(&last).unwrap();
+        assert!(v.get("mime_type").is_none());
+        assert!(v.get("req_id").is_none());
+        assert_eq!(v["eof"], true);
+        let back: GetBlobRet = serde_json::from_value(v).unwrap();
+        assert_eq!(back, last);
+    }
+
+    // ── #42 CallToolResult meta / _meta 标记 ─────────────────────────────
+
+    fn empty_ret() -> ToolCallRet {
+        ToolCallRet {
+            content: None,
+            is_error: Some(true),
+            req_id: None,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn test_mark_cancelled_default_and_custom_reason() {
+        // 默认原因 = agent_requested
+        let mut ret = empty_ret();
+        ret.mark_cancelled(None);
+        assert!(ret.is_cancelled());
+        assert_eq!(ret.cancel_reason(), Some("agent_requested"));
+        // 结果级 meta 顶层 key 为 "meta"
+        let v = serde_json::to_value(&ret).unwrap();
+        assert_eq!(v["meta"]["a2c_cancelled"], true);
+        assert_eq!(v["meta"]["a2c_cancel_reason"], "agent_requested");
+
+        // 自定义原因
+        let mut ret2 = empty_ret();
+        ret2.mark_cancelled(Some("operator_abort"));
+        assert_eq!(ret2.cancel_reason(), Some("operator_abort"));
+    }
+
+    #[test]
+    fn test_mark_timeout() {
+        let mut ret = empty_ret();
+        assert!(!ret.is_timeout());
+        ret.mark_timeout();
+        assert!(ret.is_timeout());
+        assert!(!ret.is_cancelled()); // 超时 ≠ 取消
+        let v = serde_json::to_value(&ret).unwrap();
+        assert_eq!(v["meta"]["a2c_timeout"], true);
+    }
+
+    #[test]
+    fn test_content_blob_sideband_placement_and_roundtrip() {
+        // 二进制旁路是**子级** _meta，落在 content item，而非结果级 meta
+        let mut item = serde_json::json!({ "type": "text", "text": "" });
+        set_content_blob_sideband(&mut item, "blob-xyz", Some(2048), Some("deadbeef"));
+        assert_eq!(item["_meta"]["a2c_blob_handle"], "blob-xyz");
+        assert_eq!(item["_meta"]["a2c_total_size"], 2048);
+        assert_eq!(item["_meta"]["a2c_sha256"], "deadbeef");
+
+        let sb = read_content_blob_sideband(&item).expect("应读到旁路句柄");
+        assert_eq!(sb.blob_handle, "blob-xyz");
+        assert_eq!(sb.total_size, Some(2048));
+        assert_eq!(sb.sha256.as_deref(), Some("deadbeef"));
+
+        // 无 _meta.a2c_blob_handle → None
+        let plain = serde_json::json!({ "type": "text", "text": "hi" });
+        assert!(read_content_blob_sideband(&plain).is_none());
+    }
+
+    #[test]
+    fn test_result_meta_vs_child_meta_separation() {
+        // 取消标记落结果级 meta；blob 句柄落 content item _meta —— 两层不混淆
+        let mut item = serde_json::json!({ "type": "text", "text": "" });
+        set_content_blob_sideband(&mut item, "h", None, None);
+        let mut ret = ToolCallRet {
+            content: Some(vec![item]),
+            is_error: Some(true),
+            req_id: None,
+            meta: None,
+        };
+        ret.mark_cancelled(None);
+
+        let v = serde_json::to_value(&ret).unwrap();
+        // 结果级 meta 只有取消标记，没有 blob 句柄
+        assert_eq!(v["meta"]["a2c_cancelled"], true);
+        assert!(v["meta"].get("a2c_blob_handle").is_none());
+        // content item 的 _meta 只有 blob 句柄，没有取消标记
+        assert_eq!(v["content"][0]["_meta"]["a2c_blob_handle"], "h");
+        assert!(v["content"][0]["_meta"].get("a2c_cancelled").is_none());
     }
 }
