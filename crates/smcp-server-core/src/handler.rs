@@ -3,6 +3,7 @@
 use crate::auth::{AuthError, AuthenticationProvider};
 use crate::session::{ClientRole, SessionData, SessionError, SessionManager};
 use futures_util::StreamExt;
+use serde_json::Value;
 use smcp::*;
 use socketioxide::{
     extract::{AckSender, Data, SocketRef},
