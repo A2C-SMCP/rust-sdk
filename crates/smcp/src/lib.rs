@@ -5,6 +5,19 @@ use uuid::Uuid;
 /// SMCP协议的命名空间
 pub const SMCP_NAMESPACE: &str = "/smcp";
 
+/// A2C-SMCP 协议版本号 / A2C-SMCP protocol version
+///
+/// 锁定为 `MAJOR.MINOR` = `0.2.0`。SKILL（v0.2.1）与通用二进制传输（v0.2.1）等均为**加性升级**，
+/// 不改变 `MAJOR.MINOR`，因此该常量保持 `"0.2.0"`，用于 HTTP 握手阶段的版本协商。
+///
+/// Locked to `MAJOR.MINOR` = `0.2.0`. SKILL (v0.2.1) and generic binary transfer (v0.2.1) are
+/// **additive** upgrades that do not bump `MAJOR.MINOR`; this constant stays `"0.2.0"` and is used
+/// for version negotiation during the HTTP handshake.
+///
+/// 协议依据 / Protocol: `a2c-smcp-protocol` versioning.md。
+/// Python 参考 / Python reference: `a2c_smcp/smcp.py`。
+pub const PROTOCOL_VERSION: &str = "0.2.0";
+
 /// 标准错误码模块 / Standard error codes module
 pub mod error_codes {
     // 通用错误码 / General error codes
@@ -16,8 +29,21 @@ pub mod error_codes {
     pub const INTERNAL_ERROR: i32 = 500;
 
     // 工具调用错误码 / Tool call error codes
+
+    /// 工具调用**前**查找失败：目标工具在任一活动 MCP Server 上都不存在（路由 / 注册阶段）。
+    /// 仅用于「调用前」的工具解析失败；工具**执行**阶段的失败必须使用
+    /// [`TOOL_EXECUTION_FAILED`]（4003），二者语义严格区分。
+    ///
+    /// Tool lookup failed **before** invocation: the target tool is absent on every active MCP
+    /// server (routing / registry stage). Use only for pre-call resolution failures; failures
+    /// during tool **execution** MUST use [`TOOL_EXECUTION_FAILED`] (4003).
     pub const TOOL_NOT_FOUND: i32 = 4001;
     pub const TOOL_DISABLED: i32 = 4002;
+    /// 工具**执行**失败：工具已成功解析并被调用，但在执行过程中返回错误或抛出异常。
+    /// 与查找阶段失败的 [`TOOL_NOT_FOUND`]（4001）严格区分。
+    ///
+    /// Tool **execution** failed: the tool was resolved and invoked, but returned an error or
+    /// raised during execution. Strictly distinct from the lookup-stage [`TOOL_NOT_FOUND`] (4001).
     pub const TOOL_EXECUTION_FAILED: i32 = 4003;
     pub const TOOL_TIMEOUT: i32 = 4004;
     pub const TOOL_REQUIRES_CONFIRMATION: i32 = 4005;
@@ -27,6 +53,110 @@ pub mod error_codes {
     pub const ROOM_NOT_FOUND: i32 = 4102;
     pub const NOT_IN_ROOM: i32 = 4103;
     pub const CROSS_ROOM_ACCESS: i32 = 4104;
+}
+
+/// WebSocket 握手版本拒绝的 close code（RFC 6455 私有段 4000–4999）。
+///
+/// 用于 **WS-only 直连握手**在协议版本不匹配时的拒绝，是服务端运行栈不支持
+/// ASGI WebSocket Denial Response 时的回退形态。`4900` 不携带结构化 body
+/// （WS close reason ≤123 字节）。
+///
+/// ⚠️ **MUST NOT** 与 [`ErrorCode::ProtocolVersionMismatch`]（`4008`）混用或互转：
+/// - `4008` 是 [`ErrorCode`] 值，作为 `ErrorPayload.code` 承载于 **HTTP 400 body**；
+/// - `4900` 是 **WS close code**，不承载结构化 body。
+///
+/// 二者是不同命名空间、有意取不同数值。协议依据 / Protocol: versioning.md。
+///
+/// WebSocket close code (RFC 6455 private range 4000–4999) for rejecting a WS-only direct
+/// handshake on protocol version mismatch (fallback when the server stack lacks ASGI WebSocket
+/// Denial Response). MUST NOT be conflated/converted with [`ErrorCode::ProtocolVersionMismatch`]
+/// (`4008`): 4008 is an `ErrorPayload.code` carried in the HTTP 400 body; 4900 is a WS close code
+/// with no structured body. Different namespaces, intentionally different values.
+pub const WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: i32 = 4900;
+
+/// A2C-SMCP 协议错误码（v0.2.0 起；v0.2.1 加性追加 `4016` / `4017` / `4018`）。
+///
+/// 镜像 Python 参考实现 `a2c_smcp/smcp.py::ErrorCode`，**序列化 / 反序列化均为整数**
+/// （与协议 `ErrorPayload.code` 的线格式一致）。协议依据 / Protocol: error-handling.md。
+///
+/// 语义要点 / Semantics:
+/// - [`ErrorCode::NotFound`]（`404`）：通用「资源不存在」。本 SDK 用于 `client:*` 路由层
+///   目标 Computer 名未命中（error-handling.md 明确「Computer 不存在」归 404）；镜像协议已有定义，非新增。
+/// - [`ErrorCode::McpServerNotFound`]（`4014`）：v0.2.1 复用——SKILL `name` **格式合法但不存在**
+///   （未注册 / 已卸载 / 孤儿）复用此码；`name` 格式非法 → [`ErrorCode::SkillNameInvalid`]（`4016`）；
+///   `name` 有效但 `rel_path` 不可达 → [`ErrorCode::SkillResourceNotAccessible`]（`4017`）。
+/// - SKILL 通道**不使用** `4015`：未声明 `resources` capability 的 server 在物化阶段即被排除，不上送 Agent。
+/// - `4017` / `4018` 的 `details.reason` 为**开放枚举**：解析方 MUST 容忍未知值并兜底
+///   （默认「不重试 + 诊断」），未来可非破坏地新增 reason。
+///
+/// Mirrors the Python reference `ErrorCode`; serializes to / from an **integer** matching the
+/// protocol `ErrorPayload.code` wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum ErrorCode {
+    /// 通用「资源不存在」/ Generic "resource not found"（含 `client:*` 路由层 Computer 名未命中）。
+    NotFound = 404,
+    /// MCP 上游要求授权 / MCP upstream requires authorization。
+    ToolAuthorizationRequired = 4006,
+    /// MCP 上游授权失败 / MCP upstream authorization failed。
+    ToolAuthorizationFailed = 4007,
+    /// 协议版本不匹配（承载于 HTTP 400 body）/ Protocol version mismatch (carried in HTTP 400 body)。
+    ///
+    /// ⚠️ MUST NOT 与 WS close code [`WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE`]（`4900`）混用。
+    ProtocolVersionMismatch = 4008,
+    /// MCP Server 路由未命中 / MCP server not found（v0.2.1 复用于 SKILL name 合法但 Registry 未命中）。
+    McpServerNotFound = 4014,
+    /// MCP 能力不支持 / MCP capability not supported。
+    McpCapabilityNotSupported = 4015,
+    /// SKILL `name` 违反 lexer 规则（格式硬错）/ SKILL name violates lexer rules (hard format error)。
+    SkillNameInvalid = 4016,
+    /// SKILL 资源不可达 / SKILL resource not accessible（rel_path 穿越 / .skillenv forbidden / not_found / too_large）。
+    SkillResourceNotAccessible = 4017,
+    /// 二进制 blob 不可达 / Binary blob not accessible（invalid_handle / forbidden / gone / range）。
+    BlobNotAccessible = 4018,
+}
+
+impl ErrorCode {
+    /// 返回错误码的整数值 / Return the integer code value.
+    pub const fn code(self) -> i32 {
+        self as i32
+    }
+
+    /// 从整数值解析错误码；未知值返回 `None` / Parse from an integer; unknown values return `None`.
+    pub fn from_code(code: i32) -> Option<Self> {
+        match code {
+            404 => Some(Self::NotFound),
+            4006 => Some(Self::ToolAuthorizationRequired),
+            4007 => Some(Self::ToolAuthorizationFailed),
+            4008 => Some(Self::ProtocolVersionMismatch),
+            4014 => Some(Self::McpServerNotFound),
+            4015 => Some(Self::McpCapabilityNotSupported),
+            4016 => Some(Self::SkillNameInvalid),
+            4017 => Some(Self::SkillResourceNotAccessible),
+            4018 => Some(Self::BlobNotAccessible),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for ErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_i32(self.code())
+    }
+}
+
+impl<'de> Deserialize<'de> for ErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let code = i32::deserialize(deserializer)?;
+        Self::from_code(code)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown A2C-SMCP error code: {code}")))
+    }
 }
 
 /// 错误详情结构 / Error detail structure
@@ -655,5 +785,93 @@ mod tests {
             original.error.details.as_ref().unwrap().get("trace_id"),
             deserialized.error.details.as_ref().unwrap().get("trace_id")
         );
+    }
+
+    #[test]
+    fn test_protocol_version_constant() {
+        // PROTOCOL_VERSION 锁定 MAJOR.MINOR = 0.2.0（SKILL/blob 为加性升级，不改主次版本）
+        assert_eq!(PROTOCOL_VERSION, "0.2.0");
+    }
+
+    #[test]
+    fn test_error_code_values() {
+        // 枚举值与协议 error-handling.md / Python ErrorCode 全表完全一致
+        assert_eq!(ErrorCode::NotFound.code(), 404);
+        assert_eq!(ErrorCode::ToolAuthorizationRequired.code(), 4006);
+        assert_eq!(ErrorCode::ToolAuthorizationFailed.code(), 4007);
+        assert_eq!(ErrorCode::ProtocolVersionMismatch.code(), 4008);
+        assert_eq!(ErrorCode::McpServerNotFound.code(), 4014);
+        assert_eq!(ErrorCode::McpCapabilityNotSupported.code(), 4015);
+        assert_eq!(ErrorCode::SkillNameInvalid.code(), 4016);
+        assert_eq!(ErrorCode::SkillResourceNotAccessible.code(), 4017);
+        assert_eq!(ErrorCode::BlobNotAccessible.code(), 4018);
+    }
+
+    #[test]
+    fn test_error_code_serializes_as_int() {
+        // 必须序列化为裸整数（而非字符串 / 标签对象）
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ProtocolVersionMismatch).unwrap(),
+            "4008"
+        );
+        assert_eq!(serde_json::to_string(&ErrorCode::NotFound).unwrap(), "404");
+
+        // 作为结构体字段时同样是裸整数（对齐 ErrorPayload.code 线格式）
+        let v = serde_json::json!({ "code": ErrorCode::BlobNotAccessible });
+        assert_eq!(v["code"], serde_json::json!(4018));
+    }
+
+    #[test]
+    fn test_error_code_deserializes_from_int() {
+        let c: ErrorCode = serde_json::from_str("4014").unwrap();
+        assert_eq!(c, ErrorCode::McpServerNotFound);
+        // 未知码值必须报错（解析方对已知集合是封闭的）
+        assert!(serde_json::from_str::<ErrorCode>("9999").is_err());
+        assert_eq!(ErrorCode::from_code(9999), None);
+    }
+
+    #[test]
+    fn test_error_code_int_roundtrip() {
+        for code in [
+            ErrorCode::NotFound,
+            ErrorCode::ToolAuthorizationRequired,
+            ErrorCode::ToolAuthorizationFailed,
+            ErrorCode::ProtocolVersionMismatch,
+            ErrorCode::McpServerNotFound,
+            ErrorCode::McpCapabilityNotSupported,
+            ErrorCode::SkillNameInvalid,
+            ErrorCode::SkillResourceNotAccessible,
+            ErrorCode::BlobNotAccessible,
+        ] {
+            let json = serde_json::to_string(&code).unwrap();
+            let back: ErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(code, back);
+            assert_eq!(ErrorCode::from_code(code.code()), Some(code));
+        }
+    }
+
+    #[test]
+    fn test_ws_close_code_distinct_from_protocol_mismatch() {
+        // 4900（WS close code）与 4008（ErrorPayload.code）是不同命名空间的不同值，MUST NOT 混用
+        assert_eq!(WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE, 4900);
+        assert_eq!(ErrorCode::ProtocolVersionMismatch.code(), 4008);
+        assert_ne!(
+            WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE,
+            ErrorCode::ProtocolVersionMismatch.code()
+        );
+    }
+
+    #[test]
+    fn test_tool_lookup_vs_execution_boundary() {
+        // 4001/4003 语义边界：调用前查找失败 vs 执行失败，必须是不同的码
+        assert_eq!(error_codes::TOOL_NOT_FOUND, 4001);
+        assert_eq!(error_codes::TOOL_EXECUTION_FAILED, 4003);
+        assert_ne!(
+            error_codes::TOOL_NOT_FOUND,
+            error_codes::TOOL_EXECUTION_FAILED
+        );
+        // 便捷构造器映射到正确的语义码
+        assert_eq!(ErrorResponse::tool_not_found("t").error.code, 4001);
+        assert_eq!(ErrorResponse::tool_execution_failed("t").error.code, 4003);
     }
 }
