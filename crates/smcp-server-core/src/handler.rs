@@ -3,7 +3,6 @@
 use crate::auth::{AuthError, AuthenticationProvider};
 use crate::session::{ClientRole, SessionData, SessionError, SessionManager};
 use futures_util::StreamExt;
-use serde_json::Value;
 use smcp::*;
 use socketioxide::{
     extract::{AckSender, Data, SocketRef},
@@ -40,9 +39,12 @@ impl HandlerError {
         }
     }
 
-    /// 转换为标准错误响应 / Convert to standard error response
-    pub fn to_error_response(&self) -> smcp::ErrorResponse {
-        smcp::ErrorResponse::new(self.error_code(), self.to_string())
+    /// 转换为 flat 错误负载 / Convert to a flat error payload
+    ///
+    /// 协议 0.2.2：所有 ack 路由统一为 flat [`smcp::ErrorPayload`]（顶层 `code`/`message`），
+    /// 禁止嵌套 `{"error": {...}}` envelope。完整 ack 路由改造见 SRV-01。
+    pub fn to_error_payload(&self) -> smcp::ErrorPayload {
+        smcp::ErrorPayload::new(i64::from(self.error_code()), self.to_string())
     }
 }
 
@@ -51,8 +53,8 @@ impl serde::Serialize for HandlerError {
     where
         S: serde::Serializer,
     {
-        // 使用标准错误响应格式 / Use standard error response format
-        self.to_error_response().serialize(serializer)
+        // 使用 flat 错误负载格式 / Use the flat error payload shape
+        self.to_error_payload().serialize(serializer)
     }
 }
 

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 /// SMCP协议的命名空间
@@ -159,21 +158,31 @@ impl<'de> Deserialize<'de> for ErrorCode {
     }
 }
 
-/// 错误详情结构 / Error detail structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorDetail {
-    /// 错误码 / Error code
-    pub code: i32,
-    /// 人类可读的错误描述 / Human readable error message
+/// A2C-SMCP flat 错误负载 / A2C-SMCP flat error payload
+///
+/// 协议 0.2.2 统一错误形态：顶层 `code`/`message`，诊断信息置于可选的 `details` 容器。
+/// **禁止**嵌套 `{"error": {...}}` envelope —— 所有 `client:*` ack 路由的协议级错误 MUST 为本结构。
+/// 线格式 / Wire shape: `{ "code": <int>, "message": <str>, "details"?: <object> }`。
+///
+/// `details` 是诊断容器，Agent **MUST NOT** 原样透传给最终用户（防信息泄露）。
+/// `details` is a diagnostic container; the Agent **MUST NOT** propagate it verbatim to end users.
+///
+/// 协议依据 / Protocol: `a2c-smcp-protocol` error-handling.md（flat ErrorPayload，禁止二次 unwrap）。
+/// Python 参考 / Python reference: `a2c_smcp/smcp.py` 的 `ErrorPayload`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorPayload {
+    /// 错误码（协议 `ErrorCode` 取值；线格式为裸整数）/ Error code (a protocol `ErrorCode` value; bare int on the wire)
+    pub code: i64,
+    /// 人类可读的错误描述 / Human-readable error message
     pub message: String,
-    /// 结构化调试信息（可选）/ Structured debug info (optional)
+    /// 诊断容器（可选；为空时不序列化）/ Diagnostic container (optional; skipped when absent)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<HashMap<String, serde_json::Value>>,
+    pub details: Option<serde_json::Value>,
 }
 
-impl ErrorDetail {
-    /// 创建新的错误详情 / Create new error detail
-    pub fn new(code: i32, message: impl Into<String>) -> Self {
+impl ErrorPayload {
+    /// 创建 flat 错误负载 / Create a flat error payload
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -181,123 +190,62 @@ impl ErrorDetail {
         }
     }
 
-    /// 添加详情字段 / Add detail field
-    pub fn with_detail(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
-        let details = self.details.get_or_insert_with(HashMap::new);
-        details.insert(key.into(), value.into());
-        self
-    }
-
-    /// 添加多个详情字段 / Add multiple detail fields
-    pub fn with_details(mut self, details: HashMap<String, serde_json::Value>) -> Self {
+    /// 设置整个 `details` 诊断容器 / Set the whole `details` diagnostic container
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
         self
     }
-}
 
-/// 标准错误响应格式 / Standard error response format
-/// 格式: { "error": { "code": i32, "message": str, "details": object? } }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorResponse {
-    /// 错误详情 / Error detail
-    pub error: ErrorDetail,
-}
-
-impl ErrorResponse {
-    /// 创建新的错误响应 / Create new error response
-    pub fn new(code: i32, message: impl Into<String>) -> Self {
-        Self {
-            error: ErrorDetail::new(code, message),
-        }
-    }
-
-    /// 添加详情字段 / Add detail field
+    /// 向 `details` 对象插入单个字段（若 `details` 非对象则重置为对象）
+    /// Insert a single field into the `details` object (reset to an object if it is not one)
     pub fn with_detail(
         mut self,
         key: impl Into<String>,
         value: impl Into<serde_json::Value>,
     ) -> Self {
-        self.error = self.error.with_detail(key, value);
+        let mut map = match self.details {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        map.insert(key.into(), value.into());
+        self.details = Some(serde_json::Value::Object(map));
         self
     }
+}
 
-    // 便捷构造方法 / Convenience constructors
+/// 判定 `value` 是否为协议级 **flat ErrorPayload**：顶层 `code` 属协议错误码、且无嵌套 envelope。
+///
+/// - flat shape（顶层 `code` 为 [`ErrorCode`] 取值）→ `true`
+/// - 嵌套 `{"error": {...}}`、未知码值、缺 `code`、`code` 非整数、或非对象 → `false`
+///
+/// server（透传判定）与 agent（抛协议错误）共用同一谓词，避免双重启发式漂移。
+/// Shared by the server (passthrough decision) and the agent (raise on protocol error) so the two
+/// never drift apart heuristically.
+///
+/// 对标 Python `a2c_smcp/smcp.py` 的 `is_protocol_error_payload`。
+/// 协议依据 / Protocol: error-handling.md（禁止对 ack 负载二次 unwrap）。
+pub fn is_protocol_error_payload(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .and_then(|obj| obj.get("code"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok())
+        .is_some_and(|code| ErrorCode::from_code(code).is_some())
+}
 
-    /// Bad Request 错误 / Bad Request error
-    pub fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(error_codes::BAD_REQUEST, message)
-    }
-
-    /// Unauthorized 错误 / Unauthorized error
-    pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self::new(error_codes::UNAUTHORIZED, message)
-    }
-
-    /// Forbidden 错误 / Forbidden error
-    pub fn forbidden(message: impl Into<String>) -> Self {
-        Self::new(error_codes::FORBIDDEN, message)
-    }
-
-    /// Not Found 错误 / Not Found error
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(error_codes::NOT_FOUND, message)
-    }
-
-    /// Timeout 错误 / Timeout error
-    pub fn timeout(message: impl Into<String>) -> Self {
-        Self::new(error_codes::TIMEOUT, message)
-    }
-
-    /// Internal Error 错误 / Internal Error error
-    pub fn internal_error(message: impl Into<String>) -> Self {
-        Self::new(error_codes::INTERNAL_ERROR, message)
-    }
-
-    /// Tool Not Found 错误 / Tool Not Found error
-    pub fn tool_not_found(tool_name: impl Into<String>) -> Self {
-        let name = tool_name.into();
-        Self::new(
-            error_codes::TOOL_NOT_FOUND,
-            format!("Tool '{}' not found", name),
-        )
-        .with_detail("tool_name", serde_json::Value::String(name))
-    }
-
-    /// Tool Execution Failed 错误 / Tool Execution Failed error
-    pub fn tool_execution_failed(message: impl Into<String>) -> Self {
-        Self::new(error_codes::TOOL_EXECUTION_FAILED, message)
-    }
-
-    /// Tool Timeout 错误 / Tool Timeout error
-    pub fn tool_timeout(timeout_secs: u64) -> Self {
-        Self::new(
-            error_codes::TOOL_TIMEOUT,
-            format!("Tool execution timed out after {} seconds", timeout_secs),
-        )
-        .with_detail(
-            "timeout",
-            serde_json::Value::Number(serde_json::Number::from(timeout_secs)),
-        )
-    }
-
-    /// Room Full 错误 / Room Full error
-    pub fn room_full(office_id: impl Into<String>) -> Self {
-        let id = office_id.into();
-        Self::new(
-            error_codes::ROOM_FULL,
-            format!("Room '{}' already has an agent", id),
-        )
-        .with_detail("office_id", serde_json::Value::String(id))
-    }
-
-    /// Not In Room 错误 / Not In Room error
-    pub fn not_in_room() -> Self {
-        Self::new(error_codes::NOT_IN_ROOM, "Session is not in any room")
-    }
+/// 构造 `client:*` 路由层目标 Computer 名未注册时返回的 flat ErrorPayload(404)。
+///
+/// 与 Python 实现返回**逐字节一致**的负载（双实现镜像约束）：
+/// `{ "code": 404, "message": "Computer with name '<name>' not found", "details": { "computer_name": "<name>" } }`。
+///
+/// 对标 Python `a2c_smcp/smcp.py` 的 `build_computer_not_found_error`。
+/// 协议依据 / Protocol: error-handling.md §404（工具或 Computer 不存在）；所有 `client:*` ack 协议级错误 MUST 为 flat ErrorPayload。
+pub fn build_computer_not_found_error(computer_name: &str) -> ErrorPayload {
+    ErrorPayload::new(
+        i64::from(ErrorCode::NotFound.code()),
+        format!("Computer with name '{computer_name}' not found"),
+    )
+    .with_detail("computer_name", computer_name)
 }
 
 /// SMCP事件常量定义
@@ -716,75 +664,110 @@ mod tests {
     }
 
     #[test]
-    fn test_error_response_format() {
-        // 测试标准错误响应格式 / Test standard error response format
-        let error_resp = ErrorResponse::new(404, "Resource not found");
+    fn test_error_payload_flat_serialization() {
+        // flat 形态：顶层 code/message，无嵌套 "error" envelope；details 为 None 时不序列化
+        let payload = ErrorPayload::new(404, "Resource not found");
+        let v = serde_json::to_value(&payload).unwrap();
 
-        let json = serde_json::to_string(&error_resp).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        // 验证格式: { "error": { "code": 404, "message": "..." } }
-        assert!(parsed.get("error").is_some());
-        let error = parsed.get("error").unwrap();
-        assert_eq!(error.get("code").unwrap(), 404);
-        assert_eq!(error.get("message").unwrap(), "Resource not found");
-        assert!(error.get("details").is_none()); // 没有 details 时不序列化
+        assert!(v.get("error").is_none(), "禁止嵌套 envelope"); // 顶层平铺
+        assert_eq!(v.get("code").unwrap(), 404);
+        assert_eq!(v.get("message").unwrap(), "Resource not found");
+        assert!(v.get("details").is_none()); // 没有 details 时不序列化
     }
 
     #[test]
-    fn test_error_response_with_details() {
-        // 测试带详情的错误响应 / Test error response with details
-        let error_resp = ErrorResponse::tool_not_found("my_tool");
+    fn test_error_payload_with_details_serialization() {
+        // details 以对象形式平铺在顶层 details 容器内
+        let payload = ErrorPayload::new(4014, "boom")
+            .with_detail("mcp_server_name", "srv-a")
+            .with_detail("hint", "retry");
+        let v = serde_json::to_value(&payload).unwrap();
 
-        let json = serde_json::to_string(&error_resp).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["code"], 4014);
+        assert_eq!(v["details"]["mcp_server_name"], "srv-a");
+        assert_eq!(v["details"]["hint"], "retry");
+    }
 
-        let error = parsed.get("error").unwrap();
-        assert_eq!(error.get("code").unwrap(), error_codes::TOOL_NOT_FOUND);
-        assert!(error
-            .get("message")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("my_tool"));
-        assert!(error.get("details").is_some());
+    #[test]
+    fn test_is_protocol_error_payload_flat_true() {
+        // 顶层 code 为协议 ErrorCode 取值 → true
+        for code in [404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018] {
+            let v = serde_json::json!({ "code": code, "message": "x" });
+            assert!(
+                is_protocol_error_payload(&v),
+                "code {code} 应判定为协议错误负载"
+            );
+        }
+        // 构造器产出的 payload 同样应判定为 true
+        let v = serde_json::to_value(build_computer_not_found_error("c1")).unwrap();
+        assert!(is_protocol_error_payload(&v));
+    }
+
+    #[test]
+    fn test_is_protocol_error_payload_false() {
+        // 嵌套 envelope → false（禁止二次 unwrap 的关键防线）
+        let nested = serde_json::json!({ "error": { "code": 404, "message": "x" } });
+        assert!(!is_protocol_error_payload(&nested));
+
+        // 非协议码（legacy 服务内部码 400 / 未知码 9999）→ false
+        assert!(!is_protocol_error_payload(
+            &serde_json::json!({ "code": 400 })
+        ));
+        assert!(!is_protocol_error_payload(
+            &serde_json::json!({ "code": 9999 })
+        ));
+
+        // 缺 code / code 非整数 / 非对象 → false
+        assert!(!is_protocol_error_payload(
+            &serde_json::json!({ "message": "x" })
+        ));
+        assert!(!is_protocol_error_payload(
+            &serde_json::json!({ "code": "404" })
+        ));
+        assert!(!is_protocol_error_payload(&serde_json::json!([
+            "code", 404
+        ])));
+        assert!(!is_protocol_error_payload(&serde_json::json!("nope")));
+    }
+
+    #[test]
+    fn test_build_computer_not_found_error() {
+        let payload = build_computer_not_found_error("my-computer");
+        assert_eq!(payload.code, 404);
+        assert_eq!(payload.code, i64::from(ErrorCode::NotFound.code()));
+        assert!(payload.message.contains("my-computer"));
         assert_eq!(
-            error.get("details").unwrap().get("tool_name").unwrap(),
-            "my_tool"
+            payload
+                .details
+                .as_ref()
+                .unwrap()
+                .get("computer_name")
+                .unwrap(),
+            "my-computer"
         );
     }
 
     #[test]
-    fn test_error_response_convenience_constructors() {
-        // 测试便捷构造方法 / Test convenience constructors
-        assert_eq!(ErrorResponse::bad_request("test").error.code, 400);
-        assert_eq!(ErrorResponse::unauthorized("test").error.code, 401);
-        assert_eq!(ErrorResponse::forbidden("test").error.code, 403);
-        assert_eq!(ErrorResponse::not_found("test").error.code, 404);
-        assert_eq!(ErrorResponse::timeout("test").error.code, 408);
-        assert_eq!(ErrorResponse::internal_error("test").error.code, 500);
-        assert_eq!(ErrorResponse::tool_not_found("t").error.code, 4001);
-        assert_eq!(ErrorResponse::tool_execution_failed("t").error.code, 4003);
-        assert_eq!(ErrorResponse::tool_timeout(30).error.code, 4004);
-        assert_eq!(ErrorResponse::room_full("office1").error.code, 4101);
-        assert_eq!(ErrorResponse::not_in_room().error.code, 4103);
+    fn test_build_computer_not_found_error_python_byte_compat() {
+        // 与 Python build_computer_not_found_error 逐字节一致（同字段名 / 层级 / 取值）
+        let v = serde_json::to_value(build_computer_not_found_error("c1")).unwrap();
+        let expected = serde_json::json!({
+            "code": 404,
+            "message": "Computer with name 'c1' not found",
+            "details": { "computer_name": "c1" }
+        });
+        assert_eq!(v, expected);
     }
 
     #[test]
-    fn test_error_response_roundtrip() {
-        // 测试序列化和反序列化往返 / Test serialization roundtrip
-        let original = ErrorResponse::new(500, "Internal error")
-            .with_detail("trace_id", serde_json::Value::String("abc123".to_string()));
+    fn test_error_payload_roundtrip() {
+        // ErrorPayload 对任意 code 通用；序列化/反序列化往返一致
+        let original = ErrorPayload::new(500, "Internal error").with_detail("trace_id", "abc123");
 
         let json = serde_json::to_string(&original).unwrap();
-        let deserialized: ErrorResponse = serde_json::from_str(&json).unwrap();
+        let deserialized: ErrorPayload = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(original.error.code, deserialized.error.code);
-        assert_eq!(original.error.message, deserialized.error.message);
-        assert_eq!(
-            original.error.details.as_ref().unwrap().get("trace_id"),
-            deserialized.error.details.as_ref().unwrap().get("trace_id")
-        );
+        assert_eq!(original, deserialized);
     }
 
     #[test]
@@ -870,8 +853,5 @@ mod tests {
             error_codes::TOOL_NOT_FOUND,
             error_codes::TOOL_EXECUTION_FAILED
         );
-        // 便捷构造器映射到正确的语义码
-        assert_eq!(ErrorResponse::tool_not_found("t").error.code, 4001);
-        assert_eq!(ErrorResponse::tool_execution_failed("t").error.code, 4003);
     }
 }
