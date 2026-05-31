@@ -11,5 +11,5 @@ pub mod env;
 pub mod path;
 
 pub use atomic_io::{atomic_write_bytes, atomic_write_text, unique_tmp_path};
-pub use env::{env_truthy, env_truthy_or, is_truthy};
+pub use env::{env_truthy, env_truthy_in, env_truthy_or, is_truthy};
 pub use path::{is_within, normalize_lexical, resolve_xdg_first};

@@ -97,6 +97,10 @@ pub fn resolve_xdg_first(xdg_value: Option<&str>, subpath: &[&str], fallback: &P
 ///
 /// Both sides are [`normalize_lexical`]-ed (folding `.` / `..`) before the prefix check, so `..`
 /// traversal and absolute-path escapes return `false`. Symlinks are not resolved.
+///
+/// 跨-SDK 提示 / Cross-SDK note：与 Python `is_within`（基于 `PurePath.relative_to`，纯词法、**不**折叠
+/// `..`，须调用方先 `resolve()`）行为分叉——`is_within("/base/../secret", "/base")` 本实现为 `false`、
+/// Python 为 `true`。编写跨-SDK 共享测试向量时需注意此差异（本实现默认更安全）。
 pub fn is_within(path: &Path, parent: &Path) -> bool {
     let path = normalize_lexical(path);
     let parent = normalize_lexical(parent);
@@ -166,5 +170,21 @@ mod tests {
             resolve_xdg_first(Some("relative/dir"), &["x"], fallback),
             fallback
         );
+    }
+
+    #[test]
+    fn test_expanduser_branches() {
+        // 非 `~` 前缀：原样穿透（含中段 `~` 不展开，仅前导才展开）
+        assert_eq!(expanduser(Path::new("/abs/x")), PathBuf::from("/abs/x"));
+        assert_eq!(expanduser(Path::new("rel/x")), PathBuf::from("rel/x"));
+        assert_eq!(expanduser(Path::new("/x/~/y")), PathBuf::from("/x/~/y"));
+        // `~` / `~/sub`：用 $HOME 展开（dev/CI 下 HOME 恒设置；未设置则跳过该分支断言）
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(expanduser(Path::new("~")), PathBuf::from(&home));
+            assert_eq!(
+                expanduser(Path::new("~/sub/dir")),
+                Path::new(&home).join("sub/dir")
+            );
+        }
     }
 }

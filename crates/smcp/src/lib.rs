@@ -424,6 +424,12 @@ pub struct ToolCallRet {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub req_id: Option<ReqId>,
     /// 结果级 meta（承载 `a2c_cancelled` / `a2c_cancel_reason` / `a2c_timeout` 等）。
+    ///
+    /// 读写契约 / Read-write contract：标记落**结果级 `meta`**（A2C producer **MUST** 写此处，
+    /// data-structures.md §结果级 `meta` vs 子级 `_meta`）。consumer reader（[`ToolCallRet::is_cancelled`]
+    /// 等）据此读 `meta`。协议另有 SHOULD——consumer 宜对结果级 `_meta` 线上 key 兜底宽松读取（优先 `meta`）；
+    /// 🚧 本结构暂只认 `meta`（当前无 producer 写结果级 `_meta`，Python 连 consumer 侧都未实现，见 #42 跟进），
+    /// result-级 `_meta` 兜底**待补**，以免半实现 churn。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
 }
@@ -1281,5 +1287,25 @@ mod tests {
         // content item 的 _meta 只有 blob 句柄，没有取消标记
         assert_eq!(v["content"][0]["_meta"]["a2c_blob_handle"], "h");
         assert!(v["content"][0]["_meta"].get("a2c_cancelled").is_none());
+    }
+
+    #[test]
+    fn test_tool_call_ret_deserialize_external_meta() {
+        // 反向：消费外部形态 wire JSON（producer 把标记写在结果级 meta）→ reader 正确读取
+        let cancelled_wire = r#"{"content":[{"type":"text","text":"cancelled"}],"isError":true,"meta":{"a2c_cancelled":true,"a2c_cancel_reason":"agent_requested"}}"#;
+        let ret: ToolCallRet = serde_json::from_str(cancelled_wire).unwrap();
+        assert!(ret.is_cancelled());
+        assert_eq!(ret.cancel_reason(), Some("agent_requested"));
+        assert!(!ret.is_timeout());
+
+        let timeout_wire = r#"{"isError":true,"meta":{"a2c_timeout":true}}"#;
+        let ret2: ToolCallRet = serde_json::from_str(timeout_wire).unwrap();
+        assert!(ret2.is_timeout());
+        assert!(!ret2.is_cancelled());
+        assert_eq!(ret2.cancel_reason(), None);
+
+        // 无 meta → 全 false（不 panic）
+        let plain: ToolCallRet = serde_json::from_str(r#"{"isError":false}"#).unwrap();
+        assert!(!plain.is_cancelled() && !plain.is_timeout());
     }
 }

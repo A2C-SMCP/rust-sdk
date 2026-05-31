@@ -37,8 +37,20 @@ pub fn env_truthy(key: &str) -> bool {
 ///
 /// Reads `std::env::var(key)`; unset or blank → `default`; truthy set → `true`; otherwise `false`.
 pub fn env_truthy_or(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(raw) => {
+    env_truthy_in(key, default, |k| std::env::var(k).ok())
+}
+
+/// 注入式真值判定 / Truthiness with an injectable getter（便于确定性测试与自定义环境映射）。
+///
+/// 镜像 Python `env_truthy(key, *, default, env=...)` 的 `env` 注入参：`getter(key)` 返回 `None`
+/// 视为未设置 → `default`；返回空白 → `default`；否则按 [`is_truthy`] 判定（如 `0`/`off` → `false`）。
+/// `env_truthy_or` 即以 `std::env::var` 作为 `getter` 的特化。
+///
+/// Mirrors the Python `env=` injection so the present-but-falsy / present-but-truthy / unset paths
+/// are testable without mutating the process environment.
+pub fn env_truthy_in(key: &str, default: bool, getter: impl Fn(&str) -> Option<String>) -> bool {
+    match getter(key) {
+        Some(raw) => {
             let norm = raw.trim();
             if norm.is_empty() {
                 default
@@ -46,7 +58,7 @@ pub fn env_truthy_or(key: &str, default: bool) -> bool {
                 is_truthy(norm)
             }
         }
-        Err(_) => default,
+        None => default,
     }
 }
 
@@ -77,5 +89,28 @@ mod tests {
         assert!(!env_truthy(key)); // 默认 false
         assert!(!env_truthy_or(key, false));
         assert!(env_truthy_or(key, true)); // 未设置 → default=true
+    }
+
+    #[test]
+    fn test_env_truthy_in_injected_states() {
+        // 注入式：三态确定性覆盖（无需写进程环境）。
+        // 用 fn item（Copy、零捕获）按值传入，避免把 `&闭包` 传给泛型 `impl Fn` 触发
+        // clippy::needless_borrows_for_generic_args。
+        fn env(k: &str) -> Option<String> {
+            match k {
+                "T" => Some("on".to_string()),      // 已设置真值
+                "F" => Some("0".to_string()),       // 已设置假值
+                "OFF" => Some(" OFF ".to_string()), // 已设置假值（含空白/大小写）
+                "BLANK" => Some("   ".to_string()), // 空白
+                _ => None,                          // 未设置
+            }
+        }
+        assert!(env_truthy_in("T", false, env)); // 真值 → true（default 不生效）
+        assert!(!env_truthy_in("F", true, env)); // 假值 → false（default 不生效）← 关键：已设置但为假
+        assert!(!env_truthy_in("OFF", true, env)); // off → false
+        assert!(env_truthy_in("BLANK", true, env)); // 空白 → default
+        assert!(!env_truthy_in("BLANK", false, env));
+        assert!(!env_truthy_in("MISSING", false, env)); // 未设置 → default
+        assert!(env_truthy_in("MISSING", true, env));
     }
 }
