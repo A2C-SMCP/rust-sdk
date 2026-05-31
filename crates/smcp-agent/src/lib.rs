@@ -23,3 +23,4 @@ pub use config::SmcpAgentConfig;
 pub use error::{Result, SmcpAgentError};
 pub use events::{AgentEventHandler, AsyncAgentEventHandler};
 pub use sync_agent::SyncSmcpAgent;
+pub use transport::{NotificationMessage, SocketIoTransport};

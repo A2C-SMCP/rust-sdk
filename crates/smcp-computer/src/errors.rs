@@ -63,6 +63,15 @@ pub enum ComputerError {
     /// 连接错误 / Connection error
     ConnectionError(String),
 
+    #[error("Protocol version mismatch: {0}")]
+    /// 协议版本握手不匹配 / Protocol-version handshake mismatch (HS-02 #22)。
+    ///
+    /// 连接 URL 携带 [`smcp::PROTOCOL_VERSION`] 后，服务端版本握手判定不兼容：HTTP 400 body
+    /// 中携带 4008 [`smcp::ErrorPayload`]（polling 握手），经
+    /// [`smcp::utils::handshake::build_protocol_version_error`] 映射为强类型
+    /// [`smcp::ProtocolVersionError`]。镜像 Python `a2c_smcp/computer/socketio/client.py`。
+    ProtocolVersionMismatch(#[from] smcp::ProtocolVersionError),
+
     #[error("Runtime error: {0}")]
     /// 运行时错误 / Runtime error
     RuntimeError(String),
@@ -133,6 +142,11 @@ impl ComputerError {
             ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR
             ComputerError::TransportError(_) => 500,  // INTERNAL_ERROR
             ComputerError::SocketIoError(_) => 500,   // INTERNAL_ERROR
+
+            // 协议版本握手不匹配 / Protocol version mismatch (4008)
+            ComputerError::ProtocolVersionMismatch(_) => {
+                smcp::ErrorCode::ProtocolVersionMismatch.code()
+            }
 
             // 超时错误 / Timeout errors
             ComputerError::TimeoutError(_) => 408, // TIMEOUT
@@ -224,4 +238,30 @@ pub enum McpClientError {
     #[error("Internal error: {0}")]
     /// 内部错误 / Internal error
     InternalError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_protocol_version_mismatch_from_payload() {
+        // HS-02 #22: 4008 body → ProtocolVersionError → ComputerError::ProtocolVersionMismatch
+        // 经 #[from] 自动转换；error_code() 返回 4008；Display 透传诊断字段。
+        let body = r#"{"code":4008,"message":"Protocol version mismatch","server_version":"0.3.0","client_version":"0.2.0","min_supported":"0.3.0","max_supported":"0.3.999"}"#;
+        let payload = smcp::utils::handshake::extract_4008_payload(body).expect("4008 应被识别");
+        let pve = smcp::utils::handshake::build_protocol_version_error(&payload);
+        let err: ComputerError = pve.into();
+        assert_eq!(err.error_code(), 4008);
+        match err {
+            ComputerError::ProtocolVersionMismatch(e) => {
+                assert_eq!(e.server_version.as_deref(), Some("0.3.0"));
+                assert_eq!(e.client_version.as_deref(), Some("0.2.0"));
+                let s = e.to_string();
+                assert!(s.contains("server=0.3.0"));
+                assert!(s.contains("client=0.2.0"));
+            }
+            other => panic!("expected ProtocolVersionMismatch, got {other:?}"),
+        }
+    }
 }

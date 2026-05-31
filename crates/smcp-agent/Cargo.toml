@@ -25,6 +25,9 @@ uuid.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 tf-rust-socketio.workspace = true
+tf-rust-engineio.workspace = true
 
 [dev-dependencies]
 smcp-server-core.workspace = true
+smcp-server-hyper.workspace = true
+tokio = { workspace = true }

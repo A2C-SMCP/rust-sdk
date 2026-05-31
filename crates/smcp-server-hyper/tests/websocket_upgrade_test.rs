@@ -68,7 +68,11 @@ async fn test_websocket_upgrade() {
     sleep(Duration::from_millis(100)).await;
 
     // 0.2.2 起服务端启用版本握手中间件，客户端连接 URL 必须带 a2c_version，否则被 400 拒绝。
-    let server_url = format!("http://{}/?a2c_version={}", server_addr, smcp::PROTOCOL_VERSION);
+    let server_url = format!(
+        "http://{}/?a2c_version={}",
+        server_addr,
+        smcp::PROTOCOL_VERSION
+    );
 
     // 创建客户端并强制使用WebSocket传输
     let client = ClientBuilder::new(server_url)
@@ -156,7 +160,11 @@ async fn test_websocket_upgrade_with_invalid_role() {
     sleep(Duration::from_millis(100)).await;
 
     // 0.2.2 起服务端启用版本握手中间件，客户端连接 URL 必须带 a2c_version，否则被 400 拒绝。
-    let server_url = format!("http://{}/?a2c_version={}", server_addr, smcp::PROTOCOL_VERSION);
+    let server_url = format!(
+        "http://{}/?a2c_version={}",
+        server_addr,
+        smcp::PROTOCOL_VERSION
+    );
 
     // 创建客户端并强制使用WebSocket传输
     let client = ClientBuilder::new(server_url)
@@ -248,7 +256,11 @@ async fn test_websocket_upgrade_with_polling_fallback() {
     sleep(Duration::from_millis(100)).await;
 
     // 0.2.2 起服务端启用版本握手中间件，客户端连接 URL 必须带 a2c_version，否则被 400 拒绝。
-    let server_url = format!("http://{}/?a2c_version={}", server_addr, smcp::PROTOCOL_VERSION);
+    let server_url = format!(
+        "http://{}/?a2c_version={}",
+        server_addr,
+        smcp::PROTOCOL_VERSION
+    );
 
     // 创建客户端，允许WebSocket和轮询
     let client = ClientBuilder::new(server_url)

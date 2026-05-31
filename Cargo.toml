@@ -103,7 +103,12 @@ dirs = "6"
 
 # Socket.IO / Socket.IO
 socketioxide = { version = "0.16.3", features = ["state"] }
-tf-rust-socketio = { version = "0.7.0", features = ["async"] }
+tf-rust-socketio = { version = "0.8.1", features = ["async"] }
+# engine.io 错误类型（HttpErrorWithBody / WebsocketClosed）；tf-rust-socketio 不 re-export 其 Error，
+# HS-02 (#22) 需直接 match engineio 变体来分类版本握手错误，故显式声明（版本须与 tf-rust-socketio
+# 间接依赖一致）。engine.io error types; socketio does not re-export its Error and HS-02 must match
+# the engineio variants directly. Version must match the one tf-rust-socketio pulls transitively.
+tf-rust-engineio = "0.8.1"
 
 # HTTP服务器 / HTTP server
 hyper = { version = "1", features = ["server", "http1", "http2", "full"] }
