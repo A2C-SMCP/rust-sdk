@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/smcp",
     "crates/smcp-agent",
+    "crates/smcp-client-transport",
     "crates/smcp-computer",
     "crates/smcp-server-core",
     "crates/smcp-server-hyper",
@@ -139,6 +140,7 @@ vrl = "0.29.0"
 # 内部 crate / Internal crates
 smcp = { path = "crates/smcp", version = "0.1.15" }
 smcp-agent = { path = "crates/smcp-agent", version = "0.1.15" }
+smcp-client-transport = { path = "crates/smcp-client-transport", version = "0.1.15" }
 smcp-computer = { path = "crates/smcp-computer", version = "0.1.15" }
 smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.15" }
 smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.15" }

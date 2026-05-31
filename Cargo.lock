@@ -3931,15 +3931,27 @@ dependencies = [
  "serde",
  "serde_json",
  "smcp",
+ "smcp-client-transport",
  "smcp-server-core",
  "smcp-server-hyper",
- "tf-rust-engineio",
  "tf-rust-socketio",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "smcp-client-transport"
+version = "0.1.15"
+dependencies = [
+ "serde_json",
+ "smcp",
+ "tf-rust-engineio",
+ "tf-rust-socketio",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3971,10 +3983,11 @@ dependencies = [
  "serde",
  "serde_json",
  "smcp",
+ "smcp-client-transport",
  "smcp-server-core",
+ "smcp-server-hyper",
  "socketioxide",
  "tempfile",
- "tf-rust-engineio",
  "tf-rust-socketio",
  "thiserror 2.0.18",
  "tokio",

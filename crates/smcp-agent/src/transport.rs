@@ -15,64 +15,15 @@ use smcp::events::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tf_rust_engineio::Error as EngineError;
 use tf_rust_socketio::{
     asynchronous::{Client, ClientBuilder},
-    Error as SocketError, Event, Payload, TransportType,
+    Event, Payload, TransportType,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// 事件处理器类型
 pub type EventHandler = Box<dyn FnMut(Payload, Client) + Send + Sync>;
-
-/// 连接错误的版本握手分类 / Classification of a connect error for version handshake (HS-02 #22)。
-///
-/// 纯函数 [`classify_connect_error`] 的产物，便于在不构造真实网络错误的前提下单测分类逻辑。
-/// Produced by the pure [`classify_connect_error`] so the branch logic is unit-testable without a
-/// live network error.
-#[derive(Debug)]
-enum ConnectErrorKind {
-    /// polling 握手收到 HTTP 400 + 4008 body → 已解析出强类型版本错误。
-    /// Polling handshake got HTTP 400 + a 4008 body → typed version error already parsed.
-    ProtocolVersion(smcp::ProtocolVersionError),
-    /// WS 握手被 4900 close code 拒绝（无结构化 body）→ 需改 polling 取权威 4008。
-    /// WS handshake rejected with the 4900 close code (no structured body) → must re-fetch the
-    /// authoritative 4008 over polling.
-    WsRejected4900,
-    /// 其它错误 → 走通用连接错误路径 / Anything else → generic connection error path。
-    Other,
-}
-
-/// 把 socket.io 连接错误分类到版本握手语义 / Classify a socket.io connect error (HS-02 #22)。
-///
-/// 纯函数（不触网、无副作用），按以下顺序匹配，镜像 Python `a2c_smcp` 客户端握手处理：
-/// Pure (no I/O, no side effects); matched in order, mirroring the Python client handshake:
-/// 1. `IncompleteResponseFromEngineIo(HttpErrorWithBody { status: 400, body })` 且
-///    [`extract_4008_payload`](smcp::utils::handshake::extract_4008_payload) 命中 → [`ConnectErrorKind::ProtocolVersion`]；
-/// 2. `IncompleteResponseFromEngineIo(WebsocketClosed { code })` 且
-///    `code == `[`WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE`](smcp::WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE)（4900）→ [`ConnectErrorKind::WsRejected4900`]；
-/// 3. 其它（含 400 但 body 非 4008）→ [`ConnectErrorKind::Other`]。
-fn classify_connect_error(err: &SocketError) -> ConnectErrorKind {
-    if let SocketError::IncompleteResponseFromEngineIo(engine_err) = err {
-        match engine_err {
-            EngineError::HttpErrorWithBody { status, body } if *status == 400 => {
-                if let Some(payload) = smcp::utils::handshake::extract_4008_payload(body) {
-                    return ConnectErrorKind::ProtocolVersion(
-                        smcp::utils::handshake::build_protocol_version_error(&payload),
-                    );
-                }
-            }
-            EngineError::WebsocketClosed { code, .. }
-                if i32::from(*code) == smcp::WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE =>
-            {
-                return ConnectErrorKind::WsRejected4900;
-            }
-            _ => {}
-        }
-    }
-    ConnectErrorKind::Other
-}
 
 /// 通知事件消息
 #[derive(Debug, Clone)]
@@ -284,8 +235,23 @@ impl SocketIoTransport {
         }
 
         // 连接服务器（polling-first 已设；分类版本握手错误，4900 时改 polling 取 4008）
-        let client =
-            Self::finish_connect(builder, &handshake_url, namespace, auth, headers).await?;
+        let client = match smcp_client_transport::connect_and_classify(
+            builder,
+            &handshake_url,
+            namespace,
+            auth,
+            headers,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
+                return Err(SmcpAgentError::ProtocolVersionMismatch(pve));
+            }
+            Err(smcp_client_transport::ConnectError::Connection(msg)) => {
+                return Err(SmcpAgentError::connection(msg));
+            }
+        };
 
         // 等待一小段时间确保 Socket.IO namespace 连接完全建立
         // Wait for Socket.IO namespace connection to be fully established
@@ -331,81 +297,22 @@ impl SocketIoTransport {
             builder = builder.opening_header(key.clone(), value.clone());
         }
 
-        Self::finish_connect(builder, handshake_url, namespace, auth, headers).await
-    }
-
-    /// 执行 connect 并按版本握手语义分类错误 / Run connect, classifying version-handshake errors。
-    ///
-    /// HS-02 #22 受控错误处理（镜像 Python `a2c_smcp` 客户端）：
-    /// - `Ok` → 原样返回 client；
-    /// - 4008（polling 握手 HTTP 400 + body）→ [`SmcpAgentError::ProtocolVersionMismatch`]；
-    /// - 4900（WS close code）→ **不自动重连**；做**一次**受控 polling 重连取权威 4008 body：
-    ///   命中 → 该 4008 错误；否则回退到一条仅含 message 的 [`smcp::ProtocolVersionError`]；
-    /// - 其它 → 通用连接错误。
-    async fn finish_connect(
-        builder: ClientBuilder,
-        handshake_url: &str,
-        namespace: &str,
-        auth: Option<Value>,
-        headers: HashMap<String, String>,
-    ) -> Result<Client> {
-        match builder.connect().await {
+        match smcp_client_transport::connect_and_classify(
+            builder,
+            handshake_url,
+            namespace,
+            auth,
+            headers,
+        )
+        .await
+        {
             Ok(client) => Ok(client),
-            Err(e) => match classify_connect_error(&e) {
-                ConnectErrorKind::ProtocolVersion(pve) => {
-                    Err(SmcpAgentError::ProtocolVersionMismatch(pve))
-                }
-                ConnectErrorKind::WsRejected4900 => {
-                    warn!(
-                        "WebSocket handshake rejected with close code {} (protocol version); \
-                         doing a single controlled polling re-fetch for the authoritative 4008 body",
-                        smcp::WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE
-                    );
-                    Err(SmcpAgentError::ProtocolVersionMismatch(
-                        Self::fetch_4008_via_polling(handshake_url, namespace, auth, headers).await,
-                    ))
-                }
-                ConnectErrorKind::Other => Err(SmcpAgentError::connection(format!(
-                    "Failed to connect: {}",
-                    e
-                ))),
-            },
-        }
-    }
-
-    /// 4900 后改 polling 取权威 4008 / After 4900, re-fetch the authoritative 4008 over polling。
-    ///
-    /// 单次受控重连：用 [`TransportType::Polling`]（同 handshake_url + 同 auth/headers），命中 4008
-    /// → 返回该强类型错误；否则返回仅含 message 的回退错误。**绝不循环重试**。
-    async fn fetch_4008_via_polling(
-        handshake_url: &str,
-        namespace: &str,
-        auth: Option<Value>,
-        headers: HashMap<String, String>,
-    ) -> smcp::ProtocolVersionError {
-        let mut builder = ClientBuilder::new(handshake_url).transport_type(TransportType::Polling);
-        if !namespace.is_empty() {
-            builder = builder.namespace(namespace);
-        }
-        if let Some(auth_data) = auth {
-            builder = builder.auth(auth_data);
-        }
-        for (key, value) in headers {
-            builder = builder.opening_header(key, value);
-        }
-        match builder.connect().await {
-            // polling 居然连上了（4008 不再复现）—— 仍按版本拒绝处理，给出诊断性回退。
-            Ok(_) => smcp::ProtocolVersionError::new(
-                "WebSocket handshake rejected with close code 4900 (protocol version); \
-                 authoritative 4008 unavailable",
-            ),
-            Err(e) => match classify_connect_error(&e) {
-                ConnectErrorKind::ProtocolVersion(pve) => pve,
-                _ => smcp::ProtocolVersionError::new(
-                    "WebSocket handshake rejected with close code 4900 (protocol version); \
-                     authoritative 4008 unavailable",
-                ),
-            },
+            Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
+                Err(SmcpAgentError::ProtocolVersionMismatch(pve))
+            }
+            Err(smcp_client_transport::ConnectError::Connection(msg)) => {
+                Err(SmcpAgentError::connection(msg))
+            }
         }
     }
 
@@ -488,83 +395,5 @@ impl Default for SocketIoTransport {
         // 注意：这实际上不能使用，因为Client::new()需要参数
         // 这里只是为了满足Default trait的要求
         panic!("SocketIoTransport must be created via connect() method");
-    }
-}
-
-#[cfg(test)]
-mod connect_classify_tests {
-    use super::*;
-
-    /// 构造一个 socket.io 连接错误（包裹给定 engine.io 错误）。
-    /// tf-rust-engineio::Error 是 #[non_exhaustive]，外部无法直接构造其变体；改用 SocketError 的
-    /// #[from] 转换路径（IncompleteResponseFromEngineIo）注入，再交给被测的 classify_connect_error。
-    fn socket_err(engine: EngineError) -> SocketError {
-        SocketError::from(engine)
-    }
-
-    #[test]
-    fn test_classify_400_with_4008_body_maps_to_protocol_version() {
-        let body = r#"{"code":4008,"message":"Protocol version mismatch","server_version":"0.3.0","client_version":"0.2.0","min_supported":"0.3.0","max_supported":"0.3.999"}"#;
-        let err = socket_err(EngineError::HttpErrorWithBody {
-            status: 400,
-            body: body.to_string(),
-        });
-        match classify_connect_error(&err) {
-            ConnectErrorKind::ProtocolVersion(pve) => {
-                assert_eq!(pve.server_version.as_deref(), Some("0.3.0"));
-                assert_eq!(pve.client_version.as_deref(), Some("0.2.0"));
-            }
-            other => panic!("expected ProtocolVersion, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_classify_400_non_4008_body_is_other() {
-        // 400 但 body 非 4008（如 missing/invalid 的 code=400）→ 走通用路径，绝不误判为版本错误。
-        let err = socket_err(EngineError::HttpErrorWithBody {
-            status: 400,
-            body: r#"{"code":400,"message":"Missing a2c_version"}"#.to_string(),
-        });
-        assert!(matches!(
-            classify_connect_error(&err),
-            ConnectErrorKind::Other
-        ));
-    }
-
-    #[test]
-    fn test_classify_ws_4900_maps_to_ws_rejected() {
-        let err = socket_err(EngineError::WebsocketClosed {
-            code: smcp::WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE as u16,
-            reason: "protocol version".to_string(),
-        });
-        assert!(matches!(
-            classify_connect_error(&err),
-            ConnectErrorKind::WsRejected4900
-        ));
-    }
-
-    #[test]
-    fn test_classify_ws_other_close_code_is_other() {
-        // 非 4900 的 WS close（如 1000 正常关闭）→ 不当作版本拒绝。
-        let err = socket_err(EngineError::WebsocketClosed {
-            code: 1000,
-            reason: "normal".to_string(),
-        });
-        assert!(matches!(
-            classify_connect_error(&err),
-            ConnectErrorKind::Other
-        ));
-    }
-
-    #[test]
-    fn test_classify_non_400_http_is_other() {
-        let err = socket_err(EngineError::HttpErrorWithBody {
-            status: 500,
-            body: r#"{"code":4008}"#.to_string(),
-        });
-        assert!(matches!(
-            classify_connect_error(&err),
-            ConnectErrorKind::Other
-        ));
     }
 }

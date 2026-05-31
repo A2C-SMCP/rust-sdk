@@ -9,6 +9,7 @@ keywords = ["smcp", "computer", "mcp", "tool"]
 categories = ["network-programming", "development-tools"]
 
 [dev-dependencies]
+smcp-server-hyper.workspace = true
 smcp-server-core.workspace = true
 tracing-subscriber.workspace = true
 hyper.workspace = true
@@ -21,6 +22,7 @@ socketioxide.workspace = true
 
 [dependencies]
 smcp.workspace = true
+smcp-client-transport.workspace = true
 
 tokio.workspace = true
 serde.workspace = true
@@ -34,7 +36,6 @@ dashmap.workspace = true
 async-recursion.workspace = true
 
 tf-rust-socketio.workspace = true
-tf-rust-engineio.workspace = true
 tokio-util.workspace = true
 regex.workspace = true
 lazy_static.workspace = true
