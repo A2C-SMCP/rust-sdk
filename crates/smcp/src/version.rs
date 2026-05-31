@@ -99,6 +99,65 @@ pub fn is_compatible(client: &ProtocolVersion, server: &ProtocolVersion) -> bool
     client.minor <= server.minor
 }
 
+/// 版本握手被拒错误 / Protocol-version handshake rejection error。
+///
+/// 客户端（Agent/Computer）解析服务端返回的 4008 [`crate::ErrorPayload`] 后抛出的强类型错误，
+/// 承载顶层平铺的版本诊断字段。对标 Python 参考实现 `a2c_smcp/exceptions.py` 的
+/// `ProtocolVersionError`（置于共享层、Agent 与 Computer 共用，避免反向依赖）。
+///
+/// 由 [`crate::utils::handshake::build_protocol_version_error`] 从 4008 负载构造。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolVersionError {
+    /// 客户端版本（4008 body 顶层 `client_version`）。
+    pub client_version: Option<String>,
+    /// 服务端版本（`server_version`）。
+    pub server_version: Option<String>,
+    /// 服务端支持的最小版本（`min_supported`）。
+    pub min_supported: Option<String>,
+    /// 服务端支持的最大版本（`max_supported`）。
+    pub max_supported: Option<String>,
+    /// 人类可读错误描述（`message`）。
+    pub message: String,
+}
+
+impl ProtocolVersionError {
+    /// 以一条 message 构造（版本字段留空）/ Construct from a bare message。
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            client_version: None,
+            server_version: None,
+            min_supported: None,
+            max_supported: None,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ProtocolVersionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)?;
+        let mut diag = Vec::new();
+        if let Some(c) = &self.client_version {
+            diag.push(format!("client={c}"));
+        }
+        if let Some(s) = &self.server_version {
+            diag.push(format!("server={s}"));
+        }
+        if let Some(m) = &self.min_supported {
+            diag.push(format!("min={m}"));
+        }
+        if let Some(m) = &self.max_supported {
+            diag.push(format!("max={m}"));
+        }
+        if !diag.is_empty() {
+            write!(f, " ({})", diag.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProtocolVersionError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

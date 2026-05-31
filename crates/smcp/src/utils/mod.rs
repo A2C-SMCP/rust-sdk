@@ -8,8 +8,14 @@
 
 pub mod atomic_io;
 pub mod env;
+pub mod handshake;
 pub mod path;
 
 pub use atomic_io::{atomic_write_bytes, atomic_write_text, unique_tmp_path};
 pub use env::{env_truthy, env_truthy_in, env_truthy_or, is_truthy};
+pub use handshake::{
+    apply_polling_first_guard, build_handshake_url, build_protocol_version_error,
+    enforce_polling_first, extract_4008_payload, A2C_VERSION_QUERY_KEY,
+    DEFAULT_HANDSHAKE_TRANSPORTS,
+};
 pub use path::{is_within, normalize_lexical, resolve_xdg_first};

@@ -14,7 +14,9 @@ pub use skill_name::{
 
 /// 协议版本解析与兼容性判定 / Protocol version parse & compatibility。
 pub mod version;
-pub use version::{is_compatible, ProtocolVersion, ProtocolVersionParseError};
+pub use version::{
+    is_compatible, ProtocolVersion, ProtocolVersionError, ProtocolVersionParseError,
+};
 
 /// SMCP协议的命名空间
 pub const SMCP_NAMESPACE: &str = "/smcp";
@@ -195,12 +197,12 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// 协议依据 / Protocol: `a2c-smcp-protocol` error-handling.md（flat ErrorPayload，禁止二次 unwrap）。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py` 的 `ErrorPayload`。
 ///
-/// 🚧 待补（latent 跨-SDK 漂移，随对应码的代码路径落地）：Python `ErrorPayload`（smcp.py:484，
-/// `total=False` TypedDict）对特定码在顶层平铺**分流字段**——4008 → `server_version` / `client_version` /
-/// `min_supported` / `max_supported`（HS-01 #21 / HS-02 #22）；4014 / 4015 → `mcp_server_name` / `capability`
-/// （SRV-01 #47 / AUTH-01 #23）。本结构当前仅 `code` / `message` / `details`，且无 `#[serde(flatten)]`
-/// 兜底，反序列化会静默丢弃这些顶层字段。在握手 / SKILL / blob 代码路径落地前不补齐，以免半实现
-/// （flatten 兜底后又被 typed 字段替换）造成 churn。
+/// 协议 0.2.x 对特定码在**顶层平铺**分流字段（对齐 Python `smcp.py` `ErrorPayload`
+/// `total=False` TypedDict）：4008（协议版本不兼容）→ `server_version` / `client_version` /
+/// `min_supported` / `max_supported`（HS-01 #21 / HS-02 #22，**已落地**，构造见
+/// [`ErrorPayload::version_mismatch`]）。
+/// 🚧 待补（latent，随对应码代码路径落地）：4014 / 4015 → `mcp_server_name` / `capability`
+/// （SRV-01 #47 / AUTH-01 #23）。未知顶层字段在反序列化时被忽略（serde 默认行为）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorPayload {
     /// 错误码（协议 `ErrorCode` 取值；线格式为裸整数）/ Error code (a protocol `ErrorCode` value; bare int on the wire)
@@ -210,6 +212,18 @@ pub struct ErrorPayload {
     /// 诊断容器（可选；为空时不序列化）/ Diagnostic container (optional; skipped when absent)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
+    /// 4008 顶层分流：服务端协议版本 / top-level for 4008: server protocol version。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
+    /// 4008 顶层分流：客户端协议版本 / top-level for 4008: client protocol version。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+    /// 4008 顶层分流：服务端支持的最小版本 / top-level for 4008: min supported。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_supported: Option<String>,
+    /// 4008 顶层分流：服务端支持的最大版本 / top-level for 4008: max supported。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_supported: Option<String>,
 }
 
 impl ErrorPayload {
@@ -219,6 +233,10 @@ impl ErrorPayload {
             code,
             message: message.into(),
             details: None,
+            server_version: None,
+            client_version: None,
+            min_supported: None,
+            max_supported: None,
         }
     }
 
@@ -242,6 +260,23 @@ impl ErrorPayload {
         map.insert(key.into(), value.into());
         self.details = Some(serde_json::Value::Object(map));
         self
+    }
+
+    /// 构造 4008（协议版本不兼容）flat ErrorPayload，顶层平铺 4 个版本分流字段。
+    ///
+    /// `min_supported` / `max_supported` 由 server 版本派生：同 `MAJOR.MINOR` 的整个 PATCH 段
+    /// （`{maj}.{min}.0` ～ `{maj}.{min}.999`）。`message` 固定为 `"Protocol version mismatch"`。
+    /// 与 Python middleware `_mismatch_body` 逐字段对齐。供 HS-01 (#21) 服务端握手中间件复用。
+    pub fn version_mismatch(client: &ProtocolVersion, server: &ProtocolVersion) -> Self {
+        Self {
+            code: i64::from(ErrorCode::ProtocolVersionMismatch.code()),
+            message: "Protocol version mismatch".to_string(),
+            details: None,
+            server_version: Some(server.to_string()),
+            client_version: Some(client.to_string()),
+            min_supported: Some(format!("{}.{}.0", server.major, server.minor)),
+            max_supported: Some(format!("{}.{}.999", server.major, server.minor)),
+        }
     }
 }
 
