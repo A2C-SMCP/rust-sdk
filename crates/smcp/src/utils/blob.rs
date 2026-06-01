@@ -22,9 +22,13 @@
 //! | `sha256` / `total_size` 跨块漂移          | 取消 + 串行 fallback；串行态触发从 0 重读     |
 //! | 全量 `sha256` 校验失败                    | 串行从 0 重读（最多 `max_retries`）→ 失败抛出 |
 //!
-//! async 与 sync 差异（与 Python 一致）/ async-vs-sync nuance (matches Python)：async 并行收集所有
-//! 已发生异常后按「fatal > recoverable」优先级分派；sync 并行遇首个错误即停（fatal 仍优先于
-//! recoverable，永不隐藏 fatal）。
+//! 错误优先级（async 与 sync 一致）/ error priority (async & sync agree)：并发态收集所有已完成
+//! 结果后按「fatal > recoverable」分派——**永不隐藏 fatal**。recoverable（range / 漂移）**不**提前
+//! 中止采集，确保并存的 fatal 必被发现；**仅** fatal 提前取消在飞任务（best-effort）。
+//!
+//! 注：此处刻意比 Python 参考更稳健——Python `_drain_parallel_sync` 用 `as_completed` + 首错即停，
+//! range 先完成会掩盖并存 fatal（与其 `_drain_parallel_async` 不一致）；已出建议报告促 Python 对齐。
+//! Deliberately more robust than the Python reference, whose sync path can mask a co-occurring fatal.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -73,6 +77,8 @@ pub struct DrainBlobOptions {
     /// 客户建议单块上限；`0` 取 [`DEFAULT_CHUNK_SIZE`] / suggested chunk size (`0` → default)。
     pub chunk_size: u64,
     /// 串行重读上限 / serial-reread cap（应对源漂移 / 全量 sha256 不一致）。
+    ///
+    /// 入口处夹取至 `≥ 1`（至少尝试一次）/ clamped to `≥ 1` at entry (always at least one attempt)。
     pub max_retries: usize,
 }
 
@@ -189,15 +195,16 @@ where
     Fut: Future<Output = Result<GetBlobRet, ErrorPayload>>,
 {
     let chunk_size = effective_chunk(opts.chunk_size);
+    // 夹取至 ≥1：至少尝试一次（`0` 会零次循环、不发 call 即 MaxRetriesExceeded，反直觉）。
+    let max_retries = opts.max_retries.max(1);
     if opts.concurrency <= 1 {
-        return drain_serial_async(&call, computer, blob_handle, chunk_size, opts.max_retries)
-            .await;
+        return drain_serial_async(&call, computer, blob_handle, chunk_size, max_retries).await;
     }
     match drain_parallel_async(&call, computer, blob_handle, chunk_size, opts.concurrency).await {
         Ok(v) => Ok(v),
         Err(ParallelErr::Fatal(e)) => Err(e),
         Err(ParallelErr::Fallback) => {
-            drain_serial_async(&call, computer, blob_handle, chunk_size, opts.max_retries).await
+            drain_serial_async(&call, computer, blob_handle, chunk_size, max_retries).await
         }
     }
 }
@@ -218,14 +225,16 @@ where
     F: Fn(BlobChunkRequest) -> Result<GetBlobRet, ErrorPayload> + Sync,
 {
     let chunk_size = effective_chunk(opts.chunk_size);
+    // 夹取至 ≥1：至少尝试一次（与 [`drain_blob`] 一致）。
+    let max_retries = opts.max_retries.max(1);
     if opts.concurrency <= 1 {
-        return drain_serial_sync(&call, computer, blob_handle, chunk_size, opts.max_retries);
+        return drain_serial_sync(&call, computer, blob_handle, chunk_size, max_retries);
     }
     match drain_parallel_sync(&call, computer, blob_handle, chunk_size, opts.concurrency) {
         Ok(v) => Ok(v),
         Err(ParallelErr::Fatal(e)) => Err(e),
         Err(ParallelErr::Fallback) => {
-            drain_serial_sync(&call, computer, blob_handle, chunk_size, opts.max_retries)
+            drain_serial_sync(&call, computer, blob_handle, chunk_size, max_retries)
         }
     }
 }
@@ -504,16 +513,18 @@ where
                     Ok(Some((off, bytes))) => {
                         results.lock().unwrap().insert(off, bytes);
                     }
+                    // recoverable（漂移 / range）**不**早停：继续领取剩余 offset，确保并存的
+                    // fatal 必被发现（永不隐藏 fatal）——与 async 路径一致。
+                    // Recoverable does NOT stop early: keep draining so a co-occurring fatal is
+                    // always discovered (never hide a fatal) — matching the async path.
                     Ok(None) => {
                         recoverable.store(true, Ordering::Relaxed);
-                        stop.store(true, Ordering::Relaxed);
-                        break;
                     }
                     Err(ChunkErr::Range) => {
                         recoverable.store(true, Ordering::Relaxed);
-                        stop.store(true, Ordering::Relaxed);
-                        break;
                     }
+                    // 仅 fatal 提前取消在飞任务（best-effort：已运行的 call 无法中断）。
+                    // Only a fatal cancels in-flight work (best-effort; a running call can't be killed).
                     Err(ChunkErr::Fatal(e)) => {
                         let mut guard = fatal.lock().unwrap();
                         if guard.is_none() {
@@ -1091,5 +1102,280 @@ mod tests {
             BlobErrorReason::parse("future_reason"),
             BlobErrorReason::Other("future_reason".to_string())
         );
+    }
+
+    // ── fix-review 跟进：并发关键分支 + 边界 ───────────────────────────
+
+    /// 并行态：某非零 offset 块返回**漂移**的 sha（成功响应但 sha≠expected）→ absorb_parallel
+    /// `Ok(None)` → recoverable → 回退串行（源已稳定）→ 成功。覆盖 finding 1a。
+    #[tokio::test]
+    async fn parallel_async_drift_falls_back_to_serial() {
+        let data = Arc::new(sample(2000));
+        let sha = sha256_hex(&data);
+        let wrong = "0".repeat(64);
+        let injected = Arc::new(AtomicBool::new(false));
+        let call = {
+            let data = data.clone();
+            let sha = sha.clone();
+            let wrong = wrong.clone();
+            let injected = injected.clone();
+            move |req: BlobChunkRequest| {
+                let data = data.clone();
+                let sha = sha.clone();
+                let wrong = wrong.clone();
+                let injected = injected.clone();
+                async move {
+                    // 首个非零 offset 注入一次漂移（合法字节 + 错误 sha）；之后（含串行回退）正常。
+                    let use_sha = if req.chunk_offset > 0 && !injected.swap(true, Ordering::SeqCst)
+                    {
+                        &wrong
+                    } else {
+                        &sha
+                    };
+                    Ok::<_, ErrorPayload>(serve(
+                        &data,
+                        use_sha,
+                        req.chunk_offset,
+                        req.max_chunk_bytes,
+                    ))
+                }
+            }
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 4,
+            chunk_size: 256,
+            max_retries: 3,
+        };
+        let (bytes, _mime) = drain_blob(call, "c", "h", opts).await.unwrap();
+        assert!(injected.load(Ordering::SeqCst), "应曾注入并行漂移");
+        assert_eq!(bytes, *data);
+    }
+
+    /// 并行态：range（低 offset，recoverable）与 forbidden（高 offset，fatal）并存 → **fatal 胜出**，
+    /// 返回 NotAccessible{Forbidden} 而非回退串行（回退会得到 serial 态 range fatal）。覆盖 finding 1d (async)。
+    #[tokio::test]
+    async fn parallel_async_fatal_beats_recoverable() {
+        let data = Arc::new(sample(2000));
+        let sha = sha256_hex(&data);
+        let call = {
+            let data = data.clone();
+            let sha = sha.clone();
+            move |req: BlobChunkRequest| {
+                let data = data.clone();
+                let sha = sha.clone();
+                async move {
+                    match req.chunk_offset {
+                        256 => Err::<GetBlobRet, _>(err_4018("range")),
+                        512 => Err(err_4018("forbidden")),
+                        off => Ok(serve(&data, &sha, off, req.max_chunk_bytes)),
+                    }
+                }
+            }
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 4,
+            chunk_size: 256,
+            max_retries: 3,
+        };
+        let err = drain_blob(call, "c", "h", opts).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BlobTransferError::NotAccessible {
+                    reason: BlobErrorReason::Forbidden,
+                    ..
+                }
+            ),
+            "fatal 必须胜出，得到的却是 {err:?}"
+        );
+    }
+
+    /// sync 版 fatal>recoverable——改动 1（recoverable 不早停）后确定性成立。覆盖 finding 1d (sync)。
+    #[test]
+    fn parallel_sync_fatal_beats_recoverable() {
+        let data = sample(2000);
+        let sha = sha256_hex(&data);
+        let call = |req: BlobChunkRequest| match req.chunk_offset {
+            256 => Err::<GetBlobRet, _>(err_4018("range")),
+            512 => Err(err_4018("forbidden")),
+            off => Ok(serve(&data, &sha, off, req.max_chunk_bytes)),
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 4,
+            chunk_size: 256,
+            max_retries: 3,
+        };
+        let err = drain_blob_sync(call, "c", "h", opts).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BlobTransferError::NotAccessible {
+                    reason: BlobErrorReason::Forbidden,
+                    ..
+                }
+            ),
+            "sync fatal 必须胜出，得到的却是 {err:?}"
+        );
+    }
+
+    /// sync 版并行漂移回退串行成功（absorb_parallel `Ok(None)` 对称覆盖）。
+    #[test]
+    fn parallel_sync_drift_falls_back_to_serial() {
+        let data = sample(2000);
+        let sha = sha256_hex(&data);
+        let wrong = "0".repeat(64);
+        let injected = AtomicBool::new(false);
+        let call = |req: BlobChunkRequest| {
+            let use_sha = if req.chunk_offset > 0 && !injected.swap(true, Ordering::SeqCst) {
+                &wrong
+            } else {
+                &sha
+            };
+            Ok::<_, ErrorPayload>(serve(&data, use_sha, req.chunk_offset, req.max_chunk_bytes))
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 4,
+            chunk_size: 256,
+            max_retries: 3,
+        };
+        let (bytes, _mime) = drain_blob_sync(call, "c", "h", opts).unwrap();
+        assert!(injected.load(Ordering::SeqCst));
+        assert_eq!(bytes, data);
+    }
+
+    /// 并行单块（data < chunk_size）首块 sha 不符 → `single_chunk_result` Fallback → 串行成功。覆盖 finding 1c。
+    #[tokio::test]
+    async fn parallel_async_single_chunk_sha_mismatch_falls_back() {
+        let data = Arc::new(sample(100)); // < chunk_size → 单块路径
+        let sha = sha256_hex(&data);
+        let wrong = "0".repeat(64);
+        let count = Arc::new(AtomicUsize::new(0));
+        let call = {
+            let data = data.clone();
+            let sha = sha.clone();
+            let wrong = wrong.clone();
+            let count = count.clone();
+            move |req: BlobChunkRequest| {
+                let data = data.clone();
+                let sha = sha.clone();
+                let wrong = wrong.clone();
+                let count = count.clone();
+                async move {
+                    // 首次（并行首块）报错 sha，触发 single_chunk_result Fallback；串行重读正常。
+                    let use_sha = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        &wrong
+                    } else {
+                        &sha
+                    };
+                    Ok::<_, ErrorPayload>(serve(
+                        &data,
+                        use_sha,
+                        req.chunk_offset,
+                        req.max_chunk_bytes,
+                    ))
+                }
+            }
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 4,
+            chunk_size: 256,
+            max_retries: 3,
+        };
+        let (bytes, _mime) = drain_blob(call, "c", "h", opts).await.unwrap();
+        assert_eq!(bytes, *data);
+    }
+
+    /// 并行：全块一致报 bogus sha（每块 sha 自洽 → absorb 通过）但重组字节哈希不符 →
+    /// `reassemble` Fallback → 串行 Drift → 耗尽 → `MaxRetriesExceeded`。覆盖 finding 1b。
+    #[tokio::test]
+    async fn parallel_async_reassemble_sha_mismatch_exhausts() {
+        let data = Arc::new(sample(2000));
+        let bogus = "0".repeat(64);
+        let call = {
+            let data = data.clone();
+            let bogus = bogus.clone();
+            move |req: BlobChunkRequest| {
+                let data = data.clone();
+                let bogus = bogus.clone();
+                async move {
+                    Ok::<_, ErrorPayload>(serve(
+                        &data,
+                        &bogus,
+                        req.chunk_offset,
+                        req.max_chunk_bytes,
+                    ))
+                }
+            }
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 4,
+            chunk_size: 256,
+            max_retries: 2,
+        };
+        let err = drain_blob(call, "c", "h", opts).await.unwrap_err();
+        assert_eq!(err, BlobTransferError::MaxRetriesExceeded { retries: 2 });
+    }
+
+    /// 分块响应 base64 非法 → `BlobTransferError::Decode`（fatal）。覆盖 finding 2。
+    #[tokio::test]
+    async fn serial_async_decode_error() {
+        let call = |_req: BlobChunkRequest| async {
+            Ok::<_, ErrorPayload>(GetBlobRet {
+                blob_handle: "h".to_string(),
+                mime_type: Some("application/octet-stream".to_string()),
+                total_size: 8,
+                sha256: "deadbeef".to_string(),
+                chunk_offset: 0,
+                eof: true,
+                blob: "@@@not-base64@@@".to_string(),
+                req_id: None,
+            })
+        };
+        let err = drain_blob(call, "c", "h", DrainBlobOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobTransferError::Decode(_)), "got {err:?}");
+    }
+
+    /// sync 串行重读耗尽 → `MaxRetriesExceeded`（对称 async 既有用例）。覆盖 finding 3。
+    #[test]
+    fn serial_sync_sha_mismatch_exhausts_retries() {
+        let data = sample(300);
+        let bogus = "0".repeat(64);
+        let call = |req: BlobChunkRequest| {
+            Ok::<_, ErrorPayload>(serve(&data, &bogus, req.chunk_offset, req.max_chunk_bytes))
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 1,
+            chunk_size: 128,
+            max_retries: 2,
+        };
+        let err = drain_blob_sync(call, "c", "h", opts).unwrap_err();
+        assert_eq!(err, BlobTransferError::MaxRetriesExceeded { retries: 2 });
+    }
+
+    /// `max_retries == 0` 经入口 clamp 仍尝试一次 → 正常成功（证明 ≥1 加固）。覆盖 finding 4。
+    #[tokio::test]
+    async fn serial_async_zero_retries_still_attempts_once() {
+        let data = Arc::new(sample(300));
+        let sha = sha256_hex(&data);
+        let call = {
+            let data = data.clone();
+            let sha = sha.clone();
+            move |req: BlobChunkRequest| {
+                let data = data.clone();
+                let sha = sha.clone();
+                async move {
+                    Ok::<_, ErrorPayload>(serve(&data, &sha, req.chunk_offset, req.max_chunk_bytes))
+                }
+            }
+        };
+        let opts = DrainBlobOptions {
+            concurrency: 1,
+            chunk_size: 128,
+            max_retries: 0,
+        };
+        let (bytes, _mime) = drain_blob(call, "c", "h", opts).await.unwrap();
+        assert_eq!(bytes, *data);
     }
 }
