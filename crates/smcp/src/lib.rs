@@ -325,6 +325,12 @@ pub mod events {
     pub const CLIENT_GET_DESKTOP: &str = "client:get_desktop";
     /// 客户端工具调用请求
     pub const CLIENT_TOOL_CALL: &str = "client:tool_call";
+    /// 客户端资源发现请求（v0.2.0）：透明转发 MCP `resources/list` / Resource discovery (v0.2.0).
+    pub const CLIENT_GET_RESOURCES: &str = "client:get_resources";
+    /// 客户端 SKILL 清单发现请求（v0.2.1）/ SKILL inventory discovery (v0.2.1)。
+    pub const CLIENT_GET_SKILLS: &str = "client:get_skills";
+    /// 客户端 SKILL 包内单资源拉取请求（v0.2.1）/ Single in-package SKILL resource pull (v0.2.1)。
+    pub const CLIENT_GET_SKILL: &str = "client:get_skill";
     /// 客户端通用二进制拉取请求（v0.2.1）/ Generic binary pull (v0.2.1)。
     pub const CLIENT_GET_BLOB: &str = "client:get_blob";
 
@@ -338,6 +344,8 @@ pub mod events {
     pub const SERVER_UPDATE_TOOL_LIST: &str = "server:update_tool_list";
     /// 服务器更新桌面请求
     pub const SERVER_UPDATE_DESKTOP: &str = "server:update_desktop";
+    /// 服务器 SKILL 集合变化请求（v0.2.1）：Computer 触发，Server 广播 `notify:update_skills`。
+    pub const SERVER_UPDATE_SKILLS: &str = "server:update_skills";
     /// 服务器取消工具调用请求
     pub const SERVER_TOOL_CALL_CANCEL: &str = "server:tool_call_cancel";
     /// 服务器列出房间请求
@@ -355,6 +363,8 @@ pub mod events {
     pub const NOTIFY_UPDATE_TOOL_LIST: &str = "notify:update_tool_list";
     /// 通知更新桌面
     pub const NOTIFY_UPDATE_DESKTOP: &str = "notify:update_desktop";
+    /// 通知 SKILL 集合变化（v0.2.1）：Agent 据此自动重拉 `client:get_skills`。
+    pub const NOTIFY_UPDATE_SKILLS: &str = "notify:update_skills";
 
     /// 通用通知前缀
     pub const NOTIFY_PREFIX: &str = "notify:";
@@ -683,6 +693,110 @@ pub struct GetDesktopRet {
     pub req_id: ReqId,
 }
 
+// ── 资源发现 / Resource discovery (v0.2.0) ─────────────────────────────────
+// 协议依据 / Protocol: events.md §client:get_resources（透明转发 MCP `resources/list`，cursor 翻页，
+// 不返回 resourceTemplates）；data-structures.md §A2CResource / §ResourceAnnotations。
+// Python 参考 / reference: a2c_smcp/smcp.py（A2CResource / ResourceAnnotations / GetResourcesReq / GetResourcesRet）。
+//
+// 元数据下沉 / Metadata sink (v0.2.0)：原 `window://` query 参数迁入 MCP 标准 `annotations`
+// （priority/audience/last_modified）与 A2C 扩展 `_meta`（如 fullscreen 等业务字段）。
+
+/// `client:get_resources` 事件名 / event name（顶层别名，等于 [`events::CLIENT_GET_RESOURCES`]）。
+///
+/// 对齐 Python `a2c_smcp.smcp.GET_RESOURCES_EVENT`。
+pub const GET_RESOURCES_EVENT: &str = events::CLIENT_GET_RESOURCES;
+
+/// MCP Resource 标准 annotations 的目标受众 / target audience of a resource。
+///
+/// 对标 MCP `Annotations.audience`（`list[Literal["user", "assistant"]]`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceAudience {
+    /// 面向最终用户 / for the end user。
+    User,
+    /// 面向 AI 助手 / for the AI assistant。
+    Assistant,
+}
+
+/// MCP Resource 标准 annotations（snake_case mirror）/ MCP standard Resource annotations。
+///
+/// 全字段可选（对标 Python `ResourceAnnotations(TypedDict, total=False)`）。`priority` 取值 `[0, 1]`
+/// （协议不在类型层强制范围，由生产方保证；边界 `0.0` / `1.0` 合法）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceAnnotations {
+    /// 目标受众 / intended audience。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<ResourceAudience>>,
+    /// 优先级 `[0, 1]`，越大越重要 / priority in `[0, 1]`, higher = more important。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<f32>,
+    /// 最后修改时间（ISO 8601）/ last-modified timestamp (ISO 8601)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+/// A2C 协议层 Resource，snake_case mirror MCP `Resource` / A2C protocol-level Resource。
+///
+/// 全字段可选（对标 Python `A2CResource(TypedDict, total=False)`）。元数据分工 / metadata partition：
+/// - `annotations`：MCP 标准字段（priority / audience / last_modified）。
+/// - `_meta`（[`A2CResource::meta`]）：A2C 扩展（如 fullscreen 等业务字段）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct A2CResource {
+    /// 资源 URI / resource URI（如 `window://...` 或业务自定义 scheme）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// 资源名 / resource name。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 资源描述 / resource description。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 资源 MIME 类型 / resource MIME type。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// 资源字节数 / resource size in bytes。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// MCP 标准 annotations / MCP standard annotations。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ResourceAnnotations>,
+    /// A2C 扩展元数据（线字段名 `_meta`）/ A2C extension metadata (wire field `_meta`)。
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+/// 资源发现请求 / Resource discovery request（`client:get_resources`）。
+///
+/// 透明转发 MCP 标准 `resources/list`；Agent 据此发现 window / 业务自定义 scheme 的资源。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetResourcesReq {
+    #[serde(flatten)]
+    pub base: AgentCallData,
+    /// 目标 Computer 名 / target Computer name。
+    pub computer: String,
+    /// 必填：目标 MCP Server 名称 / required: target MCP Server name。
+    pub mcp_server: String,
+    /// MCP 标准翻页游标（可选；缺省取首页）/ MCP-standard pagination cursor (optional)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// 资源发现响应 / Resource discovery response（`GetResourcesRet`）。
+///
+/// 含 MCP 标准 cursor 翻页。`next_cursor` 缺省表示无下一页。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GetResourcesRet {
+    /// 资源列表（可空）/ resource list (may be empty)。
+    #[serde(default)]
+    pub resources: Vec<A2CResource>,
+    /// 下一页游标（缺省 = 无下一页）/ next-page cursor (absent = last page)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// 回显的请求 id（可选）/ echoed request id (optional)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_id: Option<ReqId>,
+}
+
 /// 列出房间请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListRoomReq {
@@ -758,6 +872,178 @@ pub enum Notification {
     UpdateMCPConfig(UpdateMCPConfigNotification),
     UpdateToolList(UpdateToolListNotification),
     UpdateDesktop,
+}
+
+// ── SKILL 通道 / SKILL channel (v0.2.1 + v0.2.2 naming) ─────────────────────
+// 协议依据 / Protocol: events.md §client:get_skill[s] / §server:update_skills / §notify:update_skills；
+// data-structures.md §A2CSkillRef / §GetSkills* / §GetSkill*；skill.md §1 命名 / §6 数据结构 / §9 安全。
+// Python 参考 / reference: a2c_smcp/smcp.py（A2CSkillRef / GetSkillsReq|Ret / GetSkillReq|Ret）。
+//
+// 命名（v0.2.2）/ Naming：合成全局唯一**裸名**——user 1 段 `<skill>` / marketplace 2 段
+// `<plugin>:<skill>` / mcp 3 段 `mcp:<server>:<skill>`，段数消歧由 [`skill_name`] lexer 承担。
+// Agent **MUST** 当作不透明可比较字符串，判来源用 `source`（完整 provenance，**不**进 name）。
+
+/// `client:get_skills` 事件名 / event name（顶层别名，等于 [`events::CLIENT_GET_SKILLS`]）。
+pub const GET_SKILLS_EVENT: &str = events::CLIENT_GET_SKILLS;
+/// `client:get_skill` 事件名 / event name（顶层别名，等于 [`events::CLIENT_GET_SKILL`]）。
+pub const GET_SKILL_EVENT: &str = events::CLIENT_GET_SKILL;
+/// `server:update_skills` 事件名 / event name（顶层别名，等于 [`events::SERVER_UPDATE_SKILLS`]）。
+pub const UPDATE_SKILLS_EVENT: &str = events::SERVER_UPDATE_SKILLS;
+/// `notify:update_skills` 通知名 / notification name（顶层别名，等于 [`events::NOTIFY_UPDATE_SKILLS`]）。
+pub const UPDATE_SKILLS_NOTIFICATION: &str = events::NOTIFY_UPDATE_SKILLS;
+
+/// SKILL 引用对象 / Skill reference object —— `client:get_skills` 返回列表元素。
+///
+/// 必选 4 字段 / required 4：`name` / `source` / `path` / `description`（生产方 Computer **MUST** 发齐；
+/// 消费方 Agent **MUST NOT** 假定任一可选字段存在）。其余 6 个为可选（`#[serde(skip_serializing_if)]`）。
+///
+/// 关键约束 / Key invariants：
+/// - `name` 是协议主键（合成全局唯一裸名），Agent **MUST** 当不透明可比较字符串（勿解析结构）。
+/// - `source` 承载完整溯源（如 `mcp:tfrobot-tools` / `marketplace:acme-skills` / `user`），**不**进 `name`。
+/// - `path` 必选：Computer 本地绝对目录（staging 落盘是所有 source 统一第一步），面向 Agent SDK，LLM 不可见。
+/// - **无 `mcp_server` 字段**——Agent 侧协议表面与 source 无关；来源追溯由 `source` 与（仅 MCP）`uri` 承担。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2CSkillRef {
+    /// 主键：合成全局唯一裸名 / primary key: synthesized globally-unique bare name（必选 / required）。
+    pub name: String,
+    /// 来源元数据：完整 provenance / provenance（必选 / required；**不**进 `name`）。
+    pub source: String,
+    /// 仅 MCP 来源：`skill://host/skill-name`；Agent 非权威 / MCP-only, Agent non-authoritative（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// 物化输出：Computer 本地绝对目录路径 / materialization output: local absolute dir（必选 / required）。
+    pub path: String,
+    /// SKILL.md frontmatter 派生描述（跨三源强制）/ description from frontmatter（必选 / required）。
+    pub description: String,
+    /// 许可证 / license（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// 兼容性声明 / compatibility（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    /// frontmatter `allowed-tools` 规范化为列表 / normalized `allowed-tools` list（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    /// 版本（非 frontmatter 派生）/ version (not frontmatter-derived)（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// frontmatter.metadata 透传；A2C 不解释 / frontmatter.metadata passthrough（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_metadata: Option<serde_json::Value>,
+}
+
+/// 获取 SKILL 清单请求 / Get SKILL inventory request（`client:get_skills`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetSkillsReq {
+    #[serde(flatten)]
+    pub base: AgentCallData,
+    /// 目标 Computer 名 / target Computer name。
+    pub computer: String,
+}
+
+/// 获取 SKILL 清单响应 / Get SKILL inventory response（`GetSkillsRet`）。
+///
+/// 轻量元数据，**不含** SKILL.md body（body 由 `client:get_skill` 拉取）；排除孤儿、不排序、不去重。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetSkillsRet {
+    /// 当前已安装且可用 SKILL / currently installed & available skills。
+    #[serde(default)]
+    pub skills: Vec<A2CSkillRef>,
+    /// 回显的请求 id（可选）/ echoed request id (optional)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_id: Option<ReqId>,
+}
+
+/// 获取 SKILL 包内单个资源请求 / Get a single in-package SKILL resource（`client:get_skill`）。
+///
+/// SKILL 本质是文件夹：`rel_path` 缺省取包根 `SKILL.md`（入口），携带 `rel_path` 取包内其它资源
+/// （渐进式披露）。安全：`rel_path` MUST 相对、无 `..`、无绝对路径，沙箱在 Computer 解析时强制。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetSkillReq {
+    #[serde(flatten)]
+    pub base: AgentCallData,
+    /// 目标 Computer 名 / target Computer name。
+    pub computer: String,
+    /// 必选：来自某 [`A2CSkillRef::name`] / required: from some `A2CSkillRef.name`。
+    pub name: String,
+    /// 可选：SKILL 包根 POSIX 相对路径；缺省 = `"SKILL.md"` / optional, defaults to `SKILL.md`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel_path: Option<String>,
+}
+
+/// SKILL 资源载体 / SKILL resource carrier —— [`GetSkillRet`] 的 `body` 与 `blob_handle` **恰一存在**。
+///
+/// 文本且可内联 → [`SkillResource::Inline`]；二进制或过大文本 → [`SkillResource::Blob`]
+/// （转 `client:get_blob` 拉取）。由 [`GetSkillRet::resource`] 校验并返回。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillResource<'a> {
+    /// 内联文本内容（来自 `body`）/ inline text content (from `body`)。
+    Inline(&'a str),
+    /// 二进制旁路句柄（来自 `blob_handle`）/ binary sideband handle (from `blob_handle`)。
+    Blob(&'a str),
+}
+
+/// [`GetSkillRet`] 的 `body` / `blob_handle` 互斥不变式被破坏 / exclusivity invariant violated。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SkillRetError {
+    /// `body` 与 `blob_handle` 同时存在（违反 exactly-one）/ both present。
+    #[error("GetSkillRet: body and blob_handle are mutually exclusive (both present)")]
+    BothPresent,
+    /// `body` 与 `blob_handle` 均缺失（违反 exactly-one）/ neither present。
+    #[error("GetSkillRet: exactly one of body / blob_handle must be present (neither found)")]
+    NeitherPresent,
+}
+
+/// 获取 SKILL 包内单个资源响应 / Get-skill response（`GetSkillRet`）。
+///
+/// `body` 与 `blob_handle` **恰一存在**（exactly one）——经 [`GetSkillRet::resource`] 校验访问。
+/// `total_size` / `sha256` 基于 **Agent 最终消费的资源字节**（SKILL.md → frontmatter 剥离后 body；
+/// 其它 → 原始字节）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetSkillRet {
+    /// 回显请求 name / echoed request name。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 回显请求 rel_path（缺省请求时回显 `"SKILL.md"`）/ echoed rel_path。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel_path: Option<String>,
+    /// 资源 MIME，如 `text/markdown` / `image/png` / resource MIME。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// 资源总字节数（基于最终消费字节）/ total bytes (final consumed bytes)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_size: Option<u64>,
+    /// 全量资源 sha256 十六进制（完整性 + 变更检测）/ full-content sha256 (hex)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// 文本且 ≤ 内联预算：直接内容（与 `blob_handle` 恰一）/ inline body。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// 否则：转 `client:get_blob` 的不透明句柄（与 `body` 恰一）/ otherwise: blob handle。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_handle: Option<BlobHandle>,
+    /// 回显的请求 id（可选）/ echoed request id (optional)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_id: Option<ReqId>,
+}
+
+impl GetSkillRet {
+    /// 校验 `body` / `blob_handle` **恰一存在**并返回内容载体 / validate exactly-one & return carrier。
+    ///
+    /// 二者同时存在 → [`SkillRetError::BothPresent`]；均缺失 → [`SkillRetError::NeitherPresent`]。
+    pub fn resource(&self) -> Result<SkillResource<'_>, SkillRetError> {
+        match (self.body.as_deref(), self.blob_handle.as_deref()) {
+            (Some(body), None) => Ok(SkillResource::Inline(body)),
+            (None, Some(handle)) => Ok(SkillResource::Blob(handle)),
+            (Some(_), Some(_)) => Err(SkillRetError::BothPresent),
+            (None, None) => Err(SkillRetError::NeitherPresent),
+        }
+    }
+
+    /// `body` / `blob_handle` 是否满足 exactly-one 不变式 / whether the exactly-one invariant holds。
+    pub fn is_exclusive(&self) -> bool {
+        self.body.is_some() ^ self.blob_handle.is_some()
+    }
 }
 
 // ── 通用二进制传输 / Generic binary transfer (v0.2.1) ──────────────────────
@@ -1388,5 +1674,255 @@ mod tests {
         // 无 meta → 全 false（不 panic）
         let plain: ToolCallRet = serde_json::from_str(r#"{"isError":false}"#).unwrap();
         assert!(!plain.is_cancelled() && !plain.is_timeout());
+    }
+
+    // ── SMCP-02 get_resources (#26) ────────────────────────────────────
+
+    #[test]
+    fn get_resources_event_const_exact() {
+        assert_eq!(GET_RESOURCES_EVENT, "client:get_resources");
+        assert_eq!(GET_RESOURCES_EVENT, events::CLIENT_GET_RESOURCES);
+    }
+
+    #[test]
+    fn get_resources_req_round_trip_with_and_without_cursor() {
+        let base = AgentCallData {
+            agent: "agent-x".to_string(),
+            req_id: ReqId::from_string("rid-1".to_string()),
+        };
+        // 无 cursor → 不序列化 cursor 键；flatten base 平铺 agent/req_id 在顶层。
+        let req = GetResourcesReq {
+            base: base.clone(),
+            computer: "comp-1".to_string(),
+            mcp_server: "srv-1".to_string(),
+            cursor: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["agent"], "agent-x");
+        assert_eq!(v["req_id"], "rid-1");
+        assert_eq!(v["computer"], "comp-1");
+        assert_eq!(v["mcp_server"], "srv-1");
+        assert!(v.get("cursor").is_none());
+        assert_eq!(serde_json::from_value::<GetResourcesReq>(v).unwrap(), req);
+
+        // 有 cursor → 出现在线格式。
+        let req2 = GetResourcesReq {
+            base,
+            computer: "comp-1".to_string(),
+            mcp_server: "srv-1".to_string(),
+            cursor: Some("page-2".to_string()),
+        };
+        let v2 = serde_json::to_value(&req2).unwrap();
+        assert_eq!(v2["cursor"], "page-2");
+        assert_eq!(serde_json::from_value::<GetResourcesReq>(v2).unwrap(), req2);
+    }
+
+    #[test]
+    fn get_resources_ret_empty_and_populated() {
+        // 空 resources → 序列化为 `[]`，next_cursor 省略。
+        let empty = GetResourcesRet::default();
+        let v = serde_json::to_value(&empty).unwrap();
+        assert_eq!(v["resources"], serde_json::json!([]));
+        assert!(v.get("next_cursor").is_none());
+
+        // 含资源 + priority 边界 0.0/1.0 + audience + _meta + next_cursor。
+        let ret = GetResourcesRet {
+            resources: vec![
+                A2CResource {
+                    uri: Some("window://main".to_string()),
+                    name: Some("main".to_string()),
+                    annotations: Some(ResourceAnnotations {
+                        audience: Some(vec![ResourceAudience::User, ResourceAudience::Assistant]),
+                        priority: Some(0.0),
+                        last_modified: Some("2026-06-01T00:00:00Z".to_string()),
+                    }),
+                    meta: Some(serde_json::json!({ "fullscreen": true })),
+                    ..Default::default()
+                },
+                A2CResource {
+                    uri: Some("window://side".to_string()),
+                    annotations: Some(ResourceAnnotations {
+                        priority: Some(1.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            next_cursor: Some("next".to_string()),
+            req_id: Some(ReqId::from_string("rid-2".to_string())),
+        };
+        let v = serde_json::to_value(&ret).unwrap();
+        // _meta 线字段名重命名生效。
+        assert_eq!(v["resources"][0]["_meta"]["fullscreen"], true);
+        assert!(v["resources"][0].get("meta").is_none());
+        assert_eq!(v["resources"][0]["annotations"]["audience"][0], "user");
+        assert_eq!(v["resources"][0]["annotations"]["priority"], 0.0);
+        assert_eq!(v["resources"][1]["annotations"]["priority"], 1.0);
+        assert_eq!(v["next_cursor"], "next");
+        let back: GetResourcesRet = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ret);
+    }
+
+    // ── SMCP-04 SKILL (#35) ────────────────────────────────────────────
+
+    #[test]
+    fn skill_event_consts_exact() {
+        assert_eq!(GET_SKILLS_EVENT, "client:get_skills");
+        assert_eq!(GET_SKILL_EVENT, "client:get_skill");
+        assert_eq!(UPDATE_SKILLS_EVENT, "server:update_skills");
+        assert_eq!(UPDATE_SKILLS_NOTIFICATION, "notify:update_skills");
+        assert_eq!(GET_SKILLS_EVENT, events::CLIENT_GET_SKILLS);
+        assert_eq!(GET_SKILL_EVENT, events::CLIENT_GET_SKILL);
+        assert_eq!(UPDATE_SKILLS_EVENT, events::SERVER_UPDATE_SKILLS);
+        assert_eq!(UPDATE_SKILLS_NOTIFICATION, events::NOTIFY_UPDATE_SKILLS);
+    }
+
+    #[test]
+    fn skill_ref_three_sources_round_trip() {
+        // 必选 4 字段恒存；可选字段 None 时不序列化。
+        let user = A2CSkillRef {
+            name: "my-helper".to_string(),
+            source: "user".to_string(),
+            uri: None,
+            path: "/home/u/.skills/my-helper".to_string(),
+            description: "a helper".to_string(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            version: None,
+            skill_metadata: None,
+        };
+        let v = serde_json::to_value(&user).unwrap();
+        assert_eq!(v["name"], "my-helper");
+        assert_eq!(v["source"], "user");
+        assert!(v.get("uri").is_none());
+        assert!(v.get("version").is_none());
+        assert_eq!(serde_json::from_value::<A2CSkillRef>(v).unwrap(), user);
+
+        let marketplace = A2CSkillRef {
+            name: "acme-audit:audit".to_string(),
+            source: "marketplace:acme-skills".to_string(),
+            ..user.clone()
+        };
+        assert_eq!(
+            serde_json::from_value::<A2CSkillRef>(serde_json::to_value(&marketplace).unwrap())
+                .unwrap(),
+            marketplace
+        );
+
+        // mcp 源 + 全量可选字段。
+        let mcp = A2CSkillRef {
+            name: "mcp:tfrobot-tools:code-review".to_string(),
+            source: "mcp:tfrobot-tools".to_string(),
+            uri: Some("skill://tfrobot-tools/code-review".to_string()),
+            path: "/tmp/staging/code-review".to_string(),
+            description: "review".to_string(),
+            license: Some("MIT".to_string()),
+            compatibility: Some(">=0.2".to_string()),
+            allowed_tools: Some(vec!["read".to_string(), "grep".to_string()]),
+            version: Some("1.2.0".to_string()),
+            skill_metadata: Some(serde_json::json!({ "x": 1 })),
+        };
+        let v = serde_json::to_value(&mcp).unwrap();
+        assert_eq!(v["uri"], "skill://tfrobot-tools/code-review");
+        assert_eq!(v["allowed_tools"][1], "grep");
+        assert_eq!(v["skill_metadata"]["x"], 1);
+        assert_eq!(serde_json::from_value::<A2CSkillRef>(v).unwrap(), mcp);
+    }
+
+    #[test]
+    fn get_skills_req_ret_round_trip() {
+        let req = GetSkillsReq {
+            base: AgentCallData {
+                agent: "a".to_string(),
+                req_id: ReqId::from_string("r".to_string()),
+            },
+            computer: "c".to_string(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["agent"], "a");
+        assert_eq!(v["computer"], "c");
+        assert_eq!(serde_json::from_value::<GetSkillsReq>(v).unwrap(), req);
+
+        let ret = GetSkillsRet::default();
+        let v = serde_json::to_value(&ret).unwrap();
+        assert_eq!(v["skills"], serde_json::json!([]));
+        assert!(v.get("req_id").is_none());
+        assert_eq!(serde_json::from_value::<GetSkillsRet>(v).unwrap(), ret);
+    }
+
+    #[test]
+    fn get_skill_req_rel_path_optional() {
+        let base = AgentCallData {
+            agent: "a".to_string(),
+            req_id: ReqId::from_string("r".to_string()),
+        };
+        let req = GetSkillReq {
+            base: base.clone(),
+            computer: "c".to_string(),
+            name: "my-helper".to_string(),
+            rel_path: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("rel_path").is_none());
+        assert_eq!(serde_json::from_value::<GetSkillReq>(v).unwrap(), req);
+
+        let req2 = GetSkillReq {
+            base,
+            computer: "c".to_string(),
+            name: "my-helper".to_string(),
+            rel_path: Some("docs/usage.md".to_string()),
+        };
+        let v2 = serde_json::to_value(&req2).unwrap();
+        assert_eq!(v2["rel_path"], "docs/usage.md");
+        assert_eq!(serde_json::from_value::<GetSkillReq>(v2).unwrap(), req2);
+    }
+
+    #[test]
+    fn get_skill_ret_body_blob_handle_exclusive() {
+        // body 分支 → Inline。
+        let inline = GetSkillRet {
+            name: Some("my-helper".to_string()),
+            rel_path: Some("SKILL.md".to_string()),
+            mime_type: Some("text/markdown".to_string()),
+            total_size: Some(42),
+            sha256: Some("abc".to_string()),
+            body: Some("# Hello".to_string()),
+            ..Default::default()
+        };
+        assert!(inline.is_exclusive());
+        assert_eq!(inline.resource().unwrap(), SkillResource::Inline("# Hello"));
+        let back: GetSkillRet =
+            serde_json::from_value(serde_json::to_value(&inline).unwrap()).unwrap();
+        assert_eq!(back, inline);
+
+        // blob_handle 分支 → Blob。
+        let blob = GetSkillRet {
+            name: Some("big".to_string()),
+            blob_handle: Some("opaque-handle".to_string()),
+            ..Default::default()
+        };
+        assert!(blob.is_exclusive());
+        assert_eq!(
+            blob.resource().unwrap(),
+            SkillResource::Blob("opaque-handle")
+        );
+
+        // 二者并存 → BothPresent。
+        let both = GetSkillRet {
+            body: Some("x".to_string()),
+            blob_handle: Some("h".to_string()),
+            ..Default::default()
+        };
+        assert!(!both.is_exclusive());
+        assert_eq!(both.resource().unwrap_err(), SkillRetError::BothPresent);
+
+        // 二者皆缺 → NeitherPresent。
+        let neither = GetSkillRet::default();
+        assert!(!neither.is_exclusive());
+        assert_eq!(
+            neither.resource().unwrap_err(),
+            SkillRetError::NeitherPresent
+        );
     }
 }
