@@ -14,3 +14,11 @@ serde_json.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 url.workspace = true
+# utils/blob.rs（drain_blob）：分块拉取 base64 解码 + sha256 完整性自证 + 并发分块（buffer_unordered）。
+# blob transfer routine: base64 decode + sha256 integrity + bounded-concurrency chunk fetch.
+base64.workspace = true
+sha2.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

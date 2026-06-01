@@ -3915,9 +3915,13 @@ dependencies = [
 name = "smcp"
 version = "0.1.15"
 dependencies = [
+ "base64 0.22.1",
+ "futures",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
+ "tokio",
  "url",
  "uuid",
 ]
