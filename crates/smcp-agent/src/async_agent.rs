@@ -13,11 +13,15 @@ use crate::{
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
     events::AsyncAgentEventHandler,
+    protocol_error::raise_for_error_payload,
+    request_builders::{
+        build_get_desktop_request, build_get_tools_request, build_tool_call_request,
+    },
     transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
-    events::*, AgentCallData, EnterOfficeReq, GetDesktopReq, GetToolsReq, LeaveOfficeReq,
-    ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, ToolCallReq, SMCP_NAMESPACE,
+    events::*, AgentCallData, EnterOfficeReq, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool,
+    SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -237,14 +241,8 @@ impl AsyncSmcpAgent {
     /// 获取指定Computer的工具列表
     pub async fn get_tools(&self, computer: &str) -> Result<Vec<SMCPTool>> {
         let agent_config = self.auth_provider.get_agent_config();
-        let req_id = ReqId::new();
-        let req = GetToolsReq {
-            base: AgentCallData {
-                agent: agent_config.agent.clone(),
-                req_id: req_id.clone(),
-            },
-            computer: computer.to_string(),
-        };
+        let req = build_get_tools_request(&agent_config.agent, computer);
+        let req_id = req.base.req_id.clone();
 
         debug!("Getting tools from computer: {}", computer);
 
@@ -252,10 +250,13 @@ impl AsyncSmcpAgent {
         let transport = transport
             .as_ref()
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
-        let data = serde_json::to_value(req)?;
+        let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_TOOLS, data, self.config.default_timeout)
             .await?;
+
+        // flat ErrorPayload → 协议错误（#47↔#34：对端未命中/能力错误经 ack 回 flat error）
+        raise_for_error_payload(&response)?;
 
         // 验证req_id
         let response_req_id: String = response
@@ -292,23 +293,8 @@ impl AsyncSmcpAgent {
         window: Option<String>,
     ) -> Result<Vec<String>> {
         let agent_config = self.auth_provider.get_agent_config();
-        let req_id = ReqId::new();
-        let mut req = GetDesktopReq {
-            base: AgentCallData {
-                agent: agent_config.agent.clone(),
-                req_id: req_id.clone(),
-            },
-            computer: computer.to_string(),
-            desktop_size: None,
-            window: None,
-        };
-
-        if let Some(s) = size {
-            req.desktop_size = Some(s);
-        }
-        if let Some(w) = window {
-            req.window = Some(w);
-        }
+        let req = build_get_desktop_request(&agent_config.agent, computer, size, window.as_deref());
+        let req_id = req.base.req_id.clone();
 
         debug!("Getting desktop from computer: {}", computer);
 
@@ -316,10 +302,13 @@ impl AsyncSmcpAgent {
         let transport = transport
             .as_ref()
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
-        let data = serde_json::to_value(req)?;
+        let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_DESKTOP, data, self.config.default_timeout)
             .await?;
+
+        // flat ErrorPayload → 协议错误（#47↔#34）
+        raise_for_error_payload(&response)?;
 
         // 验证req_id
         let response_req_id: String = response
@@ -354,18 +343,14 @@ impl AsyncSmcpAgent {
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let agent_config = self.auth_provider.get_agent_config();
-        let req_id = ReqId::new();
-        let req_id_for_cancel = req_id.clone();
-        let req = ToolCallReq {
-            base: AgentCallData {
-                agent: agent_config.agent.clone(),
-                req_id,
-            },
-            computer: computer.to_string(),
-            tool_name: tool_name.to_string(),
+        let req = build_tool_call_request(
+            &agent_config.agent,
+            computer,
+            tool_name,
             params,
-            timeout: self.config.tool_call_timeout as i32,
-        };
+            self.config.tool_call_timeout as i32,
+        );
+        let req_id_for_cancel = req.base.req_id.clone();
 
         debug!("Calling tool {} on computer: {}", tool_name, computer);
 
@@ -373,13 +358,16 @@ impl AsyncSmcpAgent {
         let transport = transport
             .as_ref()
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
-        let data = serde_json::to_value(req.clone())?;
+        let data = serde_json::to_value(&req)?;
 
         match transport
             .call(CLIENT_TOOL_CALL, data, self.config.tool_call_timeout)
             .await
         {
             Ok(response) => {
+                // flat ErrorPayload → 协议错误（如 4006/4007 授权、404 未命中）；正常 CallToolResult
+                // （含 isError 的工具执行失败）无顶层协议 code，原样透传。
+                raise_for_error_payload(&response)?;
                 info!("Tool call successful: {} on {}", tool_name, computer);
                 Ok(response)
             }

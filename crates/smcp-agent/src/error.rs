@@ -43,6 +43,12 @@ pub enum SmcpAgentError {
     #[error("协议版本不匹配: {0}")]
     ProtocolVersionMismatch(#[from] smcp::ProtocolVersionError),
 
+    /// 对端经 `client:*` ack 回传的协议级 flat ErrorPayload（404 / 4006–4018），由
+    /// [`crate::protocol_error::raise_for_error_payload`] 解析。**装箱**以避免 `result_large_err`
+    /// 污染所有 `Result<_, SmcpAgentError>`（同 [`Self::Network`] / [`Self::Serialization`] 模式）。
+    #[error("协议错误: {0}")]
+    Protocol(Box<crate::protocol_error::SmcpProtocolError>),
+
     #[error("内部错误: {0}")]
     Internal(String),
 }
@@ -77,6 +83,13 @@ impl From<tf_rust_socketio::Error> for SmcpAgentError {
 impl From<serde_json::Error> for SmcpAgentError {
     fn from(err: serde_json::Error) -> Self {
         Self::Serialization(Box::new(err))
+    }
+}
+
+// 协议错误装箱后转换，使 `raise_for_error_payload(&resp)?` 经 `?` 自动收敛到 SmcpAgentError。
+impl From<crate::protocol_error::SmcpProtocolError> for SmcpAgentError {
+    fn from(err: crate::protocol_error::SmcpProtocolError) -> Self {
+        Self::Protocol(Box::new(err))
     }
 }
 

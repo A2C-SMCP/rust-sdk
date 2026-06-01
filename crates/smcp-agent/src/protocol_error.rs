@@ -33,6 +33,11 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("[{code}] {message}")]
 pub struct SmcpProtocolError {
+    /// 原始 flat ErrorPayload 整包 / the raw flat ErrorPayload object。
+    ///
+    /// 保留**未显式建模**的顶层字段（前向兼容：未来协议码可能新增顶层分流字段），对齐 Python
+    /// `SMCPProtocolError.payload`；下列便捷字段为其常用子集的类型化提取。
+    pub payload: serde_json::Map<String, Value>,
     /// 协议错误码（缺省 / 非整数时回退 `-1`，对齐 Python `int(payload.get("code", -1))`）。
     pub code: i64,
     /// 人类可读错误描述（缺省回退空串）/ human-readable message (defaults to empty).
@@ -63,6 +68,7 @@ impl SmcpProtocolError {
             .and_then(Value::as_str)
             .map(str::to_string);
         Self {
+            payload: obj.cloned().unwrap_or_default(),
             code: get("code").and_then(Value::as_i64).unwrap_or(-1),
             message: get("message")
                 .and_then(Value::as_str)
@@ -167,6 +173,27 @@ mod tests {
         assert_eq!(err.code, 4016);
         assert_eq!(err.message, "");
         assert!(err.details.is_empty());
+    }
+
+    #[test]
+    fn test_raw_payload_preserved_for_forward_compat() {
+        // 未显式建模的顶层字段（未来协议码新增）经 payload 完整保留，前向兼容（对齐 Python self.payload）
+        let err = raise_for_error_payload(&json!({
+            "code": 4015,
+            "message": "x",
+            "mcp_server_name": "srv",
+            "future_top_level": {"k": 1}
+        }))
+        .unwrap_err();
+        // 便捷字段照常提取
+        assert_eq!(err.mcp_server_name.as_deref(), Some("srv"));
+        // 原始整包保留全部顶层字段（含未建模的）
+        assert_eq!(err.payload.get("code").and_then(Value::as_i64), Some(4015));
+        assert_eq!(
+            err.payload.get("mcp_server_name").and_then(Value::as_str),
+            Some("srv")
+        );
+        assert_eq!(err.payload.get("future_top_level"), Some(&json!({"k": 1})));
     }
 
     #[test]
