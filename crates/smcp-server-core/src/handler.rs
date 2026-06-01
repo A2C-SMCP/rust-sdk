@@ -42,15 +42,15 @@ impl HandlerError {
 
     /// 转换为 flat 错误负载 / Convert to a flat error payload
     ///
-    /// 协议 0.2.2：所有 ack 路由统一为 flat [`smcp::ErrorPayload`]（顶层 `code`/`message`），
-    /// 禁止嵌套 `{"error": {...}}` envelope。
+    /// 协议 0.2.2：错误负载统一为 flat [`smcp::ErrorPayload`]（顶层 `code`/`message`），禁止嵌套
+    /// `{"error": {...}}` envelope。本方法服务于 `server:*` **管理事件** ack——其码空间是传输/管理层
+    /// [`smcp::error_codes`]（400/401/500/4101…），不受协议谓词约束。
     ///
-    /// ⚠️ 注意码空间收敛（待 SRV-01 #47 落地）：本方法当前用 [`smcp::error_codes`]
-    /// （传输/管理层码，如 400/401/500/4101），但协议谓词 [`smcp::is_protocol_error_payload`]
-    /// 只识别 [`smcp::ErrorCode`] 闭集（404/4006–4018），二者仅 404 重合。一旦 SRV-01 把这些
-    /// 错误投递到 `client:*` ack 且 Agent 端按谓词判定，非 `ErrorCode` 码会被误判为"非协议错误"。
-    /// 因此投递到 `client:*` ack 的错误 **MUST** 映射到 `ErrorCode` 值——该收敛归 SRV-01 #47；
-    /// 当前序列化形态仅为编译过渡。
+    /// ✅ SRV-01 (#47) 已收敛 `client:*` 路径：`client:*` ack **永不**承载裸 `HandlerError`——
+    /// 目标未命中经 [`smcp::build_computer_not_found_error`]（[`smcp::ErrorCode::NotFound`] 404）以
+    /// bare flat ErrorPayload 投递，隔离拒绝则不投递 ack（见 [`Self::relay_client_call`]）。因此
+    /// Agent 端按 [`smcp::is_protocol_error_payload`] 判定的协议级闭集（404/4006–4018）不会被本方法
+    /// 的传输层码污染。
     pub fn to_error_payload(&self) -> smcp::ErrorPayload {
         smcp::ErrorPayload::new(i64::from(self.error_code()), self.to_string())
     }
@@ -155,8 +155,13 @@ impl SmcpHandler {
         socket.on(
             smcp::events::CLIENT_TOOL_CALL,
             move |socket: SocketRef, Data::<ToolCallReq>(data), ack: AckSender| async move {
-                let result = Self::on_client_tool_call(socket, data, state_tool_call.clone()).await;
-                let _ = ack.send(&result);
+                match Self::on_client_tool_call(socket, data, state_tool_call.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    // 隔离拒绝（发起方非 Agent / 会话已断连）：镜像 Python，不投递协议 ack（发起方侧自行超时）
+                    Err(e) => warn!("client:tool_call relay rejected, no ack: {e}"),
+                }
             },
         );
 
@@ -164,8 +169,12 @@ impl SmcpHandler {
         socket.on(
             smcp::events::CLIENT_GET_TOOLS,
             move |socket: SocketRef, Data::<GetToolsReq>(data), ack: AckSender| async move {
-                let result = Self::on_client_get_tools(socket, data, state_get_tools.clone()).await;
-                let _ = ack.send(&result);
+                match Self::on_client_get_tools(socket, data, state_get_tools.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:get_tools relay rejected, no ack: {e}"),
+                }
             },
         );
 
@@ -173,9 +182,12 @@ impl SmcpHandler {
         socket.on(
             smcp::events::CLIENT_GET_DESKTOP,
             move |socket: SocketRef, Data::<GetDesktopReq>(data), ack: AckSender| async move {
-                let result =
-                    Self::on_client_get_desktop(socket, data, state_get_desktop.clone()).await;
-                let _ = ack.send(&result);
+                match Self::on_client_get_desktop(socket, data, state_get_desktop.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:get_desktop relay rejected, no ack: {e}"),
+                }
             },
         );
 
@@ -183,8 +195,12 @@ impl SmcpHandler {
         socket.on(
             smcp::events::CLIENT_GET_CONFIG,
             move |socket: SocketRef, Data::<GetComputerConfigReq>(data), ack: AckSender| async move {
-                let result = Self::on_client_get_config(socket, data, state_get_config.clone()).await;
-                let _ = ack.send(&result);
+                match Self::on_client_get_config(socket, data, state_get_config.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:get_config relay rejected, no ack: {e}"),
+                }
             },
         );
 
@@ -575,326 +591,177 @@ impl SmcpHandler {
     }
 
     /// 处理客户端工具调用事件
+    /// 统一 `client:*` 事件路由 / Generic `client:*` event router.
+    ///
+    /// 收敛 office/role 隔离校验、Computer SID 解析、flat `ErrorPayload` 透传，让每个 `client:*`
+    /// handler 缩到一行。对标 Python `server/namespace.py::_relay_client_call`。
+    ///
+    /// 投递到 ack 的负载为 **bare** 形态（成功 Ret 原样 或 flat [`smcp::ErrorPayload`]），**无**
+    /// `{"Ok"/"Err"}` / `{"error":{...}}` 嵌套 envelope（协议 0.2.2：`client:*` ack 协议级错误
+    /// MUST 为 flat ErrorPayload）。
+    ///
+    /// - 目标 Computer 在**发起方 office 内**未命中（含跨 office：office-scoped 查找天然不可达，
+    ///   不泄露存在性）/ 发起方无 office / 目标 SID 已断连 → 返回 flat `ErrorPayload(404)`（经 ack 投递）。
+    /// - 目标 ack 为协议级 flat ErrorPayload（[`smcp::is_protocol_error_payload`]）→ 原样透传；
+    ///   成功响应同样 **bare 透传**，**不**剥 `"result"`（旧实现的 `map.remove("result")` 是 bug：
+    ///   Computer 发送 bare `CallToolResult`，剥取把成功结果误抹为 `Null`）。
+    /// - 发起方非 Agent / 发起方会话已断连 → `Err`（隔离拒绝）：调用点**不投递协议 ack**
+    ///   （镜像 Python `raise` 语义，发起方侧自行超时；不泄露 Computer 存在性、不造非协议错误码）。
+    ///
+    /// 在途断连竞速（目标 Computer 中途消失）归 SRV-04 (#56)，此处不处理。
+    async fn relay_client_call<T: serde::Serialize + ?Sized>(
+        socket: &SocketRef,
+        computer_name: &str,
+        data: &T,
+        event: &str,
+        state: &ServerState,
+        timeout: tokio::time::Duration,
+    ) -> Result<Value, HandlerError> {
+        // 发起方（Agent）会话 / Originator (Agent) session
+        let sid = socket.id.to_string();
+        let session = state
+            .session_manager
+            .get_session(&sid)
+            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
+
+        // 角色隔离：仅 Agent 可发起 client:* 调用 / Role isolation: only Agents issue client:* calls
+        if session.role != ClientRole::Agent {
+            return Err(HandlerError::InvalidRequest(
+                "Only agents can issue client:* calls".to_string(),
+            ));
+        }
+
+        // 发起方无 office → 无从在任何 office 内定位目标 → flat 404（诚实 + 不泄露 + 不挂起）
+        let Some(office_id) = session.office_id else {
+            return Ok(serde_json::to_value(build_computer_not_found_error(
+                computer_name,
+            ))?);
+        };
+
+        // office-scoped 解析目标 Computer SID：跨 office 目标天然不可达 → 404（不泄露存在性）
+        let Some(computer_sid) = state
+            .session_manager
+            .get_computer_sid_in_office(&office_id, computer_name)
+        else {
+            return Ok(serde_json::to_value(build_computer_not_found_error(
+                computer_name,
+            ))?);
+        };
+
+        // 目标 socket：SID 已解析但 socket 不在 → 目标已断连，按「不存在」回 404
+        let target_socket = match computer_sid.parse() {
+            Ok(parsed) => state
+                .io
+                .of(SMCP_NAMESPACE)
+                .and_then(|op| op.get_socket(parsed)),
+            Err(_) => None,
+        };
+        let Some(target_socket) = target_socket else {
+            return Ok(serde_json::to_value(build_computer_not_found_error(
+                computer_name,
+            ))?);
+        };
+
+        // 转发并等待首个 ack / Relay and await the first ack
+        let ack_result = target_socket.emit_with_ack(event, data);
+        let response = match tokio::time::timeout(timeout, async move {
+            match ack_result {
+                Ok(stream) => {
+                    let mut pinned = Box::pin(stream);
+                    match pinned.next().await {
+                        Some((_, response)) => response,
+                        None => Ok(Value::Null),
+                    }
+                }
+                Err(_) => Ok(Value::Null),
+            }
+        })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                return Err(HandlerError::Timeout(format!(
+                    "Failed to get response from computer: {e}"
+                )))
+            }
+            Err(_) => {
+                return Err(HandlerError::Timeout(format!(
+                    "{event} timed out after {}s",
+                    timeout.as_secs()
+                )))
+            }
+        };
+
+        // bare 透传：成功 Ret 或 flat ErrorPayload 原样返回（无嵌套 envelope、无 "result" 剥取）。
+        Ok(response)
+    }
+
+    /// 处理工具调用事件（经统一 [`Self::relay_client_call`] 转发）。
     async fn on_client_tool_call(
         socket: SocketRef,
         data: ToolCallReq,
         state: ServerState,
     ) -> Result<Value, HandlerError> {
-        // 获取 Agent 的会话信息
-        let sid = socket.id.to_string();
-        let session = state
-            .session_manager
-            .get_session(&sid)
-            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
-
-        // 验证角色必须是 Agent
-        if session.role != ClientRole::Agent {
-            return Err(HandlerError::InvalidRequest(
-                "Only agents can make tool calls".to_string(),
-            ));
-        }
-
-        // 验证 Agent 在某个办公室内
-        let office_id = session.office_id.ok_or_else(|| {
-            HandlerError::InvalidRequest(
-                "Agent must be in an office to make tool calls".to_string(),
-            )
-        })?;
-
-        // 查找目标 Computer 的 sid
-        let computer_sid = state
-            .session_manager
-            .get_computer_sid_in_office(&office_id, &data.computer)
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest(format!(
-                    "Computer '{}' not found in office",
-                    data.computer
-                ))
-            })?;
-
-        // 获取目标 socket
-        let target_socket = state
-            .io
-            .of(SMCP_NAMESPACE)
-            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest("Target computer socket not found".to_string())
-            })?;
-
-        // 转发请求并等待响应
-        let timeout = tokio::time::Duration::from_secs(30);
-        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_TOOL_CALL, &data);
-
-        match tokio::time::timeout(timeout, async move {
-            match ack_result {
-                Ok(stream) => {
-                    let mut pinned = Box::pin(stream);
-                    match pinned.next().await {
-                        Some((_, response)) => response,
-                        None => Ok(serde_json::Value::Null),
-                    }
-                }
-                Err(_) => Ok(serde_json::Value::Null),
-            }
-        })
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_TOOL_CALL,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
         .await
-        {
-            Ok(Ok(response)) => {
-                // 解析响应
-                match response {
-                    serde_json::Value::Object(mut map) => {
-                        // 提取 result 字段
-                        let result = map.remove("result").unwrap_or(serde_json::Value::Null);
-                        Ok(result)
-                    }
-                    _ => Ok(response),
-                }
-            }
-            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
-                "Failed to get response from computer: {}",
-                e
-            ))),
-            Err(_) => Err(HandlerError::Timeout(
-                "Tool call timed out after 30 seconds".to_string(),
-            )),
-        }
     }
 
-    /// 处理获取工具列表事件
+    /// 处理获取工具列表事件（经统一 [`Self::relay_client_call`] 转发）。
     async fn on_client_get_tools(
         socket: SocketRef,
         data: GetToolsReq,
         state: ServerState,
-    ) -> Result<GetToolsRet, HandlerError> {
-        // 获取 Agent 的会话信息
-        let sid = socket.id.to_string();
-        let session = state
-            .session_manager
-            .get_session(&sid)
-            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
-
-        // 验证角色必须是 Agent
-        if session.role != ClientRole::Agent {
-            return Err(HandlerError::InvalidRequest(
-                "Only agents can get tools".to_string(),
-            ));
-        }
-
-        // 验证 Agent 在某个办公室内
-        let office_id = session.office_id.ok_or_else(|| {
-            HandlerError::InvalidRequest("Agent must be in an office to get tools".to_string())
-        })?;
-
-        // 查找目标 Computer 的 sid
-        let computer_sid = state
-            .session_manager
-            .get_computer_sid_in_office(&office_id, &data.computer)
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest(format!(
-                    "Computer '{}' not found in office",
-                    data.computer
-                ))
-            })?;
-
-        // 获取目标 socket
-        let target_socket = state
-            .io
-            .of(SMCP_NAMESPACE)
-            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest("Target computer socket not found".to_string())
-            })?;
-
-        // 转发请求并等待响应
-        let timeout = tokio::time::Duration::from_secs(30);
-        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_GET_TOOLS, &data);
-
-        match tokio::time::timeout(timeout, async move {
-            match ack_result {
-                Ok(stream) => {
-                    let mut pinned = Box::pin(stream);
-                    match pinned.next().await {
-                        Some((_, response)) => response,
-                        None => Ok(serde_json::Value::Null),
-                    }
-                }
-                Err(_) => Ok(serde_json::Value::Null),
-            }
-        })
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_GET_TOOLS,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
         .await
-        {
-            Ok(Ok(response)) => {
-                // 解析响应
-                serde_json::from_value(response).map_err(|e| {
-                    HandlerError::InvalidRequest(format!("Failed to parse response: {}", e))
-                })
-            }
-            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
-                "Failed to get response from computer: {}",
-                e
-            ))),
-            Err(_) => Err(HandlerError::Timeout(
-                "Get tools timed out after 30 seconds".to_string(),
-            )),
-        }
     }
 
-    /// 处理获取桌面信息事件
+    /// 处理获取桌面信息事件（经统一 [`Self::relay_client_call`] 转发）。
     async fn on_client_get_desktop(
         socket: SocketRef,
         data: GetDesktopReq,
         state: ServerState,
-    ) -> Result<GetDesktopRet, HandlerError> {
-        // 获取 Agent 的会话信息
-        let sid = socket.id.to_string();
-        let session = state
-            .session_manager
-            .get_session(&sid)
-            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
-
-        // 验证角色必须是 Agent
-        if session.role != ClientRole::Agent {
-            return Err(HandlerError::InvalidRequest(
-                "Only agents can get desktop".to_string(),
-            ));
-        }
-
-        // 验证 Agent 在某个办公室内
-        let office_id = session.office_id.ok_or_else(|| {
-            HandlerError::InvalidRequest("Agent must be in an office to get desktop".to_string())
-        })?;
-
-        // 查找目标 Computer 的 sid
-        let computer_sid = state
-            .session_manager
-            .get_computer_sid_in_office(&office_id, &data.computer)
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest(format!(
-                    "Computer '{}' not found in office",
-                    data.computer
-                ))
-            })?;
-
-        // 获取目标 socket
-        let target_socket = state
-            .io
-            .of(SMCP_NAMESPACE)
-            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest("Target computer socket not found".to_string())
-            })?;
-
-        // 转发请求并等待响应
-        let timeout = tokio::time::Duration::from_secs(30);
-        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_GET_DESKTOP, &data);
-
-        match tokio::time::timeout(timeout, async move {
-            match ack_result {
-                Ok(stream) => {
-                    let mut pinned = Box::pin(stream);
-                    match pinned.next().await {
-                        Some((_, response)) => response,
-                        None => Ok(serde_json::Value::Null),
-                    }
-                }
-                Err(_) => Ok(serde_json::Value::Null),
-            }
-        })
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_GET_DESKTOP,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
         .await
-        {
-            Ok(Ok(response)) => {
-                // 解析响应
-                serde_json::from_value(response).map_err(|e| {
-                    HandlerError::InvalidRequest(format!("Failed to parse response: {}", e))
-                })
-            }
-            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
-                "Failed to get response from computer: {}",
-                e
-            ))),
-            Err(_) => Err(HandlerError::Timeout(
-                "Get desktop timed out after 30 seconds".to_string(),
-            )),
-        }
     }
 
-    /// 处理获取计算机配置事件
+    /// 处理获取计算机配置事件（经统一 [`Self::relay_client_call`] 转发）。
     async fn on_client_get_config(
         socket: SocketRef,
         data: GetComputerConfigReq,
         state: ServerState,
-    ) -> Result<GetComputerConfigRet, HandlerError> {
-        // 获取 Agent 的会话信息
-        let sid = socket.id.to_string();
-        let session = state
-            .session_manager
-            .get_session(&sid)
-            .ok_or_else(|| HandlerError::Session(SessionError::NotFound(sid.clone())))?;
-
-        // 验证角色必须是 Agent
-        if session.role != ClientRole::Agent {
-            return Err(HandlerError::InvalidRequest(
-                "Only agents can get config".to_string(),
-            ));
-        }
-
-        // 验证 Agent 在某个办公室内
-        let office_id = session.office_id.ok_or_else(|| {
-            HandlerError::InvalidRequest("Agent must be in an office to get config".to_string())
-        })?;
-
-        // 查找目标 Computer 的 sid
-        let computer_sid = state
-            .session_manager
-            .get_computer_sid_in_office(&office_id, &data.computer)
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest(format!(
-                    "Computer '{}' not found in office",
-                    data.computer
-                ))
-            })?;
-
-        // 获取目标 socket
-        let target_socket = state
-            .io
-            .of(SMCP_NAMESPACE)
-            .and_then(|op| op.get_socket(computer_sid.parse().unwrap()))
-            .ok_or_else(|| {
-                HandlerError::InvalidRequest("Target computer socket not found".to_string())
-            })?;
-
-        // 转发请求并等待响应
-        let timeout = tokio::time::Duration::from_secs(30);
-        let ack_result = target_socket.emit_with_ack(smcp::events::CLIENT_GET_CONFIG, &data);
-
-        match tokio::time::timeout(timeout, async move {
-            match ack_result {
-                Ok(stream) => {
-                    let mut pinned = Box::pin(stream);
-                    match pinned.next().await {
-                        Some((_, response)) => response,
-                        None => Ok(serde_json::Value::Null),
-                    }
-                }
-                Err(_) => Ok(serde_json::Value::Null),
-            }
-        })
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_GET_CONFIG,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
         .await
-        {
-            Ok(Ok(response)) => {
-                // 解析响应
-                serde_json::from_value(response).map_err(|e| {
-                    HandlerError::InvalidRequest(format!("Failed to parse response: {}", e))
-                })
-            }
-            Ok(Err(e)) => Err(HandlerError::Timeout(format!(
-                "Failed to get response from computer: {}",
-                e
-            ))),
-            Err(_) => Err(HandlerError::Timeout(
-                "Get config timed out after 30 seconds".to_string(),
-            )),
-        }
     }
 
     /// 处理桌面更新事件

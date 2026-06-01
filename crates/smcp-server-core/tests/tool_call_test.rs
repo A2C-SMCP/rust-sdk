@@ -201,26 +201,32 @@ async fn test_tool_call_computer_not_found() {
         .expect("tool_call ack timeout")
         .unwrap();
 
-    // 验证错误响应
-    let error_msg = match error_payload {
-        serde_json::Value::String(s) => s,
-        serde_json::Value::Array(arr) => arr
-            .first()
-            .map(|v| {
-                if let Some(err) = v.get("Err").and_then(|e| e.as_str()) {
-                    err.to_string()
-                } else if let Some(s) = v.as_str() {
-                    s.to_string()
-                } else {
-                    v.to_string()
-                }
-            })
-            .unwrap_or_default(),
-        _ => error_payload.to_string(),
-    };
-
-    // 验证错误信息
-    assert!(error_msg.contains("not found") || error_msg.contains("Computer"));
+    // 新语义（SRV-01 #47）：目标 Computer 未命中 → 经 ack 投递 flat ErrorPayload(404)（顶层
+    // code/message，无 {"Ok"/"Err"} envelope），对标 build_computer_not_found_error。
+    // socketio ack 以 args 数组 `[<v>]` 投递，先解包。
+    let body = error_payload
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(error_payload);
+    assert_eq!(
+        body.get("code").and_then(serde_json::Value::as_i64),
+        Some(404),
+        "expected flat 404, got: {body}"
+    );
+    assert!(
+        body.get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("not found"),
+        "expected not-found message, got: {body}"
+    );
+    assert_eq!(
+        body.pointer("/details/computer_name")
+            .and_then(serde_json::Value::as_str),
+        Some("nonexistent")
+    );
+    assert!(body.get("Err").is_none(), "禁止 {{\"Err\":..}} envelope");
 
     // 清理
     agent_client.disconnect().await.unwrap();
@@ -284,33 +290,27 @@ async fn test_tool_call_cross_office_permission_denied() {
         .expect("tool_call ack timeout")
         .unwrap();
 
-    // 验证错误响应
-    let error_msg = match error_payload {
-        serde_json::Value::String(s) => s,
-        serde_json::Value::Array(arr) => arr
-            .first()
-            .map(|v| {
-                if let Some(err) = v.get("Err").and_then(|e| e.as_str()) {
-                    err.to_string()
-                } else if let Some(s) = v.as_str() {
-                    s.to_string()
-                } else {
-                    v.to_string()
-                }
-            })
-            .unwrap_or_default(),
-        _ => error_payload.to_string(),
-    };
-
-    // 验证错误信息
-    println!("Actual error message: {}", error_msg);
-    assert!(
-        error_msg.contains("Session not found")
-            || error_msg.contains("permission")
-            || error_msg.contains("office"),
-        "Expected session/permission/office error, got: {}",
-        error_msg
+    // 新语义（SRV-01 #47）：office-scoped 查找让跨 office 目标天然不可达，统一回 flat
+    // ErrorPayload(404)——刻意**不**泄露「computer1 存在于其它 office」（隔离不串话），不再回
+    // {"Err":..} envelope 或 "office"/"permission" 文案。socketio ack 以 args 数组 `[<v>]` 投递，先解包。
+    let body = error_payload
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(error_payload);
+    assert_eq!(
+        body.get("code").and_then(serde_json::Value::as_i64),
+        Some(404),
+        "expected flat 404 (cross-office unreachable), got: {body}"
     );
+    assert!(
+        body.get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("not found"),
+        "expected not-found message, got: {body}"
+    );
+    assert!(body.get("Err").is_none(), "禁止 {{\"Err\":..}} envelope");
 
     // 清理
     computer_client.disconnect().await.unwrap();
