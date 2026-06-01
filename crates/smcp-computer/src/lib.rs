@@ -13,6 +13,7 @@ pub mod desktop;
 pub mod errors;
 pub mod inputs;
 pub mod mcp_clients;
+pub mod settings;
 pub mod socketio_client;
 
 #[cfg(feature = "cli")]
