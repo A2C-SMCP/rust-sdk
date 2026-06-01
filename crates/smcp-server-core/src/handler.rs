@@ -308,8 +308,19 @@ impl SmcpHandler {
                 s
             }
             None => {
+                // 从握手 URL query 提取协商到的协议版本（仅记录用于诊断/展示，
+                // 兼容性已由 HTTP 握手中间件保证）。提取逻辑对齐 Python `_extract_a2c_version`。
+                //
+                // 时机说明：Python 在 on_connect 即记录 a2c_version；Rust 会话在 join 时才懒建，
+                // 故在此（会话创建处）记录。二者 list_room 结果等价——`req_parts().uri.query()`
+                // 反映的是该连接的握手请求 URI，连接存续期间稳定（已由集成测试
+                // `test_list_room_reports_a2c_version` 固化验证）。
+                let a2c_version = smcp::utils::handshake::extract_a2c_version(
+                    socket.req_parts().uri.query().unwrap_or(""),
+                );
                 // 创建新会话
-                let new_session = SessionData::new(sid.clone(), requested_name, requested_role);
+                let new_session = SessionData::new(sid.clone(), requested_name, requested_role)
+                    .with_a2c_version(a2c_version);
 
                 if let Err(e) = state.session_manager.register_session(new_session.clone()) {
                     return (false, Some(format!("Failed to register session: {}", e)));
@@ -990,6 +1001,7 @@ impl SmcpHandler {
                 name: s.name,
                 role: s.role.into(),
                 office_id: s.office_id.unwrap_or_default(),
+                a2c_version: s.a2c_version,
             })
             .collect();
 

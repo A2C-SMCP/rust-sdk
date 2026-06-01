@@ -698,6 +698,15 @@ pub struct SessionInfo {
     pub name: String,
     pub role: Role,
     pub office_id: String,
+    /// 协议版本号（v0.2 新增）：由 Server 在 HTTP 握手阶段从连接 URL query `a2c_version`
+    /// 写入，仅用于展示与诊断，**不参与二次校验**（兼容性已由握手中间件保证）。缺省（旧连接
+    /// 未协商）时省略序列化。对标 Python `SessionInfo.a2c_version: NotRequired[str]`。
+    ///
+    /// Protocol version (v0.2): written by the Server from the connect URL query `a2c_version`
+    /// during the HTTP handshake; for display/diagnostics only, never re-validated. Omitted from
+    /// serialization when absent (legacy connections that did not negotiate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2c_version: Option<String>,
 }
 
 /// 列出房间返回
@@ -838,6 +847,43 @@ mod tests {
 
         let de: Role = serde_json::from_str("\"computer\"").unwrap();
         assert!(matches!(de, Role::Computer));
+    }
+
+    #[test]
+    fn test_session_info_a2c_version_serde() {
+        // Some(version) → JSON 顶层含 "a2c_version"
+        let with_ver = SessionInfo {
+            sid: "sid-1".to_string(),
+            name: "agent-1".to_string(),
+            role: Role::Agent,
+            office_id: "office-1".to_string(),
+            a2c_version: Some("0.2.0".to_string()),
+        };
+        let json = serde_json::to_value(&with_ver).unwrap();
+        assert_eq!(json["a2c_version"], "0.2.0");
+
+        // None → skip_serializing_if 省略键（必须缺键，而非输出 null；对齐 Python NotRequired[str]）
+        let without_ver = SessionInfo {
+            sid: "sid-2".to_string(),
+            name: "computer-1".to_string(),
+            role: Role::Computer,
+            office_id: "office-1".to_string(),
+            a2c_version: None,
+        };
+        let json_none = serde_json::to_value(&without_ver).unwrap();
+        assert!(
+            json_none.get("a2c_version").is_none(),
+            "None 时必须省略 a2c_version 键，实得: {json_none}"
+        );
+
+        // 缺键 JSON（旧连接报文）→ default 反序列化为 None（容缺）
+        let legacy = r#"{"sid":"sid-3","name":"c2","role":"computer","office_id":"office-1"}"#;
+        let de: SessionInfo = serde_json::from_str(legacy).unwrap();
+        assert!(de.a2c_version.is_none());
+
+        // 往返一致（含版本）
+        let back: SessionInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.a2c_version.as_deref(), Some("0.2.0"));
     }
 
     #[test]

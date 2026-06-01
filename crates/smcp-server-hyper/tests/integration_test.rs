@@ -208,6 +208,22 @@ async fn create_client(addr: SocketAddr, namespace: &str) -> Client {
         .expect("Failed to connect client")
 }
 
+/// 创建在握手 URL query 注入 `a2c_version` 的 Socket.IO 客户端 / Client whose connect URL carries `a2c_version`。
+///
+/// 模拟客户端版本协商：地址带 `?a2c_version=<version>`，tf-rust-socketio 会保留该 query（engineio
+/// 仅追加 `EIO`、path 由 socketio 设为 `/socket.io/`），从而让服务端 `req_parts().uri.query()` 含该版本。
+async fn create_client_with_version(addr: SocketAddr, namespace: &str, version: &str) -> Client {
+    let url = format!("http://localhost:{}/?a2c_version={}", addr.port(), version);
+
+    ClientBuilder::new(url)
+        .transport_type(TransportType::Websocket)
+        .namespace(namespace)
+        .opening_header("access_token", "test_secret")
+        .connect()
+        .await
+        .expect("Failed to connect client with a2c_version")
+}
+
 /// 创建客户端并确保在作用域结束时断开
 async fn create_managed_client(addr: SocketAddr, namespace: &str) -> Client {
     let client = create_client(addr, namespace).await;
@@ -567,6 +583,70 @@ async fn test_list_room_sessions() {
     } else {
         panic!("Response should be an array");
     }
+}
+
+/// SMCP-08 (#15)：握手协商到的 `a2c_version` 应经 session 透出到 `server:list_room`。
+///
+/// 端到端覆盖 query → session → list_room 全链路，且**经实连验证** `req_parts().uri.query()` 在
+/// join（晚于连接握手）时仍保留握手 query 这一关键假设。同时覆盖旧式连接（不带 query）字段缺省两态。
+#[tokio::test]
+async fn test_list_room_reports_a2c_version() {
+    let server = TestServer::new().await;
+
+    // Agent：握手 URL 携带 a2c_version=0.2.0（模拟版本协商）
+    let agent = create_client_with_version(server.addr, SMCP_NAMESPACE, "0.2.0").await;
+    sleep(Duration::from_millis(100)).await;
+    // Computer：旧式连接，不带 a2c_version query
+    let computer = create_managed_client(server.addr, SMCP_NAMESPACE).await;
+    sleep(Duration::from_millis(100)).await;
+
+    let office = "office-version-test";
+
+    let agent_join = json!({"role": "agent", "name": "agent-v", "office_id": office});
+    emit_event_with_ack_validation(&agent, "server:join_office", agent_join, true)
+        .await
+        .unwrap();
+
+    let comp_join = json!({"role": "computer", "name": "computer-legacy", "office_id": office});
+    emit_event_with_ack_validation(&computer, "server:join_office", comp_join, true)
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(300)).await;
+
+    let list_data = json!({"agent": "agent-v", "req_id": "req-version", "office_id": office});
+    let list_response = emit_event_with_ack_validation(&agent, "server:list_room", list_data, true)
+        .await
+        .unwrap();
+
+    let response_array = list_response.as_array().expect("list_room 响应应为数组");
+    let list_room_ret = response_array.first().expect("响应应含 ListRoomRet");
+    let sessions = list_room_ret
+        .get("sessions")
+        .and_then(|s| s.as_array())
+        .expect("应含 sessions 数组");
+    assert_eq!(sessions.len(), 2, "房间应有 2 个会话");
+
+    // 带版本的 agent → a2c_version == "0.2.0"（验证 query→session→list_room 全链路 + req_parts 假设）
+    let agent_session = sessions
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("agent-v"))
+        .expect("应找到 agent-v 会话");
+    assert_eq!(
+        agent_session.get("a2c_version").and_then(|v| v.as_str()),
+        Some("0.2.0"),
+        "握手协商版本应透出到 list_room，实得: {agent_session}"
+    );
+
+    // 旧式 computer（无 query）→ a2c_version 缺省（skip_serializing_if 省略键）
+    let computer_session = sessions
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("computer-legacy"))
+        .expect("应找到 computer-legacy 会话");
+    assert!(
+        computer_session.get("a2c_version").is_none(),
+        "未协商版本的旧连接应省略 a2c_version，实得: {computer_session}"
+    );
 }
 
 #[tokio::test]

@@ -44,8 +44,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// 中间件统一输出 body（拒绝分支与透传分支共用）/ Unified response body type.
 type RespBody = BoxBody<Bytes, BoxError>;
 
-/// 握手版本查询参数键 / Handshake version query-param key（对齐 [`smcp::utils::handshake::A2C_VERSION_QUERY_KEY`]）。
-const A2C_VERSION_QUERY_KEY: &str = "a2c_version";
 /// 4008 诊断 header 名 / Diagnostic header carrying the 4008 code（仅 mismatch 时附带）。
 const X_A2C_ERROR_CODE_HEADER: &str = "x-a2c-error-code";
 /// 默认 Engine.IO HTTP 挂载路径 / Default Engine.IO HTTP mount path（socketioxide 默认）。
@@ -128,8 +126,9 @@ fn check_version<B>(req: &Request<B>, cfg: &VersionHandshakeConfig) -> Option<Re
         return None;
     }
     let query = req.uri().query().unwrap_or("");
-    // 空值视为缺失（对齐 Python `if not raw`）。
-    let raw = query_param(query, A2C_VERSION_QUERY_KEY).filter(|s| !s.is_empty());
+    // 取首个非空 `a2c_version`（空值视为缺失，对齐 Python `if not raw`）。复用协议层
+    // `extract_a2c_version`——与会话落库（handler 侧）共用同一套 query 解析，消除重复实现。
+    let raw = smcp::utils::handshake::extract_a2c_version(query);
     match raw {
         None => Some(reject(
             &ErrorPayload::new(400, "Missing a2c_version query parameter"),
@@ -173,19 +172,6 @@ fn reject(payload: &ErrorPayload, with_a2c_header: bool) -> Response<RespBody> {
         .map_err(|e: std::convert::Infallible| -> BoxError { match e {} })
         .boxed();
     builder.body(body).expect("构造 400 响应不应失败")
-}
-
-/// 从 query string 取首个匹配 key 的值（未百分号解码；版本串为纯 ASCII 数字与点，无需解码）。
-fn query_param(query: &str, key: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let mut it = pair.splitn(2, '=');
-        let k = it.next()?;
-        if k == key {
-            Some(it.next().unwrap_or("").to_string())
-        } else {
-            None
-        }
-    })
 }
 
 #[cfg(test)]

@@ -58,6 +58,19 @@ pub fn build_handshake_url(
     Ok(url.to_string())
 }
 
+/// 从连接 URL 的 query string 解析 `a2c_version` / Parse `a2c_version` from a connect-URL query string。
+///
+/// 服务端在握手阶段调用：取首个 `a2c_version` 值（空值视为缺省 → `None`）。对标 Python
+/// `_extract_a2c_version`（其用 `parse_qs(qs).get("a2c_version")`，取列表首项）。
+///
+/// 入参为**裸 query string**（不含前导 `?`），如 `transport=polling&a2c_version=0.2.0`。
+pub fn extract_a2c_version(query_string: &str) -> Option<String> {
+    url::form_urlencoded::parse(query_string.as_bytes())
+        .find(|(k, _)| k == A2C_VERSION_QUERY_KEY)
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
 /// 保证传输顺序 polling-first / Ensure polling-first transport order。
 ///
 /// 始终把 `polling` 置于首位（保留其它传输的相对顺序、去重）；空列表回退到
@@ -163,6 +176,31 @@ mod tests {
     #[test]
     fn test_build_handshake_url_invalid() {
         assert!(build_handshake_url("not a url", "0.2.0").is_err());
+    }
+
+    #[test]
+    fn test_extract_a2c_version() {
+        // 含 a2c_version → Some
+        assert_eq!(
+            extract_a2c_version("transport=polling&a2c_version=0.2.0&t=abc").as_deref(),
+            Some("0.2.0")
+        );
+        // 仅 a2c_version
+        assert_eq!(
+            extract_a2c_version("a2c_version=0.2.1").as_deref(),
+            Some("0.2.1")
+        );
+        // 缺失 → None
+        assert_eq!(extract_a2c_version("transport=polling&t=abc"), None);
+        // 空值 → None（视为未协商）
+        assert_eq!(extract_a2c_version("a2c_version="), None);
+        // 空 query → None
+        assert_eq!(extract_a2c_version(""), None);
+        // 多个时取首项（对齐 Python parse_qs 取列表首项）
+        assert_eq!(
+            extract_a2c_version("a2c_version=0.2.0&a2c_version=9.9.9").as_deref(),
+            Some("0.2.0")
+        );
     }
 
     #[test]
