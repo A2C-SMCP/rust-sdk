@@ -197,12 +197,18 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// 协议依据 / Protocol: `a2c-smcp-protocol` error-handling.md（flat ErrorPayload，禁止二次 unwrap）。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py` 的 `ErrorPayload`。
 ///
-/// 协议 0.2.x 对特定码在**顶层平铺**分流字段（对齐 Python `smcp.py` `ErrorPayload`
-/// `total=False` TypedDict）：4008（协议版本不兼容）→ `server_version` / `client_version` /
-/// `min_supported` / `max_supported`（HS-01 #21 / HS-02 #22，**已落地**，构造见
-/// [`ErrorPayload::version_mismatch`]）。
-/// 🚧 待补（latent，随对应码代码路径落地）：4014 / 4015 → `mcp_server_name` / `capability`
-/// （SRV-01 #47 / AUTH-01 #23）。未知顶层字段在反序列化时被忽略（serde 默认行为）。
+/// 协议 0.2.x 对特定码在**顶层平铺**分流字段（对齐 Python `smcp.py:484` `ErrorPayload`
+/// `total=False` TypedDict）：
+/// - 4008（协议版本不兼容）→ `server_version` / `client_version` / `min_supported` /
+///   `max_supported`（HS-01 #21 / HS-02 #22；构造见 [`ErrorPayload::version_mismatch`]）。
+/// - 4014（MCP Server 未命中）→ `mcp_server_name`；4015（能力不支持）→ `mcp_server_name` /
+///   `capability`（SRV-01 #47 / AUTH-01 #23；构造见 [`ErrorPayload::with_mcp_server_name`] /
+///   [`ErrorPayload::with_capability`]）。
+/// - 4016 / 4017 / 4018 的 code-specific 字段下沉到 `details` 子对象（无顶层平铺新字段）。
+///
+/// 未知顶层字段由 [`ErrorPayload::extra`]（`#[serde(flatten)]`）**捕获并保留**，跨-SDK 往返
+/// 不静默丢字段——镜像 Python `total=False` TypedDict（运行时即 `dict`）的开放语义，避免旧
+/// Rust SDK 在协议非破坏性新增顶层字段后把它们悄悄抹掉。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorPayload {
     /// 错误码（协议 `ErrorCode` 取值；线格式为裸整数）/ Error code (a protocol `ErrorCode` value; bare int on the wire)
@@ -224,6 +230,17 @@ pub struct ErrorPayload {
     /// 4008 顶层分流：服务端支持的最大版本 / top-level for 4008: max supported。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_supported: Option<String>,
+    /// 4014 / 4015 顶层分流：未命中 / 缺能力的 MCP Server 名 / top-level for 4014&4015: MCP server name。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_server_name: Option<String>,
+    /// 4015 顶层分流：缺失的 capability 名（如 `"resources"`）/ top-level for 4015: missing capability。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// 未知顶层字段兜底容器：捕获本结构未显式建模的顶层键，跨-SDK 往返不丢字段（见结构体文档）。
+    /// 为空时不产出任何额外键（空 map flatten 后无输出），故不影响既有 byte 兼容契约。
+    /// Catch-all for unmodeled top-level keys so cross-SDK round-trips never silently drop fields.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ErrorPayload {
@@ -237,7 +254,23 @@ impl ErrorPayload {
             client_version: None,
             min_supported: None,
             max_supported: None,
+            mcp_server_name: None,
+            capability: None,
+            extra: serde_json::Map::new(),
         }
+    }
+
+    /// 由协议 [`ErrorCode`] 构造 flat 错误负载，消除调用点手工 `i64::from(ErrorCode::X.code())` 样板。
+    ///
+    /// 产出的 `code` 必属 [`is_protocol_error_payload`] 识别的协议级闭集（编译期由 [`ErrorCode`] 保证），
+    /// 杜绝误用传输/管理层整数字面量（400 / 401 / 500 / 4101…）落入 `client:*` ack 致 Agent 端
+    /// [`is_protocol_error_payload`] 误判为「非协议错误」。
+    ///
+    /// Build a flat payload from a protocol [`ErrorCode`], removing manual
+    /// `i64::from(ErrorCode::X.code())` boilerplate and guaranteeing the wire `code` is always a
+    /// protocol-level value recognized by [`is_protocol_error_payload`].
+    pub fn from_error_code(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::new(i64::from(code.code()), message)
     }
 
     /// 设置整个 `details` 诊断容器 / Set the whole `details` diagnostic container
@@ -262,6 +295,18 @@ impl ErrorPayload {
         self
     }
 
+    /// 顶层平铺 `mcp_server_name`（4014 / 4015 分流字段）/ Set top-level `mcp_server_name` (4014/4015).
+    pub fn with_mcp_server_name(mut self, name: impl Into<String>) -> Self {
+        self.mcp_server_name = Some(name.into());
+        self
+    }
+
+    /// 顶层平铺 `capability`（4015 缺失能力名，如 `"resources"`）/ Set top-level `capability` (4015).
+    pub fn with_capability(mut self, capability: impl Into<String>) -> Self {
+        self.capability = Some(capability.into());
+        self
+    }
+
     /// 构造 4008（协议版本不兼容）flat ErrorPayload，顶层平铺 4 个版本分流字段。
     ///
     /// `min_supported` / `max_supported` 由 server 版本派生：同 `MAJOR.MINOR` 的整个 PATCH 段
@@ -276,6 +321,9 @@ impl ErrorPayload {
             client_version: Some(client.to_string()),
             min_supported: Some(format!("{}.{}.0", server.major, server.minor)),
             max_supported: Some(format!("{}.{}.999", server.major, server.minor)),
+            mcp_server_name: None,
+            capability: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -1395,6 +1443,86 @@ mod tests {
         let deserialized: ErrorPayload = serde_json::from_str(&json).unwrap();
 
         assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_error_payload_from_error_code() {
+        // from_error_code：code 来自协议 ErrorCode（杜绝手工整数字面量），且必被 is_protocol_error_payload 识别
+        let payload = ErrorPayload::from_error_code(ErrorCode::McpServerNotFound, "boom");
+        assert_eq!(payload.code, 4014);
+        assert_eq!(payload.code, i64::from(ErrorCode::McpServerNotFound.code()));
+        assert_eq!(payload.message, "boom");
+
+        let v = serde_json::to_value(&payload).unwrap();
+        assert!(is_protocol_error_payload(&v));
+        // 顶层分流字段未设置时不序列化
+        assert!(v.get("mcp_server_name").is_none());
+        assert!(v.get("capability").is_none());
+        assert!(v.get("details").is_none());
+    }
+
+    #[test]
+    fn test_error_payload_4014_top_level_field() {
+        // 4014：mcp_server_name 顶层平铺（非 details 子对象）
+        let v = serde_json::to_value(
+            ErrorPayload::from_error_code(ErrorCode::McpServerNotFound, "not found")
+                .with_mcp_server_name("filesystem"),
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "code": 4014,
+                "message": "not found",
+                "mcp_server_name": "filesystem"
+            })
+        );
+    }
+
+    #[test]
+    fn test_error_payload_4015_top_level_fields_python_shape() {
+        // 4015：mcp_server_name + capability 双顶层字段，与 Python smcp.py:484 total=False 形态一致
+        let v = serde_json::to_value(
+            ErrorPayload::from_error_code(ErrorCode::McpCapabilityNotSupported, "unsupported")
+                .with_mcp_server_name("docs-server")
+                .with_capability("resources"),
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "code": 4015,
+                "message": "unsupported",
+                "mcp_server_name": "docs-server",
+                "capability": "resources"
+            })
+        );
+    }
+
+    #[test]
+    fn test_error_payload_captures_unknown_top_level_fields() {
+        // 跨-SDK 前向兼容：协议未来非破坏新增的顶层字段被 extra 捕获并原样保留（不静默丢失）
+        let wire = serde_json::json!({
+            "code": 4014,
+            "message": "x",
+            "mcp_server_name": "srv",   // 已建模顶层字段 → 落入 typed field，不进 extra
+            "future_string": "keep-me", // 未建模 → 落入 extra
+            "future_object": { "nested": true },
+            "future_number": 7
+        });
+        let payload: ErrorPayload = serde_json::from_value(wire.clone()).unwrap();
+
+        // 已建模字段不污染 extra
+        assert_eq!(payload.mcp_server_name.as_deref(), Some("srv"));
+        assert!(!payload.extra.contains_key("mcp_server_name"));
+        assert!(!payload.extra.contains_key("code"));
+        // 未建模字段被 extra 捕获
+        assert_eq!(payload.extra.get("future_string").unwrap(), "keep-me");
+        assert_eq!(payload.extra.get("future_number").unwrap(), 7);
+
+        // 往返后所有顶层字段（含未知）逐字节保留
+        let round = serde_json::to_value(&payload).unwrap();
+        assert_eq!(round, wire);
     }
 
     #[test]
