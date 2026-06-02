@@ -23,6 +23,7 @@ async fn test_message_forwarding() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io.clone()),
+        inflight_disconnect: Default::default(),
     };
     SmcpHandler::register_handlers(&io, state);
 
@@ -117,6 +118,7 @@ async fn test_error_handling() {
         session_manager,
         auth_provider,
         io: Arc::new(io),
+        inflight_disconnect: Default::default(),
     };
 
     // 创建一个不在办公室的 Agent 会话

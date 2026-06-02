@@ -411,3 +411,172 @@ async fn test_tool_call_timeout_handling() {
     agent_client.disconnect().await.unwrap();
     server.shutdown();
 }
+
+/// #56 SRV-04：目标 Computer **在途断连** → 在途 relay 立即放弃等待、回 flat `ErrorPayload(404)`，
+/// 而非空等满 server 端 30s relay timeout（socketioxide `emit_with_ack` 等待原语不监听掉线）。
+#[tokio::test]
+async fn test_tool_call_target_disconnect_returns_fast_404() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+
+    // Computer 连接但**不**注册 tool_call 处理器（永不 ack）→ server relay 进入等待。
+    let computer_client = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(200)).await;
+    join_office(&computer_client, Role::Computer, "office1", "computer1").await;
+
+    let agent_client = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(200)).await;
+    join_office(&agent_client, Role::Agent, "office1", "agent1").await;
+
+    let tool_call_req = ToolCallReq {
+        base: AgentCallData {
+            agent: "agent1".to_string(),
+            req_id: ReqId("req-target-disc".to_string()),
+        },
+        computer: "computer1".to_string(),
+        tool_name: "echo".to_string(),
+        params: json!({"text": "hi"}),
+        timeout: 5,
+    };
+
+    let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
+    // 客户端 ack 超时需 > 断连延迟，但远 < server 30s relay timeout：若守卫失效则此处会超时失败。
+    agent_client
+        .emit_with_ack(
+            "client:tool_call",
+            json!(tool_call_req),
+            Duration::from_secs(15),
+            ack_to_sender(result_tx, |p| match p {
+                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            }),
+        )
+        .await
+        .expect("tool_call emit_with_ack failed");
+
+    // 等 server 转发并进入 relay 等待，再让目标 Computer 断连。
+    sleep(Duration::from_millis(300)).await;
+    let start = std::time::Instant::now();
+    computer_client.disconnect().await.unwrap();
+
+    let error_payload = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("目标在途断连后应快速收到 ack，而非空等满 server 30s relay timeout")
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    // 远小于 server 端 30s relay timeout → 证明信号竞速生效（而非超时巧合）。
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "断连→ack 耗时 {elapsed:?} 不应接近 server 30s relay timeout"
+    );
+
+    // 目标中途消失 == 不存在：与 #47/#92 同一 flat 404 payload，不泄露、不造非协议错误码。
+    let body = error_payload
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(error_payload);
+    assert_eq!(
+        body.get("code").and_then(serde_json::Value::as_i64),
+        Some(404),
+        "目标在途断连应回 flat 404, got: {body}"
+    );
+    assert_eq!(
+        body.pointer("/details/computer_name")
+            .and_then(serde_json::Value::as_str),
+        Some("computer1")
+    );
+    assert!(body.get("Err").is_none(), "禁止 {{\"Err\":..}} envelope");
+
+    agent_client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// #56 SRV-04：发起方 Agent **在途断连** → server 静默丢弃在途请求、**MUST NOT** crash/hang；
+/// 后续全新请求仍正常服务（证明注册表无死锁、无 panic 波及）。
+///
+/// 说明：tf_rust_socketio 测试客户端无法在 `on` 回调内回 ACK，故无法构造「Computer 成功响应后再
+/// 复查发起方」的精确路径——该 originator-recheck 由单测逻辑 + relay 受控 `Result` 保证；此处验证
+/// 端到端不崩溃/不卡死。
+#[tokio::test]
+async fn test_originator_disconnect_in_flight_no_crash() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+
+    let computer_client = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(200)).await;
+    join_office(&computer_client, Role::Computer, "office1", "computer1").await;
+
+    let agent_client = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(200)).await;
+    join_office(&agent_client, Role::Agent, "office1", "agent1").await;
+
+    let tool_call_req = ToolCallReq {
+        base: AgentCallData {
+            agent: "agent1".to_string(),
+            req_id: ReqId("req-orig-disc".to_string()),
+        },
+        computer: "computer1".to_string(),
+        tool_name: "echo".to_string(),
+        params: json!({"text": "hi"}),
+        timeout: 5,
+    };
+
+    // fire-and-forget：发出后立即断连发起方，无需等待 ack。
+    agent_client
+        .emit("client:tool_call", json!(tool_call_req))
+        .await
+        .expect("emit client:tool_call failed");
+    sleep(Duration::from_millis(150)).await; // 让 server 转发并进入 relay 等待
+    agent_client.disconnect().await.unwrap(); // 发起方在途断连
+    sleep(Duration::from_millis(150)).await;
+    computer_client.disconnect().await.unwrap(); // 目标也断连 → relay 经信号快速收尾
+
+    // 健康检查：全新 Agent 在新 office 仍可正常 join + list_room（server 崩溃/卡死则此处 panic/超时）。
+    sleep(Duration::from_millis(200)).await;
+    let agent2 = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(200)).await;
+    join_office(&agent2, Role::Agent, "office2", "agent2").await;
+
+    let list_req = ListRoomReq {
+        base: AgentCallData {
+            agent: "agent2".to_string(),
+            req_id: ReqId("health-check".to_string()),
+        },
+        office_id: "office2".to_string(),
+    };
+    let (tx, rx) = oneshot::channel::<serde_json::Value>();
+    agent2
+        .emit_with_ack(
+            "server:list_room",
+            json!(list_req),
+            Duration::from_secs(5),
+            ack_to_sender(tx, |p| match p {
+                Payload::Text(mut v, _) => v.pop().unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            }),
+        )
+        .await
+        .expect("list_room emit failed");
+    let resp = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("原发起方在途断连后 server MUST 仍正常响应（未崩溃/未卡死）")
+        .unwrap();
+    let body = resp
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(resp);
+    assert!(
+        body.get("sessions").is_some(),
+        "list_room 应正常返回 sessions, got: {body}"
+    );
+
+    agent2.disconnect().await.unwrap();
+    server.shutdown();
+}

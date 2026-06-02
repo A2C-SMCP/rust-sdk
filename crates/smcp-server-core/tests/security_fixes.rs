@@ -23,6 +23,7 @@ async fn test_list_room_permission_validation() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io.clone()),
+        inflight_disconnect: Default::default(),
     };
     SmcpHandler::register_handlers(&io, state.clone());
 
@@ -70,6 +71,7 @@ async fn test_join_office_consistency_check() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io),
+        inflight_disconnect: Default::default(),
     };
 
     // 测试1: 新会话可以正常加入

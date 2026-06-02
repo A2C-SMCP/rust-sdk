@@ -40,6 +40,7 @@ async fn test_get_config_event_registered() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io.clone()),
+        inflight_disconnect: Default::default(),
     };
     SmcpHandler::register_handlers(&io, state);
 }
@@ -58,6 +59,7 @@ async fn test_get_config_unauthorized_role() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io.clone()),
+        inflight_disconnect: Default::default(),
     };
     SmcpHandler::register_handlers(&io, state);
 
@@ -86,6 +88,7 @@ async fn test_get_config_success() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io.clone()),
+        inflight_disconnect: Default::default(),
     };
     SmcpHandler::register_handlers(&io, state);
 
@@ -165,6 +168,7 @@ async fn test_get_config_computer_not_found() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io.clone()),
+        inflight_disconnect: Default::default(),
     };
     SmcpHandler::register_handlers(&io, state);
 
@@ -202,6 +206,7 @@ async fn test_get_config_agent_not_in_office() {
         session_manager: session_manager.clone(),
         auth_provider,
         io: Arc::new(io.clone()),
+        inflight_disconnect: Default::default(),
     };
     SmcpHandler::register_handlers(&io, state);
 
