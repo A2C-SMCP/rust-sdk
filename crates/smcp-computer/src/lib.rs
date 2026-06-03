@@ -14,6 +14,7 @@ pub mod errors;
 pub mod inputs;
 pub mod mcp_clients;
 pub mod settings;
+pub mod skills;
 pub mod socketio_client;
 
 #[cfg(feature = "cli")]
