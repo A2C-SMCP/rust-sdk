@@ -11,7 +11,7 @@
 
 //! SKILL marketplace source 解析 / SKILL marketplace source resolution。
 //!
-//! 协议依据 / Protocol: tfrobot-marketplace `protocol-v1.md` §5（Plugin source 5 类 disjoint union +
+//! 协议依据 / Protocol: tfrobot-marketplace `docs/marketplace/protocol-v1.md` §5（Plugin source 5 类 disjoint union +
 //! github/cnb 简写糖 + git-subdir sparse clone）、§3.2（`metadata.pluginRoot` 使裸名 `"x"` 等价
 //! `"./<pluginRoot>/x"`）。对标 Python 参考实现 / Mirrors `a2c_smcp/computer/skills/sources.py`。
 //!
@@ -140,6 +140,11 @@ fn require_str(map: &Map<String, Value>, key: &str, raw: &str) -> Result<String,
 /// 提取可选 `ref` / `sha`（`sha` 须为完整 40 字符 hex，小写归一）/ Extract optional `ref` / `sha`。
 ///
 /// `null` / 缺失 → `None`；present 但非 string / 空（`ref`）或非 40-hex（`sha`）→ 抛。
+///
+/// 安全前瞻 / Security note：`ref` **内容**本层**不**校验（仅校验非空，纯解析、与 Python parity）。下游
+/// staging（SKL-04）以 `git clone --branch <ref>` / sparse-checkout `<subdir>` 拼接命令行时 **MUST** 用
+/// `--` 终止符或白名单校验 `ref` / `subdir`，防 `--upload-pack=…` 之类 git 参数注入——本层定位为「纯解析、
+/// 零 git」，刻意不在此加校验以免破坏 parity。
 fn extract_ref_sha(
     map: &Map<String, Value>,
     raw: &str,

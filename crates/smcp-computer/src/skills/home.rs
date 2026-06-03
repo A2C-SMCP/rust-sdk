@@ -106,6 +106,9 @@ fn expand_home(raw: &str, env: Option<&EnvMap>) -> PathBuf {
 /// 词法规范化为绝对路径；落盘由 staging 负责（见 [`ensure_skill_home`]）。不做 path deny-list 校验
 /// ——跨用户隔离按 CC 对齐交给 OS 权限。
 ///
+/// 相对 `A2C_SKILL_HOME`（非 `~` 前缀的相对值）在**解析时锚定到 CWD**（对齐 Python `Path.resolve()`
+/// 的词法等价物），故返回值恒为绝对路径、且落盘位置在解析时即定格（不随后续 CWD 漂移）。
+///
 /// `env` 为 `None` 时读进程环境（生产）；测试注入隔离映射（含 `HOME` / `XDG_DATA_HOME` /
 /// `A2C_SKILL_HOME`）保持 hermetic。
 pub fn resolve_skill_home(env: Option<&EnvMap>) -> PathBuf {
@@ -113,7 +116,18 @@ pub fn resolve_skill_home(env: Option<&EnvMap>) -> PathBuf {
     if let Some(raw) = env_lookup(env, SKILL_HOME_ENV) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return normalize_lexical(&expand_home(trimmed, env));
+            let expanded = expand_home(trimmed, env);
+            // 相对 override 锚定到 CWD（对齐 Python `Path.resolve()` 的词法等价物）：保证返回绝对路径，
+            // 并在解析时即**定格**落盘位置（避免相对值下 ensure_skill_home 随 CWD 漂移）。`~` 展开后与
+            // 绝对 override 已绝对，原样透传。
+            let anchored = if expanded.is_absolute() {
+                expanded
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(expanded)
+            } else {
+                expanded
+            };
+            return normalize_lexical(&anchored);
         }
     }
     // 2. `$XDG_DATA_HOME/a2c/skills`（须绝对，否则忽略）→ 3. `~/.a2c/skills` 回退。
@@ -231,6 +245,17 @@ mod tests {
             resolve_skill_home(Some(&env)),
             PathBuf::from("/home/alice/my-skills")
         );
+    }
+
+    #[test]
+    fn test_relative_override_anchored_to_cwd() {
+        // 相对（非 `~`）A2C_SKILL_HOME 在解析时锚定到 CWD → 绝对路径（对齐 Python .resolve() 定格语义）。
+        let mut env = home_only_env(Path::new("/home/u"));
+        env.insert(SKILL_HOME_ENV.to_string(), "rel-skills".to_string());
+        let cwd = std::env::current_dir().unwrap();
+        let resolved = resolve_skill_home(Some(&env));
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, normalize_lexical(&cwd.join("rel-skills")));
     }
 
     #[test]
