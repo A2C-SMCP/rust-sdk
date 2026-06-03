@@ -19,7 +19,9 @@
 //! - [`sources`]：plugin source 5 类 disjoint union 解析与简写糖归一化（SKL-03 / #46）。
 //! - [`frontmatter`]：SKILL.md YAML frontmatter 解析/剥离（共享，#43/#49/#52）。
 //! - [`registry`]：`name → A2CSkillRef` 物化索引 + 孤儿状态机（SKL-02 / #43）。
+//! - [`watcher`] / [`debouncer`]：user 源文件 watch + 多源去抖结算（SKL-06 / #55）。
 
+pub mod debouncer;
 pub mod frontmatter;
 pub mod home;
 pub mod manifest;
@@ -29,6 +31,7 @@ pub mod resource;
 pub mod sandbox;
 pub mod sources;
 pub mod staging;
+pub mod watcher;
 
 pub use naming::{
     is_valid_skill_name, normalize_mcp_server_segment, parse_skill_name,
@@ -73,4 +76,14 @@ pub use staging::{
     DefaultArchiveFetcher, KnownMarketplaceRecord, KnownMarketplaceRecorder,
     MarketplaceStageOptions, McpResource, SkillResourceManager, SkillStagingError,
     DEFAULT_GIT_TIMEOUT, MAX_ARCHIVE_DOWNLOAD_BYTES, MAX_ARCHIVE_MEMBERS, MAX_EXTRACTED_BYTES,
+};
+
+pub use debouncer::{
+    AsyncCallback, CallbackResult, SkillEventDebouncer, SkillEventDebouncerBuilder,
+    DEFAULT_DEBOUNCE_MS,
+};
+
+pub use watcher::{
+    should_fire, OnChange, SkillFileWatcher, SkillFileWatcherBuilder, SkillWatchError,
+    DEFAULT_INTERNAL_WRITE_TTL, DEFAULT_POLL_INTERVAL, POLLING_INTERNAL_WRITE_TTL_FLOOR,
 };

@@ -9,6 +9,8 @@ keywords = ["smcp", "computer", "mcp", "tool"]
 categories = ["network-programming", "development-tools"]
 
 [dev-dependencies]
+# 去抖器单测用 tokio 虚拟时钟（start_paused）/ paused virtual clock for debouncer tests（SKL-06 #55）
+tokio = { workspace = true, features = ["test-util"] }
 smcp-server-hyper.workspace = true
 smcp-server-core.workspace = true
 tracing-subscriber.workspace = true
@@ -65,6 +67,9 @@ serde_yaml_ng = "0.10.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 indexmap = "2.14.0"
 sha2.workspace = true
+
+# SKILL user 源文件 watcher / SKILL user-source file watcher（SKL-06 #55）
+notify = "8.2.0"
 
 [features]
 default = ["vrl"]
