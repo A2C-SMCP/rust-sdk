@@ -28,7 +28,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::skills::frontmatter::strip_skill_frontmatter;
-use crate::skills::sandbox::{resolve_skill_resource, SkillSandboxError, DEFAULT_SKILL_FILE};
+use crate::skills::sandbox::{
+    ensure_within_size_cap, resolve_skill_resource, SkillSandboxError, DEFAULT_SKILL_FILE,
+};
 
 /// SKILL.md 固定 MIME（frontmatter 剥离后仍是 markdown 正文）/ Fixed MIME for the SKILL.md entry doc。
 pub const DEFAULT_SKILL_MIME: &str = "text/markdown";
@@ -183,10 +185,7 @@ pub fn resolve_skill_view(
     if is_entry {
         // SKILL.md 入口：先 stat 守卫（避免读超大文件），再读全文剥 frontmatter。
         if let Some(cap) = too_large_cap {
-            let raw_size = file_size(&target, &rel_echo)?;
-            if raw_size > cap {
-                return Err(SkillSandboxError::too_large(rel_echo, raw_size));
-            }
+            ensure_within_size_cap(&target, cap, &rel_echo)?;
         }
         let raw_bytes =
             std::fs::read(&target).map_err(|_| SkillSandboxError::not_found(rel_echo.clone()))?;
@@ -213,13 +212,11 @@ pub fn resolve_skill_view(
         });
     }
 
-    // 其它包内资源：原始字节 + 惰性 disk 切片 + 流式 sha256。
-    let raw_size = file_size(&target, &rel_echo)?;
-    if let Some(cap) = too_large_cap {
-        if raw_size > cap {
-            return Err(SkillSandboxError::too_large(rel_echo, raw_size));
-        }
-    }
+    // 其它包内资源：原始字节 + 惰性 disk 切片 + 流式 sha256。size-cap 收敛到单一校验点。
+    let raw_size = match too_large_cap {
+        Some(cap) => ensure_within_size_cap(&target, cap, &rel_echo)?,
+        None => file_size(&target, &rel_echo)?,
+    };
     let mime = mime_guess::from_path(&target)
         .first_raw()
         .unwrap_or("application/octet-stream")

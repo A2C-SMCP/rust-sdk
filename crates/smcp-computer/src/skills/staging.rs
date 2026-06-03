@@ -77,6 +77,8 @@ pub const SKILLS_SUBDIR: &str = "skills";
 pub const EXTERNAL_PLUGINS_NS: &str = ".plugins";
 /// git clone/pull 默认超时 / Default git timeout（design §2.2：120s）。
 pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// 归档下载超时（reqwest 默认无超时，慢速源会令 staging 无限挂起）/ Archive fetch timeout。
+pub const ARCHIVE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 压缩态下载上限（64 MiB）/ compressed download cap。
 pub const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
@@ -121,21 +123,32 @@ pub struct DefaultArchiveFetcher;
 #[async_trait::async_trait]
 impl ArchiveFetcher for DefaultArchiveFetcher {
     async fn fetch(&self, url: &str) -> Result<Vec<u8>, SkillStagingError> {
-        let resp = reqwest::get(url)
+        let client = reqwest::Client::builder()
+            .timeout(ARCHIVE_FETCH_TIMEOUT)
+            .build()
+            .map_err(|e| SkillStagingError::new(format!("archive client build failed: {e}")))?;
+        let mut resp = client
+            .get(url)
+            .send()
             .await
             .and_then(reqwest::Response::error_for_status)
             .map_err(|e| SkillStagingError::new(format!("archive fetch failed: {e}")))?;
-        let bytes = resp
-            .bytes()
+        // 流式累计：超 cap **立即**中止，峰值内存钳在 ~MAX_ARCHIVE_DOWNLOAD_BYTES（对齐 Python
+        // iter_chunked）——防半受信 archive_uri 推送数 GB body 在事后 len 检查前耗尽内存。
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| SkillStagingError::new(format!("archive read failed: {e}")))?;
-        if bytes.len() as u64 > MAX_ARCHIVE_DOWNLOAD_BYTES {
-            return Err(SkillStagingError::new(format!(
-                "archive exceeds download size limit ({} > {MAX_ARCHIVE_DOWNLOAD_BYTES} bytes)",
-                bytes.len()
-            )));
+            .map_err(|e| SkillStagingError::new(format!("archive read failed: {e}")))?
+        {
+            if buf.len() as u64 + chunk.len() as u64 > MAX_ARCHIVE_DOWNLOAD_BYTES {
+                return Err(SkillStagingError::new(format!(
+                    "archive exceeds download size limit ({MAX_ARCHIVE_DOWNLOAD_BYTES} bytes)"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
         }
-        Ok(bytes.to_vec())
+        Ok(buf)
     }
 }
 
@@ -1292,6 +1305,11 @@ fn finalize_and_register(
     seen_this_run.insert(name.clone());
 
     // 包根目录名校正为 frontmatter.name（§4）。
+    // 已知边界（与 Python staging.py 逐行一致，跨 SDK 共享）：同一 server 下若 SKILL A 的
+    // frontmatter.name 恰等于 SKILL B 的 URI leaf，处理 B 时 materialize 的 reset_dir(staged) 会抹掉
+    // A 已 rename 落盘的内容（A 仍在 registry 但磁盘被毁）。seen_this_run 仅对合成 name 去重、不覆盖
+    // staging↔final 路径。加固（如 rename 前探测 final_dir 是否为本 run 内其它落点）须协议/Python 先行，
+    // 以维持跨 SDK 一致——不在 Rust 单侧修改。
     let final_dir = mcp_skill_dir(home, normalized_server, fm_name);
     if final_dir != staged {
         if final_dir.exists() {
