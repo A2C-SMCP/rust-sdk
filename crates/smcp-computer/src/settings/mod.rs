@@ -9,8 +9,16 @@
 *       Computer governance-layer settings module (intent-layer settings.json schema & validation)
 */
 
+pub mod reconciler;
 pub mod schema;
 pub mod scope;
+
+pub use reconciler::{
+    declared_marketplace_names, declared_plugin_ids, gc_plugins, list_orphan_marketplaces,
+    list_orphan_plugins, prune_marketplaces, reconcile, InstalledPluginRecord, InstalledPlugins,
+    KnownMarketplaceEntry, KnownMarketplaces, McpTeardown, ReconcileOptions, ReconcileReport,
+    SkillGovernanceStore,
+};
 
 pub use schema::{
     is_valid_enabled_plugin_key, is_valid_git_url, is_valid_marketplace_name, validate_settings,
