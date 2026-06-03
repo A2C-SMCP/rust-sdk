@@ -28,6 +28,7 @@ pub mod registry;
 pub mod resource;
 pub mod sandbox;
 pub mod sources;
+pub mod staging;
 
 pub use naming::{
     is_valid_skill_name, normalize_mcp_server_segment, parse_skill_name,
@@ -65,4 +66,11 @@ pub use manifest::{
     plugin_root_base, read_marketplace_manifest, read_plugin_metadata, resolve_plugin_version,
     resolve_skill_override_dirs, PluginManifestError, COMPONENT_FIELDS, MARKETPLACE_MANIFEST,
     MARKETPLACE_MANIFEST_DIR, MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR, PLUGIN_MANIFEST,
+};
+
+pub use staging::{
+    stage_marketplace_skills, stage_mcp_skills, stage_user_skills, ArchiveFetcher,
+    DefaultArchiveFetcher, KnownMarketplaceRecord, KnownMarketplaceRecorder,
+    MarketplaceStageOptions, McpResource, SkillResourceManager, SkillStagingError,
+    DEFAULT_GIT_TIMEOUT, MAX_ARCHIVE_DOWNLOAD_BYTES, MAX_ARCHIVE_MEMBERS, MAX_EXTRACTED_BYTES,
 };
