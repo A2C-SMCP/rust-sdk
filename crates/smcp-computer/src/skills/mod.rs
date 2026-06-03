@@ -22,8 +22,11 @@
 
 pub mod frontmatter;
 pub mod home;
+pub mod manifest;
 pub mod naming;
 pub mod registry;
+pub mod resource;
+pub mod sandbox;
 pub mod sources;
 
 pub use naming::{
@@ -48,3 +51,18 @@ pub use sources::{
 pub use frontmatter::{parse_skill_frontmatter, strip_skill_frontmatter};
 
 pub use registry::SkillRegistry;
+
+pub use sandbox::{
+    ensure_within_size_cap, resolve_skill_resource, resolve_skill_resource_with, SkillSandboxError,
+    SkillSandboxReason, DEFAULT_SKILL_FILE, FORBIDDEN_SKILL_FILES,
+};
+
+pub use resource::{looks_textual, resolve_skill_view, SkillResourceView, DEFAULT_SKILL_MIME};
+
+pub use manifest::{
+    check_strict_conflict, entry_is_strict, enumerate_bundled_server_files, find_plugin_entry,
+    iter_plugin_entries, load_bundled_servers, manifest_declared_components, parse_bundled_server,
+    plugin_root_base, read_marketplace_manifest, read_plugin_metadata, resolve_plugin_version,
+    resolve_skill_override_dirs, PluginManifestError, COMPONENT_FIELDS, MARKETPLACE_MANIFEST,
+    MARKETPLACE_MANIFEST_DIR, MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR, PLUGIN_MANIFEST,
+};
