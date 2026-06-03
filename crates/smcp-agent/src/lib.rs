@@ -15,6 +15,8 @@ pub mod error;
 pub mod events;
 pub mod protocol_error;
 pub mod request_builders;
+pub mod response;
+pub mod skill_consume;
 pub mod sync_agent;
 pub mod transport;
 
@@ -30,5 +32,6 @@ pub use request_builders::{
     build_get_skill_request, build_get_skills_request, build_get_tools_request,
     build_tool_call_request, validate_emit_event,
 };
+pub use skill_consume::{parse_get_skill_response, parse_get_skills_response};
 pub use sync_agent::SyncSmcpAgent;
 pub use transport::{NotificationMessage, SocketIoTransport};

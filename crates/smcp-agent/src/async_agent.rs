@@ -15,13 +15,16 @@ use crate::{
     events::AsyncAgentEventHandler,
     protocol_error::raise_for_error_payload,
     request_builders::{
-        build_get_desktop_request, build_get_tools_request, build_tool_call_request,
+        build_get_desktop_request, build_get_skill_request, build_get_skills_request,
+        build_get_tools_request, build_tool_call_request,
     },
+    response::ensure_req_id,
+    skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
-    events::*, AgentCallData, EnterOfficeReq, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool,
-    SessionInfo, SMCP_NAMESPACE,
+    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetSkillRet, LeaveOfficeReq,
+    ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -189,6 +192,34 @@ impl AsyncSmcpAgent {
                             }
                         }
                     }
+                    NotificationMessage::UpdateSkills(computer) => {
+                        // v0.2.1 自动行为（对标 Python `_on_skills_updated`）：收到 notify:update_skills
+                        // 后自动重拉 get_skills，再派发 on_skills_received hook。
+                        // 错误隔离：重拉失败仅告警；hook 抛错独立捕获、不污染通知循环（对标 Python 双层 try）。
+                        match agent_clone.get_skills(&computer).await {
+                            Ok(skills) => {
+                                info!(
+                                    "Skills refreshed from computer {}: count={}",
+                                    computer,
+                                    skills.len()
+                                );
+                                if let Some(ref handler) = event_handler {
+                                    if let Err(e) = handler
+                                        .on_skills_received(&computer, skills, &agent_clone)
+                                        .await
+                                    {
+                                        error!(
+                                            "on_skills_received hook raised for computer {}: {}",
+                                            computer, e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to refresh skills for computer {}: {}", computer, e);
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -258,19 +289,8 @@ impl AsyncSmcpAgent {
         // flat ErrorPayload → 协议错误（#47↔#34：对端未命中/能力错误经 ack 回 flat error）
         raise_for_error_payload(&response)?;
 
-        // 验证req_id
-        let response_req_id: String = response
-            .get("req_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| SmcpAgentError::internal("Missing req_id in response"))?
-            .to_string();
-
-        if response_req_id != req_id.as_str() {
-            return Err(SmcpAgentError::ReqIdMismatch {
-                expected: req_id.as_str().to_string(),
-                actual: response_req_id,
-            });
-        }
+        // 验证 req_id（全 crate 单点收敛，见 response::ensure_req_id）
+        ensure_req_id(&response, req_id.as_str())?;
 
         let tools: Vec<SMCPTool> =
             serde_json::from_value(response.get("tools").cloned().unwrap_or_default())?;
@@ -310,19 +330,8 @@ impl AsyncSmcpAgent {
         // flat ErrorPayload → 协议错误（#47↔#34）
         raise_for_error_payload(&response)?;
 
-        // 验证req_id
-        let response_req_id: String = response
-            .get("req_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| SmcpAgentError::internal("Missing req_id in response"))?
-            .to_string();
-
-        if response_req_id != req_id.as_str() {
-            return Err(SmcpAgentError::ReqIdMismatch {
-                expected: req_id.as_str().to_string(),
-                actual: response_req_id,
-            });
-        }
+        // 验证 req_id（全 crate 单点收敛，见 response::ensure_req_id）
+        ensure_req_id(&response, req_id.as_str())?;
 
         let desktops: Vec<String> =
             serde_json::from_value(response.get("desktops").cloned().unwrap_or_default())?;
@@ -333,6 +342,76 @@ impl AsyncSmcpAgent {
             computer
         );
         Ok(desktops)
+    }
+
+    /// 获取指定 Computer 的 SKILL 清单（v0.2.1）/ Get a Computer's SKILL inventory。
+    ///
+    /// 发起 `client:get_skills`，返回轻量 [`A2CSkillRef`] 列表（**不含** SKILL.md body；body 经
+    /// [`Self::get_skill`] 按需拉取）。flat ErrorPayload（如 `4014`）经 ack 透传为协议错误。
+    /// 对标 Python `a2c_smcp/agent/client.py::get_skills`。
+    pub async fn get_skills(&self, computer: &str) -> Result<Vec<A2CSkillRef>> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_skills_request(&agent_config.agent, computer);
+        let req_id = req.base.req_id.clone();
+
+        debug!("Getting skills from computer: {}", computer);
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_SKILLS, data, self.config.default_timeout)
+            .await?;
+
+        let skills = parse_get_skills_response(&response, req_id.as_str())?;
+        info!(
+            "Received {} skills from computer: {}",
+            skills.len(),
+            computer
+        );
+        Ok(skills)
+    }
+
+    /// 获取 SKILL 包内单个资源（v0.2.1）/ Get a single in-package SKILL resource。
+    ///
+    /// 发起 `client:get_skill`；`rel_path` 缺省由 Computer 解析为包根 `SKILL.md` 入口，否则 MUST
+    /// 相对、无 `..`、无绝对路径（沙箱在 Computer 端强制）。返回的 [`GetSkillRet`] 中 `body` 与
+    /// `blob_handle` **恰一存在**（经 [`GetSkillRet::resource`] 校验访问）：
+    /// - 文本且可内联 → `body` 直接可读（[`smcp::SkillResource::Inline`]）；
+    /// - 二进制或过大文本 → `blob_handle` **原样返回**，由调用方经 `client:get_blob` 自取字节。
+    ///
+    /// 注：文本 MIME 的 `blob_handle` 自动 drain 回填 `body`（Python parity）依赖 `drain_blob`
+    /// （AGT-03 / #38），本期不实现；#38 落地后在此小幅接线即可。
+    /// 对标 Python `a2c_smcp/agent/client.py::get_skill`（drain 回填段除外）。
+    pub async fn get_skill(
+        &self,
+        computer: &str,
+        name: &str,
+        rel_path: Option<&str>,
+    ) -> Result<GetSkillRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_skill_request(&agent_config.agent, computer, name, rel_path);
+        let req_id = req.base.req_id.clone();
+
+        debug!(
+            "Getting skill {:?} rel_path={:?} from computer: {}",
+            name, rel_path, computer
+        );
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_SKILL, data, self.config.default_timeout)
+            .await?;
+
+        let ret = parse_get_skill_response(&response, req_id.as_str())?;
+        info!("Received skill {:?} from computer: {}", name, computer);
+        Ok(ret)
     }
 
     /// 调用工具
@@ -428,19 +507,8 @@ impl AsyncSmcpAgent {
             .call(SERVER_LIST_ROOM, data, self.config.default_timeout)
             .await?;
 
-        // 验证req_id
-        let response_req_id: String = response
-            .get("req_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| SmcpAgentError::internal("Missing req_id in response"))?
-            .to_string();
-
-        if response_req_id != req_id.as_str() {
-            return Err(SmcpAgentError::ReqIdMismatch {
-                expected: req_id.as_str().to_string(),
-                actual: response_req_id,
-            });
-        }
+        // 验证 req_id（全 crate 单点收敛，见 response::ensure_req_id）
+        ensure_req_id(&response, req_id.as_str())?;
 
         let sessions: Vec<SessionInfo> =
             serde_json::from_value(response.get("sessions").cloned().unwrap_or_default())?;

@@ -14,7 +14,7 @@ use crate::{
     error::{Result, SmcpAgentError},
     AsyncSmcpAgent,
 };
-use smcp::{SMCPTool, SessionInfo};
+use smcp::{A2CSkillRef, GetSkillRet, SMCPTool, SessionInfo};
 use tokio::runtime::Runtime;
 
 /// 同步SMCP Agent
@@ -70,6 +70,25 @@ impl SyncSmcpAgent {
     ) -> Result<Vec<String>> {
         self.runtime
             .block_on(self.async_agent.get_desktop(computer, size, window))
+    }
+
+    /// 获取指定 Computer 的 SKILL 清单（v0.2.1，同步）/ Get a Computer's SKILL inventory (sync)。
+    pub fn get_skills(&self, computer: &str) -> Result<Vec<A2CSkillRef>> {
+        self.runtime.block_on(self.async_agent.get_skills(computer))
+    }
+
+    /// 获取 SKILL 包内单个资源（v0.2.1，同步）/ Get a single in-package SKILL resource (sync)。
+    ///
+    /// 语义同 [`AsyncSmcpAgent::get_skill`]：`body` / `blob_handle` 恰一存在；`blob_handle` 原样返回，
+    /// 文本 MIME 自动 drain 回填留待 AGT-03 / #38。
+    pub fn get_skill(
+        &self,
+        computer: &str,
+        name: &str,
+        rel_path: Option<&str>,
+    ) -> Result<GetSkillRet> {
+        self.runtime
+            .block_on(self.async_agent.get_skill(computer, name, rel_path))
     }
 
     /// 调用工具

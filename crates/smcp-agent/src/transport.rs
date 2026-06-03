@@ -33,6 +33,7 @@ pub enum NotificationMessage {
     UpdateConfig(smcp::UpdateMCPConfigNotification),
     UpdateToolList(smcp::UpdateToolListNotification),
     UpdateDesktop(String), // computer name
+    UpdateSkills(String),  // computer name（notify:update_skills，v0.2.1）
 }
 
 /// Socket.IO传输层
@@ -208,6 +209,39 @@ impl SocketIoTransport {
                                         let _ = tx.send(NotificationMessage::UpdateDesktop(
                                             computer.to_string(),
                                         ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    NOTIFY_UPDATE_SKILLS => {
+                        // v0.2.1：notify:update_skills 仅携带 {"computer": ...}，触发自动重拉 get_skills
+                        // v0.2.1: notify:update_skills carries only {"computer": ...}; triggers a
+                        // get_skills auto-refresh（与 UpdateDesktop 同款轻量载荷解析）。
+                        if let Payload::Text(values, _) = payload {
+                            if let Some(value) = values.into_iter().next() {
+                                if let Ok(notification) =
+                                    serde_json::from_value::<serde_json::Value>(value)
+                                {
+                                    // 空串 computer 视作缺失（对齐 Python `if not computer`）：
+                                    // .filter 让空串落入下方 else 告警跳过，不派发空 computer 的重拉。
+                                    if let Some(computer) = notification
+                                        .get("computer")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        info!(
+                                            "Skills update notification for computer: {}",
+                                            computer
+                                        );
+                                        let _ = tx.send(NotificationMessage::UpdateSkills(
+                                            computer.to_string(),
+                                        ));
+                                    } else {
+                                        // 对标 Python：缺 computer 字段则告警跳过
+                                        tracing::warn!(
+                                            "UPDATE_SKILLS notification missing 'computer'"
+                                        );
                                     }
                                 }
                             }

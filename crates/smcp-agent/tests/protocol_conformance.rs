@@ -110,6 +110,10 @@ async fn test_notification_message_json_format() {
             NotificationMessage::UpdateDesktop("computer-001".to_string()),
             "UpdateDesktop notification",
         ),
+        (
+            NotificationMessage::UpdateSkills("computer-001".to_string()),
+            "UpdateSkills notification",
+        ),
     ];
 
     for (notification, _description) in test_cases {
@@ -132,6 +136,9 @@ async fn test_notification_message_json_format() {
                 assert_eq!(data.computer, "computer-001");
             }
             NotificationMessage::UpdateDesktop(computer) => {
+                assert_eq!(computer, "computer-001");
+            }
+            NotificationMessage::UpdateSkills(computer) => {
                 assert_eq!(computer, "computer-001");
             }
         }
