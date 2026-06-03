@@ -58,6 +58,13 @@ percent-encoding = "2.3"
 
 # 密码输入 / Password input
 rpassword.workspace = true
+tar = "0.4.46"
+flate2 = "1.1.9"
+mime_guess = "2.0.5"
+serde_yaml_ng = "0.10.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+indexmap = "2.14.0"
+sha2.workspace = true
 
 [features]
 default = ["vrl"]

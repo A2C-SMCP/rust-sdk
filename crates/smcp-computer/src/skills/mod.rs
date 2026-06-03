@@ -17,9 +17,13 @@
 //! - [`naming`]：桥接协议级命名 lexer（[`smcp::skill_name`]）+ source → name 合成链（SKL-01 / #40）。
 //! - [`home`]：XDG 优先的 SKILL Home 解析与安装目录布局（SKL-03 / #46）。
 //! - [`sources`]：plugin source 5 类 disjoint union 解析与简写糖归一化（SKL-03 / #46）。
+//! - [`frontmatter`]：SKILL.md YAML frontmatter 解析/剥离（共享，#43/#49/#52）。
+//! - [`registry`]：`name → A2CSkillRef` 物化索引 + 孤儿状态机（SKL-02 / #43）。
 
+pub mod frontmatter;
 pub mod home;
 pub mod naming;
+pub mod registry;
 pub mod sources;
 
 pub use naming::{
@@ -40,3 +44,7 @@ pub use sources::{
     LocalPluginSource, ResolvedPluginSource, SkillSourceError, CNB_HOST, DEFAULT_PLUGIN_ROOT,
     GITHUB_HOST,
 };
+
+pub use frontmatter::{parse_skill_frontmatter, strip_skill_frontmatter};
+
+pub use registry::SkillRegistry;
