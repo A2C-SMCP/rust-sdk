@@ -8,6 +8,7 @@
 * 描述: A2C-SMCP Computer模块的Rust实现 / Rust implementation of A2C-SMCP Computer module
 */
 
+pub mod blob;
 pub mod computer;
 pub mod desktop;
 pub mod errors;

@@ -104,6 +104,8 @@ dirs = "6"
 # blob 传输 / Blob transfer（base64 解码 + sha256 完整性自证；drain_blob 例程依赖）
 base64 = "0.22"
 sha2 = "0.10"
+# blob_handle msgpack 编解码（string-keyed map，跨-SDK 与 Python msgpack 字节兼容；BLB-01 #62）
+rmp-serde = "1.3"
 # 治理层物化文件锁 / Governance materialized-file lock（旁车 .lock 跨平台 flock/LockFileEx；SET-04 #67）
 fd-lock = "4.0"
 
