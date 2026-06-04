@@ -4090,6 +4090,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "eventsource-client",
+ "fd-lock",
  "flate2",
  "futures",
  "futures-util",

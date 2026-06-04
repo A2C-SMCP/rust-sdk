@@ -12,6 +12,7 @@
 pub mod reconciler;
 pub mod schema;
 pub mod scope;
+pub mod store;
 
 pub use reconciler::{
     declared_marketplace_names, declared_plugin_ids, gc_plugins, list_orphan_marketplaces,
@@ -32,4 +33,12 @@ pub use scope::{
     workdir_project_settings_path, workdir_settings_dir, EnvMap, ResolveSettingsArgs,
     ResolvedSettings, WriteValue, LOCAL_SETTINGS_FILENAME, PROJECT_SETTINGS_FILENAME,
     TFROBOT_DIRNAME, USER_SETTINGS_FILENAME, XDG_CONFIG_HOME_ENV,
+};
+pub use store::{
+    empty_installed_plugins, empty_known_marketplaces, installed_plugins_path,
+    known_marketplaces_path, load_installed_plugins, load_known_marketplaces,
+    save_installed_plugins, save_known_marketplaces, update_installed_plugins,
+    update_known_marketplaces, FileSkillGovernanceStore, InstalledPluginsFile,
+    KnownMarketplacesFile, SettingsStoreError, INSTALLED_PLUGINS_FILENAME,
+    KNOWN_MARKETPLACES_FILENAME, MATERIALIZED_VERSION, WRITE_PROTECTION_HEADER,
 };

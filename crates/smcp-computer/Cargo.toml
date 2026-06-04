@@ -71,6 +71,9 @@ sha2.workspace = true
 # SKILL user 源文件 watcher / SKILL user-source file watcher（SKL-06 #55）
 notify = "8.2.0"
 
+# 治理层物化文件锁（known_marketplaces / installed_plugins 旁车 .lock）/ governance store file lock（SET-04 #67）
+fd-lock.workspace = true
+
 [features]
 default = ["vrl"]
 vrl = ["dep:vrl"]
