@@ -42,7 +42,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use smcp::utils::path::is_within;
+use smcp::utils::path::{is_within, normalize_lexical};
 
 use crate::settings::schema::{is_valid_enabled_plugin_key, is_valid_marketplace_name};
 use crate::settings::scope::EnvMap;
@@ -239,19 +239,28 @@ fn enabled_plugin_names_for(marketplace: &str, declared: &Map<String, Value>) ->
 // ===========================================================================
 // 安全删除 / Guarded removal
 // ===========================================================================
-/// 仅当 `path` 词法位于 SKILL Home 内才递归删除（防越权删盘外目录）/ rmtree only within SKILL Home。
+/// 仅当 `path`（**解析符号链接后**）位于 SKILL Home 内才递归删除 / rmtree only within SKILL Home。
 ///
 /// `path` 不存在 → no-op；越界 → 记 ERROR + 拒删（不抛）。删除失败 → 记 WARN（不阻断后续清理）。
+///
+/// 安全 / Security：先 `canonicalize` **双侧**再做包含判定（解析符号链接），故 Home 内指向盘外的 symlink
+/// （如 `installPath` 落点被植入 `home/.../evil -> /etc`）会被解析到盘外 → 拒删。这对齐 Python
+/// `_safe_rmtree` 的 `resolve()` 语义与本仓库 [`sandbox`](crate::skills::sandbox) 的「符号链接逃逸」防御纵深
+/// ——与纯词法的 [`is_within`]（只折叠 `..`、不解析 symlink）不同。canonicalize 双侧同时消解 macOS
+/// `/var`→`/private/var` 等前缀分叉；已 `exists` 故几乎不失败，失败时词法兜底。
 fn safe_rmtree(path: &Path, home: &Path) {
-    if !is_within(path, home) {
+    // 不存在 → no-op（先短路：避免对缺失路径误报越界 + 无谓 ERROR，且符号链接需经 exists 跟随解析）。
+    if !path.exists() {
+        return;
+    }
+    let real_path = std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical(path));
+    let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| normalize_lexical(home));
+    if !is_within(&real_path, &real_home) {
         tracing::error!(
             path = %path.display(),
             home = %home.display(),
             "reconcile: refusing to remove path outside SKILL Home"
         );
-        return;
-    }
-    if !path.exists() {
         return;
     }
     if let Err(e) = std::fs::remove_dir_all(path) {
@@ -872,5 +881,215 @@ mod tests {
             reg.resolve("audit:code-review").unwrap().description,
             "from B"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_failed_when_clone_unreachable() {
+        // 失败降级铁律（§7.2）：clone 失败 → 不入 Registry、归 report.failed、不抛。
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let bad_url = format!("file://{}/nonexistent-repo", tmp.path().display());
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": bad_url}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(
+            r.failed,
+            vec!["acme".to_string()],
+            "clone 失败应归入 failed"
+        );
+        assert!(r.installed.is_empty() && r.updated.is_empty() && r.up_to_date.is_empty());
+        assert!(r.registered_skills.is_empty(), "失败源不注册 SKILL");
+        assert!(reg.is_empty(), "失败源对 Agent 不可见（不入 Registry）");
+    }
+
+    #[tokio::test]
+    async fn reconcile_refresh_marks_updated() {
+        // do_refresh 分支（refresh=true / autoUpdate）：已存在 clone 走 pull → updated。
+        let tmp = TempDir::new().unwrap();
+        let repo = make_marketplace_repo(tmp.path(), "review code");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url = format!("file://{}", repo.display());
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let r1 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r1.installed, vec!["acme".to_string()]);
+
+        // 显式 sync：refresh=true → 对已存在 clone pull → updated（非 sourceChanged、非 installed）。
+        let r2 = reconcile(
+            &mut reg,
+            &home,
+            &d,
+            &store,
+            ReconcileOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            r2.updated,
+            vec!["acme".to_string()],
+            "refresh 应归入 updated"
+        );
+        assert!(r2.installed.is_empty() && r2.up_to_date.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_orphan_untouched() {
+        // additive-only：materialized∖declared 的孤儿 → reconcile 完全不动（不进循环）。
+        let tmp = TempDir::new().unwrap();
+        let repo = make_marketplace_repo(tmp.path(), "review code");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url = format!("file://{}", repo.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        // 预置孤儿 beta：store 记录 + clone 树 + registry SKILL（声明里没有 beta）。
+        let beta_dir = marketplace_skill_dir(&home, "beta", &[]);
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        store.record(KnownMarketplaceRecord {
+            name: "beta",
+            source: &serde_json::json!({"type": "git", "url": "beta"}),
+            install_location: &beta_dir,
+            commit_sha: Some("deadbeef"),
+            auto_update: false,
+            changed: true,
+        });
+        reg.register(mp_ref("legacy:s", "beta", &beta_dir));
+
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+
+        // acme 正常 installed；beta 三处（store / registry / clone 树）全不动。
+        assert_eq!(r.installed, vec!["acme".to_string()]);
+        assert!(
+            !r.failed.contains(&"beta".to_string()) && !r.updated.contains(&"beta".to_string())
+        );
+        assert!(store
+            .load_known_marketplaces()
+            .marketplaces
+            .contains_key("beta"));
+        assert!(reg.contains("legacy:s"), "孤儿 SKILL 不应被 reconcile 注销");
+        assert!(beta_dir.exists(), "孤儿 clone 树不应被 reconcile 删除");
+    }
+
+    #[tokio::test]
+    async fn gc_without_teardown_callback() {
+        // mcp_teardown = None：仍删 plugin + store 条目，不 panic。
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let install_path = home.join("marketplace").join(".plugins").join("audit");
+        std::fs::create_dir_all(&install_path).unwrap();
+        let store = MemStore::default();
+        store.update_installed_plugins(&mut |data| {
+            data.plugins.insert(
+                "audit@acme".to_string(),
+                vec![InstalledPluginRecord {
+                    install_path: Some(install_path.to_string_lossy().into_owned()),
+                    bundled_mcp_servers: vec!["audit-mcp".to_string()],
+                    extra: Map::new(),
+                }],
+            );
+        });
+        let mut reg = SkillRegistry::new();
+        let removed = gc_plugins(&["audit@acme".to_string()], &mut reg, &home, &store, None).await;
+        assert_eq!(removed, vec!["audit@acme".to_string()]);
+        assert!(!install_path.exists());
+        assert!(!store
+            .load_installed_plugins()
+            .plugins
+            .contains_key("audit@acme"));
+    }
+
+    #[tokio::test]
+    async fn gc_skips_unknown_pid() {
+        // 未知 pid → continue（不在 installed）→ 返回空、store 不变。
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+        let removed = gc_plugins(
+            &["ghost@nowhere".to_string()],
+            &mut reg,
+            &home,
+            &store,
+            None,
+        )
+        .await;
+        assert!(removed.is_empty());
+        assert!(store.load_installed_plugins().plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_pid_without_marketplace() {
+        // pid 无 '@' → marketplace 空、不尝试注销 → 仍从 store 移除。
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = MemStore::default();
+        store.update_installed_plugins(&mut |data| {
+            data.plugins.insert(
+                "local-only".to_string(),
+                vec![InstalledPluginRecord::default()],
+            );
+        });
+        let mut reg = SkillRegistry::new();
+        let removed = gc_plugins(&["local-only".to_string()], &mut reg, &home, &store, None).await;
+        assert_eq!(removed, vec!["local-only".to_string()]);
+        assert!(!store
+            .load_installed_plugins()
+            .plugins
+            .contains_key("local-only"));
+    }
+
+    #[test]
+    fn prune_skips_invalid_name() {
+        // 非法 marketplace 名 → 跳过、返回空。
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+        let removed = prune_marketplaces(&["Bad Name".to_string()], &mut reg, &home, &store);
+        assert!(removed.is_empty(), "非法名不应被清理");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_rmtree_refuses_symlink_escape() {
+        // Home 内指向盘外的 symlink → canonicalize 解析到盘外 → 拒删（对齐 Python resolve() + sandbox.rs）。
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let mp = home.join("marketplace");
+        std::fs::create_dir_all(&mp).unwrap();
+        // 盘外目标（含一份文件，便于断言未被删）。
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        // home 内的逃逸 symlink。
+        let evil = mp.join("evil");
+        symlink(&outside, &evil).unwrap();
+
+        safe_rmtree(&evil, &home);
+        assert!(outside.join("keep").exists(), "符号链接逃逸目标不应被删");
+        assert!(outside.exists());
     }
 }
