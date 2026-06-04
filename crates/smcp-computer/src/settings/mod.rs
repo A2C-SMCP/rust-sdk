@@ -9,10 +9,19 @@
 *       Computer governance-layer settings module (intent-layer settings.json schema & validation)
 */
 
+pub mod policy;
 pub mod reconciler;
 pub mod schema;
 pub mod scope;
 pub mod store;
+
+pub use policy::{
+    default_policy_sources, load_macos_plist, load_managed_settings, load_remote_policy,
+    load_windows_registry, resolve_policy_settings, PolicySource, LINUX_MANAGED_DIR,
+    MACOS_MANAGED_DIR, MACOS_PLIST_PATH, MANAGED_SETTINGS_DROPIN_DIRNAME,
+    MANAGED_SETTINGS_FILENAME, REMOTE_POLICY_BASE_ENV, WINDOWS_MANAGED_DIR, WINDOWS_POLICY_SUBKEY,
+    WINDOWS_POLICY_VALUE_NAME,
+};
 
 pub use reconciler::{
     declared_marketplace_names, declared_plugin_ids, gc_plugins, list_orphan_marketplaces,

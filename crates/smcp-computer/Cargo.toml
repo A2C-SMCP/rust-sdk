@@ -74,6 +74,15 @@ notify = "8.2.0"
 # 治理层物化文件锁（known_marketplaces / installed_plugins 旁车 .lock）/ governance store file lock（SET-04 #67）
 fd-lock.workspace = true
 
+# 治理层 policy 平台原生读取器（off-platform 零成本；SET-03 #65）/ governance policy platform readers
+# macOS Managed Preferences plist（layer 2）/ macOS Managed Preferences plist (layer 2)
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+
+# Windows 注册表 HKLM/HKCU 策略（layer 2/4，best-effort 无 CI lane）/ Windows registry policy (best-effort)
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
+
 [features]
 default = ["vrl"]
 vrl = ["dep:vrl"]
