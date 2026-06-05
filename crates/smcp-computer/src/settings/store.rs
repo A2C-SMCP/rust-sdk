@@ -572,6 +572,36 @@ pub fn update_installed_plugins(
 }
 
 // ===========================================================================
+// 普通 settings JSON 持锁写（无写保护头）/ Locked write of a plain settings JSON (no header)
+// ===========================================================================
+// 与 `update_*` 信封入口的区别：`settings.json` / `mcp.local.json` 是**人编意图层**——无 `version`
+// 信封、无 `// 写保护` 头。plugin installer（SET-05 #69，`enabledPlugins`）与 MCP config 门控
+// （SET-06 #71，`mcp.local.json` 数组）经此对人编文件做持锁原子 RMW，复用 store 的旁车锁 + 原子写
+// 原语而不套 `version`/header 信封。`pub(crate)`：仅 settings 子模块内部接缝。
+
+/// 持 `<path>.lock` 旁车锁执行 `work`（默认退避参数）/ Run `work` holding the sidecar lock。
+///
+/// 与 [`update_installed_plugins`] 共用 [`with_file_lock`] 的退避语义；供 installer / mcp_config 对
+/// 人编 settings 文件做「持锁 load→mutate→write」（写体经 [`atomic_write_settings_json`]，无信封头）。
+pub(crate) fn with_settings_lock<T>(
+    path: &Path,
+    work: impl FnOnce() -> T,
+) -> Result<T, SettingsStoreError> {
+    with_file_lock(
+        path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        work,
+    )
+}
+
+/// 原子写一个**普通 settings JSON**（`header=None`——人编意图层，无写保护头）/ Atomic write, no header。
+pub(crate) fn atomic_write_settings_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    atomic_write_json(path, value, None)
+}
+
+// ===========================================================================
 // lastUpdated 语义 / lastUpdated semantics（供 recorder）
 // ===========================================================================
 /// 当前 UTC `lastUpdated` 时间戳（`%Y-%m-%dT%H:%M:%SZ`，对齐 Python）/ now ISO-8601 second-precision。

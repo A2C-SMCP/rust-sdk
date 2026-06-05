@@ -9,11 +9,18 @@
 *       Computer governance-layer settings module (intent-layer settings.json schema & validation)
 */
 
+pub mod installer;
 pub mod policy;
 pub mod reconciler;
 pub mod schema;
 pub mod scope;
 pub mod store;
+
+pub use installer::{
+    disable_plugin, enable_plugin, install_plugin, uninstall_plugin, DisableOptions, EnableOptions,
+    InstallOptions, McpHookError, McpInstallHooks, McpServerNameConflictError, PluginInstallError,
+    UninstallOptions,
+};
 
 pub use policy::{
     default_policy_sources, load_macos_plist, load_managed_settings, load_remote_policy,

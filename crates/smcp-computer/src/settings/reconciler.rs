@@ -248,7 +248,7 @@ fn enabled_plugin_names_for(marketplace: &str, declared: &Map<String, Value>) ->
 /// `_safe_rmtree` 的 `resolve()` 语义与本仓库 [`sandbox`](crate::skills::sandbox) 的「符号链接逃逸」防御纵深
 /// ——与纯词法的 [`is_within`]（只折叠 `..`、不解析 symlink）不同。canonicalize 双侧同时消解 macOS
 /// `/var`→`/private/var` 等前缀分叉；已 `exists` 故几乎不失败，失败时词法兜底。
-fn safe_rmtree(path: &Path, home: &Path) {
+pub(crate) fn safe_rmtree(path: &Path, home: &Path) {
     // 不存在 → no-op（先短路：避免对缺失路径误报越界 + 无谓 ERROR，且符号链接需经 exists 跟随解析）。
     if !path.exists() {
         return;

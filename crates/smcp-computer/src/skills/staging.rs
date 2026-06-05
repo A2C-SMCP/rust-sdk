@@ -857,8 +857,10 @@ fn scan_and_register_plugin_skills(
 ///
 /// # Errors
 /// source 解析 / clone 失败 → [`SkillSourceError`] / [`SkillStagingError`]（调用方据失败降级）。
+// `pub(crate)`：plugin installer（SET-05 #69）独立定位 plugin 根（在 stage 前读 bundled servers /
+// 冲突预检 / 记录 installPath）；与 [`stage_one_plugin`] 复用同一定位逻辑、不重复 clone（缓存命中）。
 #[allow(clippy::too_many_arguments)]
-async fn locate_plugin_root(
+pub(crate) async fn locate_plugin_root(
     marketplace: &str,
     plugin_name: &str,
     entry: &Map<String, Value>,
