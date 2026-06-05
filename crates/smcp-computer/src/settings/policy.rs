@@ -126,6 +126,11 @@ fn merge_read_maps(low: &Map<String, Value>, high: &Map<String, Value>) -> Map<S
 ///
 /// base 文件先读，随后按文件名字典序合并 `managed-settings.d/*.json`（drop-in 覆盖 base，沿用读语义
 /// [`merge_read`]）。皆缺 → `None`。
+///
+/// **合并语义**（复用 [`merge_read`]，企业管理员须知）：对象**深合并**、**标量高优先覆盖**，但**数组是拼接 +
+/// 去重**（非整体覆盖）。即 drop-in 里某数组（如 `allowedMcpServers`）会与 base 同名数组并集，而非替换之；若需
+/// **整体替换**某数组，应直接改 base `managed-settings.json`、而非靠 drop-in。/ Arrays are union-merged
+/// (concat + dedup), not replaced; to fully replace an array, edit the base file rather than a drop-in.
 pub fn load_managed_settings(managed_dir: &Path) -> Option<Map<String, Value>> {
     let mut merged: Option<Map<String, Value>> =
         read_json_file(&managed_dir.join(MANAGED_SETTINGS_FILENAME));

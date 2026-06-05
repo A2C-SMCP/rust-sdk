@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use smcp::utils::atomic_io::atomic_write_text;
+use smcp::utils::atomic_io::atomic_write_bytes_mode;
 use smcp::utils::path::resolve_xdg_first;
 
 use crate::settings::scope::EnvMap;
@@ -126,20 +126,14 @@ impl ValueStore {
     }
 
     fn atomic_write(&self, data: &Map<String, Value>) -> std::io::Result<()> {
-        // 原子写（复用共享原语）后立即 chmod 0600——value store 虽仅存非密钥，仍按最小可见性硬化。
         let text = format!(
             "{}\n",
             serde_json::to_string_pretty(data)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
         );
-        atomic_write_text(&self.path, &text)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // chmod 失败非致命（如特殊文件系统不支持）/ chmod failure is non-fatal。
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        // 0600 在临时文件**创建期即设定**（rename 后无宽权限窗口）；非 unix mode 被忽略。value store 虽仅存
+        // 非密钥，仍按最小可见性硬化。
+        atomic_write_bytes_mode(&self.path, text.as_bytes(), Some(0o600))
     }
 }
 

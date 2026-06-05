@@ -38,6 +38,15 @@ pub fn unique_tmp_path(path: &Path) -> PathBuf {
 ///
 /// `rename` 前 `sync_all` 保证数据已落盘；任意失败清理半截临时文件后返回错误，目标文件保持原子完好。
 pub fn atomic_write_bytes(path: &Path, payload: &[u8]) -> io::Result<()> {
+    atomic_write_bytes_mode(path, payload, None)
+}
+
+/// 原子写字节，可选 unix 权限 mode（tmp 文件**即以该 mode 创建**，rename 后无宽权限窗口）。
+/// Atomic bytes write with an optional unix mode (tmp created with that mode → no post-rename window).
+///
+/// `mode` 仅 unix 生效（非 unix / `None` → 走默认 umask 的 `File::create`，行为同 [`atomic_write_bytes`]）。用于
+/// value store 等需 `0600` 落盘的场景，避免「rename 后再 chmod」之间的短暂宽权限窗口。
+pub fn atomic_write_bytes_mode(path: &Path, payload: &[u8], mode: Option<u32>) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -47,7 +56,7 @@ pub fn atomic_write_bytes(path: &Path, payload: &[u8]) -> io::Result<()> {
 
     // 写入 + 落盘；任何一步失败都清理临时文件。
     let write_result = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = create_tmp_file(&tmp, mode)?;
         file.write_all(payload)?;
         file.flush()?;
         file.sync_all()?;
@@ -64,6 +73,27 @@ pub fn atomic_write_bytes(path: &Path, payload: &[u8]) -> io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// 创建临时文件，unix 下可指定权限 mode（`Some` → 以该 mode 原子创建）/ create the tmp file (unix mode-aware)。
+#[cfg(unix)]
+fn create_tmp_file(tmp: &Path, mode: Option<u32>) -> io::Result<fs::File> {
+    match mode {
+        Some(m) => {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(m)
+                .open(tmp)
+        }
+        None => fs::File::create(tmp),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_tmp_file(tmp: &Path, _mode: Option<u32>) -> io::Result<fs::File> {
+    fs::File::create(tmp)
 }
 
 /// 原子写文本：按 UTF-8 编码后走 [`atomic_write_bytes`]（二进制写，不做平台换行翻译）。
@@ -141,6 +171,26 @@ mod tests {
             .collect();
         assert!(residue.is_empty(), "失败写入不得残留临时文件");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_mode_sets_0600_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        let target = dir.join("secret.json");
+        atomic_write_bytes_mode(&target, b"{}", Some(0o600)).expect("写入应成功");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "目标文件应以 0600 创建（rename 后无宽权限窗口）"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"{}");
+        // mode=None 行为同 atomic_write_bytes（不强制权限）
+        let plain = dir.join("plain.txt");
+        atomic_write_bytes_mode(&plain, b"x", None).unwrap();
+        assert_eq!(fs::read(&plain).unwrap(), b"x");
         let _ = fs::remove_dir_all(&dir);
     }
 }

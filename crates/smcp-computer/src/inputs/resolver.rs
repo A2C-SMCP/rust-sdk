@@ -74,7 +74,8 @@ pub enum InputResolveError {
 
 /// 交互 prompt 接缝（headless 默认 / 真实 CLI / 测试替身）/ interactive prompt seam。
 ///
-/// 真实 CLI 实现（rustyline / rpassword + 命令执行）由 CLI-02（#51）接线；本模块提供 trait 与 headless 默认。
+/// **纯交互**（promptString / pickString）；command input 非交互（subprocess），由 resolver 直接执行、不经本
+/// seam（见 [`InputResolver`] 的 command 分支）。真实 CLI 实现（rustyline / rpassword）由 CLI-02（#51）接线。
 pub trait Prompter: Send + Sync {
     /// 是否处于可交互环境（有 TTY / 注入会话）/ whether interactive (has TTY)。
     fn is_interactive(&self) -> bool;
@@ -92,8 +93,6 @@ pub trait Prompter: Send + Sync {
         options: &[String],
         default_index: Option<usize>,
     ) -> std::io::Result<String>;
-    /// command 取值（执行命令取 stdout）/ run a command and capture stdout。
-    fn run_command(&self, command: &str) -> std::io::Result<String>;
 }
 
 /// headless 默认 prompter：非交互、所有 prompt 报错（绝不静默）/ a headless, non-interactive prompter。
@@ -111,12 +110,6 @@ impl Prompter for NonInteractivePrompter {
         ))
     }
     fn pick_string(&self, _m: &str, _o: &[String], _d: Option<usize>) -> std::io::Result<String> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "no interactive TTY",
-        ))
-    }
-    fn run_command(&self, _c: &str) -> std::io::Result<String> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "no interactive TTY",
@@ -290,7 +283,9 @@ impl InputResolver {
                 Ok(Value::String(value))
             }
             MCPServerInput::Command(c) => {
-                let out = self.prompter.run_command(&c.command).map_err(map_err)?;
+                // command 本质非交互（subprocess），不经交互 Prompter——headless 照常执行（对标 Python
+                // `arun_command(shell=True)`）；args 暂不拼接（同 Python）。
+                let out = run_shell_command(&c.command).map_err(map_err)?;
                 Ok(Value::String(out))
             }
         }
@@ -303,6 +298,27 @@ fn prompt_message(description: &str, verb: &str, id: &str) -> String {
     } else {
         description.to_string()
     }
+}
+
+/// 同步执行 shell 命令、取 trim 后的 stdout / run a shell command synchronously, returning trimmed stdout。
+///
+/// command input 非交互（subprocess），故不挂在 [`Prompter`] 交互 seam 上——headless 亦照常执行（对标 Python
+/// `arun_command(shell=True)`）。unix `sh -c` / windows `cmd /C`。非零退出 → `Err`。
+fn run_shell_command(command: &str) -> std::io::Result<String> {
+    use std::process::Command;
+    let output = if cfg!(target_os = "windows") {
+        Command::new("cmd").arg("/C").arg(command).output()?
+    } else {
+        Command::new("sh").arg("-c").arg(command).output()?
+    };
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "command exited with {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn value_as_str(v: &Value) -> String {
@@ -369,9 +385,6 @@ mod tests {
             _o: &[String],
             _d: Option<usize>,
         ) -> std::io::Result<String> {
-            Ok(self.answer.clone())
-        }
-        fn run_command(&self, _c: &str) -> std::io::Result<String> {
             Ok(self.answer.clone())
         }
     }
@@ -566,9 +579,9 @@ mod tests {
         ));
     }
 
-    // ---- pick / command -----------------------------------------------------
+    // ---- pick（交互 seam）---------------------------------------------------
     #[test]
-    fn pick_and_command_resolve_via_prompter() {
+    fn pick_resolves_via_prompter() {
         let dir = TempDir::new().unwrap();
         let pick = MCPServerInput::PickString(PickStringInput {
             id: "env".to_string(),
@@ -576,14 +589,8 @@ mod tests {
             options: vec!["dev".into(), "prod".into()],
             default: Some("dev".into()),
         });
-        let cmd = MCPServerInput::Command(CommandInput {
-            id: "host".to_string(),
-            description: String::new(),
-            command: "echo h".to_string(),
-            args: None,
-        });
         let resolver = InputResolver::new(
-            [pick, cmd],
+            [pick],
             Box::new(RecordingPrompter {
                 answer: "prod".into(),
                 prompted: StdMutex::new(vec![]),
@@ -596,9 +603,29 @@ mod tests {
             resolver.resolve_by_id("env", None, None).unwrap(),
             json!("prod")
         );
+    }
+
+    // ---- command 非交互：headless 照常执行（parity 修复）---------------------
+    #[test]
+    fn command_resolves_headless_via_subprocess() {
+        let dir = TempDir::new().unwrap();
+        let cmd = MCPServerInput::Command(CommandInput {
+            id: "greeting".to_string(),
+            description: String::new(),
+            command: "echo hello-cmd".to_string(),
+            args: None,
+        });
+        // NonInteractivePrompter（无 TTY）——command 仍应执行（对标 Python，不受 is_interactive 约束）
+        let resolver = InputResolver::new(
+            [cmd],
+            Box::new(NonInteractivePrompter),
+            Some(EnvMap::new()),
+            Some(value_store(&dir)),
+            Some(secret_store(true)),
+        );
         assert_eq!(
-            resolver.resolve_by_id("host", None, None).unwrap(),
-            json!("prod")
+            resolver.resolve_by_id("greeting", None, None).unwrap(),
+            json!("hello-cmd")
         );
     }
 }

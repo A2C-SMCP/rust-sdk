@@ -66,12 +66,8 @@ pub struct OsKeyring;
 ))]
 impl KeyringBackend for OsKeyring {
     fn available(&self) -> bool {
-        use keyring::{Entry, Error};
-        match Entry::new(SERVICE_NAME, PROBE_KEY) {
-            // NoEntry = 后端工作但 key 不存在（可用）；其它错误（PlatformFailure / NoStorageAccess）= 不可用。
-            Ok(entry) => matches!(entry.get_password(), Ok(_) | Err(Error::NoEntry)),
-            Err(_) => false,
-        }
+        // 走缓存探测（AtomicU8），避免每次 get/set/delete 都发起一次 keyring round-trip。
+        keyring_available(false)
     }
 
     fn get(&self, service: &str, id: &str) -> Option<String> {
@@ -113,12 +109,44 @@ impl KeyringBackend for OsKeyring {
     }
 }
 
+/// 原始（未缓存）后端探测 / the raw, uncached backend probe。
+///
+/// 与 [`keyring_available`] 分离以打破递归：`keyring_available` 缓存本函数结果，[`OsKeyring::available`] 则读
+/// 缓存——三者不互相递归。keyring crate 仅 target-conditional 存在，故 cfg 双分支。
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd"
+))]
+fn probe_os_keyring() -> bool {
+    use keyring::{Entry, Error};
+    match Entry::new(SERVICE_NAME, PROBE_KEY) {
+        // NoEntry = 后端工作但 key 不存在（可用）；其它错误（PlatformFailure / NoStorageAccess）= 不可用。
+        Ok(entry) => matches!(entry.get_password(), Ok(_) | Err(Error::NoEntry)),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd"
+)))]
+fn probe_os_keyring() -> bool {
+    false
+}
+
 /// 可用性探测缓存（0=未探测，1=false，2=true）/ availability probe cache。
 static AVAILABILITY: AtomicU8 = AtomicU8::new(0);
 
 /// 探测 OS keyring 是否可用（结果缓存，`force_recheck` 可重探）/ Probe keyring availability (cached)。
 ///
-/// 判定：本 target 编译了 keyring 后端 **且** 运行期后端非 fail（容器 / 无 Secret Service 时不可用）。
+/// 判定：本 target 编译了 keyring 后端 **且** 运行期后端非 fail（容器 / 无 Secret Service 时不可用）。结果缓存于
+/// [`AVAILABILITY`]，供 [`SecretStore`] 每次 get/set/delete 廉价复用（[`OsKeyring::available`] 即读此缓存）。
 pub fn keyring_available(force_recheck: bool) -> bool {
     if !KEYRING_COMPILED {
         return false;
@@ -130,7 +158,7 @@ pub fn keyring_available(force_recheck: bool) -> bool {
             _ => {}
         }
     }
-    let avail = OsKeyring.available();
+    let avail = probe_os_keyring();
     AVAILABILITY.store(if avail { 2 } else { 1 }, Ordering::Relaxed);
     avail
 }

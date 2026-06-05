@@ -412,4 +412,39 @@ mod tests {
             decode_blob_handle(&manual).unwrap()
         );
     }
+
+    // ── 跨-SDK golden 向量：钉死与 Python 的字节级互通 ──────────────────
+    //
+    // 常量 = Python `a2c_smcp.computer.blob.handle` 对同输入的实际产出
+    // （`base64url( msgpack({...}, use_bin_type=True) ).rstrip("=")`，string-keyed fixmap，
+    // 字段序 v,kind,...；`v:1` 为 msgpack 正 fixint 0x01）。
+    // 若有人重排 `SkillWire`/`ToolspoolWire` 字段、改 int 编码、或 Python 改 dict 序，此测试立刻失败。
+    const PY_SKILL_GOLDEN: &str = "hKF2AaRraW5kpXNraWxspG5hbWWhYahyZWxfcGF0aKFi";
+    const PY_TOOLSPOOL_GOLDEN: &str = "hKF2AaRraW5kqXRvb2xzcG9vbKNjaWShY6RtaW1loWQ";
+
+    #[test]
+    fn cross_sdk_golden_decode_matches_python() {
+        // Rust 读 Python 字节（关键互解方向）
+        assert_eq!(
+            decode_blob_handle(PY_SKILL_GOLDEN).unwrap(),
+            DecodedHandle::Skill(SkillHandlePayload {
+                name: "a".to_string(),
+                rel_path: "b".to_string(),
+            })
+        );
+        assert_eq!(
+            decode_blob_handle(PY_TOOLSPOOL_GOLDEN).unwrap(),
+            DecodedHandle::Toolspool(ToolspoolHandlePayload {
+                cid: "c".to_string(),
+                mime: "d".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn cross_sdk_golden_encode_is_byte_identical_to_python() {
+        // Rust 写 == Python 字节（rmp-serde to_vec_named 与 msgpack(use_bin_type) 同构）
+        assert_eq!(encode_skill_handle("a", "b"), PY_SKILL_GOLDEN);
+        assert_eq!(encode_toolspool_handle("c", "d"), PY_TOOLSPOOL_GOLDEN);
+    }
 }
