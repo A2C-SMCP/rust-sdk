@@ -38,8 +38,12 @@
 //! **与 Python 的差异 / Divergence**：Python `MCPServerConfig`（pydantic `extra="forbid"`）令非 `envFile` 的
 //! 未知 server 键 drop+error；Rust 共享 [`MCPServerConfig`] 模型对未知键**宽容**（serde 默认忽略），故此类边角键
 //! 被容受而非 drop。强制拒绝未知 server 键属模型层硬化（影响全 crate 反序列化），**不**在本模块引入。
+//! 行为由 `unknown_server_key_is_leniently_accepted` 测试钉死——若未来给模型加 `deny_unknown_fields` 会令其失败、
+//! 拦截无声语义漂移。**下游接缝须知（#73/#69）**：Python docstring 依赖的「畸形 server 被 drop → 进启动 WARN」语义
+//! 对此类未知键在 Rust **不触发**（该 server 被容受、不入 `errors`），故 CLI 启动 WARN 接线**不应**假定与 Python
+//! 逐条对等；真正畸形（缺必填 / `type` 非法 / name-key 冲突）仍 drop+error，与 Python 一致。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -58,8 +62,6 @@ use crate::settings::scope::{
     workdir_settings_dir, EnvMap, WriteValue,
 };
 use crate::settings::store::{self, load_installed_plugins, SettingsStoreError};
-
-use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // 常量 / Constants
@@ -944,5 +946,171 @@ mod tests {
         assert!(managed_mcp_config_path(Some("linux"))
             .to_string_lossy()
             .ends_with("managed-mcp.json"));
+    }
+
+    // ---- 🟡2：wire 字符串单源钉死（serde rename_all 与手写 as_str 不得漂移）-----
+    #[test]
+    fn approval_status_wire_strings_pinned() {
+        for (status, wire) in [
+            (McpApprovalStatus::Enabled, "enabled"),
+            (McpApprovalStatus::Disabled, "disabled"),
+            (McpApprovalStatus::Pending, "pending"),
+        ] {
+            assert_eq!(status.as_str(), wire);
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(wire));
+        }
+    }
+
+    // ---- 🟡3：未知 server 键宽容（钉死 Rust 行为，拦 deny_unknown_fields 无声漂移）---
+    #[test]
+    fn unknown_server_key_is_leniently_accepted() {
+        // 非 envFile 的未知键（typo / VS Code 扩展）：Rust 共享模型 serde 默认忽略 → 容受、不 drop。
+        let sdef = json!({
+            "type": "stdio",
+            "server_parameters": {"command": "x"},
+            "unknownExtKey": "ignored"
+        });
+        let (srv, errs) = validate_server("s", &sdef, SettingsScope::User, None);
+        assert!(
+            srv.is_some(),
+            "unknown key tolerated (no deny_unknown_fields)"
+        );
+        assert!(errs.is_empty());
+        // 对照：真正畸形（缺必填 command）仍 drop+error（与 Python 一致）。
+        let bad = json!({"type": "stdio", "server_parameters": {}});
+        assert!(validate_server("s", &bad, SettingsScope::User, None)
+            .0
+            .is_none());
+    }
+
+    // ---- 🟡1：resolve 层补测（对标 Python test_mcp_config 集成层）----------------
+    /// 用不存在的 managed 路径，隔离真实系统 managed-mcp.json。
+    fn no_managed(tmp: &TempDir) -> PathBuf {
+        tmp.path().join("no-managed.json")
+    }
+    fn xdg_env(tmp: &TempDir) -> EnvMap {
+        std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("xdg").to_string_lossy().into_owned(),
+        ))
+        .collect()
+    }
+
+    #[test]
+    fn resolve_user_only_when_no_active_workdir() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let wd = tmp.path().join("wd");
+        // user：srv-u；project（须被忽略，因 active_workdir=None）：srv-p。
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"servers": {"srv-u": {"type":"stdio","server_parameters":{"command":"u"}}}}"#,
+        );
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"servers": {"srv-p": {"type":"stdio","server_parameters":{"command":"p"}}}}"#,
+        );
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            active_workdir: None,
+            env: Some(&env),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+        assert!(resolved.servers.contains_key("srv-u"));
+        assert!(!resolved.servers.contains_key("srv-p")); // project 层未读
+        assert_eq!(resolved.servers["srv-u"].origin, SettingsScope::User);
+    }
+
+    #[test]
+    fn resolve_inputs_dedup_high_wins_and_idless_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let wd = tmp.path().join("wd");
+        // user：input tok(desc=u) + 一条无 id（→ <noid-N> → 校验失败 drop）。
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"inputs": [
+                {"type":"PromptString","id":"tok","description":"u"},
+                {"type":"PromptString","description":"idless"}
+            ]}"#,
+        );
+        // project：input tok(desc=p) → 同 id 高 scope 胜。
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"inputs": [{"type":"PromptString","id":"tok","description":"p"}]}"#,
+        );
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            active_workdir: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+        // 去重 → 仅 tok；高 scope（project）胜 → desc=p。
+        assert_eq!(resolved.inputs.len(), 1);
+        assert_eq!(resolved.inputs[0].id(), "tok");
+        assert_eq!(resolved.inputs[0].description(), "p");
+        // 无 id 项被 drop 且记错（noid 路径 + §5.6）。
+        assert!(resolved
+            .errors
+            .iter()
+            .any(|e| e.field == "inputs.<unknown>"));
+    }
+
+    #[test]
+    fn resolve_malformed_server_dropped_sibling_survives() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let wd = tmp.path().join("wd");
+        // ok 合法 + bad 缺必填 command → bad drop、ok 存活、不 abort（§5.6）。
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"servers": {
+                "ok":  {"type":"stdio","server_parameters":{"command":"x"}},
+                "bad": {"type":"stdio","server_parameters":{}}
+            }}"#,
+        );
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            active_workdir: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+        assert!(resolved.servers.contains_key("ok"));
+        assert!(!resolved.servers.contains_key("bad"));
+        assert!(resolved.errors.iter().any(|e| e.field == "servers.bad"));
+    }
+
+    #[test]
+    fn resolve_local_overrides_project_and_policy_is_trusted() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let wd = tmp.path().join("wd");
+        // project srv-x(command=p) ← local srv-x(command=l) 整体替换、origin=Local、非 trusted。
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"servers": {"srv-x": {"type":"stdio","server_parameters":{"command":"p"}}}}"#,
+        );
+        write(
+            &workdir_mcp_local_config_path(&wd),
+            r#"{"servers": {"srv-x": {"type":"stdio","server_parameters":{"command":"l"}}}}"#,
+        );
+        // policy srv-y → origin=Policy、trusted_origin。
+        let policy = tmp.path().join("managed-mcp.json");
+        write(
+            &policy,
+            r#"{"servers": {"srv-y": {"type":"stdio","server_parameters":{"command":"pol"}}}}"#,
+        );
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            active_workdir: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&policy),
+            ..Default::default()
+        });
+        let x = &resolved.servers["srv-x"];
+        assert_eq!(x.origin, SettingsScope::Local);
+        assert!(!x.trusted_origin); // local 受门控
+        let y = &resolved.servers["srv-y"];
+        assert_eq!(y.origin, SettingsScope::Policy);
+        assert!(y.trusted_origin); // policy 预信任
     }
 }
