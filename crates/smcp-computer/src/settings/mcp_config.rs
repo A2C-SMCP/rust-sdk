@@ -745,8 +745,8 @@ mod tests {
     }
 
     // ---- resolve_mcp_config 多 scope 合并 ------------------------------------
-    #[tokio::test]
-    async fn resolve_merges_scopes_high_wins_origin() {
+    #[test]
+    fn resolve_merges_scopes_high_wins_origin() {
         let tmp = TempDir::new().unwrap();
         let wd = tmp.path().join("wd");
         let xdg = tmp.path().join("xdg");

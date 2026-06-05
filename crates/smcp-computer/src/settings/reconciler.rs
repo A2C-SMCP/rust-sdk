@@ -89,7 +89,11 @@ pub struct InstalledPluginRecord {
     )]
     pub install_path: Option<String>,
     /// 随附 bundled MCP server 名（gc 时经 teardown 停摘）/ bundled MCP server names。
-    #[serde(default, rename = "bundledMcpServers")]
+    #[serde(
+        default,
+        rename = "bundledMcpServers",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub bundled_mcp_servers: Vec<String>,
     /// 其余字段透传（store 拥有）/ passthrough fields owned by the store。
     #[serde(flatten)]

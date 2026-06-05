@@ -420,6 +420,7 @@ pub async fn install_plugin(
         .collect();
     let filter: HashSet<String> = std::iter::once(plugin.clone()).collect();
     let mut registered: Vec<String> = Vec::new();
+    let mut staged_skills: Vec<String> = Vec::new();
     let mut mutate_err: Option<PluginInstallError> = None;
 
     'mutate: {
@@ -438,7 +439,8 @@ pub async fn install_plugin(
             }
         }
         // skills 注册：复用既有 clone（refresh 透传）；失败降级（返回 Vec、不抛）→ 不触发回滚。
-        stage_marketplace_skills(
+        // 捕获已注册 skill 名供成功日志带计数（观测信号；stage 的「降级不抛」契约见 #49）。
+        staged_skills = stage_marketplace_skills(
             &marketplace,
             &source,
             registry,
@@ -530,13 +532,22 @@ pub async fn install_plugin(
         Some(home),
         env,
     )?;
-    tracing::info!(plugin = plugin_id, "installed plugin (skills staged)");
+    tracing::info!(
+        plugin = plugin_id,
+        skills_staged = staged_skills.len(),
+        "installed plugin"
+    );
     Ok(record)
 }
 
 /// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联 stop+remove bundled server + 删账本记录）/ Uninstall。
 ///
 /// `scope=None` 删该 id 全部记录；指定 scope 仅删该 scope 记录。未安装 / 无匹配 → `false`（no-op）。
+///
+/// ⚠️ **相对源 plugin 的删除范围**：source 为相对路径时，其 `installPath` 位于**共享 catalog clone 内**
+/// （`<home>/marketplace/<mp>/.../<plugin>`），[`safe_rmtree`] 删的是该 marketplace 共享 git 工作树的子目录
+/// （与兄弟 `gc_plugins` 同一 `safe_rmtree` 语义，非本函数新引入）；后续 `marketplace refresh` 遇脏树会 fallback
+/// 全量重 clone 干净恢复。即「删 plugin 子树」可能动到共享 catalog——勿误判为仅删独立 `.plugins/` 外部树。
 ///
 /// # Errors
 /// id 非法 / `remove_server` 失败 / 账本写失败 → [`PluginInstallError`]。
@@ -631,8 +642,11 @@ pub async fn uninstall_plugin(
 /// ① 写 `enabledPlugins[id]=false`；② 停并摘除其 bundled MCP server；③ 隐藏 skills（mark_orphan，物化层不动）。
 /// 区别于 [`uninstall_plugin`]：disable 留 installed 记录、可经 [`enable_plugin`] 一键回滚。
 ///
-/// ⚠️ **scope 契约**：`scope` 须与安装 scope 一致（调用方从上下文传）。⚠️ **非原子**：先写 settings 再摘
-/// server / orphan skill；`remove_server` 抛错留半态——靠 reconcile 兜底。
+/// ⚠️ **scope 契约**：`scope` 须与安装 scope 一致（调用方从上下文传），否则 `enabledPlugins[id]=false` 写错层、
+/// 与 live 态背离。真值已在账本 `installed_plugins.json` 每条 record 的 `scope` 内——**CLI 接线层（#48）应据
+/// `record.scope` 解析后再传**消除 footgun。本层刻意**不**自动回查（账本可含多 scope 记录、回查有歧义；保 Python
+/// parity，由调用方决策）。⚠️ **非原子**：先写 settings 再摘 server / orphan skill；`remove_server` 抛错留半态——靠
+/// reconcile 兜底。
 ///
 /// # Errors
 /// id 非法 / settings 写失败 / `remove_server` 失败 → [`PluginInstallError`]。
