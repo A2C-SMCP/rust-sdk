@@ -95,6 +95,9 @@ pub enum BlobHandleError {
     /// 源已不可达 → `4018 gone`（由 resolver 抛）/ source gone。
     #[error("blob handle gone: {0}")]
     Gone(String),
+    /// 切片范围越界（`offset > total_size`）→ `4018 range`（由 resolver 切片时抛）/ slice out of range。
+    #[error("blob handle range: {0}")]
+    Range(String),
 }
 
 impl BlobHandleError {
@@ -104,6 +107,7 @@ impl BlobHandleError {
             BlobHandleError::Invalid(_) => "invalid_handle",
             BlobHandleError::Forbidden(_) => "forbidden",
             BlobHandleError::Gone(_) => "gone",
+            BlobHandleError::Range(_) => "range",
         }
     }
 }
@@ -386,6 +390,7 @@ mod tests {
             "forbidden"
         );
         assert_eq!(BlobHandleError::Gone(String::new()).reason(), "gone");
+        assert_eq!(BlobHandleError::Range(String::new()).reason(), "range");
     }
 
     #[test]
