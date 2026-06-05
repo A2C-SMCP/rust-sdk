@@ -12,7 +12,9 @@ pub mod atomic_io;
 pub mod blob;
 pub mod env;
 pub mod handshake;
+pub mod hash;
 pub mod path;
+pub mod slice;
 
 pub use atomic_io::{atomic_write_bytes, atomic_write_text, unique_tmp_path};
 pub use blob::{
@@ -25,4 +27,6 @@ pub use handshake::{
     enforce_polling_first, extract_4008_payload, A2C_VERSION_QUERY_KEY,
     DEFAULT_HANDSHAKE_TRANSPORTS,
 };
+pub use hash::{sha256_hex, to_hex};
 pub use path::{is_within, normalize_lexical, resolve_xdg_first};
+pub use slice::{plan_slice, SlicePlan};

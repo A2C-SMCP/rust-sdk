@@ -25,6 +25,8 @@
 
 use std::path::PathBuf;
 
+use smcp::utils::slice::{plan_slice, SlicePlan};
+
 use crate::blob::handle::{BlobHandleError, DecodedHandle, SkillHandlePayload};
 use crate::skills::registry::SkillRegistry;
 use crate::skills::resource::resolve_skill_view;
@@ -84,17 +86,14 @@ impl ResolvedBlob {
     /// EOF probe 语义（`offset == total_size` 返回空、`>` 才报错）与 `client:get_blob` 严格 `>` 范围守卫
     /// 一致，避免破坏 HTTP-Range 风格的「探测末尾」客户端行为。
     pub fn slice(&self, offset: u64, length: u64) -> Result<Vec<u8>, BlobHandleError> {
-        if offset > self.total_size {
-            return Err(BlobHandleError::Range(format!(
+        match plan_slice(offset, length, self.total_size) {
+            SlicePlan::OutOfRange => Err(BlobHandleError::Range(format!(
                 "offset {offset} > total_size {}",
                 self.total_size
-            )));
+            ))),
+            SlicePlan::Empty => Ok(Vec::new()),
+            SlicePlan::Read { offset, length } => (self.slicer)(offset, length),
         }
-        if length == 0 || offset == self.total_size {
-            return Ok(Vec::new());
-        }
-        let actual = length.min(self.total_size - offset);
-        (self.slicer)(offset, actual)
     }
 }
 

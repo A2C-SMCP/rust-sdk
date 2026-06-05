@@ -1198,12 +1198,8 @@ async fn materialize_archive(
         )));
     }
     if let Some(expected) = meta.get("archive_sha256").and_then(Value::as_str) {
-        use sha2::{Digest, Sha256};
-        let actual: String = Sha256::digest(&data)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        if actual.to_lowercase() != expected.to_lowercase() {
+        let actual = smcp::utils::hash::sha256_hex(&data);
+        if actual != expected.to_lowercase() {
             return Err(SkillStagingError::new(format!(
                 "archive sha256 mismatch: expected {expected}, got {actual}"
             )));

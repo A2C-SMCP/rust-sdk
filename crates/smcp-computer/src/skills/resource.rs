@@ -20,12 +20,13 @@
 //! 消费字节基准 / Consumed-bytes baseline：SKILL.md 入口 = frontmatter 剥离后 body 的 UTF-8 字节；
 //! 其它资源 = 原始字节。
 
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use smcp::utils::hash::to_hex;
+use smcp::utils::slice::{plan_slice, SlicePlan};
 
 use crate::skills::frontmatter::strip_skill_frontmatter;
 use crate::skills::sandbox::{
@@ -114,17 +115,14 @@ impl SkillResourceView {
     /// # Errors
     /// `offset > total_size` → [`std::io::ErrorKind::InvalidInput`]；磁盘读失败透传 IO 错误。
     pub fn slice(&self, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
-        if offset > self.total_size {
-            return Err(std::io::Error::new(
+        match plan_slice(offset, length, self.total_size) {
+            SlicePlan::OutOfRange => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("offset {offset} > total_size {}", self.total_size),
-            ));
+            )),
+            SlicePlan::Empty => Ok(Vec::new()),
+            SlicePlan::Read { offset, length } => self.slicer.read_slice(offset, length),
         }
-        if length == 0 || offset == self.total_size {
-            return Ok(Vec::new());
-        }
-        let actual = length.min(self.total_size - offset);
-        self.slicer.read_slice(offset, actual)
     }
 
     /// 读取全部消费字节（供 get_skill 内联 `body`）/ Read all consumed bytes。
@@ -134,15 +132,6 @@ impl SkillResourceView {
     pub fn read_all(&self) -> std::io::Result<Vec<u8>> {
         self.slice(0, self.total_size)
     }
-}
-
-/// 字节切片 → 小写十六进制 / Lowercase hex of a byte slice。
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// 流式计算文件 sha256（O([`HASH_BLOCK`]) 内存）/ Streaming file sha256 (bounded memory)。

@@ -28,8 +28,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 use smcp::utils::atomic_io::{atomic_write_bytes, atomic_write_text};
+use smcp::utils::hash::sha256_hex;
 use smcp::utils::path::is_within;
 
 use crate::blob::handle::{BlobHandleError, DecodedHandle};
@@ -303,14 +303,6 @@ fn gone(cid: &str) -> BlobHandleError {
     BlobHandleError::Gone(format!("toolspool entry missing: cid={cid}"))
 }
 
-/// 计算字节的 sha256 十六进制 / sha256 hex of bytes。
-fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +345,25 @@ mod tests {
         let a = store.put(b"same", "text/plain").unwrap();
         let b = store.put(b"same", "text/plain").unwrap();
         assert_eq!(a, b, "相同字节复用同一 cid");
+        assert_eq!(store.iter_cids().len(), 1, "无重复副本");
+    }
+
+    #[test]
+    fn put_recovers_missing_mime_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let cid = store.put(b"payload", "image/png").unwrap();
+        // 模拟脏状态：blob 在、`.mime` 旁路缺失（首次写盘半途失败 / 外部误删）。
+        let mime_path = store.root().join(format!("{cid}.mime"));
+        std::fs::remove_file(&mime_path).unwrap();
+        assert!(!mime_path.is_file());
+        // 再 put 相同字节：blob 幂等复用（不重写），但 `.mime` 旁路被刷新恢复。
+        let cid2 = store.put(b"payload", "image/png").unwrap();
+        assert_eq!(cid2, cid, "相同字节复用同一 cid");
+        assert!(mime_path.is_file(), ".mime sidecar 应被恢复");
+        let (payload, mime) = store.get(&cid).unwrap();
+        assert_eq!(payload, b"payload");
+        assert_eq!(mime, "image/png");
         assert_eq!(store.iter_cids().len(), 1, "无重复副本");
     }
 

@@ -31,15 +31,14 @@
 //! Deliberately more robust than the Python reference, whose sync path can mask a co-occurring fatal.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use base64::Engine as _;
 use futures::stream::{self, StreamExt as _};
-use sha2::{Digest, Sha256};
 
+use crate::utils::hash::sha256_hex;
 use crate::{ErrorCode, ErrorPayload, GetBlobRet};
 
 /// 默认单块上限 256 KiB / default chunk-size cap.
@@ -701,18 +700,6 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(s)
         .map_err(|e| e.to_string())
-}
-
-/// 计算字节的 sha256 十六进制 / sha256 hex of the bytes。
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
