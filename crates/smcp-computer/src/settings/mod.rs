@@ -10,6 +10,7 @@
 */
 
 pub mod installer;
+pub mod mcp_config;
 pub mod policy;
 pub mod reconciler;
 pub mod schema;
@@ -20,6 +21,15 @@ pub use installer::{
     disable_plugin, enable_plugin, install_plugin, uninstall_plugin, DisableOptions, EnableOptions,
     InstallOptions, McpHookError, McpInstallHooks, McpServerNameConflictError, PluginInstallError,
     UninstallOptions,
+};
+
+pub use mcp_config::{
+    approve_all_project_mcp, approve_mcp_server, bundled_mcp_server_names, deny_mcp_server,
+    gate_mcp_servers, load_mcp_config_file, managed_mcp_config_path, mcp_server_status,
+    resolve_mcp_config, user_mcp_config_path, workdir_mcp_config_path,
+    workdir_mcp_local_config_path, McpApprovalStatus, McpConfigError, RawMcpConfigFile,
+    ResolveMcpConfigArgs, ResolvedMcpConfig, ResolvedMcpServer, MANAGED_MCP_FILENAME,
+    MCP_CONFIG_FILENAME, MCP_LOCAL_CONFIG_FILENAME,
 };
 
 pub use policy::{
