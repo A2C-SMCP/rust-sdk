@@ -883,6 +883,36 @@ impl MCPServerManager {
         results
     }
 
+    /// 单页透传指定 MCP Server 的 `resources/list`（v0.2 `client:get_resources` 路由层）。
+    /// Single-page passthrough of a named server's `resources/list` (the v0.2 `client:get_resources` router)。
+    ///
+    /// 仅作透传：定位命名 client → 调 [`list_resources_page`](MCPClientProtocol::list_resources_page)，
+    /// 不做 scheme/元数据过滤、不聚合，翻页由调用方经 cursor 控制。未注册 server →
+    /// [`ComputerError::McpServerNotFound`]（映射 4014）；无 `resources` 能力 →
+    /// [`ComputerError::McpCapabilityNotSupported`]（映射 4015）。
+    pub async fn list_resources(
+        &self,
+        server_name: &str,
+        cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), ComputerError> {
+        let client = {
+            let clients = self.active_clients.read().await;
+            clients.get(server_name).cloned()
+        };
+        let client =
+            client.ok_or_else(|| ComputerError::McpServerNotFound(server_name.to_string()))?;
+
+        match client.list_resources_page(cursor).await {
+            Ok(pair) => Ok(pair),
+            Err(MCPClientError::CapabilityNotSupported(cap)) => Err(
+                ComputerError::McpCapabilityNotSupported(format!("server '{server_name}': {cap}")),
+            ),
+            Err(e) => Err(ComputerError::ProtocolError(format!(
+                "list_resources '{server_name}': {e}"
+            ))),
+        }
+    }
+
     /// 获取所有窗口资源的详情 / Get details of all window resources
     /// 复用 list_all_windows 聚合窗口列表，再逐个获取内容
     /// Reuses list_all_windows to aggregate window list, then fetches each detail
@@ -1721,6 +1751,8 @@ mod tests {
     struct MockSkillClient {
         pages: Vec<Vec<Resource>>,
         fail: bool,
+        /// `list_resources_page` 返回 `CapabilityNotSupported`（模拟无 `resources` 能力）。
+        cap_fail: bool,
         read_text: String,
     }
 
@@ -1752,6 +1784,9 @@ mod tests {
             &self,
             cursor: Option<String>,
         ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            if self.cap_fail {
+                return Err(MCPClientError::CapabilityNotSupported("resources".into()));
+            }
             if self.fail {
                 return Err(MCPClientError::ProtocolError("boom".into()));
             }
@@ -1821,6 +1856,7 @@ mod tests {
             MockSkillClient {
                 pages,
                 fail: false,
+                cap_fail: false,
                 read_text: "x".into(),
             },
         )
@@ -1842,6 +1878,7 @@ mod tests {
             MockSkillClient {
                 pages: vec![vec![skill_resource("skill://srv/a", Some("mounted"))]],
                 fail: false,
+                cap_fail: false,
                 read_text: "hello-bytes".into(),
             },
         )
@@ -1876,6 +1913,7 @@ mod tests {
             MockSkillClient {
                 pages: vec![],
                 fail: true,
+                cap_fail: false,
                 read_text: String::new(),
             },
         )
@@ -1886,6 +1924,7 @@ mod tests {
             MockSkillClient {
                 pages: vec![vec![skill_resource("skill://good/a", Some("mounted"))]],
                 fail: false,
+                cap_fail: false,
                 read_text: String::new(),
             },
         )
@@ -1902,5 +1941,64 @@ mod tests {
         assert_eq!(only_good.len(), 1);
         let none = manager.list_skill_resources(Some("missing")).await;
         assert!(none.is_empty());
+    }
+
+    // ---- #68：list_resources（get_resources 路由 + 4014/4015 映射）----
+
+    #[tokio::test]
+    async fn test_list_resources_unknown_server_4014() {
+        let manager = MCPServerManager::new();
+        let err = manager.list_resources("nope", None).await.unwrap_err();
+        assert_eq!(err.error_code(), 4014);
+        assert!(matches!(err, ComputerError::McpServerNotFound(s) if s == "nope"));
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_capability_not_supported_4015() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: true,
+                read_text: String::new(),
+            },
+        )
+        .await;
+        let err = manager.list_resources("srv", None).await.unwrap_err();
+        assert!(matches!(err, ComputerError::McpCapabilityNotSupported(_)));
+        assert_eq!(err.error_code(), 4015);
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_single_page_passthrough_cursor() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages: vec![
+                    vec![make_resource("res://a", "a", None, None)],
+                    vec![make_resource("res://b", "b", None, None)],
+                ],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+
+        // 首页（cursor=None）：返回第 1 页 + next cursor（透传，不聚合第 2 页）。
+        let (page1, next1) = manager.list_resources("srv", None).await.unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].uri, "res://a");
+        assert_eq!(next1.as_deref(), Some("1"));
+
+        // 第 2 页（透传 cursor）：返回第 2 页 + 末页（next=None）。
+        let (page2, next2) = manager.list_resources("srv", next1).await.unwrap();
+        assert_eq!(page2[0].uri, "res://b");
+        assert!(next2.is_none());
     }
 }

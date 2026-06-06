@@ -27,7 +27,7 @@ use crate::blob::{
     SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
 use crate::skills::{
-    resolve_skill_home, resolve_skill_view, stage_user_skills, user_dropin_root,
+    resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
     workdir_skill_root, AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer,
     SkillFileWatcher, SkillRegistry, SkillResourceView, SkillSandboxError, SOURCE_USER,
 };
@@ -36,6 +36,7 @@ use smcp::A2CSkillRef;
 
 use crate::errors::{ComputerError, ComputerResult};
 use crate::inputs::handler::InputHandler;
+use crate::inputs::load_env_file;
 use crate::inputs::model::InputValue;
 use crate::inputs::utils::run_command;
 use crate::mcp_clients::{
@@ -266,6 +267,68 @@ fn reconcile_orphans_in(
     for name in to_orphan {
         registry.mark_orphan(&name);
     }
+}
+
+/// 合并 VS Code 风格 `envFile` 的 `KEY=VALUE` 进 stdio `server_parameters.env`（显式 env 胜，§9.1）/
+/// merge a VS Code-style envFile's KEY=VALUE into a stdio server's env (explicit env wins)。
+///
+/// 在 [`render_server_config`](Computer::render_server_config) 渲染后、反序列化前作用于 JSON 值：envFile
+/// 路径此时已展开（`${workspaceFolder}` 等）。仅对 stdio（`server_parameters` 含 `env`/`command`）生效；
+/// 置于 sse/http 上记 WARN + 原样返回。envFile 缺失 / 空 / 文件为空 → 原样返回。对标 Python `_apply_env_file`。
+fn apply_env_file(mut rendered: serde_json::Value) -> serde_json::Value {
+    let Some(env_file) = rendered
+        .get("envFile")
+        .or_else(|| rendered.get("env_file"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return rendered;
+    };
+
+    // stdio 判定：server_parameters 为对象且含 `env` 或 `command`（sse/http 无此二者）。
+    let is_stdio = rendered
+        .get("server_parameters")
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| p.contains_key("env") || p.contains_key("command"));
+    if !is_stdio {
+        let name = rendered
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let srv_type = rendered
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        warn!("envFile 在非 stdio（{srv_type}）server 上不适用，已忽略: {name} / envFile ignored on non-stdio");
+        return rendered;
+    }
+
+    let file_env = load_env_file(std::path::Path::new(&env_file));
+    if file_env.is_empty() {
+        return rendered;
+    }
+
+    if let Some(params) = rendered
+        .get_mut("server_parameters")
+        .and_then(|p| p.as_object_mut())
+    {
+        // 显式 env 同名项胜：先铺 envFile，再以显式 env 覆盖 / explicit env wins.
+        let explicit = params
+            .get("env")
+            .and_then(|e| e.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut merged = serde_json::Map::new();
+        for (k, v) in file_env {
+            merged.insert(k, serde_json::Value::String(v));
+        }
+        for (k, v) in explicit {
+            merged.insert(k, v);
+        }
+        params.insert("env".to_string(), serde_json::Value::Object(merged));
+    }
+    rendered
 }
 
 /// 构造 SKILL 去抖器（回调捕获共享 `Arc` 句柄克隆，非 `Computer` 本体——杜绝强引用环）/ Build the debouncer。
@@ -502,6 +565,29 @@ impl<S: Session> Computer<S> {
             .cloned()
     }
 
+    /// 单页透传指定 MCP Server 的 `resources/list`（v0.2 `client:get_resources`）/ single-page passthrough。
+    ///
+    /// Computer 仅作透传层：无 scheme/元数据过滤、无跨 Server 聚合，翻页由调用方经 `cursor` 控制
+    /// （首页传 `None`）。
+    ///
+    /// # Errors
+    /// - [`ComputerError::InvalidState`]：MCP Manager 未初始化。
+    /// - [`ComputerError::McpServerNotFound`]：`mcp_server` 未注册（handler 映射 4014）。
+    /// - [`ComputerError::McpCapabilityNotSupported`]：未声明 `resources` 能力（handler 映射 4015）。
+    pub async fn get_resources(
+        &self,
+        mcp_server: &str,
+        cursor: Option<String>,
+    ) -> ComputerResult<(Vec<Resource>, Option<String>)> {
+        let guard = self.mcp_manager.read().await;
+        let Some(manager) = guard.as_ref() else {
+            return Err(ComputerError::InvalidState(
+                "MCP Manager is not initialized".to_string(),
+            ));
+        };
+        manager.list_resources(mcp_server, cursor).await
+    }
+
     // ── 通用二进制传输 / generic blob transfer（#68，blob-transfer.md §3/§5）─────
     /// blob 阈值（inline / too_large / chunk_max）/ the threshold bundle。
     #[must_use]
@@ -595,6 +681,36 @@ impl<S: Session> Computer<S> {
             .into_iter()
             .collect();
         reconcile_orphans_in(&mut reg, &discovered, |s| s == SOURCE_USER);
+    }
+
+    /// 物化 mcp 源 `skill://` → 注册进 Registry（全量 → `mcp:` 源孤儿对账）/ materialize & register mcp-source skills。
+    ///
+    /// `server_name` 给定则仅重物化该 server（单 server 重枚举，不对账）；否则全部活跃 server + 孤儿对账
+    /// （本轮未出现的 `mcp:` 源 SKILL → 标孤儿，保留以便 source 回归时恢复）。SKILL Home 未就绪 / 无
+    /// manager → 空列表；staging 失败 → 记 ERROR + 空列表（失败隔离，对标 Python `_restage_mcp_skills`）。
+    /// 由 boot_up 与 MCP `ResourceListChanged`/`ResourceUpdated` 通知处理器（INT-03 #72）触发。
+    pub async fn restage_mcp_skills(&self, server_name: Option<&str>) -> Vec<String> {
+        let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
+            return Vec::new();
+        };
+        let manager_guard = self.mcp_manager.read().await;
+        let Some(manager) = manager_guard.as_ref() else {
+            return Vec::new();
+        };
+        let mut reg = self.skill_registry.write().await;
+        let registered = match stage_mcp_skills(manager, &mut reg, &home, server_name, None).await {
+            Ok(names) => names,
+            Err(e) => {
+                error!(error = %e, "restage_mcp_skills failed (non-blocking)");
+                return Vec::new();
+            }
+        };
+        // 仅全量重物化做孤儿对账（限定 `mcp:` 源，不误标 user/marketplace）。
+        if server_name.is_none() {
+            let present: HashSet<String> = registered.iter().cloned().collect();
+            reconcile_orphans_in(&mut reg, &present, |s| s.starts_with("mcp:"));
+        }
+        registered
     }
 
     /// 去抖器结算末端：推送 `server:update_skills`（无 client / 未入房间 → no-op）/ emit now。
@@ -724,9 +840,11 @@ impl<S: Session> Computer<S> {
             }
         }
 
-        // SKILL：解析 Home + 初次全量发现 user 源（= invalidate_user_skills，对标 Python boot_up）+ 启 watcher。
-        // mcp 源重物化（_restage_mcp_skills）归 INT-04 #74；marketplace 源 reconcile 归 #60/#61（非 boot）。
+        // SKILL：解析 Home + 物化 mcp 源（_restage_mcp_skills，boot 时多为空——server 后续接入）+ 初次全量
+        // 发现 user 源（= invalidate_user_skills）+ 启 watcher。三者各自失败隔离；marketplace 源 reconcile 归
+        // #60/#61（非 boot）。对标 Python boot_up SKILL 子系统初始化。
         self.ensure_skill_home();
+        self.restage_mcp_skills(None).await;
         self.invalidate_user_skills().await;
         self.start_skill_watcher().await;
 
@@ -789,6 +907,10 @@ impl<S: Session> Computer<S> {
 
         // 渲染配置 / Render config
         let rendered_json = renderer.render(config_json, resolver).await?;
+
+        // #68：envFile 合并——把渲染后 envFile 的 `KEY=VALUE` 并入 stdio `server_parameters.env`（显式胜）。
+        // envFile merge: fold envFile's KEY=VALUE into stdio env (explicit env wins).
+        let rendered_json = apply_env_file(rendered_json);
 
         // 反序列化回配置类型 / Deserialize back to config type
         let rendered_config: MCPServerConfig = serde_json::from_value(rendered_json)?;
@@ -2271,5 +2393,81 @@ mod tests {
         let result = parse_headers_string("Authorization:Bearer:token123");
         assert_eq!(result.len(), 1);
         assert_eq!(result["Authorization"], "Bearer:token123");
+    }
+
+    // ── #68 收尾：envFile 合并 / get_resources / restage 编排 ────────────────────
+
+    #[test]
+    fn test_apply_env_file_stdio_merge_explicit_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "FROM_FILE=file_val\nSHARED=file_shared\n").unwrap();
+
+        let rendered = serde_json::json!({
+            "type": "stdio",
+            "name": "srv",
+            "envFile": env_path.to_str().unwrap(),
+            "server_parameters": {
+                "command": "echo",
+                "args": [],
+                "env": { "SHARED": "explicit_shared", "EXPLICIT": "explicit_val" }
+            }
+        });
+        let out = apply_env_file(rendered);
+        let env = &out["server_parameters"]["env"];
+        assert_eq!(env["FROM_FILE"], "file_val"); // envFile-only 键并入
+        assert_eq!(env["EXPLICIT"], "explicit_val"); // 显式-only 键保留
+        assert_eq!(env["SHARED"], "explicit_shared"); // 同名：显式胜
+    }
+
+    #[test]
+    fn test_apply_env_file_non_stdio_ignored() {
+        let rendered = serde_json::json!({
+            "type": "sse",
+            "name": "srv",
+            "envFile": "/nonexistent/.env",
+            "server_parameters": { "url": "http://x", "headers": {} }
+        });
+        // sse 无 env/command → envFile 忽略，原样返回（未注入 env）。
+        let out = apply_env_file(rendered.clone());
+        assert_eq!(out, rendered);
+        assert!(out["server_parameters"].get("env").is_none());
+    }
+
+    #[test]
+    fn test_apply_env_file_missing_and_empty_file() {
+        // 无 envFile → 原样。
+        let no_ef = serde_json::json!({
+            "type": "stdio", "name": "s",
+            "server_parameters": { "command": "echo", "env": { "A": "1" } }
+        });
+        assert_eq!(apply_env_file(no_ef.clone()), no_ef);
+
+        // envFile 指向「仅注释」文件 → file_env 空 → env 不变。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let empty = tmp.path().join("empty.env");
+        std::fs::write(&empty, "# only a comment\n\n").unwrap();
+        let with_empty = serde_json::json!({
+            "type": "stdio", "name": "s",
+            "envFile": empty.to_str().unwrap(),
+            "server_parameters": { "command": "echo", "env": { "A": "1" } }
+        });
+        let out = apply_env_file(with_empty);
+        assert_eq!(out["server_parameters"]["env"]["A"], "1");
+    }
+
+    #[tokio::test]
+    async fn test_get_resources_no_manager_invalid_state() {
+        // 未 boot（mcp_manager 为 None）→ InvalidState。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let err = computer.get_resources("srv", None).await.unwrap_err();
+        assert!(matches!(err, ComputerError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn test_restage_mcp_skills_no_home_empty() {
+        // 未 boot（skill_home None / 无 manager）→ 空列表，不 panic。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        assert!(computer.restage_mcp_skills(None).await.is_empty());
     }
 }

@@ -31,6 +31,17 @@ pub enum ComputerError {
     /// 服务器未激活 / Server not active
     ServerNotActive { server_name: String },
 
+    #[error("MCP server not found: {0}")]
+    /// 目标 MCP Server 未注册（`get_resources` → 处理器映射 4014）/ target MCP server not registered
+    /// (`get_resources` → handler maps 4014)。对标 Python `MCPServerNotFoundError`。
+    McpServerNotFound(String),
+
+    #[error("MCP capability not supported: {0}")]
+    /// MCP Server 未声明所需 capability（如 `resources`）（`get_resources` → 处理器映射 4015）/
+    /// required capability not declared (`get_resources` → handler maps 4015)。对标 Python
+    /// `MCPCapabilityNotSupportedError`。
+    McpCapabilityNotSupported(String),
+
     #[error("VRL syntax error: {message}")]
     /// VRL语法错误 / VRL syntax error
     VrlSyntaxError { message: String },
@@ -131,6 +142,12 @@ impl ComputerError {
 
             // 服务器相关错误 / Server related errors
             ComputerError::ServerNotActive { .. } => 404, // NOT_FOUND
+
+            // MCP get_resources 路由错误 / MCP get_resources routing errors
+            ComputerError::McpServerNotFound(_) => smcp::ErrorCode::McpServerNotFound.code(), // 4014
+            ComputerError::McpCapabilityNotSupported(_) => {
+                smcp::ErrorCode::McpCapabilityNotSupported.code() // 4015
+            }
 
             // 语法/验证错误 / Syntax/Validation errors
             ComputerError::VrlSyntaxError { .. } => 400, // BAD_REQUEST
