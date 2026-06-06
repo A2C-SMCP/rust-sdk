@@ -8,6 +8,7 @@
 * 描述: Desktop模块入口 / Desktop module entry point
 */
 
+pub mod metadata;
 pub mod model;
 pub mod organize;
 pub mod window_uri;

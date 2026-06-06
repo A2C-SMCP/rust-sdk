@@ -7,8 +7,9 @@
 * 依赖: None
 * 描述: 桌面组织策略实现 / Desktop organizing strategy implementation
 */
+use super::metadata::{check_audience, read_fullscreen, read_priority};
 use super::model::{ServerName, ToolCallRecord, WindowInfo};
-use super::window_uri::WindowURI;
+use super::window_uri::is_window_uri;
 use super::Desktop;
 use crate::mcp_clients::model::{resource_contents_as_text, ReadResourceResult, Resource};
 use std::collections::{HashMap, HashSet};
@@ -19,8 +20,9 @@ use std::collections::{HashMap, HashSet};
 /// Rules from /desktop workflow:
 ///   1) 若指定 window_uri，Manager 层已完成过滤；此处按一般规则组织即可。
 ///   2) 按最近工具调用历史对应的 MCP Server 倒序优先（最近使用的服务器优先）。
-///   3) 同一 MCP Server 内，按 WindowURI.priority 降序推入（默认 0）。
-///   4) 若遇到 fullscreen=True 的窗口，则该 MCP 仅推入这一个；若 size 仍有剩余，则进入下一个 MCP。
+///   3) 同一 MCP Server 内，按 `Resource.annotations.priority`（f32[0,1]，缺省 0.0）降序推入；
+///      URI query 不再承载排序信息（v0.2 元数据下沉）。
+///   4) 若 `Resource._meta.fullscreen=true` 的窗口，则该 MCP 仅推入这一个；若 size 仍有剩余，则进入下一个 MCP。
 ///   5) 全局按 size 截断（None 表示不限；size<=0 则返回空）。
 ///
 /// # 参数 / Parameters
@@ -52,17 +54,17 @@ pub fn organize_desktop(
             continue;
         }
 
-        // 解析 WindowURI / Parse WindowURI
-        let (priority, fullscreen) = match WindowURI::new(&window.resource.uri) {
-            Ok(uri) => (
-                uri.priority().unwrap_or(0),
-                uri.fullscreen().unwrap_or(false),
-            ),
-            Err(_) => {
-                // 解析失败的资源，跳过 / Skip resources that failed to parse
-                continue;
-            }
-        };
+        // URI 仅作合法性守卫（必须是 window:// scheme）；元数据不再来自 query。
+        // URI is only a scheme guard (must be window://); metadata no longer comes from query.
+        if !is_window_uri(&window.resource.uri) {
+            continue;
+        }
+
+        // v0.2 元数据下沉：priority ← Resource.annotations.priority（f32[0,1]，缺省 0.0）；
+        // fullscreen ← Resource._meta.fullscreen（缺省 false）。audience 仅 WARN 校验，不过滤。
+        check_audience(&window.resource);
+        let priority = read_priority(&window.resource);
+        let fullscreen = read_fullscreen(&window.resource);
 
         let item = WindowItem {
             resource: window.resource,
@@ -96,9 +98,14 @@ pub fn organize_desktop(
 
     let server_order: Vec<ServerName> = recent_servers.into_iter().chain(remaining).collect();
 
-    // 3) 每个服务器内按 priority 降序排序
+    // 3) 每个服务器内按 priority 降序排序（f32 非 Ord：partial_cmp 降序；
+    //    NaN 已在 read_priority 归一为 0.0，不会出现）。
     for items in grouped.values_mut() {
-        items.sort_by_key(|b| std::cmp::Reverse(b.priority));
+        items.sort_by(|a, b| {
+            b.priority
+                .partial_cmp(&a.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     // 4) 组装按服务器顺序的窗口列表，处理 fullscreen 规则
@@ -146,7 +153,8 @@ pub fn organize_desktop(
 struct WindowItem {
     resource: Resource,
     read_result: ReadResourceResult,
-    priority: i32,
+    /// 布局优先级 / layout priority（`Resource.annotations.priority`，f32[0,1]，缺省 0.0）。
+    priority: f32,
     fullscreen: bool,
     original_index: usize,
 }
@@ -177,6 +185,11 @@ mod tests {
     use super::*;
     use crate::mcp_clients::model::{make_resource, ResourceContents};
 
+    /// 构造测试窗口 / Build a test window。
+    ///
+    /// v0.2 元数据下沉：`priority` / `fullscreen` 写入 `Resource.annotations.priority`（归一化为
+    /// f32[0,1]）与 `_meta.fullscreen`，**不再编码进 URI query**。为保留既有用例的 0-100 直觉，
+    /// 入参仍用 `i32`（0-100），内部除以 100 归一化。
     fn create_test_window(
         server: &str,
         uri: &str,
@@ -184,28 +197,27 @@ mod tests {
         priority: i32,
         fullscreen: bool,
     ) -> WindowInfo {
-        let mut final_uri = uri.to_string();
-        let mut query: Vec<String> = Vec::new();
-        if priority != 0 {
-            query.push(format!("priority={}", priority));
-        }
+        use crate::mcp_clients::model::{Annotated, RawResource};
+        use rmcp::model::{Annotations, Meta};
+
+        let mut raw = RawResource::new(uri.to_string(), format!("Window {}", uri));
         if fullscreen {
-            query.push("fullscreen=true".to_string());
+            let mut map = serde_json::Map::new();
+            map.insert("fullscreen".to_string(), serde_json::Value::Bool(true));
+            raw.meta = Some(Meta(map));
         }
-        if !query.is_empty() {
-            final_uri.push('?');
-            final_uri.push_str(&query.join("&"));
-        }
+        let annotations = Some(Annotations {
+            audience: None,
+            priority: Some(priority as f32 / 100.0),
+            last_modified: None,
+        });
+        let resource = Annotated::new(raw, annotations);
+
         WindowInfo {
             server_name: server.to_string(),
-            resource: make_resource(
-                final_uri.clone(),
-                format!("Window {}", final_uri),
-                None,
-                None,
-            ),
+            resource,
             read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(content, final_uri.clone())],
+                contents: vec![ResourceContents::text(content, uri.to_string())],
             },
         }
     }
@@ -594,6 +606,38 @@ mod tests {
         assert!(result[1].contains("Mid"));
         assert!(result[2].contains("window://server1.mcp.com/window1"));
         assert!(result[2].contains("Min"));
+    }
+
+    #[test]
+    fn test_organize_desktop_default_priority_when_no_annotations() {
+        use crate::mcp_clients::model::{Annotated, RawResource};
+
+        // 无 annotations 的窗口：priority 视为缺省 0.0，应排在高 priority 窗口之后。
+        let raw = RawResource::new("window://server1.mcp.com/no-ann", "no-ann");
+        let bare = WindowInfo {
+            server_name: "server1".to_string(),
+            resource: Annotated::new(raw, None),
+            read_result: ReadResourceResult {
+                contents: vec![ResourceContents::text(
+                    "bare",
+                    "window://server1.mcp.com/no-ann",
+                )],
+            },
+        };
+        let high = create_test_window(
+            "server1",
+            "window://server1.mcp.com/high",
+            "high",
+            90,
+            false,
+        );
+
+        let result = organize_desktop(vec![bare, high], None, &[]);
+
+        assert_eq!(result.len(), 2);
+        // priority 0.9 在前，缺省 0.0 在后
+        assert!(result[0].contains("window://server1.mcp.com/high"));
+        assert!(result[1].contains("window://server1.mcp.com/no-ann"));
     }
 
     #[test]
