@@ -10,7 +10,7 @@
 use super::base_client::BaseMCPClient;
 use super::model::*;
 use super::{ResourceCache, SubscriptionManager};
-use crate::desktop::window_uri::{is_window_uri, WindowURI};
+use crate::desktop::window_uri::is_window_uri;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json;
@@ -418,26 +418,25 @@ impl MCPClientProtocol for HttpMCPClient {
             }
         }
 
-        // 过滤 window:// 资源并按 priority 排序 / Filter window:// resources and sort by priority
-        let mut filtered_resources: Vec<(Resource, i32)> = Vec::new();
+        // 过滤 window:// 资源并按 priority 降序排序（v0.2 元数据下沉）
+        // Filter window:// resources and sort by priority desc (v0.2 metadata sink).
+        let mut filtered_resources: Vec<(Resource, f32)> = Vec::new();
 
         for resource in all_resources {
             if !is_window_uri(&resource.uri) {
                 continue;
             }
 
-            // 解析 priority / Parse priority
-            let priority = if let Ok(uri) = WindowURI::new(&resource.uri) {
-                uri.priority().unwrap_or(0)
-            } else {
-                0
-            };
+            // priority 取自 Resource.annotations.priority（f32[0,1]，缺省 0.0），不再读 URI query。
+            // priority comes from Resource.annotations.priority (f32[0,1], default 0.0).
+            let priority = crate::desktop::metadata::read_priority(&resource);
 
             filtered_resources.push((resource, priority));
         }
 
-        // 按 priority 降序排序 / Sort by priority in descending order
-        filtered_resources.sort_by_key(|b| std::cmp::Reverse(b.1));
+        // f32 非 Ord，用 partial_cmp 降序；NaN 已在 read_priority 归一为 0.0，故不会出现。
+        filtered_resources
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 返回仅包含 Resource 的列表 / Return list containing only Resource
         Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
