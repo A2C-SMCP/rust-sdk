@@ -11,10 +11,28 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+// INT-01 #68：SKILL / blob 子系统编排 / SKILL & blob subsystem orchestration。
+use crate::blob::{
+    decode_blob_handle, default_thresholds, encode_toolspool_handle, BlobHandleError, BlobResolver,
+    BlobThresholds, BlobTooLargeError, DecodedHandle, ResolvedBlob, SkillBlobResolver,
+    SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
+};
+use crate::skills::{
+    resolve_skill_home, resolve_skill_view, stage_user_skills, user_dropin_root,
+    workdir_skill_root, AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer,
+    SkillFileWatcher, SkillRegistry, SkillResourceView, SkillSandboxError, SOURCE_USER,
+};
+use smcp::utils::env_truthy;
+use smcp::A2CSkillRef;
 
 use crate::errors::{ComputerError, ComputerResult};
 use crate::inputs::handler::InputHandler;
@@ -202,6 +220,140 @@ pub struct Computer<S: Session> {
     socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
     /// 确认回调函数 / Confirmation callback function
     confirm_callback: Option<ConfirmCallbackType>,
+
+    // ── INT-01 #68：SKILL 子系统 / SKILL subsystem ──────────────────────────
+    /// SKILL 物化索引（name → A2CSkillRef）。`tokio::RwLock`：读路径（get_skills）取读锁、
+    /// stage/reconcile 取写锁跨 await（async 守卫 `Send`，安全）/ materialized Registry。
+    skill_registry: Arc<RwLock<SkillRegistry>>,
+    /// SKILL Home 绝对根（boot_up 解析；`std::RwLock` 配置态、同步访问不跨 await）/ SKILL Home root。
+    skill_home: Arc<StdRwLock<Option<PathBuf>>>,
+    /// SKILL Home 覆盖（测试/部署注入）/ home override。
+    skill_home_override: Option<PathBuf>,
+    /// 已登记工作目录（能力发现并集：user DropIn 扫描 + watcher 跨此）/ registered workdirs。
+    registered_workdirs: Arc<StdRwLock<Vec<PathBuf>>>,
+    /// 多源 SKILL 变更去抖器（标脏 → 窗口合并 → invalidate 重扫 + 单次 emit）；`Arc` 供 watcher 线程共享。
+    skill_debouncer: Arc<SkillEventDebouncer>,
+    /// user 源 DropIn 文件 watcher（boot 启、shutdown 停）/ file watcher。
+    skill_watcher: Arc<Mutex<Option<SkillFileWatcher>>>,
+    /// 原生 Observer 不支持的 FS 切 polling 兜底 / polling fallback flag。
+    skill_watch_polling: bool,
+
+    // ── INT-01 #68：通用二进制传输 / generic blob transfer ───────────────────
+    /// `.blobspool` 缓存根覆盖（缺省 `~/.a2c`）；boot 时建 store / blob cache root override。
+    blob_cache_root_override: Option<PathBuf>,
+    /// SKILL / blob 阈值（inline / too_large / chunk_max）/ thresholds。
+    blob_thresholds: BlobThresholds,
+    /// 内容寻址暂存（boot 时建；mint 时写入）/ toolspool store (built at boot)。
+    toolspool_store: Arc<RwLock<Option<Arc<ToolspoolBlobStore>>>>,
+    /// kind → resolver 派发表（boot 时装配 toolspool；skill 由 resolve_blob async 处理）/ resolver table。
+    blob_resolvers: Arc<RwLock<HashMap<String, Arc<dyn BlobResolver>>>>,
+}
+
+/// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
+/// `mark_orphan`（消失即从 `get_skills` 排除；恢复由 staging 的 `register_or_update` 命中孤儿自动完成）。
+/// 自由函数——供去抖器 `invalidate` 回调（无 `self`）与 [`Computer`] 方法共用 / shared free fn (no `self`)。
+fn reconcile_orphans_in(
+    registry: &mut SkillRegistry,
+    present: &HashSet<String>,
+    source_pred: impl Fn(&str) -> bool,
+) {
+    let to_orphan: Vec<String> = registry
+        .active_refs()
+        .into_iter()
+        .filter(|r| !r.name.is_empty() && !present.contains(&r.name) && source_pred(&r.source))
+        .map(|r| r.name)
+        .collect();
+    for name in to_orphan {
+        registry.mark_orphan(&name);
+    }
+}
+
+/// 构造 SKILL 去抖器（回调捕获共享 `Arc` 句柄克隆，非 `Computer` 本体——杜绝强引用环）/ Build the debouncer。
+///
+/// `on_emit` → 读 Socket.IO 客户端发 `server:update_skills`；`invalidate` → 重扫 user 源 DropIn + 对账孤儿。
+/// `new()` 与 `Clone` 共用（`SkillEventDebouncer` 非 `Clone`，clone 时按相同共享句柄重建）。
+fn build_skill_debouncer(
+    skill_registry: &Arc<RwLock<SkillRegistry>>,
+    skill_home: &Arc<StdRwLock<Option<PathBuf>>>,
+    registered_workdirs: &Arc<StdRwLock<Vec<PathBuf>>>,
+    socketio_client: &Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+) -> SkillEventDebouncer {
+    let emit_client = socketio_client.clone();
+    let on_emit: AsyncCallback = Arc::new(
+        move || -> Pin<Box<dyn Future<Output = CallbackResult> + Send>> {
+            let client_ref = emit_client.clone();
+            Box::pin(async move {
+                let guard = client_ref.read().await;
+                if let Some(client) = guard.as_ref() {
+                    if let Err(e) = client.emit_update_skills().await {
+                        debug!(error = %e, "emit_update_skills failed, skipped");
+                    }
+                }
+                Ok(())
+            })
+        },
+    );
+
+    let inv_registry = skill_registry.clone();
+    let inv_home = skill_home.clone();
+    let inv_workdirs = registered_workdirs.clone();
+    let invalidate: AsyncCallback = Arc::new(
+        move || -> Pin<Box<dyn Future<Output = CallbackResult> + Send>> {
+            let registry = inv_registry.clone();
+            let home_cell = inv_home.clone();
+            let workdirs_cell = inv_workdirs.clone();
+            Box::pin(async move {
+                let home = home_cell.read().expect("skill_home poisoned").clone();
+                let Some(home) = home else {
+                    return Ok(());
+                };
+                let workdirs = workdirs_cell.read().expect("workdirs poisoned").clone();
+                let mut reg = registry.write().await;
+                let discovered: HashSet<String> = stage_user_skills(&mut reg, &home, &workdirs)
+                    .into_iter()
+                    .collect();
+                reconcile_orphans_in(&mut reg, &discovered, |s| s == SOURCE_USER);
+                Ok(())
+            })
+        },
+    );
+
+    SkillEventDebouncer::builder(on_emit)
+        .invalidate(invalidate)
+        .build()
+}
+
+/// `mint_toolspool_handle` 失败 / toolspool mint failure。
+#[derive(Debug, thiserror::Error)]
+pub enum BlobMintError {
+    /// 超 `too_large_cap` —— 拒绝铸造、**不写盘**（DoS 防御，blob-transfer §3）/ too large, no write。
+    #[error(transparent)]
+    TooLarge(#[from] BlobTooLargeError),
+    /// blob 子系统未初始化（须先 `boot_up`）/ subsystem not initialized。
+    #[error("blob subsystem not initialized (call boot_up first)")]
+    NotBooted,
+    /// toolspool 写盘失败 / store write failed。
+    #[error("toolspool store error: {0}")]
+    Store(String),
+}
+
+/// 默认 blob 缓存根 `~/.a2c`（`.blobspool/` 挂其下）/ default blob cache root (`~/.a2c`)。
+fn default_blob_cache_root() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".a2c")
+}
+
+/// 一次性根 lookup（把 sync [`SkillRootLookup`] 适配到 async 锁的 registry：[`Computer::resolve_blob`] 先
+/// async 解析 skill 根再注入此 lookup）/ A one-shot root lookup adapting the sync trait to the locked registry。
+struct PreresolvedRoot(Option<PathBuf>);
+
+impl SkillRootLookup for PreresolvedRoot {
+    fn lookup_root(&self, _name: &str) -> Option<PathBuf> {
+        self.0.clone()
+    }
 }
 
 impl<S: Session> Computer<S> {
@@ -218,6 +370,23 @@ impl<S: Session> Computer<S> {
         let inputs = inputs.unwrap_or_default();
         let mcp_servers = mcp_servers.unwrap_or_default();
 
+        // 共享 Arc 句柄先建，供去抖器回调捕获（避免 Computer ↔ debouncer 强引用环）。
+        // Pre-create shared handles so debouncer callbacks capture clones, not Computer itself.
+        let skill_registry: Arc<RwLock<SkillRegistry>> =
+            Arc::new(RwLock::new(SkillRegistry::new()));
+        let skill_home: Arc<StdRwLock<Option<PathBuf>>> = Arc::new(StdRwLock::new(None));
+        let registered_workdirs: Arc<StdRwLock<Vec<PathBuf>>> =
+            Arc::new(StdRwLock::new(Vec::new()));
+        let socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>> =
+            Arc::new(RwLock::new(None));
+
+        let skill_debouncer = Arc::new(build_skill_debouncer(
+            &skill_registry,
+            &skill_home,
+            &registered_workdirs,
+            &socketio_client,
+        ));
+
         Self {
             name,
             mcp_manager: Arc::new(RwLock::new(None)),
@@ -228,9 +397,253 @@ impl<S: Session> Computer<S> {
             auto_reconnect,
             tool_history: Arc::new(Mutex::new(Vec::new())),
             session,
-            socketio_client: Arc::new(RwLock::new(None)),
+            socketio_client,
             confirm_callback: None,
+            skill_registry,
+            skill_home,
+            skill_home_override: None,
+            registered_workdirs,
+            skill_debouncer,
+            skill_watcher: Arc::new(Mutex::new(None)),
+            skill_watch_polling: env_truthy("A2C_SKILL_WATCH_POLLING"),
+            blob_cache_root_override: None,
+            blob_thresholds: default_thresholds(),
+            toolspool_store: Arc::new(RwLock::new(None)),
+            blob_resolvers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// 注入 SKILL Home 覆盖（测试/部署）/ Inject a SKILL Home override。
+    #[must_use]
+    pub fn with_skill_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.skill_home_override = Some(home.into());
+        self
+    }
+
+    /// 注入已登记工作目录（能力发现并集 + watcher 监控根）/ Inject registered workdirs。
+    #[must_use]
+    pub fn with_registered_workdirs(self, workdirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        *self.registered_workdirs.write().expect("workdirs poisoned") =
+            workdirs.into_iter().collect();
+        self
+    }
+
+    /// 注入 blob 缓存根覆盖（缺省 `~/.a2c`）/ Inject a blob cache-root override。
+    #[must_use]
+    pub fn with_blob_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.blob_cache_root_override = Some(root.into());
+        self
+    }
+
+    /// 注入 blob 阈值（inline / too_large / chunk_max）/ Inject blob thresholds。
+    #[must_use]
+    pub fn with_blob_thresholds(mut self, thresholds: BlobThresholds) -> Self {
+        self.blob_thresholds = thresholds;
+        self
+    }
+
+    // ── INT-01 #68：SKILL Home 解析 / SKILL Home resolution ──────────────────
+    /// 解析并缓存 SKILL Home（override > env 链）/ Resolve & cache the SKILL Home root。
+    fn ensure_skill_home(&self) -> PathBuf {
+        {
+            let guard = self.skill_home.read().expect("skill_home poisoned");
+            if let Some(home) = guard.as_ref() {
+                return home.clone();
+            }
+        }
+        let resolved = self
+            .skill_home_override
+            .clone()
+            .unwrap_or_else(|| resolve_skill_home(None));
+        *self.skill_home.write().expect("skill_home poisoned") = Some(resolved.clone());
+        resolved
+    }
+
+    // ── SKILL 通道委托 / SKILL channel delegation（#68，skill.md §9）────────────
+    /// 当前活跃 SKILL（排除孤儿；不排序/不去重）—— `client:get_skills` 数据源 / active skills。
+    pub async fn get_skills(&self) -> Vec<A2CSkillRef> {
+        self.skill_registry.read().await.active_refs()
+    }
+
+    /// O(1) 活跃精确解析 `name` → [`A2CSkillRef`]（孤儿/未注册 → `None`；handler 据此回 4014）/ resolve one。
+    pub async fn get_skill_ref(&self, name: &str) -> Option<A2CSkillRef> {
+        self.skill_registry.read().await.resolve(name)
+    }
+
+    /// 沙箱解析 SKILL 包内资源 → 消费字节视图（§9.2 包根**仅**取自 `ref.path`；带 too_large 守卫）/ read resource。
+    ///
+    /// # Errors
+    /// 沙箱拒绝（traversal/forbidden/not_found）或 too_large → [`SkillSandboxError`]（handler 映射 4017）。
+    pub fn read_skill_resource(
+        &self,
+        skill_ref: &A2CSkillRef,
+        rel_path: Option<&str>,
+    ) -> Result<SkillResourceView, SkillSandboxError> {
+        let root = std::path::Path::new(&skill_ref.path);
+        resolve_skill_view(root, rel_path, Some(self.blob_thresholds.too_large_cap))
+    }
+
+    /// 标记 SKILL 集合变更 → 去抖器窗口合并触发单次 `emit_update_skills`（CLI marketplace 变更后调）/ mark dirty。
+    pub fn mark_skills_dirty(&self) {
+        self.skill_debouncer.mark_dirty();
+    }
+
+    /// SKILL Home 绝对根（CLI marketplace/skill 命令经此取物化根）/ the SKILL Home root。
+    pub fn skill_home(&self) -> PathBuf {
+        self.ensure_skill_home()
+    }
+
+    /// 绑定当前任务的 active-workdir 单根（首个登记 workdir；空闲 = `None`）/ the active workdir。
+    pub fn active_workdir(&self) -> Option<PathBuf> {
+        self.registered_workdirs
+            .read()
+            .expect("workdirs poisoned")
+            .first()
+            .cloned()
+    }
+
+    // ── 通用二进制传输 / generic blob transfer（#68，blob-transfer.md §3/§5）─────
+    /// blob 阈值（inline / too_large / chunk_max）/ the threshold bundle。
+    #[must_use]
+    pub fn blob_thresholds(&self) -> BlobThresholds {
+        self.blob_thresholds
+    }
+
+    /// 铸造 `kind=toolspool` 不透明句柄并写盘 / Mint an opaque toolspool handle。
+    ///
+    /// `tool_call` 超内联预算二进制经此写入 `.blobspool`，返回句柄走 `_meta.a2c_blob_handle` 旁路。
+    /// `len > too_large_cap` → 拒绝、**不写盘**（铸造期 DoS 防御，§3）。
+    ///
+    /// # Errors
+    /// [`BlobMintError`]：too_large / 未 boot / 写盘失败。
+    pub async fn mint_toolspool_handle(
+        &self,
+        payload: &[u8],
+        mime: &str,
+    ) -> Result<String, BlobMintError> {
+        let size = payload.len() as u64;
+        let cap = self.blob_thresholds.too_large_cap;
+        if size > cap {
+            return Err(BlobTooLargeError { size, cap }.into());
+        }
+        let store = self
+            .toolspool_store
+            .read()
+            .await
+            .clone()
+            .ok_or(BlobMintError::NotBooted)?;
+        let cid = store
+            .put(payload, mime)
+            .map_err(|e| BlobMintError::Store(e.to_string()))?;
+        Ok(encode_toolspool_handle(&cid, mime))
+    }
+
+    /// 解码 blob 句柄 → 按 kind 路由解析 / decode → route by kind → resolve。
+    ///
+    /// `toolspool` → 注册表内 resolver（同步）；`skill` → async 读 registry 取根再跑沙箱（适配 BLB-02 的
+    /// **同步** [`SkillRootLookup`] 到 async 锁的 registry）。
+    ///
+    /// # Errors
+    /// 句柄非法 / 不可访问 → [`BlobHandleError`]（handler 映射 flat 4018）。
+    pub async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError> {
+        let decoded = decode_blob_handle(handle)?;
+        match &decoded {
+            DecodedHandle::Toolspool(_) => {
+                let resolvers = self.blob_resolvers.read().await;
+                let resolver = resolvers.get("toolspool").ok_or_else(|| {
+                    BlobHandleError::Gone(
+                        "toolspool resolver not initialized (call boot_up first)".into(),
+                    )
+                })?;
+                resolver.resolve(&decoded)
+            }
+            DecodedHandle::Skill(payload) => {
+                let root = self
+                    .skill_registry
+                    .read()
+                    .await
+                    .resolve(&payload.name)
+                    .map(|r| PathBuf::from(r.path));
+                SkillBlobResolver::new(PreresolvedRoot(root)).resolve(&decoded)
+            }
+        }
+    }
+
+    // ── 编排链：去抖结算 + user 源 watcher（#68，设计 §8）─────────────────────
+    /// 全量重扫/重物化后的孤儿对账（限定单一源谓词）/ reconcile orphans after a full rescan。
+    pub async fn reconcile_orphans(
+        &self,
+        present_names: HashSet<String>,
+        source_pred: impl Fn(&str) -> bool,
+    ) {
+        let mut reg = self.skill_registry.write().await;
+        reconcile_orphans_in(&mut reg, &present_names, source_pred);
+    }
+
+    /// 缓存失效：就地重扫 user 源 DropIn + 对账孤儿（SKILL Home 未就绪 → no-op）/ rescan user-source。
+    pub async fn invalidate_user_skills(&self) {
+        let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
+            return;
+        };
+        let workdirs = self
+            .registered_workdirs
+            .read()
+            .expect("workdirs poisoned")
+            .clone();
+        let mut reg = self.skill_registry.write().await;
+        let discovered: HashSet<String> = stage_user_skills(&mut reg, &home, &workdirs)
+            .into_iter()
+            .collect();
+        reconcile_orphans_in(&mut reg, &discovered, |s| s == SOURCE_USER);
+    }
+
+    /// 去抖器结算末端：推送 `server:update_skills`（无 client / 未入房间 → no-op）/ emit now。
+    pub async fn emit_update_skills_now(&self) {
+        let guard = self.socketio_client.read().await;
+        if let Some(client) = guard.as_ref() {
+            if let Err(e) = client.emit_update_skills().await {
+                debug!(error = %e, "emit_update_skills failed, skipped");
+            }
+        }
+    }
+
+    /// 给 SKILL 文件 watcher 打内部写标记（避免自写触发重载循环）/ mark an internal write。
+    pub async fn mark_skill_internal_write(&self, path: impl AsRef<std::path::Path>) {
+        let guard = self.skill_watcher.lock().await;
+        if let Some(watcher) = guard.as_ref() {
+            watcher.mark_internal_write(path);
+        }
+    }
+
+    /// 启动 user 源 DropIn 文件 watcher（监控 `<home>/user/` + 各登记 `<workdir>/.tfrobot/skills/`）/ start watcher。
+    ///
+    /// watcher 回调在独立线程触发 → 直接调去抖器 `mark_dirty`（`Send + Sync`、内部锁，线程安全）。已有 watcher
+    /// → 先停。SKILL Home 未就绪 → no-op。
+    async fn start_skill_watcher(&self) {
+        let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
+            return;
+        };
+        let workdirs = self
+            .registered_workdirs
+            .read()
+            .expect("workdirs poisoned")
+            .clone();
+        let debouncer = Arc::clone(&self.skill_debouncer);
+        let on_change: OnChange = Arc::new(move || debouncer.mark_dirty());
+        let mut watcher = SkillFileWatcher::builder(on_change)
+            .use_polling(self.skill_watch_polling)
+            .build();
+        let mut roots: Vec<PathBuf> = vec![user_dropin_root(&home)];
+        roots.extend(workdirs.iter().map(|wd| workdir_skill_root(wd)));
+        if let Err(e) = watcher.watch(roots) {
+            warn!(error = %e, "SKILL file watcher start failed, skipped");
+            return;
+        }
+        let mut guard = self.skill_watcher.lock().await;
+        if let Some(old) = guard.as_mut() {
+            old.stop();
+        }
+        *guard = Some(watcher);
     }
 
     /// 设置确认回调函数 / Set confirmation callback function
@@ -285,6 +698,31 @@ impl<S: Session> Computer<S> {
 
         // 设置管理器到实例 / Set manager to instance
         *self.mcp_manager.write().await = Some(manager);
+
+        // ── INT-01 #68：SKILL / blob 子系统装配 / SKILL & blob subsystem wiring ──
+        // blob：建内容寻址暂存 + 装配 resolver 表（toolspool 完整；skill 由 resolve_blob async 处理）。
+        let cache_root = self
+            .blob_cache_root_override
+            .clone()
+            .unwrap_or_else(default_blob_cache_root);
+        let toolspool_store = Arc::new(ToolspoolBlobStore::new(&cache_root).map_err(|e| {
+            ComputerError::InvalidState(format!("toolspool store init failed: {e}"))
+        })?);
+        {
+            let mut resolvers = self.blob_resolvers.write().await;
+            resolvers.insert(
+                "toolspool".to_string(),
+                Arc::new(ToolspoolBlobResolver::new(Arc::clone(&toolspool_store)))
+                    as Arc<dyn BlobResolver>,
+            );
+        }
+        *self.toolspool_store.write().await = Some(toolspool_store);
+
+        // SKILL：解析 Home + 初次全量发现 user 源（= invalidate_user_skills，对标 Python boot_up）+ 启 watcher。
+        // mcp 源重物化（_restage_mcp_skills）归 INT-04 #74；marketplace 源 reconcile 归 #60/#61（非 boot）。
+        self.ensure_skill_home();
+        self.invalidate_user_skills().await;
+        self.start_skill_watcher().await;
 
         info!("Computer {} started successfully", self.name);
         Ok(())
@@ -919,6 +1357,15 @@ impl<S: Session> Computer<S> {
     pub async fn shutdown(&self) -> ComputerResult<()> {
         info!("Shutting down Computer: {}", self.name);
 
+        // INT-01 #68：停 SKILL watcher + 关去抖器（防停机竞态遗留任务）/ stop watcher + close debouncer。
+        {
+            let mut guard = self.skill_watcher.lock().await;
+            if let Some(mut watcher) = guard.take() {
+                watcher.stop();
+            }
+        }
+        self.skill_debouncer.aclose().await;
+
         let mut manager_guard = self.mcp_manager.write().await;
         if let Some(manager) = manager_guard.take() {
             manager.stop_all().await?;
@@ -950,6 +1397,23 @@ impl<S: Session + Clone> Clone for Computer<S> {
             session: self.session.clone(),
             socketio_client: Arc::clone(&self.socketio_client),
             confirm_callback: self.confirm_callback.clone(),
+            // SKILL/blob 子系统：共享同一组 Arc 句柄；去抖器按相同句柄重建（非 Clone）。
+            skill_registry: Arc::clone(&self.skill_registry),
+            skill_home: Arc::clone(&self.skill_home),
+            skill_home_override: self.skill_home_override.clone(),
+            registered_workdirs: Arc::clone(&self.registered_workdirs),
+            skill_debouncer: Arc::new(build_skill_debouncer(
+                &self.skill_registry,
+                &self.skill_home,
+                &self.registered_workdirs,
+                &self.socketio_client,
+            )),
+            skill_watcher: Arc::clone(&self.skill_watcher),
+            skill_watch_polling: self.skill_watch_polling,
+            blob_cache_root_override: self.blob_cache_root_override.clone(),
+            blob_thresholds: self.blob_thresholds,
+            toolspool_store: Arc::clone(&self.toolspool_store),
+            blob_resolvers: Arc::clone(&self.blob_resolvers),
         }
     }
 }
@@ -1014,6 +1478,116 @@ mod tests {
         assert_eq!(computer.name, "test_computer");
         assert!(computer.auto_connect);
         assert!(computer.auto_reconnect);
+    }
+
+    // ── INT-01 #68：SKILL / blob 编排集成测试 ────────────────────────────────
+    /// 建一个带 user 源 skill 的 Computer（隔离 skill_home + blob 缓存）/ build a Computer with one user skill。
+    fn write_user_skill(home: &std::path::Path, name: &str, description: &str) {
+        let dir = home.join("user").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\ndescription: {description}\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn skill_api_after_boot_user_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        write_user_skill(&home, "my-helper", "helps");
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        // get_skills / get_skill_ref。
+        let skills = computer.get_skills().await;
+        assert_eq!(skills.len(), 1);
+        let name = skills[0].name.clone();
+        let r = computer.get_skill_ref(&name).await.unwrap();
+        assert_eq!(r.description, "helps");
+        assert!(computer.get_skill_ref("does-not-exist").await.is_none());
+        // read_skill_resource：SKILL.md frontmatter 剥离 → "body"。
+        let view = computer.read_skill_resource(&r, None).unwrap();
+        let bytes = view.slice(0, view.total_size).unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), "body");
+        // skill_home 访问器。
+        assert_eq!(computer.skill_home(), home);
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mint_and_resolve_toolspool_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        let payload = b"hello blob payload";
+        let handle = computer
+            .mint_toolspool_handle(payload, "text/plain")
+            .await
+            .unwrap();
+        let resolved = computer.resolve_blob(&handle).await.unwrap();
+        assert_eq!(resolved.total_size, payload.len() as u64);
+        let bytes = resolved.slice(0, resolved.total_size).unwrap();
+        assert_eq!(bytes, payload);
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mint_too_large_rejected_no_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_blob_thresholds(BlobThresholds {
+                inline_budget: 8,
+                too_large_cap: 4,
+                chunk_max_bytes: 8,
+            });
+        computer.boot_up().await.unwrap();
+        let err = computer
+            .mint_toolspool_handle(b"way too large", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobMintError::TooLarge(_)));
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidate_reconciles_user_orphans() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        write_user_skill(&home, "temp-skill", "tmp");
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob"));
+        computer.boot_up().await.unwrap();
+        assert_eq!(computer.get_skills().await.len(), 1);
+
+        // 删 skill 目录 → invalidate 重扫 → 孤儿排除（从 get_skills 消失）。
+        std::fs::remove_dir_all(home.join("user").join("temp-skill")).unwrap();
+        computer.invalidate_user_skills().await;
+        assert_eq!(computer.get_skills().await.len(), 0);
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_workdir_and_mark_dirty_no_panic() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_registered_workdirs([wd.clone()]);
+        assert_eq!(computer.active_workdir(), Some(wd));
+        // 去抖器存在 → mark_skills_dirty 不 panic（无 client → 结算 no-op）。
+        computer.mark_skills_dirty();
     }
 
     #[tokio::test]

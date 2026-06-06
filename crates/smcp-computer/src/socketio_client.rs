@@ -18,7 +18,7 @@ use smcp::{
     events::{
         CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_TOOLS, CLIENT_TOOL_CALL,
         SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG, SERVER_UPDATE_DESKTOP,
-        SERVER_UPDATE_TOOL_LIST,
+        SERVER_UPDATE_SKILLS, SERVER_UPDATE_TOOL_LIST,
     },
     GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetToolsReq,
     GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
@@ -555,6 +555,20 @@ impl SmcpComputerClient {
             });
             self.emit(SERVER_UPDATE_TOOL_LIST, req_data).await?;
             info!("Emitted tool list update notification");
+        }
+        Ok(())
+    }
+
+    /// 发送 SKILL 集合更新通知（`server:update_skills` → Server 广播 `notify:update_skills`，SRV-02 #50）
+    /// Emit SKILL-set update notification (INT-01 #68; handler/broadcast refined by SRV-02/#72)
+    pub async fn emit_update_skills(&self) -> ComputerResult<()> {
+        let office_id = self.office_id.read().await;
+        if office_id.is_some() {
+            let req_data = serde_json::json!({
+                "computer": self.computer_name
+            });
+            self.emit(SERVER_UPDATE_SKILLS, req_data).await?;
+            info!("Emitted SKILL update notification");
         }
         Ok(())
     }
