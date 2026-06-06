@@ -45,6 +45,7 @@ pub async fn create_test_computer_with_servers() -> Computer<SilentSession> {
     servers.insert(
         "test_server".to_string(),
         MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],

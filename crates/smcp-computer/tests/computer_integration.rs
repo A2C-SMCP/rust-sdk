@@ -144,6 +144,7 @@ async fn test_computer_server_lifecycle() {
 
     // 添加服务器 / Add server
     let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: "test_server".to_string(),
         disabled: false,
         forbidden_tools: vec![],
@@ -269,6 +270,7 @@ async fn test_computer_multiple_servers() {
 
     // 添加多个服务器 / Add multiple servers
     let server1 = MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: "server1".to_string(),
         disabled: false,
         forbidden_tools: vec![],
@@ -284,6 +286,7 @@ async fn test_computer_multiple_servers() {
     });
 
     let server2 = MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: "server2".to_string(),
         disabled: false,
         forbidden_tools: vec!["dangerous_tool".to_string()],
@@ -303,6 +306,7 @@ async fn test_computer_multiple_servers() {
 
     // 更新服务器配置 / Update server configuration
     let updated_server1 = MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: "server1".to_string(),
         disabled: true, // 禁用服务器 / Disable server
         forbidden_tools: vec![],

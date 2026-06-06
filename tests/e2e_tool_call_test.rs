@@ -40,6 +40,7 @@ async fn test_tool_call_with_echo_server() {
 
     let echo_config =
         MCPServerConfig::Stdio(smcp_computer::mcp_clients::model::StdioServerConfig {
+            env_file: None,
             name: "echo_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],

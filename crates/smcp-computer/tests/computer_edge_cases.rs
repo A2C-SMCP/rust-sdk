@@ -154,6 +154,7 @@ async fn test_computer_edge_case_servers() {
 
     // 测试空服务器名称 / Test empty server name
     let empty_server = MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: "".to_string(),
         disabled: false,
         forbidden_tools: vec![],
@@ -175,6 +176,7 @@ async fn test_computer_edge_case_servers() {
     // 测试超长服务器名称 / Test very long server name
     let long_name = "a".repeat(10000);
     let long_server = MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: long_name.clone(),
         disabled: false,
         forbidden_tools: vec![],
@@ -195,6 +197,7 @@ async fn test_computer_edge_case_servers() {
     // 测试特殊字符服务器名称 / Test special character server name
     let special_name = "!@#$%^&*()".to_string();
     let special_server = MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: special_name.clone(),
         disabled: false,
         forbidden_tools: vec![],

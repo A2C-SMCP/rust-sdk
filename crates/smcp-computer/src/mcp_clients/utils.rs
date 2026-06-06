@@ -32,6 +32,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_factory_stdio() {
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_stdio".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -53,6 +54,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_factory_http() {
         let config = MCPServerConfig::Http(HttpServerConfig {
+            env_file: None,
             name: "test_http".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -72,6 +74,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_factory_sse() {
         let config = MCPServerConfig::Sse(SseServerConfig {
+            env_file: None,
             name: "test_sse".to_string(),
             disabled: false,
             forbidden_tools: vec![],

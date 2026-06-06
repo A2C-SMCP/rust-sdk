@@ -150,6 +150,7 @@ async fn test_vrl_integration_with_manager() {
     "#;
 
     let config = StdioServerConfig {
+        env_file: None,
         name: "vrl_test_server".to_string(),
         disabled: false,
         forbidden_tools: vec![],
@@ -200,6 +201,7 @@ async fn test_vrl_multiple_server_configs() {
 
     let configs = vec![
         MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "server1".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -214,6 +216,7 @@ async fn test_vrl_multiple_server_configs() {
             },
         }),
         MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "server2".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -425,6 +428,7 @@ async fn test_auto_reconnect_semantics() {
 
     // 创建初始配置
     let config1 = StdioServerConfig {
+        env_file: None,
         name: "test".to_string(),
         disabled: false,
         forbidden_tools: vec![],

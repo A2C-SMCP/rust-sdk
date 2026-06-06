@@ -1616,6 +1616,7 @@ mod tests {
         servers.insert(
             "server1".to_string(),
             MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: "server1".to_string(),
                 disabled: false,
                 forbidden_tools: vec![],
@@ -1762,6 +1763,7 @@ mod tests {
 
         // 添加服务器配置 / Add server configuration
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1784,6 +1786,7 @@ mod tests {
         // 注意：由于MCPServerManager是私有的，我们通过添加重复的服务器来测试更新
         // Note: Since MCPServerManager is private, we test updates by adding duplicate servers
         let updated_config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: true, // 更新为禁用状态 / Update to disabled state
             forbidden_tools: vec!["tool1".to_string()],
@@ -2165,6 +2168,7 @@ mod tests {
 
         // 创建带有占位符的服务器配置 / Create server config with placeholders
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -2206,6 +2210,7 @@ mod tests {
 
         // 创建带有不存在输入的配置 / Create config with non-existent input
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],

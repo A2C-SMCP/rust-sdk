@@ -11,12 +11,20 @@ use super::model::*;
 use super::utils::client_factory;
 use super::vrl_runtime::VrlRuntime;
 use crate::errors::ComputerError;
+use crate::skills::{McpResource, SkillResourceManager, SkillStagingError};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Arc as StdArc;
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// `list_skill_resources` 单 server 翻页上限（防御非终止 cursor）/ per-server page cap for
+/// `list_skill_resources` (guards a non-terminating cursor)。对标 Python `_MAX_SKILL_LIST_PAGES`。
+const MAX_SKILL_LIST_PAGES: usize = 1000;
+
+/// SKILL 资源 URI scheme 前缀 / SKILL resource URI scheme prefix。
+const SKILL_URI_PREFIX: &str = "skill://";
 
 /// 工具名称重复错误 / Tool name duplication error
 #[derive(Debug, thiserror::Error)]
@@ -814,6 +822,67 @@ impl MCPServerManager {
         results
     }
 
+    /// 枚举活跃 MCP Server 的 `skill://` 资源（附 server 归属），**完整消费 cursor 翻页直至末尾**。
+    /// Enumerate `skill://` resources from active MCP servers (with owning server), exhausting cursor pages。
+    ///
+    /// 与 [`list_resources_page`](MCPClientProtocol::list_resources_page)（单页、Agent 控制翻页）不同：
+    /// SKILL 物化由 Computer 主导，须拿到**全量** `skill://` 集合，故在此完整消费翻页（协议 skill.md §12）。
+    /// 未声明 `resources` 能力或枚举出错的 server **跳过**（记 ERROR、不中断其余），对齐「SKILL 通道不使用
+    /// 4015——无 resources 能力的 server 在物化阶段即被排除」（skill.md §1.5）。
+    /// Unlike `list_resources_page` (single-page, Agent-driven): Computer-driven SKILL materialization needs
+    /// the full `skill://` set, so pages are exhausted here. Servers lacking `resources` or erroring are skipped.
+    ///
+    /// `server_name` 给定则仅枚举该 server（用于 ResourceListChanged 单 server 重枚举）。
+    pub async fn list_skill_resources(
+        &self,
+        server_name: Option<&str>,
+    ) -> Vec<(ServerName, Resource)> {
+        let clients: Vec<(String, StdArc<dyn MCPClientProtocol>)> = {
+            let guard = self.active_clients.read().await;
+            guard
+                .iter()
+                .filter(|(k, _)| server_name.is_none() || server_name == Some(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let mut results = Vec::new();
+        for (sname, client) in clients {
+            let mut cursor: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                match client.list_resources_page(cursor.clone()).await {
+                    Ok((page, next)) => {
+                        for resource in page {
+                            if resource.uri.starts_with(SKILL_URI_PREFIX) {
+                                results.push((sname.clone(), resource));
+                            }
+                        }
+                        pages += 1;
+                        match next {
+                            Some(c) => cursor = Some(c),
+                            None => break,
+                        }
+                        if pages >= MAX_SKILL_LIST_PAGES {
+                            error!(
+                                "list_skill_resources: server '{}' exceeded {} pages \
+                                 (non-terminating cursor?); aborting enumeration for this server",
+                                sname, MAX_SKILL_LIST_PAGES
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // 未声明 resources 能力 / 连接异常 / 翻页失败 → 跳过该 server，不阻断其余。
+                        error!("Error listing skill resources for '{}': {}", sname, e);
+                        break;
+                    }
+                }
+            }
+        }
+        results
+    }
+
     /// 获取所有窗口资源的详情 / Get details of all window resources
     /// 复用 list_all_windows 聚合窗口列表，再逐个获取内容
     /// Reuses list_all_windows to aggregate window list, then fetches each detail
@@ -1135,6 +1204,64 @@ impl MCPServerManager {
     }
 }
 
+/// SKILL staging 接缝实现（#74 INT-04）：把 manager 的 rmcp-typed 枚举/读取适配成 staging 层
+/// 解耦类型 [`McpResource`] + 字节，供 [`stage_mcp_skills`](crate::skills::stage_mcp_skills) 物化消费。
+/// The SKILL staging seam: adapts the manager's rmcp-typed enumeration/read into staging's decoupled
+/// [`McpResource`] + bytes, consumed by `stage_mcp_skills`。
+#[async_trait::async_trait]
+impl SkillResourceManager for MCPServerManager {
+    async fn list_skill_resources(
+        &self,
+        server_name: Option<&str>,
+    ) -> Result<Vec<(String, McpResource)>, SkillStagingError> {
+        let pairs = MCPServerManager::list_skill_resources(self, server_name).await;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (sname, resource) in pairs {
+            // rmcp `Resource._meta`（`Option<Meta(JsonObject)>`）→ staging 的 `Map<String, Value>`。
+            let meta = resource.meta.clone().map(|m| m.0).unwrap_or_default();
+            out.push((
+                sname,
+                McpResource {
+                    uri: resource.uri.clone(),
+                    meta,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<Vec<u8>, SkillStagingError> {
+        // 复用 manager 的通用 read（`get_window_detail` 实为通用 `resources/read`，命名沿用历史）。
+        // Reuse the manager's generic read (`get_window_detail` is a generic `resources/read`).
+        let resource = make_resource(uri, uri, None, None);
+        let result = self
+            .get_window_detail(server, resource)
+            .await
+            .map_err(|e| {
+                SkillStagingError(format!("read_resource '{uri}' from '{server}': {e}"))
+            })?;
+
+        // 拼接 content blocks → 字节：文本按 UTF-8，二进制按 base64（MCP 标准编码）解码。
+        // Concatenate content blocks → bytes: text as UTF-8, blob as standard-base64.
+        let mut bytes = Vec::new();
+        for content in result.contents {
+            match content {
+                ResourceContents::TextResourceContents { text, .. } => {
+                    bytes.extend_from_slice(text.as_bytes());
+                }
+                ResourceContents::BlobResourceContents { blob, .. } => {
+                    use base64::Engine as _;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(blob.as_bytes())
+                        .map_err(|e| SkillStagingError(format!("base64 decode '{uri}': {e}")))?;
+                    bytes.extend_from_slice(&decoded);
+                }
+            }
+        }
+        Ok(bytes)
+    }
+}
+
 impl Default for MCPServerManager {
     fn default() -> Self {
         Self::new()
@@ -1162,6 +1289,7 @@ mod tests {
         let configs = vec![
             // STDIO服务器配置 / STDIO server configuration
             MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: "test_stdio".to_string(),
                 disabled: false,
                 forbidden_tools: vec![],
@@ -1177,6 +1305,7 @@ mod tests {
             }),
             // HTTP服务器配置 / HTTP server configuration
             MCPServerConfig::Http(HttpServerConfig {
+                env_file: None,
                 name: "test_http".to_string(),
                 disabled: true, // 禁用此服务器 / Disable this server
                 forbidden_tools: vec![],
@@ -1218,6 +1347,7 @@ mod tests {
 
         // 添加服务器配置 / Add server configuration
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1247,6 +1377,7 @@ mod tests {
 
         // 添加服务器 / Add server
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1280,6 +1411,7 @@ mod tests {
         let configs = vec![
             // 第一个服务器 / First server
             MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: "server1".to_string(),
                 disabled: false,
                 forbidden_tools: vec![],
@@ -1295,6 +1427,7 @@ mod tests {
             }),
             // 第二个服务器 / Second server
             MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: "server2".to_string(),
                 disabled: false,
                 forbidden_tools: vec![],
@@ -1450,6 +1583,7 @@ mod tests {
 
         // Case 1: specific only
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1477,6 +1611,7 @@ mod tests {
 
         // Case 2: default only
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1501,6 +1636,7 @@ mod tests {
 
         // Case 3: specific + default merge (specific wins)
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1534,6 +1670,7 @@ mod tests {
 
         // Case 4: no config
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1575,5 +1712,195 @@ mod tests {
             }
             other => panic!("Expected InvalidState, got {:?}", other),
         }
+    }
+
+    // ---- #74 INT-04：list_skill_resources + SkillResourceManager 接缝 ----
+
+    /// 受控分页的假 MCP client：按 cursor 顺序返回各页，可注入失败与 read 文本。
+    /// Controllable fake MCP client paginating canned pages, with injectable failure and read text.
+    struct MockSkillClient {
+        pages: Vec<Vec<Resource>>,
+        fail: bool,
+        read_text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for MockSkillClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            if self.fail {
+                return Err(MCPClientError::ProtocolError("boom".into()));
+            }
+            let idx: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+            match self.pages.get(idx) {
+                Some(page) => {
+                    let next = if idx + 1 < self.pages.len() {
+                        Some((idx + 1).to_string())
+                    } else {
+                        None
+                    };
+                    Ok((page.clone(), next))
+                }
+                None => Ok((vec![], None)),
+            }
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(self.read_text.clone(), "skill://x")],
+            })
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 构造带 `_meta.source` 的 `skill://` 资源 / Build a `skill://` resource carrying `_meta.source`。
+    fn skill_resource(uri: &str, source: Option<&str>) -> Resource {
+        use rmcp::model::{AnnotateAble, Meta};
+        let mut raw = RawResource::new(uri, "skill");
+        if let Some(src) = source {
+            let mut m = serde_json::Map::new();
+            m.insert("source".into(), Value::String(src.to_string()));
+            m.insert("mount_dir".into(), Value::String("/tmp/mount".into()));
+            raw.meta = Some(Meta(m));
+        }
+        raw.no_annotation()
+    }
+
+    async fn inject(manager: &MCPServerManager, name: &str, client: MockSkillClient) {
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(name.to_string(), StdArc::new(client));
+    }
+
+    #[tokio::test]
+    async fn test_list_skill_resources_filters_and_exhausts_pages() {
+        let manager = MCPServerManager::new();
+        let pages = vec![
+            vec![
+                skill_resource("skill://srv/a", Some("mounted")),
+                make_resource("window://w", "w", None, None),
+            ],
+            vec![skill_resource("skill://srv/b", Some("mounted"))],
+        ];
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages,
+                fail: false,
+                read_text: "x".into(),
+            },
+        )
+        .await;
+
+        let got = manager.list_skill_resources(None).await;
+        let uris: Vec<&str> = got.iter().map(|(_, r)| r.uri.as_str()).collect();
+        // window:// 被过滤；两页都被消费 / window:// filtered out; both pages consumed.
+        assert_eq!(uris, vec!["skill://srv/a", "skill://srv/b"]);
+        assert!(got.iter().all(|(s, _)| s == "srv"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_resource_manager_trait_meta_and_read_bytes() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages: vec![vec![skill_resource("skill://srv/a", Some("mounted"))]],
+                fail: false,
+                read_text: "hello-bytes".into(),
+            },
+        )
+        .await;
+
+        // 经 SkillResourceManager trait：Resource → McpResource（提取 `_meta`）。
+        let pairs = SkillResourceManager::list_skill_resources(&manager, None)
+            .await
+            .unwrap();
+        assert_eq!(pairs.len(), 1);
+        let (sname, mcp_res) = &pairs[0];
+        assert_eq!(sname, "srv");
+        assert_eq!(mcp_res.uri, "skill://srv/a");
+        assert_eq!(
+            mcp_res.meta.get("source").and_then(|v| v.as_str()),
+            Some("mounted")
+        );
+
+        // read_resource → 字节（文本 content 拼接为 UTF-8 字节）。
+        let bytes = SkillResourceManager::read_resource(&manager, "srv", "skill://srv/a")
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"hello-bytes");
+    }
+
+    #[tokio::test]
+    async fn test_list_skill_resources_per_server_isolation_and_filter() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "bad",
+            MockSkillClient {
+                pages: vec![],
+                fail: true,
+                read_text: String::new(),
+            },
+        )
+        .await;
+        inject(
+            &manager,
+            "good",
+            MockSkillClient {
+                pages: vec![vec![skill_resource("skill://good/a", Some("mounted"))]],
+                fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+
+        // 出错 server 跳过，good 的结果仍在 / erroring server skipped, good's result remains.
+        let got = manager.list_skill_resources(None).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "good");
+        assert_eq!(got[0].1.uri, "skill://good/a");
+
+        // server_name 过滤：只枚举指定 server / server_name filter narrows enumeration.
+        let only_good = manager.list_skill_resources(Some("good")).await;
+        assert_eq!(only_good.len(), 1);
+        let none = manager.list_skill_resources(Some("missing")).await;
+        assert!(none.is_empty());
     }
 }

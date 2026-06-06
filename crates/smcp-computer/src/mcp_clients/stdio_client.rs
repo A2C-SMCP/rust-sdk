@@ -13,8 +13,8 @@ use super::{ResourceCache, SubscriptionManager};
 use crate::desktop::window_uri::{is_window_uri, WindowURI};
 use async_trait::async_trait;
 use rmcp::model::{
-    CallToolRequestParam, ClientInfo, Implementation, ReadResourceRequestParam,
-    SubscribeRequestParam, UnsubscribeRequestParam,
+    CallToolRequestParam, ClientInfo, Implementation, PaginatedRequestParam,
+    ReadResourceRequestParam, SubscribeRequestParam, UnsubscribeRequestParam,
 };
 use rmcp::service::{RunningService, ServiceExt};
 use rmcp::transport::TokioChildProcess;
@@ -336,6 +336,40 @@ impl MCPClientProtocol for StdioMCPClient {
         filtered_resources.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
+    }
+
+    async fn list_resources_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
+
+        // 能力校验：未声明 `resources` → CapabilityNotSupported（上层映射 4015）。
+        // Capability gate: no `resources` → CapabilityNotSupported (mapped to 4015 upstream).
+        let supports_resources = service
+            .peer_info()
+            .map(|info| info.capabilities.resources.is_some())
+            .unwrap_or(false);
+        if !supports_resources {
+            return Err(MCPClientError::CapabilityNotSupported(
+                "resources".to_string(),
+            ));
+        }
+
+        // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
+        // Single-page passthrough: cursor in/out, no aggregation/filter, no resourceTemplates.
+        let param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
+        let result = service
+            .list_resources(param)
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
+
+        Ok((result.resources, result.next_cursor))
     }
 
     async fn get_window_detail(

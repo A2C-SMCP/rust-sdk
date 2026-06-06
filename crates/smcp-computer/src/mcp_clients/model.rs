@@ -130,6 +130,15 @@ impl MCPServerConfig {
             MCPServerConfig::Http(config) => config.vrl.as_deref(),
         }
     }
+
+    /// 获取 VS Code 风格 envFile 路径 / Get VS Code-style envFile path
+    pub fn env_file(&self) -> Option<&str> {
+        match self {
+            MCPServerConfig::Stdio(config) => config.env_file.as_deref(),
+            MCPServerConfig::Sse(config) => config.env_file.as_deref(),
+            MCPServerConfig::Http(config) => config.env_file.as_deref(),
+        }
+    }
 }
 
 /// STDIO服务器配置 / STDIO server configuration
@@ -151,6 +160,16 @@ pub struct StdioServerConfig {
     /// VRL脚本 / VRL script
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vrl: Option<String>,
+    /// VS Code 风格 envFile：spawn 时从 `.env` 加载 `KEY=VALUE` 进 stdio server 的 `env`，显式 env 同名项
+    /// 覆盖 envFile（显式胜，§9.1）。SDK 加性字段（待协议追认），仅 Computer 本地 spawn 消费；非 stdio 忽略 + WARN。
+    /// VS Code-parity envFile: at spawn, load KEY=VALUE from .env into a stdio server's env (explicit env wins).
+    #[serde(
+        default,
+        rename = "envFile",
+        alias = "env_file",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub env_file: Option<String>,
     /// STDIO服务器参数 / STDIO server parameters
     pub server_parameters: StdioServerParameters,
 }
@@ -174,6 +193,15 @@ pub struct SseServerConfig {
     /// VRL脚本 / VRL script
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vrl: Option<String>,
+    /// VS Code 风格 envFile（仅对 stdio 生效；置于 sse 配置上 spawn 时记 WARN 并忽略，§9.1）。
+    /// VS Code-parity envFile (only effective for stdio; on sse it is ignored with a WARN at spawn).
+    #[serde(
+        default,
+        rename = "envFile",
+        alias = "env_file",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub env_file: Option<String>,
     /// SSE服务器参数 / SSE server parameters
     pub server_parameters: SseServerParameters,
 }
@@ -197,6 +225,15 @@ pub struct HttpServerConfig {
     /// VRL脚本 / VRL script
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vrl: Option<String>,
+    /// VS Code 风格 envFile（仅对 stdio 生效；置于 http 配置上 spawn 时记 WARN 并忽略，§9.1）。
+    /// VS Code-parity envFile (only effective for stdio; on http it is ignored with a WARN at spawn).
+    #[serde(
+        default,
+        rename = "envFile",
+        alias = "env_file",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub env_file: Option<String>,
     /// HTTP服务器参数 / HTTP server parameters
     pub server_parameters: HttpServerParameters,
 }
@@ -480,6 +517,19 @@ pub trait MCPClientProtocol: Send + Sync {
     /// 列出窗口资源 / List window resources
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError>;
 
+    /// 单页透传 MCP `resources/list`（v0.2 `client:get_resources`）/ Single-page passthrough of
+    /// MCP `resources/list` for the v0.2 `client:get_resources` forward path。
+    ///
+    /// 与 [`list_windows`](Self::list_windows) 严格独立：保持单页语义、不做 scheme 过滤、不订阅、不穷举翻页、
+    /// 不返回 `resourceTemplates`；`cursor` 透传（首页传 `None`）。未声明 `resources` 能力 →
+    /// [`MCPClientError::CapabilityNotSupported`]（上层映射 4015）。
+    /// Strictly independent from `list_windows`: single-page, no scheme filter, no subscription, no
+    /// pagination exhaustion, no resourceTemplates; cursor passed through (None for first page).
+    async fn list_resources_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), MCPClientError>;
+
     /// 获取窗口详情 / Get window detail
     async fn get_window_detail(
         &self,
@@ -568,6 +618,10 @@ pub enum MCPClientError {
     /// 协议错误 / Protocol error
     #[error("Protocol error: {0}")]
     ProtocolError(String),
+    /// MCP Server 未声明所需 capability（如 `resources`）→ 上层映射 4015 /
+    /// MCP Server did not declare the required capability (e.g. `resources`) → mapped to 4015 upstream.
+    #[error("Capability not supported: {0}")]
+    CapabilityNotSupported(String),
     /// IO错误 / IO error
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -611,6 +665,56 @@ pub fn resource_contents_as_text(rc: &ResourceContents) -> Option<&str> {
     match rc {
         ResourceContents::TextResourceContents { text, .. } => Some(text.as_str()),
         _ => None,
+    }
+}
+
+/// `client:get_skill` 响应的服务侧校验模型（v0.2.1）/ Server-side validation model for the
+/// `client:get_skill` response。
+///
+/// 协议 `data-structures.md §GetSkillRet` / `skill.md §9` 规定 `body` 与 `blob_handle` **恰一存在**
+/// （exactly one）：文本且 ≤ 内联预算 → `body`；二进制或过大文本 → `blob_handle`。Computer 在返回前
+/// 调用 [`GetSkillRet::validate`] 强制该不变量（服务侧自校验）。`smcp` crate 的线缆结构为其镜像。
+/// The protocol mandates exactly one of `body` / `blob_handle`; [`GetSkillRet::validate`] enforces it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetSkillRet {
+    /// SKILL 名（消歧后的 `A2CSkillRef` 名）/ SKILL name (disambiguated `A2CSkillRef` name)。
+    pub name: String,
+    /// 包根内的相对路径 / Relative path within the skill root。
+    pub rel_path: String,
+    /// MIME 类型 / MIME type。
+    pub mime_type: String,
+    /// 资源总字节数 / Total size in bytes。
+    pub total_size: u64,
+    /// 内容 sha256（hex）/ Content sha256 (hex)。
+    pub sha256: String,
+    /// 关联请求 id / Correlating request id。
+    pub req_id: String,
+    /// 内联文本正文（与 `blob_handle` 恰一）/ Inline text body (exactly one of body/blob_handle)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// 二进制旁路句柄（与 `body` 恰一）/ Binary sideband handle (exactly one of body/blob_handle)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_handle: Option<String>,
+}
+
+impl GetSkillRet {
+    /// 校验 `body` 与 `blob_handle` 恰一存在（XOR）/ Enforce exactly-one-of(body, blob_handle)。
+    ///
+    /// 两者皆有 / 皆无 → `Err`，附协议出处。对标 Python `GetSkillRet._check_body_blob_xor`。
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.body.is_some(), self.blob_handle.is_some()) {
+            (true, false) | (false, true) => Ok(()),
+            (true, true) => Err(
+                "GetSkillRet MUST carry exactly one of 'body' / 'blob_handle' (got both); \
+                 protocol data-structures.md §GetSkillRet / skill.md §9"
+                    .to_string(),
+            ),
+            (false, false) => Err(
+                "GetSkillRet MUST carry exactly one of 'body' / 'blob_handle' (got neither); \
+                 protocol data-structures.md §GetSkillRet / skill.md §9"
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -659,5 +763,77 @@ mod tests {
         assert_eq!(resource.raw.name, "Test");
         assert_eq!(resource.raw.description, Some("desc".into()));
         assert!(resource.raw.mime_type.is_none());
+    }
+
+    // ---- #74 INT-04：envFile 字段解析（envFile alias + env_file 名）----
+
+    #[test]
+    fn test_env_file_alias_camel_and_snake() {
+        // VS Code 风格 camelCase `envFile`
+        let camel = serde_json::json!({
+            "type": "stdio",
+            "name": "srv",
+            "default_tool_meta": null,
+            "envFile": ".env.prod",
+            "server_parameters": { "command": "echo", "args": [] }
+        });
+        let cfg: MCPServerConfig = serde_json::from_value(camel).unwrap();
+        assert_eq!(cfg.env_file(), Some(".env.prod"));
+
+        // 名 `env_file`（populate_by_name 等价）
+        let snake = serde_json::json!({
+            "type": "stdio",
+            "name": "srv",
+            "default_tool_meta": null,
+            "env_file": ".env.dev",
+            "server_parameters": { "command": "echo", "args": [] }
+        });
+        let cfg2: MCPServerConfig = serde_json::from_value(snake).unwrap();
+        assert_eq!(cfg2.env_file(), Some(".env.dev"));
+
+        // 缺省 → None；序列化回 camelCase `envFile`
+        let bare = serde_json::json!({
+            "type": "stdio",
+            "name": "srv",
+            "default_tool_meta": null,
+            "server_parameters": { "command": "echo", "args": [] }
+        });
+        let cfg3: MCPServerConfig = serde_json::from_value(bare).unwrap();
+        assert_eq!(cfg3.env_file(), None);
+        let round = serde_json::to_value(&cfg2).unwrap();
+        assert_eq!(round["envFile"], serde_json::json!(".env.dev"));
+        assert!(round.get("env_file").is_none());
+    }
+
+    // ---- #74 INT-04：GetSkillRet body/blob_handle 恰一互斥校验 ----
+
+    fn skill_ret(body: Option<&str>, handle: Option<&str>) -> GetSkillRet {
+        GetSkillRet {
+            name: "marketplace:demo:skill".into(),
+            rel_path: "SKILL.md".into(),
+            mime_type: "text/markdown".into(),
+            total_size: 42,
+            sha256: "ab12".into(),
+            req_id: "req-1".into(),
+            body: body.map(str::to_string),
+            blob_handle: handle.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_get_skill_ret_xor_valid() {
+        assert!(skill_ret(Some("hello"), None).validate().is_ok());
+        assert!(skill_ret(None, Some("blob:abc")).validate().is_ok());
+    }
+
+    #[test]
+    fn test_get_skill_ret_xor_both_or_neither_rejected() {
+        let both = skill_ret(Some("hello"), Some("blob:abc")).validate();
+        assert!(both.is_err());
+        assert!(both.unwrap_err().contains("both"));
+
+        let neither = skill_ret(None, None).validate();
+        assert!(neither.is_err());
+        assert!(neither.unwrap_err().contains("neither"));
     }
 }

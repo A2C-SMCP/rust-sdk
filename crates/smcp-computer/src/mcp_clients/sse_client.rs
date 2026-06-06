@@ -660,6 +660,48 @@ impl MCPClientProtocol for SseMCPClient {
         Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
     }
 
+    async fn list_resources_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+
+        // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。SSE 不缓存 server
+        // capabilities，故无 4015 预检——无 `resources` 能力的 server 由其 JSON-RPC 错误响应反映。
+        // Single-page passthrough (cursor in/out, no aggregation/filter/resourceTemplates). SSE caches
+        // no server caps, so no 4015 pre-check — a server lacking `resources` surfaces via its error.
+        let params = Some(match cursor.as_ref() {
+            Some(c) => serde_json::json!({ "cursor": c }),
+            None => serde_json::json!({}),
+        });
+        let response = self.send_request("resources/list", params).await?;
+        if let Some(error) = response.get("error") {
+            return Err(MCPClientError::ProtocolError(format!(
+                "List resources error: {}",
+                error
+            )));
+        }
+
+        let mut resources = Vec::new();
+        let mut next_cursor = None;
+        if let Some(result) = response.get("result") {
+            if let Some(arr) = result.get("resources").and_then(|v| v.as_array()) {
+                for resource in arr {
+                    if let Ok(parsed) = serde_json::from_value::<Resource>(resource.clone()) {
+                        resources.push(parsed);
+                    }
+                }
+            }
+            next_cursor = result
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        Ok((resources, next_cursor))
+    }
+
     async fn get_window_detail(
         &self,
         resource: Resource,

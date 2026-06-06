@@ -271,6 +271,17 @@ where
         Ok(vec![])
     }
 
+    async fn list_resources_page(
+        &self,
+        _cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+        if self.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+        // 基础实现返回空单页，子类需要重写 / Base returns an empty single page; subclasses override.
+        Ok((vec![], None))
+    }
+
     async fn get_window_detail(
         &self,
         _resource: Resource,
@@ -364,6 +375,24 @@ mod tests {
         // Test state change notification
         let mut rx = client.get_state_notifier();
         assert_eq!(*rx.borrow_and_update(), ClientState::Initialized);
+    }
+
+    /// #74 INT-04：base 的 `list_resources_page` 桩——未连接报错，连接后返回空单页（子类重写）。
+    /// base stub: errors when not connected, returns an empty single page when connected.
+    #[tokio::test]
+    async fn test_base_list_resources_page_stub() {
+        let client = BaseMCPClient::new("test");
+        // 未连接 → ConnectionError
+        assert!(matches!(
+            client.list_resources_page(None).await,
+            Err(MCPClientError::ConnectionError(_))
+        ));
+
+        client.update_state(ClientState::Connected).await;
+        // 连接后 → 空单页（末页，无 cursor）
+        let (resources, next) = client.list_resources_page(Some("c".into())).await.unwrap();
+        assert!(resources.is_empty());
+        assert!(next.is_none());
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ async fn test_complete_workflow() {
 
     // STDIO服务器配置 / STDIO server configuration
     configs.push(MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: "calculator_server".to_string(),
         disabled: false,
         forbidden_tools: vec![],
@@ -59,6 +60,7 @@ async fn test_complete_workflow() {
 
     // HTTP服务器配置 / HTTP server configuration
     configs.push(MCPServerConfig::Http(HttpServerConfig {
+        env_file: None,
         name: "http_server".to_string(),
         disabled: true, // 禁用以避免实际连接 / Disable to avoid actual connection
         forbidden_tools: vec![],
@@ -202,6 +204,7 @@ async fn test_concurrent_operations() {
         let manager_clone = manager.clone();
         let handle = tokio::spawn(async move {
             let config = MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: format!("calculator_{}", i),
                 disabled: false,
                 forbidden_tools: vec![],
