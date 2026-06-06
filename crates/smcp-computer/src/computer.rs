@@ -689,6 +689,12 @@ impl<S: Session> Computer<S> {
     /// （本轮未出现的 `mcp:` 源 SKILL → 标孤儿，保留以便 source 回归时恢复）。SKILL Home 未就绪 / 无
     /// manager → 空列表；staging 失败 → 记 ERROR + 空列表（失败隔离，对标 Python `_restage_mcp_skills`）。
     /// 由 boot_up 与 MCP `ResourceListChanged`/`ResourceUpdated` 通知处理器（INT-03 #72）触发。
+    ///
+    /// **持锁语义（注意）**：`skill_registry` 写锁全程持有跨 `stage_mcp_skills` await——后者 `archive`
+    /// 模式会发起归档**网络下载**、`resources` 模式会做 MCP `read_resource`。期间所有 `get_skills` /
+    /// `get_skill_ref`（读锁）被阻塞，慢/卡 fetch 会拖住全部 SKILL 读（Python 单事件循环天然串行掩盖此点）。
+    /// 锁序安全（唯一同时持 `mcp_manager.read` + `skill_registry.write` 处，无反向获取路径，不构成死锁）。
+    /// 两阶段化（先 materialize 全部、仅 register 阶段短持写锁）的硬化见 follow-up issue（触及封板 staging.rs #49）。
     pub async fn restage_mcp_skills(&self, server_name: Option<&str>) -> Vec<String> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return Vec::new();
@@ -2469,5 +2475,92 @@ mod tests {
         // 未 boot（skill_home None / 无 manager）→ 空列表，不 panic。
         let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
         assert!(computer.restage_mcp_skills(None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_resources_delegates_to_manager() {
+        use crate::mcp_clients::manager::test_support::{inject, MockSkillClient};
+        use crate::mcp_clients::model::make_resource;
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let mgr = MCPServerManager::new();
+        inject(
+            &mgr,
+            "srv",
+            MockSkillClient {
+                pages: vec![vec![make_resource("res://a", "a", None, None)]],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+        *computer.mcp_manager.write().await = Some(mgr);
+
+        // 成功委托：单页透传 manager.list_resources，cursor 出（末页 None）。
+        let (page, next) = computer.get_resources("srv", None).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].uri, "res://a");
+        assert!(next.is_none());
+
+        // 未注册 server → McpServerNotFound（4014）。
+        let err = computer.get_resources("missing", None).await.unwrap_err();
+        assert_eq!(err.error_code(), 4014);
+    }
+
+    #[tokio::test]
+    async fn test_restage_mcp_skills_happy_registers_mounted() {
+        use crate::mcp_clients::manager::test_support::{
+            inject, skill_resource_mounted, MockSkillClient,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 真实挂载源：含 SKILL.md frontmatter.name=real-name（包根名应被校正）。
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::write(
+            mount.join("SKILL.md"),
+            "---\nname: real-name\ndescription: mounted skill\n---\nbody",
+        )
+        .unwrap();
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"));
+        // boot 解析 skill_home（此时 manager 仍 None → boot 内 restage 为空，符合预期）。
+        computer.boot_up().await.unwrap();
+
+        // boot 后注入带 mounted skill:// 的 manager，再全量重物化。
+        let mgr = MCPServerManager::new();
+        inject(
+            &mgr,
+            "tfrobot-tools",
+            MockSkillClient {
+                pages: vec![vec![skill_resource_mounted(
+                    "skill://tfrobot-tools/raw-leaf",
+                    Some("mounted"),
+                    mount.to_str().unwrap(),
+                )]],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+        *computer.mcp_manager.write().await = Some(mgr);
+
+        // happy path：物化 + 注册 mcp 源（name = mcp:<server>:<frontmatter.name>）。
+        let registered = computer.restage_mcp_skills(None).await;
+        assert_eq!(registered, vec!["mcp:tfrobot-tools:real-name".to_string()]);
+
+        // get_skills 反映新注册的 mcp 源 skill。
+        let skills = computer.get_skills().await;
+        assert!(skills
+            .iter()
+            .any(|s| s.name == "mcp:tfrobot-tools:real-name"));
+
+        // 单 server 重物化（server_name=Some）：不做孤儿对账，仍返回该名。
+        let again = computer.restage_mcp_skills(Some("tfrobot-tools")).await;
+        assert_eq!(again, vec!["mcp:tfrobot-tools:real-name".to_string()]);
     }
 }

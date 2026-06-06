@@ -36,11 +36,17 @@ pub enum ComputerError {
     /// (`get_resources` → handler maps 4014)。对标 Python `MCPServerNotFoundError`。
     McpServerNotFound(String),
 
-    #[error("MCP capability not supported: {0}")]
-    /// MCP Server 未声明所需 capability（如 `resources`）（`get_resources` → 处理器映射 4015）/
-    /// required capability not declared (`get_resources` → handler maps 4015)。对标 Python
-    /// `MCPCapabilityNotSupportedError`。
-    McpCapabilityNotSupported(String),
+    #[error("MCP capability '{capability}' not supported by server '{server_name}'")]
+    /// MCP Server 未声明所需 capability（`get_resources` → 处理器映射 4015）/ required capability not
+    /// declared (`get_resources` → handler maps 4015)。对标 Python `MCPCapabilityNotSupportedError`。
+    /// 结构化分流字段：`server_name` + `capability` 供 #72 handler 直接平铺为 flat ErrorPayload 顶层
+    /// `mcp_server_name`/`capability`（`with_mcp_server_name`/`with_capability`），无需再解析字符串。
+    McpCapabilityNotSupported {
+        /// 目标 MCP Server 名（顶层 `mcp_server_name`）。
+        server_name: String,
+        /// 缺失的 capability 名（顶层 `capability`，如 `"resources"`）。
+        capability: String,
+    },
 
     #[error("VRL syntax error: {message}")]
     /// VRL语法错误 / VRL syntax error
@@ -145,7 +151,7 @@ impl ComputerError {
 
             // MCP get_resources 路由错误 / MCP get_resources routing errors
             ComputerError::McpServerNotFound(_) => smcp::ErrorCode::McpServerNotFound.code(), // 4014
-            ComputerError::McpCapabilityNotSupported(_) => {
+            ComputerError::McpCapabilityNotSupported { .. } => {
                 smcp::ErrorCode::McpCapabilityNotSupported.code() // 4015
             }
 

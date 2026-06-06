@@ -904,9 +904,12 @@ impl MCPServerManager {
 
         match client.list_resources_page(cursor).await {
             Ok(pair) => Ok(pair),
-            Err(MCPClientError::CapabilityNotSupported(cap)) => Err(
-                ComputerError::McpCapabilityNotSupported(format!("server '{server_name}': {cap}")),
-            ),
+            Err(MCPClientError::CapabilityNotSupported(cap)) => {
+                Err(ComputerError::McpCapabilityNotSupported {
+                    server_name: server_name.to_string(),
+                    capability: cap,
+                })
+            }
             Err(e) => Err(ComputerError::ProtocolError(format!(
                 "list_resources '{server_name}': {e}"
             ))),
@@ -1295,6 +1298,117 @@ impl SkillResourceManager for MCPServerManager {
 impl Default for MCPServerManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 测试支撑：可控分页/失败的假 MCP client + 资源/注入助手，`pub(crate)` 供 manager 与 computer 两处
+/// 集成测试共用（单一 mock 真源）/ test-support mock + helpers shared by manager and computer tests。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// 受控分页的假 MCP client：按 cursor 顺序返回各页，可注入翻页失败 / 能力缺失 / read 文本。
+    /// Controllable fake MCP client paginating canned pages, with injectable failure/cap-fail/read text.
+    pub(crate) struct MockSkillClient {
+        pub(crate) pages: Vec<Vec<Resource>>,
+        pub(crate) fail: bool,
+        /// `list_resources_page` 返回 `CapabilityNotSupported`（模拟无 `resources` 能力）。
+        pub(crate) cap_fail: bool,
+        pub(crate) read_text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for MockSkillClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            if self.cap_fail {
+                return Err(MCPClientError::CapabilityNotSupported("resources".into()));
+            }
+            if self.fail {
+                return Err(MCPClientError::ProtocolError("boom".into()));
+            }
+            let idx: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+            match self.pages.get(idx) {
+                Some(page) => {
+                    let next = if idx + 1 < self.pages.len() {
+                        Some((idx + 1).to_string())
+                    } else {
+                        None
+                    };
+                    Ok((page.clone(), next))
+                }
+                None => Ok((vec![], None)),
+            }
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(self.read_text.clone(), "skill://x")],
+            })
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 构造带 `_meta.source` 的 `skill://` 资源（mount_dir 固定占位）/ a `skill://` resource with `_meta.source`。
+    pub(crate) fn skill_resource(uri: &str, source: Option<&str>) -> Resource {
+        skill_resource_mounted(uri, source, "/tmp/mount")
+    }
+
+    /// 同上但 mount_dir 取真实路径（供 mounted 物化 happy-path 测试）/ with a real mount_dir for materialization。
+    pub(crate) fn skill_resource_mounted(
+        uri: &str,
+        source: Option<&str>,
+        mount_dir: &str,
+    ) -> Resource {
+        use rmcp::model::{AnnotateAble, Meta};
+        let mut raw = RawResource::new(uri, "skill");
+        if let Some(src) = source {
+            let mut m = serde_json::Map::new();
+            m.insert("source".into(), Value::String(src.to_string()));
+            m.insert("mount_dir".into(), Value::String(mount_dir.to_string()));
+            raw.meta = Some(Meta(m));
+        }
+        raw.no_annotation()
+    }
+
+    /// 把假 client 注入 manager 的 `active_clients` / inject a fake client into the manager。
+    pub(crate) async fn inject(manager: &MCPServerManager, name: &str, client: MockSkillClient) {
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(name.to_string(), StdArc::new(client));
     }
 }
 
@@ -1745,100 +1859,8 @@ mod tests {
     }
 
     // ---- #74 INT-04：list_skill_resources + SkillResourceManager 接缝 ----
-
-    /// 受控分页的假 MCP client：按 cursor 顺序返回各页，可注入失败与 read 文本。
-    /// Controllable fake MCP client paginating canned pages, with injectable failure and read text.
-    struct MockSkillClient {
-        pages: Vec<Vec<Resource>>,
-        fail: bool,
-        /// `list_resources_page` 返回 `CapabilityNotSupported`（模拟无 `resources` 能力）。
-        cap_fail: bool,
-        read_text: String,
-    }
-
-    #[async_trait::async_trait]
-    impl MCPClientProtocol for MockSkillClient {
-        fn state(&self) -> ClientState {
-            ClientState::Connected
-        }
-        async fn connect(&self) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-        async fn disconnect(&self) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
-            Ok(vec![])
-        }
-        async fn call_tool(
-            &self,
-            _tool: &str,
-            _params: Value,
-        ) -> Result<CallToolResult, MCPClientError> {
-            Err(MCPClientError::ProtocolError("n/a".into()))
-        }
-        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
-            Ok(vec![])
-        }
-        async fn list_resources_page(
-            &self,
-            cursor: Option<String>,
-        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
-            if self.cap_fail {
-                return Err(MCPClientError::CapabilityNotSupported("resources".into()));
-            }
-            if self.fail {
-                return Err(MCPClientError::ProtocolError("boom".into()));
-            }
-            let idx: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
-            match self.pages.get(idx) {
-                Some(page) => {
-                    let next = if idx + 1 < self.pages.len() {
-                        Some((idx + 1).to_string())
-                    } else {
-                        None
-                    };
-                    Ok((page.clone(), next))
-                }
-                None => Ok((vec![], None)),
-            }
-        }
-        async fn get_window_detail(
-            &self,
-            _resource: Resource,
-        ) -> Result<ReadResourceResult, MCPClientError> {
-            Ok(ReadResourceResult {
-                contents: vec![ResourceContents::text(self.read_text.clone(), "skill://x")],
-            })
-        }
-        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-    }
-
-    /// 构造带 `_meta.source` 的 `skill://` 资源 / Build a `skill://` resource carrying `_meta.source`。
-    fn skill_resource(uri: &str, source: Option<&str>) -> Resource {
-        use rmcp::model::{AnnotateAble, Meta};
-        let mut raw = RawResource::new(uri, "skill");
-        if let Some(src) = source {
-            let mut m = serde_json::Map::new();
-            m.insert("source".into(), Value::String(src.to_string()));
-            m.insert("mount_dir".into(), Value::String("/tmp/mount".into()));
-            raw.meta = Some(Meta(m));
-        }
-        raw.no_annotation()
-    }
-
-    async fn inject(manager: &MCPServerManager, name: &str, client: MockSkillClient) {
-        manager
-            .active_clients
-            .write()
-            .await
-            .insert(name.to_string(), StdArc::new(client));
-    }
+    // Mock / helpers 提升至 `super::test_support`（`pub(crate)`），供 computer.rs 集成测试复用。
+    use super::test_support::{inject, skill_resource, MockSkillClient};
 
     #[tokio::test]
     async fn test_list_skill_resources_filters_and_exhausts_pages() {
@@ -1968,8 +1990,12 @@ mod tests {
         )
         .await;
         let err = manager.list_resources("srv", None).await.unwrap_err();
-        assert!(matches!(err, ComputerError::McpCapabilityNotSupported(_)));
         assert_eq!(err.error_code(), 4015);
+        assert!(matches!(
+            err,
+            ComputerError::McpCapabilityNotSupported { server_name, capability }
+            if server_name == "srv" && capability == "resources"
+        ));
     }
 
     #[tokio::test]
