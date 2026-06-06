@@ -16,6 +16,14 @@ use smcp_computer::{
 */
 use std::collections::HashMap;
 use std::sync::Arc;
+use tempfile::TempDir;
+
+/// INT-01 #68：boot_up 起 FS 副作用（建 ~/.a2c/.blobspool + watch ~/.a2c/skills）→ 隔离到 TempDir。
+/// Isolate boot_up's FS side-effects to a TempDir so tests never touch the real home。
+fn isolate_boot(c: Computer<SilentSession>, td: &TempDir) -> Computer<SilentSession> {
+    c.with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+}
 
 #[tokio::test]
 async fn test_computer_concurrent_input_operations() {
@@ -135,8 +143,12 @@ async fn test_computer_edge_case_inputs() {
 
 #[tokio::test]
 async fn test_computer_edge_case_servers() {
+    let td = TempDir::new().unwrap();
     let session = SilentSession::new("test");
-    let computer = Computer::new("test_computer", session, None, None, false, false);
+    let computer = isolate_boot(
+        Computer::new("test_computer", session, None, None, false, false),
+        &td,
+    );
 
     computer.boot_up().await.unwrap();
 
@@ -205,8 +217,12 @@ async fn test_computer_edge_case_servers() {
 
 #[tokio::test]
 async fn test_computer_multiple_boot_up() {
+    let td = TempDir::new().unwrap();
     let session = SilentSession::new("test");
-    let computer = Computer::new("test_computer", session, None, None, false, false);
+    let computer = isolate_boot(
+        Computer::new("test_computer", session, None, None, false, false),
+        &td,
+    );
 
     // 第一次启动 / First boot up
     computer.boot_up().await.unwrap();

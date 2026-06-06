@@ -701,22 +701,28 @@ impl<S: Session> Computer<S> {
 
         // ── INT-01 #68：SKILL / blob 子系统装配 / SKILL & blob subsystem wiring ──
         // blob：建内容寻址暂存 + 装配 resolver 表（toolspool 完整；skill 由 resolve_blob async 处理）。
+        // **失败隔离**（对标 Python computer.py「SKILL boot init failed (non-blocking)」+ skill.md §1.5）：
+        // 建目录/canonicalize 失败 → 记 ERROR、blob 本会话禁用（mint→NotBooted、resolve_blob toolspool→Gone），
+        // **不**阻断 Computer 启动（与同 block `start_skill_watcher` 的 warn!+skip 隔离自洽）。
         let cache_root = self
             .blob_cache_root_override
             .clone()
             .unwrap_or_else(default_blob_cache_root);
-        let toolspool_store = Arc::new(ToolspoolBlobStore::new(&cache_root).map_err(|e| {
-            ComputerError::InvalidState(format!("toolspool store init failed: {e}"))
-        })?);
-        {
-            let mut resolvers = self.blob_resolvers.write().await;
-            resolvers.insert(
-                "toolspool".to_string(),
-                Arc::new(ToolspoolBlobResolver::new(Arc::clone(&toolspool_store)))
-                    as Arc<dyn BlobResolver>,
-            );
+        match ToolspoolBlobStore::new(&cache_root) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                self.blob_resolvers.write().await.insert(
+                    "toolspool".to_string(),
+                    Arc::new(ToolspoolBlobResolver::new(Arc::clone(&store)))
+                        as Arc<dyn BlobResolver>,
+                );
+                *self.toolspool_store.write().await = Some(store);
+            }
+            Err(e) => {
+                error!(error = %e, cache_root = %cache_root.display(),
+                    "toolspool blob store init failed (non-blocking); blob disabled this session");
+            }
         }
-        *self.toolspool_store.write().await = Some(toolspool_store);
 
         // SKILL：解析 Home + 初次全量发现 user 源（= invalidate_user_skills，对标 Python boot_up）+ 启 watcher。
         // mcp 源重物化（_restage_mcp_skills）归 INT-04 #74；marketplace 源 reconcile 归 #60/#61（非 boot）。
@@ -1408,7 +1414,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
                 &self.registered_workdirs,
                 &self.socketio_client,
             )),
-            skill_watcher: Arc::clone(&self.skill_watcher),
+            // watcher 属**运行时态**（非共享句柄）：克隆体重启时自建（同 inputs/mcp_servers 重置语义）。
+            // 否则共享 watcher 的 on_change 仍驱动**原** debouncer、克隆体 shutdown 会误 stop 共享 watcher。
+            skill_watcher: Arc::new(Mutex::new(None)),
             skill_watch_polling: self.skill_watch_polling,
             blob_cache_root_override: self.blob_cache_root_override.clone(),
             blob_thresholds: self.blob_thresholds,
@@ -2113,8 +2121,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_computer_shutdown() {
+        // INT-01 #68：boot_up 起 FS 副作用 → 隔离到 TempDir（不污染真实 ~/.a2c / skill home）。
+        let td = tempfile::TempDir::new().unwrap();
         let session = SilentSession::new("test");
-        let computer = Computer::new("test_computer", session, None, None, true, true);
+        let computer = Computer::new("test_computer", session, None, None, true, true)
+            .with_skill_home(td.path().join("skills"))
+            .with_blob_cache_root(td.path().join("blob"));
 
         // 测试关闭未初始化的Computer / Test shutting down uninitialized computer
         computer.shutdown().await.unwrap();

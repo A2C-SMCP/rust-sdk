@@ -6,6 +6,14 @@ use smcp_computer::{
         StdioServerParameters,
     },
 };
+use tempfile::TempDir;
+
+/// INT-01 #68：boot_up 起 FS 副作用（建 ~/.a2c/.blobspool + watch ~/.a2c/skills）→ 隔离到 TempDir。
+/// Isolate boot_up's FS side-effects to a TempDir so tests never touch the real home。
+fn isolate_boot(c: Computer<SilentSession>, td: &TempDir) -> Computer<SilentSession> {
+    c.with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+}
 /**
 * 文件名: computer_integration
 * 作者: JQQ
@@ -124,8 +132,12 @@ async fn test_computer_with_mock_session() {
 
 #[tokio::test]
 async fn test_computer_server_lifecycle() {
+    let td = TempDir::new().unwrap();
     let session = SilentSession::new("test");
-    let computer = Computer::new("test_computer", session, None, None, false, false);
+    let computer = isolate_boot(
+        Computer::new("test_computer", session, None, None, false, false),
+        &td,
+    );
 
     // 测试启动 / Test boot up
     computer.boot_up().await.unwrap();
@@ -246,8 +258,12 @@ async fn test_computer_input_value_management() {
 
 #[tokio::test]
 async fn test_computer_multiple_servers() {
+    let td = TempDir::new().unwrap();
     let session = SilentSession::new("test");
-    let computer = Computer::new("test_computer", session, None, None, false, false);
+    let computer = isolate_boot(
+        Computer::new("test_computer", session, None, None, false, false),
+        &td,
+    );
 
     computer.boot_up().await.unwrap();
 
@@ -314,8 +330,12 @@ async fn test_computer_multiple_servers() {
 
 #[tokio::test]
 async fn test_computer_error_handling() {
+    let td = TempDir::new().unwrap();
     let session = SilentSession::new("test");
-    let computer = Computer::new("test_computer", session, None, None, false, false);
+    let computer = isolate_boot(
+        Computer::new("test_computer", session, None, None, false, false),
+        &td,
+    );
 
     // 测试未初始化时的错误 / Test errors when not initialized
     let tools_result = computer.get_available_tools().await;
@@ -345,8 +365,12 @@ async fn test_computer_error_handling() {
 
 #[tokio::test]
 async fn test_computer_tool_history() {
+    let td = TempDir::new().unwrap();
     let session = SilentSession::new("test");
-    let computer = Computer::new("test_computer", session, None, None, false, false);
+    let computer = isolate_boot(
+        Computer::new("test_computer", session, None, None, false, false),
+        &td,
+    );
 
     // 初始历史为空 / Initial history is empty
     let history = computer.get_tool_history().await.unwrap();
