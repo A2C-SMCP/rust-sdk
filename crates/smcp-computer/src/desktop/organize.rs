@@ -9,7 +9,7 @@
 */
 use super::metadata::{check_audience, cmp_priority_desc, read_fullscreen, read_priority};
 use super::model::{ServerName, ToolCallRecord, WindowInfo};
-use super::window_uri::is_window_uri;
+use super::window_uri::{is_window_uri, WindowURI};
 use super::Desktop;
 use crate::mcp_clients::model::{resource_contents_as_text, ReadResourceResult, Resource};
 use std::collections::{HashMap, HashSet};
@@ -37,6 +37,18 @@ pub fn organize_desktop(
     size: Option<usize>,
     history: &[ToolCallRecord],
 ) -> Vec<Desktop> {
+    // MCP-01：`window://` host **SHOULD** 跨 MCP Server 唯一。冲突仅记 lint-style WARN（不阻塞组织）。
+    // desktop 组织按 MCP Server 名分组、不依赖 host 唯一，故冲突不影响下方逻辑，仅作引导。
+    // MCP-01: window:// host SHOULD be unique across MCP servers; collisions only WARN (non-blocking).
+    for (host, servers) in detect_host_collisions(&windows) {
+        tracing::warn!(
+            host = %host,
+            servers = ?servers,
+            "window:// host 跨 MCP Server 冲突（SHOULD 唯一，仅 lint 引导，不阻塞）/ \
+             window:// host collides across MCP servers (SHOULD be unique; lint-only, non-blocking)"
+        );
+    }
+
     // 快速处理 size 边界 / Quick handling of size boundary
     if let Some(size) = size {
         if size == 0 {
@@ -142,6 +154,45 @@ pub fn organize_desktop(
     }
 
     result
+}
+
+/// 检测跨 MCP Server 的 `window://` host 冲突（MCP-01）/ detect cross-server window:// host collisions。
+///
+/// host **SHOULD**（非 MUST）跨 MCP Server 唯一（协议 desktop §host）。本函数为**纯检测**：返回被
+/// **≥2 个不同 MCP Server** 暴露的 host 及其 server 名集合（host 升序、server 名升序，稳定输出），由
+/// 调用方据此发 lint-style WARN——**不阻塞**注册/组织。desktop 组织按 MCP Server 名分组、不依赖 host
+/// 唯一，故冲突不影响功能。Rust 侧从未构建 host 反向索引（无 `HostConflictError`/`find_server_by_host`），
+/// 对齐 Python 参考实现「host 唯一性降级为 WARN、移除反向索引」。
+///
+/// Pure detector: returns hosts exposed by ≥2 distinct MCP servers (sorted, stable). Callers emit a
+/// non-blocking lint WARN; desktop organizing groups by server name and does not depend on host
+/// uniqueness. No reverse host index exists (mirrors the Python reference).
+pub(crate) fn detect_host_collisions(windows: &[WindowInfo]) -> Vec<(String, Vec<ServerName>)> {
+    use std::collections::BTreeMap;
+
+    let mut by_host: BTreeMap<String, Vec<ServerName>> = BTreeMap::new();
+    for w in windows {
+        // 仅 window:// 资源参与 host 唯一性检查；非法/非 window URI 跳过（与 organize 守卫一致）。
+        if !is_window_uri(&w.resource.uri) {
+            continue;
+        }
+        let Ok(uri) = WindowURI::new(&w.resource.uri) else {
+            continue;
+        };
+        let servers = by_host.entry(uri.mcp_id().to_string()).or_default();
+        if !servers.contains(&w.server_name) {
+            servers.push(w.server_name.clone());
+        }
+    }
+
+    by_host
+        .into_iter()
+        .filter(|(_, servers)| servers.len() > 1)
+        .map(|(host, mut servers)| {
+            servers.sort();
+            (host, servers)
+        })
+        .collect()
 }
 
 /// 窗口项（内部使用） / Window item (internal use)
@@ -663,5 +714,61 @@ mod tests {
         // serverB 应该优先（因为最近），serverA 次之
         assert!(result[0].contains("window://serverB.mcp.com/b"));
         assert!(result[1].contains("window://serverA.mcp.com/a"));
+    }
+
+    // ===== MCP-01: host 唯一性 lint（SHOULD WARN，纯检测，不阻塞）=====
+
+    #[test]
+    fn test_detect_host_collision_across_servers() {
+        // 同一 host `shared.app` 被两个不同 MCP Server 暴露 → 视为冲突。
+        let windows = vec![
+            create_test_window("serverA", "window://shared.app/w1", "a", 0, false),
+            create_test_window("serverB", "window://shared.app/w2", "b", 0, false),
+        ];
+
+        let collisions = detect_host_collisions(&windows);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].0, "shared.app");
+        // server 名升序稳定输出
+        assert_eq!(collisions[0].1, vec!["serverA", "serverB"]);
+    }
+
+    #[test]
+    fn test_no_collision_same_server_same_host() {
+        // 同一 server 多个窗口共享 host —— 单 server 内 host 唯一由 MCP 自身保证，**不**算冲突。
+        let windows = vec![
+            create_test_window("serverA", "window://app.one/w1", "a", 0, false),
+            create_test_window("serverA", "window://app.one/w2", "b", 0, false),
+        ];
+
+        assert!(detect_host_collisions(&windows).is_empty());
+    }
+
+    #[test]
+    fn test_no_collision_distinct_hosts() {
+        // 不同 server 各用不同 host —— 合规，无冲突。
+        let windows = vec![
+            create_test_window("serverA", "window://serverA.app/w", "a", 0, false),
+            create_test_window("serverB", "window://serverB.app/w", "b", 0, false),
+        ];
+
+        assert!(detect_host_collisions(&windows).is_empty());
+    }
+
+    #[test]
+    fn test_organize_still_succeeds_under_host_collision() {
+        // 冲突仅 WARN（lint-style），**不阻塞**：两个 server 的窗口仍照常组织进桌面。
+        let windows = vec![
+            create_test_window("serverA", "window://shared.app/w1", "Content A", 0, false),
+            create_test_window("serverB", "window://shared.app/w2", "Content B", 0, false),
+        ];
+
+        // 前置断言：的确存在 host 冲突（驱动 WARN 的检测结果非空）。
+        assert_eq!(detect_host_collisions(&windows).len(), 1);
+
+        let result = organize_desktop(windows, None, &[]);
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|d| d.contains("Content A")));
+        assert!(result.iter().any(|d| d.contains("Content B")));
     }
 }
