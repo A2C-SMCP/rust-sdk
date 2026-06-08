@@ -7,7 +7,7 @@
 * 依赖: None
 * 描述: 桌面组织策略实现 / Desktop organizing strategy implementation
 */
-use super::metadata::{check_audience, read_fullscreen, read_priority};
+use super::metadata::{check_audience, cmp_priority_desc, read_fullscreen, read_priority};
 use super::model::{ServerName, ToolCallRecord, WindowInfo};
 use super::window_uri::is_window_uri;
 use super::Desktop;
@@ -98,14 +98,9 @@ pub fn organize_desktop(
 
     let server_order: Vec<ServerName> = recent_servers.into_iter().chain(remaining).collect();
 
-    // 3) 每个服务器内按 priority 降序排序（f32 非 Ord：partial_cmp 降序；
-    //    NaN 已在 read_priority 归一为 0.0，不会出现）。
+    // 3) 每个服务器内按 priority 降序排序（共享比较器，单源化 f32 NaN→Equal 语义）。
     for items in grouped.values_mut() {
-        items.sort_by(|a, b| {
-            b.priority
-                .partial_cmp(&a.priority)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        items.sort_by(|a, b| cmp_priority_desc(a.priority, b.priority));
     }
 
     // 4) 组装按服务器顺序的窗口列表，处理 fullscreen 规则

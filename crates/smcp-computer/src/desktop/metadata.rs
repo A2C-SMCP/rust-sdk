@@ -10,6 +10,7 @@
 *       `Resource.annotations` / `_meta`, replacing the old `window://` URI query).
 */
 
+use super::window_uri::is_window_uri;
 use crate::mcp_clients::model::Resource;
 
 /// 从 `Resource.annotations.priority` 读取布局优先级（v0.2 协议指南 §6.2 / §6.4）。
@@ -37,6 +38,37 @@ pub fn read_priority(resource: &Resource) -> f32 {
             0.0
         }
     }
+}
+
+/// 按布局优先级降序比较 / Descending comparison by layout priority。
+///
+/// `f32` 非 `Ord`：用 `partial_cmp` 降序；`NaN` 已在 [`read_priority`] 归一为 `0.0`，
+/// 故 `unwrap_or(Equal)` 仅作防御。`organize_desktop` 与 [`filter_and_sort_window_resources`]
+/// 共用，单源化 NaN→Equal 语义。
+/// `f32` is not `Ord`; `NaN` is already normalized to `0.0` by [`read_priority`], so the
+/// `unwrap_or(Equal)` is purely defensive. Shared by `organize_desktop` and the client helper.
+pub(crate) fn cmp_priority_desc(a: f32, b: f32) -> std::cmp::Ordering {
+    b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// 过滤 `window://` 资源并按 `annotations.priority`（f32[0,1]，缺省 0.0）降序排序。
+/// Filter `window://` resources and sort by `annotations.priority` (f32[0,1], default 0.0) desc。
+///
+/// stdio / sse / http 三个 MCP 客户端的 `list_windows` 末段共享此逻辑，对齐 Python
+/// `base_client.list_windows` 的内联 filter + sort（仅 `all_resources` 的获取方式按传输不同）。
+/// Shared by the `list_windows` tail of the stdio/sse/http MCP clients, mirroring Python
+/// `base_client.list_windows`.
+pub(crate) fn filter_and_sort_window_resources(all: Vec<Resource>) -> Vec<Resource> {
+    let mut filtered: Vec<(Resource, f32)> = all
+        .into_iter()
+        .filter(|r| is_window_uri(&r.uri))
+        .map(|r| {
+            let priority = read_priority(&r);
+            (r, priority)
+        })
+        .collect();
+    filtered.sort_by(|a, b| cmp_priority_desc(a.1, b.1));
+    filtered.into_iter().map(|(r, _)| r).collect()
 }
 
 /// 从 `Resource._meta.fullscreen` 读取全屏标记（v0.2 协议指南 §6.2）。
@@ -139,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_read_priority_out_of_range_falls_back_to_zero() {
-        // 越界（>1.0 / <0.0）按 0.0 处理 / out-of-range clamps to 0.0
+        // 越界（>1.0 / <0.0）按 0.0 处理 / out-of-range resets to 0.0 (not clamped)
         assert_eq!(read_priority(&res_with_priority(Some(1.5))), 0.0);
         assert_eq!(read_priority(&res_with_priority(Some(-0.1))), 0.0);
     }
