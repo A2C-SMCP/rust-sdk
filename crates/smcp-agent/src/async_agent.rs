@@ -15,16 +15,16 @@ use crate::{
     events::AsyncAgentEventHandler,
     protocol_error::raise_for_error_payload,
     request_builders::{
-        build_get_desktop_request, build_get_skill_request, build_get_skills_request,
-        build_get_tools_request, build_tool_call_request,
+        build_get_desktop_request, build_get_resources_request, build_get_skill_request,
+        build_get_skills_request, build_get_tools_request, build_tool_call_request,
     },
-    response::ensure_req_id,
+    response::{ensure_req_id, parse_get_resources_response},
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
-    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetSkillRet, LeaveOfficeReq,
-    ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
+    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetResourcesRet, GetSkillRet,
+    LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -342,6 +342,53 @@ impl AsyncSmcpAgent {
             computer
         );
         Ok(desktops)
+    }
+
+    /// 获取指定 Computer 上某 MCP Server 的资源列表（v0.2.0）/ Get a MCP Server's resource list。
+    ///
+    /// 透明转发 MCP `resources/list`：SDK **不**自动翻页——`cursor` 由调用方控制，首次传 `None`，
+    /// 响应含 `next_cursor` 时由调用方决定是否带该 cursor 继续请求（协议指南 §5.3 #3）。flat
+    /// ErrorPayload（`4014` MCP Server 未注册 / `4015` 未声明 `resources` 能力）经 ack 透传为协议
+    /// 错误，不吞错。对标 Python `a2c_smcp/agent/client.py::get_resources`。
+    pub async fn get_resources(
+        &self,
+        computer: &str,
+        mcp_server: &str,
+        cursor: Option<String>,
+    ) -> Result<GetResourcesRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_resources_request(
+            &agent_config.agent,
+            computer,
+            mcp_server,
+            cursor.as_deref(),
+        );
+        let req_id = req.base.req_id.clone();
+
+        debug!(
+            "Getting resources from computer {}, mcp_server={}, cursor={:?}",
+            computer, mcp_server, cursor
+        );
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_RESOURCES, data, self.config.default_timeout)
+            .await?;
+
+        // 响应编排（flat ErrorPayload 4014/4015 透传 + req_id 校验 + 整页解析）单点收敛于纯函数，
+        // 与 get_skills 同构、可独立单测（见 response::parse_get_resources_response）。
+        let ret = parse_get_resources_response(&response, req_id.as_str())?;
+        info!(
+            "Received {} resources from computer: {} (next_cursor={:?})",
+            ret.resources.len(),
+            computer,
+            ret.next_cursor
+        );
+        Ok(ret)
     }
 
     /// 获取指定 Computer 的 SKILL 清单（v0.2.1）/ Get a Computer's SKILL inventory。

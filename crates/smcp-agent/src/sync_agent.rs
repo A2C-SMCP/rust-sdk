@@ -14,7 +14,7 @@ use crate::{
     error::{Result, SmcpAgentError},
     AsyncSmcpAgent,
 };
-use smcp::{A2CSkillRef, GetSkillRet, SMCPTool, SessionInfo};
+use smcp::{A2CSkillRef, GetResourcesRet, GetSkillRet, SMCPTool, SessionInfo};
 use tokio::runtime::Runtime;
 
 /// 同步SMCP Agent
@@ -70,6 +70,20 @@ impl SyncSmcpAgent {
     ) -> Result<Vec<String>> {
         self.runtime
             .block_on(self.async_agent.get_desktop(computer, size, window))
+    }
+
+    /// 获取指定 Computer 上某 MCP Server 的资源列表（v0.2.0，同步）/ Get a MCP Server's resources (sync)。
+    ///
+    /// 阻塞包装 [`AsyncSmcpAgent::get_resources`]：透明转发 MCP `resources/list`，`cursor` 调用方控制
+    /// （首次 `None`），flat ErrorPayload（`4014`/`4015`）透传为协议错误。
+    pub fn get_resources(
+        &self,
+        computer: &str,
+        mcp_server: &str,
+        cursor: Option<String>,
+    ) -> Result<GetResourcesRet> {
+        self.runtime
+            .block_on(self.async_agent.get_resources(computer, mcp_server, cursor))
     }
 
     /// 获取指定 Computer 的 SKILL 清单（v0.2.1，同步）/ Get a Computer's SKILL inventory (sync)。
