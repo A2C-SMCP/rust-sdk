@@ -1110,7 +1110,11 @@ pub(crate) fn to_a2c_resource(resource: &crate::mcp_clients::model::Resource) ->
             }),
             priority: ann.priority,
             last_modified: ann.last_modified.map(|dt| dt.to_rfc3339()),
-        });
+        })
+        // 与 Python `_to_a2c_resource` 的 `if ann:` 守卫对齐：三字段全 None 时折叠为 None，避免线格式
+        // 产出空 `"annotations": {}`（rmcp 把入参 `"annotations": {}` 解析为 `Some(全 None)`）造成
+        // 跨-SDK 字节分歧 / fold to None when all sub-fields are None, mirroring Python's truthiness guard.
+        .filter(|a| a.audience.is_some() || a.priority.is_some() || a.last_modified.is_some());
 
     // rmcp `_meta`（`Meta(JsonObject)`）→ `serde_json::Value::Object`，原样搬运 A2C 扩展字段。
     let meta = resource
@@ -1288,10 +1292,12 @@ mod tests {
         let mut m = serde_json::Map::new();
         m.insert("fullscreen".into(), serde_json::Value::Bool(true));
         raw.meta = Some(Meta(m));
+        // last_modified 设为定值，覆盖 DateTime<Utc> → RFC3339 映射分支。
+        let dt: chrono::DateTime<chrono::Utc> = "2025-01-02T03:04:05Z".parse().unwrap();
         let ann = Annotations {
             audience: Some(vec![Role::Assistant]),
             priority: Some(0.7),
-            last_modified: None,
+            last_modified: Some(dt),
         };
         let a2c = to_a2c_resource(&Annotated::new(raw, Some(ann)));
 
@@ -1306,10 +1312,30 @@ mod tests {
             out_ann.audience,
             Some(vec![smcp::ResourceAudience::Assistant])
         );
+        // RFC3339（ISO 8601）字符串，UTC 以 `+00:00` 结尾。
+        assert_eq!(
+            out_ann.last_modified.as_deref(),
+            Some("2025-01-02T03:04:05+00:00")
+        );
         // _meta（A2C 扩展，如 fullscreen）原样搬运。
         assert_eq!(
             a2c.meta.unwrap()["fullscreen"],
             serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_to_a2c_resource_empty_annotations_folded() {
+        use crate::mcp_clients::model::{Annotated, RawResource};
+        use rmcp::model::Annotations;
+
+        // MCP server 主动发回 `"annotations": {}` → rmcp 解析为 Some(全 None)。转换器须折叠为 None，
+        // 与 Python `if ann:` 守卫字节对齐（否则线格式残留空 `"annotations": {}`）。
+        let raw = RawResource::new("custom://a/b", "R");
+        let a2c = to_a2c_resource(&Annotated::new(raw, Some(Annotations::default())));
+        assert!(
+            a2c.annotations.is_none(),
+            "all-None annotations must fold to None"
         );
     }
 
