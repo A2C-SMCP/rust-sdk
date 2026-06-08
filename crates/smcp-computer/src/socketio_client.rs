@@ -16,12 +16,12 @@ use futures_util::FutureExt;
 use serde_json::Value;
 use smcp::{
     events::{
-        CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_TOOLS, CLIENT_TOOL_CALL,
-        SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG, SERVER_UPDATE_DESKTOP,
-        SERVER_UPDATE_SKILLS, SERVER_UPDATE_TOOL_LIST,
+        CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_RESOURCES, CLIENT_GET_TOOLS,
+        CLIENT_TOOL_CALL, SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG,
+        SERVER_UPDATE_DESKTOP, SERVER_UPDATE_SKILLS, SERVER_UPDATE_TOOL_LIST,
     },
-    GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetToolsReq,
-    GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
+    GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetResourcesReq,
+    GetResourcesRet, GetToolsReq, GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use tf_rust_socketio::{
     Event, Payload, TransportType,
 };
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// 默认鉴权 HTTP header 键名 /
 /// Default auth HTTP header key name.
@@ -375,6 +375,28 @@ impl SmcpComputerClient {
                             }
                             Err(e) => {
                                 error!("Error handling get desktop: {}", e);
+                            }
+                        }
+                    }
+                    .boxed()
+                }
+                CLIENT_GET_RESOURCES => {
+                    let manager = manager_clone.clone();
+                    let computer_name = computer_name_clone.clone();
+
+                    async move {
+                        match Self::handle_get_resources_with_ack(payload, manager, computer_name)
+                            .await
+                        {
+                            Ok((ack_id, response)) => {
+                                if let Some(id) = ack_id {
+                                    if let Err(e) = client.ack_with_id(id, response).await {
+                                        error!("Failed to send ack: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error handling get resources: {}", e);
                             }
                         }
                     }
@@ -900,6 +922,93 @@ impl SmcpComputerClient {
         Ok((ack_id, serde_json::to_value(response)?))
     }
 
+    /// 处理资源发现事件（带 ACK 响应）/ Handle get_resources event (with ACK).
+    ///
+    /// 透明转发指定 MCP Server 的 `resources/list`：单页透传（cursor 入参/`next_cursor` 出参原样转发），
+    /// **不**聚合、**不**做 scheme/元数据过滤、**不**返回 `resourceTemplates`。错误经 ACK 第一参回传
+    /// **flat ErrorPayload**（禁止嵌套 envelope）：未知 `mcp_server` → 4014（顶层平铺 `mcp_server_name`）；
+    /// 目标 server 未声明 `resources` 能力 → 4015（顶层平铺 `mcp_server_name` + `capability`）。对齐
+    /// Python `on_get_resources`（RES-01 #30，协议 0.2.0 `client:get_resources`）。
+    async fn handle_get_resources_with_ack(
+        payload: Payload,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
+        computer_name: String,
+    ) -> ComputerResult<(Option<i32>, Value)> {
+        let (ack_id, req) = Self::extract_ack_and_parse::<GetResourcesReq>(payload)?;
+
+        // 验证 computer_name（Server 路由已保证请求来自同一 office，无需验证 agent 字段）
+        if computer_name != req.computer {
+            return Err(ComputerError::ValidationError(format!(
+                "Computer name mismatch: expected {}, got {}",
+                computer_name, req.computer
+            )));
+        }
+
+        // 单页透传 MCP `resources/list` / single-page passthrough。
+        let result = {
+            let manager_guard = manager.read().await;
+            match manager_guard.as_ref() {
+                Some(mgr) => {
+                    mgr.list_resources(&req.mcp_server, req.cursor.clone())
+                        .await
+                }
+                None => {
+                    return Err(ComputerError::InvalidState(
+                        "MCP Manager not initialized".to_string(),
+                    ));
+                }
+            }
+        };
+
+        match result {
+            Ok((resources, next_cursor)) => {
+                let response = GetResourcesRet {
+                    resources: resources.iter().map(to_a2c_resource).collect(),
+                    next_cursor,
+                    req_id: Some(req.base.req_id),
+                };
+                info!(
+                    "Returned {} resource(s) from '{}' for agent {}",
+                    response.resources.len(),
+                    req.mcp_server,
+                    req.base.agent
+                );
+                Ok((ack_id, serde_json::to_value(response)?))
+            }
+            // 未知 mcp_server → 4014 flat ErrorPayload（ACK 第一参回传）。
+            Err(ComputerError::McpServerNotFound(server)) => {
+                warn!(
+                    "client:get_resources references unregistered MCP server '{}'",
+                    server
+                );
+                let payload = smcp::ErrorPayload::from_error_code(
+                    smcp::ErrorCode::McpServerNotFound,
+                    "MCP Server not registered",
+                )
+                .with_mcp_server_name(server);
+                Ok((ack_id, serde_json::to_value(payload)?))
+            }
+            // capability 不支持 → 4015 flat ErrorPayload。
+            Err(ComputerError::McpCapabilityNotSupported {
+                server_name,
+                capability,
+            }) => {
+                warn!(
+                    "client:get_resources MCP server '{}' does not support '{}' capability",
+                    server_name, capability
+                );
+                let payload = smcp::ErrorPayload::from_error_code(
+                    smcp::ErrorCode::McpCapabilityNotSupported,
+                    "MCP Server does not support the requested capability",
+                )
+                .with_mcp_server_name(server_name)
+                .with_capability(capability);
+                Ok((ack_id, serde_json::to_value(payload)?))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// 从payload中提取ack_id并解析数据
     /// Extract ack_id from payload and parse data
     fn extract_ack_and_parse<T: serde::de::DeserializeOwned>(
@@ -975,6 +1084,48 @@ impl SmcpComputerClient {
     /// [`DEFAULT_AUTH_HEADER_NAME`]).
     pub fn get_auth_header_name(&self) -> &str {
         &self.auth_header_name
+    }
+}
+
+/// 将 MCP `Resource`（rmcp `Annotated<RawResource>`）转换为 A2C 协议层 [`smcp::A2CResource`]（snake_case
+/// mirror）/ Convert an MCP `Resource` to the A2C protocol-level `A2CResource`。
+///
+/// 元数据分工 / metadata partition：MCP 标准 annotations（`priority`/`audience`/`last_modified`）→
+/// `annotations`；rmcp `_meta`（A2C 扩展，如 `fullscreen`）原样搬运到 `_meta`。`audience` 的
+/// `Role::{User,Assistant}` 映射到 [`smcp::ResourceAudience`]；`last_modified` 的 `DateTime<Utc>`
+/// 序列化为 RFC3339（ISO 8601）字符串。对齐 Python `_to_a2c_resource`（RES-01 #30）。
+pub(crate) fn to_a2c_resource(resource: &crate::mcp_clients::model::Resource) -> smcp::A2CResource {
+    let annotations = resource
+        .annotations
+        .as_ref()
+        .map(|ann| smcp::ResourceAnnotations {
+            audience: ann.audience.as_ref().map(|roles| {
+                roles
+                    .iter()
+                    .map(|role| match role {
+                        rmcp::model::Role::User => smcp::ResourceAudience::User,
+                        rmcp::model::Role::Assistant => smcp::ResourceAudience::Assistant,
+                    })
+                    .collect()
+            }),
+            priority: ann.priority,
+            last_modified: ann.last_modified.map(|dt| dt.to_rfc3339()),
+        });
+
+    // rmcp `_meta`（`Meta(JsonObject)`）→ `serde_json::Value::Object`，原样搬运 A2C 扩展字段。
+    let meta = resource
+        .meta
+        .as_ref()
+        .map(|m| serde_json::Value::Object(m.0.clone()));
+
+    smcp::A2CResource {
+        uri: Some(resource.uri.clone()),
+        name: Some(resource.name.clone()),
+        description: resource.description.clone(),
+        mime_type: resource.mime_type.clone(),
+        size: resource.size.map(u64::from),
+        annotations,
+        meta,
     }
 }
 
@@ -1121,5 +1272,233 @@ mod tests {
         let meta_map = meta_obj.as_object().unwrap();
         // Should be the raw string, not "\"already_a_string\""
         assert_eq!(meta_map["simple_key"].as_str().unwrap(), "already_a_string");
+    }
+
+    // ===== RES-01 #30: to_a2c_resource 转换器 =====
+
+    #[test]
+    fn test_to_a2c_resource_full() {
+        use crate::mcp_clients::model::{Annotated, RawResource};
+        use rmcp::model::{Annotations, Meta, Role};
+
+        let mut raw = RawResource::new("window://app/w1", "Win");
+        raw.description = Some("desc".into());
+        raw.mime_type = Some("text/plain".into());
+        raw.size = Some(42);
+        let mut m = serde_json::Map::new();
+        m.insert("fullscreen".into(), serde_json::Value::Bool(true));
+        raw.meta = Some(Meta(m));
+        let ann = Annotations {
+            audience: Some(vec![Role::Assistant]),
+            priority: Some(0.7),
+            last_modified: None,
+        };
+        let a2c = to_a2c_resource(&Annotated::new(raw, Some(ann)));
+
+        assert_eq!(a2c.uri.as_deref(), Some("window://app/w1"));
+        assert_eq!(a2c.name.as_deref(), Some("Win"));
+        assert_eq!(a2c.description.as_deref(), Some("desc"));
+        assert_eq!(a2c.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(a2c.size, Some(42u64));
+        let out_ann = a2c.annotations.expect("annotations preserved");
+        assert_eq!(out_ann.priority, Some(0.7));
+        assert_eq!(
+            out_ann.audience,
+            Some(vec![smcp::ResourceAudience::Assistant])
+        );
+        // _meta（A2C 扩展，如 fullscreen）原样搬运。
+        assert_eq!(
+            a2c.meta.unwrap()["fullscreen"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_to_a2c_resource_minimal() {
+        // 裸资源（无 annotations / _meta）：仅 uri / name，annotations/meta 缺省。
+        let res = crate::mcp_clients::model::make_resource("custom://x/y", "Y", None, None);
+        let a2c = to_a2c_resource(&res);
+        assert_eq!(a2c.uri.as_deref(), Some("custom://x/y"));
+        assert_eq!(a2c.name.as_deref(), Some("Y"));
+        assert!(a2c.annotations.is_none());
+        assert!(a2c.meta.is_none());
+        assert!(a2c.description.is_none());
+    }
+
+    // ===== RES-01 #30: on_get_resources 透明转发 handler =====
+
+    /// 构造 `client:get_resources` 的 wire 形态 payload（flatten 后 agent/req_id 顶层）。
+    fn get_resources_payload(
+        computer: &str,
+        mcp_server: &str,
+        cursor: Option<&str>,
+        ack: i32,
+    ) -> Payload {
+        let mut obj = json!({
+            "agent": "agent-1",
+            "req_id": "req-1",
+            "computer": computer,
+            "mcp_server": mcp_server,
+        });
+        if let Some(c) = cursor {
+            obj.as_object_mut()
+                .unwrap()
+                .insert("cursor".into(), json!(c));
+        }
+        Payload::Text(vec![obj], Some(ack))
+    }
+
+    fn mock(
+        pages: Vec<Vec<crate::mcp_clients::model::Resource>>,
+        cap_fail: bool,
+    ) -> crate::mcp_clients::manager::test_support::MockSkillClient {
+        crate::mcp_clients::manager::test_support::MockSkillClient {
+            pages,
+            fail: false,
+            cap_fail,
+            read_text: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_resources_single_page_passthrough() {
+        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::model::make_resource;
+
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv-1",
+            mock(
+                vec![vec![
+                    make_resource("window://app/w1", "W1", None, None),
+                    make_resource("custom://x/y", "Y", None, None),
+                ]],
+                false,
+            ),
+        )
+        .await;
+        let manager = Arc::new(RwLock::new(Some(manager)));
+
+        let (ack, value) = SmcpComputerClient::handle_get_resources_with_ack(
+            get_resources_payload("comp-1", "srv-1", None, 7),
+            manager,
+            "comp-1".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ack, Some(7));
+        let ret: smcp::GetResourcesRet = serde_json::from_value(value).unwrap();
+        // 单页透传：2 个资源，无下一页；不含 resourceTemplates（仅 resources）。
+        assert_eq!(ret.resources.len(), 2);
+        assert_eq!(ret.next_cursor, None);
+        assert_eq!(ret.resources[0].uri.as_deref(), Some("window://app/w1"));
+        assert_eq!(ret.req_id.unwrap().0, "req-1");
+    }
+
+    #[tokio::test]
+    async fn test_get_resources_cursor_passthrough() {
+        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::model::make_resource;
+
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv-1",
+            mock(
+                vec![
+                    vec![make_resource("res://0", "r0", None, None)],
+                    vec![make_resource("res://1", "r1", None, None)],
+                ],
+                false,
+            ),
+        )
+        .await;
+        let manager = Arc::new(RwLock::new(Some(manager)));
+
+        // 首页：cursor=None → next_cursor 透传为 "1"。
+        let (_, v0) = SmcpComputerClient::handle_get_resources_with_ack(
+            get_resources_payload("comp-1", "srv-1", None, 1),
+            manager.clone(),
+            "comp-1".to_string(),
+        )
+        .await
+        .unwrap();
+        let p0: smcp::GetResourcesRet = serde_json::from_value(v0).unwrap();
+        assert_eq!(p0.next_cursor.as_deref(), Some("1"));
+        assert_eq!(p0.resources[0].uri.as_deref(), Some("res://0"));
+
+        // 次页：cursor="1" 入参透传 → 末页 next_cursor=None。
+        let (_, v1) = SmcpComputerClient::handle_get_resources_with_ack(
+            get_resources_payload("comp-1", "srv-1", Some("1"), 2),
+            manager,
+            "comp-1".to_string(),
+        )
+        .await
+        .unwrap();
+        let p1: smcp::GetResourcesRet = serde_json::from_value(v1).unwrap();
+        assert_eq!(p1.next_cursor, None);
+        assert_eq!(p1.resources[0].uri.as_deref(), Some("res://1"));
+    }
+
+    #[tokio::test]
+    async fn test_get_resources_unknown_server_4014() {
+        use crate::mcp_clients::manager::MCPServerManager;
+
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let (ack, value) = SmcpComputerClient::handle_get_resources_with_ack(
+            get_resources_payload("comp-1", "missing", None, 3),
+            manager,
+            "comp-1".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // flat ErrorPayload 4014（经 ACK 第一参回传），顶层平铺 mcp_server_name。
+        assert_eq!(ack, Some(3));
+        let err: smcp::ErrorPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(err.code, 4014);
+        assert_eq!(err.mcp_server_name.as_deref(), Some("missing"));
+        // 无嵌套 envelope：顶层即 code。
+        assert!(err.capability.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_resources_capability_not_supported_4015() {
+        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+
+        let manager = MCPServerManager::new();
+        inject(&manager, "srv-1", mock(vec![], true)).await;
+        let manager = Arc::new(RwLock::new(Some(manager)));
+
+        let (_, value) = SmcpComputerClient::handle_get_resources_with_ack(
+            get_resources_payload("comp-1", "srv-1", None, 9),
+            manager,
+            "comp-1".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // flat ErrorPayload 4015，顶层平铺 mcp_server_name + capability。
+        let err: smcp::ErrorPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(err.code, 4015);
+        assert_eq!(err.mcp_server_name.as_deref(), Some("srv-1"));
+        assert_eq!(err.capability.as_deref(), Some("resources"));
+    }
+
+    #[tokio::test]
+    async fn test_get_resources_computer_name_mismatch() {
+        use crate::mcp_clients::manager::MCPServerManager;
+
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        // computer_name ≠ req.computer → ValidationError（不进入转发）。
+        let result = SmcpComputerClient::handle_get_resources_with_ack(
+            get_resources_payload("other-comp", "srv-1", None, 5),
+            manager,
+            "comp-1".to_string(),
+        )
+        .await;
+        assert!(matches!(result, Err(ComputerError::ValidationError(_))));
     }
 }
