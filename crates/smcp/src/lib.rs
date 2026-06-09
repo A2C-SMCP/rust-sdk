@@ -549,6 +549,20 @@ pub mod tool_meta {
     pub const A2C_TOTAL_SIZE_KEY: &str = "a2c_total_size";
     /// 子级：旁路资源全量 sha256（十六进制）。
     pub const A2C_SHA256_KEY: &str = "a2c_sha256";
+
+    // ── MCP 上游授权错误（AUTH-01，error-handling.md §403）/ MCP upstream authorization error ──
+    // 协议字面键，**非** a2c 前缀；结果级 `CallToolResult.meta`（wire `_meta`）。授权失败的 tool_call
+    // 不走 flat ErrorPayload，而内嵌 CallToolResult(isError=true) + 下列三键，使 Agent 区分「工具坏了」
+    // 与「需授权」。Protocol-literal keys (NOT a2c-prefixed) for the upstream-auth CallToolResult.meta.
+
+    /// 结果级（MUST）：授权错误码 `4006`/`4007`（整数，[`ErrorCode::ToolAuthorizationRequired`] /
+    /// [`ErrorCode::ToolAuthorizationFailed`]）。
+    pub const AUTH_ERROR_CODE_KEY: &str = "error_code";
+    /// 结果级（MUST）：触发授权错误的 MCP Server 标识 / the MCP server that raised the auth error。
+    pub const AUTH_MCP_SERVER_KEY: &str = "mcp_server";
+    /// 结果级（SHOULD）：面向用户的**非敏感**授权提示对象（`action`/`message`，已脱敏）/
+    /// non-sensitive user-facing auth hint object (sanitized per error-handling.md §454)。
+    pub const AUTH_HINT_KEY: &str = "auth_hint";
 }
 
 impl ToolCallRet {

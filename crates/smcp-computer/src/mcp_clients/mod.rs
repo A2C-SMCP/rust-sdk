@@ -8,6 +8,7 @@
 * 描述: MCP客户端模块，负责管理与MCP服务器的连接和交互
 */
 // 模块声明 / Module declarations
+pub mod auth_error;
 pub mod base_client;
 pub mod http_client;
 pub mod manager;

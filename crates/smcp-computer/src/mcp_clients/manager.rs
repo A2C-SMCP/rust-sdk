@@ -7,6 +7,7 @@
 * 依赖: tokio, async-trait, serde_json
 * 描述: MCP服务器管理器，负责管理多个MCP服务器连接和工具调用路由
 */
+use super::auth_error;
 use super::model::*;
 use super::utils::client_factory;
 use super::vrl_runtime::VrlRuntime;
@@ -522,8 +523,25 @@ impl MCPServerManager {
             client.call_tool(tool_name, parameters).await
         };
 
-        let mut result = result
-            .map_err(|e| ComputerError::ProtocolError(format!("Tool execution failed: {}", e)))?;
+        // 上游错误分流（AUTH-01 #23）：授权类（4006/4007）→ 以协议形状的授权 CallToolResult 透传
+        // （error-handling.md §403，内嵌结果级 meta，**非** flat ErrorPayload）；其余维持通用 ProtocolError。
+        // Branch upstream errors: authorization (4006/4007) surfaces a protocol-shaped auth
+        // CallToolResult; everything else stays a generic ProtocolError.
+        let mut result = match result {
+            Ok(r) => r,
+            Err(e) => match auth_error::classify_auth_error(&e) {
+                Some(code) => {
+                    let hint = auth_error::build_default_auth_hint(code);
+                    return Ok(auth_error::build_auth_error_result(server_name, code, hint));
+                }
+                None => {
+                    return Err(ComputerError::ProtocolError(format!(
+                        "Tool execution failed: {}",
+                        e
+                    )))
+                }
+            },
+        };
 
         // 添加工具元数据到结果 / Add tool metadata to result
         let config = {
@@ -1417,6 +1435,100 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tokio::time::{sleep, Duration};
+
+    /// 最小假 client：`call_tool` 返回注入的 transport 错误，用于覆盖 `call_tool` 授权分流（AUTH-01 #23）。
+    /// 余方法 trivial。Minimal fake whose `call_tool` returns an injected transport error.
+    struct AuthErrClient {
+        msg: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for AuthErrClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ConnectionError(self.msg.clone()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult { contents: vec![] })
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 注入 `AuthErrClient` 到 `active_clients`（auth 分支在 `servers_config` 读取前早返回，仅需此）。
+    async fn inject_auth_err(manager: &MCPServerManager, name: &str, msg: &str) {
+        manager.active_clients.write().await.insert(
+            name.to_string(),
+            StdArc::new(AuthErrClient {
+                msg: msg.to_string(),
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_upstream_401_yields_auth_result_4006() {
+        // 上游 401 → call_tool 不再 Err，而是返回协议形状的授权 CallToolResult（_meta.error_code=4006）。
+        let manager = MCPServerManager::new();
+        inject_auth_err(&manager, "srv", "HTTP error: 401 Unauthorized").await;
+
+        let r = manager
+            .call_tool("srv", "t", serde_json::json!({}), None)
+            .await
+            .expect("auth error should surface as Ok(CallToolResult), not Err");
+
+        assert_eq!(r.is_error, Some(true));
+        let meta = r.meta.as_ref().expect("meta present");
+        assert_eq!(meta.get("error_code").and_then(|v| v.as_i64()), Some(4006));
+        assert_eq!(meta.get("mcp_server").and_then(|v| v.as_str()), Some("srv"));
+        assert!(meta.get("auth_hint").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_non_auth_error_stays_protocol_error() {
+        // 非授权上游错误 → 维持通用 ProtocolError（覆盖 classify 的 None 臂）。
+        let manager = MCPServerManager::new();
+        inject_auth_err(&manager, "srv", "boom: something broke").await;
+
+        let err = manager
+            .call_tool("srv", "t", serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ComputerError::ProtocolError(_)),
+            "got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_manager_creation() {
