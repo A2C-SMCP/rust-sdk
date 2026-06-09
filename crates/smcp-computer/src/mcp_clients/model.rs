@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 // Re-export MCP protocol types from rmcp
 pub use rmcp::model::{
@@ -492,6 +493,20 @@ pub struct HealthCheckResult {
     pub response_time_ms: Option<u64>,
 }
 
+/// 可取消工具调用的结果 / Outcome of a cancellable tool call.
+///
+/// 区分「正常完成」（含工具级 `isError`）与「被显式取消」（`notify:tool_call_cancel` 触发，
+/// 在途调用已就地中断）。取消的**协议态**（结果级 `meta.a2c_cancelled`）由上层 `Computer` 用
+/// SMCP-07 helper 统一写入——本层只表达控制流结果，不预先构造取消态 `CallToolResult`。
+#[derive(Debug)]
+pub enum ToolCallOutcome {
+    /// 正常完成（可能是工具级失败 `isError=true`）/ Completed (possibly a tool-level error).
+    Completed(CallToolResult),
+    /// 被显式取消：在途调用已就地中断；rmcp 传输已尽力向远端补发 MCP `notifications/cancelled`。
+    /// Explicitly cancelled: in-flight call interrupted; rmcp transports best-effort emit `notifications/cancelled`.
+    Cancelled,
+}
+
 /// MCP客户端协议trait / MCP client protocol trait
 #[async_trait::async_trait]
 pub trait MCPClientProtocol: Send + Sync {
@@ -513,6 +528,32 @@ pub trait MCPClientProtocol: Send + Sync {
         tool_name: &str,
         params: serde_json::Value,
     ) -> Result<CallToolResult, MCPClientError>;
+
+    /// 可被取消的工具调用（INT-02 #70 取消最后一公里）/ Cancellable tool call.
+    ///
+    /// `cancel` 触发（`Computer::acancel_tool` ← `notify:tool_call_cancel`）时就地中断在途调用并返回
+    /// [`ToolCallOutcome::Cancelled`]，使原 `client:tool_call` 的 ack 能迅速回填取消态响应。
+    ///
+    /// **默认实现**用 `select!` 竞速 [`Self::call_tool`] 与 `cancel.cancelled()`：取消胜出即 drop 在途
+    /// 调用 future（就地中断——已满足协议 0.2.2 MUST：Agent 迅速拿到取消态响应），但**不**向远端补发 MCP
+    /// `notifications/cancelled`。rmcp 传输（stdio）**覆盖**本方法，经 `RequestHandle` 暴露的 `request_id`
+    /// best-effort 补发 `notifications/cancelled`（MCP 取消为协作式，SHOULD 而非 MUST）。HTTP/SSE 自研
+    /// JSON-RPC 客户端沿用默认就地中断：其 `send_request` 的 id 为内部时间戳、外露需侵入式改造，对无状态
+    /// 请求补发价值有限，列为后续项（见 #70 验收降级说明）。
+    ///
+    /// `biased`：在途调用与取消同时就绪时**优先**取真实结果（对齐 Python `if call_task in done` 先判定）。
+    async fn call_tool_cancellable(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<ToolCallOutcome, MCPClientError> {
+        tokio::select! {
+            biased;
+            res = self.call_tool(tool_name, params) => res.map(ToolCallOutcome::Completed),
+            _ = cancel.cancelled() => Ok(ToolCallOutcome::Cancelled),
+        }
+    }
 
     /// 列出窗口资源 / List window resources
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError>;
