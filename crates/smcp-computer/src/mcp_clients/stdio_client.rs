@@ -310,9 +310,9 @@ impl MCPClientProtocol for StdioMCPClient {
     /// modelcontextprotocol/python-sdk#1410/#1419，故 Python 侧只能本地中断不补发；Rust 在此**领先**）。
     /// 因此用低层 [`Peer::send_request_with_option`](rmcp::service::Peer::send_request_with_option) 下发
     /// `tools/call` 以捕获 `request_id`，再把「等待响应（`rx`）」与「取消信号」`select!` 竞速：
-    /// - 响应先到 → [`ToolCallOutcome::Completed`]；
+    /// - 响应先到 → [`CancellableCallOutcome::Completed`]；
     /// - 取消先到 → 经捕获的 `request_id` best-effort 补发 MCP `notifications/cancelled`（time-box 2s，
-    ///   防 teardown 卡住），返回 [`ToolCallOutcome::Cancelled`]。MCP 取消为**协作式**：远端**可忽略**该
+    ///   防 teardown 卡住），返回 [`CancellableCallOutcome::Cancelled`]。MCP 取消为**协作式**：远端**可忽略**该
     ///   通知跑完，不作硬保证（协议 SHOULD）。`rx` 与 `peer` 由 `RequestHandle` 拆解后各自独立持有，
     ///   使两分支互不消费 `self`。
     async fn call_tool_cancellable(
@@ -320,13 +320,12 @@ impl MCPClientProtocol for StdioMCPClient {
         tool_name: &str,
         params: serde_json::Value,
         cancel: CancellationToken,
-    ) -> Result<ToolCallOutcome, MCPClientError> {
+    ) -> Result<CancellableCallOutcome, MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
         let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
 
         // 低层下发以捕获 rmcp 分配的 request_id（高层 service.call_tool 不暴露 id）。
         let request = ClientRequest::CallToolRequest(CallToolRequest {
@@ -337,10 +336,17 @@ impl MCPClientProtocol for StdioMCPClient {
             },
             extensions: Default::default(),
         });
-        let handle: RequestHandle<RoleClient> = service
+        // 内联 service 借用：`send_request_with_option` 返回后即结束对 guard 的借用。
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
             .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
             .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+        // handle 已 owned（id/rx/peer 均独立于 service）→ 立即释放 RunningService 互斥锁，放开同一 stdio
+        // server 上的并发在途调用/取消（可取消调用可长/无界，绝不应在 select! 全程持锁）。RunningService
+        // 由 self.running_service 的 Arc<Mutex> 保活，drop guard 仅释放锁、不析构 service，peer 仍可用。
+        drop(guard);
         let request_id = handle.id.clone();
         // 拆解：rx（等待响应）与 peer（取消补发）各自独立，避免 await_response/cancel 互相消费 handle。
         let RequestHandle { rx, peer, .. } = handle;
@@ -348,7 +354,7 @@ impl MCPClientProtocol for StdioMCPClient {
         tokio::select! {
             biased;
             resp = rx => match resp {
-                Ok(Ok(ServerResult::CallToolResult(r))) => Ok(ToolCallOutcome::Completed(r)),
+                Ok(Ok(ServerResult::CallToolResult(r))) => Ok(CancellableCallOutcome::Completed(r)),
                 Ok(Ok(_)) => Err(MCPClientError::ProtocolError(
                     "Unexpected response variant for tools/call".to_string(),
                 )),
@@ -364,7 +370,7 @@ impl MCPClientProtocol for StdioMCPClient {
                 if tokio::time::timeout(Duration::from_secs(2), notify).await.is_err() {
                     warn!("emit MCP notifications/cancelled timed out (best-effort, ignored)");
                 }
-                Ok(ToolCallOutcome::Cancelled)
+                Ok(CancellableCallOutcome::Cancelled)
             }
         }
     }

@@ -499,7 +499,7 @@ pub struct HealthCheckResult {
 /// 在途调用已就地中断）。取消的**协议态**（结果级 `meta.a2c_cancelled`）由上层 `Computer` 用
 /// SMCP-07 helper 统一写入——本层只表达控制流结果，不预先构造取消态 `CallToolResult`。
 #[derive(Debug)]
-pub enum ToolCallOutcome {
+pub enum CancellableCallOutcome {
     /// 正常完成（可能是工具级失败 `isError=true`）/ Completed (possibly a tool-level error).
     Completed(CallToolResult),
     /// 被显式取消：在途调用已就地中断；rmcp 传输已尽力向远端补发 MCP `notifications/cancelled`。
@@ -532,7 +532,7 @@ pub trait MCPClientProtocol: Send + Sync {
     /// 可被取消的工具调用（INT-02 #70 取消最后一公里）/ Cancellable tool call.
     ///
     /// `cancel` 触发（`Computer::acancel_tool` ← `notify:tool_call_cancel`）时就地中断在途调用并返回
-    /// [`ToolCallOutcome::Cancelled`]，使原 `client:tool_call` 的 ack 能迅速回填取消态响应。
+    /// [`CancellableCallOutcome::Cancelled`]，使原 `client:tool_call` 的 ack 能迅速回填取消态响应。
     ///
     /// **默认实现**用 `select!` 竞速 [`Self::call_tool`] 与 `cancel.cancelled()`：取消胜出即 drop 在途
     /// 调用 future（就地中断——已满足协议 0.2.2 MUST：Agent 迅速拿到取消态响应），但**不**向远端补发 MCP
@@ -547,11 +547,11 @@ pub trait MCPClientProtocol: Send + Sync {
         tool_name: &str,
         params: serde_json::Value,
         cancel: CancellationToken,
-    ) -> Result<ToolCallOutcome, MCPClientError> {
+    ) -> Result<CancellableCallOutcome, MCPClientError> {
         tokio::select! {
             biased;
-            res = self.call_tool(tool_name, params) => res.map(ToolCallOutcome::Completed),
-            _ = cancel.cancelled() => Ok(ToolCallOutcome::Cancelled),
+            res = self.call_tool(tool_name, params) => res.map(CancellableCallOutcome::Completed),
+            _ = cancel.cancelled() => Ok(CancellableCallOutcome::Cancelled),
         }
     }
 

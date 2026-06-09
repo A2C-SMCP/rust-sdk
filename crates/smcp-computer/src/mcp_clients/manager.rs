@@ -533,8 +533,8 @@ impl MCPServerManager {
     /// 与 [`Self::call_tool`] 同：套用 manager 级 `timeout`，并对**完成**结果跑相同收尾
     /// （授权分流 / `tool_meta` / VRL，见 [`Self::finalize_tool_result`]）。差异仅在改调
     /// [`MCPClientProtocol::call_tool_cancellable`] 并透传 `cancel`：
-    /// - [`ToolCallOutcome::Cancelled`]（取消胜出）→ 原样上抛，由 `Computer` 写结果级 `meta.a2c_cancelled`；
-    /// - 完成 / 上游错误 → 经 `finalize_tool_result` 收尾后包回 [`ToolCallOutcome::Completed`]；
+    /// - [`CancellableCallOutcome::Cancelled`]（取消胜出）→ 原样上抛，由 `Computer` 写结果级 `meta.a2c_cancelled`；
+    /// - 完成 / 上游错误 → 经 `finalize_tool_result` 收尾后包回 [`CancellableCallOutcome::Completed`]；
     /// - 超时 → [`ComputerError::TimeoutError`]（`Computer` 写 `meta.a2c_timeout`）。
     pub async fn call_tool_cancellable(
         &self,
@@ -543,7 +543,7 @@ impl MCPServerManager {
         parameters: serde_json::Value,
         timeout: Option<std::time::Duration>,
         cancel: CancellationToken,
-    ) -> Result<ToolCallOutcome, ComputerError> {
+    ) -> Result<CancellableCallOutcome, ComputerError> {
         // 获取客户端引用 / Get client reference
         let client = {
             let clients = self.active_clients.read().await;
@@ -559,6 +559,10 @@ impl MCPServerManager {
         };
 
         // 执行可取消调用（manager 级 timeout 包裹；token 透传至客户端就地中断 + best-effort 远端补发）。
+        // ⚠️ 超时分支语义：manager 级 timeout 触发时直接 **drop** client future、**不**经取消 token 的
+        // select! 分支，故超时**不**向远端补发 MCP notifications/cancelled（区别于 Agent 显式取消）。这是
+        // best-effort 协作式取消的有意取舍（timeout ≠ cancel）：超时的 stdio 工具子进程可能仍在跑，但 Agent
+        // 已据 meta.a2c_timeout 拿到超时态响应。如需超时也补发，须改成 token 路径取消而非 drop（后续评估）。
         let outcome = if let Some(timeout) = timeout {
             tokio::time::timeout(
                 timeout,
@@ -575,17 +579,17 @@ impl MCPServerManager {
         match outcome {
             // 取消胜出：在途调用已就地中断（rmcp 传输已 best-effort 补发 notifications/cancelled）。上抛由
             // Computer 写取消态结果，不在此构造（保持「控制流结果 vs 协议态结果」分层）。
-            Ok(ToolCallOutcome::Cancelled) => Ok(ToolCallOutcome::Cancelled),
+            Ok(CancellableCallOutcome::Cancelled) => Ok(CancellableCallOutcome::Cancelled),
             // 完成：跑与 call_tool 一致的收尾（授权分流可能把 4006/4007 转成协议形状授权结果）。
-            Ok(ToolCallOutcome::Completed(r)) => self
+            Ok(CancellableCallOutcome::Completed(r)) => self
                 .finalize_tool_result(server_name, tool_name, Ok(r))
                 .await
-                .map(ToolCallOutcome::Completed),
+                .map(CancellableCallOutcome::Completed),
             // 上游错误：交由 finalize 的授权分流（Err 路径）；非授权类仍上抛 ProtocolError。
             Err(e) => self
                 .finalize_tool_result(server_name, tool_name, Err(e))
                 .await
-                .map(ToolCallOutcome::Completed),
+                .map(CancellableCallOutcome::Completed),
         }
     }
 
@@ -1504,6 +1508,97 @@ pub(crate) mod test_support {
             .await
             .insert(name.to_string(), StdArc::new(client));
     }
+
+    // ── INT-02 #70：可取消调用的共享假 client（manager 三态 + computer 端到端共用）──────────
+
+    /// 可配置行为的假 MCP client，覆盖可取消调用三态（用默认 trait 实现的 select-drop 竞速）。经
+    /// [`inject_callable`] 注入，供 manager（`call_tool_cancellable` 三态）与 computer
+    /// （`execute_tool_cancellable` / `acancel_tool` 端到端）测试共享。字段私有——构造走 `inject_callable`。
+    pub(crate) struct CancelMockClient {
+        behavior: CancelBehavior,
+    }
+
+    /// [`CancelMockClient`] 的注入行为 / injected behavior for the cancellable mock。
+    pub(crate) enum CancelBehavior {
+        /// 立即返回成功结果 / return Ok immediately.
+        CompleteOk,
+        /// 永不返回（模拟在途阻塞——由取消令牌就地中断）/ never resolves (interrupted by cancel token).
+        BlockForever,
+        /// 睡眠后返回（配合短 timeout 触发 manager 级超时）/ sleep then Ok.
+        Sleep(std::time::Duration),
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for CancelMockClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            match &self.behavior {
+                CancelBehavior::CompleteOk => {
+                    Ok(CallToolResult::success(vec![Content::text("done")]))
+                }
+                CancelBehavior::BlockForever => std::future::pending().await,
+                CancelBehavior::Sleep(d) => {
+                    tokio::time::sleep(*d).await;
+                    Ok(CallToolResult::success(vec![Content::text("late")]))
+                }
+            }
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 注入可取消假 client + `tool→server` 映射，使 `validate_tool_call` 可解析（供 computer 端到端测试）。
+    /// Inject a cancellable fake client + tool→server mapping so `validate_tool_call` resolves.
+    pub(crate) async fn inject_callable(
+        manager: &MCPServerManager,
+        server: &str,
+        tool: &str,
+        behavior: CancelBehavior,
+    ) {
+        manager.active_clients.write().await.insert(
+            server.to_string(),
+            StdArc::new(CancelMockClient { behavior }),
+        );
+        manager
+            .tool_mapping
+            .write()
+            .await
+            .insert(tool.to_string(), server.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -2217,80 +2312,13 @@ mod tests {
     }
 
     // ── INT-02 #70：call_tool_cancellable 三态（completed / cancelled / timeout）─────────
-
-    /// 可配置行为的假 client，覆盖 call_tool_cancellable 三态（用默认 trait 实现的 select-drop 竞速）。
-    /// Configurable fake client to exercise the cancellable call's three outcomes.
-    struct CancelMockClient {
-        behavior: CancelBehavior,
-    }
-    enum CancelBehavior {
-        /// 立即返回成功结果 / return Ok immediately.
-        CompleteOk,
-        /// 永不返回（模拟在途阻塞——由取消令牌就地中断）/ never resolves.
-        BlockForever,
-        /// 睡眠后返回（配合短 timeout 触发 manager 级超时）/ sleep then Ok.
-        Sleep(Duration),
-    }
-
-    #[async_trait::async_trait]
-    impl MCPClientProtocol for CancelMockClient {
-        fn state(&self) -> ClientState {
-            ClientState::Connected
-        }
-        async fn connect(&self) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-        async fn disconnect(&self) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
-            Ok(vec![])
-        }
-        async fn call_tool(
-            &self,
-            _tool: &str,
-            _params: Value,
-        ) -> Result<CallToolResult, MCPClientError> {
-            match &self.behavior {
-                CancelBehavior::CompleteOk => {
-                    Ok(CallToolResult::success(vec![Content::text("done")]))
-                }
-                CancelBehavior::BlockForever => std::future::pending().await,
-                CancelBehavior::Sleep(d) => {
-                    sleep(*d).await;
-                    Ok(CallToolResult::success(vec![Content::text("late")]))
-                }
-            }
-        }
-        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
-            Ok(vec![])
-        }
-        async fn list_resources_page(
-            &self,
-            _cursor: Option<String>,
-        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
-            Ok((vec![], None))
-        }
-        async fn get_window_detail(
-            &self,
-            _resource: Resource,
-        ) -> Result<ReadResourceResult, MCPClientError> {
-            Err(MCPClientError::ProtocolError("n/a".into()))
-        }
-        async fn subscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-        async fn unsubscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
-            Ok(())
-        }
-    }
+    // CancelMockClient / CancelBehavior / inject_callable 已上移至 test_support（pub(crate)），
+    // 供 manager（本节）与 computer（execute_tool_cancellable 端到端）测试共享。
+    use super::test_support::{inject_callable, CancelBehavior};
 
     async fn manager_with_cancel_mock(behavior: CancelBehavior) -> MCPServerManager {
         let manager = MCPServerManager::new();
-        manager.active_clients.write().await.insert(
-            "srv".to_string(),
-            StdArc::new(CancelMockClient { behavior }),
-        );
+        inject_callable(&manager, "srv", "t", behavior).await;
         manager
     }
 
@@ -2309,8 +2337,8 @@ mod tests {
             .await
             .unwrap();
         match outcome {
-            ToolCallOutcome::Completed(r) => assert_ne!(r.is_error, Some(true)),
-            ToolCallOutcome::Cancelled => panic!("未 fire 令牌不应取消"),
+            CancellableCallOutcome::Completed(r) => assert_ne!(r.is_error, Some(true)),
+            CancellableCallOutcome::Cancelled => panic!("未 fire 令牌不应取消"),
         }
     }
 
@@ -2326,7 +2354,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcome, ToolCallOutcome::Cancelled),
+            matches!(outcome, CancellableCallOutcome::Cancelled),
             "在途阻塞 + 取消令牌应回 Cancelled"
         );
     }

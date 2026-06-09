@@ -421,6 +421,10 @@ impl SocketIoTransport {
         // AGT-05 #44：把 ack 等待与断连信号竞速——Agent MUST NOT 靠 ack 超时判定断连（协议 0.2.2
         // in-flight disconnect 容错）。`wait_for(|v| *v)` 只在断连位为 true 时就绪：粘滞——若进入前已断连
         // 立即就绪（关闭「断连早于 call」竞速窗）；且忽略重连时 Connect→false 的中间值，不误触发。
+        //
+        // 测试覆盖说明：本竞速逻辑依赖真实 socket 事件（Event::Close/Error），按项目"无 mock transport"
+        // 约定（SocketIoTransport 为具体 struct）无法单测；其端到端覆盖（mid-call 杀连接）随 #72 socketio
+        // 接线一并补 e2e。逻辑正确性：粘滞读 + Err（发送端析构=传输析构）亦视为断连。
         let mut disconnect_rx = self.disconnect_rx.clone();
 
         tokio::select! {

@@ -44,8 +44,8 @@ use crate::inputs::utils::run_command;
 use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{
-        content_as_text, is_call_tool_error, CallToolResult, Content, MCPServerConfig,
-        MCPServerInput, ReadResourceResult, Resource, Tool, ToolCallOutcome,
+        content_as_text, is_call_tool_error, CallToolResult, CancellableCallOutcome, Content,
+        MCPServerConfig, MCPServerInput, ReadResourceResult, Resource, Tool,
     },
     ConfigRender, RenderError,
 };
@@ -257,9 +257,6 @@ pub struct Computer<S: Session> {
     /// `Arc` 共享——clone 体与原 Computer 命中**同一**注册表，使任意 clone 上的 `acancel_tool` 生效。
     /// In-flight cancellable tool-call registry; `acancel_tool` fires the matching token.
     inflight_tool_tasks: Arc<StdMutex<HashMap<String, CancellationToken>>>,
-    /// 经 `acancel_tool` 显式取消的 `req_id` 标记（供历史区分「取消」与其它失败；与外层 future 被 drop
-    /// 的「连接断开/teardown」取消相区别）/ req_ids explicitly cancelled via `acancel_tool`。
-    cancelled_req_ids: Arc<StdMutex<HashSet<String>>>,
 }
 
 /// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
@@ -532,7 +529,6 @@ impl<S: Session> Computer<S> {
             toolspool_store: Arc::new(RwLock::new(None)),
             blob_resolvers: Arc::new(RwLock::new(HashMap::new())),
             inflight_tool_tasks: Arc::new(StdMutex::new(HashMap::new())),
-            cancelled_req_ids: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -1370,7 +1366,7 @@ impl<S: Session> Computer<S> {
     /// 超时回填 `meta.a2c_timeout=true`（协议 0.2.2 结果级标记，SMCP-07 键）。
     ///
     /// 三态判别（对齐 #70 验收）：
-    /// - **显式取消**（`acancel_tool` fire 令牌）→ [`ToolCallOutcome::Cancelled`] → 取消态结果；
+    /// - **显式取消**（`acancel_tool` fire 令牌）→ [`CancellableCallOutcome::Cancelled`] → 取消态结果；
     /// - **超时**（manager 级 timeout）→ [`ComputerError::TimeoutError`] → 超时态结果；
     /// - **外层断连/teardown**（本 future 被 drop）→ 不产生任何结果（future 消失，无 ack 可投），
     ///   RAII [`InflightCancelGuard`] 注销注册表，**绝不**被误判为取消态（tokio drop 语义天然满足）。
@@ -1424,7 +1420,7 @@ impl<S: Session> Computer<S> {
         let mut success = false;
         let mut error_msg: Option<String> = None;
         let result: CallToolResult = match outcome {
-            Ok(ToolCallOutcome::Completed(r)) => {
+            Ok(CancellableCallOutcome::Completed(r)) => {
                 success = !is_call_tool_error(&r);
                 if !success {
                     error_msg = r
@@ -1434,12 +1430,10 @@ impl<S: Session> Computer<S> {
                 }
                 r
             }
-            Ok(ToolCallOutcome::Cancelled) => {
-                // 显式取消：写协议 0.2.2 取消态结果级 meta（区别于普通失败/超时）；清理取消标记。
-                self.cancelled_req_ids
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(req_id);
+            Ok(CancellableCallOutcome::Cancelled) => {
+                // 显式取消：写协议 0.2.2 取消态结果级 meta（区别于普通失败/超时）。取消唯一性由
+                // CancellableCallOutcome::Cancelled 自身保证（token 每调用独享、仅 acancel_tool 调 .cancel()），
+                // 无需额外标记集合。
                 error_msg = Some("cancelled".to_string());
                 let mut r = CallToolResult::error(vec![Content::text(
                     "工具调用已被取消 / Tool call cancelled",
@@ -1485,8 +1479,8 @@ impl<S: Session> Computer<S> {
 
     /// 取消一个在途工具调用（响应 `notify:tool_call_cancel`，INT-02 #70）/ Cancel an in-flight tool call.
     ///
-    /// 标记 `req_id` 已显式取消并 fire 其 [`CancellationToken`]，触发 [`Self::execute_tool_cancellable`]
-    /// 的取消分支（就地中断 + rmcp 传输 best-effort 补发 MCP `notifications/cancelled`）。
+    /// fire 该 `req_id` 的 [`CancellationToken`]，触发 [`Self::execute_tool_cancellable`] 的取消分支
+    /// （就地中断 + rmcp 传输 best-effort 补发 MCP `notifications/cancelled`）。
     ///
     /// 返回 `true`：已对一个在途任务请求取消；`false`：`req_id` 未知或已完成（**幂等 no-op**，对齐
     /// Python `acancel_tool`——完成即由 [`InflightCancelGuard`] 注销注册表，再次取消落空回 `false`）。
@@ -1501,10 +1495,6 @@ impl<S: Session> Computer<S> {
         };
         match token {
             Some(token) => {
-                self.cancelled_req_ids
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(req_id.to_string());
                 token.cancel();
                 true
             }
@@ -1762,7 +1752,6 @@ impl<S: Session + Clone> Clone for Computer<S> {
             blob_resolvers: Arc::clone(&self.blob_resolvers),
             // 取消注册表属**共享态**：clone 体与原 Computer 须命中同一表，否则跨 clone 的 acancel_tool 失效。
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
-            cancelled_req_ids: Arc::clone(&self.cancelled_req_ids),
         }
     }
 }
@@ -2836,6 +2825,108 @@ mod tests {
         assert!(
             v["_meta"].get("a2c_cancelled").is_none(),
             "超时 ≠ 取消：不应同时写 a2c_cancelled"
+        );
+    }
+
+    // ── INT-02 #70：execute_tool_cancellable / acancel_tool 端到端（注入 mock manager）──────
+    // 用 manager test_support 的可取消假 client + tool_mapping 把这条编排路径拉成单测（不必等 #72 e2e）。
+
+    /// 建一个注入了可取消假 client（server="srv", tool="t"）的 Computer / build a Computer with a
+    /// cancellable fake MCP client wired in。
+    async fn computer_with_cancel_mock(
+        behavior: crate::mcp_clients::manager::test_support::CancelBehavior,
+    ) -> Computer<SilentSession> {
+        let computer = Computer::new(
+            "test_computer",
+            SilentSession::new("t"),
+            None,
+            None,
+            true,
+            true,
+        );
+        let manager = MCPServerManager::new();
+        crate::mcp_clients::manager::test_support::inject_callable(&manager, "srv", "t", behavior)
+            .await;
+        *computer.mcp_manager.write().await = Some(manager);
+        computer
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_cancellable_timeout_marks_meta_and_history() {
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+        use std::time::Duration;
+        // 假 client 睡 10s + 50ms timeout → manager 级超时 → 回填超时态结果（_meta.a2c_timeout）+ 历史。
+        let computer =
+            computer_with_cancel_mock(CancelBehavior::Sleep(Duration::from_secs(10))).await;
+
+        let result = computer
+            .execute_tool_cancellable("rid-timeout", "t", serde_json::json!({}), Some(0.05))
+            .await
+            .expect("超时应回填结果而非上抛");
+
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            v["_meta"]["a2c_timeout"], true,
+            "超时态须写 _meta.a2c_timeout"
+        );
+        assert_eq!(result.is_error, Some(true));
+
+        let history = computer.get_tool_history().await.unwrap();
+        let rec = history
+            .iter()
+            .find(|r| r.req_id == "rid-timeout")
+            .expect("历史应落一条记录");
+        assert!(!rec.success);
+        assert_eq!(rec.error.as_deref(), Some("timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_cancellable_cancel_marks_meta_and_acancel_true() {
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+        use std::time::Duration;
+        // 假 client 永不返回（在途阻塞）；另一上下文 acancel → 就地中断 → 回填取消态结果。
+        // Arc<Computer> 两持有共享 inflight 注册表（与 socketio 接线 #72 同款：取消由独立上下文触发）。
+        let computer = Arc::new(computer_with_cancel_mock(CancelBehavior::BlockForever).await);
+
+        let exec = computer.clone();
+        let handle = tokio::spawn(async move {
+            exec.execute_tool_cancellable("rid-cancel", "t", serde_json::json!({}), None)
+                .await
+        });
+
+        // bounded-poll：等 execute 注册令牌后 acancel 命中在途调用回 true（确定性，避免裸 sleep 竞速）。
+        let mut cancelled = false;
+        for _ in 0..200 {
+            if computer.acancel_tool("rid-cancel").await {
+                cancelled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cancelled, "acancel_tool 应对在途调用返回 true");
+
+        let result = handle.await.expect("join").expect("取消应回填结果而非上抛");
+
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            v["_meta"]["a2c_cancelled"], true,
+            "取消态须写 _meta.a2c_cancelled"
+        );
+        assert_eq!(v["_meta"]["a2c_cancel_reason"], "agent_requested");
+        assert_eq!(result.is_error, Some(true));
+
+        let history = computer.get_tool_history().await.unwrap();
+        let rec = history
+            .iter()
+            .find(|r| r.req_id == "rid-cancel")
+            .expect("历史应落一条记录");
+        assert!(!rec.success);
+        assert_eq!(rec.error.as_deref(), Some("cancelled"));
+
+        // 已完成：注册表已注销，再次 acancel 落空回 false（幂等）。
+        assert!(
+            !computer.acancel_tool("rid-cancel").await,
+            "已完成的 req_id 再次取消应回 false"
         );
     }
 }
