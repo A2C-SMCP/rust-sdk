@@ -16,7 +16,8 @@ use crate::{
     protocol_error::raise_for_error_payload,
     request_builders::{
         build_get_desktop_request, build_get_resources_request, build_get_skill_request,
-        build_get_skills_request, build_get_tools_request, build_tool_call_request,
+        build_get_skills_request, build_get_tools_request, build_tool_call_cancel,
+        build_tool_call_request,
     },
     response::{ensure_req_id, parse_get_resources_response},
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
@@ -283,7 +284,7 @@ impl AsyncSmcpAgent {
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
         let data = serde_json::to_value(&req)?;
         let response = transport
-            .call(CLIENT_GET_TOOLS, data, self.config.default_timeout)
+            .call(CLIENT_GET_TOOLS, data, self.config.get_timeout)
             .await?;
 
         // flat ErrorPayload → 协议错误（#47↔#34：对端未命中/能力错误经 ack 回 flat error）
@@ -324,7 +325,7 @@ impl AsyncSmcpAgent {
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
         let data = serde_json::to_value(&req)?;
         let response = transport
-            .call(CLIENT_GET_DESKTOP, data, self.config.default_timeout)
+            .call(CLIENT_GET_DESKTOP, data, self.config.get_timeout)
             .await?;
 
         // flat ErrorPayload → 协议错误（#47↔#34）
@@ -376,7 +377,7 @@ impl AsyncSmcpAgent {
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
         let data = serde_json::to_value(&req)?;
         let response = transport
-            .call(CLIENT_GET_RESOURCES, data, self.config.default_timeout)
+            .call(CLIENT_GET_RESOURCES, data, self.config.get_timeout)
             .await?;
 
         // 响应编排（flat ErrorPayload 4014/4015 透传 + req_id 校验 + 整页解析）单点收敛于纯函数，
@@ -409,7 +410,7 @@ impl AsyncSmcpAgent {
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
         let data = serde_json::to_value(&req)?;
         let response = transport
-            .call(CLIENT_GET_SKILLS, data, self.config.default_timeout)
+            .call(CLIENT_GET_SKILLS, data, self.config.get_timeout)
             .await?;
 
         let skills = parse_get_skills_response(&response, req_id.as_str())?;
@@ -453,7 +454,7 @@ impl AsyncSmcpAgent {
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
         let data = serde_json::to_value(&req)?;
         let response = transport
-            .call(CLIENT_GET_SKILL, data, self.config.default_timeout)
+            .call(CLIENT_GET_SKILL, data, self.config.get_timeout)
             .await?;
 
         let ret = parse_get_skill_response(&response, req_id.as_str())?;
@@ -502,11 +503,9 @@ impl AsyncSmcpAgent {
                     "Tool call timeout, cancelling: {} on {}",
                     tool_name, computer
                 );
-                // 发送取消请求
-                let cancel_data = AgentCallData {
-                    agent: agent_config.agent.clone(),
-                    req_id: req_id_for_cancel.clone(),
-                };
+                // 发送取消请求（复用统一取消载体 builder：req_id==原 tool_call req_id）
+                let cancel_data =
+                    build_tool_call_cancel(&agent_config.agent, req_id_for_cancel.as_str());
                 let cancel_value = serde_json::to_value(cancel_data)?;
                 if let Err(e) = transport.emit(SERVER_TOOL_CALL_CANCEL, cancel_value).await {
                     error!("Failed to send cancel request: {}", e);
@@ -529,6 +528,36 @@ impl AsyncSmcpAgent {
                 Err(e)
             }
         }
+    }
+
+    /// 取消一次在途工具调用（AGT-05 #44）/ Cancel an in-flight tool call.
+    ///
+    /// 发送 `server:tool_call_cancel`（**fire-and-forget，无 ack**）：`req_id` **MUST**==被取消的原
+    /// `client:tool_call` 的 req_id（唯一定位在途调用）。Server 收后仅向房间广播 `notify:tool_call_cancel`、
+    /// **不**回执——故本方法用 `emit`（**非** `call`）不等待 ack，交付传输层即返回 `Ok(())`；ack 缺席是
+    /// 协议合规预期，**MUST NOT** 当作失败。
+    ///
+    /// 取消是否真正中断由 Computer 侧协作式处理（INT-02 #70）；Agent 随后从原 `client:tool_call` 的 ack
+    /// 拿到取消态 `CallToolResult`（结果级 `a2c_cancelled=true`），用 [`classify_tool_call_outcome`]
+    /// 区分取消 / 超时 / 失败。
+    ///
+    /// 注：取消载体 `AgentCallData` 仅 `{agent, req_id}`，**不含** reason 字段——取消原因
+    /// （`a2c_cancel_reason`）由 Computer 写在结果级 meta，非 Agent 发送（故本方法无 `reason` 参数）。
+    /// 调用方需自行持有原 tool_call 的 `req_id`（由另一上下文触发取消，与阻塞中的 tool_call 并行）。
+    pub async fn tool_call_cancel(&self, req_id: &str) -> Result<()> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let cancel = build_tool_call_cancel(&agent_config.agent, req_id);
+        let data = serde_json::to_value(cancel)?;
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+
+        // fire-and-forget：emit 不等待 ack（仅表示「已交给传输层发出」），契合 server:tool_call_cancel 无 ack 语义。
+        transport.emit(SERVER_TOOL_CALL_CANCEL, data).await?;
+        debug!("Sent server:tool_call_cancel for req_id={}", req_id);
+        Ok(())
     }
 
     /// 列出房间内的所有会话

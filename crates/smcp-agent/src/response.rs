@@ -54,6 +54,61 @@ pub(crate) fn parse_get_resources_response(
     Ok(ret)
 }
 
+/// `client:tool_call` 结果三态（+成功）/ tri-state of a tool_call result (AGT-05 #44).
+///
+/// 据**结果级** A2C 标记在 `isError` 之上进一步分流，供 Agent 调用方区分「取消 / 超时 / 普通失败」：
+/// - [`ToolCallOutcome::Cancelled`]：被 `notify:tool_call_cancel` 取消（`a2c_cancelled=true`）；
+/// - [`ToolCallOutcome::TimedOut`]：执行超时（`a2c_timeout=true`）；
+/// - [`ToolCallOutcome::Failed`]：其它工具级失败（`isError=true` 但无取消/超时标记）；
+/// - [`ToolCallOutcome::Completed`]：成功。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallOutcome {
+    /// 成功（`isError` 非 true，无取消/超时标记）。
+    Completed,
+    /// 被取消（结果级 `a2c_cancelled=true`）。
+    Cancelled,
+    /// 超时（结果级 `a2c_timeout=true`）。
+    TimedOut,
+    /// 普通工具级失败（`isError=true`，无取消/超时标记）。
+    Failed,
+}
+
+/// 据结果级 A2C 标记把 `client:tool_call` 响应分类为三态（+成功）（AGT-05 #44）。
+///
+/// **宽松读取**结果级 meta 的两种线上 key：`meta`（smcp `ToolCallRet` 形态）与 `_meta`（rmcp
+/// `CallToolResult` / MCP 约定形态——Rust Computer 即经此发出取消/超时标记，见 INT-02 #70）。协议
+/// data-structures.md §234 规定 consumer **SHOULD** 对 `meta`/`_meta` 兜底读取，故二者任一命中即生效。
+///
+/// 优先级：取消 > 超时 > 失败 > 成功（取消/超时是对 `isError` 的语义细化，故先判定）。纯函数，无 I/O，
+/// 供 async/sync Agent 共享并独立单测（对标 Python agent 三态区分逻辑）。
+pub fn classify_tool_call_outcome(response: &Value) -> ToolCallOutcome {
+    if result_meta_flag(response, smcp::tool_meta::A2C_CANCELLED_KEY) {
+        ToolCallOutcome::Cancelled
+    } else if result_meta_flag(response, smcp::tool_meta::A2C_TIMEOUT_KEY) {
+        ToolCallOutcome::TimedOut
+    } else if response
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        ToolCallOutcome::Failed
+    } else {
+        ToolCallOutcome::Completed
+    }
+}
+
+/// 读结果级 meta 的布尔标记，兜底 `meta` 与 `_meta` 两种线上 key（任一为 `true` 即真）。
+/// Read a result-level meta bool flag, leniently across both `meta` and `_meta` wire keys.
+fn result_meta_flag(response: &Value, key: &str) -> bool {
+    ["meta", "_meta"].iter().any(|container| {
+        response
+            .get(*container)
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +202,74 @@ mod tests {
         assert!(
             matches!(err, SmcpAgentError::ReqIdMismatch { .. }),
             "got {err:?}"
+        );
+    }
+
+    // ── AGT-05 #44：tool_call 结果三态区分（classify_tool_call_outcome）──────────────────
+
+    #[test]
+    fn test_classify_completed() {
+        // 成功：无 isError、无标记 → Completed。
+        let resp = json!({ "content": [{ "type": "text", "text": "ok" }], "isError": false });
+        assert_eq!(
+            classify_tool_call_outcome(&resp),
+            ToolCallOutcome::Completed
+        );
+        // 缺省（无 isError 键）同样视为成功。
+        assert_eq!(
+            classify_tool_call_outcome(&json!({ "content": [] })),
+            ToolCallOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn test_classify_failed_plain_error() {
+        // isError=true 但无取消/超时标记 → Failed（普通工具级失败）。
+        let resp = json!({ "isError": true, "content": [{ "type": "text", "text": "boom" }] });
+        assert_eq!(classify_tool_call_outcome(&resp), ToolCallOutcome::Failed);
+    }
+
+    #[test]
+    fn test_classify_cancelled_reads_both_meta_and_underscore_meta() {
+        // 取消标记落 `meta`（smcp ToolCallRet 形态）→ Cancelled。
+        let via_meta = json!({ "isError": true, "meta": { "a2c_cancelled": true } });
+        assert_eq!(
+            classify_tool_call_outcome(&via_meta),
+            ToolCallOutcome::Cancelled
+        );
+        // 取消标记落 `_meta`（rmcp CallToolResult / Rust Computer 形态，INT-02 #70）→ 同样 Cancelled。
+        // 这是取消全链能跑通的关键：Computer 发 `_meta`，Agent MUST 据此识别。
+        let via_underscore = json!({ "isError": true, "_meta": { "a2c_cancelled": true } });
+        assert_eq!(
+            classify_tool_call_outcome(&via_underscore),
+            ToolCallOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_classify_timeout_reads_both_keys() {
+        let via_meta = json!({ "isError": true, "meta": { "a2c_timeout": true } });
+        assert_eq!(
+            classify_tool_call_outcome(&via_meta),
+            ToolCallOutcome::TimedOut
+        );
+        let via_underscore = json!({ "isError": true, "_meta": { "a2c_timeout": true } });
+        assert_eq!(
+            classify_tool_call_outcome(&via_underscore),
+            ToolCallOutcome::TimedOut
+        );
+    }
+
+    #[test]
+    fn test_classify_cancelled_takes_precedence_over_timeout_and_error() {
+        // 取消优先于超时（理论上不并存，但优先级须确定）。
+        let resp = json!({
+            "isError": true,
+            "_meta": { "a2c_cancelled": true, "a2c_timeout": true }
+        });
+        assert_eq!(
+            classify_tool_call_outcome(&resp),
+            ToolCallOutcome::Cancelled
         );
     }
 }

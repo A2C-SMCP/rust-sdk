@@ -47,6 +47,19 @@ pub fn build_tool_call_request(
     }
 }
 
+/// 创建工具调用取消载体 / Create a `server:tool_call_cancel` carrier (AGT-05 #44)。
+///
+/// 复用 [`AgentCallData`]——`req_id` **MUST**==被取消的原 `client:tool_call` 的 req_id（唯一定位在途
+/// 调用），故与其它 builder 不同：**不**生成新 `req_id`，而是透传调用方持有的原 req_id。载体仅
+/// `{agent, req_id}`——**无** computer，**无** reason 字段（取消原因 `a2c_cancel_reason` 由 Computer
+/// 写在结果级 meta，非 Agent 发送）。
+pub fn build_tool_call_cancel(agent: &str, req_id: &str) -> AgentCallData {
+    AgentCallData {
+        agent: agent.to_string(),
+        req_id: ReqId::from_string(req_id.to_string()),
+    }
+}
+
 /// 创建获取工具列表请求 / Create a `client:get_tools` request。
 pub fn build_get_tools_request(agent: &str, computer: &str) -> GetToolsReq {
     GetToolsReq {
@@ -172,6 +185,22 @@ mod tests {
         assert_eq!(v["params"], json!({"text": "hi"}));
         assert_eq!(v["timeout"], 30);
         assert!(v["req_id"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn test_tool_call_cancel_carrier_reuses_req_id_no_extra_fields() {
+        // 取消载体透传**原** req_id（不新生成）——取消 MUST 命中原在途调用。
+        let v = to_val(&build_tool_call_cancel("agent1", "rid-orig"));
+        assert_eq!(v["agent"], "agent1");
+        assert_eq!(v["req_id"], "rid-orig");
+        // 载体恰 {agent, req_id}：无 computer / reason / timeout（AgentCallData 取消形态）。
+        assert!(v.get("computer").is_none());
+        assert!(v.get("reason").is_none());
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(2),
+            "取消载体在线形态应恰为 {{agent, req_id}}"
+        );
     }
 
     #[test]

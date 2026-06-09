@@ -15,6 +15,10 @@ pub struct SmcpAgentConfig {
     pub default_timeout: u64,
     /// 工具调用超时时间（秒）
     pub tool_call_timeout: u64,
+    /// `client:get_*` 请求 ack 超时（秒）。协议 0.2.2 建议 **≥30s**（AGT-05 #44）——get_skills/get_skill
+    /// 等可能拉取较大 SKILL/blob 元数据，过短阈值会误判为超时。缺省 30s。
+    /// `client:get_*` ack timeout; protocol 0.2.2 recommends ≥30s (large skill/blob payloads). Default 30s.
+    pub get_timeout: u64,
     /// 是否在收到桌面更新通知时自动拉取桌面
     pub auto_fetch_desktop: bool,
     /// 是否在 Computer 进入办公室时自动获取工具列表
@@ -31,6 +35,7 @@ impl Default for SmcpAgentConfig {
         Self {
             default_timeout: 20,
             tool_call_timeout: 60,
+            get_timeout: 30,
             auto_fetch_desktop: true,
             auto_fetch_tools: true,
             max_retries: 3,
@@ -51,6 +56,12 @@ impl SmcpAgentConfig {
 
     pub fn with_tool_call_timeout(mut self, timeout: u64) -> Self {
         self.tool_call_timeout = timeout;
+        self
+    }
+
+    /// 设置 `client:get_*` ack 超时（秒）。协议 0.2.2 建议 ≥30s（AGT-05 #44）。
+    pub fn with_get_timeout(mut self, timeout: u64) -> Self {
+        self.get_timeout = timeout;
         self
     }
 
@@ -103,6 +114,9 @@ mod tests {
 
         assert_eq!(config.default_timeout, 20);
         assert_eq!(config.tool_call_timeout, 60);
+        // 协议 0.2.2：client:get_* ack 超时缺省 ≥30s（AGT-05 #44）。
+        assert_eq!(config.get_timeout, 30);
+        assert!(config.get_timeout >= 30, "client:get_* 超时 MUST ≥30s");
         assert!(config.auto_fetch_desktop);
         assert!(config.auto_fetch_tools); // 默认开启 / Default enabled
         assert_eq!(config.max_retries, 3);

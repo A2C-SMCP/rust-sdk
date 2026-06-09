@@ -116,6 +116,13 @@ impl SyncSmcpAgent {
             .block_on(self.async_agent.tool_call(computer, tool_name, params))
     }
 
+    /// 取消一次在途工具调用（fire-and-forget，无 ack，AGT-05 #44）。
+    /// `req_id` MUST==被取消的原 tool_call req_id。详见 [`AsyncSmcpAgent::tool_call_cancel`]。
+    pub fn tool_call_cancel(&self, req_id: &str) -> Result<()> {
+        self.runtime
+            .block_on(self.async_agent.tool_call_cancel(req_id))
+    }
+
     /// 列出房间内的所有会话
     pub fn list_room(&self, office_id: &str) -> Result<Vec<SessionInfo>> {
         self.runtime.block_on(self.async_agent.list_room(office_id))

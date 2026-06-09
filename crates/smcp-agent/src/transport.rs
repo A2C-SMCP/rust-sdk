@@ -19,8 +19,8 @@ use tf_rust_socketio::{
     asynchronous::{Client, ClientBuilder},
     Event, Payload, TransportType,
 };
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, error, info};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tracing::{debug, error, info, warn};
 
 /// 事件处理器类型
 pub type EventHandler = Box<dyn FnMut(Payload, Client) + Send + Sync>;
@@ -40,6 +40,15 @@ pub enum NotificationMessage {
 pub struct SocketIoTransport {
     client: Client,
     namespace: String,
+    /// 断连信号发送端（AGT-05 #44 in-flight disconnect 容错）。`connect_with_handlers` 的 `on_any`
+    /// 收到底层 `Event::Close`/`Event::Error` 时 `send(true)`，使在途 [`Self::call`] 立即放弃等待——
+    /// 协议 0.2.2：Agent **MUST NOT** 靠 ack 超时判定断连，须用 disconnect/connect_error 事件。
+    /// `Arc` 持有以保活（watch::Sender 非 Clone）：发送端存活则 [`Self::call`] 的 `changed()` 不会因
+    /// 发送端析构而误判断连（`connect` 无处理器路径据此保持惰性而非常断）。仅作 RAII 保活、构造后不再读取。
+    #[allow(dead_code)]
+    disconnect_tx: Arc<watch::Sender<bool>>,
+    /// 断连信号接收端（粘滞：watch 保留最新值，关闭「断连早于 call」竞速窗）/ sticky disconnect receiver。
+    disconnect_rx: watch::Receiver<bool>,
 }
 
 impl SocketIoTransport {
@@ -78,10 +87,16 @@ impl SocketIoTransport {
             url, namespace
         );
 
+        // 无处理器路径：断连信号保持惰性（发送端经 Arc 保活、永不 send，call 仅靠 ack/timeout）。
+        // 断连事件容错需 on_any（见 connect_with_handlers），故此路径不提供——agent 走 connect_with_handlers。
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+
         Ok((
             Self {
                 client,
                 namespace: namespace.to_string(),
+                disconnect_tx: Arc::new(disconnect_tx),
+                disconnect_rx,
             },
             rx,
         ))
@@ -118,7 +133,25 @@ impl SocketIoTransport {
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = Arc::new(tx);
 
+        // AGT-05 #44：断连信号。on_any 收到底层 Event::Close/Error → send(true)，使在途 call 立即
+        // 放弃等待（不靠 ack 超时）。watch 粘滞保留最新值，关闭「断连早于 call」竞速窗。
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let disconnect_tx = Arc::new(disconnect_tx);
+        let handler_disconnect_tx = disconnect_tx.clone();
+
         builder = builder.on_any(move |event, payload, _client| {
+            // 断连信号随底层连接状态翻转（协议 0.2.2 in-flight disconnect 容错——MUST NOT 靠 ack 超时）：
+            // Close/Error → true（断连）；Connect → false（重连恢复，清除粘滞断连位，避免重连后 call 误判）。
+            // call() 用 wait_for(|v| *v) 只认 true，故 Connect→false 的中间值不会误触发在途 call。
+            match &event {
+                Event::Close | Event::Error => {
+                    let _ = handler_disconnect_tx.send(true);
+                }
+                Event::Connect => {
+                    let _ = handler_disconnect_tx.send(false);
+                }
+                _ => {}
+            }
             let event_str = match event {
                 Event::Custom(s) => s,
                 _ => return Box::pin(async {}),
@@ -300,6 +333,8 @@ impl SocketIoTransport {
             Self {
                 client,
                 namespace: namespace.to_string(),
+                disconnect_tx,
+                disconnect_rx,
             },
             rx,
         ))
@@ -383,30 +418,40 @@ impl SocketIoTransport {
             )
             .await?;
 
-        match rx.await {
-            Ok(response) => {
+        // AGT-05 #44：把 ack 等待与断连信号竞速——Agent MUST NOT 靠 ack 超时判定断连（协议 0.2.2
+        // in-flight disconnect 容错）。`wait_for(|v| *v)` 只在断连位为 true 时就绪：粘滞——若进入前已断连
+        // 立即就绪（关闭「断连早于 call」竞速窗）；且忽略重连时 Connect→false 的中间值，不误触发。
+        let mut disconnect_rx = self.disconnect_rx.clone();
+
+        tokio::select! {
+            // biased：ack 与断连同时就绪时优先取真实响应（避免已到达的结果被误判为断连）。
+            biased;
+            recv = rx => match recv {
                 // 从响应中提取JSON数据
-                match response {
-                    Payload::Text(values, _) => {
-                        if let Some(value) = values.into_iter().next() {
-                            Ok(value)
-                        } else {
-                            Err(SmcpAgentError::internal("Empty response"))
-                        }
-                    }
-                    #[allow(deprecated)]
-                    Payload::String(s, _) => {
-                        // 尝试解析字符串为JSON
-                        serde_json::from_str(&s).map_err(SmcpAgentError::from)
-                    }
-                    Payload::Binary(_, _) => {
-                        Err(SmcpAgentError::internal("Binary response not supported"))
-                    }
+                Ok(Payload::Text(values, _)) => values
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| SmcpAgentError::internal("Empty response")),
+                #[allow(deprecated)]
+                Ok(Payload::String(s, _)) => {
+                    // 尝试解析字符串为JSON
+                    serde_json::from_str(&s).map_err(SmcpAgentError::from)
                 }
-            }
-            Err(_) => {
-                error!("Timeout while calling event: {}", event);
-                Err(SmcpAgentError::Timeout)
+                Ok(Payload::Binary(_, _)) => {
+                    Err(SmcpAgentError::internal("Binary response not supported"))
+                }
+                Err(_) => {
+                    error!("Timeout while calling event: {}", event);
+                    Err(SmcpAgentError::Timeout)
+                }
+            },
+            // 底层 socket 断连 / 连接错误（on_any 收到 Event::Close/Error 置 true）→ 立即判定断连，
+            // 不空等满 ack 超时。`wait_for` 返回 Err（发送端析构 = 传输析构）同样视为断连。
+            _ = disconnect_rx.wait_for(|disconnected| *disconnected) => {
+                warn!("Connection lost during in-flight call: {}", event);
+                Err(SmcpAgentError::connection(
+                    "connection lost (disconnect/connect_error) during call",
+                ))
             }
         }
     }
