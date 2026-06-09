@@ -1818,6 +1818,32 @@ mod tests {
         assert!(!plain.is_cancelled() && !plain.is_timeout());
     }
 
+    #[test]
+    fn test_agent_call_data_cancel_carrier_shape() {
+        // SRV-03 (#53)：server:tool_call_cancel / notify:tool_call_cancel 复用 AgentCallData。
+        // 协议 0.2.2 规定该载体**仅** {agent, req_id}，且 req_id MUST==被取消的原 tool_call req_id，
+        // **不含** computer 字段（唯一定位在途调用靠 req_id，不靠 computer）。
+        let cancel = AgentCallData {
+            agent: "agent-x".to_string(),
+            req_id: ReqId::from_string("rid_tool".to_string()),
+        };
+        let v = serde_json::to_value(&cancel).unwrap();
+        assert_eq!(v["agent"], "agent-x");
+        assert_eq!(v["req_id"], "rid_tool");
+        assert!(
+            v.get("computer").is_none(),
+            "取消载体 MUST NOT 含 computer 字段，实得: {v}"
+        );
+        // 恰两个键，杜绝未来误加字段
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(2),
+            "AgentCallData 在线形态应恰为 {{agent, req_id}}"
+        );
+        // 往返
+        assert_eq!(serde_json::from_value::<AgentCallData>(v).unwrap(), cancel);
+    }
+
     // ── SMCP-02 get_resources (#26) ────────────────────────────────────
 
     #[test]

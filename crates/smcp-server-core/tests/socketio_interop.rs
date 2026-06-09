@@ -43,6 +43,34 @@ fn counter_handler(
     }
 }
 
+/// 与 [`counter_handler`] 等价，额外把收到的事件 payload（首个 JSON 值）捕获到共享槽，
+/// 供断言「广播负载逐字透传」（如 `notify:tool_call_cancel` 的 `req_id` MUST==原 tool_call req_id）。
+/// Same as [`counter_handler`], but also captures the received payload for wire-level assertions.
+fn capturing_handler(
+    counter: Arc<AtomicUsize>,
+    notify: Option<Arc<Notify>>,
+    captured: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+{
+    move |payload: Payload, _client| {
+        let counter = counter.clone();
+        let notify = notify.clone();
+        let captured = captured.clone();
+        async move {
+            if let Payload::Text(mut values, _) = payload {
+                if let Some(v) = values.pop() {
+                    *captured.lock().unwrap() = Some(v);
+                }
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            if let Some(notify) = notify {
+                notify.notify_one();
+            }
+        }
+        .boxed()
+    }
+}
+
 struct TestServer {
     addr: SocketAddr,
     shutdown_tx: oneshot::Sender<()>,
@@ -276,6 +304,8 @@ async fn test_update_notifications_and_role_checks() {
     let computer_update_desktop_count = Arc::new(AtomicUsize::new(0));
     let computer_tool_cancel_count = Arc::new(AtomicUsize::new(0));
     let computer_tool_cancel_notify = Arc::new(Notify::new());
+    // 捕获 computer 收到的 notify:tool_call_cancel 负载，断言 req_id 逐字透传 + AgentCallData 无 computer 字段。
+    let computer_tool_cancel_payload = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
 
     let computer_client = ClientBuilder::new(&server_url)
         .namespace(smcp::SMCP_NAMESPACE)
@@ -295,9 +325,10 @@ async fn test_update_notifications_and_role_checks() {
         )
         .on(
             smcp::events::NOTIFY_TOOL_CALL_CANCEL,
-            counter_handler(
+            capturing_handler(
                 computer_tool_cancel_count.clone(),
                 Some(computer_tool_cancel_notify.clone()),
+                computer_tool_cancel_payload.clone(),
             ),
         )
         .connect()
@@ -466,6 +497,30 @@ async fn test_update_notifications_and_role_checks() {
     .expect("computer did not receive tool_call_cancel");
     assert_eq!(computer_tool_cancel_count.load(Ordering::SeqCst), 1);
     assert_eq!(agent_tool_cancel_count.load(Ordering::SeqCst), 0);
+
+    // req_id 逐字透传：广播的 notify:tool_call_cancel.req_id MUST==原 tool_call 的 req_id（协议 0.2.2）。
+    // 并确认 AgentCallData 仅 {agent, req_id}——取消事件**不含** computer 字段。
+    {
+        let payload = computer_tool_cancel_payload
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("computer should have captured the cancel payload");
+        assert_eq!(
+            payload.get("req_id").and_then(|v| v.as_str()),
+            Some("rid_tool"),
+            "notify:tool_call_cancel.req_id 必须透传原 tool_call req_id"
+        );
+        assert_eq!(
+            payload.get("agent").and_then(|v| v.as_str()),
+            Some("agent_a"),
+            "notify:tool_call_cancel.agent 必须透传发起 Agent"
+        );
+        assert!(
+            payload.get("computer").is_none(),
+            "AgentCallData(取消) MUST NOT 含 computer 字段，实得: {payload}"
+        );
+    }
 
     // Negative case: wrong role should not broadcast.
     let agent_update_config_before = agent_update_config_count.load(Ordering::SeqCst);
