@@ -22,7 +22,7 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use super::{
-    file_store, msg_dim, msg_err, ok_msg, print_json, Confirm, EXIT_NETWORK_ERROR, EXIT_OK,
+    err_flat as err, file_store, msg_dim, ok_msg, print_json, Confirm, EXIT_NETWORK_ERROR, EXIT_OK,
     EXIT_USER_ERROR,
 };
 use crate::settings::installer::{uninstall_plugin, McpInstallHooks, UninstallOptions};
@@ -45,15 +45,6 @@ use crate::skills::{
 };
 
 // ── 输出辅助 / output helpers ────────────────────────────────────────────────
-fn err(msg: &str, json_output: bool, code: i32) -> i32 {
-    if json_output {
-        print_json(&json!({ "error": msg }));
-    } else {
-        msg_err(msg);
-    }
-    code
-}
-
 fn map_store_err(e: SettingsStoreError) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
@@ -494,7 +485,9 @@ pub async fn marketplace_remove(
     // 撤销信任，避免 trustedMarketplaces 只增不减（user scope）。best-effort：对标 Python（marketplace.py:309
     // 无错误处理）——写失败仅告警、**不**把已完成的卸载/prune 级联翻成用户错（destructive 工作已落地）。
     if let Err(e) = revoke_trust(name, env) {
-        msg_dim(&format!("warning: failed to revoke trust for {name:?}: {e}"));
+        msg_dim(&format!(
+            "warning: failed to revoke trust for {name:?}: {e}"
+        ));
     }
 
     if json_output {
@@ -944,6 +937,8 @@ mod tests {
         .await;
         assert_eq!(code, EXIT_OK);
         assert!(!confirm.was_called());
-        assert!(load_mps(home, Some(&env)).marketplaces.contains_key("skills"));
+        assert!(load_mps(home, Some(&env))
+            .marketplaces
+            .contains_key("skills"));
     }
 }

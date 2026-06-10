@@ -38,7 +38,8 @@ use crate::skills::manifest::{MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR};
 pub mod handler;
 pub mod marketplace;
 pub mod plugin;
-// settings / skill 子命令模块由 CLI-02（#51）加入 / added by CLI-02.
+pub mod settings;
+pub mod skill;
 
 // REPL 适配器复用既有 handler 的运行时类型 / re-export for the REPL entry & interactive loop。
 pub use handler::{CliConfig, CommandError, CommandHandler};
@@ -70,6 +71,11 @@ pub(crate) fn msg_err(s: &str) {
     println!("{}", style(format!("✗ {s}")).red());
 }
 
+/// 黄色提示行（usage / 警告）/ yellow hint line。
+pub(crate) fn msg_warn(s: &str) {
+    println!("{}", style(s).yellow());
+}
+
 /// 暗色次要行 / dim secondary line。
 pub(crate) fn msg_dim(s: &str) {
     println!("{}", style(s).dim());
@@ -79,6 +85,19 @@ pub(crate) fn msg_dim(s: &str) {
 pub(crate) fn ok_msg(msg: &str) -> i32 {
     msg_ok(msg);
     EXIT_OK
+}
+
+/// 扁平错误输出 + 返回退出码（`--json` → `{"error": msg}`；否则红色 ✗）/ flat error output returning a code。
+///
+/// marketplace / settings / skill 共用（对标 Python 各模块 `_err(msg, json_output)`）；plugin 的
+/// `{error, message}` 变体单列（额外 `error_code`）/ shared flat shape; plugin uses its own variant。
+pub(crate) fn err_flat(msg: &str, json_output: bool, code: i32) -> i32 {
+    if json_output {
+        print_json(&serde_json::json!({ "error": msg }));
+    } else {
+        msg_err(msg);
+    }
+    code
 }
 
 /// 由 `home` / `env` 装配文件式治理存储（marketplace/plugin 命令的 prune/gc/recorder 共用）/ file store。
