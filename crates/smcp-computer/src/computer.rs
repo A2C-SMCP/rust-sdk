@@ -626,6 +626,25 @@ impl<S: Session> Computer<S> {
             .cloned()
     }
 
+    /// 已登记工作目录快照（plugin list / settings 六层合并的 `registered_workdirs` 视图）/ registered workdirs。
+    pub fn registered_workdirs(&self) -> Vec<PathBuf> {
+        self.registered_workdirs
+            .read()
+            .expect("workdirs poisoned")
+            .clone()
+    }
+
+    /// SKILL registry 的共享句柄 / shared SKILL registry handle。
+    ///
+    /// CLI REPL 的 governance 命令（marketplace/plugin add/install/...）经此取写锁拿到 `&mut SkillRegistry`
+    /// 调 handler（installer/staging 直收 `&mut SkillRegistry`，不再回锁 registry；与 [`add_or_update_server`]
+    /// 等只触 `mcp_servers`/`mcp_manager` 的方法无锁序冲突）。
+    ///
+    /// [`add_or_update_server`]: Self::add_or_update_server
+    pub fn skill_registry_arc(&self) -> Arc<RwLock<SkillRegistry>> {
+        Arc::clone(&self.skill_registry)
+    }
+
     /// 单页透传指定 MCP Server 的 `resources/list`（v0.2 `client:get_resources`）/ single-page passthrough。
     ///
     /// Computer 仅作透传层：无 scheme/元数据过滤、无跨 Server 聚合，翻页由调用方经 `cursor` 控制
@@ -754,8 +773,12 @@ impl<S: Session> Computer<S> {
     /// **持锁语义（注意）**：`skill_registry` 写锁全程持有跨 `stage_mcp_skills` await——后者 `archive`
     /// 模式会发起归档**网络下载**、`resources` 模式会做 MCP `read_resource`。期间所有 `get_skills` /
     /// `get_skill_ref`（读锁）被阻塞，慢/卡 fetch 会拖住全部 SKILL 读（Python 单事件循环天然串行掩盖此点）。
-    /// 锁序安全（唯一同时持 `mcp_manager.read` + `skill_registry.write` 处，无反向获取路径，不构成死锁）。
-    /// 两阶段化（先 materialize 全部、仅 register 阶段短持写锁）的硬化见 follow-up issue（触及封板 staging.rs #49）。
+    /// **锁序（注意，CLI-03 #54 后）**：本路径取 `mcp_manager.read` → `skill_registry.write`；而 CLI REPL 的
+    /// governance 路径（`cli::repl`）取 `skill_registry.write` → 经 `CliMcpHooks` 调 `add_or_update_server`/
+    /// `remove_server` 间接取 `mcp_manager` 锁——**相反序**，构成潜在 ABBA。当前**不可达**：`restage_mcp_skills`
+    /// 仅由 `boot_up`（REPL 起步前）调用，MCP `ResourceListChanged`/`ResourceUpdated` 通知 → restage 的并发接线
+    /// **尚未落地**（INT 收尾时再接）。**接线时务必先统一锁序**（建议两路均 `mcp_manager` 先于 `skill_registry`），
+    /// 否则并发 restage 与 REPL governance 命令会死锁。两阶段化硬化见 follow-up issue（触及封板 staging.rs #49）。
     pub async fn restage_mcp_skills(&self, server_name: Option<&str>) -> Vec<String> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return Vec::new();
