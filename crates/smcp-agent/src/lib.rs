@@ -10,6 +10,8 @@
 
 pub mod async_agent;
 pub mod auth;
+// 内部模块：tool_call 二进制旁路 extract/inject helper（成员全 pub(crate)，对外不导出）。
+pub(crate) mod blob_sideband;
 pub mod config;
 pub mod error;
 pub mod events;

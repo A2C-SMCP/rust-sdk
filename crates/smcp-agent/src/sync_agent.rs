@@ -14,7 +14,7 @@ use crate::{
     error::{Result, SmcpAgentError},
     AsyncSmcpAgent,
 };
-use smcp::{A2CSkillRef, GetResourcesRet, GetSkillRet, SMCPTool, SessionInfo};
+use smcp::{A2CSkillRef, GetBlobRet, GetResourcesRet, GetSkillRet, SMCPTool, SessionInfo};
 use tokio::runtime::Runtime;
 
 /// 同步SMCP Agent
@@ -93,8 +93,9 @@ impl SyncSmcpAgent {
 
     /// 获取 SKILL 包内单个资源（v0.2.1，同步）/ Get a single in-package SKILL resource (sync)。
     ///
-    /// 语义同 [`AsyncSmcpAgent::get_skill`]：`body` / `blob_handle` 恰一存在；`blob_handle` 原样返回，
-    /// 文本 MIME 自动 drain 回填留待 AGT-03 / #38。
+    /// 语义同 [`AsyncSmcpAgent::get_skill`]：`body` / `blob_handle` 恰一存在。文本 MIME 的 `blob_handle`
+    /// 已由 AGT-03 #38 自动 drain 回填为 `body`（对调用方透明）；二进制句柄原样返回，按需经
+    /// [`Self::get_blob`] 自取字节。
     pub fn get_skill(
         &self,
         computer: &str,
@@ -103,6 +104,26 @@ impl SyncSmcpAgent {
     ) -> Result<GetSkillRet> {
         self.runtime
             .block_on(self.async_agent.get_skill(computer, name, rel_path))
+    }
+
+    /// 通用二进制单块拉取（v0.2.1，同步，AGT-03 #38）/ Pull one binary chunk via `client:get_blob` (sync)。
+    ///
+    /// 阻塞包装 [`AsyncSmcpAgent::get_blob`]：按 `chunk_offset`/`max_chunk_bytes` 取一块返回 [`GetBlobRet`]；
+    /// flat ErrorPayload（`4018`）透传为协议错误。多块重组由上层用 [`SyncSmcpAgent::tool_call`] /
+    /// [`SyncSmcpAgent::get_skill`] 的自动旁路覆盖；裸 drain 暂不公开同步入口（按需再加）。
+    pub fn get_blob(
+        &self,
+        computer: &str,
+        blob_handle: &str,
+        chunk_offset: Option<u64>,
+        max_chunk_bytes: Option<u64>,
+    ) -> Result<GetBlobRet> {
+        self.runtime.block_on(self.async_agent.get_blob(
+            computer,
+            blob_handle,
+            chunk_offset,
+            max_chunk_bytes,
+        ))
     }
 
     /// 调用工具

@@ -16,8 +16,9 @@
 //! （与 `get_tools` / `get_desktop` 同款约定）+ 结构反序列化。
 //!
 //! `get_skill` 的 body/blob_handle 分支：inline `body`（文本 MIME）由 [`smcp::GetSkillRet::resource`]
-//! 返回 [`smcp::SkillResource::Inline`] 直接可读；`blob_handle` 分支**原样保留**，文本 MIME 的
-//! 自动 drain 回填 body 依赖 `drain_blob`（AGT-03 / #38），本期不实现、留待其落地后小幅接线。
+//! 返回 [`smcp::SkillResource::Inline`] 直接可读。注：文本 MIME 的 `blob_handle` 自动 drain 回填 `body`
+//! 由 AGT-03 #38 在 [`crate::async_agent::AsyncSmcpAgent::get_skill`] 接线（此纯解析器只还原线上形态，
+//! 不发起 I/O）；二进制 `blob_handle` 仍**原样保留**，由调用方经 `client:get_blob` 自取字节。
 
 use serde_json::Value;
 use smcp::{A2CSkillRef, GetSkillRet};

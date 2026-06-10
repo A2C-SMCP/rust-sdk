@@ -15,7 +15,7 @@
 //! `get_resources` 响应解析（[`parse_get_resources_response`]，与 `skill_consume` 同款纯函数约定）。
 
 use serde_json::Value;
-use smcp::GetResourcesRet;
+use smcp::{GetBlobRet, GetResourcesRet};
 
 use crate::error::{Result, SmcpAgentError};
 use crate::protocol_error::raise_for_error_payload;
@@ -51,6 +51,25 @@ pub(crate) fn parse_get_resources_response(
     raise_for_error_payload(response)?;
     ensure_req_id(response, expected_req_id)?;
     let ret: GetResourcesRet = serde_json::from_value(response.clone())?;
+    Ok(ret)
+}
+
+/// 解析 `client:get_blob` 单块响应为 [`GetBlobRet`] / parse a `client:get_blob` ack into one chunk。
+///
+/// 与 [`parse_get_resources_response`] 同款约定：flat ErrorPayload（`4018` `details.reason` ∈
+/// `invalid_handle`/`forbidden`/`gone`/`range`）→ 协议错误；`req_id` 回显校验；整包反序列化为
+/// [`GetBlobRet`]（含 `total_size`/`sha256`/`chunk_offset`/`eof`/base64 `blob`）。无 I/O，供 async/sync
+/// Agent 共享并独立单测（不依赖 Socket.IO 传输）。对标 Python `a2c_smcp/agent/client.py::get_blob` 响应段。
+///
+/// 注：多块拉取的 drain 适配器**不**经此（每块自有 fresh `req_id`、靠 ack 关联，且漂移/完整性由
+/// `sha256` 自证），仅 [`crate::async_agent::AsyncSmcpAgent::get_blob`] 单块公开方法用此校验回显。
+pub(crate) fn parse_get_blob_response(
+    response: &Value,
+    expected_req_id: &str,
+) -> Result<GetBlobRet> {
+    raise_for_error_payload(response)?;
+    ensure_req_id(response, expected_req_id)?;
+    let ret: GetBlobRet = serde_json::from_value(response.clone())?;
     Ok(ret)
 }
 
@@ -270,6 +289,86 @@ mod tests {
         assert_eq!(
             classify_tool_call_outcome(&resp),
             ToolCallOutcome::Cancelled
+        );
+    }
+
+    // ── AGT-03 #38：parse_get_blob_response（get_blob 单块响应解析）──────────────────
+
+    #[test]
+    fn test_get_blob_happy_first_chunk() {
+        // 首块：含 total_size/sha256/chunk_offset/eof/base64 blob + req_id 回显。
+        let resp = json!({
+            "blob_handle": "ts:abc",
+            "mime_type": "image/png",
+            "total_size": 1024,
+            "sha256": "deadbeef",
+            "chunk_offset": 0,
+            "eof": false,
+            "blob": "AAAA",
+            "req_id": "R1"
+        });
+        let ret = parse_get_blob_response(&resp, "R1").unwrap();
+        assert_eq!(ret.blob_handle, "ts:abc");
+        assert_eq!(ret.total_size, 1024);
+        assert_eq!(ret.chunk_offset, 0);
+        assert!(!ret.eof);
+        assert_eq!(ret.blob, "AAAA");
+        assert_eq!(ret.mime_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn test_get_blob_eof_probe_empty_chunk() {
+        // EOF probe：offset==total_size 时 Computer 回空块 + eof=true（非 range 错误）。
+        let resp = json!({
+            "blob_handle": "ts:abc",
+            "mime_type": "text/plain",
+            "total_size": 5,
+            "sha256": "cafef00d",
+            "chunk_offset": 5,
+            "eof": true,
+            "blob": "",
+            "req_id": "R2"
+        });
+        let ret = parse_get_blob_response(&resp, "R2").unwrap();
+        assert!(ret.eof);
+        assert_eq!(ret.blob, "");
+        assert_eq!(ret.chunk_offset, 5);
+    }
+
+    #[test]
+    fn test_get_blob_flat_error_4018_raises_with_reason() {
+        // flat ErrorPayload（4018 句柄失效）→ 协议错误，details.reason 经 open-enum 提取。
+        let resp = json!({
+            "code": 4018,
+            "message": "blob not accessible",
+            "details": { "reason": "gone" }
+        });
+        let err = parse_get_blob_response(&resp, "R1").unwrap_err();
+        match err {
+            SmcpAgentError::Protocol(p) => {
+                assert_eq!(p.code, 4018);
+                assert_eq!(p.reason.as_deref(), Some("gone"));
+            }
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_get_blob_req_id_mismatch() {
+        // req_id 不匹配 → ReqIdMismatch（先 raise_for_error_payload 后 ensure_req_id 的顺序）。
+        let resp = json!({
+            "blob_handle": "ts:abc",
+            "total_size": 0,
+            "sha256": "x",
+            "chunk_offset": 0,
+            "eof": true,
+            "blob": "",
+            "req_id": "OTHER"
+        });
+        let err = parse_get_blob_response(&resp, "R1").unwrap_err();
+        assert!(
+            matches!(err, SmcpAgentError::ReqIdMismatch { .. }),
+            "got {err:?}"
         );
     }
 }

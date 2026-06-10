@@ -15,17 +15,17 @@ use crate::{
     events::AsyncAgentEventHandler,
     protocol_error::raise_for_error_payload,
     request_builders::{
-        build_get_desktop_request, build_get_resources_request, build_get_skill_request,
-        build_get_skills_request, build_get_tools_request, build_tool_call_cancel,
-        build_tool_call_request,
+        build_get_blob_request, build_get_desktop_request, build_get_resources_request,
+        build_get_skill_request, build_get_skills_request, build_get_tools_request,
+        build_tool_call_cancel, build_tool_call_request,
     },
-    response::{ensure_req_id, parse_get_resources_response},
+    response::{ensure_req_id, parse_get_blob_response, parse_get_resources_response},
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
-    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetResourcesRet, GetSkillRet,
-    LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
+    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetResourcesRet,
+    GetSkillRet, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -457,9 +457,166 @@ impl AsyncSmcpAgent {
             .call(CLIENT_GET_SKILL, data, self.config.get_timeout)
             .await?;
 
-        let ret = parse_get_skill_response(&response, req_id.as_str())?;
+        let mut ret = parse_get_skill_response(&response, req_id.as_str())?;
+
+        // AGT-03 #38：文本 MIME 的 `blob_handle` 自动 drain 回填 `body`（Python parity）。
+        // Computer 对「文本但超内联预算」走句柄；Agent 拉回并 UTF-8 解码即得 body，对调用方透明。
+        // 二进制句柄（image/png 等）**保持原样**，由调用方按二进制经 get_blob/drain 自取。
+        if ret.body.is_none() {
+            if let Some(handle) = ret.blob_handle.clone() {
+                if mime_is_textual(ret.mime_type.as_deref()) {
+                    match self.drain_blob_bytes(computer, &handle).await {
+                        Ok((bytes, _mime)) => match String::from_utf8(bytes) {
+                            Ok(text) => {
+                                ret.body = Some(text);
+                                ret.blob_handle = None;
+                            }
+                            // 非 UTF-8：保留 blob_handle 让调用方按二进制处理（保守回退，对齐 Python）。
+                            Err(_) => debug!(
+                                "get_skill {:?} textual mime but body not UTF-8; keeping blob_handle",
+                                name
+                            ),
+                        },
+                        Err(e) => warn!(
+                            "get_skill blob backfill failed for handle={}: {}; keeping blob_handle",
+                            handle, e
+                        ),
+                    }
+                }
+            }
+        }
+
         info!("Received skill {:?} from computer: {}", name, computer);
         Ok(ret)
+    }
+
+    /// 通用二进制单块拉取（v0.2.1，AGT-03 #38）/ Pull one binary chunk via `client:get_blob`。
+    ///
+    /// 直接对应协议 `client:get_blob`：按 `chunk_offset`（资源字节绝对偏移，缺省 0）+ `max_chunk_bytes`
+    /// （客户建议单块上限，Computer clamp 至 `BlobThresholds.chunk_max_bytes`）取一块，返回 [`GetBlobRet`]
+    /// （含 `total_size`/`sha256`/`eof`/base64 `blob`）。flat ErrorPayload（`4018` invalid_handle/
+    /// forbidden/gone/range）经 ack 透传为协议错误。多块重组/校验/重试请用 [`Self::drain_blob_bytes`]。
+    /// 对标 Python `a2c_smcp/agent/client.py::get_blob`。
+    pub async fn get_blob(
+        &self,
+        computer: &str,
+        blob_handle: &str,
+        chunk_offset: Option<u64>,
+        max_chunk_bytes: Option<u64>,
+    ) -> Result<GetBlobRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_blob_request(
+            &agent_config.agent,
+            computer,
+            blob_handle,
+            chunk_offset,
+            max_chunk_bytes,
+        );
+        let req_id = req.base.req_id.clone();
+
+        debug!(
+            "Getting blob chunk from computer {}, handle={}, offset={:?}",
+            computer, blob_handle, chunk_offset
+        );
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_BLOB, data, self.config.get_timeout)
+            .await?;
+
+        let ret = parse_get_blob_response(&response, req_id.as_str())?;
+        Ok(ret)
+    }
+
+    /// 经 `client:get_blob` 拉取并重组某句柄的全量字节（AGT-03 #38）/ drain & reassemble all bytes。
+    ///
+    /// 复用 UTIL-02 [`smcp::utils::blob::drain_blob`]（串行多块拉取 + 跨块源漂移重读 + 全量 `sha256`
+    /// 自证 + 4018 处置），注入「以本 Agent transport 发 `client:get_blob`」的单块 `call` 闭包。
+    /// 传输层错误（超时/断连/序列化）经 out-of-band 暂存**保真**上抛（[`SmcpAgentError::Timeout`] 等，
+    /// 不被压成协议码）；拉取期协议错误（4018/漂移/解码）经 [`SmcpAgentError::Blob`] 传播。返回
+    /// `(bytes, mime_type)`。供 [`Self::get_skill`] 文本回填与 tool_call 二进制旁路（AGT-04 #41）共用。
+    /// 对标 Python `client.py` 的 `_make_blob_call` + `drain_blob`。
+    pub(crate) async fn drain_blob_bytes(
+        &self,
+        computer: &str,
+        blob_handle: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        use smcp::utils::blob::{drain_blob, BlobChunkRequest, DrainBlobOptions};
+
+        let agent = self.auth_provider.get_agent_config().agent.clone();
+        let get_timeout = self.config.get_timeout;
+        // drain 的 `call` 仅能回 ErrorPayload，无法表达传输层错误；用 out-of-band 暂存保真
+        // SmcpAgentError（超时/断连/序列化），drain 失败后优先返回它，回退才映射 BlobTransferError。
+        let stash: Arc<std::sync::Mutex<Option<SmcpAgentError>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let call = |chunk: BlobChunkRequest| {
+            let agent = agent.clone();
+            let stash = stash.clone();
+            async move {
+                let req = build_get_blob_request(
+                    &agent,
+                    &chunk.computer,
+                    &chunk.blob_handle,
+                    Some(chunk.chunk_offset),
+                    Some(chunk.max_chunk_bytes),
+                );
+                let data = match serde_json::to_value(&req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        *stash.lock().unwrap() = Some(SmcpAgentError::from(e));
+                        return Err(smcp::ErrorPayload::new(
+                            -1,
+                            "serialize get_blob request failed",
+                        ));
+                    }
+                };
+                let guard = self.transport.read().await;
+                let transport = match guard.as_ref() {
+                    Some(t) => t,
+                    None => {
+                        *stash.lock().unwrap() =
+                            Some(SmcpAgentError::connection("Not connected".to_string()));
+                        return Err(smcp::ErrorPayload::new(-1, "not connected"));
+                    }
+                };
+                match transport.call(CLIENT_GET_BLOB, data, get_timeout).await {
+                    // flat ErrorPayload（4018 等）→ 交 drain 分类（4018→NotAccessible，余→Protocol）。
+                    Ok(resp) if smcp::is_protocol_error_payload(&resp) => {
+                        Err(error_payload_from_value(&resp))
+                    }
+                    Ok(resp) => match serde_json::from_value::<GetBlobRet>(resp) {
+                        Ok(ret) => Ok(ret),
+                        Err(e) => {
+                            *stash.lock().unwrap() = Some(SmcpAgentError::from(e));
+                            Err(smcp::ErrorPayload::new(-1, "malformed GetBlobRet"))
+                        }
+                    },
+                    Err(e) => {
+                        *stash.lock().unwrap() = Some(e);
+                        Err(smcp::ErrorPayload::new(
+                            -1,
+                            "transport error during get_blob",
+                        ))
+                    }
+                }
+            }
+        };
+
+        match drain_blob(call, computer, blob_handle, DrainBlobOptions::default()).await {
+            Ok(pair) => Ok(pair),
+            Err(blob_err) => {
+                // 传输层错误优先保真返回；否则映射拉取期协议错误（4018/漂移/解码）。
+                if let Some(te) = stash.lock().unwrap().take() {
+                    return Err(te);
+                }
+                Err(SmcpAgentError::from(blob_err))
+            }
+        }
     }
 
     /// 调用工具
@@ -495,6 +652,11 @@ impl AsyncSmcpAgent {
                 // flat ErrorPayload → 协议错误（如 4006/4007 授权、404 未命中）；正常 CallToolResult
                 // （含 isError 的工具执行失败）无顶层协议 code，原样透传。
                 raise_for_error_payload(&response)?;
+                // AGT-04 #41（⚠️ BREAKING）：消费 CallToolResult 二进制旁路——遍历 content item 检测
+                // `_meta.a2c_blob_handle` 并 drain 回填，否则超内联预算的大二进制会静默变空。无句柄路径不变。
+                let response = self
+                    .resolve_tool_call_binary_sideband(computer, response)
+                    .await;
                 info!("Tool call successful: {} on {}", tool_name, computer);
                 Ok(response)
             }
@@ -528,6 +690,46 @@ impl AsyncSmcpAgent {
                 Err(e)
             }
         }
+    }
+
+    /// 解析并回填 `client:tool_call` 结果的二进制旁路（AGT-04 #41，⚠️ BREAKING）/ resolve tool_call binary sideband。
+    ///
+    /// 三段式（见 [`crate::blob_sideband`] 模块文档）：
+    /// 1. **extract**——遍历 `CallToolResult.content` 收集带 `_meta.a2c_blob_handle` 的 item 索引+句柄；
+    /// 2. **drain**——逐句柄经 [`Self::drain_blob_bytes`] 拉回全量字节（多块 + sha256 自证 + 4018 处置）；
+    /// 3. **inject**——把字节回填到对应 content item 内联载体并清理 `_meta` 旁路键（消费后与小尺寸内联无异）。
+    ///
+    /// 无句柄的 content item 路径**完全不变**（无句柄时直接早返回原值）。容错（对齐 Python
+    /// `_resolve_tool_call_binary_sideband`）：任一 item 的 drain 失败仅 `warn` + **保留**其
+    /// `_meta.a2c_blob_handle` 不回填，继续处理其余 item（不整体失败、不早退）——调用方仍可据残留句柄
+    /// 自行 [`Self::get_blob`] 兜底。
+    async fn resolve_tool_call_binary_sideband(
+        &self,
+        computer: &str,
+        mut response: serde_json::Value,
+    ) -> serde_json::Value {
+        let handles = crate::blob_sideband::extract_sideband_handles(&response);
+        if handles.is_empty() {
+            return response; // 无旁路句柄：路径不变（含全部非二进制 tool_call）。
+        }
+        for (idx, handle) in handles {
+            match self.drain_blob_bytes(computer, &handle).await {
+                Ok((bytes, _mime)) => {
+                    if let Some(item) = response
+                        .get_mut("content")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|arr| arr.get_mut(idx))
+                    {
+                        crate::blob_sideband::inject_payload_into_content_item(item, &bytes);
+                    }
+                }
+                Err(e) => warn!(
+                    "tool_call binary sideband drain failed for handle={}: {}; keeping _meta.a2c_blob_handle intact",
+                    handle, e
+                ),
+            }
+        }
+        response
     }
 
     /// 取消一次在途工具调用（AGT-05 #44）/ Cancel an in-flight tool call.
@@ -598,6 +800,34 @@ impl AsyncSmcpAgent {
     }
 }
 
+/// MIME 是否「文本类」（决定 `get_skill` 句柄是否自动 drain 回填 `body`）/ is this MIME textual?
+///
+/// **仅** `text/*`——与 Python 参考 `a2c_smcp/agent/client.py` 的 `mime_type.startswith("text/")`
+/// 逐字符对齐（跨 SDK 一致性：同一 Computer 响应在两 SDK 给调用方**相同**结果）。`text/plain;
+/// charset=utf-8` 经 `starts_with` 天然命中、无需剥 charset；结构化非 text（如 `application/json`）与
+/// 二进制一律保持 `blob_handle`，由调用方按需经 `get_blob` 自取（与 Python 一致，**不**自动回填）。
+fn mime_is_textual(mime: Option<&str>) -> bool {
+    mime.map(|m| m.starts_with("text/")).unwrap_or(false)
+}
+
+/// 从已判定为 flat 协议错误的 `Value` 宽松构造 [`smcp::ErrorPayload`]，交 `drain_blob` 分类。
+/// 保留 `code`/`message`/`details`（`classify_fatal` 仅据 `code` + `details.reason` 分流），
+/// 缺字段宽松回退（不 panic），等价于直接 `from_value` 但容忍缺 `message`。
+fn error_payload_from_value(v: &serde_json::Value) -> smcp::ErrorPayload {
+    let code = v
+        .get("code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
+    let message = v
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut payload = smcp::ErrorPayload::new(code, message);
+    payload.details = v.get("details").cloned();
+    payload
+}
+
 // 实现Clone以便在事件处理器中使用
 impl Clone for AsyncSmcpAgent {
     fn clone(&self) -> Self {
@@ -609,5 +839,26 @@ impl Clone for AsyncSmcpAgent {
             tools_cache: self.tools_cache.clone(),
             notification_task: None, // Note: 任务句柄不克隆，因为它是特定于实例的
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AGT-03 #38：`get_skill` 文本句柄自动回填的 MIME 判定（fix-review #1：严格对齐 Python
+    /// `startswith("text/")`，承载跨 SDK 一致性决策）/ textual-MIME gate, exact Python parity。
+    #[test]
+    fn test_mime_is_textual_text_only_python_parity() {
+        // text/* 命中（含 charset 参数，starts_with 天然兼容）。
+        assert!(mime_is_textual(Some("text/plain")));
+        assert!(mime_is_textual(Some("text/markdown")));
+        assert!(mime_is_textual(Some("text/plain; charset=utf-8")));
+        // 结构化非 text / 二进制 / 缺省一律非文本（保持 blob_handle，与 Python 一致）。
+        assert!(!mime_is_textual(Some("application/json")));
+        assert!(!mime_is_textual(Some("application/xml")));
+        assert!(!mime_is_textual(Some("image/png")));
+        assert!(!mime_is_textual(Some("")));
+        assert!(!mime_is_textual(None));
     }
 }

@@ -49,6 +49,13 @@ pub enum SmcpAgentError {
     #[error("协议错误: {0}")]
     Protocol(Box<crate::protocol_error::SmcpProtocolError>),
 
+    /// `client:get_blob` 多块拉取（`drain_blob`）的拉取期不可恢复错误（AGT-03 #38）：4018
+    /// invalid_handle/forbidden/gone/range、跨块源漂移耗尽重试、base64 解码失败、或非 4018 协议码。
+    /// **装箱**避免 `result_large_err` 污染所有 `Result<_, SmcpAgentError>`（同 [`Self::Protocol`] 模式）。
+    /// 注：传输层错误（超时/断连）仍走 [`Self::Timeout`] / [`Self::Network`]，**不**并入此变体。
+    #[error("Blob 拉取错误: {0}")]
+    Blob(Box<smcp::utils::blob::BlobTransferError>),
+
     #[error("内部错误: {0}")]
     Internal(String),
 }
@@ -90,6 +97,13 @@ impl From<serde_json::Error> for SmcpAgentError {
 impl From<crate::protocol_error::SmcpProtocolError> for SmcpAgentError {
     fn from(err: crate::protocol_error::SmcpProtocolError) -> Self {
         Self::Protocol(Box::new(err))
+    }
+}
+
+// drain_blob 拉取错误装箱收敛（AGT-03 #38），使 `drain_blob(...)?` 经 `?` 自动转 SmcpAgentError。
+impl From<smcp::utils::blob::BlobTransferError> for SmcpAgentError {
+    fn from(err: smcp::utils::blob::BlobTransferError) -> Self {
+        Self::Blob(Box::new(err))
     }
 }
 
