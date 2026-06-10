@@ -24,6 +24,10 @@ pub struct HttpMCPClient {
     http_client: Client,
     /// 会话ID / Session ID
     session_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    /// initialize 时缓存的 server `resources` 能力声明（INT-04 #78）。`None` = 未初始化/未知；
+    /// 供 `list_resources_page` 的 4015 预检，使 http 的能力语义与 stdio 一致。
+    /// Cached `resources` capability from initialize; drives the 4015 pre-check in `list_resources_page`.
+    capabilities_resources: std::sync::Arc<tokio::sync::Mutex<Option<bool>>>,
     /// 订阅管理器 / Subscription manager
     subscription_manager: SubscriptionManager,
     /// 资源缓存 / Resource cache
@@ -52,6 +56,7 @@ impl HttpMCPClient {
             base: BaseMCPClient::new(params),
             http_client,
             session_id: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            capabilities_resources: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
         }
@@ -182,14 +187,22 @@ impl HttpMCPClient {
             )));
         }
 
-        if let Some(result) = response.get("result") {
-            // session_id 从 header 提取为主，body 中的 sessionId 作为 fallback
-            if self.session_id.lock().await.is_none() {
-                if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
-                    *self.session_id.lock().await = Some(session_id.to_string());
-                }
+        // 无 `result` 即无合法 InitializeResult → 视为初始化失败（与 stdio rmcp 握手对齐），消除
+        // "已连接但能力未捕获 → 误判 4015"的窄路径（#78 fix-review）。
+        let Some(result) = response.get("result") else {
+            return Err(MCPClientError::ProtocolError(
+                "Initialize response missing 'result' (no valid InitializeResult)".to_string(),
+            ));
+        };
+        // session_id 从 header 提取为主，body 中的 sessionId 作为 fallback
+        if self.session_id.lock().await.is_none() {
+            if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
+                *self.session_id.lock().await = Some(session_id.to_string());
             }
         }
+        // 缓存 server 的 `resources` 能力声明，供 list_resources_page 的 4015 预检（INT-04 #78）。
+        *self.capabilities_resources.lock().await =
+            Some(super::utils::server_declares_resources(result));
 
         // 发送initialized通知 / Send initialized notification
         self.send_request("notifications/initialized", Some(serde_json::json!({})))
@@ -197,6 +210,12 @@ impl HttpMCPClient {
 
         info!("HTTP session initialized successfully");
         Ok(())
+    }
+
+    /// server 是否声明 `resources` 能力（initialize 时缓存）。未知/未初始化 → `false`（默认拒绝，对齐
+    /// stdio `peer_info` 预检）。Whether the server declared `resources`; unknown → false (default-deny).
+    async fn supports_resources(&self) -> bool {
+        self.capabilities_resources.lock().await.unwrap_or(false)
     }
 
     // ========== 订阅管理 API / Subscription Management API ==========
@@ -432,11 +451,15 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        // 单页透传：cursor 进/出，不聚合（区别于 list_windows 的穷举翻页）、不过滤、不返回
-        // resourceTemplates。HTTP 不缓存 server capabilities，故无 4015 预检——无 `resources` 能力的
-        // server 由其 JSON-RPC 错误响应反映。
-        // Single-page passthrough (vs list_windows' pagination loop); HTTP caches no server caps, so
-        // no 4015 pre-check — a server lacking `resources` surfaces via its JSON-RPC error response.
+        // 4015 能力预检：server 未声明 `resources` → CapabilityNotSupported（上层映射 4015），与 stdio 一致。
+        // INT-04 #78：initialize 时缓存 `capabilities.resources`，三传输统一 4015 语义，不再随传输退化为
+        // ProtocolError。Capability gate mirroring stdio: undeclared `resources` ⇒ 4015 (not ProtocolError).
+        if !self.supports_resources().await {
+            return Err(MCPClientError::CapabilityNotSupported("resources".to_string()));
+        }
+
+        // 单页透传：cursor 进/出，不聚合（区别于 list_windows 的穷举翻页）、不过滤、不返回 resourceTemplates。
+        // Single-page passthrough (vs list_windows' pagination loop).
         let params = Some(match cursor.as_ref() {
             Some(c) => serde_json::json!({ "cursor": c }),
             None => serde_json::json!({}),
@@ -797,6 +820,44 @@ mod tests {
             result.unwrap_err(),
             MCPClientError::ConnectionError(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_page_4015_when_capability_absent() {
+        // INT-04 #78：连接后若 server 未声明 `resources` 能力 → 在发请求前返回 CapabilityNotSupported
+        // （上层映射 4015），与 stdio 一致，不再退化为 ProtocolError。门控先于网络发送。
+        let params = HttpServerParameters {
+            url: "http://localhost:8080".to_string(),
+            headers: HashMap::new(),
+        };
+        let client = HttpMCPClient::new(params);
+        client.base.update_state(ClientState::Connected).await;
+        *client.capabilities_resources.lock().await = Some(false);
+
+        let err = client.list_resources_page(None).await.unwrap_err();
+        assert!(
+            matches!(err, MCPClientError::CapabilityNotSupported(ref c) if c == "resources"),
+            "expected CapabilityNotSupported(resources), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_page_passes_gate_when_capability_present() {
+        // 声明了 `resources` → 预检通过；后续因无真实 server 而失败于非 4015 错误，证明门控不误伤
+        // 支持 resources 的 server（断言「非 CapabilityNotSupported」对网络结果鲁棒）。
+        let params = HttpServerParameters {
+            url: "http://localhost:8080".to_string(),
+            headers: HashMap::new(),
+        };
+        let client = HttpMCPClient::new(params);
+        client.base.update_state(ClientState::Connected).await;
+        *client.capabilities_resources.lock().await = Some(true);
+
+        let err = client.list_resources_page(None).await.unwrap_err();
+        assert!(
+            !matches!(err, MCPClientError::CapabilityNotSupported(_)),
+            "gate should pass for declared resources; got {err:?}"
+        );
     }
 
     #[tokio::test]
