@@ -770,15 +770,16 @@ impl<S: Session> Computer<S> {
     /// manager → 空列表；staging 失败 → 记 ERROR + 空列表（失败隔离，对标 Python `_restage_mcp_skills`）。
     /// 由 boot_up 与 MCP `ResourceListChanged`/`ResourceUpdated` 通知处理器（INT-03 #72）触发。
     ///
-    /// **持锁语义（注意）**：`skill_registry` 写锁全程持有跨 `stage_mcp_skills` await——后者 `archive`
-    /// 模式会发起归档**网络下载**、`resources` 模式会做 MCP `read_resource`。期间所有 `get_skills` /
-    /// `get_skill_ref`（读锁）被阻塞，慢/卡 fetch 会拖住全部 SKILL 读（Python 单事件循环天然串行掩盖此点）。
+    /// **持锁语义（#77 两阶段化后）**：`skill_registry` 写锁**不再**跨 `stage_mcp_skills` 的网络 await 持有——
+    /// `stage_mcp_skills` 内部按 SKILL 仅在 `finalize`（FS rename + 内存注册，同步无 await）**短持写锁**，
+    /// `archive` 网络下载 / `resources` MCP `read_resource` 期间**不持任何 Registry 锁**。慢/卡 fetch 不再阻塞
+    /// `get_skills` / `get_skill_ref` 读（修复 Python 单事件循环掩盖、Rust 暴露的尾延迟竞争）。孤儿对账亦短持写锁。
     /// **锁序（注意，CLI-03 #54 后）**：本路径取 `mcp_manager.read` → `skill_registry.write`；而 CLI REPL 的
     /// governance 路径（`cli::repl`）取 `skill_registry.write` → 经 `CliMcpHooks` 调 `add_or_update_server`/
     /// `remove_server` 间接取 `mcp_manager` 锁——**相反序**，构成潜在 ABBA。当前**不可达**：`restage_mcp_skills`
     /// 仅由 `boot_up`（REPL 起步前）调用，MCP `ResourceListChanged`/`ResourceUpdated` 通知 → restage 的并发接线
-    /// **尚未落地**（INT 收尾时再接）。**接线时务必先统一锁序**（建议两路均 `mcp_manager` 先于 `skill_registry`），
-    /// 否则并发 restage 与 REPL governance 命令会死锁。两阶段化硬化见 follow-up issue（触及封板 staging.rs #49）。
+    /// **尚未落地**（INT 收尾时再接）。#77 后写锁窗口已收窄到 per-SKILL finalize，但接线并发 restage 时**仍须统一锁序**
+    /// （建议两路均 `mcp_manager` 先于 `skill_registry`），否则并发 restage 与 REPL governance 命令仍可能死锁。
     pub async fn restage_mcp_skills(&self, server_name: Option<&str>) -> Vec<String> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return Vec::new();
@@ -787,17 +788,19 @@ impl<S: Session> Computer<S> {
         let Some(manager) = manager_guard.as_ref() else {
             return Vec::new();
         };
-        let mut reg = self.skill_registry.write().await;
-        let registered = match stage_mcp_skills(manager, &mut reg, &home, server_name, None).await {
-            Ok(names) => names,
-            Err(e) => {
-                error!(error = %e, "restage_mcp_skills failed (non-blocking)");
-                return Vec::new();
-            }
-        };
-        // 仅全量重物化做孤儿对账（限定 `mcp:` 源，不误标 user/marketplace）。
+        // #77：写锁不再跨 materialize 网络持有——stage_mcp_skills 内部按 SKILL 在 finalize 阶段短持写锁。
+        let registered =
+            match stage_mcp_skills(manager, &self.skill_registry, &home, server_name, None).await {
+                Ok(names) => names,
+                Err(e) => {
+                    error!(error = %e, "restage_mcp_skills failed (non-blocking)");
+                    return Vec::new();
+                }
+            };
+        // 仅全量重物化做孤儿对账（限定 `mcp:` 源，不误标 user/marketplace）；短持写锁，纯内存、不跨网络。
         if server_name.is_none() {
             let present: HashSet<String> = registered.iter().cloned().collect();
+            let mut reg = self.skill_registry.write().await;
             reconcile_orphans_in(&mut reg, &present, |s| s.starts_with("mcp:"));
         }
         registered

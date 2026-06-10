@@ -42,6 +42,7 @@ use std::time::Duration;
 use flate2::read::GzDecoder;
 use regex::Regex;
 use serde_json::{Map, Value};
+use tokio::sync::RwLock;
 
 use smcp::utils::path::{is_within, normalize_lexical};
 use smcp::A2CSkillRef;
@@ -1343,9 +1344,22 @@ fn finalize_and_register(
 ///
 /// `server_name` 给定则仅物化该 server。`fetcher` 为归档拉取替身（`None` → [`DefaultArchiveFetcher`]）。
 /// 返回成功注册（或刷新）的 SKILL name 列表。
+///
+/// **两阶段持锁（#77 INT 硬化）**：写锁 **不再** 跨 `materialize_*` 的网络/FS await 持有——
+/// `registry` 改为 `&RwLock<SkillRegistry>`，按 SKILL 仅在 `finalize_and_register`（FS rename + 内存注册，
+/// 同步无 await）**短持写锁**；`materialize_archive`（归档网络下载）/ `materialize_resources`（MCP
+/// `read_resource`）**不持任何 Registry 锁**。期间 `client:get_skills` / `get_skill_ref` 读不再被慢/卡
+/// fetch 阻塞（修复 Python 单事件循环掩盖、Rust 暴露的尾延迟竞争）。
+///
+/// **刻意保持** per-SKILL 的 `materialize → finalize` **交错次序**（而非"全部 materialize 后再批量
+/// register"）：finalize 内含 `staged → final_dir` 的 rename，其相对 materialize 的次序决定了
+/// `finalize_and_register` 注释所述「A.frontmatter.name == B.uri-leaf」rename 冲突边界的可观测行为
+/// （与 Python `staging.py` 逐行一致的跨 SDK 边界，**不在 Rust 单侧改变**）。批量化会重排该次序、
+/// 改变此边界，故采用「per-SKILL 短持写锁」取得相同的"锁不跨网络"收益而不动语义。
+/// 失败隔离不变：单 SKILL materialize 失败 → skip + 清理 staged。
 pub async fn stage_mcp_skills(
     manager: &dyn SkillResourceManager,
-    registry: &mut SkillRegistry,
+    registry: &RwLock<SkillRegistry>,
     home: &Path,
     server_name: Option<&str>,
     fetcher: Option<&dyn ArchiveFetcher>,
@@ -1378,6 +1392,7 @@ pub async fn stage_mcp_skills(
                 continue;
             }
             let staged = mcp_skill_dir(home, &normalized_server, leaf);
+            // phase 1（不持 Registry 锁）：物化到 staged——archive 网络下载 / resources MCP read_resource。
             let materialize = match mode {
                 "mounted" => materialize_mounted(&res.meta, &staged),
                 "archive" => materialize_archive(&res.meta, &staged, fetch).await,
@@ -1395,6 +1410,9 @@ pub async fn stage_mcp_skills(
                 let _ = std::fs::remove_dir_all(&staged);
                 continue;
             }
+            // phase 2（短持写锁）：finalize（FS rename + 内存注册，同步无 await）。写锁不跨 materialize
+            // 网络，并严格保持 per-SKILL materialize→finalize 交错（维持 rename 冲突的跨 SDK 边界）。
+            let mut reg = registry.write().await;
             if let Some(name) = finalize_and_register(
                 sname,
                 &normalized_server,
@@ -1402,11 +1420,12 @@ pub async fn stage_mcp_skills(
                 &staged,
                 root_uri,
                 home,
-                registry,
+                &mut reg,
                 &mut seen_this_run,
             ) {
                 registered.push(name);
             }
+            drop(reg);
         }
     }
     Ok(registered)
@@ -1688,16 +1707,100 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let manager = FakeManager { mount_src: mount };
-        let mut reg = SkillRegistry::new();
-        let names = stage_mcp_skills(&manager, &mut reg, &home, None, None)
+        // #77：stage_mcp_skills 现取 `&RwLock<SkillRegistry>`（内部 per-skill 短持写锁）。
+        let reg = RwLock::new(SkillRegistry::new());
+        let names = stage_mcp_skills(&manager, &reg, &home, None, None)
             .await
             .unwrap();
         // name = mcp:<server>:<frontmatter.name>，包根目录名校正为 real-name。
         assert_eq!(names, vec!["mcp:tfrobot-tools:real-name".to_string()]);
+        let reg = reg.into_inner();
         let r = reg.resolve("mcp:tfrobot-tools:real-name").unwrap();
         assert_eq!(r.source, "mcp:tfrobot-tools");
         assert_eq!(r.version.as_deref(), Some("2.1"));
         assert!(r.path.ends_with("mcp/tfrobot-tools/real-name"));
         assert!(Path::new(&r.path).join("SKILL.md").is_file());
+    }
+
+    // ---- #77：写锁不跨 materialize 网络 fetch（archive 模式回归守卫）----
+    /// 列出单个 `archive` 源 SKILL（字节由 fetcher 决定）/ lists one archive-source SKILL。
+    struct ArchiveManager;
+
+    #[async_trait::async_trait]
+    impl SkillResourceManager for ArchiveManager {
+        async fn list_skill_resources(
+            &self,
+            _server: Option<&str>,
+        ) -> Result<Vec<(String, McpResource)>, SkillStagingError> {
+            let mut meta = Map::new();
+            meta.insert("source".into(), Value::String("archive".into()));
+            meta.insert(
+                "archive_uri".into(),
+                Value::String("https://example.test/skill.tar.gz".into()),
+            );
+            meta.insert(
+                "archive_format".into(),
+                Value::String("tar.gz".into()),
+            );
+            Ok(vec![(
+                "tfrobot-tools".to_string(),
+                McpResource {
+                    uri: "skill://tfrobot-tools/pkg".to_string(),
+                    meta,
+                },
+            )])
+        }
+
+        async fn read_resource(
+            &self,
+            _server: &str,
+            _uri: &str,
+        ) -> Result<Vec<u8>, SkillStagingError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// fetch（模拟网络下载）期间断言 Registry **未被写锁占用**——直接证明 #77：写锁不跨 materialize 网络。
+    /// 旧实现（调用方跨整个 stage 持写锁）会令此 `try_read` 返回 `Err`，从而捕获回归。
+    struct AssertUnlockedFetcher {
+        registry: std::sync::Arc<RwLock<SkillRegistry>>,
+        body: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArchiveFetcher for AssertUnlockedFetcher {
+        async fn fetch(&self, _url: &str) -> Result<Vec<u8>, SkillStagingError> {
+            assert!(
+                self.registry.try_read().is_ok(),
+                "#77 regression: skill_registry MUST NOT be write-locked during archive fetch"
+            );
+            Ok(self.body.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stage_mcp_archive_does_not_hold_write_lock_during_fetch() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let body = make_tar_gz(&[(
+            "SKILL.md",
+            b"---\nname: pkg\ndescription: archived skill\n---\nbody",
+        )]);
+        let registry = std::sync::Arc::new(RwLock::new(SkillRegistry::new()));
+        let fetcher = AssertUnlockedFetcher {
+            registry: registry.clone(),
+            body,
+        };
+        let names = stage_mcp_skills(&ArchiveManager, &registry, &home, None, Some(&fetcher))
+            .await
+            .unwrap();
+        // fetch 期间的 try_read 断言已通过（写锁未跨网络），且 finalize 阶段完成注册。
+        assert_eq!(names, vec!["mcp:tfrobot-tools:pkg".to_string()]);
+        assert!(registry
+            .read()
+            .await
+            .resolve("mcp:tfrobot-tools:pkg")
+            .is_some());
     }
 }
