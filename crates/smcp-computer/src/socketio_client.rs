@@ -8,20 +8,27 @@
 * 描述: SMCP Computer的Socket.IO客户端实现 / Socket.IO client implementation for SMCP Computer
 */
 
+use crate::blob::encode_skill_handle;
+use crate::computer::ComputerHandlerOps;
 use crate::desktop::{organize_desktop, WindowInfo};
 use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
 use crate::mcp_clients::model::MCPServerInput;
+use crate::skills::naming::parse_skill_name;
+use base64::Engine as _;
 use futures_util::FutureExt;
 use serde_json::Value;
 use smcp::{
     events::{
-        CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_RESOURCES, CLIENT_GET_TOOLS,
-        CLIENT_TOOL_CALL, SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG,
+        CLIENT_GET_BLOB, CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_RESOURCES,
+        CLIENT_GET_SKILL, CLIENT_GET_SKILLS, CLIENT_GET_TOOLS, CLIENT_TOOL_CALL,
+        NOTIFY_TOOL_CALL_CANCEL, SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG,
         SERVER_UPDATE_DESKTOP, SERVER_UPDATE_SKILLS, SERVER_UPDATE_TOOL_LIST,
     },
+    set_content_blob_sideband, AgentCallData, ErrorCode, ErrorPayload, GetBlobReq, GetBlobRet,
     GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetResourcesReq,
-    GetResourcesRet, GetToolsReq, GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
+    GetResourcesRet, GetSkillReq, GetSkillRet, GetSkillsReq, GetSkillsRet, GetToolsReq,
+    GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,6 +62,10 @@ pub struct SmcpComputerClientBuilder {
     auth_header_name: Option<String>,
     namespace: Option<String>,
     headers: Option<HashMap<String, String>>,
+    /// INT-03 #72：Computer 操作句柄（socketio-detached），供 blob/skill/cancel/tool_call handler 调用。
+    /// `Option`：兼容旧入口（`SmcpComputerClient::new` / 不接 Computer 的测试）——缺省时 blob/skill/cancel
+    /// handler 回 InvalidState、tool_call 回退旧 `manager.execute_tool`（无取消/铸造）。
+    computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
 }
 
 impl SmcpComputerClientBuilder {
@@ -74,7 +85,17 @@ impl SmcpComputerClientBuilder {
             auth_header_name: None,
             namespace: None,
             headers: None,
+            computer_ops: None,
         }
+    }
+
+    /// 注入 Computer 操作句柄（INT-03 #72）/ inject the Computer ops handle for blob/skill/cancel handlers。
+    ///
+    /// 由 [`crate::computer::Computer::connect_socketio`] 以 socketio-detached 克隆注入；不设时
+    /// blob/skill/cancel handler 不可用、tool_call 退回旧 manager 路径（无取消/铸造）。
+    pub(crate) fn computer_ops(mut self, ops: Arc<dyn ComputerHandlerOps>) -> Self {
+        self.computer_ops = Some(ops);
+        self
     }
 
     /// 鉴权密钥（写入 `auth_header_name` 指定的 header）。
@@ -122,6 +143,7 @@ impl SmcpComputerClientBuilder {
             auth_header_name,
             namespace,
             self.headers,
+            self.computer_ops,
         )
         .await
     }
@@ -186,12 +208,15 @@ impl SmcpComputerClient {
         auth_header_name: String,
         namespace: String,
         headers: Option<HashMap<String, String>>,
+        computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
     ) -> ComputerResult<Self> {
         let office_id = Arc::new(RwLock::new(None));
         let manager_clone = manager.clone();
         let computer_name_clone = computer_name.clone();
         let office_id_clone = office_id.clone();
         let inputs_clone = inputs.clone();
+        // INT-03 #72：Computer ops 句柄供 blob/skill/cancel/tool_call handler 闭包按需克隆。
+        let computer_ops_clone = computer_ops.clone();
 
         // HS-02 #22: 在连接 URL 注入权威 a2c_version（丢弃调用方自带值，防版本漂移），
         // 使服务端 HTTP 握手中间件能在 Socket.IO 业务层之前完成版本协商。
@@ -248,6 +273,7 @@ impl SmcpComputerClient {
                 CLIENT_TOOL_CALL => {
                     let manager = manager_clone.clone();
                     let computer_name = computer_name_clone.clone();
+                    let ops = computer_ops_clone.clone();
                     let office_id = office_id_clone.clone();
                     let client_clone = client.clone();
                     let payload_clone = payload.clone();
@@ -257,6 +283,7 @@ impl SmcpComputerClient {
                             payload,
                             manager,
                             computer_name,
+                            ops,
                             office_id,
                             client_clone,
                         )
@@ -399,6 +426,68 @@ impl SmcpComputerClient {
                                 error!("Error handling get resources: {}", e);
                             }
                         }
+                    }
+                    .boxed()
+                }
+                // INT-03 #72：通用二进制拉取 client:get_blob（带 ACK）。
+                CLIENT_GET_BLOB => {
+                    let ops = computer_ops_clone.clone();
+                    let computer_name = computer_name_clone.clone();
+                    async move {
+                        match Self::handle_get_blob_with_ack(payload, ops, computer_name).await {
+                            Ok((ack_id, response)) => {
+                                if let Some(id) = ack_id {
+                                    if let Err(e) = client.ack_with_id(id, response).await {
+                                        error!("Failed to send ack: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => error!("Error handling get_blob: {}", e),
+                        }
+                    }
+                    .boxed()
+                }
+                // INT-03 #72：SKILL 清单 client:get_skills（带 ACK）。
+                CLIENT_GET_SKILLS => {
+                    let ops = computer_ops_clone.clone();
+                    let computer_name = computer_name_clone.clone();
+                    async move {
+                        match Self::handle_get_skills_with_ack(payload, ops, computer_name).await {
+                            Ok((ack_id, response)) => {
+                                if let Some(id) = ack_id {
+                                    if let Err(e) = client.ack_with_id(id, response).await {
+                                        error!("Failed to send ack: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => error!("Error handling get_skills: {}", e),
+                        }
+                    }
+                    .boxed()
+                }
+                // INT-03 #72：SKILL 单资源 client:get_skill（带 ACK；body XOR blob_handle）。
+                CLIENT_GET_SKILL => {
+                    let ops = computer_ops_clone.clone();
+                    let computer_name = computer_name_clone.clone();
+                    async move {
+                        match Self::handle_get_skill_with_ack(payload, ops, computer_name).await {
+                            Ok((ack_id, response)) => {
+                                if let Some(id) = ack_id {
+                                    if let Err(e) = client.ack_with_id(id, response).await {
+                                        error!("Failed to send ack: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => error!("Error handling get_skill: {}", e),
+                        }
+                    }
+                    .boxed()
+                }
+                // INT-03 #72 + 取消纵切：notify:tool_call_cancel → acancel_tool（**无 ACK**，fire-and-forget）。
+                NOTIFY_TOOL_CALL_CANCEL => {
+                    let ops = computer_ops_clone.clone();
+                    async move {
+                        Self::handle_tool_call_cancel(payload, ops).await;
                     }
                     .boxed()
                 }
@@ -714,6 +803,7 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
         _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
@@ -728,28 +818,53 @@ impl SmcpComputerClient {
             )));
         }
 
-        // 执行工具调用 / Execute tool call
-        let result = {
-            let manager_guard = manager.read().await;
-            match manager_guard.as_ref() {
-                Some(mgr) => {
-                    mgr.execute_tool(
+        // timeout=0 → 无超时（None）；否则秒。两条执行路径（ops / 旧 manager 兜底）从同一规则派生，
+        // 语义统一（fix-review #4：避免 0 在兜底路径被当 0s-立即超时）。/ unify timeout 0 = no timeout.
+        let timeout = if req.timeout > 0 {
+            Some(f64::from(req.timeout))
+        } else {
+            None
+        };
+        let timeout_duration = timeout.map(std::time::Duration::from_secs_f64);
+
+        let result_value = match ops {
+            // INT-03 #72：经 Computer::execute_tool_cancellable（支持 notify:tool_call_cancel 协作式取消
+            // + 取消/超时结果级 meta），随后对超内联预算的二进制 content item 铸造 toolspool 旁路句柄。
+            Some(ops) => {
+                let result = ops
+                    .execute_tool_cancellable(
+                        req.base.req_id.as_str(),
                         &req.tool_name,
                         req.params,
-                        Some(std::time::Duration::from_secs(req.timeout as u64)),
+                        timeout,
                     )
-                    .await?
-                }
-                None => {
-                    return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized".to_string(),
-                    ));
-                }
+                    .await?;
+                let mut value =
+                    serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
+                // 铸造旁路（>内联预算的二进制 → toolspool 句柄 + 内联清空；超 too_large_cap 拒绝 + WARN）。
+                // mint 失败/小尺寸不致命：保留原内联，不阻断 tool_call 应答。
+                mint_oversize_binary_content(ops.as_ref(), &mut value).await;
+                value
+            }
+            // 兼容旧入口（无 Computer ops）：退回 manager.execute_tool（无取消/铸造）。
+            None => {
+                let result = {
+                    let manager_guard = manager.read().await;
+                    match manager_guard.as_ref() {
+                        Some(mgr) => {
+                            mgr.execute_tool(&req.tool_name, req.params, timeout_duration)
+                                .await?
+                        }
+                        None => {
+                            return Err(ComputerError::InvalidState(
+                                "MCP Manager not initialized".to_string(),
+                            ));
+                        }
+                    }
+                };
+                serde_json::to_value(result).map_err(ComputerError::SerializationError)?
             }
         };
-
-        let result_value =
-            serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
 
         info!("Tool call executed successfully: {}", req.tool_name);
         Ok((ack_id, result_value))
@@ -1009,6 +1124,223 @@ impl SmcpComputerClient {
         }
     }
 
+    /// 处理 SKILL 清单事件 `client:get_skills`（带 ACK，INT-03 #72）/ Handle get_skills (with ACK)。
+    ///
+    /// 透传 [`ComputerHandlerOps::get_skills`]（仅活跃 SKILL，排除孤儿）。对齐 Python `on_get_skills`。
+    async fn handle_get_skills_with_ack(
+        payload: Payload,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
+        computer_name: String,
+    ) -> ComputerResult<(Option<i32>, Value)> {
+        let (ack_id, req) = Self::extract_ack_and_parse::<GetSkillsReq>(payload)?;
+        if computer_name != req.computer {
+            return Err(ComputerError::ValidationError(format!(
+                "Computer name mismatch: expected {}, got {}",
+                computer_name, req.computer
+            )));
+        }
+        let ops = ops.ok_or_else(|| {
+            ComputerError::InvalidState("Computer ops not available for get_skills".to_string())
+        })?;
+        let skills = ops.get_skills().await;
+        let ret = GetSkillsRet {
+            skills,
+            req_id: Some(req.base.req_id),
+        };
+        Ok((ack_id, serde_json::to_value(ret)?))
+    }
+
+    /// 处理 SKILL 单资源事件 `client:get_skill`（带 ACK，INT-03 #72）/ Handle get_skill (with ACK)。
+    ///
+    /// 错误码（flat ErrorPayload，ACK 第一参）：`name` 格式非法 → `4016`；格式合法但未注册/孤儿 →
+    /// `4014`；`rel_path` 沙箱不可达（traversal/forbidden/not_found/too_large）→ `4017`。成功：`body`
+    /// 与 `blob_handle` **恰一**——文本且 ≤ 内联预算且 UTF-8 → `body`；否则铸 skill `blob_handle`。
+    /// 对齐 Python `on_get_skill`。
+    async fn handle_get_skill_with_ack(
+        payload: Payload,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
+        computer_name: String,
+    ) -> ComputerResult<(Option<i32>, Value)> {
+        let (ack_id, req) = Self::extract_ack_and_parse::<GetSkillReq>(payload)?;
+        if computer_name != req.computer {
+            return Err(ComputerError::ValidationError(format!(
+                "Computer name mismatch: expected {}, got {}",
+                computer_name, req.computer
+            )));
+        }
+        let ops = ops.ok_or_else(|| {
+            ComputerError::InvalidState("Computer ops not available for get_skill".to_string())
+        })?;
+
+        // 1) name 格式校验 → 4016（格式硬错，先于 registry）。
+        if let Err(e) = parse_skill_name(&req.name) {
+            warn!("client:get_skill invalid skill name {:?}: {}", req.name, e);
+            let payload =
+                ErrorPayload::from_error_code(ErrorCode::SkillNameInvalid, "Invalid SKILL name")
+                    .with_detail("name", req.name.clone());
+            return Ok((ack_id, serde_json::to_value(payload)?));
+        }
+
+        // 2) registry 查找 → 4014（格式合法但未注册/孤儿）。
+        let Some(skill_ref) = ops.get_skill_ref(&req.name).await else {
+            warn!(
+                "client:get_skill name not in registry (unregistered or orphaned): {:?}",
+                req.name
+            );
+            let payload =
+                ErrorPayload::from_error_code(ErrorCode::McpServerNotFound, "SKILL not found")
+                    .with_detail("name", req.name.clone());
+            return Ok((ack_id, serde_json::to_value(payload)?));
+        };
+
+        // 3) 沙箱解析资源 → 4017（traversal/forbidden/not_found/too_large）。
+        let view = match ops.read_skill_resource(&skill_ref, req.rel_path.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "client:get_skill resource not accessible: name={:?} reason={} rel={:?}",
+                    req.name, e.reason, e.rel_path
+                );
+                return Ok((ack_id, serde_json::to_value(e.to_error_payload())?));
+            }
+        };
+
+        // 4) body XOR blob_handle：文本 + ≤ 内联预算 + UTF-8 → body；否则铸 skill 句柄。
+        let budget = ops.blob_thresholds().inline_budget;
+        let mut body: Option<String> = None;
+        if view.is_text && view.total_size <= budget {
+            if let Ok(bytes) = view.read_all() {
+                match String::from_utf8(bytes) {
+                    Ok(text) => body = Some(text),
+                    // 文本 MIME 但非 UTF-8 → 回退 blob_handle（保守，对齐 Python）。
+                    Err(_) => debug!(
+                        "client:get_skill {:?} rel={:?} textual mime but not UTF-8; routing to blob_handle",
+                        req.name, view.rel_path
+                    ),
+                }
+            }
+        }
+        // too_large 已在 read_skill_resource 拦截，此处铸造安全。
+        let blob_handle = if body.is_none() {
+            Some(encode_skill_handle(&req.name, &view.rel_path))
+        } else {
+            None
+        };
+
+        let ret = GetSkillRet {
+            name: Some(req.name),
+            rel_path: Some(view.rel_path),
+            mime_type: Some(view.mime),
+            total_size: Some(view.total_size),
+            sha256: Some(view.sha256),
+            body,
+            blob_handle,
+            req_id: Some(req.base.req_id),
+        };
+        Ok((ack_id, serde_json::to_value(ret)?))
+    }
+
+    /// 处理通用二进制拉取事件 `client:get_blob`（带 ACK，INT-03 #72）/ Handle get_blob (with ACK)。
+    ///
+    /// 解码句柄 → 路由 resolver（重施铸造通道鉴权）→ 切片（`max_chunk_bytes` clamp）→ base64。范围守卫
+    /// **严格 `>`**：`offset == total_size` 是 EOF probe（返回空块 + `eof=true`），仅 `offset > total_size`
+    /// 才 `4018 range`。句柄失效/越权/消失 → `4018`（reason ∈ invalid_handle/forbidden/gone/range）。
+    /// 对齐 Python `on_get_blob`。
+    async fn handle_get_blob_with_ack(
+        payload: Payload,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
+        computer_name: String,
+    ) -> ComputerResult<(Option<i32>, Value)> {
+        let (ack_id, req) = Self::extract_ack_and_parse::<GetBlobReq>(payload)?;
+        if computer_name != req.computer {
+            return Err(ComputerError::ValidationError(format!(
+                "Computer name mismatch: expected {}, got {}",
+                computer_name, req.computer
+            )));
+        }
+        let ops = ops.ok_or_else(|| {
+            ComputerError::InvalidState("Computer ops not available for get_blob".to_string())
+        })?;
+
+        let thresholds = ops.blob_thresholds();
+        let max_chunk = thresholds.clamp_chunk(req.max_chunk_bytes.map(|v| v as i64));
+        let chunk_offset = req.chunk_offset.unwrap_or(0);
+
+        // 解码 + 路由 + 重施鉴权 → 4018（按 BlobHandleError::reason 映射）。
+        let resolved = match ops.resolve_blob(&req.blob_handle).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "client:get_blob handle rejected: reason={}, err={}",
+                    e.reason(),
+                    e
+                );
+                return Ok((
+                    ack_id,
+                    serde_json::to_value(blob_error_payload(e.reason()))?,
+                ));
+            }
+        };
+
+        // 范围守卫：严格 `>`（offset==total_size 为 EOF probe，返回空块 + eof）。
+        if chunk_offset > resolved.total_size {
+            warn!(
+                "client:get_blob range out of bounds: offset={}, total_size={}",
+                chunk_offset, resolved.total_size
+            );
+            return Ok((ack_id, serde_json::to_value(blob_error_payload("range"))?));
+        }
+
+        let remaining = resolved.total_size - chunk_offset;
+        let slice_len = max_chunk.min(remaining);
+        let chunk = match resolved.slice(chunk_offset, slice_len) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok((
+                    ack_id,
+                    serde_json::to_value(blob_error_payload(e.reason()))?,
+                ));
+            }
+        };
+        // eof：保留 len(chunk) 形式（对短读稳健）。
+        let eof = chunk_offset + chunk.len() as u64 == resolved.total_size;
+
+        let ret = GetBlobRet {
+            blob_handle: req.blob_handle,
+            mime_type: Some(resolved.mime),
+            total_size: resolved.total_size,
+            sha256: resolved.sha256,
+            chunk_offset,
+            eof,
+            blob: base64::engine::general_purpose::STANDARD.encode(&chunk),
+            req_id: Some(req.base.req_id),
+        };
+        Ok((ack_id, serde_json::to_value(ret)?))
+    }
+
+    /// 处理取消通知 `notify:tool_call_cancel`（**无 ACK**，fire-and-forget，INT-03 #72 + 取消纵切）。
+    ///
+    /// 解析广播载体 `{agent, req_id}`（[`AgentCallData`]），fire 对应在途调用的取消令牌
+    /// （[`ComputerHandlerOps::acancel_tool`]）。取消为协作式——远端是否真正停止不保证；未知 req_id
+    /// 幂等 no-op。无应答（与 Server fire-and-forget 广播语义一致）。
+    async fn handle_tool_call_cancel(payload: Payload, ops: Option<Arc<dyn ComputerHandlerOps>>) {
+        let Some(ops) = ops else {
+            warn!("notify:tool_call_cancel received but Computer ops not available");
+            return;
+        };
+        match Self::extract_ack_and_parse::<AgentCallData>(payload) {
+            Ok((_ack, data)) => {
+                let cancelled = ops.acancel_tool(data.req_id.as_str()).await;
+                debug!(
+                    "notify:tool_call_cancel req_id={} → cancelled={}",
+                    data.req_id.as_str(),
+                    cancelled
+                );
+            }
+            Err(e) => warn!("notify:tool_call_cancel parse failed: {}", e),
+        }
+    }
+
     /// 从payload中提取ack_id并解析数据
     /// Extract ack_id from payload and parse data
     fn extract_ack_and_parse<T: serde::de::DeserializeOwned>(
@@ -1175,6 +1507,125 @@ pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -
         params_schema,
         return_schema: None,
         meta,
+    }
+}
+
+/// 构造 `4018 Blob Not Accessible` flat ErrorPayload（`details.reason` ∈ invalid_handle/forbidden/
+/// gone/range）/ build a flat 4018 ErrorPayload。供 `client:get_blob` handler 回传（ACK 第一参）。
+fn blob_error_payload(reason: &str) -> ErrorPayload {
+    ErrorPayload::from_error_code(ErrorCode::BlobNotAccessible, "Blob not accessible")
+        .with_detail("reason", reason)
+}
+
+/// 对 `CallToolResult`（已序列化为 `Value`）的超内联预算二进制 content item 铸造 toolspool 旁路句柄
+/// （INT-03 #72）/ mint oversize binary content items into toolspool sideband handles。
+///
+/// 遍历 `content[*]`，检出二进制载体（顶层 `data`+`mimeType`，或 `EmbeddedResource` 的
+/// `resource.blob`+`resource.mimeType`），base64 解码后按**三档阈值**：
+/// - `size ≤ inline_budget` → 保留内联（跳过）；
+/// - `size > too_large_cap` → 拒绝铸造 + WARN（DoS 防御，**不**写句柄、**不**清内联）；
+/// - 介于之间 → `mint_toolspool_handle` 铸 cid 句柄，**清空**内联 `data`/`blob`，并经
+///   [`set_content_blob_sideband`] 写 `_meta.a2c_blob_handle`(+`a2c_total_size`/`a2c_sha256`)
+///   （该 helper 规范化非 dict `_meta`，避免孤儿 cid）。
+///
+/// 容错：解码失败 / mint 失败均仅跳过该 item（保留内联），**不**阻断 tool_call 应答。对齐 Python
+/// `_mint_oversize_binary_content`。
+async fn mint_oversize_binary_content(ops: &dyn ComputerHandlerOps, raw: &mut Value) {
+    let thresholds = ops.blob_thresholds();
+    let budget = thresholds.inline_budget;
+    let too_large = thresholds.too_large_cap;
+
+    let Some(content) = raw.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for item in content.iter_mut() {
+        // 1) 只读提取候选载体（不跨 await 持有借用）：(base64, mime, is_resource, meta_is_bad)。
+        // `meta_is_bad`：`_meta` 存在且既非 null 又非 object（如字符串/数字/数组）——畸形 MCP 输入，
+        // 铸造时须跳过（见 fix-review #2，对齐 Python `_mint_oversize_binary_content`）。
+        let candidate: Option<(String, String, bool, bool)> = {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let meta_is_bad = obj
+                .get("_meta")
+                .is_some_and(|m| !m.is_null() && !m.is_object());
+            if let Some(d) = obj.get("data").and_then(Value::as_str) {
+                let mime = obj
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Some((d.to_string(), mime, false, meta_is_bad))
+            } else if let Some(res) = obj.get("resource").and_then(Value::as_object) {
+                res.get("blob").and_then(Value::as_str).map(|b| {
+                    let mime = res
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .or_else(|| obj.get("mimeType").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string();
+                    (b.to_string(), mime, true, meta_is_bad)
+                })
+            } else {
+                None
+            }
+        };
+        let Some((b64, mime, is_resource, meta_is_bad)) = candidate else {
+            continue;
+        };
+
+        // 2) 解码 + 三档阈值判定。
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+            continue; // 非法 base64 → 保留内联，不铸造。
+        };
+        let size = bytes.len() as u64;
+        if size <= budget {
+            continue; // 内联预算内 → 保留。
+        }
+        if size > too_large {
+            warn!(
+                "on_tool_call binary item size {} exceeds too_large_cap {}; skipping mint",
+                size, too_large
+            );
+            continue; // DoS 防御：不铸造、保留内联。
+        }
+        // 畸形 `_meta`（非 null 非 object）→ 跳过铸造、保留内联（对齐 Python：避免覆写畸形 _meta 后
+        // 落盘孤儿 cid）。null/缺省/object 由 set_content_blob_sideband 正确规范化，照常铸造。
+        if meta_is_bad {
+            warn!("on_tool_call skipping mint: item['_meta'] is not a dict; keeping inline");
+            continue;
+        }
+
+        // 3) 铸造（await，无 item 借用）。
+        let mime_for_mint = if mime.is_empty() {
+            "application/octet-stream"
+        } else {
+            mime.as_str()
+        };
+        let handle = match ops.mint_toolspool_handle(&bytes, mime_for_mint).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    "on_tool_call mint failed for item size={}: {}; keeping inline",
+                    size, e
+                );
+                continue;
+            }
+        };
+        let sha = smcp::utils::sha256_hex(&bytes);
+
+        // 4) 清空内联载体 + 写 _meta 旁路（set_content_blob_sideband 规范化非 dict _meta）。
+        if let Some(obj) = item.as_object_mut() {
+            if is_resource {
+                if let Some(res) = obj.get_mut("resource").and_then(Value::as_object_mut) {
+                    res.insert("blob".to_string(), Value::String(String::new()));
+                }
+            } else {
+                obj.insert("data".to_string(), Value::String(String::new()));
+            }
+        }
+        set_content_blob_sideband(item, &handle, Some(size), Some(&sha));
     }
 }
 
@@ -1526,5 +1977,245 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ComputerError::ValidationError(_))));
+    }
+
+    // ── INT-03 #72：blob mint / get_blob / get_skill[s] / cancel handler ─────────────────
+
+    /// 启一个带 blob 子系统的 Computer，返回 socketio handler 用的 ops（直接 `Arc<Computer>`——测试无
+    /// socketio client，故无需 detached 克隆、无环）。`TempDir` 一并返回避免被 drop。
+    async fn boot_blob_ops(
+        inline_budget: u64,
+        too_large_cap: u64,
+    ) -> (Arc<dyn ComputerHandlerOps>, tempfile::TempDir) {
+        use crate::blob::BlobThresholds;
+        use crate::computer::{Computer, SilentSession};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_blob_thresholds(BlobThresholds {
+                inline_budget,
+                too_large_cap,
+                chunk_max_bytes: 256 * 1024,
+            });
+        computer.boot_up().await.unwrap();
+        let ops: Arc<dyn ComputerHandlerOps> = Arc::new(computer);
+        (ops, tmp)
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[tokio::test]
+    async fn test_mint_oversize_image_item_minted_text_untouched() {
+        let (ops, _tmp) = boot_blob_ops(8, 1024).await;
+        let bytes = vec![0xABu8; 20]; // 20 > inline_budget(8) 且 < too_large_cap(1024) → 铸造
+        let mut result = json!({
+            "content": [
+                { "type": "text", "text": "hello" },
+                { "type": "image", "mimeType": "image/png", "data": b64(&bytes) }
+            ]
+        });
+        mint_oversize_binary_content(ops.as_ref(), &mut result).await;
+        // text item 路径不变。
+        assert_eq!(result["content"][0]["text"], json!("hello"));
+        // image item：内联 data 清空 + _meta 旁路写入（handle / total_size / sha256）。
+        let item = &result["content"][1];
+        assert_eq!(item["data"], json!(""));
+        assert!(!item["_meta"]["a2c_blob_handle"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert_eq!(item["_meta"]["a2c_total_size"], json!(20));
+        assert_eq!(
+            item["_meta"]["a2c_sha256"].as_str().unwrap(),
+            smcp::utils::sha256_hex(&bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mint_small_inline_and_too_large_rejected() {
+        let (ops, _tmp) = boot_blob_ops(8, 16).await; // budget=8, cap=16
+        let small = b64(&[1u8; 4]); // 4 ≤ 8 → 保留内联
+        let huge = b64(&[2u8; 20]); // 20 > 16(cap) → 拒绝铸造，保留内联
+        let mut result = json!({
+            "content": [
+                { "type": "image", "mimeType": "image/png", "data": small.clone() },
+                { "type": "image", "mimeType": "image/png", "data": huge.clone() }
+            ]
+        });
+        mint_oversize_binary_content(ops.as_ref(), &mut result).await;
+        // 小尺寸：data 原样、无 _meta。
+        assert_eq!(result["content"][0]["data"], json!(small));
+        assert!(result["content"][0].get("_meta").is_none());
+        // 超 too_large_cap：data 原样（保留内联避免丢字节）、无 _meta。
+        assert_eq!(result["content"][1]["data"], json!(huge));
+        assert!(result["content"][1].get("_meta").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mint_embedded_resource_blob_and_non_dict_meta() {
+        let (ops, _tmp) = boot_blob_ops(8, 1024).await;
+        let bytes = vec![0xCDu8; 20];
+        let mut result = json!({
+            "content": [{
+                "type": "resource",
+                "resource": { "mimeType": "application/pdf", "blob": b64(&bytes) },
+                "_meta": null  // 非 dict _meta：铸造时须规范化，避免孤儿 cid。
+            }]
+        });
+        mint_oversize_binary_content(ops.as_ref(), &mut result).await;
+        let item = &result["content"][0];
+        // EmbeddedResource：写回 resource.blob 清空，顶层不误写 data。
+        assert_eq!(item["resource"]["blob"], json!(""));
+        assert!(item.get("data").is_none());
+        // null _meta 被规范化为 object 并写入旁路（null/缺省/object 均照常铸造）。
+        assert!(item["_meta"].is_object());
+        assert!(item["_meta"]["a2c_blob_handle"].is_string());
+        assert_eq!(item["_meta"]["a2c_total_size"], json!(20));
+    }
+
+    #[tokio::test]
+    async fn test_mint_skips_non_dict_meta() {
+        // fix-review #2：`_meta` 非 null 非 object（字符串 / 数组）→ 跳过铸造、保留内联（对齐 Python）。
+        let (ops, _tmp) = boot_blob_ops(8, 1024).await;
+        let payload = b64(&[0xEEu8; 20]); // 20 > budget(8)，本应铸造——但畸形 _meta 阻止
+        let mut result = json!({
+            "content": [
+                { "type": "image", "mimeType": "image/png", "data": payload.clone(), "_meta": "i-am-a-string" },
+                { "type": "image", "mimeType": "image/png", "data": payload.clone(), "_meta": [1, 2, 3] }
+            ]
+        });
+        mint_oversize_binary_content(ops.as_ref(), &mut result).await;
+        // 字符串 _meta：data 原样、_meta 不被改写为 object、无旁路句柄。
+        assert_eq!(result["content"][0]["data"], json!(payload));
+        assert_eq!(result["content"][0]["_meta"], json!("i-am-a-string"));
+        // 数组 _meta：同样跳过。
+        assert_eq!(result["content"][1]["data"], json!(payload));
+        assert_eq!(result["content"][1]["_meta"], json!([1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_roundtrip_eof_probe_and_range() {
+        let (ops, _tmp) = boot_blob_ops(8, 1 << 20).await;
+        let handle = ops
+            .mint_toolspool_handle(b"0123456789", "text/plain")
+            .await
+            .unwrap(); // 10 bytes
+        let mk = |off: u64, max: u64, ack: i32| {
+            Payload::Text(
+                vec![json!({
+                    "agent": "a", "req_id": "r1", "computer": "c",
+                    "blob_handle": handle.clone(), "chunk_offset": off, "max_chunk_bytes": max
+                })],
+                Some(ack),
+            )
+        };
+
+        // 整块拉取：total_size/sha256/eof/chunk_offset + base64 还原。
+        let (ack, resp) = SmcpComputerClient::handle_get_blob_with_ack(
+            mk(0, 1000, 3),
+            Some(ops.clone()),
+            "c".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ack, Some(3));
+        assert_eq!(resp["total_size"], json!(10));
+        assert_eq!(resp["eof"], json!(true));
+        assert_eq!(resp["chunk_offset"], json!(0));
+        assert_eq!(resp["mime_type"], json!("text/plain"));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(resp["blob"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"0123456789");
+
+        // EOF probe：offset==total_size → 空块 + eof=true（**非** range error）。
+        let (_, probe) = SmcpComputerClient::handle_get_blob_with_ack(
+            mk(10, 1000, 4),
+            Some(ops.clone()),
+            "c".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(probe["eof"], json!(true));
+        assert_eq!(probe["blob"], json!(""));
+        assert!(probe.get("code").is_none());
+
+        // 越界：offset > total_size → 4018 range。
+        let (_, rng) = SmcpComputerClient::handle_get_blob_with_ack(
+            mk(11, 1000, 5),
+            Some(ops.clone()),
+            "c".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rng["code"], json!(4018));
+        assert_eq!(rng["details"]["reason"], json!("range"));
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_invalid_handle_4018() {
+        let (ops, _tmp) = boot_blob_ops(8, 1 << 20).await;
+        let payload = Payload::Text(
+            vec![json!({
+                "agent": "a", "req_id": "r1", "computer": "c", "blob_handle": "garbage-not-a-handle"
+            })],
+            Some(9),
+        );
+        let (_, resp) =
+            SmcpComputerClient::handle_get_blob_with_ack(payload, Some(ops), "c".to_string())
+                .await
+                .unwrap();
+        assert_eq!(resp["code"], json!(4018));
+        assert_eq!(resp["details"]["reason"], json!("invalid_handle"));
+    }
+
+    #[tokio::test]
+    async fn test_get_skills_empty_and_get_skill_not_found_4014() {
+        let (ops, _tmp) = boot_blob_ops(1024, 1 << 20).await;
+
+        // get_skills：空 registry → 空列表（透传 ComputerHandlerOps::get_skills）。
+        let p = Payload::Text(
+            vec![json!({ "agent": "a", "req_id": "r1", "computer": "c" })],
+            Some(1),
+        );
+        let (ack, resp) =
+            SmcpComputerClient::handle_get_skills_with_ack(p, Some(ops.clone()), "c".to_string())
+                .await
+                .unwrap();
+        assert_eq!(ack, Some(1));
+        assert_eq!(resp["skills"], json!([]));
+
+        // get_skill：合法 kebab name 但未注册 → 4014（格式合法但不存在）。
+        let p2 = Payload::Text(
+            vec![json!({ "agent": "a", "req_id": "r1", "computer": "c", "name": "my-skill" })],
+            Some(2),
+        );
+        let (_, resp2) =
+            SmcpComputerClient::handle_get_skill_with_ack(p2, Some(ops), "c".to_string())
+                .await
+                .unwrap();
+        assert_eq!(resp2["code"], json!(4014));
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_cancel_unknown_reqid_is_noop() {
+        let (ops, _tmp) = boot_blob_ops(1024, 1 << 20).await;
+        // notify:tool_call_cancel 对未知 req_id 幂等 no-op（不 panic、无 ACK）。
+        let p = Payload::Text(vec![json!({ "agent": "a", "req_id": "nonexistent" })], None);
+        SmcpComputerClient::handle_tool_call_cancel(p, Some(ops)).await;
+    }
+
+    #[tokio::test]
+    async fn test_handlers_require_ops_when_absent() {
+        // ops 缺省（旧入口）：blob/skill handler 回 InvalidState（不 panic）。
+        let p = Payload::Text(
+            vec![json!({ "agent": "a", "req_id": "r1", "computer": "c", "blob_handle": "x" })],
+            Some(1),
+        );
+        let r = SmcpComputerClient::handle_get_blob_with_ack(p, None, "c".to_string()).await;
+        assert!(matches!(r, Err(ComputerError::InvalidState(_))));
     }
 }

@@ -143,6 +143,11 @@ pub trait Session: Send + Sync {
 }
 
 /// 默认的静默Session实现 / Default silent session implementation
+///
+/// `Clone`：socketio 接线（#72）的 [`Computer::clone_for_handlers`] 需克隆 Session 以构造
+/// socketio-detached 句柄；`SilentSession` 仅持 `id`，克隆无副作用。自定义 Session 若要接 socketio
+/// blob/skill/cancel handler，亦须可 `Clone`（handler 路径**不**触碰 session，克隆体仅占位）。
+#[derive(Clone)]
 pub struct SilentSession {
     id: String,
 }
@@ -1573,13 +1578,65 @@ impl<S: Session> Computer<S> {
     }
 
     /// 连接Socket.IO服务器 / Connect to Socket.IO server
+    /// socketio-detached 克隆，供 [`SmcpComputerClient`] handler 持有（INT-03 #72）/ socketio-detached clone for handlers.
+    ///
+    /// 与 [`Clone`] 实现一致地**共享**全部运行态 Arc（manager / tool_history / skill registry /
+    /// toolspool / resolvers / inflight 注册表），使 handler 命中与原 Computer **同一**状态——唯独
+    /// `socketio_client` 置空（fresh `None`），且去抖器按此 detached 句柄重建，从而**断开** client →
+    /// ops → socketio_client → client 的 Arc 环。handler 路径（resolve_blob / get_skill* /
+    /// mint / execute_tool_cancellable / acancel_tool）均不经 socketio_client 发包，故置空无副作用。
+    ///
+    /// `session` 被克隆但 handler 路径**不触碰**它（仅占位满足 struct 完整性）。
+    fn clone_for_handlers(&self) -> Self
+    where
+        S: Clone,
+    {
+        // detached socketio：handler 持有的 ops 不得反向强引用真正的 client（否则成环）。
+        let detached_socketio: Arc<RwLock<Option<Arc<SmcpComputerClient>>>> =
+            Arc::new(RwLock::new(None));
+        Self {
+            name: self.name.clone(),
+            mcp_manager: Arc::clone(&self.mcp_manager),
+            inputs: Arc::new(RwLock::new(HashMap::new())), // 运行时态不复制（同 Clone 语义）。
+            mcp_servers: RwLock::new(HashMap::new()),
+            input_handler: Arc::clone(&self.input_handler),
+            auto_connect: self.auto_connect,
+            auto_reconnect: self.auto_reconnect,
+            tool_history: Arc::clone(&self.tool_history),
+            session: self.session.clone(),
+            socketio_client: detached_socketio.clone(),
+            confirm_callback: self.confirm_callback.clone(),
+            skill_registry: Arc::clone(&self.skill_registry),
+            skill_home: Arc::clone(&self.skill_home),
+            skill_home_override: self.skill_home_override.clone(),
+            registered_workdirs: Arc::clone(&self.registered_workdirs),
+            // 去抖器按 detached socketio 重建：避免 handler 持有的 ops 经去抖器反向引用真 client。
+            skill_debouncer: Arc::new(build_skill_debouncer(
+                &self.skill_registry,
+                &self.skill_home,
+                &self.registered_workdirs,
+                &detached_socketio,
+            )),
+            skill_watcher: Arc::new(Mutex::new(None)),
+            skill_watch_polling: self.skill_watch_polling,
+            blob_cache_root_override: self.blob_cache_root_override.clone(),
+            blob_thresholds: self.blob_thresholds,
+            toolspool_store: Arc::clone(&self.toolspool_store),
+            blob_resolvers: Arc::clone(&self.blob_resolvers),
+            inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
+        }
+    }
+
     pub async fn connect_socketio(
         &self,
         url: &str,
         namespace: &str,
         auth: &Option<String>,
         headers: &Option<String>,
-    ) -> ComputerResult<()> {
+    ) -> ComputerResult<()>
+    where
+        S: Clone + 'static,
+    {
         // 确保管理器已初始化 / Ensure manager is initialized
         let _manager_check = {
             let manager_guard = self.mcp_manager.read().await;
@@ -1598,24 +1655,23 @@ impl<S: Session> Computer<S> {
             }
         };
 
-        // 由于类型不匹配，我们需要创建一个新的manager实例
-        // Due to type mismatch, we need to create a new manager instance
-        // TODO: 这里应该重新设计以共享同一个manager实例
-        // TODO: Should redesign to share the same manager instance
-        let new_manager = MCPServerManager::new();
-
         // 解析 headers 字符串为 HashMap / Parse headers string into HashMap
         let parsed_headers = headers.as_deref().map(parse_headers_string);
 
-        // 创建Socket.IO客户端：通过 Builder 串联可配置项（含 namespace）
-        // Create Socket.IO client via Builder (threading namespace through)
+        // INT-03 #72：共享**真实** manager（修复历史 throwaway `MCPServerManager::new()` bug——旧码给
+        // socket client 传空 manager，使 on_tool_call / on_get_resources 命中空注册表），并经
+        // `computer_ops` 注入 socketio-detached 的 [`ComputerHandlerOps`]，让 blob/skill/cancel handler
+        // 能调 resolve_blob / get_skill* / mint / execute_tool_cancellable / acancel_tool。
+        // Create Socket.IO client via Builder (threading namespace through).
+        let ops: Arc<dyn ComputerHandlerOps> = Arc::new(self.clone_for_handlers());
         let mut builder = SmcpComputerClientBuilder::new(
             url,
-            Arc::new(RwLock::new(Some(new_manager))),
+            self.mcp_manager.clone(),
             self.name.clone(),
             self.inputs.clone(),
         )
-        .namespace(namespace);
+        .namespace(namespace)
+        .computer_ops(ops);
         if let Some(secret) = auth.clone() {
             builder = builder.auth_secret(secret);
         }
@@ -1753,6 +1809,92 @@ impl<S: Session + Clone> Clone for Computer<S> {
             // 取消注册表属**共享态**：clone 体与原 Computer 须命中同一表，否则跨 clone 的 acancel_tool 失效。
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
         }
+    }
+}
+
+/// Socket.IO handler 所需的 Computer 操作（非泛型 trait 对象，INT-03 #72）/ Computer ops for socketio handlers.
+///
+/// `socketio_client.rs` 的 `SmcpComputerClient` 是**非泛型** struct（其在 `Computer<S>` 中以
+/// `Arc<SmcpComputerClient>` 存储），故不能直接持 `Computer<S>`。本 trait 把 handler 所需的 Computer
+/// 操作**类型擦除**为 `Arc<dyn ComputerHandlerOps>`，由 [`Computer::clone_for_handlers`] 的
+/// socketio-detached 克隆充当——克隆共享全部运行态 Arc（manager / toolspool / resolvers / skill
+/// registry / inflight 注册表），故 handler 与原 Computer 命中同一状态；唯独 `socketio_client` 被置空以
+/// **断开 Arc 环**（client → ops → socketio_client → client）。handler 路径均不经 socketio_client 发包。
+///
+/// 各方法为对 [`Computer`] 同名 inherent 方法的纯委托，无逻辑重复。
+#[async_trait]
+pub(crate) trait ComputerHandlerOps: Send + Sync {
+    /// 解析 blob 句柄（toolspool / skill）→ 可切片描述符 / resolve a blob handle。
+    async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError>;
+    /// 活跃 SKILL 列表（排除孤儿）/ active SKILL refs。
+    async fn get_skills(&self) -> Vec<A2CSkillRef>;
+    /// 按 name 查活跃 SKILL / lookup an active SKILL by name。
+    async fn get_skill_ref(&self, name: &str) -> Option<A2CSkillRef>;
+    /// 沙箱解析 SKILL 包内资源 → 字节视图 / sandbox-resolve a SKILL resource。
+    fn read_skill_resource(
+        &self,
+        skill_ref: &A2CSkillRef,
+        rel_path: Option<&str>,
+    ) -> Result<SkillResourceView, SkillSandboxError>;
+    /// 铸造 toolspool blob 句柄（写 `.blobspool`）/ mint a toolspool blob handle。
+    async fn mint_toolspool_handle(
+        &self,
+        payload: &[u8],
+        mime: &str,
+    ) -> Result<String, BlobMintError>;
+    /// blob 阈值（inline / too_large / chunk_max）/ blob thresholds。
+    fn blob_thresholds(&self) -> BlobThresholds;
+    /// 可取消执行工具调用（取消/超时写结果级 meta）/ cancellable tool-call execution。
+    async fn execute_tool_cancellable(
+        &self,
+        req_id: &str,
+        tool_name: &str,
+        parameters: serde_json::Value,
+        timeout: Option<f64>,
+    ) -> ComputerResult<CallToolResult>;
+    /// fire 在途调用的取消令牌（响应 `notify:tool_call_cancel`）/ fire an in-flight cancel token。
+    async fn acancel_tool(&self, req_id: &str) -> bool;
+}
+
+#[async_trait]
+impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
+    async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError> {
+        Computer::resolve_blob(self, handle).await
+    }
+    async fn get_skills(&self) -> Vec<A2CSkillRef> {
+        Computer::get_skills(self).await
+    }
+    async fn get_skill_ref(&self, name: &str) -> Option<A2CSkillRef> {
+        Computer::get_skill_ref(self, name).await
+    }
+    fn read_skill_resource(
+        &self,
+        skill_ref: &A2CSkillRef,
+        rel_path: Option<&str>,
+    ) -> Result<SkillResourceView, SkillSandboxError> {
+        Computer::read_skill_resource(self, skill_ref, rel_path)
+    }
+    async fn mint_toolspool_handle(
+        &self,
+        payload: &[u8],
+        mime: &str,
+    ) -> Result<String, BlobMintError> {
+        Computer::mint_toolspool_handle(self, payload, mime).await
+    }
+    fn blob_thresholds(&self) -> BlobThresholds {
+        Computer::blob_thresholds(self)
+    }
+    async fn execute_tool_cancellable(
+        &self,
+        req_id: &str,
+        tool_name: &str,
+        parameters: serde_json::Value,
+        timeout: Option<f64>,
+    ) -> ComputerResult<CallToolResult> {
+        Computer::execute_tool_cancellable(self, req_id, tool_name, parameters, timeout).await
+    }
+    async fn acancel_tool(&self, req_id: &str) -> bool {
+        Computer::acancel_tool(self, req_id).await
     }
 }
 
