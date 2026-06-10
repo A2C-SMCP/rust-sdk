@@ -322,6 +322,68 @@ impl SmcpHandler {
                 let _ = ack.send(&result);
             },
         );
+
+        // ── SKILL 通道（SRV-02 #50）/ SKILL channel ──────────────────────────
+        let state_get_skills = state.clone();
+        socket.on(
+            smcp::events::CLIENT_GET_SKILLS,
+            move |socket: SocketRef, Data::<GetSkillsReq>(data), ack: AckSender| async move {
+                match Self::on_client_get_skills(socket, data, state_get_skills.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:get_skills relay rejected, no ack: {e}"),
+                }
+            },
+        );
+
+        let state_get_skill = state.clone();
+        socket.on(
+            smcp::events::CLIENT_GET_SKILL,
+            move |socket: SocketRef, Data::<GetSkillReq>(data), ack: AckSender| async move {
+                match Self::on_client_get_skill(socket, data, state_get_skill.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:get_skill relay rejected, no ack: {e}"),
+                }
+            },
+        );
+
+        let state_get_blob = state.clone();
+        socket.on(
+            smcp::events::CLIENT_GET_BLOB,
+            move |socket: SocketRef, Data::<GetBlobReq>(data), ack: AckSender| async move {
+                match Self::on_client_get_blob(socket, data, state_get_blob.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:get_blob relay rejected, no ack: {e}"),
+                }
+            },
+        );
+
+        let state_get_resources = state.clone();
+        socket.on(
+            smcp::events::CLIENT_GET_RESOURCES,
+            move |socket: SocketRef, Data::<GetResourcesReq>(data), ack: AckSender| async move {
+                match Self::on_client_get_resources(socket, data, state_get_resources.clone()).await
+                {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:get_resources relay rejected, no ack: {e}"),
+                }
+            },
+        );
+
+        let state_update_skills = state.clone();
+        socket.on(
+            smcp::events::SERVER_UPDATE_SKILLS,
+            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+                Self::on_server_update_skills(socket, data, state_update_skills.clone()).await
+            },
+        );
     }
 
     /// 处理连接事件
@@ -697,6 +759,59 @@ impl SmcpHandler {
         }
     }
 
+    /// 处理 SKILL 集合更新事件（SRV-02 #50）/ broadcast `server:update_skills` → `notify:update_skills`.
+    ///
+    /// Computer 在 SKILL 集合变化（增/删/物化更新）时触发；Server **仅**在来源为 Computer 时向其所在 office
+    /// 广播 `notify:update_skills`（跳过自己），Agent 据此自动重拉 `client:get_skills`（仿既有 `notify:update_*`
+    /// 自动刷新模式）。非法来源（非 Computer / 无 office）被拒绝、不广播。对标 Python `on_server_update_skills`；
+    /// 载荷复用 `UpdateComputerConfigReq`（仅 `computer` 字段，三事件族共用）。
+    async fn on_server_update_skills(
+        socket: SocketRef,
+        data: UpdateComputerConfigReq,
+        state: ServerState,
+    ) {
+        let sid = socket.id.to_string();
+        let session = match state.session_manager.get_session(&sid) {
+            Some(s) => s,
+            None => {
+                warn!("SERVER_UPDATE_SKILLS from unknown session sid={}", sid);
+                return;
+            }
+        };
+
+        // 仅 Computer 可上报 SKILL 变更（非法来源拒绝）。
+        if session.role != ClientRole::Computer {
+            warn!(
+                "SERVER_UPDATE_SKILLS role mismatch: expected Computer, got {:?}, sid={}",
+                session.role, sid
+            );
+            return;
+        }
+
+        let office_id = match session.office_id {
+            Some(ref office_id) => office_id.clone(),
+            None => {
+                warn!(
+                    "SERVER_UPDATE_SKILLS but session not in office, sid={}",
+                    sid
+                );
+                return;
+            }
+        };
+
+        // 广播 SKILL 更新通知（向 office 广播并跳过自己）；载荷复用 `{computer}` 形态。
+        let notification = UpdateMCPConfigNotification {
+            computer: data.computer,
+        };
+        if let Err(e) = socket
+            .to(office_id)
+            .emit(smcp::events::NOTIFY_UPDATE_SKILLS, &notification)
+            .await
+        {
+            warn!("Failed to broadcast NOTIFY_UPDATE_SKILLS: {}", e);
+        }
+    }
+
     /// 构造 bare flat `ErrorPayload(404)`（Computer 未命中 / 中途消失）的 ack 负载。
     /// 复用 [`smcp::build_computer_not_found_error`]（与 #47/#92 同 payload，不泄露存在性、不新增错误码）。
     fn computer_not_found_value(computer_name: &str) -> Result<Value, HandlerError> {
@@ -918,6 +1033,74 @@ impl SmcpHandler {
             &data.computer,
             &data,
             smcp::events::CLIENT_GET_CONFIG,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// 透明转发 `client:get_skills` 至目标 Computer（SKILL 轻量元数据清单）/ relay `client:get_skills`.
+    async fn on_client_get_skills(
+        socket: SocketRef,
+        data: GetSkillsReq,
+        state: ServerState,
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_GET_SKILLS,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// 透明转发 `client:get_skill` 至目标 Computer（单 SKILL 详情/资源；4016/4017 flat 透传）/ relay `client:get_skill`.
+    async fn on_client_get_skill(
+        socket: SocketRef,
+        data: GetSkillReq,
+        state: ServerState,
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_GET_SKILL,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// 透明转发 `client:get_blob` 至目标 Computer（Server 不重组，逐 ack 透传分块）/ relay `client:get_blob`.
+    async fn on_client_get_blob(
+        socket: SocketRef,
+        data: GetBlobReq,
+        state: ServerState,
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_GET_BLOB,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// 透明转发 `client:get_resources` 至目标 Computer（含 cursor 翻页；4014/4015 flat 透传）/ relay `client:get_resources`.
+    async fn on_client_get_resources(
+        socket: SocketRef,
+        data: GetResourcesReq,
+        state: ServerState,
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_GET_RESOURCES,
             &state,
             tokio::time::Duration::from_secs(30),
         )
