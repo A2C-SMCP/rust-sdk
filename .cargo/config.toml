@@ -6,7 +6,9 @@
 test-ws = "test --workspace"
 test-all = "test --workspace --all-features"
 test-e2e = "test --workspace --features e2e -- --ignored"
-test-computer = "test -p smcp-computer"
+# 治理层 CLI 子命令测试在 `cli` feature 之下（marketplace/plugin/settings/skill）；默认带上避免治理套件变暗。
+# Governance CLI subcommand tests live behind the `cli` feature — enable it so the suite is never dark.
+test-computer = "test -p smcp-computer --features cli"
 test-agent = "test -p smcp-agent"
 test-server = "test -p smcp-server-core"
 test-integration = "test -p smcp-computer --test mcp_clients_integration"
