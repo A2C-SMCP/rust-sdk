@@ -7,12 +7,15 @@ name = "a2c-smcp"
 version = "0.1.15"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "futures-util",
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "smcp",
  "smcp-agent",
  "smcp-computer",
@@ -20,6 +23,7 @@ dependencies = [
  "smcp-server-hyper",
  "socketioxide",
  "tempfile",
+ "tf-rust-socketio",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",

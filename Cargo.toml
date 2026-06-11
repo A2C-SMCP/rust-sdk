@@ -34,6 +34,10 @@ agent = ["dep:smcp-agent"]
 computer = ["dep:smcp-computer"]
 server = ["dep:smcp-server-core", "dep:smcp-server-hyper"]
 full = ["agent", "computer", "server"]
+# REL-01 (#24)：workspace v0.2.2 集成测试矩阵开关。`cargo test-e2e`（`--workspace --features e2e
+# -- --ignored`）下整套编译并跑通；缺省（test-ws/test-all）整套 cfg-out，零编译/运行开销。
+# Gate for the workspace v0.2.2 integration matrix; built + run under `cargo test-e2e`, cfg'd out otherwise.
+e2e = []
 
 [dependencies]
 # Core protocol types (always included)
@@ -72,6 +76,14 @@ smcp-server-core.workspace = true
 smcp-server-hyper.workspace = true
 smcp-agent.workspace = true
 smcp-computer.workspace = true
+
+# REL-01 (#24) v0.2.2 集成测试矩阵：裸 socket.io 客户端驱动 Agent 侧 + ack future 组合 +
+# blob 重组完整性自证（base64 解码 + sha256 比对）。
+# v0.2.2 matrix: raw socket.io client (Agent side) + ack future combinators + blob sha256 verification.
+tf-rust-socketio.workspace = true
+futures-util.workspace = true
+base64.workspace = true
+sha2.workspace = true
 
 [workspace.dependencies]
 # 核心运行时 / Core runtime
