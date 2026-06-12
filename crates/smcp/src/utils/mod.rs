@@ -1,9 +1,10 @@
 //! 基础设施工具 / Infrastructure utilities（治理层 SET/SKL 共用）。
 //!
 //! `{atomic_io,env,path}` 为纯 std（+ `uuid`）实现，无协议依赖：原子写、XDG 优先路径解析、
-//! 路径包含判定、环境变量真值判定。`handshake` 复用协议类型；`blob` 引入 `base64` / `sha2` /
-//! `futures`（分块拉取 + 完整性自证 + 并发）。对标 Python 参考实现 / mirrors the Python reference:
-//! `a2c_smcp/utils/{atomic_io,env,path,blob}.py`。
+//! 路径包含判定、环境变量真值判定。`mime` 为纯静态表（无依赖）：确定性扩展名→MIME + 文本性判据
+//! （§6.4，Computer 铸造 / Agent drain 共用单一权威）。`handshake` 复用协议类型；`blob` 引入
+//! `base64` / `sha2` / `futures`（分块拉取 + 完整性自证 + 并发）。对标 Python 参考实现 /
+//! mirrors the Python reference: `a2c_smcp/utils/{atomic_io,env,path,mime,blob}.py`。
 //!
 //! 协议依据 / Protocol：`{atomic_io,env,path}` 无直接协议条款（基础设施层，服务于 0.2.2 治理资产）；
 //! `blob` 对标 blob-transfer.md（`client:get_blob` 句柄契约 + 4018）。
@@ -13,6 +14,7 @@ pub mod blob;
 pub mod env;
 pub mod handshake;
 pub mod hash;
+pub mod mime;
 pub mod path;
 pub mod slice;
 
@@ -28,5 +30,6 @@ pub use handshake::{
     DEFAULT_HANDSHAKE_TRANSPORTS,
 };
 pub use hash::{sha256_hex, to_hex};
+pub use mime::{guess_mime, is_text_mime, FALLBACK_MIME};
 pub use path::{is_within, normalize_lexical, resolve_xdg_first};
 pub use slice::{plan_slice, SlicePlan};

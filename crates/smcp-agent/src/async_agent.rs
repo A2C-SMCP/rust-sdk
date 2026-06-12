@@ -430,9 +430,9 @@ impl AsyncSmcpAgent {
     /// - 文本且可内联 → `body` 直接可读（[`smcp::SkillResource::Inline`]）；
     /// - 二进制或过大文本 → `blob_handle` **原样返回**，由调用方经 `client:get_blob` 自取字节。
     ///
-    /// 注：文本 MIME 的 `blob_handle` 自动 drain 回填 `body`（Python parity）依赖 `drain_blob`
-    /// （AGT-03 / #38），本期不实现；#38 落地后在此小幅接线即可。
-    /// 对标 Python `a2c_smcp/agent/client.py::get_skill`（drain 回填段除外）。
+    /// 文本 MIME 的 `blob_handle` 自动经 `drain_blob` 拉回并 UTF-8 解码回填 `body`，对调用方透明；
+    /// 文本性判定经单一权威 [`mime_is_textual`]（协议 §6.4(2)）。对标 Python
+    /// `a2c_smcp/agent/client.py::get_skill`。
     pub async fn get_skill(
         &self,
         computer: &str,
@@ -802,12 +802,13 @@ impl AsyncSmcpAgent {
 
 /// MIME 是否「文本类」（决定 `get_skill` 句柄是否自动 drain 回填 `body`）/ is this MIME textual?
 ///
-/// **仅** `text/*`——与 Python 参考 `a2c_smcp/agent/client.py` 的 `mime_type.startswith("text/")`
-/// 逐字符对齐（跨 SDK 一致性：同一 Computer 响应在两 SDK 给调用方**相同**结果）。`text/plain;
-/// charset=utf-8` 经 `starts_with` 天然命中、无需剥 charset；结构化非 text（如 `application/json`）与
-/// 二进制一律保持 `blob_handle`，由调用方按需经 `get_blob` 自取（与 Python 一致，**不**自动回填）。
+/// 经单一权威 [`smcp::utils::mime::is_text_mime`] 实施协议 §6.4(2) 三分支（`text/*` ∨ `+json/+xml/+yaml`
+/// 后缀 ∨ essence 白名单），与 Computer 铸造期 `is_text` 路由及当前 Python `a2c_smcp/agent/client.py`
+/// 的 `is_text_mime` **同源同判**（跨 SDK 一致：同一 Computer 响应在两 SDK 给调用方相同结果）。
+/// 旧实现仅 `starts_with("text/")`，会漏判 `application/json|yaml|toml` 等超内联预算的文本（python-sdk
+/// #105 盲区）；现已收敛。非文本（真二进制）一律保持 `blob_handle`，由调用方按需经 `get_blob` 自取。
 fn mime_is_textual(mime: Option<&str>) -> bool {
-    mime.map(|m| m.starts_with("text/")).unwrap_or(false)
+    mime.map(smcp::utils::mime::is_text_mime).unwrap_or(false)
 }
 
 /// 从已判定为 flat 协议错误的 `Value` 宽松构造 [`smcp::ErrorPayload`]，交 `drain_blob` 分类。
@@ -846,17 +847,25 @@ impl Clone for AsyncSmcpAgent {
 mod tests {
     use super::*;
 
-    /// AGT-03 #38：`get_skill` 文本句柄自动回填的 MIME 判定（fix-review #1：严格对齐 Python
-    /// `startswith("text/")`，承载跨 SDK 一致性决策）/ textual-MIME gate, exact Python parity。
+    /// #81：`get_skill` 文本句柄自动 drain 的 MIME 判定遵循协议 §6.4(2) 三分支，经单一权威
+    /// `smcp::utils::mime::is_text_mime`（与当前 Python `is_text_mime` parity）/ §6.4(2) textual gate。
     #[test]
-    fn test_mime_is_textual_text_only_python_parity() {
-        // text/* 命中（含 charset 参数，starts_with 天然兼容）。
+    fn test_mime_is_textual_follows_spec_64_2() {
+        // 分支 1：text/*（含 charset 参数）。
         assert!(mime_is_textual(Some("text/plain")));
         assert!(mime_is_textual(Some("text/markdown")));
         assert!(mime_is_textual(Some("text/plain; charset=utf-8")));
-        // 结构化非 text / 二进制 / 缺省一律非文本（保持 blob_handle，与 Python 一致）。
-        assert!(!mime_is_textual(Some("application/json")));
-        assert!(!mime_is_textual(Some("application/xml")));
+        // 分支 2：+json / +xml / +yaml 后缀（旧 starts_with("text/") 漏掉）。
+        assert!(mime_is_textual(Some("image/svg+xml")));
+        assert!(mime_is_textual(Some("application/vnd.api+json")));
+        // 分支 3：application/* 文本 essence 白名单（旧 starts_with("text/") 漏掉 → python-sdk #105 盲区）。
+        assert!(mime_is_textual(Some("application/json")));
+        assert!(mime_is_textual(Some("application/json; charset=utf-8")));
+        assert!(mime_is_textual(Some("application/xml")));
+        assert!(mime_is_textual(Some("application/yaml")));
+        assert!(mime_is_textual(Some("application/toml")));
+        // 真二进制 / 缺省一律非文本（保持 blob_handle）。
+        assert!(!mime_is_textual(Some("application/octet-stream")));
         assert!(!mime_is_textual(Some("image/png")));
         assert!(!mime_is_textual(Some("")));
         assert!(!mime_is_textual(None));

@@ -4,7 +4,7 @@
 * 创建日期: 2026/06/03
 * 最后修改日期: 2026/06/03
 * 版权: 2023 JQQ. All rights reserved.
-* 依赖: sha2, mime_guess, crate::skills::{sandbox, frontmatter}
+* 依赖: sha2, smcp::utils::mime（§6.4 单一权威）, crate::skills::{sandbox, frontmatter}
 * 描述: SKILL 包内资源读取视图（对标 Python computer/skills/resource.py）/ In-package SKILL resource read view.
 */
 
@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use smcp::utils::hash::to_hex;
+use smcp::utils::mime::{guess_mime, is_text_mime};
 use smcp::utils::slice::{plan_slice, SlicePlan};
 
 use crate::skills::frontmatter::strip_skill_frontmatter;
@@ -38,24 +39,6 @@ pub const DEFAULT_SKILL_MIME: &str = "text/markdown";
 
 /// 流式 sha256 / 惰性切片读块大小 / Read-block size for streaming sha256 & lazy slicing。
 const HASH_BLOCK: usize = 1024 * 1024; // 1 MiB
-
-/// 可内联为 `body` 的文本类 MIME 允许集（非 `text/*` 的常见文本格式）/ Textual MIME allowlist。
-const TEXTUAL_NON_TEXT_MIME: &[&str] = &[
-    "application/json",
-    "application/xml",
-    "application/yaml",
-    "application/x-yaml",
-    "application/toml",
-    "application/javascript",
-];
-
-/// MIME 是否文本类（可内联为 `body`）/ Whether a MIME is textual enough to inline as `body`。
-///
-/// `text/*` 或常见文本格式（json/xml/yaml/...）→ `true`；其余（含 `application/octet-stream` 与各类
-/// 二进制）→ `false`（一律铸句柄）。最终能否内联仍需调用方叠加「≤ inline_budget」+「UTF-8 可解码」判定。
-pub fn looks_textual(mime: &str) -> bool {
-    mime.starts_with("text/") || TEXTUAL_NON_TEXT_MIME.contains(&mime)
-}
 
 /// 惰性切片来源 / Lazy slice source。
 #[derive(Debug, Clone)]
@@ -104,7 +87,7 @@ pub struct SkillResourceView {
     pub sha256: String,
     /// 是否服务 frontmatter 剥离后的 SKILL.md 入口 / serving the stripped SKILL.md entry。
     pub is_entry: bool,
-    /// MIME 是否文本类（[`looks_textual`]）/ whether MIME is textual。
+    /// MIME 是否文本类（[`smcp::utils::mime::is_text_mime`]）/ whether MIME is textual。
     pub is_text: bool,
     slicer: Slicer,
 }
@@ -206,13 +189,17 @@ pub fn resolve_skill_view(
         Some(cap) => ensure_within_size_cap(&target, cap, &rel_echo)?,
         None => file_size(&target, &rel_echo)?,
     };
-    let mime = mime_guess::from_path(&target)
-        .first_raw()
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    // §6.4(1)/(3)：确定性扩展名→MIME，绝不依赖宿主库（mime_guess 内置表对 .yaml/.toml/.rst 等
+    // 与协议基线不一致、跨 SDK 漂移）；对标 Python `guess_mime(target.name)`。
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(rel_echo.as_str());
+    let mime = guess_mime(file_name).to_string();
     let sha256 =
         stream_sha256(&target).map_err(|_| SkillSandboxError::not_found(rel_echo.clone()))?;
-    let is_text = looks_textual(&mime);
+    // §6.4(2)：文本性判据三分支单一权威，与 Agent drain 门同源同判。
+    let is_text = is_text_mime(&mime);
     Ok(SkillResourceView {
         rel_path: rel_echo,
         abs_path: target.clone(),
@@ -245,18 +232,27 @@ mod tests {
         tmp
     }
 
+    /// #81：铸造期 wire `mime_type` + `is_text` 走单一权威，遵循协议 §6.4（确定、跨 SDK 一致）。
+    /// 重点覆盖 mime_guess 旧实现会漂移的扩展名（.yaml/.toml/.rst/.xml/.svg），值与 Python 逐项一致。
     #[test]
-    fn test_looks_textual() {
-        for t in [
-            "text/plain",
-            "text/markdown",
-            "application/json",
-            "application/yaml",
-        ] {
-            assert!(looks_textual(t), "{t}");
-        }
-        for b in ["image/png", "application/octet-stream", "application/pdf"] {
-            assert!(!looks_textual(b), "{b}");
+    fn test_subresource_mime_follows_spec_64() {
+        let pkg = pkg_with("---\nname: d\n---\nb");
+        // (相对路径, 期望 mime, 期望 is_text)：mime 值即 §6.4(3) 基线，与 Python guess_mime 同值。
+        let cases: &[(&str, &str, bool)] = &[
+            ("conf.yaml", "application/yaml", true), // 旧 mime_guess → text/x-yaml（漂移）
+            ("conf.yml", "application/yaml", true),
+            ("pyproject.toml", "application/toml", true), // 旧 mime_guess → text/x-toml（漂移）
+            ("readme.rst", "text/x-rst", true),           // 旧 mime_guess → 缺失 → octet-stream
+            ("data.xml", "application/xml", true),        // 旧 mime_guess → text/xml（漂移）
+            ("logo.svg", "image/svg+xml", true), // +xml 后缀 → §6.4(2) 判文本（旧 looks_textual 漏判）
+            ("icon.png", "image/png", false),    // 真二进制
+            ("blob.bin", "application/octet-stream", false), // 未登记 → 确定回退
+        ];
+        for (rel, want_mime, want_text) in cases {
+            fs::write(pkg.path().join(rel), "x").unwrap();
+            let v = resolve_skill_view(pkg.path(), Some(rel), None).unwrap();
+            assert_eq!(v.mime, *want_mime, "mime for {rel}");
+            assert_eq!(v.is_text, *want_text, "is_text for {rel}");
         }
     }
 

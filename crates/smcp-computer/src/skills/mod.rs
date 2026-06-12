@@ -61,7 +61,7 @@ pub use sandbox::{
     SkillSandboxReason, DEFAULT_SKILL_FILE, FORBIDDEN_SKILL_FILES,
 };
 
-pub use resource::{looks_textual, resolve_skill_view, SkillResourceView, DEFAULT_SKILL_MIME};
+pub use resource::{resolve_skill_view, SkillResourceView, DEFAULT_SKILL_MIME};
 
 pub use manifest::{
     check_strict_conflict, entry_is_strict, enumerate_bundled_server_files, find_plugin_entry,
