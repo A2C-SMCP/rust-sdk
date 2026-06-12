@@ -431,15 +431,15 @@ impl SocketIoTransport {
             // biased：ack 与断连同时就绪时优先取真实响应（避免已到达的结果被误判为断连）。
             biased;
             recv = rx => match recv {
-                // 从响应中提取JSON数据
-                Ok(Payload::Text(values, _)) => values
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| SmcpAgentError::internal("Empty response")),
+                // 从响应中提取 JSON 数据（拆 socket.io ack 外层 args 数组，见 extract_ack_value）。
+                Ok(Payload::Text(values, _)) => extract_ack_value(values),
                 #[allow(deprecated)]
                 Ok(Payload::String(s, _)) => {
-                    // 尝试解析字符串为JSON
-                    serde_json::from_str(&s).map_err(SmcpAgentError::from)
+                    // 尝试解析字符串为 JSON（deprecated 路径；ack 实际走 Payload::Text）。同样拆一层
+                    // args 数组（对对象是 no-op，安全）。
+                    serde_json::from_str(&s)
+                        .map(flatten_ack_arg)
+                        .map_err(SmcpAgentError::from)
                 }
                 Ok(Payload::Binary(_, _)) => {
                     Err(SmcpAgentError::internal("Binary response not supported"))
@@ -478,5 +478,95 @@ impl Default for SocketIoTransport {
         // 注意：这实际上不能使用，因为Client::new()需要参数
         // 这里只是为了满足Default trait的要求
         panic!("SocketIoTransport must be created via connect() method");
+    }
+}
+
+/// 从 socket.io ack 的 `Payload::Text` values 提取单个响应实参 / extract the single ack arg.
+///
+/// **根因修复（#82）**：socket.io ack 数据在网线上恒以 args 数组 `[<value>]` 投递——tf-rust-socketio
+/// `handle_ack` 用 `Payload::from(String)` 把整帧 args 数组 JSON 文本解析成**单元素** `Vec<Value>`，
+/// 其唯一元素即 args 数组本身（`Value::Array`）。故须：① 取该单元素；② 再经 [`flatten_ack_arg`]
+/// 拆一层 args 数组取首个实参（A2C ack 恒单实参）。缺第 ② 步则下游 `ensure_req_id` 在数组上
+/// `.get("req_id")` → `None` → 误报 “Missing req_id”。与集成矩阵 harness 的 `flat()` 同义（该助手
+/// 正是靠此解一层才让矩阵全绿，掩盖了高层 SDK 路径缺同等拆封的本 bug）。
+fn extract_ack_value(values: Vec<Value>) -> Result<Value> {
+    let arg = values
+        .into_iter()
+        .next()
+        .ok_or_else(|| SmcpAgentError::internal("Empty response"))?;
+    Ok(flatten_ack_arg(arg))
+}
+
+/// 拆 socket.io ack 外层 args 数组取首个实参 / unwrap the outer socket.io ack args array。
+///
+/// ack 恒以 `[<value>]` 投递，取首个实参即响应本体；非数组 / 空数组**原样返回**（防御：理论不应
+/// 出现，空数组交下游报缺字段而非在此 panic）。语义等同矩阵 harness 的 `flat()`。
+fn flatten_ack_arg(value: Value) -> Value {
+    match value {
+        Value::Array(mut args) if !args.is_empty() => args.swap_remove(0),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::{classify_tool_call_outcome, ensure_req_id, ToolCallOutcome};
+    use serde_json::json;
+
+    // #82：socket.io ack 数据在网线上恒以 args 数组 `[<value>]` 投递——tf-rust-socketio `handle_ack`
+    // 用 `Payload::from(String)` 把整帧 args 数组 JSON 文本解析成**单元素** `Vec<Value>`，其唯一元素
+    // 即 args 数组本身（`Value::Array`）。`extract_ack_value` MUST 拆该外层数组返回内层响应对象，
+    // 否则下游 `ensure_req_id` 在数组上 `.get("req_id")` → `None` → 误报 “Missing req_id”。
+    // `transport.call` 的 I/O 边界（SocketIoTransport 为具体 struct）不可单测，提取逻辑经此纯函数覆盖。
+
+    #[test]
+    fn extract_ack_unwraps_socketio_args_array() {
+        // 原帧形状：Payload::Text 的单元素就是 args 数组 `[{...}]`（见上方注释）。
+        let values = vec![json!([{ "req_id": "R1", "tools": [{ "name": "echo" }] }])];
+        let v = extract_ack_value(values).expect("should extract inner response object");
+        // 拆封后是对象，req_id 回显校验通过（修复前在数组上 .get("req_id")=None → Missing req_id）。
+        assert!(v.is_object(), "expected inner object, got {v}");
+        assert!(
+            ensure_req_id(&v, "R1").is_ok(),
+            "echoed req_id must validate after unwrap: {v}"
+        );
+        assert_eq!(v["tools"][0]["name"], "echo");
+    }
+
+    #[test]
+    fn extract_ack_tool_call_result_not_double_wrapped() {
+        // tool_call 同源：不校验 req_id 故不直接报错，但畸形多套一层数组会让结果级 meta 分类与
+        // binary sideband（按 content 数组遍历句柄）全部落空。拆封后须为对象、content 可达。
+        let values =
+            vec![json!([{ "content": [{ "type": "text", "text": "ok" }], "isError": false }])];
+        let v = extract_ack_value(values).expect("should extract inner response object");
+        assert!(v.is_object(), "expected inner object, got {v}");
+        assert_eq!(classify_tool_call_outcome(&v), ToolCallOutcome::Completed);
+        assert!(
+            v.get("content").and_then(Value::as_array).is_some(),
+            "content must be reachable as array (binary sideband 依赖): {v}"
+        );
+    }
+
+    #[test]
+    fn extract_ack_empty_values_is_error() {
+        // 空 values（无 ack 实参）→ internal “Empty response”。
+        let err = extract_ack_value(vec![]).unwrap_err();
+        assert!(matches!(err, SmcpAgentError::Internal(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn extract_ack_non_array_arg_passthrough() {
+        // 防御：理论上 ack 实参恒为数组；万一已是对象（非标准帧）则原样返回，不过度拆封。
+        let v = extract_ack_value(vec![json!({ "req_id": "R2" })]).expect("ok");
+        assert_eq!(v, json!({ "req_id": "R2" }));
+    }
+
+    #[test]
+    fn extract_ack_empty_args_array_passthrough() {
+        // 空 args 数组 `[]` 原样返回（交下游报缺字段，不 panic、不静默成功）。
+        let v = extract_ack_value(vec![json!([])]).expect("ok");
+        assert_eq!(v, json!([]));
     }
 }

@@ -716,6 +716,66 @@ async fn originator_disconnect_server_survives() {
     server.shutdown();
 }
 
+// ──────────── 12：高层 Agent SDK 查询端到端（#82 回归护栏）/ high-level Agent SDK query e2e ────────────
+
+/// 场景 12：真实 [`smcp_agent::AsyncSmcpAgent`] 走**高层查询方法**（`get_tools` + `list_room`）端到端
+/// 必须返回结果，而非 `内部错误: Missing req_id in response`（#82）。
+///
+/// 此前矩阵的 Agent 侧一律用裸 `tf-rust-socketio` 客户端 + `flat()`（见 [`harness::emit_call`]）绕开
+/// 高层 SDK——`flat()` 恰好替调用方拆了 socket.io ack 外层 args 数组，**掩盖**了 `transport.call` 缺
+/// 同等拆封的根因 bug（ack 数据恒以 `[<value>]` 投递，`ensure_req_id` 落在数组上 → `Missing req_id`）。
+/// 本测试改用**真实 Agent SDK** 驱动 `transport.call` → `ensure_req_id` 全链，端到端护住根因修复
+/// （transport `extract_ack_value`/`flatten_ack_arg`）。覆盖两条结构不同的 ack 生产路径：
+/// - `get_tools`：**Computer 中继**路径（Server 转发给 Computer 回包）；
+/// - `list_room`：**Server 直答**路径（Server 直接回包，不经 Computer）。
+/// 二者同走 `transport.call` 拆封，修复前均立即 `Err`，修复后均正确解析。
+#[tokio::test]
+#[ignore = "e2e: REL-01 v0.2.2 matrix; run via cargo test-e2e"]
+async fn high_level_agent_query_methods_unwrap_ack() {
+    use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
+
+    let td = TempDir::new().unwrap();
+    let server = RelayServer::start().await;
+    let computer = spawn_computer(&server.url(), OFFICE, COMPUTER, &td, None).await;
+
+    // 真实 Agent SDK（非裸客户端）：with_api_key 走默认 `access_token` 鉴权头，对齐 RelayServer 的
+    // DefaultAuthenticationProvider(SECRET)；connect → join_office → 走高层查询方法。
+    let auth = DefaultAuthProvider::new(AGENT.to_string(), OFFICE.to_string())
+        .with_api_key(SECRET.to_string());
+    let mut agent = AsyncSmcpAgent::new(auth, SmcpAgentConfig::default());
+    agent.connect(&server.url()).await.expect("agent connect");
+    agent.join_office(AGENT).await.expect("agent join_office");
+    // 等 agent join 在房间内落定（与 spawn_computer 同款 settle）。
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // (a) get_tools（Computer 中继路径）。修复前：立即 Err(internal "Missing req_id")；修复后：返回工具。
+    let tools = agent
+        .get_tools(COMPUTER)
+        .await
+        .expect("get_tools 必须成功（#82：拆 socket.io ack 外层 args 数组）");
+    assert!(
+        tools.iter().any(|t| t.name == "echo"),
+        "应返回 v022 MCP 的 echo 工具，实得: {:?}",
+        tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+    );
+
+    // (b) list_room（Server 直答路径，与 get_tools 的中继路径结构不同，此前同样全坏）：经同一
+    // transport.call ack 拆封 + ensure_req_id 解析会话列表（应含本 Agent 自身会话）。
+    let sessions = agent
+        .list_room(OFFICE)
+        .await
+        .expect("list_room 必须成功（#82：Server 直答路径同走 ack 拆封）");
+    assert!(
+        sessions.iter().any(|s| s.name == AGENT),
+        "list_room 应含本 Agent 会话，实得: {:?}",
+        sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+    );
+
+    let _ = agent.leave_office().await;
+    computer.shutdown().await.unwrap();
+    server.shutdown();
+}
+
 // ──────────────────────────── 10 & 11：治理层覆盖说明 / governance coverage ────────────────────────────
 //
 // 场景 10（marketplace strict 冲突）与 11（settings 5 级 scope 合并 / plugin installer install-enable-
