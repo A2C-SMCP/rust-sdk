@@ -73,6 +73,22 @@ jobs:
           done
           echo "Timeout waiting for index, proceeding anyway"
 
+      # 1b. 客户端传输层（仅依赖 smcp；被 smcp-agent / smcp-computer 依赖——v0.2.2 新增 crate #22，
+      #      此前漏配导致 smcp-agent/computer/a2c-smcp 发布失败）
+      - name: Publish smcp-client-transport
+        run: cargo publish -p smcp-client-transport --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1 || true
+
+      - name: Wait for crates.io index (smcp-client-transport)
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="smcp-client-transport") | .version')
+          for i in $(seq 1 12); do
+            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/smcp-client-transport/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
+              echo "smcp-client-transport@$VERSION is indexed"; exit 0
+            fi
+            echo "Waiting for smcp-client-transport@$VERSION... (${i}/12)"; sleep 5
+          done
+          echo "Timeout waiting for index, proceeding anyway"
+
       # 2. 依赖 smcp 的 crate，且被其他 crate dev-deps 引用
       - name: Publish smcp-server-core
         run: cargo publish -p smcp-server-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>&1 || true
