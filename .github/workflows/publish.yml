@@ -23,6 +23,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # keyring（INP-01 #73 secret_store）在 Linux --all-features 下经 secret-service 拉
+      # libdbus-sys，需系统 dbus 开发库 + pkg-config（macOS 用 apple-native 无此依赖）。
+      - name: Install system deps (libdbus for keyring on Linux)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -45,6 +50,10 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      # keyring（INP-01 #73）在 Linux 经 secret-service 拉 libdbus-sys，需系统 dbus 开发库。
+      - name: Install system deps (libdbus for keyring on Linux)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       # 按依赖顺序发布（dev-dependencies 也需要先发布）
       # 每个 publish 步骤容忍 "already exists" 错误，以便重跑时跳过已发布的 crate
