@@ -553,26 +553,9 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
         auth: args.auth.clone(),
         headers: args.headers.clone(),
     };
-    let mut handler = CommandHandler::new(computer, cli_config);
 
-    if let Some(inputs_path) = inputs {
-        if let Err(e) = handler.load_inputs(&inputs_path).await {
-            eprintln!("加载 inputs 失败: {e}");
-        }
-    }
-    if let Some(config_path) = config {
-        if let Err(e) = handler.load_config(&config_path).await {
-            eprintln!("加载 config 失败: {e}");
-        }
-    }
-    if let Some(url) = &args.url {
-        if let Err(e) = handler
-            .connect_socketio(url, &args.namespace, &args.auth, &args.headers)
-            .await
-        {
-            eprintln!("连接 SocketIO 失败: {e}");
-        }
-    }
+    // 启动前缀（inputs/config 加载 → boot_up 子系统装配 → socket.io 连接）抽出为可测 helper。
+    let handler = prepare_handler(computer, cli_config, config, inputs).await;
 
     // 启动 banner（版本 / 协议版本 / home）。
     let home = handler.computer.skill_home();
@@ -599,11 +582,88 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
     }
 }
 
+/// 装配 REPL handler：加载 inputs/config → `boot_up`（SKILL/blob/watcher 子系统）→ 连接 Socket.IO。
+///
+/// 从 [`run_repl`] 抽出的启动前缀，使「`run` 模式必须 boot SKILL/blob 子系统」可被回归测试覆盖
+/// （`run_repl` 末尾进交互循环、不可直接测）。各步失败均**非阻塞**告警，与 Python `a2c-computer run`
+/// 的非阻塞隔离策略一致（修 #83：此前 `run` 全程不调 `boot_up`，致 `get_skills` 恒空 / `get_skill`
+/// 恒 4014 / blob mint `NotBooted`）。
+async fn prepare_handler(
+    computer: Computer<SilentSession>,
+    cli_config: commands::CliConfig,
+    config: Option<PathBuf>,
+    inputs: Option<PathBuf>,
+) -> CommandHandler {
+    let url = cli_config.url.clone();
+    let namespace = cli_config.namespace.clone();
+    let auth = cli_config.auth.clone();
+    let headers = cli_config.headers.clone();
+    let mut handler = CommandHandler::new(computer, cli_config);
+
+    if let Some(inputs_path) = inputs {
+        if let Err(e) = handler.load_inputs(&inputs_path).await {
+            eprintln!("加载 inputs 失败: {e}");
+        }
+    }
+    if let Some(config_path) = config {
+        if let Err(e) = handler.load_config(&config_path).await {
+            eprintln!("加载 config 失败: {e}");
+        }
+    }
+
+    // #83 修复：装配 SKILL/blob/watcher 子系统（对齐 Python `a2c-computer run`）。
+    // 必须在 connect_socketio 之前完成——Computer 一旦在线，Agent 可立即 get_skills/get_skill/mint blob。
+    if let Err(e) = handler.computer.boot_up().await {
+        eprintln!("初始化 SKILL/blob 子系统失败: {e}");
+    }
+
+    if let Some(url) = &url {
+        if let Err(e) = handler
+            .connect_socketio(url, &namespace, &auth, &headers)
+            .await
+        {
+            eprintln!("连接 SocketIO 失败: {e}");
+        }
+    }
+
+    handler
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use commands::{EXIT_OK, EXIT_USER_ERROR};
     use tempfile::tempdir;
+
+    /// #83 回归：`run` 模式的启动前缀（`prepare_handler`）必须 `boot_up` SKILL 子系统。
+    /// 修复前 `run_repl` 全程不调 `boot_up`，user 源 SKILL 永不被发现（`get_skills` 恒空）。
+    #[tokio::test]
+    async fn prepare_handler_boots_skill_subsystem() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        // seed 一个 user 源 SKILL（home/user/<pkg>/SKILL.md，带 frontmatter）。
+        let pkg = home.join("user").join("my-helper");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("SKILL.md"), "---\ndescription: helps\n---\nbody").unwrap();
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob"));
+        // 前置：未 boot 时 SKILL 子系统未装配，get_skills 为空。
+        assert_eq!(computer.get_skills().await.len(), 0);
+
+        let cli_config = commands::CliConfig {
+            url: None, // 不连接 Socket.IO，仅验证 boot 装配。
+            namespace: "/smcp".to_string(),
+            auth: None,
+            headers: None,
+        };
+        let handler = prepare_handler(computer, cli_config, None, None).await;
+
+        // 修复后：prepare_handler 内 boot_up 已发现 user 源 SKILL。
+        assert_eq!(handler.computer.get_skills().await.len(), 1);
+        handler.computer.shutdown().await.unwrap();
+    }
 
     #[test]
     fn resolve_workdirs_absolutize_dedup_order() {
