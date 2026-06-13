@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a2c-smcp"
-version = "0.1.15"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4112,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "smcp"
-version = "0.1.15"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -4127,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-agent"
-version = "0.1.15"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-client-transport"
-version = "0.1.15"
+version = "0.2.2"
 dependencies = [
  "serde_json",
  "smcp",
@@ -4160,7 +4160,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-computer"
-version = "0.1.15"
+version = "0.2.2"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-server-core"
-version = "0.1.15"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -4244,7 +4244,7 @@ dependencies = [
 
 [[package]]
 name = "smcp-server-hyper"
-version = "0.1.15"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "futures",
