@@ -1,0 +1,1 @@
+{"name":"strict-true-merge","version":"1.0.0","plugins":[{"name":"audit","source":"./plugins/audit","skills":["extra-skills"]}]}
