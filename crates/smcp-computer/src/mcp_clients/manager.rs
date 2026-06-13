@@ -7,16 +7,26 @@
 * 依赖: tokio, async-trait, serde_json
 * 描述: MCP服务器管理器，负责管理多个MCP服务器连接和工具调用路由
 */
+use super::auth_error;
 use super::model::*;
 use super::utils::client_factory;
 use super::vrl_runtime::VrlRuntime;
 use crate::errors::ComputerError;
+use crate::skills::{McpResource, SkillResourceManager, SkillStagingError};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Arc as StdArc;
 use tokio::sync::{watch, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// `list_skill_resources` 单 server 翻页上限（防御非终止 cursor）/ per-server page cap for
+/// `list_skill_resources` (guards a non-terminating cursor)。对标 Python `_MAX_SKILL_LIST_PAGES`。
+const MAX_SKILL_LIST_PAGES: usize = 1000;
+
+/// SKILL 资源 URI scheme 前缀 / SKILL resource URI scheme prefix。
+const SKILL_URI_PREFIX: &str = "skill://";
 
 /// 工具名称重复错误 / Tool name duplication error
 #[derive(Debug, thiserror::Error)]
@@ -514,8 +524,104 @@ impl MCPServerManager {
             client.call_tool(tool_name, parameters).await
         };
 
-        let mut result = result
-            .map_err(|e| ComputerError::ProtocolError(format!("Tool execution failed: {}", e)))?;
+        self.finalize_tool_result(server_name, tool_name, result)
+            .await
+    }
+
+    /// 可取消工具调用（INT-02 #70 取消最后一公里）/ Cancellable tool call.
+    ///
+    /// 与 [`Self::call_tool`] 同：套用 manager 级 `timeout`，并对**完成**结果跑相同收尾
+    /// （授权分流 / `tool_meta` / VRL，见 [`Self::finalize_tool_result`]）。差异仅在改调
+    /// [`MCPClientProtocol::call_tool_cancellable`] 并透传 `cancel`：
+    /// - [`CancellableCallOutcome::Cancelled`]（取消胜出）→ 原样上抛，由 `Computer` 写结果级 `meta.a2c_cancelled`；
+    /// - 完成 / 上游错误 → 经 `finalize_tool_result` 收尾后包回 [`CancellableCallOutcome::Completed`]；
+    /// - 超时 → [`ComputerError::TimeoutError`]（`Computer` 写 `meta.a2c_timeout`）。
+    pub async fn call_tool_cancellable(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        parameters: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+        cancel: CancellationToken,
+    ) -> Result<CancellableCallOutcome, ComputerError> {
+        // 获取客户端引用 / Get client reference
+        let client = {
+            let clients = self.active_clients.read().await;
+            clients
+                .get(server_name)
+                .ok_or_else(|| {
+                    ComputerError::InvalidConfiguration(format!(
+                        "Server '{}' for tool '{}' is not active",
+                        server_name, tool_name
+                    ))
+                })?
+                .clone()
+        };
+
+        // 执行可取消调用（manager 级 timeout 包裹；token 透传至客户端就地中断 + best-effort 远端补发）。
+        // ⚠️ 超时分支语义：manager 级 timeout 触发时直接 **drop** client future、**不**经取消 token 的
+        // select! 分支，故超时**不**向远端补发 MCP notifications/cancelled（区别于 Agent 显式取消）。这是
+        // best-effort 协作式取消的有意取舍（timeout ≠ cancel）：超时的 stdio 工具子进程可能仍在跑，但 Agent
+        // 已据 meta.a2c_timeout 拿到超时态响应。如需超时也补发，须改成 token 路径取消而非 drop（后续评估）。
+        let outcome = if let Some(timeout) = timeout {
+            tokio::time::timeout(
+                timeout,
+                client.call_tool_cancellable(tool_name, parameters, cancel),
+            )
+            .await
+            .map_err(|_| ComputerError::TimeoutError("Tool execution timed out".to_string()))?
+        } else {
+            client
+                .call_tool_cancellable(tool_name, parameters, cancel)
+                .await
+        };
+
+        match outcome {
+            // 取消胜出：在途调用已就地中断（rmcp 传输已 best-effort 补发 notifications/cancelled）。上抛由
+            // Computer 写取消态结果，不在此构造（保持「控制流结果 vs 协议态结果」分层）。
+            Ok(CancellableCallOutcome::Cancelled) => Ok(CancellableCallOutcome::Cancelled),
+            // 完成：跑与 call_tool 一致的收尾（授权分流可能把 4006/4007 转成协议形状授权结果）。
+            Ok(CancellableCallOutcome::Completed(r)) => self
+                .finalize_tool_result(server_name, tool_name, Ok(r))
+                .await
+                .map(CancellableCallOutcome::Completed),
+            // 上游错误：交由 finalize 的授权分流（Err 路径）；非授权类仍上抛 ProtocolError。
+            Err(e) => self
+                .finalize_tool_result(server_name, tool_name, Err(e))
+                .await
+                .map(CancellableCallOutcome::Completed),
+        }
+    }
+
+    /// 工具调用结果收尾——[`Self::call_tool`] 与 [`Self::call_tool_cancellable`] 共用 / shared finalize。
+    ///
+    /// 上游错误分流（AUTH-01 #23）：授权类（4006/4007）→ 协议形状授权 `CallToolResult` 透传；其余 ProtocolError。
+    /// 成功结果：注入合并后的 `tool_meta` + 可选 VRL 转换。
+    async fn finalize_tool_result(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        result: Result<CallToolResult, MCPClientError>,
+    ) -> Result<CallToolResult, ComputerError> {
+        // 上游错误分流（AUTH-01 #23）：授权类（4006/4007）→ 以协议形状的授权 CallToolResult 透传
+        // （error-handling.md §403，内嵌结果级 meta，**非** flat ErrorPayload）；其余维持通用 ProtocolError。
+        // Branch upstream errors: authorization (4006/4007) surfaces a protocol-shaped auth
+        // CallToolResult; everything else stays a generic ProtocolError.
+        let mut result = match result {
+            Ok(r) => r,
+            Err(e) => match auth_error::classify_auth_error(&e) {
+                Some(code) => {
+                    let hint = auth_error::build_default_auth_hint(code);
+                    return Ok(auth_error::build_auth_error_result(server_name, code, hint));
+                }
+                None => {
+                    return Err(ComputerError::ProtocolError(format!(
+                        "Tool execution failed: {}",
+                        e
+                    )))
+                }
+            },
+        };
 
         // 添加工具元数据到结果 / Add tool metadata to result
         let config = {
@@ -812,6 +918,100 @@ impl MCPServerManager {
             }
         }
         results
+    }
+
+    /// 枚举活跃 MCP Server 的 `skill://` 资源（附 server 归属），**完整消费 cursor 翻页直至末尾**。
+    /// Enumerate `skill://` resources from active MCP servers (with owning server), exhausting cursor pages。
+    ///
+    /// 与 [`list_resources_page`](MCPClientProtocol::list_resources_page)（单页、Agent 控制翻页）不同：
+    /// SKILL 物化由 Computer 主导，须拿到**全量** `skill://` 集合，故在此完整消费翻页（协议 skill.md §12）。
+    /// 未声明 `resources` 能力或枚举出错的 server **跳过**（记 ERROR、不中断其余），对齐「SKILL 通道不使用
+    /// 4015——无 resources 能力的 server 在物化阶段即被排除」（skill.md §1.5）。
+    /// Unlike `list_resources_page` (single-page, Agent-driven): Computer-driven SKILL materialization needs
+    /// the full `skill://` set, so pages are exhausted here. Servers lacking `resources` or erroring are skipped.
+    ///
+    /// `server_name` 给定则仅枚举该 server（用于 ResourceListChanged 单 server 重枚举）。
+    pub async fn list_skill_resources(
+        &self,
+        server_name: Option<&str>,
+    ) -> Vec<(ServerName, Resource)> {
+        let clients: Vec<(String, StdArc<dyn MCPClientProtocol>)> = {
+            let guard = self.active_clients.read().await;
+            guard
+                .iter()
+                .filter(|(k, _)| server_name.is_none() || server_name == Some(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let mut results = Vec::new();
+        for (sname, client) in clients {
+            let mut cursor: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                match client.list_resources_page(cursor.clone()).await {
+                    Ok((page, next)) => {
+                        for resource in page {
+                            if resource.uri.starts_with(SKILL_URI_PREFIX) {
+                                results.push((sname.clone(), resource));
+                            }
+                        }
+                        pages += 1;
+                        match next {
+                            Some(c) => cursor = Some(c),
+                            None => break,
+                        }
+                        if pages >= MAX_SKILL_LIST_PAGES {
+                            error!(
+                                "list_skill_resources: server '{}' exceeded {} pages \
+                                 (non-terminating cursor?); aborting enumeration for this server",
+                                sname, MAX_SKILL_LIST_PAGES
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // 未声明 resources 能力 / 连接异常 / 翻页失败 → 跳过该 server，不阻断其余。
+                        error!("Error listing skill resources for '{}': {}", sname, e);
+                        break;
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// 单页透传指定 MCP Server 的 `resources/list`（v0.2 `client:get_resources` 路由层）。
+    /// Single-page passthrough of a named server's `resources/list` (the v0.2 `client:get_resources` router)。
+    ///
+    /// 仅作透传：定位命名 client → 调 [`list_resources_page`](MCPClientProtocol::list_resources_page)，
+    /// 不做 scheme/元数据过滤、不聚合，翻页由调用方经 cursor 控制。未注册 server →
+    /// [`ComputerError::McpServerNotFound`]（映射 4014）；无 `resources` 能力 →
+    /// [`ComputerError::McpCapabilityNotSupported`]（映射 4015）。
+    pub async fn list_resources(
+        &self,
+        server_name: &str,
+        cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), ComputerError> {
+        let client = {
+            let clients = self.active_clients.read().await;
+            clients.get(server_name).cloned()
+        };
+        let client =
+            client.ok_or_else(|| ComputerError::McpServerNotFound(server_name.to_string()))?;
+
+        match client.list_resources_page(cursor).await {
+            Ok(pair) => Ok(pair),
+            Err(MCPClientError::CapabilityNotSupported(cap)) => {
+                Err(ComputerError::McpCapabilityNotSupported {
+                    server_name: server_name.to_string(),
+                    capability: cap,
+                })
+            }
+            Err(e) => Err(ComputerError::ProtocolError(format!(
+                "list_resources '{server_name}': {e}"
+            ))),
+        }
     }
 
     /// 获取所有窗口资源的详情 / Get details of all window resources
@@ -1135,9 +1335,269 @@ impl MCPServerManager {
     }
 }
 
+/// SKILL staging 接缝实现（#74 INT-04）：把 manager 的 rmcp-typed 枚举/读取适配成 staging 层
+/// 解耦类型 [`McpResource`] + 字节，供 [`stage_mcp_skills`](crate::skills::stage_mcp_skills) 物化消费。
+/// The SKILL staging seam: adapts the manager's rmcp-typed enumeration/read into staging's decoupled
+/// [`McpResource`] + bytes, consumed by `stage_mcp_skills`。
+#[async_trait::async_trait]
+impl SkillResourceManager for MCPServerManager {
+    async fn list_skill_resources(
+        &self,
+        server_name: Option<&str>,
+    ) -> Result<Vec<(String, McpResource)>, SkillStagingError> {
+        let pairs = MCPServerManager::list_skill_resources(self, server_name).await;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (sname, resource) in pairs {
+            // rmcp `Resource._meta`（`Option<Meta(JsonObject)>`）→ staging 的 `Map<String, Value>`。
+            let meta = resource.meta.clone().map(|m| m.0).unwrap_or_default();
+            out.push((
+                sname,
+                McpResource {
+                    uri: resource.uri.clone(),
+                    meta,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<Vec<u8>, SkillStagingError> {
+        // 复用 manager 的通用 read（`get_window_detail` 实为通用 `resources/read`，命名沿用历史）。
+        // Reuse the manager's generic read (`get_window_detail` is a generic `resources/read`).
+        let resource = make_resource(uri, uri, None, None);
+        let result = self
+            .get_window_detail(server, resource)
+            .await
+            .map_err(|e| {
+                SkillStagingError(format!("read_resource '{uri}' from '{server}': {e}"))
+            })?;
+
+        // 拼接 content blocks → 字节：文本按 UTF-8，二进制按 base64（MCP 标准编码）解码。
+        // Concatenate content blocks → bytes: text as UTF-8, blob as standard-base64.
+        let mut bytes = Vec::new();
+        for content in result.contents {
+            match content {
+                ResourceContents::TextResourceContents { text, .. } => {
+                    bytes.extend_from_slice(text.as_bytes());
+                }
+                ResourceContents::BlobResourceContents { blob, .. } => {
+                    use base64::Engine as _;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(blob.as_bytes())
+                        .map_err(|e| SkillStagingError(format!("base64 decode '{uri}': {e}")))?;
+                    bytes.extend_from_slice(&decoded);
+                }
+            }
+        }
+        Ok(bytes)
+    }
+}
+
 impl Default for MCPServerManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 测试支撑：可控分页/失败的假 MCP client + 资源/注入助手，`pub(crate)` 供 manager 与 computer 两处
+/// 集成测试共用（单一 mock 真源）/ test-support mock + helpers shared by manager and computer tests。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// 受控分页的假 MCP client：按 cursor 顺序返回各页，可注入翻页失败 / 能力缺失 / read 文本。
+    /// Controllable fake MCP client paginating canned pages, with injectable failure/cap-fail/read text.
+    pub(crate) struct MockSkillClient {
+        pub(crate) pages: Vec<Vec<Resource>>,
+        pub(crate) fail: bool,
+        /// `list_resources_page` 返回 `CapabilityNotSupported`（模拟无 `resources` 能力）。
+        pub(crate) cap_fail: bool,
+        pub(crate) read_text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for MockSkillClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            if self.cap_fail {
+                return Err(MCPClientError::CapabilityNotSupported("resources".into()));
+            }
+            if self.fail {
+                return Err(MCPClientError::ProtocolError("boom".into()));
+            }
+            let idx: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+            match self.pages.get(idx) {
+                Some(page) => {
+                    let next = if idx + 1 < self.pages.len() {
+                        Some((idx + 1).to_string())
+                    } else {
+                        None
+                    };
+                    Ok((page.clone(), next))
+                }
+                None => Ok((vec![], None)),
+            }
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(self.read_text.clone(), "skill://x")],
+            })
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 构造带 `_meta.source` 的 `skill://` 资源（mount_dir 固定占位）/ a `skill://` resource with `_meta.source`。
+    pub(crate) fn skill_resource(uri: &str, source: Option<&str>) -> Resource {
+        skill_resource_mounted(uri, source, "/tmp/mount")
+    }
+
+    /// 同上但 mount_dir 取真实路径（供 mounted 物化 happy-path 测试）/ with a real mount_dir for materialization。
+    pub(crate) fn skill_resource_mounted(
+        uri: &str,
+        source: Option<&str>,
+        mount_dir: &str,
+    ) -> Resource {
+        use rmcp::model::{AnnotateAble, Meta};
+        let mut raw = RawResource::new(uri, "skill");
+        if let Some(src) = source {
+            let mut m = serde_json::Map::new();
+            m.insert("source".into(), Value::String(src.to_string()));
+            m.insert("mount_dir".into(), Value::String(mount_dir.to_string()));
+            raw.meta = Some(Meta(m));
+        }
+        raw.no_annotation()
+    }
+
+    /// 把假 client 注入 manager 的 `active_clients` / inject a fake client into the manager。
+    pub(crate) async fn inject(manager: &MCPServerManager, name: &str, client: MockSkillClient) {
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(name.to_string(), StdArc::new(client));
+    }
+
+    // ── INT-02 #70：可取消调用的共享假 client（manager 三态 + computer 端到端共用）──────────
+
+    /// 可配置行为的假 MCP client，覆盖可取消调用三态（用默认 trait 实现的 select-drop 竞速）。经
+    /// [`inject_callable`] 注入，供 manager（`call_tool_cancellable` 三态）与 computer
+    /// （`execute_tool_cancellable` / `acancel_tool` 端到端）测试共享。字段私有——构造走 `inject_callable`。
+    pub(crate) struct CancelMockClient {
+        behavior: CancelBehavior,
+    }
+
+    /// [`CancelMockClient`] 的注入行为 / injected behavior for the cancellable mock。
+    pub(crate) enum CancelBehavior {
+        /// 立即返回成功结果 / return Ok immediately.
+        CompleteOk,
+        /// 永不返回（模拟在途阻塞——由取消令牌就地中断）/ never resolves (interrupted by cancel token).
+        BlockForever,
+        /// 睡眠后返回（配合短 timeout 触发 manager 级超时）/ sleep then Ok.
+        Sleep(std::time::Duration),
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for CancelMockClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            match &self.behavior {
+                CancelBehavior::CompleteOk => {
+                    Ok(CallToolResult::success(vec![Content::text("done")]))
+                }
+                CancelBehavior::BlockForever => std::future::pending().await,
+                CancelBehavior::Sleep(d) => {
+                    tokio::time::sleep(*d).await;
+                    Ok(CallToolResult::success(vec![Content::text("late")]))
+                }
+            }
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 注入可取消假 client + `tool→server` 映射，使 `validate_tool_call` 可解析（供 computer 端到端测试）。
+    /// Inject a cancellable fake client + tool→server mapping so `validate_tool_call` resolves.
+    pub(crate) async fn inject_callable(
+        manager: &MCPServerManager,
+        server: &str,
+        tool: &str,
+        behavior: CancelBehavior,
+    ) {
+        manager.active_clients.write().await.insert(
+            server.to_string(),
+            StdArc::new(CancelMockClient { behavior }),
+        );
+        manager
+            .tool_mapping
+            .write()
+            .await
+            .insert(tool.to_string(), server.to_string());
     }
 }
 
@@ -1146,6 +1606,100 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tokio::time::{sleep, Duration};
+
+    /// 最小假 client：`call_tool` 返回注入的 transport 错误，用于覆盖 `call_tool` 授权分流（AUTH-01 #23）。
+    /// 余方法 trivial。Minimal fake whose `call_tool` returns an injected transport error.
+    struct AuthErrClient {
+        msg: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for AuthErrClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ConnectionError(self.msg.clone()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult { contents: vec![] })
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 注入 `AuthErrClient` 到 `active_clients`（auth 分支在 `servers_config` 读取前早返回，仅需此）。
+    async fn inject_auth_err(manager: &MCPServerManager, name: &str, msg: &str) {
+        manager.active_clients.write().await.insert(
+            name.to_string(),
+            StdArc::new(AuthErrClient {
+                msg: msg.to_string(),
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_upstream_401_yields_auth_result_4006() {
+        // 上游 401 → call_tool 不再 Err，而是返回协议形状的授权 CallToolResult（_meta.error_code=4006）。
+        let manager = MCPServerManager::new();
+        inject_auth_err(&manager, "srv", "HTTP error: 401 Unauthorized").await;
+
+        let r = manager
+            .call_tool("srv", "t", serde_json::json!({}), None)
+            .await
+            .expect("auth error should surface as Ok(CallToolResult), not Err");
+
+        assert_eq!(r.is_error, Some(true));
+        let meta = r.meta.as_ref().expect("meta present");
+        assert_eq!(meta.get("error_code").and_then(|v| v.as_i64()), Some(4006));
+        assert_eq!(meta.get("mcp_server").and_then(|v| v.as_str()), Some("srv"));
+        assert!(meta.get("auth_hint").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_non_auth_error_stays_protocol_error() {
+        // 非授权上游错误 → 维持通用 ProtocolError（覆盖 classify 的 None 臂）。
+        let manager = MCPServerManager::new();
+        inject_auth_err(&manager, "srv", "boom: something broke").await;
+
+        let err = manager
+            .call_tool("srv", "t", serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ComputerError::ProtocolError(_)),
+            "got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_manager_creation() {
@@ -1162,6 +1716,7 @@ mod tests {
         let configs = vec![
             // STDIO服务器配置 / STDIO server configuration
             MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: "test_stdio".to_string(),
                 disabled: false,
                 forbidden_tools: vec![],
@@ -1177,6 +1732,7 @@ mod tests {
             }),
             // HTTP服务器配置 / HTTP server configuration
             MCPServerConfig::Http(HttpServerConfig {
+                env_file: None,
                 name: "test_http".to_string(),
                 disabled: true, // 禁用此服务器 / Disable this server
                 forbidden_tools: vec![],
@@ -1218,6 +1774,7 @@ mod tests {
 
         // 添加服务器配置 / Add server configuration
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1247,6 +1804,7 @@ mod tests {
 
         // 添加服务器 / Add server
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "test_server".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1280,6 +1838,7 @@ mod tests {
         let configs = vec![
             // 第一个服务器 / First server
             MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: "server1".to_string(),
                 disabled: false,
                 forbidden_tools: vec![],
@@ -1295,6 +1854,7 @@ mod tests {
             }),
             // 第二个服务器 / Second server
             MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
                 name: "server2".to_string(),
                 disabled: false,
                 forbidden_tools: vec![],
@@ -1450,6 +2010,7 @@ mod tests {
 
         // Case 1: specific only
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1477,6 +2038,7 @@ mod tests {
 
         // Case 2: default only
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1501,6 +2063,7 @@ mod tests {
 
         // Case 3: specific + default merge (specific wins)
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1534,6 +2097,7 @@ mod tests {
 
         // Case 4: no config
         let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
             name: "s".to_string(),
             disabled: false,
             forbidden_tools: vec![],
@@ -1575,5 +2139,244 @@ mod tests {
             }
             other => panic!("Expected InvalidState, got {:?}", other),
         }
+    }
+
+    // ---- #74 INT-04：list_skill_resources + SkillResourceManager 接缝 ----
+    // Mock / helpers 提升至 `super::test_support`（`pub(crate)`），供 computer.rs 集成测试复用。
+    use super::test_support::{inject, skill_resource, MockSkillClient};
+
+    #[tokio::test]
+    async fn test_list_skill_resources_filters_and_exhausts_pages() {
+        let manager = MCPServerManager::new();
+        let pages = vec![
+            vec![
+                skill_resource("skill://srv/a", Some("mounted")),
+                make_resource("window://w", "w", None, None),
+            ],
+            vec![skill_resource("skill://srv/b", Some("mounted"))],
+        ];
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages,
+                fail: false,
+                cap_fail: false,
+                read_text: "x".into(),
+            },
+        )
+        .await;
+
+        let got = manager.list_skill_resources(None).await;
+        let uris: Vec<&str> = got.iter().map(|(_, r)| r.uri.as_str()).collect();
+        // window:// 被过滤；两页都被消费 / window:// filtered out; both pages consumed.
+        assert_eq!(uris, vec!["skill://srv/a", "skill://srv/b"]);
+        assert!(got.iter().all(|(s, _)| s == "srv"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_resource_manager_trait_meta_and_read_bytes() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages: vec![vec![skill_resource("skill://srv/a", Some("mounted"))]],
+                fail: false,
+                cap_fail: false,
+                read_text: "hello-bytes".into(),
+            },
+        )
+        .await;
+
+        // 经 SkillResourceManager trait：Resource → McpResource（提取 `_meta`）。
+        let pairs = SkillResourceManager::list_skill_resources(&manager, None)
+            .await
+            .unwrap();
+        assert_eq!(pairs.len(), 1);
+        let (sname, mcp_res) = &pairs[0];
+        assert_eq!(sname, "srv");
+        assert_eq!(mcp_res.uri, "skill://srv/a");
+        assert_eq!(
+            mcp_res.meta.get("source").and_then(|v| v.as_str()),
+            Some("mounted")
+        );
+
+        // read_resource → 字节（文本 content 拼接为 UTF-8 字节）。
+        let bytes = SkillResourceManager::read_resource(&manager, "srv", "skill://srv/a")
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"hello-bytes");
+    }
+
+    #[tokio::test]
+    async fn test_list_skill_resources_per_server_isolation_and_filter() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "bad",
+            MockSkillClient {
+                pages: vec![],
+                fail: true,
+                cap_fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+        inject(
+            &manager,
+            "good",
+            MockSkillClient {
+                pages: vec![vec![skill_resource("skill://good/a", Some("mounted"))]],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+
+        // 出错 server 跳过，good 的结果仍在 / erroring server skipped, good's result remains.
+        let got = manager.list_skill_resources(None).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "good");
+        assert_eq!(got[0].1.uri, "skill://good/a");
+
+        // server_name 过滤：只枚举指定 server / server_name filter narrows enumeration.
+        let only_good = manager.list_skill_resources(Some("good")).await;
+        assert_eq!(only_good.len(), 1);
+        let none = manager.list_skill_resources(Some("missing")).await;
+        assert!(none.is_empty());
+    }
+
+    // ---- #68：list_resources（get_resources 路由 + 4014/4015 映射）----
+
+    #[tokio::test]
+    async fn test_list_resources_unknown_server_4014() {
+        let manager = MCPServerManager::new();
+        let err = manager.list_resources("nope", None).await.unwrap_err();
+        assert_eq!(err.error_code(), 4014);
+        assert!(matches!(err, ComputerError::McpServerNotFound(s) if s == "nope"));
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_capability_not_supported_4015() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: true,
+                read_text: String::new(),
+            },
+        )
+        .await;
+        let err = manager.list_resources("srv", None).await.unwrap_err();
+        assert_eq!(err.error_code(), 4015);
+        assert!(matches!(
+            err,
+            ComputerError::McpCapabilityNotSupported { server_name, capability }
+            if server_name == "srv" && capability == "resources"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_single_page_passthrough_cursor() {
+        let manager = MCPServerManager::new();
+        inject(
+            &manager,
+            "srv",
+            MockSkillClient {
+                pages: vec![
+                    vec![make_resource("res://a", "a", None, None)],
+                    vec![make_resource("res://b", "b", None, None)],
+                ],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+
+        // 首页（cursor=None）：返回第 1 页 + next cursor（透传，不聚合第 2 页）。
+        let (page1, next1) = manager.list_resources("srv", None).await.unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].uri, "res://a");
+        assert_eq!(next1.as_deref(), Some("1"));
+
+        // 第 2 页（透传 cursor）：返回第 2 页 + 末页（next=None）。
+        let (page2, next2) = manager.list_resources("srv", next1).await.unwrap();
+        assert_eq!(page2[0].uri, "res://b");
+        assert!(next2.is_none());
+    }
+
+    // ── INT-02 #70：call_tool_cancellable 三态（completed / cancelled / timeout）─────────
+    // CancelMockClient / CancelBehavior / inject_callable 已上移至 test_support（pub(crate)），
+    // 供 manager（本节）与 computer（execute_tool_cancellable 端到端）测试共享。
+    use super::test_support::{inject_callable, CancelBehavior};
+
+    async fn manager_with_cancel_mock(behavior: CancelBehavior) -> MCPServerManager {
+        let manager = MCPServerManager::new();
+        inject_callable(&manager, "srv", "t", behavior).await;
+        manager
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_cancellable_completed() {
+        // 正常完成 → Completed(result)，无取消/超时（令牌未 fire）。
+        let manager = manager_with_cancel_mock(CancelBehavior::CompleteOk).await;
+        let outcome = manager
+            .call_tool_cancellable(
+                "srv",
+                "t",
+                serde_json::json!({}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            CancellableCallOutcome::Completed(r) => assert_ne!(r.is_error, Some(true)),
+            CancellableCallOutcome::Cancelled => panic!("未 fire 令牌不应取消"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_cancellable_cancelled() {
+        // 在途阻塞 + 令牌已 fire → 就地中断回 Cancelled（biased select 先轮询阻塞的 call_tool=pending，
+        // 再命中已就绪的取消分支）。
+        let manager = manager_with_cancel_mock(CancelBehavior::BlockForever).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        let outcome = manager
+            .call_tool_cancellable("srv", "t", serde_json::json!({}), None, token)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CancellableCallOutcome::Cancelled),
+            "在途阻塞 + 取消令牌应回 Cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_cancellable_timeout() {
+        // 睡眠 10s + 50ms timeout → manager 级超时 → Err(TimeoutError)（Computer 据此写 meta.a2c_timeout）。
+        let manager =
+            manager_with_cancel_mock(CancelBehavior::Sleep(Duration::from_secs(10))).await;
+        let err = manager
+            .call_tool_cancellable(
+                "srv",
+                "t",
+                serde_json::json!({}),
+                Some(Duration::from_millis(50)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ComputerError::TimeoutError(_)),
+            "超时应回 TimeoutError，实得: {err:?}"
+        );
     }
 }

@@ -20,6 +20,7 @@ fn echo_server_path() -> String {
 
 fn stdio_config(name: &str) -> MCPServerConfig {
     MCPServerConfig::Stdio(StdioServerConfig {
+        env_file: None,
         name: name.to_string(),
         disabled: false,
         forbidden_tools: vec![],

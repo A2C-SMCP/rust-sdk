@@ -253,6 +253,10 @@ async fn test_notification_payload_validation() {
             NotificationMessage::UpdateDesktop("comp1".to_string()),
             "UpdateDesktop",
         ),
+        (
+            NotificationMessage::UpdateSkills("comp1".to_string()),
+            "UpdateSkills",
+        ),
     ];
 
     for (notification, description) in test_cases {
@@ -272,6 +276,9 @@ async fn test_notification_payload_validation() {
             }
             NotificationMessage::UpdateDesktop(_) => {
                 assert!(description.contains("UpdateDesktop"));
+            }
+            NotificationMessage::UpdateSkills(_) => {
+                assert!(description.contains("UpdateSkills"));
             }
         }
     }
@@ -328,6 +335,10 @@ async fn test_python_compatibility_behavior() {
             NotificationMessage::UpdateDesktop(computer) => {
                 assert_eq!(computer, "computer1");
                 assert_eq!(i, 3); // 第四个通知
+            }
+            NotificationMessage::UpdateSkills(_) => {
+                // 这个测试用例中没有 UpdateSkills
+                panic!("Unexpected UpdateSkills notification");
             }
         }
     }

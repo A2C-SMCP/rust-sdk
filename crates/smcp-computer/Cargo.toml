@@ -9,6 +9,9 @@ keywords = ["smcp", "computer", "mcp", "tool"]
 categories = ["network-programming", "development-tools"]
 
 [dev-dependencies]
+# 去抖器单测用 tokio 虚拟时钟（start_paused）/ paused virtual clock for debouncer tests（SKL-06 #55）
+tokio = { workspace = true, features = ["test-util"] }
+smcp-server-hyper.workspace = true
 smcp-server-core.workspace = true
 tracing-subscriber.workspace = true
 hyper.workspace = true
@@ -21,6 +24,7 @@ socketioxide.workspace = true
 
 [dependencies]
 smcp.workspace = true
+smcp-client-transport.workspace = true
 
 tokio.workspace = true
 serde.workspace = true
@@ -56,6 +60,37 @@ percent-encoding = "2.3"
 
 # 密码输入 / Password input
 rpassword.workspace = true
+tar = "0.4.46"
+flate2 = "1.1.9"
+
+# blob_handle 编解码（base64url + msgpack；BLB-01 #62）/ blob handle codec
+base64.workspace = true
+rmp-serde.workspace = true
+serde_yaml_ng = "0.10.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+indexmap = { version = "2.14.0", features = ["serde"] }
+sha2.workspace = true
+
+# SKILL user 源文件 watcher / SKILL user-source file watcher（SKL-06 #55）
+notify = "8.2.0"
+
+# 治理层物化文件锁（known_marketplaces / installed_plugins 旁车 .lock）/ governance store file lock（SET-04 #67）
+fd-lock.workspace = true
+
+# 治理层平台原生依赖（off-platform 零成本）/ governance platform-native deps
+# macOS：Managed Preferences plist（SET-03 #65 layer 2）+ Keychain（INP-01 #73 secret_store）
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+keyring = { version = "3", features = ["apple-native"] }
+
+# Windows：注册表策略（SET-03 #65 layer 2/4，best-effort 无 CI lane）+ Credential Manager（INP-01 #73）
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
+keyring = { version = "3", features = ["windows-native"] }
+
+# Linux/BSD：OS Secret Service（INP-01 #73 secret_store；sync-secret-service 纯 Rust zbus，无需系统 libdbus）
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
 
 [features]
 default = ["vrl"]

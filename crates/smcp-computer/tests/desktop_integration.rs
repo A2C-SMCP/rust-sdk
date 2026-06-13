@@ -9,52 +9,72 @@
 */
 mod common;
 
+use rmcp::model::{Annotations, Meta};
 use smcp_computer::desktop::{organize_desktop, ToolCallRecord, WindowInfo};
-use smcp_computer::mcp_clients::model::{make_resource, ReadResourceResult, ResourceContents};
+use smcp_computer::mcp_clients::model::{
+    make_resource, Annotated, RawResource, ReadResourceResult, ResourceContents,
+};
 use std::collections::HashMap;
+
+/// 构造带 v0.2 下沉元数据的窗口资源 / Build a window resource carrying v0.2 sunk metadata。
+///
+/// 对齐 WIN-01 #16 / WIN-02 #18：`window://` URI 是**纯标识符**，不再承载 query；布局元数据下沉到
+/// MCP `Resource.annotations.priority`（f32[0,1]，`None` = 不附带 annotations）与 `_meta.fullscreen`。
+/// 与 `desktop::organize` 模块内单测的 `create_test_window` 同构。
+/// Mirrors WIN-01/02: bare-identifier URI; priority → `annotations.priority`, fullscreen → `_meta.fullscreen`.
+fn window_with_meta(
+    server: &str,
+    uri: &str,
+    content: &str,
+    priority: Option<f32>,
+    fullscreen: bool,
+) -> WindowInfo {
+    let mut raw = RawResource::new(uri.to_string(), format!("Window {uri}"));
+    if fullscreen {
+        let mut map = serde_json::Map::new();
+        map.insert("fullscreen".to_string(), serde_json::Value::Bool(true));
+        raw.meta = Some(Meta(map));
+    }
+    let annotations = priority.map(|p| Annotations {
+        audience: None,
+        priority: Some(p),
+        last_modified: None,
+    });
+    WindowInfo {
+        server_name: server.to_string(),
+        resource: Annotated::new(raw, annotations),
+        read_result: ReadResourceResult {
+            contents: vec![ResourceContents::text(content, uri.to_string())],
+        },
+    }
+}
 
 /// 测试desktop模块与mcp_clients类型的集成 / Test integration between desktop and mcp_clients types
 #[test]
 fn test_desktop_with_mcp_clients_types() {
-    // 使用mcp_clients中定义的类型创建窗口信息
+    // 使用 mcp_clients 类型创建窗口信息；priority/fullscreen 经 v0.2 下沉元数据承载（非 URI query）。
     let windows = vec![
-        WindowInfo {
-            server_name: "test_server".to_string(),
-            resource: make_resource(
-                "window://test.mcp.com/window1?priority=10",
-                "Test Window 1",
-                Some("A test window".to_string()),
-                Some("text/plain".to_string()),
-            ),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "Test content 1",
-                    "window://test.mcp.com/window1?priority=10",
-                )],
-            },
-        },
-        WindowInfo {
-            server_name: "test_server".to_string(),
-            resource: make_resource(
-                "window://test.mcp.com/window2?fullscreen=true",
-                "Test Window 2",
-                None,
-                None,
-            ),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "Fullscreen content",
-                    "window://test.mcp.com/window2?fullscreen=true",
-                )],
-            },
-        },
+        window_with_meta(
+            "test_server",
+            "window://test.mcp.com/window1",
+            "Test content 1",
+            Some(0.1),
+            false,
+        ),
+        window_with_meta(
+            "test_server",
+            "window://test.mcp.com/window2",
+            "Fullscreen content",
+            None,
+            true,
+        ),
     ];
 
     let result = organize_desktop(windows, None, &[]);
 
-    // 验证结果符合预期：有fullscreen时只返回一个窗口
+    // 同一 server 内存在 _meta.fullscreen → 仅返回该 fullscreen 窗口（一条），URI 为纯标识符。
     assert_eq!(result.len(), 1);
-    assert!(result[0].contains("window://test.mcp.com/window2?fullscreen=true"));
+    assert!(result[0].contains("window://test.mcp.com/window2"));
     assert!(result[0].contains("Fullscreen content"));
 }
 
@@ -62,41 +82,28 @@ fn test_desktop_with_mcp_clients_types() {
 #[test]
 fn test_multi_server_organization() {
     let windows = vec![
-        WindowInfo {
-            server_name: "server_a".to_string(),
-            resource: make_resource("window://server_a.mcp.com/window1", "Window A1", None, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "Content A1",
-                    "window://server_a.mcp.com/window1",
-                )],
-            },
-        },
-        WindowInfo {
-            server_name: "server_b".to_string(),
-            resource: make_resource("window://server_b.mcp.com/window1", "Window B1", None, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "Content B1",
-                    "window://server_b.mcp.com/window1",
-                )],
-            },
-        },
-        WindowInfo {
-            server_name: "server_a".to_string(),
-            resource: make_resource(
-                "window://server_a.mcp.com/window2?priority=50",
-                "Window A2",
-                None,
-                None,
-            ),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "Content A2",
-                    "window://server_a.mcp.com/window2?priority=50",
-                )],
-            },
-        },
+        window_with_meta(
+            "server_a",
+            "window://server_a.mcp.com/window1",
+            "Content A1",
+            None,
+            false,
+        ),
+        window_with_meta(
+            "server_b",
+            "window://server_b.mcp.com/window1",
+            "Content B1",
+            None,
+            false,
+        ),
+        // window2 经 annotations.priority=0.5 在 server_a 内排到 window1（缺省 0.0）之前。
+        window_with_meta(
+            "server_a",
+            "window://server_a.mcp.com/window2",
+            "Content A2",
+            Some(0.5),
+            false,
+        ),
     ];
 
     // 设置历史记录让server_b优先
@@ -109,10 +116,10 @@ fn test_multi_server_organization() {
 
     let result = organize_desktop(windows, None, &history);
 
-    // server_b应该优先，然后是server_a（按priority排序）
+    // server_b 最近使用 → 优先；server_a 内按 annotations.priority 降序（window2=0.5 在 window1=0.0 前）。
     assert_eq!(result.len(), 3);
     assert!(result[0].contains("window://server_b.mcp.com/window1"));
-    assert!(result[1].contains("window://server_a.mcp.com/window2?priority=50"));
+    assert!(result[1].contains("window://server_a.mcp.com/window2"));
     assert!(result[2].contains("window://server_a.mcp.com/window1"));
 }
 

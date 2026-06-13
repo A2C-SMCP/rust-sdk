@@ -85,6 +85,11 @@ pub struct SessionData {
     pub role: ClientRole,
     /// 当前所在的办公室 ID
     pub office_id: Option<OfficeId>,
+    /// 握手协商到的协议版本号（来自连接 URL query `a2c_version`）。
+    /// 仅用于 `server:list_room` 展示与诊断；缺省（旧连接未协商）时为 `None`。
+    /// 对齐 Python `session["a2c_version"]`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2c_version: Option<String>,
     /// 其他扩展数据
     pub extra: serde_json::Value,
 }
@@ -97,6 +102,7 @@ impl SessionData {
             name,
             role,
             office_id: None,
+            a2c_version: None,
             extra: serde_json::Value::Object(Default::default()),
         }
     }
@@ -104,6 +110,12 @@ impl SessionData {
     /// 设置办公室 ID
     pub fn with_office_id(mut self, office_id: OfficeId) -> Self {
         self.office_id = Some(office_id);
+        self
+    }
+
+    /// 设置握手协商到的协议版本号 / Set the negotiated protocol version (from handshake)
+    pub fn with_a2c_version(mut self, a2c_version: Option<String>) -> Self {
+        self.a2c_version = a2c_version;
         self
     }
 

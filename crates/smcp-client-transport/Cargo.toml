@@ -1,0 +1,16 @@
+[package]
+name = "smcp-client-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared client-side Socket.IO connect + version-handshake error handling for SMCP"
+
+[dependencies]
+smcp.workspace = true
+tf-rust-socketio.workspace = true
+tf-rust-engineio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

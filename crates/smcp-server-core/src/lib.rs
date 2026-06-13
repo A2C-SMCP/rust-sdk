@@ -10,7 +10,7 @@ pub mod session;
 
 // 重新导出主要类型
 pub use auth::{AuthError, AuthenticationProvider, DefaultAuthenticationProvider};
-pub use handler::{HandlerError, ServerState, SmcpHandler};
+pub use handler::{HandlerError, InflightDisconnectRegistry, ServerState, SmcpHandler};
 pub use server::{SmcpServerBuilder, SmcpServerLayer};
 pub use session::{ClientRole, SessionData, SessionError, SessionManager, SessionStats};
 

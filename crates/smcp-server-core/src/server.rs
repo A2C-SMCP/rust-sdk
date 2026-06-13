@@ -82,6 +82,7 @@ impl SmcpServerBuilder {
             session_manager,
             auth_provider,
             io: Arc::new(io.clone()),
+            inflight_disconnect: Arc::new(crate::handler::InflightDisconnectRegistry::default()),
         };
 
         // 注册处理器

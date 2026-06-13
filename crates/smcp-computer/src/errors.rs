@@ -31,6 +31,23 @@ pub enum ComputerError {
     /// 服务器未激活 / Server not active
     ServerNotActive { server_name: String },
 
+    #[error("MCP server not found: {0}")]
+    /// 目标 MCP Server 未注册（`get_resources` → 处理器映射 4014）/ target MCP server not registered
+    /// (`get_resources` → handler maps 4014)。对标 Python `MCPServerNotFoundError`。
+    McpServerNotFound(String),
+
+    #[error("MCP capability '{capability}' not supported by server '{server_name}'")]
+    /// MCP Server 未声明所需 capability（`get_resources` → 处理器映射 4015）/ required capability not
+    /// declared (`get_resources` → handler maps 4015)。对标 Python `MCPCapabilityNotSupportedError`。
+    /// 结构化分流字段：`server_name` + `capability` 供 #72 handler 直接平铺为 flat ErrorPayload 顶层
+    /// `mcp_server_name`/`capability`（`with_mcp_server_name`/`with_capability`），无需再解析字符串。
+    McpCapabilityNotSupported {
+        /// 目标 MCP Server 名（顶层 `mcp_server_name`）。
+        server_name: String,
+        /// 缺失的 capability 名（顶层 `capability`，如 `"resources"`）。
+        capability: String,
+    },
+
     #[error("VRL syntax error: {message}")]
     /// VRL语法错误 / VRL syntax error
     VrlSyntaxError { message: String },
@@ -62,6 +79,15 @@ pub enum ComputerError {
     #[error("Connection error: {0}")]
     /// 连接错误 / Connection error
     ConnectionError(String),
+
+    #[error("Protocol version mismatch: {0}")]
+    /// 协议版本握手不匹配 / Protocol-version handshake mismatch (HS-02 #22)。
+    ///
+    /// 连接 URL 携带 [`smcp::PROTOCOL_VERSION`] 后，服务端版本握手判定不兼容：HTTP 400 body
+    /// 中携带 4008 [`smcp::ErrorPayload`]（polling 握手），经
+    /// [`smcp::utils::handshake::build_protocol_version_error`] 映射为强类型
+    /// [`smcp::ProtocolVersionError`]。镜像 Python `a2c_smcp/computer/socketio/client.py`。
+    ProtocolVersionMismatch(#[from] smcp::ProtocolVersionError),
 
     #[error("Runtime error: {0}")]
     /// 运行时错误 / Runtime error
@@ -123,6 +149,12 @@ impl ComputerError {
             // 服务器相关错误 / Server related errors
             ComputerError::ServerNotActive { .. } => 404, // NOT_FOUND
 
+            // MCP get_resources 路由错误 / MCP get_resources routing errors
+            ComputerError::McpServerNotFound(_) => smcp::ErrorCode::McpServerNotFound.code(), // 4014
+            ComputerError::McpCapabilityNotSupported { .. } => {
+                smcp::ErrorCode::McpCapabilityNotSupported.code() // 4015
+            }
+
             // 语法/验证错误 / Syntax/Validation errors
             ComputerError::VrlSyntaxError { .. } => 400, // BAD_REQUEST
             ComputerError::ValidationError(_) => 400,    // BAD_REQUEST
@@ -133,6 +165,11 @@ impl ComputerError {
             ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR
             ComputerError::TransportError(_) => 500,  // INTERNAL_ERROR
             ComputerError::SocketIoError(_) => 500,   // INTERNAL_ERROR
+
+            // 协议版本握手不匹配 / Protocol version mismatch (4008)
+            ComputerError::ProtocolVersionMismatch(_) => {
+                smcp::ErrorCode::ProtocolVersionMismatch.code()
+            }
 
             // 超时错误 / Timeout errors
             ComputerError::TimeoutError(_) => 408, // TIMEOUT
@@ -224,4 +261,30 @@ pub enum McpClientError {
     #[error("Internal error: {0}")]
     /// 内部错误 / Internal error
     InternalError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_protocol_version_mismatch_from_payload() {
+        // HS-02 #22: 4008 body → ProtocolVersionError → ComputerError::ProtocolVersionMismatch
+        // 经 #[from] 自动转换；error_code() 返回 4008；Display 透传诊断字段。
+        let body = r#"{"code":4008,"message":"Protocol version mismatch","server_version":"0.3.0","client_version":"0.2.0","min_supported":"0.3.0","max_supported":"0.3.999"}"#;
+        let payload = smcp::utils::handshake::extract_4008_payload(body).expect("4008 应被识别");
+        let pve = smcp::utils::handshake::build_protocol_version_error(&payload);
+        let err: ComputerError = pve.into();
+        assert_eq!(err.error_code(), 4008);
+        match err {
+            ComputerError::ProtocolVersionMismatch(e) => {
+                assert_eq!(e.server_version.as_deref(), Some("0.3.0"));
+                assert_eq!(e.client_version.as_deref(), Some("0.2.0"));
+                let s = e.to_string();
+                assert!(s.contains("server=0.3.0"));
+                assert!(s.contains("client=0.2.0"));
+            }
+            other => panic!("expected ProtocolVersionMismatch, got {other:?}"),
+        }
+    }
 }

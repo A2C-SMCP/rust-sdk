@@ -148,13 +148,16 @@ async fn test_notification_channel_flow() {
     tx.send(NotificationMessage::UpdateDesktop("comp1".to_string()))
         .unwrap();
 
+    tx.send(NotificationMessage::UpdateSkills("comp1".to_string()))
+        .unwrap();
+
     // 接收并验证通知
     let mut count = 0;
     while timeout(Duration::from_millis(100), rx.recv()).await.is_ok() {
         count += 1;
     }
 
-    assert_eq!(count, 5);
+    assert_eq!(count, 6);
 }
 
 #[tokio::test]
@@ -206,10 +209,11 @@ async fn test_all_notification_types() {
             computer: "comp1".to_string(),
         }),
         NotificationMessage::UpdateDesktop("comp1".to_string()),
+        NotificationMessage::UpdateSkills("comp1".to_string()),
     ];
 
     // 验证所有通知类型都能正确创建
-    assert_eq!(notifications.len(), 5);
+    assert_eq!(notifications.len(), 6);
 
     // 验证每种通知类型
     for (i, notification) in notifications.into_iter().enumerate() {
@@ -225,6 +229,7 @@ async fn test_all_notification_types() {
                 notification,
                 NotificationMessage::UpdateDesktop(_)
             )),
+            5 => assert!(matches!(notification, NotificationMessage::UpdateSkills(_))),
             _ => panic!("Unexpected notification index"),
         }
     }

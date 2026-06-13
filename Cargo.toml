@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/smcp",
     "crates/smcp-agent",
+    "crates/smcp-client-transport",
     "crates/smcp-computer",
     "crates/smcp-server-core",
     "crates/smcp-server-hyper",
@@ -11,7 +12,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.1.15"
+version = "0.2.2"
 
 [package]
 name = "a2c-smcp"
@@ -33,6 +34,10 @@ agent = ["dep:smcp-agent"]
 computer = ["dep:smcp-computer"]
 server = ["dep:smcp-server-core", "dep:smcp-server-hyper"]
 full = ["agent", "computer", "server"]
+# REL-01 (#24)：workspace v0.2.2 集成测试矩阵开关。`cargo test-e2e`（`--workspace --features e2e
+# -- --ignored`）下整套编译并跑通；缺省（test-ws/test-all）整套 cfg-out，零编译/运行开销。
+# Gate for the workspace v0.2.2 integration matrix; built + run under `cargo test-e2e`, cfg'd out otherwise.
+e2e = []
 
 [dependencies]
 # Core protocol types (always included)
@@ -72,6 +77,14 @@ smcp-server-hyper.workspace = true
 smcp-agent.workspace = true
 smcp-computer.workspace = true
 
+# REL-01 (#24) v0.2.2 集成测试矩阵：裸 socket.io 客户端驱动 Agent 侧 + ack future 组合 +
+# blob 重组完整性自证（base64 解码 + sha256 比对）。
+# v0.2.2 matrix: raw socket.io client (Agent side) + ack future combinators + blob sha256 verification.
+tf-rust-socketio.workspace = true
+futures-util.workspace = true
+base64.workspace = true
+sha2.workspace = true
+
 [workspace.dependencies]
 # 核心运行时 / Core runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal", "process"] }
@@ -100,10 +113,22 @@ lazy_static = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"
 dirs = "6"
+# blob 传输 / Blob transfer（base64 解码 + sha256 完整性自证；drain_blob 例程依赖）
+base64 = "0.22"
+sha2 = "0.10"
+# blob_handle msgpack 编解码（string-keyed map，跨-SDK 与 Python msgpack 字节兼容；BLB-01 #62）
+rmp-serde = "1.3"
+# 治理层物化文件锁 / Governance materialized-file lock（旁车 .lock 跨平台 flock/LockFileEx；SET-04 #67）
+fd-lock = "4.0"
 
 # Socket.IO / Socket.IO
 socketioxide = { version = "0.16.3", features = ["state"] }
-tf-rust-socketio = { version = "0.7.0", features = ["async"] }
+tf-rust-socketio = { version = "0.8.1", features = ["async"] }
+# engine.io 错误类型（HttpErrorWithBody / WebsocketClosed）；tf-rust-socketio 不 re-export 其 Error，
+# HS-02 (#22) 需直接 match engineio 变体来分类版本握手错误，故显式声明（版本须与 tf-rust-socketio
+# 间接依赖一致）。engine.io error types; socketio does not re-export its Error and HS-02 must match
+# the engineio variants directly. Version must match the one tf-rust-socketio pulls transitively.
+tf-rust-engineio = "0.8.1"
 
 # HTTP服务器 / HTTP server
 hyper = { version = "1", features = ["server", "http1", "http2", "full"] }
@@ -132,11 +157,12 @@ rpassword = "7.2"
 vrl = "0.29.0"
 
 # 内部 crate / Internal crates
-smcp = { path = "crates/smcp", version = "0.1.15" }
-smcp-agent = { path = "crates/smcp-agent", version = "0.1.15" }
-smcp-computer = { path = "crates/smcp-computer", version = "0.1.15" }
-smcp-server-core = { path = "crates/smcp-server-core", version = "0.1.15" }
-smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.1.15" }
+smcp = { path = "crates/smcp", version = "0.2.2" }
+smcp-agent = { path = "crates/smcp-agent", version = "0.2.2" }
+smcp-client-transport = { path = "crates/smcp-client-transport", version = "0.2.2" }
+smcp-computer = { path = "crates/smcp-computer", version = "0.2.2" }
+smcp-server-core = { path = "crates/smcp-server-core", version = "0.2.2" }
+smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.2.2" }
 
 # 测试 / Testing
 tempfile = "3.8"

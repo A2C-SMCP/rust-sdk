@@ -13,11 +13,19 @@ use crate::{
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
     events::AsyncAgentEventHandler,
+    protocol_error::raise_for_error_payload,
+    request_builders::{
+        build_get_blob_request, build_get_desktop_request, build_get_resources_request,
+        build_get_skill_request, build_get_skills_request, build_get_tools_request,
+        build_tool_call_cancel, build_tool_call_request,
+    },
+    response::{ensure_req_id, parse_get_blob_response, parse_get_resources_response},
+    skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
-    events::*, AgentCallData, EnterOfficeReq, GetDesktopReq, GetToolsReq, LeaveOfficeReq,
-    ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, ToolCallReq, SMCP_NAMESPACE,
+    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetResourcesRet,
+    GetSkillRet, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -185,6 +193,34 @@ impl AsyncSmcpAgent {
                             }
                         }
                     }
+                    NotificationMessage::UpdateSkills(computer) => {
+                        // v0.2.1 自动行为（对标 Python `_on_skills_updated`）：收到 notify:update_skills
+                        // 后自动重拉 get_skills，再派发 on_skills_received hook。
+                        // 错误隔离：重拉失败仅告警；hook 抛错独立捕获、不污染通知循环（对标 Python 双层 try）。
+                        match agent_clone.get_skills(&computer).await {
+                            Ok(skills) => {
+                                info!(
+                                    "Skills refreshed from computer {}: count={}",
+                                    computer,
+                                    skills.len()
+                                );
+                                if let Some(ref handler) = event_handler {
+                                    if let Err(e) = handler
+                                        .on_skills_received(&computer, skills, &agent_clone)
+                                        .await
+                                    {
+                                        error!(
+                                            "on_skills_received hook raised for computer {}: {}",
+                                            computer, e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to refresh skills for computer {}: {}", computer, e);
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -237,14 +273,8 @@ impl AsyncSmcpAgent {
     /// 获取指定Computer的工具列表
     pub async fn get_tools(&self, computer: &str) -> Result<Vec<SMCPTool>> {
         let agent_config = self.auth_provider.get_agent_config();
-        let req_id = ReqId::new();
-        let req = GetToolsReq {
-            base: AgentCallData {
-                agent: agent_config.agent.clone(),
-                req_id: req_id.clone(),
-            },
-            computer: computer.to_string(),
-        };
+        let req = build_get_tools_request(&agent_config.agent, computer);
+        let req_id = req.base.req_id.clone();
 
         debug!("Getting tools from computer: {}", computer);
 
@@ -252,24 +282,16 @@ impl AsyncSmcpAgent {
         let transport = transport
             .as_ref()
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
-        let data = serde_json::to_value(req)?;
+        let data = serde_json::to_value(&req)?;
         let response = transport
-            .call(CLIENT_GET_TOOLS, data, self.config.default_timeout)
+            .call(CLIENT_GET_TOOLS, data, self.config.get_timeout)
             .await?;
 
-        // 验证req_id
-        let response_req_id: String = response
-            .get("req_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| SmcpAgentError::internal("Missing req_id in response"))?
-            .to_string();
+        // flat ErrorPayload → 协议错误（#47↔#34：对端未命中/能力错误经 ack 回 flat error）
+        raise_for_error_payload(&response)?;
 
-        if response_req_id != req_id.as_str() {
-            return Err(SmcpAgentError::ReqIdMismatch {
-                expected: req_id.as_str().to_string(),
-                actual: response_req_id,
-            });
-        }
+        // 验证 req_id（全 crate 单点收敛，见 response::ensure_req_id）
+        ensure_req_id(&response, req_id.as_str())?;
 
         let tools: Vec<SMCPTool> =
             serde_json::from_value(response.get("tools").cloned().unwrap_or_default())?;
@@ -292,23 +314,8 @@ impl AsyncSmcpAgent {
         window: Option<String>,
     ) -> Result<Vec<String>> {
         let agent_config = self.auth_provider.get_agent_config();
-        let req_id = ReqId::new();
-        let mut req = GetDesktopReq {
-            base: AgentCallData {
-                agent: agent_config.agent.clone(),
-                req_id: req_id.clone(),
-            },
-            computer: computer.to_string(),
-            desktop_size: None,
-            window: None,
-        };
-
-        if let Some(s) = size {
-            req.desktop_size = Some(s);
-        }
-        if let Some(w) = window {
-            req.window = Some(w);
-        }
+        let req = build_get_desktop_request(&agent_config.agent, computer, size, window.as_deref());
+        let req_id = req.base.req_id.clone();
 
         debug!("Getting desktop from computer: {}", computer);
 
@@ -316,24 +323,16 @@ impl AsyncSmcpAgent {
         let transport = transport
             .as_ref()
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
-        let data = serde_json::to_value(req)?;
+        let data = serde_json::to_value(&req)?;
         let response = transport
-            .call(CLIENT_GET_DESKTOP, data, self.config.default_timeout)
+            .call(CLIENT_GET_DESKTOP, data, self.config.get_timeout)
             .await?;
 
-        // 验证req_id
-        let response_req_id: String = response
-            .get("req_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| SmcpAgentError::internal("Missing req_id in response"))?
-            .to_string();
+        // flat ErrorPayload → 协议错误（#47↔#34）
+        raise_for_error_payload(&response)?;
 
-        if response_req_id != req_id.as_str() {
-            return Err(SmcpAgentError::ReqIdMismatch {
-                expected: req_id.as_str().to_string(),
-                actual: response_req_id,
-            });
-        }
+        // 验证 req_id（全 crate 单点收敛，见 response::ensure_req_id）
+        ensure_req_id(&response, req_id.as_str())?;
 
         let desktops: Vec<String> =
             serde_json::from_value(response.get("desktops").cloned().unwrap_or_default())?;
@@ -346,6 +345,280 @@ impl AsyncSmcpAgent {
         Ok(desktops)
     }
 
+    /// 获取指定 Computer 上某 MCP Server 的资源列表（v0.2.0）/ Get a MCP Server's resource list。
+    ///
+    /// 透明转发 MCP `resources/list`：SDK **不**自动翻页——`cursor` 由调用方控制，首次传 `None`，
+    /// 响应含 `next_cursor` 时由调用方决定是否带该 cursor 继续请求（协议指南 §5.3 #3）。flat
+    /// ErrorPayload（`4014` MCP Server 未注册 / `4015` 未声明 `resources` 能力）经 ack 透传为协议
+    /// 错误，不吞错。对标 Python `a2c_smcp/agent/client.py::get_resources`。
+    pub async fn get_resources(
+        &self,
+        computer: &str,
+        mcp_server: &str,
+        cursor: Option<String>,
+    ) -> Result<GetResourcesRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_resources_request(
+            &agent_config.agent,
+            computer,
+            mcp_server,
+            cursor.as_deref(),
+        );
+        let req_id = req.base.req_id.clone();
+
+        debug!(
+            "Getting resources from computer {}, mcp_server={}, cursor={:?}",
+            computer, mcp_server, cursor
+        );
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_RESOURCES, data, self.config.get_timeout)
+            .await?;
+
+        // 响应编排（flat ErrorPayload 4014/4015 透传 + req_id 校验 + 整页解析）单点收敛于纯函数，
+        // 与 get_skills 同构、可独立单测（见 response::parse_get_resources_response）。
+        let ret = parse_get_resources_response(&response, req_id.as_str())?;
+        info!(
+            "Received {} resources from computer: {} (next_cursor={:?})",
+            ret.resources.len(),
+            computer,
+            ret.next_cursor
+        );
+        Ok(ret)
+    }
+
+    /// 获取指定 Computer 的 SKILL 清单（v0.2.1）/ Get a Computer's SKILL inventory。
+    ///
+    /// 发起 `client:get_skills`，返回轻量 [`A2CSkillRef`] 列表（**不含** SKILL.md body；body 经
+    /// [`Self::get_skill`] 按需拉取）。flat ErrorPayload（如 `4014`）经 ack 透传为协议错误。
+    /// 对标 Python `a2c_smcp/agent/client.py::get_skills`。
+    pub async fn get_skills(&self, computer: &str) -> Result<Vec<A2CSkillRef>> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_skills_request(&agent_config.agent, computer);
+        let req_id = req.base.req_id.clone();
+
+        debug!("Getting skills from computer: {}", computer);
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_SKILLS, data, self.config.get_timeout)
+            .await?;
+
+        let skills = parse_get_skills_response(&response, req_id.as_str())?;
+        info!(
+            "Received {} skills from computer: {}",
+            skills.len(),
+            computer
+        );
+        Ok(skills)
+    }
+
+    /// 获取 SKILL 包内单个资源（v0.2.1）/ Get a single in-package SKILL resource。
+    ///
+    /// 发起 `client:get_skill`；`rel_path` 缺省由 Computer 解析为包根 `SKILL.md` 入口，否则 MUST
+    /// 相对、无 `..`、无绝对路径（沙箱在 Computer 端强制）。返回的 [`GetSkillRet`] 中 `body` 与
+    /// `blob_handle` **恰一存在**（经 [`GetSkillRet::resource`] 校验访问）：
+    /// - 文本且可内联 → `body` 直接可读（[`smcp::SkillResource::Inline`]）；
+    /// - 二进制或过大文本 → `blob_handle` **原样返回**，由调用方经 `client:get_blob` 自取字节。
+    ///
+    /// 文本 MIME 的 `blob_handle` 自动经 `drain_blob` 拉回并 UTF-8 解码回填 `body`，对调用方透明；
+    /// 文本性判定经单一权威 [`mime_is_textual`]（协议 §6.4(2)）。对标 Python
+    /// `a2c_smcp/agent/client.py::get_skill`。
+    pub async fn get_skill(
+        &self,
+        computer: &str,
+        name: &str,
+        rel_path: Option<&str>,
+    ) -> Result<GetSkillRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_skill_request(&agent_config.agent, computer, name, rel_path);
+        let req_id = req.base.req_id.clone();
+
+        debug!(
+            "Getting skill {:?} rel_path={:?} from computer: {}",
+            name, rel_path, computer
+        );
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_SKILL, data, self.config.get_timeout)
+            .await?;
+
+        let mut ret = parse_get_skill_response(&response, req_id.as_str())?;
+
+        // AGT-03 #38：文本 MIME 的 `blob_handle` 自动 drain 回填 `body`（Python parity）。
+        // Computer 对「文本但超内联预算」走句柄；Agent 拉回并 UTF-8 解码即得 body，对调用方透明。
+        // 二进制句柄（image/png 等）**保持原样**，由调用方按二进制经 get_blob/drain 自取。
+        if ret.body.is_none() {
+            if let Some(handle) = ret.blob_handle.clone() {
+                if mime_is_textual(ret.mime_type.as_deref()) {
+                    match self.drain_blob_bytes(computer, &handle).await {
+                        Ok((bytes, _mime)) => match String::from_utf8(bytes) {
+                            Ok(text) => {
+                                ret.body = Some(text);
+                                ret.blob_handle = None;
+                            }
+                            // 非 UTF-8：保留 blob_handle 让调用方按二进制处理（保守回退，对齐 Python）。
+                            Err(_) => debug!(
+                                "get_skill {:?} textual mime but body not UTF-8; keeping blob_handle",
+                                name
+                            ),
+                        },
+                        Err(e) => warn!(
+                            "get_skill blob backfill failed for handle={}: {}; keeping blob_handle",
+                            handle, e
+                        ),
+                    }
+                }
+            }
+        }
+
+        info!("Received skill {:?} from computer: {}", name, computer);
+        Ok(ret)
+    }
+
+    /// 通用二进制单块拉取（v0.2.1，AGT-03 #38）/ Pull one binary chunk via `client:get_blob`。
+    ///
+    /// 直接对应协议 `client:get_blob`：按 `chunk_offset`（资源字节绝对偏移，缺省 0）+ `max_chunk_bytes`
+    /// （客户建议单块上限，Computer clamp 至 `BlobThresholds.chunk_max_bytes`）取一块，返回 [`GetBlobRet`]
+    /// （含 `total_size`/`sha256`/`eof`/base64 `blob`）。flat ErrorPayload（`4018` invalid_handle/
+    /// forbidden/gone/range）经 ack 透传为协议错误。多块重组/校验/重试请用 [`Self::drain_blob_bytes`]。
+    /// 对标 Python `a2c_smcp/agent/client.py::get_blob`。
+    pub async fn get_blob(
+        &self,
+        computer: &str,
+        blob_handle: &str,
+        chunk_offset: Option<u64>,
+        max_chunk_bytes: Option<u64>,
+    ) -> Result<GetBlobRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_blob_request(
+            &agent_config.agent,
+            computer,
+            blob_handle,
+            chunk_offset,
+            max_chunk_bytes,
+        );
+        let req_id = req.base.req_id.clone();
+
+        debug!(
+            "Getting blob chunk from computer {}, handle={}, offset={:?}",
+            computer, blob_handle, chunk_offset
+        );
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_BLOB, data, self.config.get_timeout)
+            .await?;
+
+        let ret = parse_get_blob_response(&response, req_id.as_str())?;
+        Ok(ret)
+    }
+
+    /// 经 `client:get_blob` 拉取并重组某句柄的全量字节（AGT-03 #38）/ drain & reassemble all bytes。
+    ///
+    /// 复用 UTIL-02 [`smcp::utils::blob::drain_blob`]（串行多块拉取 + 跨块源漂移重读 + 全量 `sha256`
+    /// 自证 + 4018 处置），注入「以本 Agent transport 发 `client:get_blob`」的单块 `call` 闭包。
+    /// 传输层错误（超时/断连/序列化）经 out-of-band 暂存**保真**上抛（[`SmcpAgentError::Timeout`] 等，
+    /// 不被压成协议码）；拉取期协议错误（4018/漂移/解码）经 [`SmcpAgentError::Blob`] 传播。返回
+    /// `(bytes, mime_type)`。供 [`Self::get_skill`] 文本回填与 tool_call 二进制旁路（AGT-04 #41）共用。
+    /// 对标 Python `client.py` 的 `_make_blob_call` + `drain_blob`。
+    pub(crate) async fn drain_blob_bytes(
+        &self,
+        computer: &str,
+        blob_handle: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        use smcp::utils::blob::{drain_blob, BlobChunkRequest, DrainBlobOptions};
+
+        let agent = self.auth_provider.get_agent_config().agent.clone();
+        let get_timeout = self.config.get_timeout;
+        // drain 的 `call` 仅能回 ErrorPayload，无法表达传输层错误；用 out-of-band 暂存保真
+        // SmcpAgentError（超时/断连/序列化），drain 失败后优先返回它，回退才映射 BlobTransferError。
+        let stash: Arc<std::sync::Mutex<Option<SmcpAgentError>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let call = |chunk: BlobChunkRequest| {
+            let agent = agent.clone();
+            let stash = stash.clone();
+            async move {
+                let req = build_get_blob_request(
+                    &agent,
+                    &chunk.computer,
+                    &chunk.blob_handle,
+                    Some(chunk.chunk_offset),
+                    Some(chunk.max_chunk_bytes),
+                );
+                let data = match serde_json::to_value(&req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        *stash.lock().unwrap() = Some(SmcpAgentError::from(e));
+                        return Err(smcp::ErrorPayload::new(
+                            -1,
+                            "serialize get_blob request failed",
+                        ));
+                    }
+                };
+                let guard = self.transport.read().await;
+                let transport = match guard.as_ref() {
+                    Some(t) => t,
+                    None => {
+                        *stash.lock().unwrap() =
+                            Some(SmcpAgentError::connection("Not connected".to_string()));
+                        return Err(smcp::ErrorPayload::new(-1, "not connected"));
+                    }
+                };
+                match transport.call(CLIENT_GET_BLOB, data, get_timeout).await {
+                    // flat ErrorPayload（4018 等）→ 交 drain 分类（4018→NotAccessible，余→Protocol）。
+                    Ok(resp) if smcp::is_protocol_error_payload(&resp) => {
+                        Err(error_payload_from_value(&resp))
+                    }
+                    Ok(resp) => match serde_json::from_value::<GetBlobRet>(resp) {
+                        Ok(ret) => Ok(ret),
+                        Err(e) => {
+                            *stash.lock().unwrap() = Some(SmcpAgentError::from(e));
+                            Err(smcp::ErrorPayload::new(-1, "malformed GetBlobRet"))
+                        }
+                    },
+                    Err(e) => {
+                        *stash.lock().unwrap() = Some(e);
+                        Err(smcp::ErrorPayload::new(
+                            -1,
+                            "transport error during get_blob",
+                        ))
+                    }
+                }
+            }
+        };
+
+        match drain_blob(call, computer, blob_handle, DrainBlobOptions::default()).await {
+            Ok(pair) => Ok(pair),
+            Err(blob_err) => {
+                // 传输层错误优先保真返回；否则映射拉取期协议错误（4018/漂移/解码）。
+                if let Some(te) = stash.lock().unwrap().take() {
+                    return Err(te);
+                }
+                Err(SmcpAgentError::from(blob_err))
+            }
+        }
+    }
+
     /// 调用工具
     pub async fn tool_call(
         &self,
@@ -354,18 +627,14 @@ impl AsyncSmcpAgent {
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let agent_config = self.auth_provider.get_agent_config();
-        let req_id = ReqId::new();
-        let req_id_for_cancel = req_id.clone();
-        let req = ToolCallReq {
-            base: AgentCallData {
-                agent: agent_config.agent.clone(),
-                req_id,
-            },
-            computer: computer.to_string(),
-            tool_name: tool_name.to_string(),
+        let req = build_tool_call_request(
+            &agent_config.agent,
+            computer,
+            tool_name,
             params,
-            timeout: self.config.tool_call_timeout as i32,
-        };
+            self.config.tool_call_timeout as i32,
+        );
+        let req_id_for_cancel = req.base.req_id.clone();
 
         debug!("Calling tool {} on computer: {}", tool_name, computer);
 
@@ -373,13 +642,21 @@ impl AsyncSmcpAgent {
         let transport = transport
             .as_ref()
             .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
-        let data = serde_json::to_value(req.clone())?;
+        let data = serde_json::to_value(&req)?;
 
         match transport
             .call(CLIENT_TOOL_CALL, data, self.config.tool_call_timeout)
             .await
         {
             Ok(response) => {
+                // flat ErrorPayload → 协议错误（如 4006/4007 授权、404 未命中）；正常 CallToolResult
+                // （含 isError 的工具执行失败）无顶层协议 code，原样透传。
+                raise_for_error_payload(&response)?;
+                // AGT-04 #41（⚠️ BREAKING）：消费 CallToolResult 二进制旁路——遍历 content item 检测
+                // `_meta.a2c_blob_handle` 并 drain 回填，否则超内联预算的大二进制会静默变空。无句柄路径不变。
+                let response = self
+                    .resolve_tool_call_binary_sideband(computer, response)
+                    .await;
                 info!("Tool call successful: {} on {}", tool_name, computer);
                 Ok(response)
             }
@@ -388,11 +665,9 @@ impl AsyncSmcpAgent {
                     "Tool call timeout, cancelling: {} on {}",
                     tool_name, computer
                 );
-                // 发送取消请求
-                let cancel_data = AgentCallData {
-                    agent: agent_config.agent.clone(),
-                    req_id: req_id_for_cancel.clone(),
-                };
+                // 发送取消请求（复用统一取消载体 builder：req_id==原 tool_call req_id）
+                let cancel_data =
+                    build_tool_call_cancel(&agent_config.agent, req_id_for_cancel.as_str());
                 let cancel_value = serde_json::to_value(cancel_data)?;
                 if let Err(e) = transport.emit(SERVER_TOOL_CALL_CANCEL, cancel_value).await {
                     error!("Failed to send cancel request: {}", e);
@@ -415,6 +690,76 @@ impl AsyncSmcpAgent {
                 Err(e)
             }
         }
+    }
+
+    /// 解析并回填 `client:tool_call` 结果的二进制旁路（AGT-04 #41，⚠️ BREAKING）/ resolve tool_call binary sideband。
+    ///
+    /// 三段式（见 [`crate::blob_sideband`] 模块文档）：
+    /// 1. **extract**——遍历 `CallToolResult.content` 收集带 `_meta.a2c_blob_handle` 的 item 索引+句柄；
+    /// 2. **drain**——逐句柄经 [`Self::drain_blob_bytes`] 拉回全量字节（多块 + sha256 自证 + 4018 处置）；
+    /// 3. **inject**——把字节回填到对应 content item 内联载体并清理 `_meta` 旁路键（消费后与小尺寸内联无异）。
+    ///
+    /// 无句柄的 content item 路径**完全不变**（无句柄时直接早返回原值）。容错（对齐 Python
+    /// `_resolve_tool_call_binary_sideband`）：任一 item 的 drain 失败仅 `warn` + **保留**其
+    /// `_meta.a2c_blob_handle` 不回填，继续处理其余 item（不整体失败、不早退）——调用方仍可据残留句柄
+    /// 自行 [`Self::get_blob`] 兜底。
+    async fn resolve_tool_call_binary_sideband(
+        &self,
+        computer: &str,
+        mut response: serde_json::Value,
+    ) -> serde_json::Value {
+        let handles = crate::blob_sideband::extract_sideband_handles(&response);
+        if handles.is_empty() {
+            return response; // 无旁路句柄：路径不变（含全部非二进制 tool_call）。
+        }
+        for (idx, handle) in handles {
+            match self.drain_blob_bytes(computer, &handle).await {
+                Ok((bytes, _mime)) => {
+                    if let Some(item) = response
+                        .get_mut("content")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|arr| arr.get_mut(idx))
+                    {
+                        crate::blob_sideband::inject_payload_into_content_item(item, &bytes);
+                    }
+                }
+                Err(e) => warn!(
+                    "tool_call binary sideband drain failed for handle={}: {}; keeping _meta.a2c_blob_handle intact",
+                    handle, e
+                ),
+            }
+        }
+        response
+    }
+
+    /// 取消一次在途工具调用（AGT-05 #44）/ Cancel an in-flight tool call.
+    ///
+    /// 发送 `server:tool_call_cancel`（**fire-and-forget，无 ack**）：`req_id` **MUST**==被取消的原
+    /// `client:tool_call` 的 req_id（唯一定位在途调用）。Server 收后仅向房间广播 `notify:tool_call_cancel`、
+    /// **不**回执——故本方法用 `emit`（**非** `call`）不等待 ack，交付传输层即返回 `Ok(())`；ack 缺席是
+    /// 协议合规预期，**MUST NOT** 当作失败。
+    ///
+    /// 取消是否真正中断由 Computer 侧协作式处理（INT-02 #70）；Agent 随后从原 `client:tool_call` 的 ack
+    /// 拿到取消态 `CallToolResult`（结果级 `a2c_cancelled=true`），用 [`classify_tool_call_outcome`]
+    /// 区分取消 / 超时 / 失败。
+    ///
+    /// 注：取消载体 `AgentCallData` 仅 `{agent, req_id}`，**不含** reason 字段——取消原因
+    /// （`a2c_cancel_reason`）由 Computer 写在结果级 meta，非 Agent 发送（故本方法无 `reason` 参数）。
+    /// 调用方需自行持有原 tool_call 的 `req_id`（由另一上下文触发取消，与阻塞中的 tool_call 并行）。
+    pub async fn tool_call_cancel(&self, req_id: &str) -> Result<()> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let cancel = build_tool_call_cancel(&agent_config.agent, req_id);
+        let data = serde_json::to_value(cancel)?;
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+
+        // fire-and-forget：emit 不等待 ack（仅表示「已交给传输层发出」），契合 server:tool_call_cancel 无 ack 语义。
+        transport.emit(SERVER_TOOL_CALL_CANCEL, data).await?;
+        debug!("Sent server:tool_call_cancel for req_id={}", req_id);
+        Ok(())
     }
 
     /// 列出房间内的所有会话
@@ -440,19 +785,8 @@ impl AsyncSmcpAgent {
             .call(SERVER_LIST_ROOM, data, self.config.default_timeout)
             .await?;
 
-        // 验证req_id
-        let response_req_id: String = response
-            .get("req_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| SmcpAgentError::internal("Missing req_id in response"))?
-            .to_string();
-
-        if response_req_id != req_id.as_str() {
-            return Err(SmcpAgentError::ReqIdMismatch {
-                expected: req_id.as_str().to_string(),
-                actual: response_req_id,
-            });
-        }
+        // 验证 req_id（全 crate 单点收敛，见 response::ensure_req_id）
+        ensure_req_id(&response, req_id.as_str())?;
 
         let sessions: Vec<SessionInfo> =
             serde_json::from_value(response.get("sessions").cloned().unwrap_or_default())?;
@@ -466,6 +800,35 @@ impl AsyncSmcpAgent {
     }
 }
 
+/// MIME 是否「文本类」（决定 `get_skill` 句柄是否自动 drain 回填 `body`）/ is this MIME textual?
+///
+/// 经单一权威 [`smcp::utils::mime::is_text_mime`] 实施协议 §6.4(2) 三分支（`text/*` ∨ `+json/+xml/+yaml`
+/// 后缀 ∨ essence 白名单），与 Computer 铸造期 `is_text` 路由及当前 Python `a2c_smcp/agent/client.py`
+/// 的 `is_text_mime` **同源同判**（跨 SDK 一致：同一 Computer 响应在两 SDK 给调用方相同结果）。
+/// 旧实现仅 `starts_with("text/")`，会漏判 `application/json|yaml|toml` 等超内联预算的文本（python-sdk
+/// #105 盲区）；现已收敛。非文本（真二进制）一律保持 `blob_handle`，由调用方按需经 `get_blob` 自取。
+fn mime_is_textual(mime: Option<&str>) -> bool {
+    mime.map(smcp::utils::mime::is_text_mime).unwrap_or(false)
+}
+
+/// 从已判定为 flat 协议错误的 `Value` 宽松构造 [`smcp::ErrorPayload`]，交 `drain_blob` 分类。
+/// 保留 `code`/`message`/`details`（`classify_fatal` 仅据 `code` + `details.reason` 分流），
+/// 缺字段宽松回退（不 panic），等价于直接 `from_value` 但容忍缺 `message`。
+fn error_payload_from_value(v: &serde_json::Value) -> smcp::ErrorPayload {
+    let code = v
+        .get("code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
+    let message = v
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut payload = smcp::ErrorPayload::new(code, message);
+    payload.details = v.get("details").cloned();
+    payload
+}
+
 // 实现Clone以便在事件处理器中使用
 impl Clone for AsyncSmcpAgent {
     fn clone(&self) -> Self {
@@ -477,5 +840,34 @@ impl Clone for AsyncSmcpAgent {
             tools_cache: self.tools_cache.clone(),
             notification_task: None, // Note: 任务句柄不克隆，因为它是特定于实例的
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #81：`get_skill` 文本句柄自动 drain 的 MIME 判定遵循协议 §6.4(2) 三分支，经单一权威
+    /// `smcp::utils::mime::is_text_mime`（与当前 Python `is_text_mime` parity）/ §6.4(2) textual gate。
+    #[test]
+    fn test_mime_is_textual_follows_spec_64_2() {
+        // 分支 1：text/*（含 charset 参数）。
+        assert!(mime_is_textual(Some("text/plain")));
+        assert!(mime_is_textual(Some("text/markdown")));
+        assert!(mime_is_textual(Some("text/plain; charset=utf-8")));
+        // 分支 2：+json / +xml / +yaml 后缀（旧 starts_with("text/") 漏掉）。
+        assert!(mime_is_textual(Some("image/svg+xml")));
+        assert!(mime_is_textual(Some("application/vnd.api+json")));
+        // 分支 3：application/* 文本 essence 白名单（旧 starts_with("text/") 漏掉 → python-sdk #105 盲区）。
+        assert!(mime_is_textual(Some("application/json")));
+        assert!(mime_is_textual(Some("application/json; charset=utf-8")));
+        assert!(mime_is_textual(Some("application/xml")));
+        assert!(mime_is_textual(Some("application/yaml")));
+        assert!(mime_is_textual(Some("application/toml")));
+        // 真二进制 / 缺省一律非文本（保持 blob_handle）。
+        assert!(!mime_is_textual(Some("application/octet-stream")));
+        assert!(!mime_is_textual(Some("image/png")));
+        assert!(!mime_is_textual(Some("")));
+        assert!(!mime_is_textual(None));
     }
 }

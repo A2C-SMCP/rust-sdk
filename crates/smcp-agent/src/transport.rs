@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tf_rust_socketio::{
     asynchronous::{Client, ClientBuilder},
-    Event, Payload,
+    Event, Payload, TransportType,
 };
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, error, info};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tracing::{debug, error, info, warn};
 
 /// 事件处理器类型
 pub type EventHandler = Box<dyn FnMut(Payload, Client) + Send + Sync>;
@@ -33,12 +33,22 @@ pub enum NotificationMessage {
     UpdateConfig(smcp::UpdateMCPConfigNotification),
     UpdateToolList(smcp::UpdateToolListNotification),
     UpdateDesktop(String), // computer name
+    UpdateSkills(String),  // computer name（notify:update_skills，v0.2.1）
 }
 
 /// Socket.IO传输层
 pub struct SocketIoTransport {
     client: Client,
     namespace: String,
+    /// 断连信号发送端（AGT-05 #44 in-flight disconnect 容错）。`connect_with_handlers` 的 `on_any`
+    /// 收到底层 `Event::Close`/`Event::Error` 时 `send(true)`，使在途 [`Self::call`] 立即放弃等待——
+    /// 协议 0.2.2：Agent **MUST NOT** 靠 ack 超时判定断连，须用 disconnect/connect_error 事件。
+    /// `Arc` 持有以保活（watch::Sender 非 Clone）：发送端存活则 [`Self::call`] 的 `changed()` 不会因
+    /// 发送端析构而误判断连（`connect` 无处理器路径据此保持惰性而非常断）。仅作 RAII 保活、构造后不再读取。
+    #[allow(dead_code)]
+    disconnect_tx: Arc<watch::Sender<bool>>,
+    /// 断连信号接收端（粘滞：watch 保留最新值，关闭「断连早于 call」竞速窗）/ sticky disconnect receiver。
+    disconnect_rx: watch::Receiver<bool>,
 }
 
 impl SocketIoTransport {
@@ -54,34 +64,19 @@ impl SocketIoTransport {
             url, namespace
         );
 
-        let mut builder = ClientBuilder::new(url);
-
-        // 启用 WebSocket 传输以避免 polling 问题
-        // Enable WebSocket transport to avoid polling issues
-        builder = builder.transport_type(tf_rust_socketio::TransportType::Websocket);
-
-        // 设置命名空间
-        if !namespace.is_empty() {
-            builder = builder.namespace(namespace);
-        }
-
-        // 设置认证信息
-        if let Some(auth_data) = auth {
-            builder = builder.auth(auth_data);
-        }
-
-        // 设置头部
-        for (key, value) in headers {
-            builder = builder.opening_header(key, value);
-        }
+        // HS-02 #22: 在连接 URL 注入权威 a2c_version（丢弃调用方自带值，防版本漂移），
+        // 使服务端 HTTP 握手中间件能在 Socket.IO 业务层之前完成版本协商。
+        // HS-02 #22: inject the authoritative a2c_version into the connection URL so the server's
+        // HTTP handshake middleware can negotiate the version before the Socket.IO layer.
+        let handshake_url =
+            smcp::utils::handshake::build_handshake_url(url, smcp::PROTOCOL_VERSION)
+                .map_err(|e| SmcpAgentError::connection(format!("Invalid handshake URL: {}", e)))?;
 
         let (_tx, rx) = mpsc::unbounded_channel();
 
-        // 连接服务器
-        let client = builder
-            .connect()
-            .await
-            .map_err(|e| SmcpAgentError::connection(format!("Failed to connect: {}", e)))?;
+        // 连接服务器（polling-first，分类版本握手错误）
+        let client =
+            Self::connect_polling_first(&handshake_url, namespace, auth, headers, None).await?;
 
         // 等待一小段时间确保 Socket.IO namespace 连接完全建立
         // Wait for Socket.IO namespace connection to be fully established
@@ -92,10 +87,16 @@ impl SocketIoTransport {
             url, namespace
         );
 
+        // 无处理器路径：断连信号保持惰性（发送端经 Arc 保活、永不 send，call 仅靠 ack/timeout）。
+        // 断连事件容错需 on_any（见 connect_with_handlers），故此路径不提供——agent 走 connect_with_handlers。
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+
         Ok((
             Self {
                 client,
                 namespace: namespace.to_string(),
+                disconnect_tx: Arc::new(disconnect_tx),
+                disconnect_rx,
             },
             rx,
         ))
@@ -113,17 +114,44 @@ impl SocketIoTransport {
             url, namespace
         );
 
-        let mut builder = ClientBuilder::new(url);
+        // HS-02 #22: 注入权威 a2c_version（见 [`SocketIoTransport::connect`] 注释）。
+        let handshake_url =
+            smcp::utils::handshake::build_handshake_url(url, smcp::PROTOCOL_VERSION)
+                .map_err(|e| SmcpAgentError::connection(format!("Invalid handshake URL: {}", e)))?;
 
-        // 启用 WebSocket 传输以避免 polling 问题
-        // Enable WebSocket transport to avoid polling issues
-        builder = builder.transport_type(tf_rust_socketio::TransportType::Websocket);
+        let mut builder = ClientBuilder::new(&handshake_url);
+
+        // HS-02 #22: polling-first（先 HTTP polling 握手，可被服务端 400+4008 body 拦截，
+        // 失败时再升级 WebSocket）。⚠️ 不可用 WS-only（TransportType::Websocket）——会绕过服务端
+        // HTTP 版本握手中间件，使版本不兼容无法被感知。
+        // HS-02 #22: polling-first (HTTP polling handshake can be intercepted by the server's
+        // 400 + 4008 body, then upgrades to WebSocket). MUST NOT use WS-only
+        // (TransportType::Websocket) — it bypasses the server's HTTP version handshake gate.
+        builder = builder.transport_type(TransportType::Any);
 
         // 注册on_any处理器来捕获所有事件
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = Arc::new(tx);
 
+        // AGT-05 #44：断连信号。on_any 收到底层 Event::Close/Error → send(true)，使在途 call 立即
+        // 放弃等待（不靠 ack 超时）。watch 粘滞保留最新值，关闭「断连早于 call」竞速窗。
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let disconnect_tx = Arc::new(disconnect_tx);
+        let handler_disconnect_tx = disconnect_tx.clone();
+
         builder = builder.on_any(move |event, payload, _client| {
+            // 断连信号随底层连接状态翻转（协议 0.2.2 in-flight disconnect 容错——MUST NOT 靠 ack 超时）：
+            // Close/Error → true（断连）；Connect → false（重连恢复，清除粘滞断连位，避免重连后 call 误判）。
+            // call() 用 wait_for(|v| *v) 只认 true，故 Connect→false 的中间值不会误触发在途 call。
+            match &event {
+                Event::Close | Event::Error => {
+                    let _ = handler_disconnect_tx.send(true);
+                }
+                Event::Connect => {
+                    let _ = handler_disconnect_tx.send(false);
+                }
+                _ => {}
+            }
             let event_str = match event {
                 Event::Custom(s) => s,
                 _ => return Box::pin(async {}),
@@ -219,6 +247,39 @@ impl SocketIoTransport {
                             }
                         }
                     }
+                    NOTIFY_UPDATE_SKILLS => {
+                        // v0.2.1：notify:update_skills 仅携带 {"computer": ...}，触发自动重拉 get_skills
+                        // v0.2.1: notify:update_skills carries only {"computer": ...}; triggers a
+                        // get_skills auto-refresh（与 UpdateDesktop 同款轻量载荷解析）。
+                        if let Payload::Text(values, _) = payload {
+                            if let Some(value) = values.into_iter().next() {
+                                if let Ok(notification) =
+                                    serde_json::from_value::<serde_json::Value>(value)
+                                {
+                                    // 空串 computer 视作缺失（对齐 Python `if not computer`）：
+                                    // .filter 让空串落入下方 else 告警跳过，不派发空 computer 的重拉。
+                                    if let Some(computer) = notification
+                                        .get("computer")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        info!(
+                                            "Skills update notification for computer: {}",
+                                            computer
+                                        );
+                                        let _ = tx.send(NotificationMessage::UpdateSkills(
+                                            computer.to_string(),
+                                        ));
+                                    } else {
+                                        // 对标 Python：缺 computer 字段则告警跳过
+                                        tracing::warn!(
+                                            "UPDATE_SKILLS notification missing 'computer'"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             })
@@ -229,21 +290,35 @@ impl SocketIoTransport {
             builder = builder.namespace(namespace);
         }
 
-        // 设置认证信息
-        if let Some(auth_data) = auth {
-            builder = builder.auth(auth_data);
+        // 设置认证信息（克隆：原值留作 4900 改 polling 重连复用）
+        // Set auth (clone: keep the original for the 4900 polling re-fetch)
+        if let Some(auth_data) = &auth {
+            builder = builder.auth(auth_data.clone());
         }
 
         // 设置头部
-        for (key, value) in headers {
-            builder = builder.opening_header(key, value);
+        for (key, value) in &headers {
+            builder = builder.opening_header(key.clone(), value.clone());
         }
 
-        // 连接服务器
-        let client = builder
-            .connect()
-            .await
-            .map_err(|e| SmcpAgentError::connection(format!("Failed to connect: {}", e)))?;
+        // 连接服务器（polling-first 已设；分类版本握手错误，4900 时改 polling 取 4008）
+        let client = match smcp_client_transport::connect_and_classify(
+            builder,
+            &handshake_url,
+            namespace,
+            auth,
+            headers,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
+                return Err(SmcpAgentError::ProtocolVersionMismatch(pve));
+            }
+            Err(smcp_client_transport::ConnectError::Connection(msg)) => {
+                return Err(SmcpAgentError::connection(msg));
+            }
+        };
 
         // 等待一小段时间确保 Socket.IO namespace 连接完全建立
         // Wait for Socket.IO namespace connection to be fully established
@@ -258,9 +333,56 @@ impl SocketIoTransport {
             Self {
                 client,
                 namespace: namespace.to_string(),
+                disconnect_tx,
+                disconnect_rx,
             },
             rx,
         ))
+    }
+
+    /// polling-first 连接（无事件处理器）/ polling-first connect (no event handlers)。
+    ///
+    /// 构建 builder（namespace/auth/headers + [`TransportType::Any`]），交由 [`finish_connect`] 完成
+    /// 连接与版本握手错误分类。`_handlers` 占位保留扩展位（当前无处理器）。
+    async fn connect_polling_first(
+        handshake_url: &str,
+        namespace: &str,
+        auth: Option<Value>,
+        headers: HashMap<String, String>,
+        _handlers: Option<()>,
+    ) -> Result<Client> {
+        let mut builder = ClientBuilder::new(handshake_url);
+
+        // HS-02 #22: polling-first（见 [`connect_with_handlers`] 注释）。⚠️ 不可 WS-only。
+        builder = builder.transport_type(TransportType::Any);
+
+        if !namespace.is_empty() {
+            builder = builder.namespace(namespace);
+        }
+        if let Some(auth_data) = &auth {
+            builder = builder.auth(auth_data.clone());
+        }
+        for (key, value) in &headers {
+            builder = builder.opening_header(key.clone(), value.clone());
+        }
+
+        match smcp_client_transport::connect_and_classify(
+            builder,
+            handshake_url,
+            namespace,
+            auth,
+            headers,
+        )
+        .await
+        {
+            Ok(client) => Ok(client),
+            Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
+                Err(SmcpAgentError::ProtocolVersionMismatch(pve))
+            }
+            Err(smcp_client_transport::ConnectError::Connection(msg)) => {
+                Err(SmcpAgentError::connection(msg))
+            }
+        }
     }
 
     /// 发送事件（不等待响应）
@@ -296,30 +418,44 @@ impl SocketIoTransport {
             )
             .await?;
 
-        match rx.await {
-            Ok(response) => {
-                // 从响应中提取JSON数据
-                match response {
-                    Payload::Text(values, _) => {
-                        if let Some(value) = values.into_iter().next() {
-                            Ok(value)
-                        } else {
-                            Err(SmcpAgentError::internal("Empty response"))
-                        }
-                    }
-                    #[allow(deprecated)]
-                    Payload::String(s, _) => {
-                        // 尝试解析字符串为JSON
-                        serde_json::from_str(&s).map_err(SmcpAgentError::from)
-                    }
-                    Payload::Binary(_, _) => {
-                        Err(SmcpAgentError::internal("Binary response not supported"))
-                    }
+        // AGT-05 #44：把 ack 等待与断连信号竞速——Agent MUST NOT 靠 ack 超时判定断连（协议 0.2.2
+        // in-flight disconnect 容错）。`wait_for(|v| *v)` 只在断连位为 true 时就绪：粘滞——若进入前已断连
+        // 立即就绪（关闭「断连早于 call」竞速窗）；且忽略重连时 Connect→false 的中间值，不误触发。
+        //
+        // 测试覆盖说明：本竞速逻辑依赖真实 socket 事件（Event::Close/Error），按项目"无 mock transport"
+        // 约定（SocketIoTransport 为具体 struct）无法单测；其端到端覆盖（mid-call 杀连接）随 #72 socketio
+        // 接线一并补 e2e。逻辑正确性：粘滞读 + Err（发送端析构=传输析构）亦视为断连。
+        let mut disconnect_rx = self.disconnect_rx.clone();
+
+        tokio::select! {
+            // biased：ack 与断连同时就绪时优先取真实响应（避免已到达的结果被误判为断连）。
+            biased;
+            recv = rx => match recv {
+                // 从响应中提取 JSON 数据（拆 socket.io ack 外层 args 数组，见 extract_ack_value）。
+                Ok(Payload::Text(values, _)) => extract_ack_value(values),
+                #[allow(deprecated)]
+                Ok(Payload::String(s, _)) => {
+                    // 尝试解析字符串为 JSON（deprecated 路径；ack 实际走 Payload::Text）。同样拆一层
+                    // args 数组（对对象是 no-op，安全）。
+                    serde_json::from_str(&s)
+                        .map(flatten_ack_arg)
+                        .map_err(SmcpAgentError::from)
                 }
-            }
-            Err(_) => {
-                error!("Timeout while calling event: {}", event);
-                Err(SmcpAgentError::Timeout)
+                Ok(Payload::Binary(_, _)) => {
+                    Err(SmcpAgentError::internal("Binary response not supported"))
+                }
+                Err(_) => {
+                    error!("Timeout while calling event: {}", event);
+                    Err(SmcpAgentError::Timeout)
+                }
+            },
+            // 底层 socket 断连 / 连接错误（on_any 收到 Event::Close/Error 置 true）→ 立即判定断连，
+            // 不空等满 ack 超时。`wait_for` 返回 Err（发送端析构 = 传输析构）同样视为断连。
+            _ = disconnect_rx.wait_for(|disconnected| *disconnected) => {
+                warn!("Connection lost during in-flight call: {}", event);
+                Err(SmcpAgentError::connection(
+                    "connection lost (disconnect/connect_error) during call",
+                ))
             }
         }
     }
@@ -342,5 +478,95 @@ impl Default for SocketIoTransport {
         // 注意：这实际上不能使用，因为Client::new()需要参数
         // 这里只是为了满足Default trait的要求
         panic!("SocketIoTransport must be created via connect() method");
+    }
+}
+
+/// 从 socket.io ack 的 `Payload::Text` values 提取单个响应实参 / extract the single ack arg.
+///
+/// **根因修复（#82）**：socket.io ack 数据在网线上恒以 args 数组 `[<value>]` 投递——tf-rust-socketio
+/// `handle_ack` 用 `Payload::from(String)` 把整帧 args 数组 JSON 文本解析成**单元素** `Vec<Value>`，
+/// 其唯一元素即 args 数组本身（`Value::Array`）。故须：① 取该单元素；② 再经 [`flatten_ack_arg`]
+/// 拆一层 args 数组取首个实参（A2C ack 恒单实参）。缺第 ② 步则下游 `ensure_req_id` 在数组上
+/// `.get("req_id")` → `None` → 误报 “Missing req_id”。与集成矩阵 harness 的 `flat()` 同义（该助手
+/// 正是靠此解一层才让矩阵全绿，掩盖了高层 SDK 路径缺同等拆封的本 bug）。
+fn extract_ack_value(values: Vec<Value>) -> Result<Value> {
+    let arg = values
+        .into_iter()
+        .next()
+        .ok_or_else(|| SmcpAgentError::internal("Empty response"))?;
+    Ok(flatten_ack_arg(arg))
+}
+
+/// 拆 socket.io ack 外层 args 数组取首个实参 / unwrap the outer socket.io ack args array。
+///
+/// ack 恒以 `[<value>]` 投递，取首个实参即响应本体；非数组 / 空数组**原样返回**（防御：理论不应
+/// 出现，空数组交下游报缺字段而非在此 panic）。语义等同矩阵 harness 的 `flat()`。
+fn flatten_ack_arg(value: Value) -> Value {
+    match value {
+        Value::Array(mut args) if !args.is_empty() => args.swap_remove(0),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::{classify_tool_call_outcome, ensure_req_id, ToolCallOutcome};
+    use serde_json::json;
+
+    // #82：socket.io ack 数据在网线上恒以 args 数组 `[<value>]` 投递——tf-rust-socketio `handle_ack`
+    // 用 `Payload::from(String)` 把整帧 args 数组 JSON 文本解析成**单元素** `Vec<Value>`，其唯一元素
+    // 即 args 数组本身（`Value::Array`）。`extract_ack_value` MUST 拆该外层数组返回内层响应对象，
+    // 否则下游 `ensure_req_id` 在数组上 `.get("req_id")` → `None` → 误报 “Missing req_id”。
+    // `transport.call` 的 I/O 边界（SocketIoTransport 为具体 struct）不可单测，提取逻辑经此纯函数覆盖。
+
+    #[test]
+    fn extract_ack_unwraps_socketio_args_array() {
+        // 原帧形状：Payload::Text 的单元素就是 args 数组 `[{...}]`（见上方注释）。
+        let values = vec![json!([{ "req_id": "R1", "tools": [{ "name": "echo" }] }])];
+        let v = extract_ack_value(values).expect("should extract inner response object");
+        // 拆封后是对象，req_id 回显校验通过（修复前在数组上 .get("req_id")=None → Missing req_id）。
+        assert!(v.is_object(), "expected inner object, got {v}");
+        assert!(
+            ensure_req_id(&v, "R1").is_ok(),
+            "echoed req_id must validate after unwrap: {v}"
+        );
+        assert_eq!(v["tools"][0]["name"], "echo");
+    }
+
+    #[test]
+    fn extract_ack_tool_call_result_not_double_wrapped() {
+        // tool_call 同源：不校验 req_id 故不直接报错，但畸形多套一层数组会让结果级 meta 分类与
+        // binary sideband（按 content 数组遍历句柄）全部落空。拆封后须为对象、content 可达。
+        let values =
+            vec![json!([{ "content": [{ "type": "text", "text": "ok" }], "isError": false }])];
+        let v = extract_ack_value(values).expect("should extract inner response object");
+        assert!(v.is_object(), "expected inner object, got {v}");
+        assert_eq!(classify_tool_call_outcome(&v), ToolCallOutcome::Completed);
+        assert!(
+            v.get("content").and_then(Value::as_array).is_some(),
+            "content must be reachable as array (binary sideband 依赖): {v}"
+        );
+    }
+
+    #[test]
+    fn extract_ack_empty_values_is_error() {
+        // 空 values（无 ack 实参）→ internal “Empty response”。
+        let err = extract_ack_value(vec![]).unwrap_err();
+        assert!(matches!(err, SmcpAgentError::Internal(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn extract_ack_non_array_arg_passthrough() {
+        // 防御：理论上 ack 实参恒为数组；万一已是对象（非标准帧）则原样返回，不过度拆封。
+        let v = extract_ack_value(vec![json!({ "req_id": "R2" })]).expect("ok");
+        assert_eq!(v, json!({ "req_id": "R2" }));
+    }
+
+    #[test]
+    fn extract_ack_empty_args_array_passthrough() {
+        // 空 args 数组 `[]` 原样返回（交下游报缺字段，不 panic、不静默成功）。
+        let v = extract_ack_value(vec![json!([])]).expect("ok");
+        assert_eq!(v, json!([]));
     }
 }

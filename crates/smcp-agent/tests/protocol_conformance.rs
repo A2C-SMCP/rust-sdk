@@ -28,6 +28,7 @@ async fn test_tool_call_ret_python_compatibility() {
         })]),
         is_error: Some(false),
         req_id: Some(ReqId::from_string("req-123".to_string())),
+        meta: None,
     };
 
     let json = serde_json::to_string(&success_ret).unwrap();
@@ -60,6 +61,7 @@ async fn test_tool_call_ret_error_python_compatibility() {
         })]),
         is_error: Some(true),
         req_id: Some(ReqId::from_string("req-456".to_string())),
+        meta: None,
     };
 
     let json = serde_json::to_string(&error_ret).unwrap();
@@ -108,6 +110,10 @@ async fn test_notification_message_json_format() {
             NotificationMessage::UpdateDesktop("computer-001".to_string()),
             "UpdateDesktop notification",
         ),
+        (
+            NotificationMessage::UpdateSkills("computer-001".to_string()),
+            "UpdateSkills notification",
+        ),
     ];
 
     for (notification, _description) in test_cases {
@@ -130,6 +136,9 @@ async fn test_notification_message_json_format() {
                 assert_eq!(data.computer, "computer-001");
             }
             NotificationMessage::UpdateDesktop(computer) => {
+                assert_eq!(computer, "computer-001");
+            }
+            NotificationMessage::UpdateSkills(computer) => {
                 assert_eq!(computer, "computer-001");
             }
         }
@@ -228,6 +237,7 @@ async fn test_protocol_field_names() {
         content: None,
         is_error: Some(true),
         req_id: None,
+        meta: None,
     };
 
     let json = serde_json::to_string(&tool_ret).unwrap();
@@ -257,6 +267,7 @@ async fn test_empty_and_optional_fields() {
         content: None,
         is_error: None,
         req_id: None,
+        meta: None,
     };
 
     let json = serde_json::to_string(&empty_ret).unwrap();
@@ -267,6 +278,7 @@ async fn test_empty_and_optional_fields() {
         content: Some(vec![]),
         is_error: Some(false),
         req_id: None,
+        meta: None,
     };
 
     let json = serde_json::to_string(&partial_ret).unwrap();
@@ -287,6 +299,7 @@ async fn test_python_compatibility_checklist() {
         content: Some(vec![serde_json::json!({"type": "text", "text": "test"})]),
         is_error: Some(false),
         req_id: Some(ReqId::new()),
+        meta: None,
     };
 
     // 2. Role 序列化为小写

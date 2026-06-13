@@ -1,0 +1,1 @@
+{"name":"mp-bundled-mcp","version":"1.0.0","plugins":[{"name":"foo","source":"./plugins/foo"}]}

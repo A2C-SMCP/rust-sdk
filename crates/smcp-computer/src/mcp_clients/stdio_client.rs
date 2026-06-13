@@ -10,13 +10,13 @@
 use super::base_client::BaseMCPClient;
 use super::model::*;
 use super::{ResourceCache, SubscriptionManager};
-use crate::desktop::window_uri::{is_window_uri, WindowURI};
 use async_trait::async_trait;
 use rmcp::model::{
-    CallToolRequestParam, ClientInfo, Implementation, ReadResourceRequestParam,
+    CallToolRequest, CallToolRequestParam, CancelledNotificationParam, ClientInfo, ClientRequest,
+    Implementation, PaginatedRequestParam, ReadResourceRequestParam, ServerResult,
     SubscribeRequestParam, UnsubscribeRequestParam,
 };
-use rmcp::service::{RunningService, ServiceExt};
+use rmcp::service::{PeerRequestOptions, RequestHandle, RunningService, ServiceExt};
 use rmcp::transport::TokioChildProcess;
 use rmcp::RoleClient;
 use std::process::Stdio;
@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// STDIO 客户端连接超时时间（秒）
@@ -303,6 +304,77 @@ impl MCPClientProtocol for StdioMCPClient {
         Ok(result)
     }
 
+    /// 可取消 tool_call（INT-02 #70「最后一公里」的 **full-feasible** rmcp 路径）。
+    ///
+    /// rmcp 0.11 经 [`RequestHandle`] 暴露了客户端 `request_id`（Python 官方 SDK 不暴露——
+    /// modelcontextprotocol/python-sdk#1410/#1419，故 Python 侧只能本地中断不补发；Rust 在此**领先**）。
+    /// 因此用低层 [`Peer::send_request_with_option`](rmcp::service::Peer::send_request_with_option) 下发
+    /// `tools/call` 以捕获 `request_id`，再把「等待响应（`rx`）」与「取消信号」`select!` 竞速：
+    /// - 响应先到 → [`CancellableCallOutcome::Completed`]；
+    /// - 取消先到 → 经捕获的 `request_id` best-effort 补发 MCP `notifications/cancelled`（time-box 2s，
+    ///   防 teardown 卡住），返回 [`CancellableCallOutcome::Cancelled`]。MCP 取消为**协作式**：远端**可忽略**该
+    ///   通知跑完，不作硬保证（协议 SHOULD）。`rx` 与 `peer` 由 `RequestHandle` 拆解后各自独立持有，
+    ///   使两分支互不消费 `self`。
+    async fn call_tool_cancellable(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<CancellableCallOutcome, MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+
+        let guard = self.get_service().await?;
+
+        // 低层下发以捕获 rmcp 分配的 request_id（高层 service.call_tool 不暴露 id）。
+        let request = ClientRequest::CallToolRequest(CallToolRequest {
+            method: Default::default(),
+            params: CallToolRequestParam {
+                name: tool_name.to_string().into(),
+                arguments: params.as_object().cloned(),
+            },
+            extensions: Default::default(),
+        });
+        // 内联 service 借用：`send_request_with_option` 返回后即结束对 guard 的借用。
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+        // handle 已 owned（id/rx/peer 均独立于 service）→ 立即释放 RunningService 互斥锁，放开同一 stdio
+        // server 上的并发在途调用/取消（可取消调用可长/无界，绝不应在 select! 全程持锁）。RunningService
+        // 由 self.running_service 的 Arc<Mutex> 保活，drop guard 仅释放锁、不析构 service，peer 仍可用。
+        drop(guard);
+        let request_id = handle.id.clone();
+        // 拆解：rx（等待响应）与 peer（取消补发）各自独立，避免 await_response/cancel 互相消费 handle。
+        let RequestHandle { rx, peer, .. } = handle;
+
+        tokio::select! {
+            biased;
+            resp = rx => match resp {
+                Ok(Ok(ServerResult::CallToolResult(r))) => Ok(CancellableCallOutcome::Completed(r)),
+                Ok(Ok(_)) => Err(MCPClientError::ProtocolError(
+                    "Unexpected response variant for tools/call".to_string(),
+                )),
+                Ok(Err(e)) => Err(MCPClientError::ProtocolError(format!("Call tool error: {}", e))),
+                Err(_) => Err(MCPClientError::ConnectionError("MCP transport closed".to_string())),
+            },
+            _ = cancel.cancelled() => {
+                // best-effort 协作式取消：补发 notifications/cancelled（远端可忽略）；time-box 防 teardown 卡死。
+                let notify = peer.notify_cancelled(CancelledNotificationParam {
+                    request_id,
+                    reason: Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
+                });
+                if tokio::time::timeout(Duration::from_secs(2), notify).await.is_err() {
+                    warn!("emit MCP notifications/cancelled timed out (best-effort, ignored)");
+                }
+                Ok(CancellableCallOutcome::Cancelled)
+            }
+        }
+    }
+
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
@@ -316,26 +388,45 @@ impl MCPClientProtocol for StdioMCPClient {
             .await
             .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
 
-        // 过滤 window:// 资源并按 priority 排序
-        let mut filtered_resources: Vec<(Resource, i32)> = Vec::new();
+        // 过滤 window:// 资源并按 priority 降序排序（v0.2 元数据下沉，逻辑共享）
+        // Filter window:// resources and sort by priority desc (shared v0.2 metadata sink).
+        Ok(crate::desktop::metadata::filter_and_sort_window_resources(
+            all_resources,
+        ))
+    }
 
-        for resource in all_resources {
-            if !is_window_uri(&resource.uri) {
-                continue;
-            }
-
-            let priority = if let Ok(uri) = WindowURI::new(&resource.uri) {
-                uri.priority().unwrap_or(0)
-            } else {
-                0
-            };
-
-            filtered_resources.push((resource, priority));
+    async fn list_resources_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        filtered_resources.sort_by_key(|b| std::cmp::Reverse(b.1));
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
 
-        Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
+        // 能力校验：未声明 `resources` → CapabilityNotSupported（上层映射 4015）。
+        // Capability gate: no `resources` → CapabilityNotSupported (mapped to 4015 upstream).
+        let supports_resources = service
+            .peer_info()
+            .map(|info| info.capabilities.resources.is_some())
+            .unwrap_or(false);
+        if !supports_resources {
+            return Err(MCPClientError::CapabilityNotSupported(
+                "resources".to_string(),
+            ));
+        }
+
+        // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
+        // Single-page passthrough: cursor in/out, no aggregation/filter, no resourceTemplates.
+        let param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
+        let result = service
+            .list_resources(param)
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
+
+        Ok((result.resources, result.next_cursor))
     }
 
     async fn get_window_detail(

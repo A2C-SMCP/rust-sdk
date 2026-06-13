@@ -10,7 +10,6 @@
 use super::base_client::BaseMCPClient;
 use super::model::*;
 use super::{ResourceCache, SubscriptionManager};
-use crate::desktop::window_uri::{is_window_uri, WindowURI};
 use async_trait::async_trait;
 use es::Client as EsClient;
 use eventsource_client as es;
@@ -34,6 +33,10 @@ pub struct SseMCPClient {
     response_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<serde_json::Value>>>>,
     /// 会话ID / Session ID
     session_id: Arc<Mutex<Option<String>>>,
+    /// initialize 时缓存的 server `resources` 能力声明（INT-04 #78）。`None` = 未初始化/未知；
+    /// 供 `list_resources_page` 的 4015 预检，使 sse 的能力语义与 stdio 一致。
+    /// Cached `resources` capability from initialize; drives the 4015 pre-check in `list_resources_page`.
+    capabilities_resources: Arc<Mutex<Option<bool>>>,
     /// SSE 服务器告知的 POST 端点 URL
     endpoint_url: Arc<Mutex<Option<String>>>,
     /// 订阅管理器 / Subscription manager
@@ -79,6 +82,7 @@ impl SseMCPClient {
             request_tx: Arc::new(Mutex::new(None)),
             response_rx: Arc::new(Mutex::new(None)),
             session_id: Arc::new(Mutex::new(None)),
+            capabilities_resources: Arc::new(Mutex::new(None)),
             endpoint_url: Arc::new(Mutex::new(None)),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
@@ -381,11 +385,19 @@ impl SseMCPClient {
             )));
         }
 
-        if let Some(result) = response.get("result") {
-            if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
-                *self.session_id.lock().await = Some(session_id.to_string());
-            }
+        // 无 `result` 即无合法 InitializeResult → 视为初始化失败（与 stdio rmcp 握手"无 InitializeResult
+        // 即连接失败"对齐），消除"已连接但能力未捕获 → 误判 4015"的窄路径（#78 fix-review）。
+        let Some(result) = response.get("result") else {
+            return Err(MCPClientError::ProtocolError(
+                "Initialize response missing 'result' (no valid InitializeResult)".to_string(),
+            ));
+        };
+        if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
+            *self.session_id.lock().await = Some(session_id.to_string());
         }
+        // 缓存 server 的 `resources` 能力声明，供 list_resources_page 的 4015 预检（INT-04 #78）。
+        *self.capabilities_resources.lock().await =
+            Some(super::utils::server_declares_resources(result));
 
         // 发送initialized通知 / Send initialized notification
         self.send_request("notifications/initialized", Some(serde_json::json!({})))
@@ -393,6 +405,12 @@ impl SseMCPClient {
 
         info!("SSE session initialized successfully");
         Ok(())
+    }
+
+    /// server 是否声明 `resources` 能力（initialize 时缓存）。未知/未初始化 → `false`（默认拒绝，对齐
+    /// stdio `peer_info` 预检）。Whether the server declared `resources`; unknown → false (default-deny).
+    async fn supports_resources(&self) -> bool {
+        self.capabilities_resources.lock().await.unwrap_or(false)
     }
 
     // ========== 订阅管理 API / Subscription Management API ==========
@@ -638,26 +656,60 @@ impl MCPClientProtocol for SseMCPClient {
             }
         }
 
-        // 过滤 window:// 资源并按 priority 排序
-        let mut filtered_resources: Vec<(Resource, i32)> = Vec::new();
+        // 过滤 window:// 资源并按 priority 降序排序（v0.2 元数据下沉，逻辑共享）
+        // Filter window:// resources and sort by priority desc (shared v0.2 metadata sink).
+        Ok(crate::desktop::metadata::filter_and_sort_window_resources(
+            all_resources,
+        ))
+    }
 
-        for resource in all_resources {
-            if !is_window_uri(&resource.uri) {
-                continue;
-            }
-
-            let priority = if let Ok(uri) = WindowURI::new(&resource.uri) {
-                uri.priority().unwrap_or(0)
-            } else {
-                0
-            };
-
-            filtered_resources.push((resource, priority));
+    async fn list_resources_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        filtered_resources.sort_by_key(|b| std::cmp::Reverse(b.1));
+        // 4015 能力预检：server 未声明 `resources` → CapabilityNotSupported（上层映射 4015），与 stdio 一致。
+        // INT-04 #78：initialize 时缓存 `capabilities.resources`，三传输统一 4015 语义，不再随传输退化为
+        // ProtocolError。Capability gate mirroring stdio: undeclared `resources` ⇒ 4015 (not ProtocolError).
+        if !self.supports_resources().await {
+            return Err(MCPClientError::CapabilityNotSupported(
+                "resources".to_string(),
+            ));
+        }
 
-        Ok(filtered_resources.into_iter().map(|(r, _)| r).collect())
+        // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
+        // Single-page passthrough (cursor in/out, no aggregation/filter/resourceTemplates).
+        let params = Some(match cursor.as_ref() {
+            Some(c) => serde_json::json!({ "cursor": c }),
+            None => serde_json::json!({}),
+        });
+        let response = self.send_request("resources/list", params).await?;
+        if let Some(error) = response.get("error") {
+            return Err(MCPClientError::ProtocolError(format!(
+                "List resources error: {}",
+                error
+            )));
+        }
+
+        let mut resources = Vec::new();
+        let mut next_cursor = None;
+        if let Some(result) = response.get("result") {
+            if let Some(arr) = result.get("resources").and_then(|v| v.as_array()) {
+                for resource in arr {
+                    if let Ok(parsed) = serde_json::from_value::<Resource>(resource.clone()) {
+                        resources.push(parsed);
+                    }
+                }
+            }
+            next_cursor = result
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        Ok((resources, next_cursor))
     }
 
     async fn get_window_detail(
@@ -970,6 +1022,44 @@ mod tests {
             result.unwrap_err(),
             MCPClientError::ConnectionError(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_page_4015_when_capability_absent() {
+        // INT-04 #78：连接后若 server 未声明 `resources` 能力 → 在发请求前返回 CapabilityNotSupported
+        // （上层映射 4015），与 stdio 一致，不再退化为 ProtocolError。门控先于网络发送。
+        let params = SseServerParameters {
+            url: "http://localhost:8081".to_string(),
+            headers: HashMap::new(),
+        };
+        let client = SseMCPClient::new(params);
+        client.base.update_state(ClientState::Connected).await;
+        *client.capabilities_resources.lock().await = Some(false);
+
+        let err = client.list_resources_page(None).await.unwrap_err();
+        assert!(
+            matches!(err, MCPClientError::CapabilityNotSupported(ref c) if c == "resources"),
+            "expected CapabilityNotSupported(resources), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_resources_page_passes_gate_when_capability_present() {
+        // 声明了 `resources` → 预检通过；后续因无真实 SSE 通道而失败于 ConnectionError（非 4015），
+        // 证明能力门控不误伤支持 resources 的 server。
+        let params = SseServerParameters {
+            url: "http://localhost:8081".to_string(),
+            headers: HashMap::new(),
+        };
+        let client = SseMCPClient::new(params);
+        client.base.update_state(ClientState::Connected).await;
+        *client.capabilities_resources.lock().await = Some(true);
+
+        let err = client.list_resources_page(None).await.unwrap_err();
+        assert!(
+            matches!(err, MCPClientError::ConnectionError(_)),
+            "gate should pass for declared resources; got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -15,9 +15,12 @@ sync = ["async"]
 
 [dependencies]
 smcp.workspace = true
+smcp-client-transport.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# AGT-04 #41：tool_call 二进制旁路回填——drain 回字节后重编码为 content item 的 base64 内联载体。
+base64.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -28,3 +31,5 @@ tf-rust-socketio.workspace = true
 
 [dev-dependencies]
 smcp-server-core.workspace = true
+smcp-server-hyper.workspace = true
+tokio = { workspace = true }

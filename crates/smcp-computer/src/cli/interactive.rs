@@ -8,17 +8,39 @@
 * 描述: 交互式REPL循环 / Interactive REPL loop
 */
 
-use crate::cli::commands::{CommandError, CommandHandler};
+use crate::cli::commands::{msg_warn, CommandError, CommandHandler};
+use crate::cli::completer::{A2CCompleter, SkillNameSnapshot};
+use crate::cli::help::render_help;
+use crate::cli::repl;
+use crate::computer::SilentSession;
 use crate::errors::ComputerError;
 use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
 use rustyline::Editor;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 const PROMPT: &str = "a2c> ";
 
-pub async fn run_interactive_loop(mut handler: CommandHandler) -> Result<(), CommandError> {
-    let mut rl = Editor::<(), rustyline::history::DefaultHistory>::new()
+async fn refresh_skill_names(comp: &crate::computer::Computer<SilentSession>) -> Vec<String> {
+    comp.get_skills()
+        .await
+        .into_iter()
+        .map(|skill_ref| skill_ref.name)
+        .collect()
+}
+
+pub async fn run_interactive_loop(
+    mut handler: CommandHandler,
+    flag_path: Option<PathBuf>,
+) -> Result<(), CommandError> {
+    let home = handler.computer.skill_home();
+    let skill_names: SkillNameSnapshot =
+        Arc::new(Mutex::new(refresh_skill_names(&handler.computer).await));
+    let mut rl = Editor::<A2CCompleter, DefaultHistory>::new()
         .map_err(|e| CommandError::ComputerError(ComputerError::TransportError(e.to_string())))?;
+    rl.set_helper(Some(A2CCompleter::new(home, Arc::clone(&skill_names))));
 
     println!("进入交互模式，输入 help 查看命令 / Enter interactive mode, type 'help' for commands");
 
@@ -32,8 +54,14 @@ pub async fn run_interactive_loop(mut handler: CommandHandler) -> Result<(), Com
 
                 rl.add_history_entry(line).ok();
 
-                if let Err(e) = handle_command(&mut handler, line).await {
+                if let Err(e) = handle_command(&mut handler, line, flag_path.as_deref()).await {
                     eprintln!("命令执行失败: {}", e);
+                }
+
+                // 刷新 skill 名快照供 Tab 补全（governance 命令可能改变可见 SKILL 集）。
+                let names = refresh_skill_names(&handler.computer).await;
+                if let Ok(mut guard) = skill_names.lock() {
+                    *guard = names;
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -55,7 +83,11 @@ pub async fn run_interactive_loop(mut handler: CommandHandler) -> Result<(), Com
     Ok(())
 }
 
-async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), CommandError> {
+async fn handle_command(
+    handler: &mut CommandHandler,
+    line: &str,
+    flag_path: Option<&Path>,
+) -> Result<(), CommandError> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return Ok(());
@@ -64,8 +96,26 @@ async fn handle_command(handler: &mut CommandHandler, line: &str) -> Result<(), 
     let cmd = parts[0].to_lowercase();
 
     match cmd.as_str() {
-        "help" | "?" => {
-            handler.show_help();
+        "help" => {
+            render_help(parts.get(1).copied());
+        }
+        "?" => {
+            render_help(None);
+        }
+        "marketplace" | "plugin" | "settings" | "skill" => {
+            if parts.len() < 2 {
+                msg_warn(&format!(
+                    "usage: {cmd} <subcommand> ...  (try 'help {cmd}')"
+                ));
+                return Ok(());
+            }
+            match cmd.as_str() {
+                "marketplace" => repl::dispatch_marketplace(&handler.computer, &parts).await,
+                "plugin" => repl::dispatch_plugin(&handler.computer, &parts).await,
+                "settings" => repl::dispatch_settings(&handler.computer, &parts, flag_path),
+                "skill" => repl::dispatch_skill(&handler.computer, &parts).await,
+                _ => unreachable!(),
+            }
         }
         "status" => {
             handler.show_status().await?;
