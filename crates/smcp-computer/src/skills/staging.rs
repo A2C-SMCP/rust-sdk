@@ -1738,10 +1738,7 @@ mod tests {
                 "archive_uri".into(),
                 Value::String("https://example.test/skill.tar.gz".into()),
             );
-            meta.insert(
-                "archive_format".into(),
-                Value::String("tar.gz".into()),
-            );
+            meta.insert("archive_format".into(), Value::String("tar.gz".into()));
             Ok(vec![(
                 "tfrobot-tools".to_string(),
                 McpResource {

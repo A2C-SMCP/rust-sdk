@@ -455,7 +455,9 @@ impl MCPClientProtocol for HttpMCPClient {
         // INT-04 #78：initialize 时缓存 `capabilities.resources`，三传输统一 4015 语义，不再随传输退化为
         // ProtocolError。Capability gate mirroring stdio: undeclared `resources` ⇒ 4015 (not ProtocolError).
         if !self.supports_resources().await {
-            return Err(MCPClientError::CapabilityNotSupported("resources".to_string()));
+            return Err(MCPClientError::CapabilityNotSupported(
+                "resources".to_string(),
+            ));
         }
 
         // 单页透传：cursor 进/出，不聚合（区别于 list_windows 的穷举翻页）、不过滤、不返回 resourceTemplates。

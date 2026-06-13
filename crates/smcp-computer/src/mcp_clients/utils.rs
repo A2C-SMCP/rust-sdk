@@ -76,7 +76,9 @@ mod tests {
     #[test]
     fn test_server_declares_resources_non_object_result() {
         assert!(!server_declares_resources(&serde_json::Value::Null));
-        assert!(!server_declares_resources(&serde_json::json!("not-an-object")));
+        assert!(!server_declares_resources(&serde_json::json!(
+            "not-an-object"
+        )));
     }
 
     #[tokio::test]

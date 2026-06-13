@@ -62,7 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or("127.0.0.1:0")
         .parse()?;
 
-    info!("Starting UAT permissive SMCP server on {} (auth: permissive)", addr);
+    info!(
+        "Starting UAT permissive SMCP server on {} (auth: permissive)",
+        addr
+    );
 
     let layer = SmcpServerBuilder::new()
         .with_auth_provider(Arc::new(PermissiveAuth))
