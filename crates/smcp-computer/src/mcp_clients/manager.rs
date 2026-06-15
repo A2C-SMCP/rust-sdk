@@ -400,8 +400,22 @@ impl MCPServerManager {
                             .and_then(|meta| meta.alias)
                             .unwrap_or_else(|| original_tool_name.to_string());
 
-                        // 如果使用别名，更新别名映射 / Update alias mapping if using alias
                         let original_tool_name_str = original_tool_name.to_string();
+
+                        // 禁用判定必须先于 alias_mapping / tool_sources 收集：被禁用工具不暴露、不路由、
+                        // 也不参与跨 server 重名冲突检测（对标 Python python-sdk #106/#107）。forbidden_tools
+                        // 归属单个 ServerConfig，按 display_name 或原始名命中即禁用（用户可能配置 alias 却用
+                        // 原始名禁用，故两者都查）。The forbidden check must precede collection so a disabled
+                        // tool is neither exposed, routed, nor counted in cross-server duplicate detection.
+                        let forbidden_tools = config.forbidden_tools();
+                        if forbidden_tools.contains(&display_name)
+                            || forbidden_tools.contains(&original_tool_name_str)
+                        {
+                            self.disabled_tools.write().await.insert(display_name);
+                            continue;
+                        }
+
+                        // 如果使用别名，更新别名映射 / Update alias mapping if using alias
                         if display_name != original_tool_name_str {
                             let mut alias_map = self.alias_mapping.write().await;
                             alias_map.insert(
@@ -415,15 +429,6 @@ impl MCPServerManager {
                             .entry(display_name.clone())
                             .or_default()
                             .push(server_name.clone());
-
-                        // 检查是否为禁用工具 / Check if disabled tool
-                        let forbidden_tools = config.forbidden_tools();
-                        if forbidden_tools.contains(&display_name)
-                            || forbidden_tools.contains(&original_tool_name_str)
-                        {
-                            let mut disabled = self.disabled_tools.write().await;
-                            disabled.insert(display_name);
-                        }
                     }
                 }
                 Err(e) => {
@@ -431,6 +436,13 @@ impl MCPServerManager {
                 }
             }
         }
+
+        // 工具收集已完成：及早释放 active_clients / servers_config 读锁，使下方 build + 跨 server 对账
+        // 不再持有这两把锁（缩小持锁窗口；对账块仅依赖 tool_mapping / disabled_tools）。
+        // Tool collection done: drop the client/config read locks early so the build + reconciliation
+        // below hold neither (narrower lock window; reconciliation depends only on tool_mapping/disabled_tools).
+        drop(clients);
+        drop(configs);
 
         // 构建最终映射（处理工具名冲突） / Build final mapping (handle tool name conflicts)
         for (tool, sources) in tool_sources {
@@ -446,6 +458,19 @@ impl MCPServerManager {
             }
             let mut mapping = self.tool_mapping.write().await;
             mapping.insert(tool, sources[0].clone());
+        }
+
+        // 跨 server 误伤对账（对标 Python #106/#107）：disabled_tools 按全局 display_name 索引，若某名被
+        // 某 server forbid，但同名工具由其它 server 正常提供（已进入 tool_mapping），以存活方为准——否则
+        // validate_tool_call 会因 disabled 命中而误拒可用工具。单 server 独有工具被 forbid（无其它提供方）
+        // 则仍保留禁用语义。Cross-server reconciliation: a name forbidden on one server but live on another
+        // keeps the live one (equivalent to Python `difference_update(tool_mapping.keys())`).
+        {
+            let mapping = self.tool_mapping.read().await;
+            self.disabled_tools
+                .write()
+                .await
+                .retain(|name| !mapping.contains_key(name));
         }
 
         debug!("Tool mapping refreshed successfully");
@@ -1599,6 +1624,67 @@ pub(crate) mod test_support {
             .await
             .insert(tool.to_string(), server.to_string());
     }
+
+    /// 返回固定工具列表的假 client：仅 `list_tools` 有意义，供 `refresh_tool_mapping` /
+    /// `list_available_tools` 的 forbidden/alias 回归测试构造工具来源（对标 Python python-sdk
+    /// #106/#107）。A fake client returning a fixed tool list; only `list_tools` is meaningful.
+    pub(crate) struct MockToolsClient {
+        pub(crate) tools: Vec<Tool>,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for MockToolsClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 用给定工具集构造 [`MockToolsClient`] 并注入 `active_clients`；配套 `ServerConfig` 由调用方写入
+    /// `servers_config`（`refresh_tool_mapping` 同时读两者）。Inject a `MockToolsClient` into `active_clients`.
+    pub(crate) async fn inject_tools(manager: &MCPServerManager, name: &str, tools: Vec<Tool>) {
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(name.to_string(), StdArc::new(MockToolsClient { tools }));
+    }
 }
 
 #[cfg(test)]
@@ -2377,6 +2463,395 @@ mod tests {
         assert!(
             matches!(err, ComputerError::TimeoutError(_)),
             "超时应回 TimeoutError，实得: {err:?}"
+        );
+    }
+
+    // ── forbidden_tools / alias 暴露面回归（对标 Python python-sdk #106/#107）─────────────────
+    use super::test_support::inject_tools;
+
+    /// 最小 Stdio 工具：仅 name + 空 object inputSchema（参照 `socketio_client::tests::make_tool`）。
+    fn tool_named(name: &str) -> Tool {
+        let input_schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"type": "object"})).unwrap();
+        Tool {
+            name: name.to_string().into(),
+            title: None,
+            description: Some("t".into()),
+            input_schema: StdArc::new(input_schema),
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
+        }
+    }
+
+    /// Stdio ServerConfig 构造器（forbidden_tools / tool_meta 可定制），server_parameters 占位。
+    fn stdio_cfg(
+        name: &str,
+        forbidden: Vec<String>,
+        tool_meta: HashMap<String, ToolMeta>,
+    ) -> MCPServerConfig {
+        MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
+            name: name.to_string(),
+            disabled: false,
+            forbidden_tools: forbidden,
+            tool_meta,
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        })
+    }
+
+    /// 注入 (client, config) 并刷新映射；`refresh_tool_mapping` 同时读 active_clients + servers_config。
+    async fn setup_and_refresh(
+        manager: &MCPServerManager,
+        servers: Vec<(&str, Vec<Tool>, MCPServerConfig)>,
+    ) -> Result<(), ComputerError> {
+        for (name, tools, cfg) in servers {
+            inject_tools(manager, name, tools).await;
+            manager
+                .servers_config
+                .write()
+                .await
+                .insert(name.to_string(), cfg);
+        }
+        manager.refresh_tool_mapping().await
+    }
+
+    fn meta_with_alias(original: &str, alias: &str) -> HashMap<String, ToolMeta> {
+        let mut tm = HashMap::new();
+        tm.insert(
+            original.to_string(),
+            ToolMeta {
+                alias: Some(alias.to_string()),
+                ..ToolMeta::new()
+            },
+        );
+        tm
+    }
+
+    /// alias 必须反映到对外暴露的 Tool.name（display_name 优先），原始名不出现。
+    #[tokio::test]
+    async fn test_available_tools_exposes_alias_as_name() {
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "srv",
+                vec![tool_named("tool5")],
+                stdio_cfg("srv", vec![], meta_with_alias("tool5", "aliased_tool")),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let names: Vec<String> = manager
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.contains(&"aliased_tool".to_string()),
+            "暴露名应为 alias: {names:?}"
+        );
+        assert!(
+            !names.contains(&"tool5".to_string()),
+            "原始名不应出现: {names:?}"
+        );
+    }
+
+    /// 两 server 同名 tool1，forbid 一侧后不再触发重名冲突，存活侧仍可寻址、不被误伤禁用。
+    #[tokio::test]
+    async fn test_forbidden_tool_excluded_from_duplicate_detection() {
+        let manager = MCPServerManager::new();
+        let res = setup_and_refresh(
+            &manager,
+            vec![
+                (
+                    "server1",
+                    vec![tool_named("tool1")],
+                    stdio_cfg("server1", vec!["tool1".to_string()], HashMap::new()),
+                ),
+                (
+                    "server2",
+                    vec![tool_named("tool1")],
+                    stdio_cfg("server2", vec![], HashMap::new()),
+                ),
+            ],
+        )
+        .await;
+
+        assert!(res.is_ok(), "forbid 一侧后不应再冲突报错: {res:?}");
+        assert_eq!(
+            manager.tool_mapping.read().await.get("tool1").cloned(),
+            Some("server2".to_string())
+        );
+        assert!(
+            !manager.disabled_tools.read().await.contains("tool1"),
+            "存活侧不应被另一 server 的 forbid 误伤"
+        );
+        let (srv, orig) = manager
+            .validate_tool_call("tool1", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!((srv.as_str(), orig.as_str()), ("server2", "tool1"));
+        let count = manager
+            .list_available_tools()
+            .await
+            .into_iter()
+            .filter(|t| t.name.as_ref() == "tool1")
+            .count();
+        assert_eq!(count, 1, "暴露面 tool1 应恰一次");
+    }
+
+    /// 对原始名 forbid 时，即便配了 alias，alias 也被抑制（forbid 优先于 alias）。
+    #[tokio::test]
+    async fn test_forbidden_original_name_suppresses_alias() {
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "srv",
+                vec![tool_named("tool5")],
+                stdio_cfg(
+                    "srv",
+                    vec!["tool5".to_string()],
+                    meta_with_alias("tool5", "aliased_tool"),
+                ),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let names: Vec<String> = manager
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            !names.contains(&"aliased_tool".to_string()) && !names.contains(&"tool5".to_string()),
+            "forbid 原始名应同时抑制 alias: {names:?}"
+        );
+        let mapping = manager.tool_mapping.read().await;
+        assert!(!mapping.contains_key("aliased_tool") && !mapping.contains_key("tool5"));
+    }
+
+    /// 单 server 独有工具被 forbid（无其它提供方）仍保留禁用语义：不路由、调用 PermissionError。
+    #[tokio::test]
+    async fn test_forbidden_tool_without_provider_stays_disabled() {
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "server1",
+                vec![tool_named("tool2")],
+                stdio_cfg("server1", vec!["tool2".to_string()], HashMap::new()),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        assert!(manager.disabled_tools.read().await.contains("tool2"));
+        assert!(!manager.tool_mapping.read().await.contains_key("tool2"));
+        let err = manager
+            .validate_tool_call("tool2", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ComputerError::PermissionError(_)),
+            "禁用工具调用应 PermissionError，实得: {err:?}"
+        );
+    }
+
+    /// 禁用工具不出现在 `list_available_tools` 暴露面（不可见且不可调用）；同 server 未禁用工具正常暴露。
+    #[tokio::test]
+    async fn test_forbidden_tool_not_in_available_list() {
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "server1",
+                vec![tool_named("tool2"), tool_named("safe")],
+                stdio_cfg("server1", vec!["tool2".to_string()], HashMap::new()),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let names: Vec<String> = manager
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            !names.contains(&"tool2".to_string()),
+            "禁用工具不应出现在暴露面: {names:?}"
+        );
+        assert!(
+            names.contains(&"safe".to_string()),
+            "未禁用工具应正常暴露: {names:?}"
+        );
+    }
+
+    /// 直接把 alias 名写进 forbidden_tools（命中 `display_name` 分支，区别于按原始名 forbid）：
+    /// 该 aliased 工具被禁用、不暴露、不路由、调用 PermissionError。
+    #[tokio::test]
+    async fn test_forbidden_by_alias_name_disables_aliased_tool() {
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "srv",
+                vec![tool_named("tool5")],
+                stdio_cfg(
+                    "srv",
+                    vec!["aliased_tool".to_string()],
+                    meta_with_alias("tool5", "aliased_tool"),
+                ),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let names: Vec<String> = manager
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            !names.contains(&"aliased_tool".to_string()) && !names.contains(&"tool5".to_string()),
+            "按 alias 名 forbid 应禁用该工具且原始名也不出现: {names:?}"
+        );
+        assert!(manager.disabled_tools.read().await.contains("aliased_tool"));
+        assert!(!manager
+            .tool_mapping
+            .read()
+            .await
+            .contains_key("aliased_tool"));
+        let err = manager
+            .validate_tool_call("aliased_tool", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ComputerError::PermissionError(_)));
+    }
+
+    /// `default_tool_meta` 提供的 alias 同样反映到暴露名（端到端经 refresh），并可被对原始名的 forbid 抑制。
+    #[tokio::test]
+    async fn test_default_tool_meta_alias_flows_through_exposure_and_forbid() {
+        let cfg_default = |forbidden: Vec<String>| {
+            MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
+                name: "srv".to_string(),
+                disabled: false,
+                forbidden_tools: forbidden,
+                tool_meta: HashMap::new(),
+                default_tool_meta: Some(ToolMeta {
+                    alias: Some("def_alias".to_string()),
+                    ..ToolMeta::new()
+                }),
+                vrl: None,
+                server_parameters: StdioServerParameters {
+                    command: "echo".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    cwd: None,
+                },
+            })
+        };
+
+        // (a) default alias 作为暴露名 / default alias surfaces as the exposed name
+        let exposed = MCPServerManager::new();
+        inject_tools(&exposed, "srv", vec![tool_named("t")]).await;
+        exposed
+            .servers_config
+            .write()
+            .await
+            .insert("srv".to_string(), cfg_default(vec![]));
+        exposed.refresh_tool_mapping().await.expect("refresh ok");
+        let names: Vec<String> = exposed
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.contains(&"def_alias".to_string()) && !names.contains(&"t".to_string()),
+            "default alias 应作为暴露名: {names:?}"
+        );
+
+        // (b) 对原始名 forbid 时，default alias 也被抑制 / forbidding the original name suppresses it too
+        let forbidden = MCPServerManager::new();
+        inject_tools(&forbidden, "srv", vec![tool_named("t")]).await;
+        forbidden
+            .servers_config
+            .write()
+            .await
+            .insert("srv".to_string(), cfg_default(vec!["t".to_string()]));
+        forbidden.refresh_tool_mapping().await.expect("refresh ok");
+        let names2: Vec<String> = forbidden
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            !names2.contains(&"def_alias".to_string()) && !names2.contains(&"t".to_string()),
+            "forbid 原始名应抑制 default alias: {names2:?}"
+        );
+    }
+
+    /// 非直觉交互：A 的 alias 与 B 的原始名撞名，且 B 侧对该原始名 forbid → 该名最终路由到 A 的 alias、
+    /// 不被禁用，且寻址解析回 A 的原始名（验证对账以最终 tool_mapping 为准、与遍历顺序无关）。
+    #[tokio::test]
+    async fn test_alias_collides_with_forbidden_original_on_other_server() {
+        let manager = MCPServerManager::new();
+        let res = setup_and_refresh(
+            &manager,
+            vec![
+                // server A：原始名 x，alias 为 shared / original x aliased to shared
+                (
+                    "serverA",
+                    vec![tool_named("x")],
+                    stdio_cfg("serverA", vec![], meta_with_alias("x", "shared")),
+                ),
+                // server B：原始名就叫 shared，且被 B forbid / original named shared, forbidden on B
+                (
+                    "serverB",
+                    vec![tool_named("shared")],
+                    stdio_cfg("serverB", vec!["shared".to_string()], HashMap::new()),
+                ),
+            ],
+        )
+        .await;
+
+        assert!(res.is_ok(), "B forbid 后不应冲突: {res:?}");
+        assert_eq!(
+            manager.tool_mapping.read().await.get("shared").cloned(),
+            Some("serverA".to_string()),
+            "shared 应路由到 A 的 alias"
+        );
+        assert!(
+            !manager.disabled_tools.read().await.contains("shared"),
+            "存活的 alias 不应被 B 的 forbid 误伤"
+        );
+        let (srv, orig) = manager
+            .validate_tool_call("shared", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            (srv.as_str(), orig.as_str()),
+            ("serverA", "x"),
+            "应解析回 A 的原始名 x"
         );
     }
 }
