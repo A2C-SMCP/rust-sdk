@@ -22,6 +22,8 @@
 //! 1. 版本握手三态  → [`handshake_tristate_http`] + [`handshake_compatible_connects`]
 //! 2. WS-only 拒绝   → [`ws_only_rejected_without_version`]
 //! 3. get_resources → [`get_resources_transparent_passthrough`] + [`get_resources_unknown_server_4014`]
+//! 3b. get_desktop（窗口聚合视图：仅 `window://` + `window` 精确过滤 + `desktop_size` 截断）
+//!     → [`get_desktop_window_filter_and_size`]（WIN-01/02 端到端，对照 get_resources 透传）
 //! 4. SKILL 发现/读取 → [`skills_discovery_and_read`] + [`skill_traversal_rejected_4017`]
 //! 5. blob drain    → [`tool_call_binary_blob_roundtrip`]（分块 offset/eof/sha256 重组）
 //! 6. tool_call 二进制 → [`tool_call_binary_blob_roundtrip`]（`_meta.a2c_blob_handle` 旁路）
@@ -40,8 +42,8 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use smcp::{
-    events, is_protocol_error_payload, AgentCallData, GetBlobReq, GetBlobRet, GetResourcesReq,
-    GetSkillReq, GetSkillsReq, ReqId, Role, ToolCallReq, PROTOCOL_VERSION,
+    events, is_protocol_error_payload, AgentCallData, GetBlobReq, GetBlobRet, GetDesktopReq,
+    GetResourcesReq, GetSkillReq, GetSkillsReq, ReqId, Role, ToolCallReq, PROTOCOL_VERSION,
 };
 
 use harness::{
@@ -226,6 +228,146 @@ async fn get_resources_unknown_server_4014() {
         "未知 server 应回 flat ErrorPayload: {body}"
     );
     assert_eq!(body["code"], 4014, "未知 MCP server 应 4014, got: {body}");
+
+    computer.shutdown().await.unwrap();
+    agent.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+// ─────────────────── 3b：get_desktop 窗口聚合视图 / window-only desktop view ───────────────────
+
+/// 场景 3b（WIN-01/02 端到端）：`client:get_desktop` 的**窗口聚合视图**——区别于 get_resources 的透明
+/// 转发，desktop **仅**聚合 `window://` 资源（过滤 `file://` 等非窗口），并验证两个可选参数：
+/// - `window`：**精确匹配**某个 window URI，仅返回该窗口；不存在则返回空（非错误）。
+/// - `desktop_size`：全局截断返回条数。
+///
+/// 复用 v022 MCP 的 3 个资源：2 个 `window://`（status / logs）+ 1 个 `file://`（readme）。每条 desktop
+/// 渲染为 `"<uri>\n\n<body>"`（见 `smcp_computer::desktop::organize::render_desktop_item`）。
+#[tokio::test]
+#[ignore = "e2e: REL-01 v0.2.2 matrix; run via cargo test-e2e"]
+async fn get_desktop_window_filter_and_size() {
+    let td = TempDir::new().unwrap();
+    let server = RelayServer::start().await;
+    let computer = spawn_computer(&server.url(), OFFICE, COMPUTER, &td, None).await;
+    let agent = agent_client(&server.url()).await;
+    join(&agent, Role::Agent, OFFICE, AGENT).await;
+
+    // GetDesktopRet.desktops 取为 Vec<String>（emit_call 已 flat 解包外层 args 数组）。
+    let desktops = |body: &Value| -> Vec<String> {
+        body["desktops"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // (a) 无 window 过滤 → 仅 2 个 window://（status + logs）；file:// readme 被排除（desktop ≠ get_resources）。
+    let req = GetDesktopReq {
+        base: AgentCallData {
+            agent: AGENT.into(),
+            req_id: ReqId("desk-all".into()),
+        },
+        computer: COMPUTER.into(),
+        desktop_size: None,
+        window: None,
+    };
+    let body = emit_call(&agent, events::CLIENT_GET_DESKTOP, json!(req)).await;
+    assert!(body.get("code").is_none(), "get_desktop 不应回错误: {body}");
+    let all = desktops(&body);
+    assert_eq!(
+        all.len(),
+        2,
+        "应聚合 2 个 window://（status+logs）, got: {all:?}"
+    );
+    assert!(
+        all.iter().any(|d| d.contains("System status: OK")),
+        "应含 status 窗口正文: {all:?}"
+    );
+    assert!(
+        all.iter().any(|d| d.contains("Log entry 1")),
+        "应含 logs 窗口正文: {all:?}"
+    );
+    assert!(
+        all.iter()
+            .all(|d| !d.contains("This is the v022 readme content")),
+        "desktop 仅聚合 window://，应排除 file:// readme: {all:?}"
+    );
+    assert!(
+        all.iter().all(|d| !d.contains("file://")),
+        "desktop 渲染不应含 file:// 资源: {all:?}"
+    );
+
+    // (b) 指定 window 精确匹配 → 仅返回该窗口（status），不混入 logs；回显被选 window URI。
+    let req = GetDesktopReq {
+        base: AgentCallData {
+            agent: AGENT.into(),
+            req_id: ReqId("desk-one".into()),
+        },
+        computer: COMPUTER.into(),
+        desktop_size: None,
+        window: Some("window://v022.mcp.test/status?priority=10".into()),
+    };
+    let body = emit_call(&agent, events::CLIENT_GET_DESKTOP, json!(req)).await;
+    assert!(
+        body.get("code").is_none(),
+        "带 window 的 get_desktop 不应回错误: {body}"
+    );
+    let one = desktops(&body);
+    assert_eq!(one.len(), 1, "指定 window 应仅返回 1 个窗口, got: {one:?}");
+    assert!(
+        one[0].contains("System status: OK"),
+        "应为 status 窗口正文: {one:?}"
+    );
+    assert!(
+        one[0].contains("window://v022.mcp.test/status"),
+        "应回显被选 window URI: {one:?}"
+    );
+    assert!(!one[0].contains("Log entry"), "不应混入 logs 窗口: {one:?}");
+
+    // (c) 指定不存在的 window URI（精确匹配，非前缀）→ 返回空 desktops（非错误）。
+    let req = GetDesktopReq {
+        base: AgentCallData {
+            agent: AGENT.into(),
+            req_id: ReqId("desk-none".into()),
+        },
+        computer: COMPUTER.into(),
+        desktop_size: None,
+        window: Some("window://v022.mcp.test/does-not-exist".into()),
+    };
+    let body = emit_call(&agent, events::CLIENT_GET_DESKTOP, json!(req)).await;
+    assert!(
+        body.get("code").is_none(),
+        "不存在 window 不应回错误（应空列表）: {body}"
+    );
+    assert!(
+        desktops(&body).is_empty(),
+        "不存在的 window 应返回空 desktops: {body}"
+    );
+
+    // (d) desktop_size 全局截断 → 2 个窗口截断为 1。
+    let req = GetDesktopReq {
+        base: AgentCallData {
+            agent: AGENT.into(),
+            req_id: ReqId("desk-size".into()),
+        },
+        computer: COMPUTER.into(),
+        desktop_size: Some(1),
+        window: None,
+    };
+    let body = emit_call(&agent, events::CLIENT_GET_DESKTOP, json!(req)).await;
+    assert!(
+        body.get("code").is_none(),
+        "带 size 的 get_desktop 不应回错误: {body}"
+    );
+    let capped = desktops(&body);
+    assert_eq!(
+        capped.len(),
+        1,
+        "desktop_size=1 应截断为 1 条, got: {capped:?}"
+    );
 
     computer.shutdown().await.unwrap();
     agent.disconnect().await.unwrap();
