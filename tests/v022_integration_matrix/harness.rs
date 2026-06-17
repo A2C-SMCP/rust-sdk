@@ -31,14 +31,14 @@ use tower::Layer;
 
 use smcp::Role;
 use smcp_computer::blob::thresholds::BlobThresholds;
-use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, StdioServerConfig, StdioServerParameters,
 };
 use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 use smcp_server_hyper::HyperServerBuilder;
 
-/// 测试共享密钥（对齐 DefaultAuthenticationProvider 的 access_token）。
+/// 测试共享密钥（#86：放入 Socket.IO auth dict `token` 字段，对齐 DefaultAuthenticationProvider 默认）。
 pub const SECRET: &str = "test_secret";
 /// 裸 `tf-rust-socketio` 客户端连接的 namespace。**不带前导 `/`**：tf-rust-socketio 会归一为
 /// `/smcp`（= 服务端 `io.ns(SMCP_NAMESPACE)`）；显式传 `/smcp` 反而连不上默认命名空间（实测 ack 超时）。
@@ -231,7 +231,14 @@ pub async fn spawn_computer(
         .await
         .expect("start MCP servers");
     computer
-        .connect_socketio(server_url, NS, &Some(SECRET.to_string()), &None)
+        .connect_socketio(
+            server_url,
+            ConnectOptions {
+                auth_payload: Some(serde_json::json!({"token": SECRET})),
+                namespace: NS.to_string(),
+                ..Default::default()
+            },
+        )
         .await
         .expect("computer connect_socketio");
     computer
@@ -245,12 +252,12 @@ pub async fn spawn_computer(
 
 // ──────────────────────────── 裸 Agent 客户端 / raw Agent client ────────────────────────────
 
-/// 连接一个裸 Agent 客户端（websocket，带 access_token；无 a2c_version——裸 server 不 gate）。
+/// 连接一个裸 Agent 客户端（websocket，鉴权走 auth dict `token` 字段；无 a2c_version——裸 server 不 gate）。
 pub async fn agent_client(server_url: &str) -> Client {
     let client = ClientBuilder::new(server_url.to_string())
         .transport_type(TransportType::Websocket)
         .namespace(NS)
-        .opening_header("access_token", SECRET)
+        .auth(serde_json::json!({"token": SECRET}))
         .connect()
         .await
         .expect("agent connect");

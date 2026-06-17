@@ -12,6 +12,13 @@ fn generate_uuid_segment() -> String {
     format!("{:x}", timestamp)
 }
 
+/// 把连接面鉴权密钥包成 Socket.IO CONNECT `auth` dict（默认字段 `token`，对齐 server 默认 + #86）。
+/// Wrap a connection-auth secret into the Socket.IO CONNECT `auth` dict (default field `token`).
+#[allow(dead_code)]
+pub fn auth_dict(secret: &str) -> serde_json::Value {
+    serde_json::json!({ "token": secret })
+}
+
 /// Default timeout for E2E test operations
 #[allow(dead_code)]
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);

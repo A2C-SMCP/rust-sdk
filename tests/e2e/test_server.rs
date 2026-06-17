@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tower::{Layer, Service};
+use tower::Layer;
 use tracing::info;
 
 use smcp_server_core::SmcpServerBuilder;
@@ -32,11 +32,42 @@ impl TestServer {
 
         info!("Starting test server on {}", addr);
 
-        // Build SMCP layer with default auth for testing
-        // This layer already has all Socket.IO handlers registered
+        // Build SMCP layer with default auth for testing.
+        // This layer already has all Socket.IO handlers registered.
         let smcp_layer = SmcpServerBuilder::new()
             .with_default_auth(Some("test_secret".to_string()), None)
             .build_layer()?;
+
+        // 关键：socket.io layer **只叠一次**后整体 clone 给每条连接——polling（Computer 默认
+        // `TransportType::Any` 起手）需跨多次 HTTP 请求维持 engine.io 会话；若**每请求**新叠 layer
+        // 会断会话连续性（实测 Computer connect → EngineIO Error）。对齐 RelayServer 的已验证形态。
+        // Build the layered socket.io service ONCE and clone it per connection — building a fresh
+        // layer per request breaks engine.io polling session continuity (Computer connect → EngineIO Error).
+        let fallback = tower::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+            // Fallback service for non-socket.io routes.
+            match (req.method(), req.uri().path()) {
+                (&Method::GET, "/") => Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("SMCP Server is running")))
+                        .unwrap(),
+                ),
+                (&Method::GET, "/health") => Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from("{\"status\":\"ok\"}")))
+                        .unwrap(),
+                ),
+                _ => Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Full::new(Bytes::from("Not found")))
+                        .unwrap(),
+                ),
+            }
+        });
+        let service = smcp_layer.layer.layer(fallback);
 
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
@@ -51,52 +82,9 @@ impl TestServer {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, _remote_addr)) => {
-                                let layer = smcp_layer.clone();
                                 let io = TokioIo::new(stream);
-
+                                let svc = hyper_util::service::TowerToHyperService::new(service.clone());
                                 tokio::spawn(async move {
-                                    // Create service that chains socket.io layer with fallback
-                                    let svc = tower::service_fn(|req| {
-                                        let layer = layer.clone();
-                                        async move {
-                                            // Use tower layer chain: socket.io layer -> fallback service
-                                            let mut svc = layer.layer.layer(tower::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
-                                                // Fallback service for non-socket.io routes
-                                                match (req.method(), req.uri().path()) {
-                                                    (&Method::GET, "/") => {
-                                                        Ok::<_, std::convert::Infallible>(
-                                                            hyper::Response::builder()
-                                                                .status(StatusCode::OK)
-                                                                .body(Full::new(Bytes::from("SMCP Server is running")))
-                                                                .unwrap()
-                                                        )
-                                                    }
-                                                    (&Method::GET, "/health") => {
-                                                        Ok::<_, std::convert::Infallible>(
-                                                            hyper::Response::builder()
-                                                                .status(StatusCode::OK)
-                                                                .header("content-type", "application/json")
-                                                                .body(Full::new(Bytes::from("{\"status\":\"ok\"}")))
-                                                                .unwrap()
-                                                        )
-                                                    }
-                                                    _ => {
-                                                        Ok::<_, std::convert::Infallible>(
-                                                            hyper::Response::builder()
-                                                                .status(StatusCode::NOT_FOUND)
-                                                                .body(Full::new(Bytes::from("Not found")))
-                                                                .unwrap()
-                                                        )
-                                                    }
-                                                }
-                                            }));
-                                            svc.call(req).await
-                                        }
-                                    });
-
-                                    // Convert tower service to hyper service
-                                    let svc = hyper_util::service::TowerToHyperService::new(svc);
-
                                     let _ = hyper::server::conn::http1::Builder::new()
                                         .serve_connection(io, svc)
                                         .with_upgrades()

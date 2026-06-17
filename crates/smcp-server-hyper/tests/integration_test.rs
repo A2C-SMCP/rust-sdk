@@ -202,7 +202,7 @@ async fn create_client(addr: SocketAddr, namespace: &str) -> Client {
     ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect client")
@@ -218,7 +218,7 @@ async fn create_client_with_version(addr: SocketAddr, namespace: &str, version: 
     ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect client with a2c_version")
@@ -335,7 +335,7 @@ where
     let client = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on(event, handler)
         .connect()
         .await

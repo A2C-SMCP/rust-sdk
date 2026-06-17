@@ -63,7 +63,10 @@ pub struct Args {
     #[arg(long, default_value = "/smcp")]
     pub namespace: String,
 
-    /// 认证参数，形如 key:value,foo:bar
+    /// 连接面鉴权令牌，注入 Socket.IO CONNECT `auth` dict 的 `token` 字段（`{"token": <auth>}`，
+    /// 对齐 server 默认）。#86 起鉴权走 auth dict（非 HTTP header）。CLI 暂固定 `token` 字段名——
+    /// 若部署方把 server `api_key_name` 覆盖为非 `token`，请改用库 API（`ConnectOptions.auth_payload`）。
+    /// Connection-auth token → Socket.IO CONNECT `auth` dict `token` field.
     #[arg(long)]
     pub auth: Option<String>,
 

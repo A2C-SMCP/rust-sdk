@@ -8,7 +8,7 @@
 * 描述: CLI命令处理器 / CLI command handlers
 */
 
-use crate::computer::{Computer, SilentSession};
+use crate::computer::{Computer, ConnectOptions, SilentSession};
 use crate::errors::ComputerError;
 use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
 use serde_json::{json, Value};
@@ -316,6 +316,9 @@ impl CommandHandler {
     }
 
     /// 连接 SocketIO
+    ///
+    /// #86：`auth` 是连接面鉴权令牌，注入 Socket.IO CONNECT `auth` dict（`{"token": <auth>}`，
+    /// 对齐 server 默认读 `token` 字段）；`headers` 仅作路由（非鉴权）。
     pub async fn connect_socketio(
         &mut self,
         url: &str,
@@ -323,8 +326,18 @@ impl CommandHandler {
         auth: &Option<String>,
         headers: &Option<String>,
     ) -> Result<(), CommandError> {
+        let auth_payload = auth
+            .clone()
+            .map(|token| serde_json::json!({ "token": token }));
         self.computer
-            .connect_socketio(url, namespace, auth, headers)
+            .connect_socketio(
+                url,
+                ConnectOptions {
+                    auth_payload,
+                    headers: headers.clone(),
+                    namespace: namespace.to_string(),
+                },
+            )
             .await?;
         println!("✅ 已连接到 Socket.IO: {} / Connected to Socket.IO", url);
         Ok(())

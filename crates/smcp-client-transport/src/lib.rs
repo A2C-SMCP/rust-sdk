@@ -149,7 +149,13 @@ fn fallback_4900_error() -> smcp::ProtocolVersionError {
 ///
 /// This performs exactly one reconnect over `TransportType::Polling` (no loop).
 /// 仅通过 `TransportType::Polling` 执行一次重连（无循环）。
-async fn fetch_4008_via_polling(
+///
+/// `#[doc(hidden)] pub`：仅为跨 crate 集成测试暴露（验证 #85 的 4900→polling 重连**重放 auth dict**），
+/// 非稳定公共 API，调用方请走 [`connect_and_classify`]。Exposed (doc-hidden) only so cross-crate
+/// integration tests can assert the 4900→polling reconnect replays the `auth` dict (#85); not a
+/// stable public API — callers should use [`connect_and_classify`].
+#[doc(hidden)]
+pub async fn fetch_4008_via_polling(
     handshake_url: &str,
     namespace: &str,
     auth: Option<serde_json::Value>,

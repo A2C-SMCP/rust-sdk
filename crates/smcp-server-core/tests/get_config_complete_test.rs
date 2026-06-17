@@ -134,7 +134,7 @@ async fn test_get_config_complete_flow() {
     let computer_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("client:get_config", move |payload: Payload, _client| {
             let computer_received = computer_received_clone.clone();
             async move {
@@ -190,7 +190,7 @@ async fn test_get_config_complete_flow() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect agent");
@@ -267,7 +267,7 @@ async fn test_get_config_computer_not_found() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect agent");

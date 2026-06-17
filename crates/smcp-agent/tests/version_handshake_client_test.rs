@@ -53,10 +53,14 @@ async fn test_client_maps_incompatible_version_to_typed_error() {
 
     // 客户端走真实 smcp-agent 代码路径：build_handshake_url 注入 0.2.0 + polling-first + 分类。
     let url = format!("http://127.0.0.1:{}/", port);
-    let mut headers = HashMap::new();
-    headers.insert("access_token".to_string(), "test_secret".to_string());
-
-    let result = SocketIoTransport::connect(&url, "/smcp", None, headers).await;
+    // #86：鉴权走 Socket.IO CONNECT auth dict（字段 `token`，对齐 server 默认）；headers 仅路由。
+    let result = SocketIoTransport::connect(
+        &url,
+        "/smcp",
+        Some(serde_json::json!({ "token": "test_secret" })),
+        HashMap::new(),
+    )
+    .await;
 
     match result {
         Err(SmcpAgentError::ProtocolVersionMismatch(e)) => {
@@ -109,10 +113,14 @@ async fn test_client_compatible_version_connects() {
     sleep(Duration::from_millis(150)).await;
 
     let url = format!("http://127.0.0.1:{}/", port);
-    let mut headers = HashMap::new();
-    headers.insert("access_token".to_string(), "test_secret".to_string());
-
-    let result = SocketIoTransport::connect(&url, "/smcp", None, headers).await;
+    // #86：鉴权走 Socket.IO CONNECT auth dict（字段 `token`，对齐 server 默认）；headers 仅路由。
+    let result = SocketIoTransport::connect(
+        &url,
+        "/smcp",
+        Some(serde_json::json!({ "token": "test_secret" })),
+        HashMap::new(),
+    )
+    .await;
     assert!(
         result.is_ok(),
         "compatible 0.2.0 client should connect via polling-first; got: {:?}",

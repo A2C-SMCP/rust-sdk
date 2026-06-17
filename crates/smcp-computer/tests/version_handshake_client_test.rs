@@ -64,16 +64,15 @@ async fn test_computer_maps_incompatible_version_to_typed_error() {
     let url = format!("http://127.0.0.1:{}/", port);
     let manager: Arc<RwLock<Option<MCPServerManager>>> = Arc::new(RwLock::new(None));
     let inputs = Arc::new(RwLock::new(HashMap::new()));
-    let mut headers = HashMap::new();
-    headers.insert("access_token".to_string(), "test_secret".to_string());
 
+    // 鉴权与本测试无关（版本不匹配在 HTTP 握手阶段先失败），auth_payload/headers 传 None 即可。
     let result = SmcpComputerClient::new(
         &url,
         manager,
         "test-computer".to_string(),
-        Some("test_secret".to_string()),
+        None,
         inputs,
-        Some(headers),
+        None,
     )
     .await;
 

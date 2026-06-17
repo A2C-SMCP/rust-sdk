@@ -6,7 +6,7 @@ mod e2e;
 
 use e2e::*;
 use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
-use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use std::time::Duration;
 
 /// Test agent interacting with multiple computers
@@ -55,7 +55,13 @@ async fn test_multiple_computers() {
 
     let auth_secret1 = Some("test_secret".to_string());
     computer1
-        .connect_socketio(server.url(), "/smcp", &auth_secret1, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret1.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect computer1");
     computer1
@@ -68,7 +74,13 @@ async fn test_multiple_computers() {
 
     let auth_secret2 = Some("test_secret".to_string());
     computer2
-        .connect_socketio(server.url(), "/smcp", &auth_secret2, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret2.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect computer2");
     computer2
@@ -120,7 +132,13 @@ async fn test_computer_leave_notification() {
 
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer
@@ -189,7 +207,13 @@ async fn test_list_room_sessions() {
 
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer

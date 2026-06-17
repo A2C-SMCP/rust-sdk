@@ -322,7 +322,7 @@ async fn test_get_config_event_forwarded() {
     let computer_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("client:get_config", move |payload, _client| {
             let get_config_received = get_config_received_clone.clone();
             Box::pin(async move {
@@ -355,7 +355,7 @@ async fn test_get_config_event_forwarded() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Agent connection failed");
@@ -414,7 +414,7 @@ async fn test_get_config_computer_not_found_integration() {
     let agent_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Agent connection failed");
@@ -469,7 +469,7 @@ async fn test_get_config_unauthorized_role_integration() {
     let computer_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Computer connection failed");

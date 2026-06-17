@@ -4,7 +4,7 @@ mod e2e;
 
 use e2e::*;
 use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
-use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use tracing::info;
 
 /// Test basic server startup
@@ -46,7 +46,14 @@ async fn test_minimal_computer_connection() {
     let auth_secret = Some("test_secret".to_string());
     let headers = None;
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &headers)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                headers: headers.clone(),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
 

@@ -22,8 +22,8 @@
 //! 1. 版本握手三态  → [`handshake_tristate_http`] + [`handshake_compatible_connects`]
 //! 2. WS-only 拒绝   → [`ws_only_rejected_without_version`]
 //! 3. get_resources → [`get_resources_transparent_passthrough`] + [`get_resources_unknown_server_4014`]
-//! 3b. get_desktop（窗口聚合视图：仅 `window://` + `window` 精确过滤 + `desktop_size` 截断）
-//!     → [`get_desktop_window_filter_and_size`]（WIN-01/02 端到端，对照 get_resources 透传）
+//!    3b. get_desktop（窗口聚合视图：仅 `window://` + `window` 精确过滤 + `desktop_size` 截断）
+//!    → [`get_desktop_window_filter_and_size`]（WIN-01/02 端到端，对照 get_resources 透传）
 //! 4. SKILL 发现/读取 → [`skills_discovery_and_read`] + [`skill_traversal_rejected_4017`]
 //! 5. blob drain    → [`tool_call_binary_blob_roundtrip`]（分块 offset/eof/sha256 重组）
 //! 6. tool_call 二进制 → [`tool_call_binary_blob_roundtrip`]（`_meta.a2c_blob_handle` 旁路）
@@ -113,7 +113,7 @@ async fn handshake_compatible_connects() {
     let client = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace(NS)
-        .opening_header("access_token", SECRET)
+        .auth(serde_json::json!({"token": SECRET}))
         .connect()
         .await
         .expect("兼容版本应连接成功");
@@ -141,7 +141,7 @@ async fn ws_only_rejected_without_version() {
     let res = ClientBuilder::new(server.http())
         .transport_type(TransportType::Websocket)
         .namespace(NS)
-        .opening_header("access_token", SECRET)
+        .auth(serde_json::json!({"token": SECRET}))
         .connect()
         .await;
     assert!(res.is_err(), "WS-only 且缺 a2c_version 应被握手中间件拒绝");
@@ -624,7 +624,7 @@ async fn tool_call_cancel_fireforget_and_broadcast() {
     let observer = ClientBuilder::new(server.url())
         .transport_type(TransportType::Websocket)
         .namespace(NS)
-        .opening_header("access_token", SECRET)
+        .auth(serde_json::json!({"token": SECRET}))
         .on(events::NOTIFY_TOOL_CALL_CANCEL, move |p: Payload, _c| {
             let seen = seen_cb.clone();
             async move {
@@ -880,8 +880,8 @@ async fn high_level_agent_query_methods_unwrap_ack() {
     let server = RelayServer::start().await;
     let computer = spawn_computer(&server.url(), OFFICE, COMPUTER, &td, None).await;
 
-    // 真实 Agent SDK（非裸客户端）：with_api_key 走默认 `access_token` 鉴权头，对齐 RelayServer 的
-    // DefaultAuthenticationProvider(SECRET)；connect → join_office → 走高层查询方法。
+    // 真实 Agent SDK（非裸客户端）：#86 起 with_api_key 走 Socket.IO auth dict 默认 `token` 字段，
+    // 对齐 RelayServer 的 DefaultAuthenticationProvider(SECRET)；connect → join_office → 走高层查询方法。
     let auth = DefaultAuthProvider::new(AGENT.to_string(), OFFICE.to_string())
         .with_api_key(SECRET.to_string());
     let mut agent = AsyncSmcpAgent::new(auth, SmcpAgentConfig::default());

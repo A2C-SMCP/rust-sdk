@@ -99,23 +99,20 @@ fn test_protocol_serialization_compatibility() {
 }
 
 #[test]
-fn test_auth_provider_headers_format() {
-    // 中文：测试认证提供者头部格式与Python一致
-    // English: Test auth provider headers format matches Python
+fn test_auth_provider_auth_dict_format() {
+    // #86：连接面鉴权走 Socket.IO CONNECT auth dict（默认字段 `token`），不再用 HTTP header。
+    // #86: connection auth lives in the Socket.IO CONNECT auth dict (default field `token`), no header.
 
     let auth = DefaultAuthProvider::new("test-agent".to_string(), "test-office".to_string())
         .with_api_key("test-api-key".to_string());
 
-    let headers = auth.get_connection_headers();
+    // api_key 进 auth dict 的 `token` 字段（对齐 server 默认 + Python 契约 AS-38）。
+    let auth_dict = auth.get_connection_auth().unwrap();
+    assert_eq!(auth_dict, serde_json::json!({ "token": "test-api-key" }));
 
-    // 应该使用 access_token（默认），不是 Authorization 或旧版 x-api-key /
-    // Should use access_token (default), not Authorization or legacy x-api-key
-    assert_eq!(
-        headers.get("access_token"),
-        Some(&"test-api-key".to_string())
-    );
-    assert!(!headers.contains_key("Authorization"));
-    assert!(!headers.contains_key("x-api-key"));
+    // 连接面 headers 默认空（仅路由用）——不含 Authorization / 旧版 x-api-key / access_token。
+    let headers = auth.get_connection_headers();
+    assert!(headers.is_empty());
 }
 
 #[test]

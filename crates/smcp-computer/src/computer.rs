@@ -71,6 +71,37 @@ fn parse_headers_string(headers: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// [`Computer::connect_socketio`] 的连接可选项 / Options for [`Computer::connect_socketio`].
+///
+/// 用具名字段替代位置参。#86 起连接面鉴权**唯一**走 Socket.IO auth dict
+/// （[`auth_payload`](Self::auth_payload)，如 `{"token":"<jwt>"}`，server 默认读 `token` 字段）；
+/// HTTP header 仅用于路由（[`headers`](Self::headers)，如 `X-TF-*`，**非鉴权**）。A2C-SMCP auth-agnostic。
+///
+/// Named-field options. Since #86 connection auth lives **only** in the Socket.IO auth dict
+/// (`auth_payload`); HTTP headers are routing-only.
+#[derive(Debug, Clone)]
+pub struct ConnectOptions {
+    /// Socket.IO CONNECT `auth` 字段负载（连接面鉴权唯一信道）；auth-agnostic，整个 JSON 由调用方决定。
+    /// Socket.IO CONNECT `auth` payload (the sole connection-auth channel; caller owns the JSON).
+    pub auth_payload: Option<serde_json::Value>,
+    /// 路由 HTTP upgrade headers，`"k:v,foo:bar"` 串（沿用 [`parse_headers_string`]；**非鉴权**）。
+    /// Routing HTTP upgrade headers as a `"k:v,foo:bar"` string (NOT for auth).
+    pub headers: Option<String>,
+    /// 应用层 namespace；[`Default`] 为 [`smcp::SMCP_NAMESPACE`] (`/smcp`)。
+    /// Application-layer namespace; defaults to `/smcp`.
+    pub namespace: String,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            auth_payload: None,
+            headers: None,
+            namespace: smcp::SMCP_NAMESPACE.to_string(),
+        }
+    }
+}
+
 /// 将 InputValue 转换为 serde_json::Value / Convert InputValue to serde_json::Value
 fn input_value_to_json(value: InputValue) -> serde_json::Value {
     match value {
@@ -1653,13 +1684,10 @@ impl<S: Session> Computer<S> {
         }
     }
 
-    pub async fn connect_socketio(
-        &self,
-        url: &str,
-        namespace: &str,
-        auth: &Option<String>,
-        headers: &Option<String>,
-    ) -> ComputerResult<()>
+    /// 建立 Socket.IO 连接 / Establish the Socket.IO connection.
+    ///
+    /// #86：连接面鉴权唯一走 `options.auth_payload`（Socket.IO auth dict）；`options.headers` 仅路由。
+    pub async fn connect_socketio(&self, url: &str, options: ConnectOptions) -> ComputerResult<()>
     where
         S: Clone + 'static,
     {
@@ -1682,7 +1710,7 @@ impl<S: Session> Computer<S> {
         };
 
         // 解析 headers 字符串为 HashMap / Parse headers string into HashMap
-        let parsed_headers = headers.as_deref().map(parse_headers_string);
+        let parsed_headers = options.headers.as_deref().map(parse_headers_string);
 
         // INT-03 #72：共享**真实** manager（修复历史 throwaway `MCPServerManager::new()` bug——旧码给
         // socket client 传空 manager，使 on_tool_call / on_get_resources 命中空注册表），并经
@@ -1696,10 +1724,11 @@ impl<S: Session> Computer<S> {
             self.name.clone(),
             self.inputs.clone(),
         )
-        .namespace(namespace)
+        .namespace(options.namespace)
         .computer_ops(ops);
-        if let Some(secret) = auth.clone() {
-            builder = builder.auth_secret(secret);
+        // #86：auth dict 负载接到 Builder（Builder 再透传到 CONNECT auth + 4900 重连）——唯一鉴权信道。
+        if let Some(payload) = options.auth_payload {
+            builder = builder.auth_payload(payload);
         }
         if let Some(h) = parsed_headers {
             builder = builder.headers(h);

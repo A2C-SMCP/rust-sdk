@@ -26,7 +26,7 @@ async fn listener_client(
     ClientBuilder::new(server_url.to_string())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("notify:update_skills", move |payload: Payload, _client| {
             let flag = flag.clone();
             async move {

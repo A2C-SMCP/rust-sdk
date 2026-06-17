@@ -33,7 +33,7 @@ async fn test_tool_call_roundtrip() {
     let computer_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("client:tool_call", move |_payload: Payload, _client| {
             let computer_received = computer_received_clone.clone();
             async move {
@@ -329,7 +329,7 @@ async fn test_tool_call_timeout_handling() {
     let computer_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect computer");

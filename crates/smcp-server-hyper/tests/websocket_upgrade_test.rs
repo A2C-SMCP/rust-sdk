@@ -78,7 +78,7 @@ async fn test_websocket_upgrade() {
     let client = ClientBuilder::new(server_url)
         .transport_type(TransportType::Websocket) // 强制使用WebSocket
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect with WebSocket");
@@ -170,7 +170,7 @@ async fn test_websocket_upgrade_with_invalid_role() {
     let client = ClientBuilder::new(server_url)
         .transport_type(TransportType::Websocket) // 强制使用WebSocket
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect with WebSocket");
@@ -266,7 +266,7 @@ async fn test_websocket_upgrade_with_polling_fallback() {
     let client = ClientBuilder::new(server_url)
         .transport_type(TransportType::Polling) // 使用轮询作为对比
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Failed to connect with Polling");

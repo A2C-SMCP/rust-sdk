@@ -116,7 +116,7 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
     let client1 = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("notify:leave_office", move |payload: Payload, _client| {
             let leave_received = leave_received_clone.clone();
             async move {
@@ -167,7 +167,7 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
     let client2 = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Connection failed");
@@ -232,7 +232,7 @@ async fn test_join_office_broadcasts_only_to_room() {
     let client1 = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("notify:enter_office", move |payload: Payload, _client| {
             let office1_received = office1_received_clone.clone();
             async move {
@@ -256,7 +256,7 @@ async fn test_join_office_broadcasts_only_to_room() {
     let client2 = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("notify:enter_office", move |payload: Payload, _client| {
             let office2_received = office2_received_clone.clone();
             async move {
@@ -280,7 +280,7 @@ async fn test_join_office_broadcasts_only_to_room() {
     let client3 = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .on("notify:enter_office", move |payload: Payload, _client| {
             let global_received = global_received_clone.clone();
             async move {
@@ -337,7 +337,7 @@ async fn test_join_office_broadcasts_only_to_room() {
     let computer_client = ClientBuilder::new(server_url.clone())
         .transport_type(TransportType::Websocket)
         .namespace("smcp")
-        .opening_header("access_token", "test_secret")
+        .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
         .expect("Connection failed");

@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use smcp::*;
 use socketioxide::{
-    extract::{AckSender, Data, SocketRef},
+    extract::{AckSender, Data, SocketRef, TryData},
     SocketIo,
 };
 use std::collections::HashMap;
@@ -186,18 +186,30 @@ impl SmcpHandler {
     /// 注册所有事件处理器
     pub fn register_handlers(io: &SocketIo, state: ServerState) {
         // 注册命名空间和连接处理器
-        io.ns(SMCP_NAMESPACE, move |socket: SocketRef| {
-            let state = state.clone();
-            async move {
-                if let Err(e) = Self::on_connect(socket.clone(), &state).await {
-                    error!("on_connect failed: {}", e);
-                    return;
-                }
+        // #86：用 `TryData<Value>` 提取器拿 Socket.IO CONNECT `auth` dict（连接面鉴权唯一来源）。
+        io.ns(
+            SMCP_NAMESPACE,
+            move |socket: SocketRef, TryData(auth): TryData<Value>| {
+                let state = state.clone();
+                async move {
+                    if let Err(e) = Self::on_connect(socket.clone(), auth.ok(), &state).await {
+                        // #86：鉴权/握手失败 → **主动断开** socket，真正拒绝连接，而非仅 log+return
+                        // 留下「半开、无业务 handler」的 socket（后者会让无效鉴权静默旁路）。
+                        // Auth/handshake failure → disconnect the socket (real rejection), instead of
+                        // leaving a half-open handler-less socket that silently bypasses auth.
+                        warn!(
+                            "on_connect rejected ({}); disconnecting socket {}",
+                            e, socket.id
+                        );
+                        let _ = socket.disconnect();
+                        return;
+                    }
 
-                // 连接时注册所有事件处理器
-                Self::handle_connection(socket, state)
-            }
-        });
+                    // 连接时注册所有事件处理器
+                    Self::handle_connection(socket, state)
+                }
+            },
+        );
     }
 
     /// 处理连接并注册事件处理器
@@ -387,20 +399,26 @@ impl SmcpHandler {
     }
 
     /// 处理连接事件
-    async fn on_connect(socket: SocketRef, state: &ServerState) -> Result<(), HandlerError> {
+    ///
+    /// `auth`：Socket.IO CONNECT `auth` dict（#86 连接面鉴权唯一来源，由 `.ns()` 的
+    /// `TryData<Value>` 提取器解码得到；HTTP header 不再参与鉴权）。
+    async fn on_connect(
+        socket: SocketRef,
+        auth: Option<Value>,
+        state: &ServerState,
+    ) -> Result<(), HandlerError> {
         info!(
             "SocketIO Client {} connecting to {}...",
             socket.id, SMCP_NAMESPACE
         );
 
-        // 获取请求头进行认证
+        // #86：用 CONNECT auth dict 鉴权（headers 仅供需要路由头的自定义 provider 参考）。
         let headers = socket.req_parts().headers.clone();
-        let auth_data = socket.req_parts().extensions.get::<Value>();
 
         // 认证
         state
             .auth_provider
-            .authenticate(&headers, auth_data)
+            .authenticate(&headers, auth.as_ref())
             .await?;
 
         info!(

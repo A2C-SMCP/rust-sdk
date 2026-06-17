@@ -13,9 +13,9 @@ mod common;
 use common::*;
 
 #[tokio::test]
-async fn test_agent_auth_provider_headers() {
-    // 中文：测试认证提供者正确设置请求头
-    // English: Test auth provider correctly sets headers
+async fn test_agent_auth_provider_auth_dict() {
+    // #86：认证提供者把 api_key 放入 Socket.IO CONNECT auth dict（默认字段 `token`），不再用 HTTP header。
+    // #86: the provider puts api_key into the Socket.IO CONNECT auth dict (default field `token`).
 
     let agent_id = "test-agent-headers";
     let office_id = "test-office-headers";
@@ -24,9 +24,10 @@ async fn test_agent_auth_provider_headers() {
     let auth = DefaultAuthProvider::new(agent_id.to_string(), office_id.to_string())
         .with_api_key(api_key.to_string());
 
-    // 验证请求头
-    let headers = auth.get_connection_headers();
-    assert_eq!(headers.get("access_token"), Some(&api_key.to_string()));
+    // 验证连接面鉴权走 auth dict（header 仅路由、默认空）
+    let auth_dict = auth.get_connection_auth().unwrap();
+    assert_eq!(auth_dict, serde_json::json!({ "token": api_key }));
+    assert!(auth.get_connection_headers().is_empty());
 
     // 验证Agent配置
     let config = auth.get_agent_config();
@@ -35,25 +36,21 @@ async fn test_agent_auth_provider_headers() {
 }
 
 #[tokio::test]
-async fn test_agent_auth_provider_custom_headers() {
-    // 中文：测试认证提供者支持自定义请求头
-    // English: Test auth provider supports custom headers
+async fn test_agent_auth_provider_custom_field() {
+    // #86：自定义 auth dict 密钥字段名（with_auth_field_name）必须真实生效。
+    // #86: the custom auth-dict field name (with_auth_field_name) must take effect.
 
     let agent_id = "test-agent-custom";
     let office_id = "test-office-custom";
     let api_key = "custom-api-key";
 
     let auth = DefaultAuthProvider::new(agent_id.to_string(), office_id.to_string())
-        .with_api_key(api_key.to_string());
+        .with_api_key(api_key.to_string())
+        .with_auth_field_name("x-legacy");
 
-    // 注意：DefaultAuthProvider 不支持添加自定义请求头
-    // auth.add_header("X-Custom-Header".to_string(), "custom-value".to_string());
-    // auth.add_header("Authorization".to_string(), "Bearer token123".to_string());
-
-    // 验证基本请求头（仅API密钥）
-    let headers = auth.get_connection_headers();
-    assert_eq!(headers.get("access_token"), Some(&api_key.to_string()));
-    // 注意：自定义请求头功能暂未实现
+    let auth_dict = auth.get_connection_auth().unwrap();
+    assert_eq!(auth_dict, serde_json::json!({ "x-legacy": api_key }));
+    assert!(auth.get_connection_headers().is_empty());
 }
 
 #[tokio::test]

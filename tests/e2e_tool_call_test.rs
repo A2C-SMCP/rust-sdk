@@ -7,7 +7,7 @@ mod e2e;
 use e2e::*;
 use serde_json::json;
 use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
-use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use smcp_computer::mcp_clients::model::MCPServerConfig;
 use std::collections::HashMap;
 
@@ -66,7 +66,13 @@ async fn test_tool_call_with_echo_server() {
 
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer
@@ -148,7 +154,13 @@ async fn test_concurrent_tool_calls() {
 
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer
@@ -206,7 +218,13 @@ async fn test_tool_call_timeout() {
 
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer

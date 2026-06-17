@@ -6,7 +6,7 @@ mod e2e;
 
 use e2e::*;
 use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
-use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use std::time::Duration;
 
 /// Test desktop information retrieval
@@ -29,7 +29,13 @@ async fn test_desktop_info_retrieval() {
     computer.boot_up().await.expect("Failed to boot");
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer
@@ -103,7 +109,13 @@ async fn test_desktop_update_notifications() {
     computer.boot_up().await.expect("Failed to boot");
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer

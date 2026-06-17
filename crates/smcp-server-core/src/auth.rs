@@ -35,13 +35,15 @@ pub trait AuthenticationProvider: Send + Sync + 'static + std::fmt::Debug {
     ) -> Result<(), AuthError>;
 }
 
-/// 默认鉴权 HTTP header 键名 / Default auth HTTP header key name.
+/// 默认鉴权字段名（Socket.IO CONNECT `auth` dict 内的键）/ Default auth field name within the
+/// Socket.IO CONNECT `auth` dict.
 ///
-/// 与 client 侧 `smcp-computer` / `smcp-agent` 默认值保持一致；
-/// A2C-SMCP 协议 auth-agnostic，部署方可显式覆盖 `api_key_name`。
-/// Aligned with the client-side defaults in `smcp-computer` / `smcp-agent`;
-/// A2C-SMCP is auth-agnostic — operators may override `api_key_name`.
-pub const DEFAULT_AUTH_HEADER_NAME: &str = "access_token";
+/// #86：连接面鉴权统一走 Socket.IO `auth` dict（不再用 HTTP header）。A2C-SMCP 协议 auth-agnostic，
+/// 部署方可显式覆盖 `api_key_name`；默认 `token`，对齐 client 侧 `auth_payload({"token": ...})` 与
+/// TuringFocus/TFRC token-exchange 契约（AS-38）。
+/// #86: connection auth lives in the Socket.IO `auth` dict (no HTTP header). A2C-SMCP is
+/// auth-agnostic — operators may override `api_key_name`; defaults to `token`.
+pub const DEFAULT_AUTH_FIELD_NAME: &str = "token";
 
 /// 默认认证提供者，提供基础的认证逻辑实现
 /// Default authentication provider, provides basic authentication logic implementation
@@ -49,7 +51,7 @@ pub const DEFAULT_AUTH_HEADER_NAME: &str = "access_token";
 pub struct DefaultAuthenticationProvider {
     /// 管理员密钥 / Admin secret
     admin_secret: Option<String>,
-    /// API 密钥字段名 / API key field name
+    /// auth dict 内密钥字段名 / Key field name within the auth dict
     api_key_name: String,
 }
 
@@ -59,13 +61,13 @@ impl DefaultAuthenticationProvider {
     ///
     /// # Arguments
     /// * `admin_secret` - 管理员密钥 / Admin secret
-    /// * `api_key_name` - API 密钥字段名，默认为 [`DEFAULT_AUTH_HEADER_NAME`]
-    ///   (`access_token`) / API key field name, defaults to
-    ///   [`DEFAULT_AUTH_HEADER_NAME`] (`access_token`)
+    /// * `api_key_name` - auth dict 内密钥字段名，默认为 [`DEFAULT_AUTH_FIELD_NAME`]
+    ///   (`token`) / auth-dict key field name, defaults to
+    ///   [`DEFAULT_AUTH_FIELD_NAME`] (`token`)
     pub fn new(admin_secret: Option<String>, api_key_name: Option<String>) -> Self {
         Self {
             admin_secret,
-            api_key_name: api_key_name.unwrap_or_else(|| DEFAULT_AUTH_HEADER_NAME.to_string()),
+            api_key_name: api_key_name.unwrap_or_else(|| DEFAULT_AUTH_FIELD_NAME.to_string()),
         }
     }
 }
@@ -74,14 +76,15 @@ impl DefaultAuthenticationProvider {
 impl AuthenticationProvider for DefaultAuthenticationProvider {
     async fn authenticate(
         &self,
-        headers: &HeaderMap,
-        _auth: Option<&serde_json::Value>,
+        _headers: &HeaderMap,
+        auth: Option<&serde_json::Value>,
     ) -> Result<(), AuthError> {
-        // 从 headers 中提取 API 密钥
-        // Extract API key from headers
-        let api_key = headers
-            .get(self.api_key_name.as_str())
-            .and_then(|value| value.to_str().ok())
+        // #86：从 Socket.IO CONNECT `auth` dict 提取密钥（字段 `api_key_name`，默认 `token`）。
+        // HTTP header 不再参与连接面鉴权；routing headers（X-TF-*）仍由传输层透传，与鉴权无关。
+        // Extract the key from the Socket.IO CONNECT `auth` dict; HTTP headers no longer authenticate.
+        let api_key = auth
+            .and_then(|value| value.get(self.api_key_name.as_str()))
+            .and_then(|value| value.as_str())
             .map(|s| s.to_string());
 
         let api_key = api_key.ok_or(AuthError::MissingApiKey)?;
@@ -103,44 +106,45 @@ impl AuthenticationProvider for DefaultAuthenticationProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::HeaderValue;
+    use serde_json::json;
 
     #[tokio::test]
     async fn test_default_auth_success() {
         let auth = DefaultAuthenticationProvider::new(Some("secret123".to_string()), None);
-        let mut headers = HeaderMap::new();
-        headers.insert("access_token", HeaderValue::from_static("secret123"));
+        let dict = json!({ "token": "secret123" });
 
-        let result = auth.authenticate(&headers, None).await;
+        let result = auth.authenticate(&HeaderMap::new(), Some(&dict)).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_default_auth_missing_key() {
         let auth = DefaultAuthenticationProvider::new(Some("secret123".to_string()), None);
-        let headers = HeaderMap::new();
 
-        let result = auth.authenticate(&headers, None).await;
+        // auth dict 缺失（None）或无 `token` 字段 → MissingApiKey。
+        let result = auth.authenticate(&HeaderMap::new(), None).await;
+        assert!(matches!(result, Err(AuthError::MissingApiKey)));
+
+        let empty = json!({});
+        let result = auth.authenticate(&HeaderMap::new(), Some(&empty)).await;
         assert!(matches!(result, Err(AuthError::MissingApiKey)));
     }
 
     #[tokio::test]
     async fn test_default_auth_invalid_key() {
         let auth = DefaultAuthenticationProvider::new(Some("secret123".to_string()), None);
-        let mut headers = HeaderMap::new();
-        headers.insert("access_token", HeaderValue::from_static("wrong"));
+        let dict = json!({ "token": "wrong" });
 
-        let result = auth.authenticate(&headers, None).await;
+        let result = auth.authenticate(&HeaderMap::new(), Some(&dict)).await;
         assert!(matches!(result, Err(AuthError::InvalidApiKey)));
     }
 
     #[tokio::test]
     async fn test_default_auth_no_admin_secret() {
         let auth = DefaultAuthenticationProvider::new(None, None);
-        let mut headers = HeaderMap::new();
-        headers.insert("access_token", HeaderValue::from_static("anykey"));
+        let dict = json!({ "token": "anykey" });
 
-        let result = auth.authenticate(&headers, None).await;
+        let result = auth.authenticate(&HeaderMap::new(), Some(&dict)).await;
         assert!(matches!(result, Err(AuthError::InvalidApiKey)));
     }
 }

@@ -11,7 +11,7 @@ mod e2e;
 
 use e2e::*;
 use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
-use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use std::time::Duration;
 use tracing::info;
 
@@ -81,9 +81,10 @@ async fn test_basic_three_component_integration() {
     computer
         .connect_socketio(
             server.url(),
-            "/smcp",
-            &auth_secret, // API key for authentication
-            &None,        // No custom headers
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict), // API key for authentication
+                ..Default::default()                                 // No custom headers / auth dict
+            },
         )
         .await
         .expect("Failed to connect computer to server");
@@ -145,7 +146,13 @@ async fn test_tool_call_flow() {
 
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect computer");
 
@@ -234,7 +241,13 @@ async fn test_notification_system() {
 
     let auth_secret = Some("test_secret".to_string());
     computer
-        .connect_socketio(server.url(), "/smcp", &auth_secret, &None)
+        .connect_socketio(
+            server.url(),
+            ConnectOptions {
+                auth_payload: auth_secret.as_deref().map(auth_dict),
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to connect");
     computer
