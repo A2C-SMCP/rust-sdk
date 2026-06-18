@@ -857,8 +857,10 @@ impl<S: Session> Computer<S> {
 
     /// 启动 user 源 DropIn 文件 watcher（监控 `<home>/user/` + 各登记 `<workdir>/.tfrobot/skills/`）/ start watcher。
     ///
-    /// watcher 回调在独立线程触发 → 直接调去抖器 `mark_dirty`（`Send + Sync`、内部锁，线程安全）。已有 watcher
-    /// → 先停。SKILL Home 未就绪 → no-op。
+    /// watcher 回调在 notify/Poll 观察者的**独立 OS 线程**触发——该线程**无 Tokio 运行时上下文**。
+    /// 去抖器契约（见 [`skills::debouncer`](crate::skills) 线程模型）要求跨线程触发**先 marshal 回运行时**
+    /// 再 `mark_dirty`（其内部 `tokio::spawn` 须有运行时上下文）；否则在观察者线程上 panic → 毒化去抖器
+    /// 状态锁 + 静默断 SKILL 热重载。故经 `Handle::spawn` 把 `mark_dirty` 调度回运行时。已有 watcher → 先停。
     async fn start_skill_watcher(&self) {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return;
@@ -869,7 +871,13 @@ impl<S: Session> Computer<S> {
             .expect("workdirs poisoned")
             .clone();
         let debouncer = Arc::clone(&self.skill_debouncer);
-        let on_change: OnChange = Arc::new(move || debouncer.mark_dirty());
+        // `start_skill_watcher` 是 async → 必在 Tokio 运行时内，`Handle::current()` 恒有效。
+        let rt = tokio::runtime::Handle::current();
+        let on_change: OnChange = Arc::new(move || {
+            let debouncer = Arc::clone(&debouncer);
+            // marshal：从观察者线程把 mark_dirty 调度回运行时线程执行（fire-and-forget）。
+            rt.spawn(async move { debouncer.mark_dirty() });
+        });
         let mut watcher = SkillFileWatcher::builder(on_change)
             .use_polling(self.skill_watch_polling)
             .build();
