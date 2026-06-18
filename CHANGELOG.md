@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-06-18
+
+### Bug Fixes
+
+- *(computer)* Forbidden_tools 跨 server 暴露面对账，禁用先于 alias/冲突收集（对标 Python #106/#107）
+- *(skills)* SKILL watcher 回调 marshal 回 Tokio 运行时再 mark_dirty（修热重载 panic）
+
+### Features
+
+- *(auth)* 全 SDK Socket.IO auth-dict-only 连接面鉴权（退役 HTTP-header 鉴权）
+
+### Testing
+
+- *(e2e)* 补 get_desktop 指定 window 过滤 + desktop_size 截断端到端测试
+
+### Ci
+
+- *(publish)* 装 libdbus-1-dev/pkg-config 供 Linux keyring 构建（解 v0.2.2 发布 validate 失败）
+- *(publish)* 补发布 smcp-client-transport（v0.2.2 新增 crate #22，漏配致下游发布失败）
+- *(test)* 装 libdbus-1-dev/pkg-config 供 Linux keyring(libdbus-sys) 构建
+
 ## [0.2.2] - 2026-06-13
 
 ### Bug Fixes
@@ -71,6 +92,8 @@ All notable changes to this project will be documented in this file.
 ### Miscellaneous Tasks
 
 - *(deps)* Bump libredox 0.1.15 → 0.1.17 in Cargo.lock
+- Release v0.2.2
+- Merge develop-v0.2.2 for v0.2.2 release
 
 ### Performance
 
@@ -85,6 +108,10 @@ All notable changes to this project will be documented in this file.
 - *(smcp)* Code-review 跟进——digest→hex + 切片边界下沉 smcp::utils 统一（#64 #66）
 - *(smcp-computer)* Code-review 跟进——list_windows 过滤排序抽取共享 helper + 比较器单源化（#16 #18）
 - *(smcp-computer,smcp-agent)* Fix-review 跟进——取消纵切 #70/#44 收尾（无阻塞项）
+
+### Styling
+
+- *(fmt)* Cargo fmt-all 收敛遗留格式（发布前 fmt-clean）
 
 ### Testing
 
