@@ -673,14 +673,8 @@ impl AsyncSmcpAgent {
                     error!("Failed to send cancel request: {}", e);
                 }
 
-                // 返回超时错误
-                Ok(serde_json::json!({
-                    "content": [{
-                        "type": "text",
-                        "text": format!("工具调用超时 / Tool call timeout, req_id={}", req_id_for_cancel.as_str())
-                    }],
-                    "isError": true
-                }))
+                // 返回超时错误（结果级 meta.a2c_timeout=true → Agent 三态分类归 TimedOut，#92 P1）
+                Ok(local_timeout_call_result(req_id_for_cancel.as_str()))
             }
             Err(e) => {
                 error!(
@@ -843,6 +837,29 @@ impl Clone for AsyncSmcpAgent {
     }
 }
 
+/// 构造 Agent **本地**超时兜底的 `CallToolResult`-shape 响应（P1 #92）。
+///
+/// 写结果级 `meta.a2c_timeout=true`（协议规范 wire key `meta`，键用单一权威常量
+/// [`smcp::tool_meta::A2C_TIMEOUT_KEY`]），使 [`crate::response::classify_tool_call_outcome`] 把该响应归类为
+/// `TimedOut`（而非 `Failed`），与 Computer 侧超时态语义对齐。纯函数，便于单测（本仓 transport
+/// 无 mock 接缝，约定抽纯 helper 单测）。
+fn local_timeout_call_result(req_id: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!("工具调用超时 / Tool call timeout, req_id={}", req_id)
+        }],
+        "isError": true,
+    });
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        smcp::tool_meta::A2C_TIMEOUT_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    v["meta"] = serde_json::Value::Object(meta);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,5 +886,24 @@ mod tests {
         assert!(!mime_is_textual(Some("image/png")));
         assert!(!mime_is_textual(Some("")));
         assert!(!mime_is_textual(None));
+    }
+
+    /// #92 P1：本地超时兜底结果写结果级 `meta.a2c_timeout=true`，使三态分类归 `TimedOut`（非 `Failed`）。
+    #[test]
+    fn test_local_timeout_result_classifies_as_timed_out() {
+        use crate::response::{classify_tool_call_outcome, ToolCallOutcome};
+        let v = local_timeout_call_result("rid-42");
+        // 结果级标记落协议规范的 wire key `meta`。
+        assert_eq!(
+            v["meta"][smcp::tool_meta::A2C_TIMEOUT_KEY],
+            serde_json::json!(true)
+        );
+        assert_eq!(v["isError"], serde_json::json!(true));
+        assert!(
+            v["content"][0]["text"].as_str().unwrap().contains("rid-42"),
+            "超时文案应含 req_id"
+        );
+        // 关键：被三态分类器归为 TimedOut（之前无 meta 时归 Failed）。
+        assert_eq!(classify_tool_call_outcome(&v), ToolCallOutcome::TimedOut);
     }
 }

@@ -467,8 +467,12 @@ impl SkillRootLookup for PreresolvedRoot {
 /// 在 rmcp [`CallToolResult`] 的**结果级** `meta` 写取消标记（SMCP-07 键，data-structures.md §结果级 meta）。
 ///
 /// computer.rs 的结果流是 rmcp `CallToolResult`（其 `meta` 为 `rmcp::model::Meta`，**非** smcp
-/// `ToolCallRet`），故不能直接调用 [`smcp::ToolCallRet::mark_cancelled`]；本 helper 用**同名键**就地写入，
-/// 在线（wire）形态与之等价（`meta.a2c_cancelled=true` + `a2c_cancel_reason`）。
+/// `ToolCallRet`），故不能直接调用 [`smcp::ToolCallRet::mark_cancelled`]；本 helper 用**同名键**就地写入。
+///
+/// ⚠️ wire 形态注意（#92）：rmcp `CallToolResult.meta` 为 `#[serde(rename = "_meta")]`（**无条件**），
+/// 故本 helper 写入的标记**直接序列化为 `_meta.a2c_*`**，**并非**协议规范的 `meta`。协议合规的出线
+/// `meta.a2c_*` 由 tool_call ack 边界的 `promote_result_meta_to_meta`（socketio_client.rs）把顶层
+/// `_meta` 提升为 `meta` 而产生（对齐 Python `result.meta=` + `model_dump`，data-structures.md §234）。
 fn mark_result_cancelled(result: &mut CallToolResult, reason: &str) {
     let meta = result.meta.get_or_insert_with(rmcp::model::Meta::new);
     meta.insert(
@@ -3007,8 +3011,9 @@ mod tests {
     #[test]
     fn test_mark_result_cancelled_writes_protocol_meta() {
         // 取消态结果级 meta：a2c_cancelled=true + a2c_cancel_reason（协议 0.2.2 MUST/SHOULD）。
-        // 注意：rmcp CallToolResult.meta 在线 key 为 `_meta`（#[serde(rename="_meta")]，MCP 约定）——
-        // 协议允许（producer 写结果级 meta，consumer 宽松读 meta/_meta，data-structures.md §234）。
+        // 本测试断言的是 **rmcp 层**直接序列化形态：rmcp CallToolResult.meta 为 `#[serde(rename="_meta")]`
+        // （无条件），故此处必为 `_meta`。协议规范的 wire `meta` 由 ack 边界 `promote_result_meta_to_meta`
+        // 重映射产生（#92），其出线断言见 socketio_client.rs `test_promote_result_meta_*`。
         let mut r = CallToolResult::error(vec![Content::text("x")]);
         mark_result_cancelled(&mut r, smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON);
         let v = serde_json::to_value(&r).unwrap();
@@ -3023,6 +3028,7 @@ mod tests {
     #[test]
     fn test_mark_result_timeout_writes_protocol_meta() {
         // 超时态结果级 meta：a2c_timeout=true（SHOULD），且不写取消标记。
+        // 同上：此为 rmcp 层 `_meta`；wire `meta` 由 promote_result_meta_to_meta 重映射（#92）。
         let mut r = CallToolResult::error(vec![Content::text("x")]);
         mark_result_timeout(&mut r);
         let v = serde_json::to_value(&r).unwrap();
@@ -3060,7 +3066,7 @@ mod tests {
     async fn test_execute_tool_cancellable_timeout_marks_meta_and_history() {
         use crate::mcp_clients::manager::test_support::CancelBehavior;
         use std::time::Duration;
-        // 假 client 睡 10s + 50ms timeout → manager 级超时 → 回填超时态结果（_meta.a2c_timeout）+ 历史。
+        // 假 client 睡 10s + 50ms timeout → manager 级超时 → 回填超时态结果（rmcp 层 _meta.a2c_timeout）+ 历史。
         let computer =
             computer_with_cancel_mock(CancelBehavior::Sleep(Duration::from_secs(10))).await;
 
@@ -3069,10 +3075,13 @@ mod tests {
             .await
             .expect("超时应回填结果而非上抛");
 
+        // execute_tool_cancellable 返回 rmcp CallToolResult，直接序列化为 `_meta`（rename）。
+        // 协议规范的 wire `meta` 由 ack 边界 promote_result_meta_to_meta 重映射（#92，出线断言见
+        // socketio_client.rs `test_promote_result_meta_*`）。
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(
             v["_meta"]["a2c_timeout"], true,
-            "超时态须写 _meta.a2c_timeout"
+            "rmcp 层超时态须写 _meta.a2c_timeout（wire `meta` 由 promote 重映射）"
         );
         assert_eq!(result.is_error, Some(true));
 

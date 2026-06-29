@@ -832,6 +832,9 @@ impl SmcpComputerClient {
                     .await?;
                 let mut value =
                     serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
+                // #92：顶层结果级 `_meta`（rmcp rename）→ 协议规范的 `meta`（producer MUST，跨 SDK 互通）。
+                // 先提升顶层、再铸造 content 旁路（二者操作不相交键：顶层 meta vs content[*]._meta）。
+                promote_result_meta_to_meta(&mut value);
                 // 铸造旁路（>内联预算的二进制 → toolspool 句柄 + 内联清空；超 too_large_cap 拒绝 + WARN）。
                 // mint 失败/小尺寸不致命：保留原内联，不阻断 tool_call 应答。
                 mint_oversize_binary_content(ops.as_ref(), &mut value).await;
@@ -853,7 +856,11 @@ impl SmcpComputerClient {
                         }
                     }
                 };
-                serde_json::to_value(result).map_err(ComputerError::SerializationError)?
+                let mut value =
+                    serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
+                // #92：同上——旧 manager 兜底路径亦须把顶层 `_meta` 提升为 `meta`（无标记则 no-op）。
+                promote_result_meta_to_meta(&mut value);
+                value
             }
         };
 
@@ -1613,6 +1620,46 @@ async fn mint_oversize_binary_content(ops: &dyn ComputerHandlerOps, raw: &mut Va
     }
 }
 
+/// 把已序列化 tool_call ack 的**顶层**结果级 `_meta` 重映射为协议规范的 `meta`
+/// （data-structures.md §234：producer MUST 写结果级 `meta`）。
+///
+/// 背景：rmcp `CallToolResult.meta` 为 `#[serde(rename = "_meta")]`（**无条件** rename），故
+/// `serde_json::to_value` 后 A2C 结果级标记出线为 `_meta.a2c_*`；而 Python 参考实现用 `result.meta=`
+/// 配合 `model_dump(mode="json")`（按字段名 dump）出线为 `meta`。为跨 SDK 互通，须在 wire 边界把顶层
+/// `_meta` 整体提升为 `meta`，覆盖所有结果级标记：`a2c_cancelled`、`a2c_cancel_reason`、`a2c_timeout`
+/// 及 AUTH-01 授权失败键（`error_code`、`mcp_server`、`auth_hint` 等，同根因顺带覆盖）。
+///
+/// 边界：**仅**动顶层；**不**触碰 `content[*]._meta`（blob 句柄子级，data-structures.md §683 规定
+/// MUST 保持 `_meta`）。非 object 的顶层 `_meta`（畸形）原样保留。已有顶层 `meta` 时按键合并、不覆盖
+/// 既有键（幂等、防丢键）。
+fn promote_result_meta_to_meta(raw: &mut Value) {
+    let Some(obj) = raw.as_object_mut() else {
+        return;
+    };
+    // 仅当顶层 `_meta` 为 object 时提升；非 object（畸形）原样保留、不报错。
+    if !obj.get("_meta").is_some_and(Value::is_object) {
+        return;
+    }
+    let Some(Value::Object(underscored)) = obj.remove("_meta") else {
+        return; // 不可达（上面已确认是 object），防御性返回。
+    };
+    // 并入顶层 `meta`：缺省新建；已存在则按键合并、不覆盖既有键（幂等、防丢键）。
+    let meta = obj
+        .entry("meta".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    match meta.as_object_mut() {
+        Some(meta_map) => {
+            for (k, v) in underscored {
+                meta_map.entry(k).or_insert(v);
+            }
+        }
+        // 顶层 `meta` 已存在但非 object（畸形，rmcp 不会产生）：不破坏既有值，整体放回 `_meta`。
+        None => {
+            obj.insert("_meta".to_string(), Value::Object(underscored));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2201,5 +2248,98 @@ mod tests {
         );
         let r = SmcpComputerClient::handle_get_blob_with_ack(p, None, "c".to_string()).await;
         assert!(matches!(r, Err(ComputerError::InvalidState(_))));
+    }
+
+    // ── #92：tool_call ack 顶层结果级 `_meta`→`meta` 重映射（协议 §234 producer MUST=meta）──────
+
+    #[test]
+    fn test_promote_result_meta_top_level_cancel_timeout_to_meta() {
+        // rmcp CallToolResult 出线形态：顶层结果级标记落 `_meta`（rename）。重映射后须为协议规范的 `meta`。
+        let mut v = json!({
+            "content": [{ "type": "text", "text": "x" }],
+            "isError": true,
+            "_meta": { "a2c_cancelled": true, "a2c_cancel_reason": "agent_requested" }
+        });
+        promote_result_meta_to_meta(&mut v);
+        // 顶层标记出线为 `meta.*`，且顶层不再残留 `_meta`。
+        assert_eq!(v["meta"]["a2c_cancelled"], json!(true));
+        assert_eq!(v["meta"]["a2c_cancel_reason"], json!("agent_requested"));
+        assert!(
+            v.get("_meta").is_none(),
+            "顶层 _meta 应被提升为 meta 后移除"
+        );
+
+        // 超时态同理。
+        let mut t = json!({ "isError": true, "_meta": { "a2c_timeout": true } });
+        promote_result_meta_to_meta(&mut t);
+        assert_eq!(t["meta"]["a2c_timeout"], json!(true));
+        assert!(t.get("_meta").is_none());
+    }
+
+    #[test]
+    fn test_promote_result_meta_preserves_content_item_meta() {
+        // 子级 content[*]._meta（blob 句柄）MUST 保持 `_meta` 不变（data-structures.md §683）。
+        let mut v = json!({
+            "content": [
+                { "type": "text", "text": "x" },
+                { "type": "image", "data": "", "_meta": { "a2c_blob_handle": "ts:img", "a2c_total_size": 1024 } }
+            ],
+            "_meta": { "a2c_cancelled": true }
+        });
+        promote_result_meta_to_meta(&mut v);
+        // 顶层提升为 meta。
+        assert_eq!(v["meta"]["a2c_cancelled"], json!(true));
+        assert!(v.get("_meta").is_none());
+        // content item 的 `_meta` 原封不动（绝不被提升/移除）。
+        assert_eq!(v["content"][1]["_meta"]["a2c_blob_handle"], json!("ts:img"));
+        assert_eq!(v["content"][1]["_meta"]["a2c_total_size"], json!(1024));
+        assert!(
+            v["content"][1].get("meta").is_none(),
+            "content item 不应长出 meta"
+        );
+    }
+
+    #[test]
+    fn test_promote_result_meta_covers_auth_error_keys() {
+        // 同根因：AUTH-01 的 error_code / mcp_server 亦经 rmcp `_meta` 出线，顺带覆盖。
+        let mut v = json!({
+            "content": [{ "type": "text", "text": "denied" }],
+            "isError": true,
+            "_meta": { "error_code": 4006, "mcp_server": "srv-a" }
+        });
+        promote_result_meta_to_meta(&mut v);
+        assert_eq!(v["meta"]["error_code"], json!(4006));
+        assert_eq!(v["meta"]["mcp_server"], json!("srv-a"));
+        assert!(v.get("_meta").is_none());
+    }
+
+    #[test]
+    fn test_promote_result_meta_noop_and_merge_and_malformed() {
+        // 1) 无顶层 `_meta` → no-op（含完全无 meta 的成功结果）。
+        let mut ok = json!({ "content": [{ "type": "text", "text": "ok" }] });
+        let before = ok.clone();
+        promote_result_meta_to_meta(&mut ok);
+        assert_eq!(ok, before, "无 _meta 应原样返回");
+
+        // 2) 顶层已有 `meta` 时按键合并、不覆盖既有键，并清掉 `_meta`。
+        let mut both = json!({
+            "meta": { "a2c_cancelled": true, "keep": "orig" },
+            "_meta": { "a2c_timeout": true, "keep": "shadow" }
+        });
+        promote_result_meta_to_meta(&mut both);
+        assert_eq!(both["meta"]["a2c_cancelled"], json!(true));
+        assert_eq!(both["meta"]["a2c_timeout"], json!(true), "新键并入");
+        assert_eq!(
+            both["meta"]["keep"],
+            json!("orig"),
+            "既有 meta 键不被 _meta 覆盖"
+        );
+        assert!(both.get("_meta").is_none());
+
+        // 3) 畸形非-object 顶层 `_meta` → 原样保留（不提升、不报错）。
+        let mut bad = json!({ "_meta": "i-am-a-string" });
+        promote_result_meta_to_meta(&mut bad);
+        assert_eq!(bad["_meta"], json!("i-am-a-string"));
+        assert!(bad.get("meta").is_none());
     }
 }

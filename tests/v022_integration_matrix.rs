@@ -745,10 +745,20 @@ async fn tool_call_timeout_marks_meta() {
         body.get("code").is_none(),
         "tool_call 不应回协议错误: {body}"
     );
-    let timed_out = deep_find(&body, "a2c_timeout")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    assert!(timed_out, "超时结果 meta 应 a2c_timeout=true, got: {body}");
+    // #92：在**真实 ack 线形态**上钉死协议规范出线 key——结果级标记 MUST 落顶层 `meta`（非 `_meta`），
+    // 否则只读 `meta` 的 consumer（如 Python Agent）识别不到超时态。用 key-精确断言（**不**用 key-agnostic
+    // 的 deep_find）以守护 promote_result_meta_to_meta 的接线：若该重映射被移除，标记将落 `_meta.a2c_timeout`，
+    // 本断言即失败（验收点 #1/#3 的端到端回归守护）。
+    assert_eq!(
+        body.pointer("/meta/a2c_timeout").and_then(Value::as_bool),
+        Some(true),
+        "超时结果须出线为顶层 meta.a2c_timeout=true, got: {body}"
+    );
+    // 且顶层 `_meta` 不再携带该结果级标记（producer 已合规、已提升为 `meta`）。
+    assert!(
+        body.pointer("/_meta/a2c_timeout").is_none(),
+        "重映射后顶层 _meta 不应再携带 a2c_timeout, got: {body}"
+    );
     // 1s 超时态远早于 4s 自然完成（证明超时分支胜出而非自然返回）。
     assert!(
         elapsed < Duration::from_millis(3500),
