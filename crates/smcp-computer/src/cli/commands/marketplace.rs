@@ -9,11 +9,13 @@
 *       Marketplace command handlers.
 *
 * 对标 Python `a2c_smcp/computer/cli/commands/marketplace.py`：handler 取显式资源（`registry` / `home`
-* / `env`）+ flags，返回退出码（0 成功 / 1 用户错 / 2 网络错），包裹既有后端——克隆/对账
-* [`stage_marketplace_skills`]、物化读写 [`load_known_marketplaces`] 等、卸载级联 [`uninstall_plugin`] +
-* [`prune_marketplaces`]。Trust（§10.5）首见经 [`Confirm`] 回调（REPL=session y/N；Typer 非交互无 confirm
-* 且无 `--trust` → 退出码 1），批准后持久化到 user scope `trustedMarketplaces`（CC 模型，§16：
-* `known_marketplaces.json` **不**带 trusted 字段）。
+* / `env`）+ flags，返回退出码（0 成功 / 1 用户错 / 2 网络错）。
+*
+* **#94 后**：add/refresh/remove 的 stage+prune 高层编排已抬到非 CLI 的 [`crate::settings::lifecycle`]，
+* handler **薄化**为：信任门（user-scope）+ 结构化 [`GovernanceError`] / Outcome → 退出码映射；list/info/set
+* 仍直接读写物化账本（[`load_known_marketplaces`] 等）。Trust（§10.5）首见经 [`Confirm`] 回调（REPL=session
+* y/N；Typer 非交互无 confirm 且无 `--trust` → 退出码 1），批准后持久化到 user scope `trustedMarketplaces`
+* （CC 模型，§16：`known_marketplaces.json` **不**带 trusted 字段，故 trust **不**属 `skill_home` 治理边界）。
 */
 
 use std::collections::BTreeMap;
@@ -22,11 +24,15 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use super::{
-    err_flat as err, file_store, msg_dim, ok_msg, print_json, Confirm, EXIT_NETWORK_ERROR, EXIT_OK,
+    err_flat as err, msg_dim, ok_msg, print_json, Confirm, EXIT_NETWORK_ERROR, EXIT_OK,
     EXIT_USER_ERROR,
 };
-use crate::settings::installer::{uninstall_plugin, McpInstallHooks, UninstallOptions};
-use crate::settings::reconciler::{prune_marketplaces, SkillGovernanceStore};
+use crate::settings::installer::McpInstallHooks;
+use crate::settings::lifecycle::{
+    marketplace_name_taken, refresh_marketplaces, register_or_stage_marketplace,
+    remove_marketplace, resolve_marketplace_identity, AddMarketplaceParams, GovernanceError,
+    RefreshStatus, RemoveMarketplaceParams,
+};
 use crate::settings::schema::FIELD_TRUSTED_MARKETPLACES;
 use crate::settings::scope::{
     apply_write, load_settings_file, user_settings_path, EnvMap, WriteValue,
@@ -35,14 +41,12 @@ use crate::settings::store::{
     atomic_write_settings_json, load_installed_plugins, load_known_marketplaces,
     update_known_marketplaces, with_settings_lock, SettingsStoreError,
 };
-use crate::settings::{
-    is_valid_git_url, is_valid_marketplace_name, KnownMarketplaceEntry, KnownMarketplaces,
-    SettingsScope,
-};
-use crate::skills::{
-    normalize_repo_shorthand, stage_marketplace_skills, MarketplaceStageOptions, SkillRegistry,
-    GITHUB_HOST,
-};
+use crate::settings::{KnownMarketplaceEntry, KnownMarketplaces, SettingsScope};
+use crate::skills::SkillRegistry;
+
+// `marketplace add/refresh/remove` 的 stage+prune 高层编排已抬到非 CLI 的 [`crate::settings::lifecycle`]（#94）；
+// URL 归一 / 名派生纯函数随之迁移，此处再导出以保持既有引用路径 / re-export relocated pure helpers。
+pub use crate::settings::lifecycle::{default_marketplace_name, normalize_marketplace_url};
 
 // ── 输出辅助 / output helpers ────────────────────────────────────────────────
 fn map_store_err(e: SettingsStoreError) -> std::io::Error {
@@ -67,38 +71,6 @@ fn read_string_array(map: &Map<String, Value>, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-// ── URL / name 归一（CLI 层补齐：Python 在 marketplace.py 本地实现）/ normalization ──
-/// 归一 marketplace git URL：完整 URL 原样；裸 `owner/repo` 简写按 GitHub 糖展开 / normalize a git URL。
-pub fn normalize_marketplace_url(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if is_valid_git_url(raw) {
-        return Some(raw.to_string());
-    }
-    normalize_repo_shorthand(raw, GITHUB_HOST).ok()
-}
-
-/// 从 git URL 末段派生严格-kebab marketplace 名（去 `.git`、非字母数字折叠为 `-`）/ derive a kebab name。
-pub fn default_marketplace_name(url: &str) -> Option<String> {
-    let tail = url.trim_end_matches('/');
-    let seg = tail.rsplit(['/', ':']).next().unwrap_or(tail);
-    let seg = seg.strip_suffix(".git").unwrap_or(seg);
-
-    // `re.sub(r"[^a-z0-9]+", "-", seg.lower()).strip("-")`：小写后非 [a-z0-9] 连续段折叠为单 `-`。
-    let mut slug = String::new();
-    let mut prev_dash = false;
-    for ch in seg.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            slug.push('-');
-            prev_dash = true;
-        }
-    }
-    let slug = slug.trim_matches('-').to_string();
-    (!slug.is_empty() && is_valid_marketplace_name(&slug)).then_some(slug)
 }
 
 // ── trust 持久化（user scope settings.json）/ trust persistence ────────────────
@@ -161,6 +133,9 @@ pub struct MarketplaceAddOptions<'a> {
 }
 
 /// 添加新 marketplace（首次 trust y/N，默认 eager clone）/ add a marketplace。
+///
+/// **薄封装**：信任门（user-scope，§10.5/§11）属 CLI 表现层，其余 stage/no-clone 编排委托非 CLI 的
+/// [`register_or_stage_marketplace`]；本 handler 仅做信任决策 + 结构化结果 → 退出码映射。
 pub async fn marketplace_add(
     registry: &mut SkillRegistry,
     home: &Path,
@@ -169,29 +144,30 @@ pub async fn marketplace_add(
     opts: MarketplaceAddOptions<'_>,
 ) -> i32 {
     let json_output = opts.json_output;
-    let Some(url) = normalize_marketplace_url(git_url) else {
-        return err(
-            &format!("not a well-formed git url or owner/repo shorthand: {git_url:?}"),
-            json_output,
-            EXIT_USER_ERROR,
-        );
-    };
-    let mp_name = match opts
-        .name
-        .map(str::to_string)
-        .or_else(|| default_marketplace_name(&url))
-    {
-        Some(n) if is_valid_marketplace_name(&n) => n,
-        _ => {
+    // 解析身份（归一 URL + 派生/校验名）——信任门与 stage 共用同一身份语义。
+    let identity = match resolve_marketplace_identity(git_url, opts.name) {
+        Ok(id) => id,
+        Err(GovernanceError::InvalidUrl(u)) => {
             return err(
-                &format!("cannot derive a valid marketplace name from {git_url:?}; pass --name"),
+                &format!("not a well-formed git url or owner/repo shorthand: {u:?}"),
                 json_output,
                 EXIT_USER_ERROR,
             )
         }
+        Err(GovernanceError::InvalidName(u)) => {
+            return err(
+                &format!("cannot derive a valid marketplace name from {u:?}; pass --name"),
+                json_output,
+                EXIT_USER_ERROR,
+            )
+        }
+        Err(e) => return err(&e.to_string(), json_output, EXIT_USER_ERROR),
     };
+    let mp_name = identity.name.clone();
+    let url = identity.url.clone();
 
-    if load_mps(home, env).marketplaces.contains_key(&mp_name) {
+    // 重名校验先于信任提示（保留既有时序：重名直接拒、不弹 confirm、不记 trust）。
+    if marketplace_name_taken(home, env, &mp_name) {
         return err(
             &format!("marketplace name conflict: {mp_name:?} already exists"),
             json_output,
@@ -229,74 +205,47 @@ pub async fn marketplace_add(
         );
     }
 
-    if opts.no_clone {
-        // 仅注册意图（不推荐，§4.2 debug 用）：记 known_marketplaces 但不 clone/stage。
-        let name_for_write = mp_name.clone();
-        let url_for_write = url.clone();
-        let auto = opts.auto_update;
-        let res = update_known_marketplaces(
-            move |file| {
-                let mut extra = Map::new();
-                extra.insert("installLocation".to_string(), json!(""));
-                extra.insert("autoUpdate".to_string(), json!(auto));
-                file.account.marketplaces.insert(
-                    name_for_write,
-                    KnownMarketplaceEntry {
-                        source: json!({ "type": "git", "url": url_for_write }),
-                        extra,
-                    },
-                );
-            },
-            Some(home),
-            env,
-        );
-        if let Err(e) = res {
-            return err(
-                &format!("failed to record marketplace intent: {e}"),
-                json_output,
-                EXIT_USER_ERROR,
-            );
-        }
-        return ok_msg(&format!(
-            "registered marketplace intent {mp_name:?} (no clone)"
-        ));
-    }
-
-    let source = json!({ "type": "git", "url": url });
-    let store = file_store(home, env);
-    let registered = stage_marketplace_skills(
-        &mp_name,
-        &source,
+    // 编排（register-or-stage）委托 lifecycle，结构化结果 → 退出码 / 文案。
+    match register_or_stage_marketplace(
         registry,
         home,
-        MarketplaceStageOptions {
-            plugin_filter: None,
+        env,
+        &identity,
+        &AddMarketplaceParams {
+            name: opts.name,
             auto_update: opts.auto_update,
-            refresh: false,
-            timeout: None,
-            env,
-            recorder: Some(store.as_recorder()),
+            no_clone: opts.no_clone,
         },
     )
-    .await;
-
-    // 成功判定：stage 失败降级（不抛、返回空 + 不写 known_marketplaces）；据物化记录是否落盘判定。
-    if !load_mps(home, env).marketplaces.contains_key(&mp_name) {
-        return err(
-            &format!("clone/refresh failed for {url:?} (see logs)"),
+    .await
+    {
+        Ok(outcome) if outcome.no_clone => ok_msg(&format!(
+            "registered marketplace intent {mp_name:?} (no clone)"
+        )),
+        Ok(outcome) => {
+            if json_output {
+                print_json(
+                    &json!({ "added": outcome.name, "url": outcome.url, "skills": outcome.skills.len() }),
+                );
+                return EXIT_OK;
+            }
+            ok_msg(&format!(
+                "added {mp_name:?} — cloned, {} skill(s) found",
+                outcome.skills.len()
+            ))
+        }
+        Err(GovernanceError::CloneFailed(u)) => err(
+            &format!("clone/refresh failed for {u:?} (see logs)"),
             json_output,
             EXIT_NETWORK_ERROR,
-        );
+        ),
+        // no-clone 账本写失败（[`GovernanceError::Store`]）等 → 用户错。
+        Err(e) => err(
+            &format!("failed to record marketplace intent: {e}"),
+            json_output,
+            EXIT_USER_ERROR,
+        ),
     }
-
-    if json_output {
-        print_json(&json!({ "added": mp_name, "url": url, "skills": registered.len() }));
-        return EXIT_OK;
-    }
-    ok_msg(&format!(
-        "added {mp_name:?} — cloned, {} skill(s) found",
-        registered.len()
-    ))
 }
 
 /// 列出所有已知 marketplace（trusted / clone 状态 / 上次刷新 / auto_update）/ list known marketplaces。
@@ -430,6 +379,9 @@ pub struct MarketplaceRemoveOptions<'a> {
 }
 
 /// 移除 marketplace。默认级联卸载其下 installed plugin（含 MCP server）；`keep_plugins` 仅 prune clone。
+///
+/// **薄封装**：未知校验 + confirm 闸门 + trust 撤销（user-scope）属 CLI 表现层，级联卸载 + prune 编排委托非
+/// CLI 的 [`remove_marketplace`]；本 handler 仅做结构化结果 → 退出码映射。
 pub async fn marketplace_remove(
     registry: &mut SkillRegistry,
     home: &Path,
@@ -438,7 +390,8 @@ pub async fn marketplace_remove(
     opts: MarketplaceRemoveOptions<'_>,
 ) -> i32 {
     let json_output = opts.json_output;
-    if !load_mps(home, env).marketplaces.contains_key(name) {
+    // 未知校验先于 confirm（保留既有时序：未知直接拒、不弹 confirm）。
+    if !marketplace_name_taken(home, env, name) {
         return err(
             &format!("unknown marketplace: {name:?}"),
             json_output,
@@ -451,37 +404,22 @@ pub async fn marketplace_remove(
         }
     }
 
-    let mut uninstalled: Vec<String> = Vec::new();
-    if !opts.keep_plugins {
-        let suffix = format!("@{name}");
-        let installed = load_installed_plugins(Some(home), env).account;
-        let victims: Vec<String> = installed
-            .plugins
-            .keys()
-            .filter(|pid| pid.ends_with(&suffix))
-            .cloned()
-            .collect();
-        for pid in &victims {
-            let res = uninstall_plugin(
-                pid,
-                registry,
-                home,
-                UninstallOptions {
-                    scope: None,
-                    keep_servers: false,
-                    env,
-                },
-                opts.hooks,
-            )
-            .await;
-            if matches!(res, Ok(true)) {
-                uninstalled.push(pid.clone());
-            }
-        }
-    }
+    let outcome = match remove_marketplace(
+        registry,
+        home,
+        env,
+        name,
+        RemoveMarketplaceParams {
+            keep_plugins: opts.keep_plugins,
+            hooks: opts.hooks,
+        },
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(&e.to_string(), json_output, EXIT_USER_ERROR),
+    };
 
-    let store = file_store(home, env);
-    let pruned = prune_marketplaces(&[name.to_string()], registry, home, &store);
     // 撤销信任，避免 trustedMarketplaces 只增不减（user scope）。best-effort：对标 Python（marketplace.py:309
     // 无错误处理）——写失败仅告警、**不**把已完成的卸载/prune 级联翻成用户错（destructive 工作已落地）。
     if let Err(e) = revoke_trust(name, env) {
@@ -492,16 +430,19 @@ pub async fn marketplace_remove(
 
     if json_output {
         print_json(&json!({
-            "removed": name,
-            "pruned": pruned,
-            "uninstalledPlugins": uninstalled,
-            "keptPlugins": opts.keep_plugins,
+            "removed": outcome.name,
+            "pruned": outcome.pruned,
+            "uninstalledPlugins": outcome.uninstalled_plugins,
+            "keptPlugins": outcome.kept_plugins,
         }));
         return EXIT_OK;
     }
-    let detail = if !uninstalled.is_empty() {
-        format!(" (uninstalled {} plugin(s))", uninstalled.len())
-    } else if opts.keep_plugins {
+    let detail = if !outcome.uninstalled_plugins.is_empty() {
+        format!(
+            " (uninstalled {} plugin(s))",
+            outcome.uninstalled_plugins.len()
+        )
+    } else if outcome.kept_plugins {
         " (plugins kept as orphans)".to_string()
     } else {
         String::new()
@@ -510,6 +451,9 @@ pub async fn marketplace_remove(
 }
 
 /// `git pull` 失败则全量重 clone；与缓存 plugin 集合对账 + 失败汇总（§10.4）/ refresh marketplaces。
+///
+/// **薄封装**：逐 marketplace 对账编排委托非 CLI 的 [`refresh_marketplaces`]；本 handler 仅把结构化行
+/// 渲染为 JSON / 文本（refresh 永远 `EXIT_OK`，失败逐行以 `missing` 汇报）。
 pub async fn marketplace_refresh(
     registry: &mut SkillRegistry,
     home: &Path,
@@ -517,72 +461,35 @@ pub async fn marketplace_refresh(
     target: &str,
     json_output: bool,
 ) -> i32 {
-    let mps = load_mps(home, env);
-    let names: Vec<String> = if target == "all" {
-        mps.marketplaces.keys().cloned().collect()
-    } else {
-        vec![target.to_string()]
-    };
-
-    let mut rows: Vec<Value> = Vec::new();
-    for nm in &names {
-        let Some(rec) = mps.marketplaces.get(nm) else {
-            rows.push(json!({ "name": nm, "status": "missing" }));
-            continue;
-        };
-        let before = rec.extra.get("commitSha").cloned();
-        let source = rec.source.clone();
-        let auto = rec
-            .extra
-            .get("autoUpdate")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let store = file_store(home, env);
-        let registered = stage_marketplace_skills(
-            nm,
-            &source,
-            registry,
-            home,
-            MarketplaceStageOptions {
-                plugin_filter: None,
-                auto_update: auto,
-                refresh: true,
-                timeout: None,
-                env,
-                recorder: Some(store.as_recorder()),
-            },
-        )
-        .await;
-        let after_sha = load_mps(home, env)
-            .marketplaces
-            .get(nm)
-            .and_then(|r| r.extra.get("commitSha").cloned());
-        let status = if after_sha != before {
-            "updated"
-        } else {
-            "unchanged"
-        };
-        rows.push(json!({ "name": nm, "status": status, "skills": registered.len() }));
-    }
+    let rows = refresh_marketplaces(registry, home, env, target).await;
 
     if json_output {
-        print_json(&json!(rows));
+        let json_rows: Vec<Value> = rows
+            .iter()
+            .map(|r| match r.status {
+                RefreshStatus::Missing => json!({ "name": r.name, "status": "missing" }),
+                _ => json!({ "name": r.name, "status": r.status.as_str(), "skills": r.skills }),
+            })
+            .collect();
+        print_json(&json!(json_rows));
         return EXIT_OK;
     }
     for r in &rows {
-        let mark = match r["status"].as_str() {
-            Some("updated") => "✓",
-            Some("unchanged") => "·",
-            _ => "✗",
+        let mark = match r.status {
+            RefreshStatus::Updated => "✓",
+            RefreshStatus::Unchanged => "·",
+            RefreshStatus::Missing => "✗",
         };
-        println!(
-            "  {mark} {}  ({})",
-            r["name"].as_str().unwrap_or(""),
-            r["status"].as_str().unwrap_or("")
-        );
+        println!("  {mark} {}  ({})", r.name, r.status.as_str());
     }
-    let updated = rows.iter().filter(|r| r["status"] == "updated").count();
-    let failed = rows.iter().filter(|r| r["status"] == "missing").count();
+    let updated = rows
+        .iter()
+        .filter(|r| r.status == RefreshStatus::Updated)
+        .count();
+    let failed = rows
+        .iter()
+        .filter(|r| r.status == RefreshStatus::Missing)
+        .count();
     msg_dim(&format!(
         "{} marketplace(s) · {updated} updated · {failed} failed",
         rows.len()
@@ -675,31 +582,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn normalize_url_passthrough_and_shorthand() {
-        assert_eq!(
-            normalize_marketplace_url("https://github.com/acme/skills.git"),
-            Some("https://github.com/acme/skills.git".to_string())
-        );
-        // owner/repo 简写 → GitHub 糖。
-        assert_eq!(
-            normalize_marketplace_url("acme/skills"),
-            Some("https://github.com/acme/skills.git".to_string())
-        );
-        assert_eq!(normalize_marketplace_url("not a url"), None);
-    }
-
-    #[test]
-    fn default_name_derivation() {
-        assert_eq!(
-            default_marketplace_name("https://github.com/acme/My_Skills.git"),
-            Some("my-skills".to_string())
-        );
-        assert_eq!(
-            default_marketplace_name("git@github.com:acme/cool-repo.git"),
-            Some("cool-repo".to_string())
-        );
-    }
+    // URL 归一 / 名派生纯函数的单测随实现迁移到 settings::lifecycle（#94），不在此重复。
 
     #[tokio::test]
     async fn add_non_interactive_requires_trust() {

@@ -745,10 +745,35 @@ pub async fn enable_plugin(
     )
     .await;
 
-    // ④ 重挂 servers。
+    // ④ 重挂 servers——**原子回滚**（#94 点 4 / §10.6 回滚契约）：与 install 把账本写在最后不同，enable 先写
+    //    `enabledPlugins=true`（步骤 ②）再挂 server，故 `register_server` 失败会留"标记已启用但 server 未挂"的
+    //    半态——Sub-B 的 boot 恢复会据此复活半装 plugin。失败 → 摘除本次已挂 server + 重新 orphan 本 plugin
+    //    skills + 回写 `enabledPlugins=false`（确定性禁用末态，优于精确还原前值：无论前值如何，失败即落定禁用）。
     if let Some(h) = hooks {
+        let mut remounted: Vec<String> = Vec::new();
         for cfg in servers {
-            h.register_server(cfg).await?;
+            let sname = cfg.name().to_string();
+            if let Err(e) = h.register_server(cfg).await {
+                for done in &remounted {
+                    if let Err(re) = h.remove_server(done).await {
+                        tracing::warn!(server = %done, error = %re, "enable rollback: remove_server failed");
+                    }
+                }
+                for name in plugin_skill_names(registry, &marketplace, &plugin) {
+                    registry.mark_orphan(&name);
+                }
+                // ⚠️ 已知窄边界：若**这一步**回写也失败（settings I/O 在回滚中途再挂），账本停在步骤 ② 的
+                //    `enabledPlugins=true`，server 已摘 + skills 已 orphan，末态即降级前要消灭的半启用态。属
+                //    "降级之上的再降级"，不再有更可靠的兜底——Sub-B 的 boot reconcile 须容此残窗（勿假设回滚后账本
+                //    必为 false）。原 hook 错（`e`）优先上抛；回写错仅 WARN（避免淹没根因）。
+                if let Err(we) =
+                    write_enabled_plugin(plugin_id, false, scope, options.project_path, env)
+                {
+                    tracing::warn!(plugin = plugin_id, error = %we, "enable rollback: re-disable write failed (ledger may残留 enabled=true)");
+                }
+                return Err(e.into());
+            }
+            remounted.push(sname);
         }
     }
     tracing::info!(
@@ -840,8 +865,10 @@ mod tests {
         );
     }
 
-    /// 构造源 git 仓库（marketplace.json + audit plugin：1 skill + 可选 bundled server），返回 git source。
-    fn build_source_repo(repo: &Path, with_server: bool) -> Value {
+    /// 构造源 git 仓库（marketplace.json + audit plugin：1 skill + 给定 bundled server 名集合），返回 git
+    /// source。`servers` 空 = 无 server；文件名即挂载序（见 [`enumerate_bundled_server_files`](crate::skills::manifest)
+    /// 的 `sort`）/ build a source repo with the given bundled server names。
+    fn build_source_repo_with_servers(repo: &Path, servers: &[&str]) -> Value {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
@@ -855,14 +882,18 @@ mod tests {
             "---\nname: code-review\ndescription: review code\n---\nbody",
         )
         .unwrap();
-        if with_server {
+        if !servers.is_empty() {
             let sd = repo.join("plugins/audit/mcp-servers");
             fs::create_dir_all(&sd).unwrap();
-            fs::write(
-                sd.join("audit-mcp.json"),
-                r#"{"type":"stdio","name":"audit-mcp","server_parameters":{"command":"node"}}"#,
-            )
-            .unwrap();
+            for name in servers {
+                fs::write(
+                    sd.join(format!("{name}.json")),
+                    format!(
+                        r#"{{"type":"stdio","name":"{name}","server_parameters":{{"command":"node"}}}}"#
+                    ),
+                )
+                .unwrap();
+            }
         }
         git(&["init", "-q"], repo);
         git(&["add", "-A"], repo);
@@ -870,10 +901,25 @@ mod tests {
         serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())})
     }
 
+    /// 读 user settings 的 `enabledPlugins[<pid>]` 布尔值（解析 JSON，避免脆弱的子串断言）/ read the enabled flag。
+    fn enabled_flag(env: &EnvMap, pid: &str) -> Option<bool> {
+        let txt = fs::read_to_string(user_settings_path(Some(env))).ok()?;
+        let v: Value = serde_json::from_str(&txt).ok()?;
+        v.get("enabledPlugins")?.get(pid)?.as_bool()
+    }
+
     /// 预 clone catalog 进 home + 写 known_marketplaces.json；返回 (home, env, source)。
     async fn setup_installed_catalog(tmp: &TempDir, with_server: bool) -> (PathBuf, EnvMap, Value) {
+        setup_installed_catalog_servers(tmp, if with_server { &["audit-mcp"] } else { &[] }).await
+    }
+
+    /// 同上但显式给定 bundled server 名集合 / same but with explicit bundled server names。
+    async fn setup_installed_catalog_servers(
+        tmp: &TempDir,
+        servers: &[&str],
+    ) -> (PathBuf, EnvMap, Value) {
         let repo = tmp.path().join("repo");
-        let source = build_source_repo(&repo, with_server);
+        let source = build_source_repo_with_servers(&repo, servers);
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let env: EnvMap = EnvMap::new();
@@ -1232,6 +1278,136 @@ mod tests {
         );
         let txt = fs::read_to_string(&user_settings).unwrap();
         assert!(txt.contains("true"));
+    }
+
+    #[tokio::test]
+    async fn enable_rollback_on_register_failure_redisables_and_reorphans() {
+        // #94 点 4 回滚契约回归：enable 先写 enabledPlugins=true 再挂 server；register_server 失败须原子回滚
+        // （回写 false + 重 orphan skills），避免半启用态被 boot 恢复复活。
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let mut env = env;
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        );
+
+        let mut reg = SkillRegistry::new();
+        let hooks = RecordingHooks::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        // disable → 进入禁用态（enabledPlugins=false、skill orphaned）。
+        disable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            DisableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        assert!(reg.resolve("audit:code-review").is_none());
+
+        // enable 但 register_server 注定失败 → Err(Hook) + 原子回滚。
+        let failing = RecordingHooks::new().failing_register("audit-mcp");
+        let err = enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&failing),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::Hook(_)));
+
+        // 回滚末态：skill 重新 orphaned（非活跃）+ enabledPlugins 落定为 false（非半启用 true）。
+        assert!(reg.resolve("audit:code-review").is_none());
+        assert_eq!(enabled_flag(&env, "audit@acme"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn enable_rollback_removes_already_remounted_servers() {
+        // #94 点 4 回滚契约：多 server 时 register_server 中途失败，须摘除**本次已挂**的 server（不只回写账本）。
+        // 文件名 sort 决定挂载序（enumerate_bundled_server_files）：alpha-mcp 先挂成功、zeta-mcp 失败 → 回滚摘 alpha-mcp。
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) =
+            setup_installed_catalog_servers(&tmp, &["alpha-mcp", "zeta-mcp"]).await;
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let mut env = env;
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        );
+
+        let mut reg = SkillRegistry::new();
+        let hooks = RecordingHooks::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        disable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            DisableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+
+        // enable：第二个 server（zeta-mcp）注册失败 → 回滚摘除已挂的第一个（alpha-mcp）。
+        let failing = RecordingHooks::new().failing_register("zeta-mcp");
+        let err = enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&failing),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::Hook(_)));
+        // 已挂的 alpha-mcp 被回滚摘除；zeta-mcp 因 register 失败未进 remounted，故不在 removed。
+        assert_eq!(
+            *failing.removed.lock().unwrap(),
+            vec!["alpha-mcp".to_string()]
+        );
+        // 账本回写 false（确定性禁用末态）。
+        assert_eq!(enabled_flag(&env, "audit@acme"), Some(false));
     }
 
     #[tokio::test]

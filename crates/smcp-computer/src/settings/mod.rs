@@ -10,6 +10,7 @@
 */
 
 pub mod installer;
+pub mod lifecycle;
 pub mod mcp_config;
 pub mod policy;
 pub mod reconciler;
@@ -21,6 +22,13 @@ pub use installer::{
     disable_plugin, enable_plugin, install_plugin, uninstall_plugin, DisableOptions, EnableOptions,
     InstallOptions, McpHookError, McpInstallHooks, McpServerNameConflictError, PluginInstallError,
     UninstallOptions,
+};
+
+pub use lifecycle::{
+    add_marketplace, default_marketplace_name, marketplace_name_taken, normalize_marketplace_url,
+    refresh_marketplaces, remove_marketplace, resolve_marketplace_identity, AddMarketplaceParams,
+    GovernanceError, MarketplaceAddOutcome, MarketplaceIdentity, MarketplaceRefreshRow,
+    MarketplaceRemoveOutcome, RefreshStatus, RemoveMarketplaceParams,
 };
 
 pub use mcp_config::{

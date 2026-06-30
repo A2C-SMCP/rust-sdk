@@ -28,6 +28,16 @@ use crate::blob::{
     BlobThresholds, BlobTooLargeError, DecodedHandle, ResolvedBlob, SkillBlobResolver,
     SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
+// 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
+use crate::settings::installer::{
+    DisableOptions, EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError,
+    UninstallOptions,
+};
+use crate::settings::lifecycle::{
+    AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceRefreshRow,
+    MarketplaceRemoveOutcome, RemoveMarketplaceParams,
+};
+use crate::settings::reconciler::InstalledPluginRecord;
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
     workdir_skill_root, AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer,
@@ -678,6 +688,171 @@ impl<S: Session> Computer<S> {
     /// [`add_or_update_server`]: Self::add_or_update_server
     pub fn skill_registry_arc(&self) -> Arc<RwLock<SkillRegistry>> {
         Arc::clone(&self.skill_registry)
+    }
+
+    // ── Computer 级 marketplace / plugin 生命周期 API（#94）/ governance lifecycle API ──────
+    //
+    // 把 marketplace/plugin 生命周期编排从 `cli` feature 抬到 `Computer` 级（#93 北极星）：GUI/Tauri 产品
+    // client 无需启用 `cli` feature、无需直接触碰 `SkillRegistry`，即可在**构造期固定的 `skill_home` 边界内**
+    // 完成治理。统一锁纪律：取 `skill_registry` 写锁 → 调非 CLI 编排核心（[`crate::settings::lifecycle`] /
+    // [`crate::settings::installer`]）→ 成功后 `mark_skills_dirty()`。`home` 恒取自 `skill_home()`（运行期
+    // 只读，**无** setter），`env = None`（进程环境）。`McpInstallHooks` 保持可注入，让产品 client 把 plugin
+    // bundled MCP server 物化到自己的 MCP 配置模型。**不**含 boot 恢复 / `reconcile_governance()`（归 Sub-B）。
+
+    /// 添加 marketplace（归一 URL + 派生名 + clone/stage 或仅注册意图）/ add a marketplace。
+    ///
+    /// 信任门（user-scope `trustedMarketplaces`）由产品 client 在调用前自理——**不**属 `skill_home` 治理边界。
+    ///
+    /// # Errors
+    /// 见 [`GovernanceError`]（非法 URL/名、重名、clone 失败、账本写失败）。
+    pub async fn add_marketplace(
+        &self,
+        git_url: &str,
+        params: AddMarketplaceParams<'_>,
+    ) -> Result<MarketplaceAddOutcome, GovernanceError> {
+        let home = self.skill_home();
+        let res = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::lifecycle::add_marketplace(&mut reg, &home, None, git_url, params)
+                .await
+        };
+        if res.is_ok() {
+            self.mark_skills_dirty();
+        }
+        res
+    }
+
+    /// 刷新 marketplace（`git pull` 失败则全量重 clone；逐 marketplace 对账分类）/ refresh marketplaces。
+    ///
+    /// `target == "all"` → 全部已知 marketplace；否则单个目标。未知目标 → `missing` 行（不整体报错）。
+    pub async fn refresh_marketplace(&self, target: &str) -> Vec<MarketplaceRefreshRow> {
+        let home = self.skill_home();
+        let rows = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::lifecycle::refresh_marketplaces(&mut reg, &home, None, target).await
+        };
+        // refresh 即便全 unchanged 也可能翻活孤儿 / 重挂；统一标脏交去抖器判定。
+        self.mark_skills_dirty();
+        rows
+    }
+
+    /// 移除 marketplace（默认级联卸载其下 installed plugin + prune clone；`keep_plugins` 仅 prune）/ remove。
+    ///
+    /// trust 撤销（user-scope）由产品 client 自理。`hooks` 提供 `remove_server` 供级联卸载摘除 bundled server。
+    ///
+    /// # Errors
+    /// 未知 marketplace → [`GovernanceError::UnknownMarketplace`]。
+    pub async fn remove_marketplace(
+        &self,
+        name: &str,
+        params: RemoveMarketplaceParams<'_>,
+    ) -> Result<MarketplaceRemoveOutcome, GovernanceError> {
+        let home = self.skill_home();
+        let res = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::lifecycle::remove_marketplace(&mut reg, &home, None, name, params)
+                .await
+        };
+        if res.is_ok() {
+            self.mark_skills_dirty();
+        }
+        res
+    }
+
+    /// 安装单个 plugin（外来 MCP 同名硬抛、原子失败，§10.6）/ install a plugin。
+    ///
+    /// `options.env`/scope 由调用方按上下文给定；`home` 恒取 `skill_home()`。`hooks=None` ⇒ ledger-only。
+    ///
+    /// # Errors
+    /// 见 [`PluginInstallError`]（冲突 / 前置 / manifest / 定位 / 注入 / 账本）。
+    pub async fn install_plugin(
+        &self,
+        plugin_id: &str,
+        options: InstallOptions<'_>,
+        hooks: Option<&dyn McpInstallHooks>,
+    ) -> Result<InstalledPluginRecord, PluginInstallError> {
+        let home = self.skill_home();
+        let res = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::installer::install_plugin(plugin_id, &mut reg, &home, options, hooks)
+                .await
+        };
+        if res.is_ok() {
+            self.mark_skills_dirty();
+        }
+        res
+    }
+
+    /// 启用单个 plugin（廉价复原：复活 skills + 重挂 server；hook 失败原子回滚）/ enable a plugin。
+    ///
+    /// ⚠️ **scope 契约**：`options.scope` 须与安装 scope 一致（产品 client 从账本 `record.scope` 解析后传）。
+    ///
+    /// # Errors
+    /// 见 [`PluginInstallError`]（未安装 / 冲突 / manifest / settings 写 / 注入）。
+    pub async fn enable_plugin(
+        &self,
+        plugin_id: &str,
+        options: EnableOptions<'_>,
+        hooks: Option<&dyn McpInstallHooks>,
+    ) -> Result<(), PluginInstallError> {
+        let home = self.skill_home();
+        let res = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::installer::enable_plugin(plugin_id, &mut reg, &home, options, hooks)
+                .await
+        };
+        if res.is_ok() {
+            self.mark_skills_dirty();
+        }
+        res
+    }
+
+    /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；可经 [`enable_plugin`] 复原）/ disable。
+    ///
+    /// ⚠️ **scope 契约**：同 [`enable_plugin`](Self::enable_plugin)。
+    ///
+    /// # Errors
+    /// 见 [`PluginInstallError`]（id 非法 / settings 写 / `remove_server` 失败）。
+    pub async fn disable_plugin(
+        &self,
+        plugin_id: &str,
+        options: DisableOptions<'_>,
+        hooks: Option<&dyn McpInstallHooks>,
+    ) -> Result<(), PluginInstallError> {
+        let home = self.skill_home();
+        let res = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::installer::disable_plugin(plugin_id, &mut reg, &home, options, hooks)
+                .await
+        };
+        if res.is_ok() {
+            self.mark_skills_dirty();
+        }
+        res
+    }
+
+    /// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联停摘 bundled server + 删账本）/ uninstall。
+    ///
+    /// 未安装 / 无匹配 scope → `Ok(false)`（no-op）。
+    ///
+    /// # Errors
+    /// 见 [`PluginInstallError`]（id 非法 / `remove_server` 失败 / 账本写失败）。
+    pub async fn uninstall_plugin(
+        &self,
+        plugin_id: &str,
+        options: UninstallOptions<'_>,
+        hooks: Option<&dyn McpInstallHooks>,
+    ) -> Result<bool, PluginInstallError> {
+        let home = self.skill_home();
+        let res = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::installer::uninstall_plugin(plugin_id, &mut reg, &home, options, hooks)
+                .await
+        };
+        if matches!(res, Ok(true)) {
+            self.mark_skills_dirty();
+        }
+        res
     }
 
     /// 单页透传指定 MCP Server 的 `resources/list`（v0.2 `client:get_resources`）/ single-page passthrough。
@@ -2064,6 +2239,89 @@ mod tests {
         // skill_home 访问器。
         assert_eq!(computer.skill_home(), home);
         computer.shutdown().await.unwrap();
+    }
+
+    // ── #94：Computer 级 marketplace / plugin 生命周期 API ───────────────────────
+    #[tokio::test]
+    async fn computer_marketplace_add_and_remove_no_clone() {
+        use crate::settings::lifecycle::marketplace_name_taken;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // 不 boot_up：add/remove 只需 skill_registry 写锁 + skill_home（运行期只读、override 即足）。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        // 产品 client 经 Computer 方法添加 marketplace——**不**直接触碰 SkillRegistry，得结构化结果。
+        let outcome = computer
+            .add_marketplace(
+                "acme/skills",
+                AddMarketplaceParams {
+                    no_clone: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.name, "skills");
+        assert!(outcome.no_clone);
+        // 账本落在构造期固定的 skill_home 边界内。
+        assert!(marketplace_name_taken(
+            &computer.skill_home(),
+            None,
+            "skills"
+        ));
+
+        // 移除（保留 plugin 记录）→ prune 账本条目。
+        let removed = computer
+            .remove_marketplace(
+                "skills",
+                RemoveMarketplaceParams {
+                    keep_plugins: true,
+                    hooks: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.name, "skills");
+        assert!(removed.kept_plugins);
+        assert!(!marketplace_name_taken(
+            &computer.skill_home(),
+            None,
+            "skills"
+        ));
+
+        // 未知 marketplace → 结构化错误。
+        assert!(matches!(
+            computer
+                .remove_marketplace("ghost", RemoveMarketplaceParams::default())
+                .await,
+            Err(GovernanceError::UnknownMarketplace(n)) if n == "ghost"
+        ));
+    }
+
+    #[tokio::test]
+    async fn computer_plugin_wrappers_plumb_errors_and_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        // 非法 id → 错误经薄封装如实上抛（Precondition）。
+        assert!(matches!(
+            computer
+                .install_plugin("no-at-sign", InstallOptions::default(), None)
+                .await,
+            Err(PluginInstallError::Precondition(_))
+        ));
+        // 未安装 plugin uninstall → Ok(false) no-op（不标脏）。
+        assert!(!computer
+            .uninstall_plugin("ghost@acme", UninstallOptions::default(), None)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
