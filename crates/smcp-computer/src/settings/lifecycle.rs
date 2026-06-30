@@ -632,4 +632,243 @@ mod tests {
         assert_eq!(rows[0].name, "ghost");
         assert_eq!(rows[0].status, RefreshStatus::Missing);
     }
+
+    // ── 真实 git fixture + 记录式 hooks（级联卸载 / refresh 分类测试用）─────────────
+    fn git(args: &[&str], cwd: &Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 构造 marketplace 源仓库（audit plugin：1 skill）→ git source value。
+    fn build_repo(repo: &Path) -> Value {
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+        )
+        .unwrap();
+        let skill = repo.join("plugins/audit/skills/code-review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: review code\n---\nbody",
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        json!({"type": "git", "url": format!("file://{}", repo.display())})
+    }
+
+    /// 记录式 `McpInstallHooks` 替身：记录 `remove_server` 调用（级联卸载断言用）/ recording hooks。
+    struct RecordingHooks {
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl McpInstallHooks for RecordingHooks {
+        fn existing_server_names(&self) -> std::collections::HashSet<String> {
+            std::collections::HashSet::new()
+        }
+        async fn register_server(
+            &self,
+            _cfg: crate::mcp_clients::model::MCPServerConfig,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            Ok(())
+        }
+        async fn remove_server(
+            &self,
+            name: &str,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            self.removed.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+    }
+
+    /// 直接向 `installed_plugins.json` 写一条记录（绕过 install，专测 remove 级联）/ seed an install record。
+    fn seed_installed(home: &Path, pid: &str, bundled: &[&str]) {
+        let pid = pid.to_string();
+        let bundled: Vec<String> = bundled.iter().map(|s| s.to_string()).collect();
+        crate::settings::store::update_installed_plugins(
+            move |file| {
+                file.account.plugins.insert(
+                    pid,
+                    vec![crate::settings::reconciler::InstalledPluginRecord {
+                        install_path: None,
+                        bundled_mcp_servers: bundled,
+                        extra: Map::new(),
+                    }],
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+    }
+
+    fn is_installed(home: &Path, pid: &str) -> bool {
+        load_installed_plugins(Some(home), None)
+            .account
+            .plugins
+            .contains_key(pid)
+    }
+
+    // ---- 🔴1：remove_marketplace 级联卸载（keep_plugins=false 默认主路径）+ 跨 mp 隔离 ----
+    #[tokio::test]
+    async fn remove_marketplace_cascade_uninstalls_and_isolates_other_marketplace() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let mut registry = SkillRegistry::new();
+        let mk = || AddMarketplaceParams {
+            no_clone: true,
+            ..Default::default()
+        };
+        // 两个 marketplace：skills（待移除，下挂 audit@skills 带 bundled server）+ my-skills（须保留 x@my-skills）。
+        add_marketplace(&mut registry, home, None, "acme/skills", mk())
+            .await
+            .unwrap();
+        add_marketplace(&mut registry, home, None, "acme/my-skills", mk())
+            .await
+            .unwrap();
+        seed_installed(home, "audit@skills", &["audit-mcp"]);
+        seed_installed(home, "x@my-skills", &["x-mcp"]); // 后缀 @my-skills，不应被 @skills 命中
+
+        let hooks = RecordingHooks {
+            removed: std::sync::Mutex::new(Vec::new()),
+        };
+        let outcome = remove_marketplace(
+            &mut registry,
+            home,
+            None,
+            "skills",
+            RemoveMarketplaceParams {
+                keep_plugins: false,
+                hooks: Some(&hooks),
+            },
+        )
+        .await
+        .unwrap();
+
+        // ① 级联卸载命中 audit@skills；② bundled server 经 hook 摘除；③ prune 命中 skills。
+        assert_eq!(
+            outcome.uninstalled_plugins,
+            vec!["audit@skills".to_string()]
+        );
+        assert!(!outcome.kept_plugins);
+        assert_eq!(
+            *hooks.removed.lock().unwrap(),
+            vec!["audit-mcp".to_string()]
+        );
+        assert_eq!(outcome.pruned, vec!["skills".to_string()]);
+        // 账本：audit@skills 已删、known_marketplaces["skills"] 已 prune。
+        assert!(!is_installed(home, "audit@skills"));
+        assert!(!marketplace_name_taken(home, None, "skills"));
+        // 负向：x@my-skills（@ 锚点防跨 mp 误删）仍在；my-skills 仍在。
+        assert!(
+            is_installed(home, "x@my-skills"),
+            "@ 锚点应防跨 marketplace 误删"
+        );
+        assert!(marketplace_name_taken(home, None, "my-skills"));
+    }
+
+    // ---- 🔴2：refresh_marketplaces 的 Unchanged / Updated 分类（target=="all" + commitSha 对比）----
+    #[tokio::test]
+    async fn refresh_marketplaces_classifies_unchanged_then_updated() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let repo = dir.path().join("repo");
+        let source = build_repo(&repo);
+        let url = source
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let mut registry = SkillRegistry::new();
+
+        // 真实 clone 落账。
+        add_marketplace(
+            &mut registry,
+            home,
+            None,
+            &url,
+            AddMarketplaceParams {
+                name: Some("acme"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // refresh("all")：源未变 → commitSha 不变 → Unchanged。
+        let rows = refresh_marketplaces(&mut registry, home, None, "all").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "acme");
+        assert_eq!(
+            rows[0].status,
+            RefreshStatus::Unchanged,
+            "源未变应 Unchanged"
+        );
+
+        // 源仓库再提交一笔 → commitSha 变 → refresh 应 Updated。
+        std::fs::write(
+            repo.join("plugins/audit/skills/code-review/SKILL.md"),
+            "---\nname: code-review\ndescription: v2\n---\nbody2",
+        )
+        .unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "v2"], &repo);
+        let rows2 = refresh_marketplaces(&mut registry, home, None, "all").await;
+        assert_eq!(
+            rows2[0].status,
+            RefreshStatus::Updated,
+            "源更新后应 Updated"
+        );
+    }
+
+    // ---- 🟡3a：尾段仅 ".git" → 派生空名 → InvalidName（纯函数级触发）----
+    #[test]
+    fn resolve_identity_dotgit_only_tail_is_invalid_name() {
+        assert!(matches!(
+            resolve_marketplace_identity("https://example.com/.git", None),
+            Err(GovernanceError::InvalidName(_))
+        ));
+    }
+
+    // ---- 🟡3b：clone 不可达（stage 降级未落账）→ CloneFailed ----
+    #[tokio::test]
+    async fn add_unreachable_source_is_clone_failed() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let mut registry = SkillRegistry::new();
+        let bad = format!("file://{}/nonexistent-repo.git", dir.path().display());
+        let err = add_marketplace(
+            &mut registry,
+            home,
+            None,
+            &bad,
+            AddMarketplaceParams {
+                name: Some("acme"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GovernanceError::CloneFailed(_)));
+        // 降级铁律：未落 known_marketplaces。
+        assert!(!marketplace_name_taken(home, None, "acme"));
+    }
 }

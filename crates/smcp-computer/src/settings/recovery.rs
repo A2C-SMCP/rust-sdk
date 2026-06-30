@@ -76,9 +76,14 @@ use crate::skills::staging::{stage_marketplace_skills, MarketplaceStageOptions};
 /// [`recover_marketplace_skills`] 仅产出 skills 维度，`remounted_servers` 留空。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GovernanceRecoveryReport {
-    /// 成功重挂 skills 的启用 plugin id（`<plugin>@<mp>`）/ enabled plugin ids whose skills were restaged。
+    /// **marketplace clone 树存在（可达）故已尝试重挂**的启用 plugin id（`<plugin>@<mp>`）/ attempted plugins。
+    ///
+    /// ⚠️ 语义为「**clone 可达 + 已尝试 stage**」，**非**「保证注册了 skill」：成功判定以 clone 树存在为代理
+    /// （[`stage_marketplace_skills`] 失败降级吞错）。clone 存在但 manifest 损坏 / 条目非法时，pid 仍计入此处、
+    /// 但 [`restored_skills`](Self::restored_skills) 可能不含其 skill。**`restored_skills` 才是已注册 skill 的
+    /// 权威清单**（亦含合法但无 SKILL.md、仅带 bundled server 的 plugin → 不在 restored_skills 但在此）。
     pub restored_plugins: Vec<String>,
-    /// 本次重新注册的全部 marketplace SKILL 名 / all marketplace SKILL names re-registered。
+    /// 本次重新注册的全部 marketplace SKILL 名（**已注册 skill 的权威清单**）/ all SKILL names re-registered。
     pub restored_skills: Vec<String>,
     /// 经 hooks 成功重挂的 bundled MCP server 名（编排方第二阶段填充）/ bundled servers remounted via hooks。
     pub remounted_servers: Vec<String>,
@@ -517,5 +522,221 @@ mod tests {
         let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
         assert_eq!(report, GovernanceRecoveryReport::default());
         assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
+    }
+
+    // ---- 直接写 installed_plugins 记录（绕过 install）/ seed an install record -------
+    fn seed_install_record(home: &Path, pid: &str, install_path: Option<&Path>) {
+        let pid = pid.to_string();
+        let ip = install_path.map(|p| p.to_string_lossy().into_owned());
+        crate::settings::store::update_installed_plugins(
+            move |file| {
+                file.account.plugins.insert(
+                    pid,
+                    vec![crate::settings::reconciler::InstalledPluginRecord {
+                        install_path: ip,
+                        bundled_mcp_servers: Vec::new(),
+                        extra: Map::new(),
+                    }],
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// 造一个含单个 bundled server 文件的 plugin 根 / a plugin root with one bundled server file。
+    fn plugin_root_with_server(root: &Path, server_name: &str) -> PathBuf {
+        let sd = root.join("mcp-servers");
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(
+            sd.join(format!("{server_name}.json")),
+            format!(
+                r#"{{"type":"stdio","name":"{server_name}","server_parameters":{{"command":"node"}}}}"#
+            ),
+        )
+        .unwrap();
+        root.to_path_buf()
+    }
+
+    // ---- 🟡7：clone 存在但 manifest 损坏 → pid 计入 restored_plugins 但 restored_skills 空（钉记文档语义）----
+    #[tokio::test]
+    async fn recover_present_clone_broken_manifest_overcounts_plugins() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _src) = setup_installed(&tmp).await;
+        // 损坏 clone 的 marketplace.json（保留 clone 树存在）。
+        let manifest = crate::skills::home::marketplace_skill_dir(&home, "acme", &[])
+            .join(".tfrobot-plugin/marketplace.json");
+        fs::write(&manifest, b"{ not valid json").unwrap();
+
+        let mut fresh = SkillRegistry::new();
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &Map::new()).await;
+        // clone 树存在 → 不算 failed；pid 计入 restored_plugins；但无 skill 注册。
+        assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
+        assert!(report.failed_marketplaces.is_empty(), "clone 存在不算降级");
+        assert!(
+            report.restored_skills.is_empty(),
+            "manifest 损坏 → 无 skill 注册（restored_skills 才是权威）"
+        );
+    }
+
+    // ---- 🟡8a：显式 enabledPlugins=true → 恢复（三态之 true）----------------------
+    #[tokio::test]
+    async fn recover_respects_explicit_enabled_true() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _src) = setup_installed(&tmp).await;
+        let declared = json!({"enabledPlugins": {"audit@acme": true}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut fresh = SkillRegistry::new();
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+        assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
+        assert!(fresh.resolve("audit:code-review").is_some());
+    }
+
+    // ---- 🟡8b：无 '@' 的本地-only pid → 跳过（非 marketplace plugin，不 restored 不 skipped）----
+    #[tokio::test]
+    async fn recover_skips_local_only_pid_without_at() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        seed_install_record(&home, "local-only", None);
+        let mut fresh = SkillRegistry::new();
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &Map::new()).await;
+        assert!(report.restored_plugins.is_empty());
+        assert!(
+            report.skipped_disabled.is_empty(),
+            "无 '@' 非禁用、不计 skipped"
+        );
+        assert!(report.failed_marketplaces.is_empty());
+    }
+
+    // ---- 🟡8c/8d：collect 跳过损坏 bundled JSON + install_path None ----------------
+    #[tokio::test]
+    async fn collect_skips_broken_json_and_none_install_path() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let good = plugin_root_with_server(&tmp.path().join("good"), "good-mcp");
+        // 损坏 bundled JSON：mcp-servers/bad.json 非法。
+        let bad = tmp.path().join("bad");
+        fs::create_dir_all(bad.join("mcp-servers")).unwrap();
+        fs::write(bad.join("mcp-servers/bad.json"), b"{ not json").unwrap();
+
+        seed_install_record(&home, "good@acme", Some(&good));
+        seed_install_record(&home, "bad@acme", Some(&bad));
+        seed_install_record(&home, "nopath@acme", None);
+
+        let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
+        let names: Vec<&str> = servers.iter().map(MCPServerConfig::name).collect();
+        assert_eq!(
+            names,
+            vec!["good-mcp"],
+            "损坏 JSON + 无 install_path 均跳过"
+        );
+    }
+
+    // ---- 🟡8e：跨 plugin 同名 bundled server 去重（首见保留）------------------------
+    #[tokio::test]
+    async fn collect_dedups_same_named_servers_across_plugins() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let a = plugin_root_with_server(&tmp.path().join("a"), "shared-mcp");
+        let b = plugin_root_with_server(&tmp.path().join("b"), "shared-mcp");
+        seed_install_record(&home, "a@acme", Some(&a));
+        seed_install_record(&home, "b@acme", Some(&b));
+
+        let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
+        let names: Vec<&str> = servers.iter().map(MCPServerConfig::name).collect();
+        assert_eq!(names, vec!["shared-mcp"], "同名 server 跨 plugin 去重");
+    }
+
+    // ---- 🟡8f：单 marketplace 下多 plugin 分组恢复 --------------------------------
+    #[tokio::test]
+    async fn recover_groups_multiple_plugins_one_marketplace() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        // 两 plugin（audit/lint）的源仓 → stage catalog + 写 known_marketplaces。
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins":[{"name":"audit","source":"./plugins/audit"},{"name":"lint","source":"./plugins/lint"}]}"#,
+        )
+        .unwrap();
+        for p in ["audit", "lint"] {
+            let skill = repo.join(format!("plugins/{p}/skills/{p}-skill"));
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {p}-skill\ndescription: d\n---\nbody"),
+            )
+            .unwrap();
+        }
+        git(&["init", "-q"], &repo);
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+        let source = json!({"type":"git","url":format!("file://{}",repo.display())});
+        let mut throwaway = SkillRegistry::new();
+        stage(
+            "acme",
+            &source,
+            &mut throwaway,
+            &home,
+            MarketplaceStageOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let src_clone = source.clone();
+        update_known_marketplaces(
+            move |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    crate::settings::reconciler::KnownMarketplaceEntry {
+                        source: src_clone,
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+        seed_install_record(&home, "audit@acme", None);
+        seed_install_record(&home, "lint@acme", None);
+
+        let mut fresh = SkillRegistry::new();
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &Map::new()).await;
+        assert_eq!(
+            report.restored_plugins,
+            vec!["audit@acme".to_string(), "lint@acme".to_string()]
+        );
+        assert!(fresh.resolve("audit:audit-skill").is_some());
+        assert!(fresh.resolve("lint:lint-skill").is_some());
+    }
+
+    // ---- 🟡9：跨重启 disable 已知局限——禁用旗不在 declared（如写在未登记 workdir 的 project scope）→ 复活 ----
+    #[tokio::test]
+    async fn recover_revives_when_disable_flag_absent_from_declared() {
+        // 钉记已知局限（recovery.rs plugin_enabled / reconcile_governance doc）：若 enabledPlugins=false 写在
+        // **未并入 declared** 的 scope（如未登记 workdir 的 project/local），恢复时不可见 → plugin 被视为启用复活。
+        let tmp = TempDir::new().unwrap();
+        let (home, _src) = setup_installed(&tmp).await;
+        // declared 缺该 pid 的 false 旗（模拟禁用写在未登记 workdir 的 project scope）。
+        let declared = Map::new();
+        let mut fresh = SkillRegistry::new();
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+        assert_eq!(
+            report.restored_plugins,
+            vec!["audit@acme".to_string()],
+            "禁用旗不在 declared → 复活（已知局限，跨重启可靠禁用须 user scope）"
+        );
     }
 }

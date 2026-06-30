@@ -31,7 +31,7 @@ use crate::settings::installer::McpInstallHooks;
 use crate::settings::lifecycle::{
     marketplace_name_taken, refresh_marketplaces, register_or_stage_marketplace,
     remove_marketplace, resolve_marketplace_identity, AddMarketplaceParams, GovernanceError,
-    RefreshStatus, RemoveMarketplaceParams,
+    MarketplaceRefreshRow, MarketplaceRemoveOutcome, RefreshStatus, RemoveMarketplaceParams,
 };
 use crate::settings::schema::FIELD_TRUSTED_MARKETPLACES;
 use crate::settings::scope::{
@@ -51,6 +51,31 @@ pub use crate::settings::lifecycle::{default_marketplace_name, normalize_marketp
 // ── 输出辅助 / output helpers ────────────────────────────────────────────────
 fn map_store_err(e: SettingsStoreError) -> std::io::Error {
     std::io::Error::other(e.to_string())
+}
+
+/// `marketplace remove` 的 JSON 输出 / remove JSON output。
+///
+/// 抽成纯函数：键名（`removed`/`pruned`/`uninstalledPlugins`/`keptPlugins`）是**跨 SDK 兼容契约**，
+/// 经独立单测锁定 camelCase 防漂移（handler 内联 `json!` 无法在不捕获 stdout 下断言）。
+fn remove_outcome_json(outcome: &MarketplaceRemoveOutcome) -> Value {
+    json!({
+        "removed": outcome.name,
+        "pruned": outcome.pruned,
+        "uninstalledPlugins": outcome.uninstalled_plugins,
+        "keptPlugins": outcome.kept_plugins,
+    })
+}
+
+/// `marketplace refresh` 的逐行 JSON / refresh per-row JSON。
+///
+/// 同上键名契约（`name`/`status`/`skills`；`missing` 行省 `skills`）。
+fn refresh_rows_json(rows: &[MarketplaceRefreshRow]) -> Vec<Value> {
+    rows.iter()
+        .map(|r| match r.status {
+            RefreshStatus::Missing => json!({ "name": r.name, "status": "missing" }),
+            _ => json!({ "name": r.name, "status": r.status.as_str(), "skills": r.skills }),
+        })
+        .collect()
 }
 
 // ── 读视图辅助 / read-view helpers ───────────────────────────────────────────
@@ -429,12 +454,7 @@ pub async fn marketplace_remove(
     }
 
     if json_output {
-        print_json(&json!({
-            "removed": outcome.name,
-            "pruned": outcome.pruned,
-            "uninstalledPlugins": outcome.uninstalled_plugins,
-            "keptPlugins": outcome.kept_plugins,
-        }));
+        print_json(&remove_outcome_json(&outcome));
         return EXIT_OK;
     }
     let detail = if !outcome.uninstalled_plugins.is_empty() {
@@ -464,14 +484,7 @@ pub async fn marketplace_refresh(
     let rows = refresh_marketplaces(registry, home, env, target).await;
 
     if json_output {
-        let json_rows: Vec<Value> = rows
-            .iter()
-            .map(|r| match r.status {
-                RefreshStatus::Missing => json!({ "name": r.name, "status": "missing" }),
-                _ => json!({ "name": r.name, "status": r.status.as_str(), "skills": r.skills }),
-            })
-            .collect();
-        print_json(&json!(json_rows));
+        print_json(&json!(refresh_rows_json(&rows)));
         return EXIT_OK;
     }
     for r in &rows {
@@ -823,5 +836,59 @@ mod tests {
         assert!(load_mps(home, Some(&env))
             .marketplaces
             .contains_key("skills"));
+    }
+
+    // ── 🟡10：refresh handler 退出码 + JSON 键名 parity（跨 SDK 兼容契约）───────────
+    #[tokio::test]
+    async fn refresh_handler_empty_home_is_exit_ok() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let env = test_env(home);
+        let mut registry = SkillRegistry::new();
+        // 无 marketplace → 空行 → refresh 永远 EXIT_OK。
+        let code = marketplace_refresh(&mut registry, home, Some(&env), "all", true).await;
+        assert_eq!(code, EXIT_OK);
+    }
+
+    #[test]
+    fn remove_outcome_json_key_parity() {
+        let outcome = MarketplaceRemoveOutcome {
+            name: "skills".to_string(),
+            pruned: vec!["skills".to_string()],
+            uninstalled_plugins: vec!["audit@skills".to_string()],
+            kept_plugins: false,
+        };
+        let v = remove_outcome_json(&outcome);
+        // camelCase 键锁定（跨 SDK parity，防漂移）。
+        assert_eq!(v["removed"], json!("skills"));
+        assert_eq!(v["pruned"], json!(["skills"]));
+        assert_eq!(v["uninstalledPlugins"], json!(["audit@skills"]));
+        assert_eq!(v["keptPlugins"], json!(false));
+        assert_eq!(v.as_object().unwrap().len(), 4, "仅这 4 个键");
+    }
+
+    #[test]
+    fn refresh_rows_json_key_parity() {
+        let rows = vec![
+            MarketplaceRefreshRow {
+                name: "a".to_string(),
+                status: RefreshStatus::Updated,
+                skills: 3,
+            },
+            MarketplaceRefreshRow {
+                name: "b".to_string(),
+                status: RefreshStatus::Missing,
+                skills: 0,
+            },
+        ];
+        let v = refresh_rows_json(&rows);
+        // Updated 行：name/status/skills。
+        assert_eq!(v[0]["name"], json!("a"));
+        assert_eq!(v[0]["status"], json!("updated"));
+        assert_eq!(v[0]["skills"], json!(3));
+        // Missing 行：name/status（省 skills）。
+        assert_eq!(v[1]["name"], json!("b"));
+        assert_eq!(v[1]["status"], json!("missing"));
+        assert!(v[1].get("skills").is_none(), "missing 行省 skills");
     }
 }

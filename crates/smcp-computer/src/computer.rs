@@ -660,6 +660,16 @@ impl<S: Session> Computer<S> {
         self.skill_debouncer.mark_dirty();
     }
 
+    /// 是否有挂起未结算的 SKILL 去抖窗口（[`mark_skills_dirty`](Self::mark_skills_dirty) 已触发、尚未 emit）/
+    /// whether a SKILL settlement window is pending。
+    ///
+    /// 内省 / 测试用：治理封装（marketplace/plugin lifecycle、[`reconcile_governance`](Self::reconcile_governance)）
+    /// 成功后应标脏、空恢复不应标脏，本访问器使该接线可被断言（默认窗口 300ms，调用后同步可见）。
+    #[must_use]
+    pub fn skill_settlement_pending(&self) -> bool {
+        self.skill_debouncer.has_pending()
+    }
+
     /// SKILL Home 绝对根（CLI marketplace/skill 命令经此取物化根）/ the SKILL Home root。
     pub fn skill_home(&self) -> PathBuf {
         self.ensure_skill_home()
@@ -2698,6 +2708,73 @@ mod tests {
             "boot_up 后应从 ledger 恢复 marketplace skill"
         );
         comp_b.shutdown().await.unwrap();
+    }
+
+    // ── #94/#95 follow-up：Computer 薄封装的接线（skill_home / 写锁 / mark_skills_dirty）冒烟 ──────
+    //
+    // ⚠️ disable_plugin / enable_plugin(happy) 不在此做 Computer 级测试：Computer 封装恒用 `env = None`
+    // （运行期无注入 seam），二者会把 `enabledPlugins` 写到**真实** user settings（~/.config），污染开发机。
+    // 其完整启停语义在 installer 层经注入 env hermetic 覆盖（disable_then_enable_toggles_flag_and_skills 等）。
+    // 此处覆盖**不写 settings** 的封装路径：refresh（标脏接线）、enable 错误前置（不写不脏）、空恢复（不脏）。
+
+    /// 🟡4/🟡5：refresh_marketplace 薄封装冒烟——结构化行 + 成功标脏（skill_settlement_pending 探针）。
+    #[tokio::test]
+    async fn computer_refresh_marketplace_smoke_marks_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let comp = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        assert!(!comp.skill_settlement_pending(), "初始无挂起去抖窗口");
+
+        let rows = comp.refresh_marketplace("all").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "acme");
+        // 源未变 → Unchanged（真实 file:// pull，无新提交）。
+        assert_eq!(rows[0].status, crate::settings::RefreshStatus::Unchanged);
+        // refresh 封装恒标脏 → 去抖窗口挂起（300ms 内同步可见）。
+        assert!(
+            comp.skill_settlement_pending(),
+            "refresh_marketplace 成功应触发 mark_skills_dirty"
+        );
+    }
+
+    /// 🟡4/🟡5：enable_plugin 薄封装错误前置——未安装 → Precondition，且**不写不脏**（Err 不标脏）。
+    #[tokio::test]
+    async fn computer_enable_plugin_error_path_does_not_mark_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let comp = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        // 未安装 → enable 在写 enabledPlugins 之前即 Precondition 失败（不触真实 settings）。
+        let err = comp
+            .enable_plugin("ghost@acme", EnableOptions::default(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginInstallError::Precondition(_)));
+        assert!(
+            !comp.skill_settlement_pending(),
+            "失败封装不应 mark_skills_dirty"
+        );
+    }
+
+    /// 🟡6：空 home reconcile_governance → 0 skills → 不标脏（假分支的 Computer 级断言）。
+    #[tokio::test]
+    async fn reconcile_governance_empty_home_does_not_mark_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let comp = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        let report = comp.reconcile_governance(None).await;
+        assert!(report.restored_skills.is_empty());
+        assert!(
+            !comp.skill_settlement_pending(),
+            "恢复 0 skills 不应 mark_skills_dirty"
+        );
     }
 
     #[tokio::test]
