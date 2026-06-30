@@ -37,7 +37,10 @@ use crate::settings::lifecycle::{
     AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceRefreshRow,
     MarketplaceRemoveOutcome, RemoveMarketplaceParams,
 };
+use crate::settings::policy::resolve_policy_settings;
 use crate::settings::reconciler::InstalledPluginRecord;
+use crate::settings::recovery::GovernanceRecoveryReport;
+use crate::settings::scope::{resolve_settings, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
     workdir_skill_root, AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer,
@@ -855,6 +858,87 @@ impl<S: Session> Computer<S> {
         res
     }
 
+    /// 治理状态启动恢复（从 `skill_home` 持久化 ledger 重建边界内派生态）/ governance boot recovery（#95）。
+    ///
+    /// 冷启动 / 进程重启后，从 `installed_plugins.json` + `known_marketplaces.json` 重挂**已装且启用**的
+    /// marketplace plugin skills；给定 `hooks` 时再经 [`McpInstallHooks`] 重挂其 bundled MCP server（SDK 决定
+    /// 「哪些」= 已装且启用 plugin 的 bundled server，client 经 hooks 决定「如何物化」）。由
+    /// [`boot_up`](Self::boot_up)（`hooks = None`）自动调用，亦允许 client 显式调用驱动 MCP 重挂。
+    ///
+    /// - **幂等**：重复调用（boot 自动 + client 显式）结果一致，不重复注册 / 重复 staging。
+    /// - **enabled 门控**：仅 `enabledPlugins[pid] != false` 的已装 plugin 恢复——显式 `false`（disable / #94
+    ///   enable-rollback 落定）**不**复活，含已回滚的半装 plugin（窄残窗见
+    ///   [`installer`](crate::settings::installer) enable 回滚注释，本恢复据账本视其为启用、与持久化态一致）。
+    /// - **降级铁律**：marketplace 源不可达 / clone 树缺失 → WARN 降级、**不**阻断；`register_server` 失败 →
+    ///   WARN、**不**阻断（best-effort 重挂）。
+    /// - **边界**（#93 Non-Goal）：只在**构造期固定的 `skill_home`** 内重建派生态，**不**改 `skill_home` /
+    ///   配置根 / skill 源根。`home = skill_home()`、`env = None`（进程环境）。
+    /// - **锁纪律**：阶段一持 `skill_registry` 写锁重挂 skills；**释放写锁后**再经 hooks 重挂 server，避免
+    ///   「skill 写锁 → mcp_manager 锁」相反序死锁（见 [`restage_mcp_skills`](Self::restage_mcp_skills) 锁序）。
+    ///
+    /// ## 调用方须知 / Caller notes
+    /// - **boot 仅恢复 skills 派生态**：[`boot_up`](Self::boot_up) 以 `hooks = None` 调用 → 阶段二跳过，**boot
+    ///   不重挂任何 bundled MCP server**（boot 期 SDK 无 hooks 对象）。bundled MCP 恢复由 **client** 承担：要么
+    ///   client 在重启时把 bundled server 物化进**自己的 MCP 配置模型**（boot 的 `manager.initialize` 自然重挂），
+    ///   要么 client 重启后**显式**调 `reconcile_governance(Some(hooks))` 让 SDK 决定「哪些」、client hooks 物化
+    ///   「如何」。此为 #93 point 4「client owns MCP config」边界的直接后果，非疏漏。
+    /// - **运行期显式调用会阻塞 skill 读**：阶段一对**全部** marketplace 串行 stage 且写锁跨 stage await。常态
+    ///   （clone 树已存在、`refresh = false`）仅本地 FS、无网络，开销小；但 clone 树缺失需 clone 时单源最坏
+    ///   `DEFAULT_GIT_TIMEOUT`，期间 `get_skills` 等 skill 读阻塞。宜**低频 / 受控**触发（恢复语义本就一次性）。
+    /// - **跨重启 disable 语义以 user scope 为准**：enabled 门控读合并 `declared`，其 project/local 层仅来自
+    ///   当前 `active_workdir` + 已登记 workdir 的能力发现层并集。写在**未登记 workdir 的 project/local scope**
+    ///   的 `enabledPlugins=false` 在恢复时可能不可见 → 该 plugin 被复活。**跨重启可靠禁用应写 user scope**
+    ///   （对齐 installer disable/enable 的 scope 契约：scope 须与安装 scope 一致、由调用方据上下文传）。
+    ///
+    /// 返回 [`GovernanceRecoveryReport`]（恢复 / 跳过 / 降级明细，供观测与测试）。
+    pub async fn reconcile_governance(
+        &self,
+        hooks: Option<&dyn McpInstallHooks>,
+    ) -> GovernanceRecoveryReport {
+        let home = self.skill_home();
+        // 合并 `enabledPlugins` 声明视图（能力发现层并集 + user + policy）；env=None（进程环境）。
+        let policy = resolve_policy_settings(None, None, None);
+        let workdirs = self.registered_workdirs();
+        let active = self.active_workdir();
+        let declared = resolve_settings(ResolveSettingsArgs {
+            registered_workdirs: &workdirs,
+            active_workdir: active.as_deref(),
+            env: None,
+            flag_settings_path: None,
+            policy_settings: Some(&policy),
+        })
+        .settings;
+
+        // 阶段一：重挂 marketplace skills（持 `skill_registry` 写锁；stage 含 git await，boot 期无并发故安全）。
+        let mut report = {
+            let mut reg = self.skill_registry.write().await;
+            crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, None, &declared)
+                .await
+        };
+
+        // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
+        if let Some(h) = hooks {
+            for cfg in
+                crate::settings::recovery::collect_enabled_bundled_servers(&home, None, &declared)
+            {
+                let name = cfg.name().to_string();
+                match h.register_server(cfg).await {
+                    Ok(()) => report.remounted_servers.push(name),
+                    Err(e) => {
+                        warn!(server = %name, error = %e,
+                            "reconcile_governance: remount register_server failed (non-blocking)");
+                    }
+                }
+            }
+        }
+
+        // 派生注册表已变更才标脏（交去抖器 emit `server:update_skills`；boot 期 socketio 未连 → no-op）。
+        if !report.restored_skills.is_empty() {
+            self.mark_skills_dirty();
+        }
+        report
+    }
+
     /// 单页透传指定 MCP Server 的 `resources/list`（v0.2 `client:get_resources`）/ single-page passthrough。
     ///
     /// Computer 仅作透传层：无 scheme/元数据过滤、无跨 Server 聚合，翻页由调用方经 `cursor` 控制
@@ -1151,10 +1235,21 @@ impl<S: Session> Computer<S> {
             }
         }
 
-        // SKILL：解析 Home + 物化 mcp 源（_restage_mcp_skills，boot 时多为空——server 后续接入）+ 初次全量
-        // 发现 user 源（= invalidate_user_skills）+ 启 watcher。三者各自失败隔离；marketplace 源 reconcile 归
-        // #60/#61（非 boot）。对标 Python boot_up SKILL 子系统初始化。
+        // SKILL：解析 Home + **治理启动恢复**（#95：从 ledger 重挂已装/启用 marketplace plugin skills，
+        // boot 不带 hooks → 仅恢复 skills 派生态；bundled MCP 重挂由 client 显式 reconcile_governance(hooks)
+        // 或其自身 MCP 配置物化承担，对齐 #93 client-owns-MCP-config 边界）+ 物化 mcp 源（_restage_mcp_skills，
+        // boot 时多为空——server 后续接入）+ 初次全量发现 user 源（= invalidate_user_skills）+ 启 watcher。
+        // 各自失败隔离。对标 Python boot_up SKILL 子系统初始化。
         self.ensure_skill_home();
+        let recovery = self.reconcile_governance(None).await;
+        if !recovery.restored_plugins.is_empty() || !recovery.failed_marketplaces.is_empty() {
+            info!(
+                restored_plugins = recovery.restored_plugins.len(),
+                restored_skills = recovery.restored_skills.len(),
+                failed_marketplaces = recovery.failed_marketplaces.len(),
+                "governance boot recovery complete"
+            );
+        }
         self.restage_mcp_skills(None).await;
         self.invalidate_user_skills().await;
         self.start_skill_watcher().await;
@@ -2322,6 +2417,287 @@ mod tests {
             .uninstall_plugin("ghost@acme", UninstallOptions::default(), None)
             .await
             .unwrap());
+    }
+
+    // ── #95：Computer::reconcile_governance + boot 启动恢复 ───────────────────────
+    /// 真实 git 子进程（与 staging / installer 测试同款假设：本机有 git）/ git subprocess helper。
+    fn git95(args: &[&str], cwd: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 构造 marketplace 源仓库（audit plugin：1 skill + 1 bundled MCP server）→ file:// url。
+    fn build_marketplace_repo95(repo: &std::path::Path) -> String {
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+        )
+        .unwrap();
+        let skill = repo.join("plugins/audit/skills/code-review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: review code\n---\nbody",
+        )
+        .unwrap();
+        // bundled MCP server（供 reconcile_governance 阶段二经 hooks 重挂）。
+        let servers = repo.join("plugins/audit/mcp-servers");
+        std::fs::create_dir_all(&servers).unwrap();
+        std::fs::write(
+            servers.join("audit-mcp.json"),
+            r#"{"type":"stdio","name":"audit-mcp","server_parameters":{"command":"node"}}"#,
+        )
+        .unwrap();
+        git95(&["init", "-q"], repo);
+        git95(&["add", "-A"], repo);
+        git95(&["commit", "-qm", "init"], repo);
+        format!("file://{}", repo.display())
+    }
+
+    /// 记录式 `McpInstallHooks` 替身（重挂阶段二测试用；可注入注定失败的 `register_server`）/ recording hooks。
+    struct RecordingRemountHooks {
+        registered: std::sync::Mutex<Vec<String>>,
+        fail_register: Option<String>,
+    }
+    impl RecordingRemountHooks {
+        fn new() -> Self {
+            Self {
+                registered: std::sync::Mutex::new(Vec::new()),
+                fail_register: None,
+            }
+        }
+        fn failing(name: &str) -> Self {
+            Self {
+                registered: std::sync::Mutex::new(Vec::new()),
+                fail_register: Some(name.to_string()),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl McpInstallHooks for RecordingRemountHooks {
+        fn existing_server_names(&self) -> std::collections::HashSet<String> {
+            std::collections::HashSet::new()
+        }
+        async fn register_server(
+            &self,
+            cfg: MCPServerConfig,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            if self.fail_register.as_deref() == Some(cfg.name()) {
+                return Err(crate::settings::installer::McpHookError(format!(
+                    "boom on {}",
+                    cfg.name()
+                )));
+            }
+            self.registered.lock().unwrap().push(cfg.name().to_string());
+            Ok(())
+        }
+        async fn remove_server(
+            &self,
+            _name: &str,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            Ok(())
+        }
+    }
+
+    /// 重启前装配：Computer A add marketplace（真实 clone）+ install audit@acme（写 ledger）→ 返回 home。
+    async fn cold_start_setup95(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url = build_marketplace_repo95(&tmp.path().join("repo"));
+        let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob-a"));
+        comp_a
+            .add_marketplace(
+                &url,
+                AddMarketplaceParams {
+                    name: Some("acme"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        comp_a
+            .install_plugin("audit@acme", InstallOptions::default(), None)
+            .await
+            .unwrap();
+        home
+    }
+
+    /// 冷启动恢复：Computer A 经 SDK API add+install（写 ledger），新 Computer B 同 skill_home
+    /// 经 `reconcile_governance` 从 ledger 重挂 marketplace skill（registry 重启即空 → 恢复）+ 幂等。
+    #[tokio::test]
+    async fn reconcile_governance_cold_start_restores_installed_plugin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url = build_marketplace_repo95(&tmp.path().join("repo"));
+
+        // ── 重启前：Computer A 添加 marketplace（真实 clone）+ 安装 plugin（写 installed_plugins.json）。
+        let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob-a"));
+        comp_a
+            .add_marketplace(
+                &url,
+                AddMarketplaceParams {
+                    name: Some("acme"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        comp_a
+            .install_plugin("audit@acme", InstallOptions::default(), None)
+            .await
+            .unwrap();
+        assert!(comp_a
+            .skill_registry_arc()
+            .read()
+            .await
+            .resolve("audit:code-review")
+            .is_some());
+        drop(comp_a);
+
+        // ── 重启后：Computer B 同 skill_home、registry 为空 → reconcile_governance 从 ledger 恢复。
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        assert!(
+            comp_b
+                .skill_registry_arc()
+                .read()
+                .await
+                .resolve("audit:code-review")
+                .is_none(),
+            "新进程 registry 恢复前应为空"
+        );
+
+        let report = comp_b.reconcile_governance(None).await;
+        assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        assert!(report.failed_marketplaces.is_empty());
+        assert!(
+            comp_b
+                .skill_registry_arc()
+                .read()
+                .await
+                .resolve("audit:code-review")
+                .is_some(),
+            "冷启动应从 ledger 恢复 marketplace skill"
+        );
+
+        // 幂等：再调一次仍恢复同一 skill、不重复 / 不 panic。
+        let report2 = comp_b.reconcile_governance(None).await;
+        assert_eq!(
+            report2.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        assert!(comp_b
+            .skill_registry_arc()
+            .read()
+            .await
+            .resolve("audit:code-review")
+            .is_some());
+    }
+
+    /// 阶段二：给定 hooks → 重挂 bundled MCP server；report.remounted_servers 命中 + hook 收到注册 + 幂等。
+    #[tokio::test]
+    async fn reconcile_governance_remounts_bundled_servers_via_hooks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp_b.reconcile_governance(Some(&hooks)).await;
+
+        // skills 恢复 + bundled server 经 hooks 重挂。
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        assert_eq!(report.remounted_servers, vec!["audit-mcp".to_string()]);
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()]
+        );
+
+        // 幂等：二次调用仍重挂同一 server（register-or-update，by name 幂等）、不 panic。
+        let report2 = comp_b.reconcile_governance(Some(&hooks)).await;
+        assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
+    }
+
+    /// 失败隔离铁律：`register_server` 注定失败 → 不 panic、不阻断、skills 仍恢复、failed server 不入 report。
+    #[tokio::test]
+    async fn reconcile_governance_register_failure_is_non_blocking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let hooks = RecordingRemountHooks::failing("audit-mcp");
+        // 不 panic、正常返回。
+        let report = comp_b.reconcile_governance(Some(&hooks)).await;
+
+        // skills 阶段不受 MCP 重挂失败影响，仍恢复。
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        assert!(
+            comp_b
+                .skill_registry_arc()
+                .read()
+                .await
+                .resolve("audit:code-review")
+                .is_some(),
+            "register_server 失败不应阻断 skill 恢复"
+        );
+        // 失败的 server 未计入 remounted、也未被 hook 记录为成功。
+        assert!(report.remounted_servers.is_empty());
+        assert!(hooks.registered.lock().unwrap().is_empty());
+    }
+
+    /// acceptance #1 字面：`boot_up()` 后 marketplace skill 已从 ledger 恢复（走 boot 接线、非直调）。
+    #[tokio::test]
+    async fn reconcile_governance_boot_up_restores_from_ledger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        comp_b.boot_up().await.unwrap();
+
+        // boot_up 经 reconcile_governance(None) 从 ledger 重挂 marketplace skill（boot 不带 hooks → 仅 skills）。
+        let skills = comp_b.get_skills().await;
+        assert!(
+            skills.iter().any(|s| s.name == "audit:code-review"),
+            "boot_up 后应从 ledger 恢复 marketplace skill"
+        );
+        comp_b.shutdown().await.unwrap();
     }
 
     #[tokio::test]

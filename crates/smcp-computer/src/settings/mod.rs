@@ -14,6 +14,7 @@ pub mod lifecycle;
 pub mod mcp_config;
 pub mod policy;
 pub mod reconciler;
+pub mod recovery;
 pub mod schema;
 pub mod scope;
 pub mod store;
@@ -53,6 +54,10 @@ pub use reconciler::{
     list_orphan_plugins, prune_marketplaces, reconcile, InstalledPluginRecord, InstalledPlugins,
     KnownMarketplaceEntry, KnownMarketplaces, McpTeardown, ReconcileOptions, ReconcileReport,
     SkillGovernanceStore,
+};
+
+pub use recovery::{
+    collect_enabled_bundled_servers, recover_marketplace_skills, GovernanceRecoveryReport,
 };
 
 pub use schema::{
