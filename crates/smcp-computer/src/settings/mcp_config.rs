@@ -58,8 +58,8 @@ use crate::settings::schema::{
     FIELD_DISABLED_MCPJSON_SERVERS, FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP,
 };
 use crate::settings::scope::{
-    apply_write, load_settings_file, resolve_user_config_dir, workdir_local_settings_path,
-    workdir_settings_dir, EnvMap, WriteValue,
+    apply_write, load_settings_file, resolve_cwd, resolve_user_config_dir,
+    workdir_local_settings_path, workdir_settings_dir, EnvMap, WriteValue,
 };
 use crate::settings::store::{self, load_installed_plugins, SettingsStoreError};
 
@@ -68,7 +68,7 @@ use crate::settings::store::{self, load_installed_plugins, SettingsStoreError};
 // ---------------------------------------------------------------------------
 /// user / project scope 定义文件名（§9.1）/ definition filename for user/project scope。
 pub const MCP_CONFIG_FILENAME: &str = "mcp.json";
-/// active workdir local scope 文件名（不入 git）/ local-scope filename (not git-tracked)。
+/// local scope 文件名（`<cwd>/.tfrobot/`，不入 git）/ local-scope filename (not git-tracked)。
 pub const MCP_LOCAL_CONFIG_FILENAME: &str = "mcp.local.json";
 /// policy scope 文件名（企业下发）/ policy-scope filename (enterprise-managed)。
 pub const MANAGED_MCP_FILENAME: &str = "managed-mcp.json";
@@ -86,12 +86,11 @@ const TRUSTED_ORIGINS: &[SettingsScope] = &[
 // ---------------------------------------------------------------------------
 // 错误 / Errors
 // ---------------------------------------------------------------------------
-/// MCP 定义/批准写助手的契约违例（如批准写缺 active workdir）/ Contract violation in MCP config helpers。
+/// MCP 批准写助手的失败（持锁写 / I/O）/ Failure of an MCP approval-write helper (locked write / I/O)。
+///
+/// #98：`Contract`（批准写缺 active workdir）已随 workdir 概念瘦身移除——批准写锚定进程 cwd、无 fail-fast。
 #[derive(Debug, thiserror::Error)]
 pub enum McpConfigError {
-    /// 契约违例（缺 active workdir 等）/ contract violation。
-    #[error("{0}")]
-    Contract(String),
     /// local settings 持锁写失败 / locked write failed。
     #[error(transparent)]
     Store(#[from] SettingsStoreError),
@@ -168,8 +167,9 @@ pub struct RawMcpConfigFile {
 /// [`resolve_mcp_config`] 入参 / arguments to [`resolve_mcp_config`]。
 #[derive(Default)]
 pub struct ResolveMcpConfigArgs<'a> {
-    /// 当前绑定任务的单根（project/local 来源）；`None` = 空闲 / active workdir (None = idle)。
-    pub active_workdir: Option<&'a Path>,
+    /// project/local 锚定的工作目录；`None` → 进程 cwd / project/local anchor, `None` → process cwd。
+    /// #98：`Computer` 不再持有 workspace，project/local 锚定进程 cwd。测试注入接缝（镜像 `env`）；生产传 `None`。
+    pub cwd: Option<&'a Path>,
     /// 环境映射（解析 user config dir），`None` → 进程环境 / env map。
     pub env: Option<&'a EnvMap>,
     /// `--config @file` 老接口文件（最低优先级，§5.5）/ legacy flag config path。
@@ -418,10 +418,11 @@ fn validate_input(
 // ---------------------------------------------------------------------------
 /// 多 scope 加载合并 `.tfrobot/mcp.json` + 字段级校验 / Multi-scope load + merge + validate mcp.json。
 ///
-/// 合并顺序 low → high = `[flag, user, active-project, active-local, policy]`（优先级
-/// `policy > local > project > user > flag`，§9.1/§5.5）；**无能力层并集**。`active_workdir is None` →
-/// project/local 全空。server 按 name **整体替换**（`origin` = 最高定义 scope）；inputs 按 `id` 去重高 scope 胜
-/// （缺 `id` 的条目各自保留以逐条报错）。单 server / input 畸形 → drop + 错误，**不 abort**（§5.6）。
+/// 合并顺序 low → high = `[flag, user, project, local, policy]`（优先级
+/// `policy > local > project > user > flag`，§9.1/§5.5）；**无能力层并集**。#98：project/local **无条件**锚定
+/// 进程 cwd（`cwd` 注入接缝，`None` → `std::env::current_dir()`；cwd 不可读则该两层缺省）。server 按 name
+/// **整体替换**（`origin` = 最高定义 scope）；inputs 按 `id` 去重高 scope 胜（缺 `id` 的条目各自保留以逐条报错）。
+/// 单 server / input 畸形 → drop + 错误，**不 abort**（§5.6）。
 #[must_use]
 pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
     let managed_path = args
@@ -435,9 +436,10 @@ pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
         layers.push((SettingsScope::Flag, fc.to_path_buf()));
     }
     layers.push((SettingsScope::User, user_mcp_config_path(args.env)));
-    if let Some(wd) = args.active_workdir {
-        layers.push((SettingsScope::Project, workdir_mcp_config_path(wd)));
-        layers.push((SettingsScope::Local, workdir_mcp_local_config_path(wd)));
+    // project/local：无条件锚定进程 cwd（cwd 不可读 → 跳过该两层）。
+    if let Some(base) = resolve_cwd(args.cwd) {
+        layers.push((SettingsScope::Project, workdir_mcp_config_path(&base)));
+        layers.push((SettingsScope::Local, workdir_mcp_local_config_path(&base)));
     }
     layers.push((SettingsScope::Policy, managed_path));
 
@@ -580,15 +582,17 @@ pub fn bundled_mcp_server_names(home: Option<&Path>, env: Option<&EnvMap>) -> Ha
 // ---------------------------------------------------------------------------
 // 批准写助手（写 local scope = settings.local.json）/ Approval write helpers（§9.2）
 // ---------------------------------------------------------------------------
-/// 批准写须落 local scope = active workdir；缺则 fail-fast / local-scope guard。
-fn require_active_workdir(active_workdir: Option<&Path>) -> Result<PathBuf, McpConfigError> {
-    match active_workdir {
-        Some(p) if !p.as_os_str().is_empty() => Ok(p.to_path_buf()),
-        _ => Err(McpConfigError::Contract(
-            "MCP approval write requires an active workdir (local scope); none provided"
-                .to_string(),
-        )),
-    }
+/// 批准写落 local scope = `<cwd>/.tfrobot/settings.local.json`（cwd 注入接缝，`None` → 进程 cwd）。
+///
+/// #98：不再需要 active workdir——批准写锚定进程 cwd（无 fail-fast）。进程 cwd 不可读（罕见）→ `Io` 错误。
+fn local_settings_write_path(cwd: Option<&Path>) -> Result<PathBuf, McpConfigError> {
+    let base = resolve_cwd(cwd).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "process cwd unavailable for local write",
+        )
+    })?;
+    Ok(workdir_local_settings_path(&base))
 }
 
 /// 把 `name` 追加进 local `settings.local.json` 的某 MCP 数组字段（持锁原子 RMW + dedup）/ Append to a local array。
@@ -596,12 +600,11 @@ fn require_active_workdir(active_workdir: Option<&Path>) -> Result<PathBuf, McpC
 /// 复用 store 旁车锁 + 原子写 + scope 的 [`load_settings_file`] / [`apply_write`]（数组整体替换，§5.4）；
 /// settings.local.json 人编意图层 → 无写保护头。锁内读-改-写杜绝并发丢更新。
 fn append_local_mcp_array(
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     field_name: &str,
     name: &str,
 ) -> Result<(), McpConfigError> {
-    let wd = require_active_workdir(active_workdir)?;
-    let path = workdir_local_settings_path(&wd);
+    let path = local_settings_write_path(cwd)?;
     store::with_settings_lock(&path, || -> io::Result<()> {
         let (existing, _errors) = load_settings_file(&path, SettingsScope::Local);
         let mut current: Vec<String> = existing
@@ -632,27 +635,32 @@ fn append_local_mcp_array(
 
 /// 批准框 `[y]es`：追加 `enabledMcpjsonServers` 到 local scope（§9.2）/ Approve → append to enabled list (local)。
 ///
+/// #98：写锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
+///
 /// # Errors
-/// 缺 active workdir / 写失败 → [`McpConfigError`]。
-pub fn approve_mcp_server(name: &str, active_workdir: Option<&Path>) -> Result<(), McpConfigError> {
-    append_local_mcp_array(active_workdir, FIELD_ENABLED_MCPJSON_SERVERS, name)
+/// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
+pub fn approve_mcp_server(name: &str, cwd: Option<&Path>) -> Result<(), McpConfigError> {
+    append_local_mcp_array(cwd, FIELD_ENABLED_MCPJSON_SERVERS, name)
 }
 
 /// 批准框 `[n]o`：追加 `disabledMcpjsonServers` 到 local scope（§9.2）/ Deny → append to disabled list (local)。
 ///
+/// #98：写锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
+///
 /// # Errors
-/// 缺 active workdir / 写失败 → [`McpConfigError`]。
-pub fn deny_mcp_server(name: &str, active_workdir: Option<&Path>) -> Result<(), McpConfigError> {
-    append_local_mcp_array(active_workdir, FIELD_DISABLED_MCPJSON_SERVERS, name)
+/// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
+pub fn deny_mcp_server(name: &str, cwd: Option<&Path>) -> Result<(), McpConfigError> {
+    append_local_mcp_array(cwd, FIELD_DISABLED_MCPJSON_SERVERS, name)
 }
 
 /// 批准框 `[a]ll`：`enableAllProjectMcpServers=true` 写 local scope（§9.2）/ Approve-all → set the bool (local)。
 ///
+/// #98：写锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
+///
 /// # Errors
-/// 缺 active workdir / 写失败 → [`McpConfigError`]。
-pub fn approve_all_project_mcp(active_workdir: Option<&Path>) -> Result<(), McpConfigError> {
-    let wd = require_active_workdir(active_workdir)?;
-    let path = workdir_local_settings_path(&wd);
+/// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
+pub fn approve_all_project_mcp(cwd: Option<&Path>) -> Result<(), McpConfigError> {
+    let path = local_settings_write_path(cwd)?;
     store::with_settings_lock(&path, || -> io::Result<()> {
         let (existing, _errors) = load_settings_file(&path, SettingsScope::Local);
         let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
@@ -772,7 +780,7 @@ mod tests {
         );
 
         let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             // 用不存在的 managed 路径，避免读到真实系统 managed-mcp.json。
             managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
@@ -895,16 +903,12 @@ mod tests {
         assert!(names.contains("audit-mcp"));
     }
 
-    // ---- 批准写助手 ----------------------------------------------------------
+    // ---- 批准写助手（#98：锚定 cwd，无 fail-fast）----------------------------
     #[test]
     fn approve_deny_and_all_write_local_settings_with_dedup() {
+        // #98：批准写锚定注入 cwd（`Some(&wd)`），不再要求 active workdir、无 fail-fast。
         let tmp = TempDir::new().unwrap();
         let wd = tmp.path().join("wd");
-        // 缺 active workdir → Contract 错。
-        assert!(matches!(
-            approve_mcp_server("s", None),
-            Err(McpConfigError::Contract(_))
-        ));
 
         approve_mcp_server("s", Some(&wd)).unwrap();
         approve_mcp_server("s", Some(&wd)).unwrap(); // dedup
@@ -997,11 +1001,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_user_only_when_no_active_workdir() {
+    fn resolve_mcp_config_anchors_project_at_cwd() {
+        // #98：project/local 锚定注入 cwd。cwd=Some(wd) 时读 <wd>/.tfrobot/mcp.json：
+        // srv-p → origin=Project、trusted_origin=false（project/local 非受信、须门控）。
         let tmp = TempDir::new().unwrap();
         let env = xdg_env(&tmp);
         let wd = tmp.path().join("wd");
-        // user：srv-u；project（须被忽略，因 active_workdir=None）：srv-p。
         write(
             &user_mcp_config_path(Some(&env)),
             r#"{"servers": {"srv-u": {"type":"stdio","server_parameters":{"command":"u"}}}}"#,
@@ -1011,13 +1016,15 @@ mod tests {
             r#"{"servers": {"srv-p": {"type":"stdio","server_parameters":{"command":"p"}}}}"#,
         );
         let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
-            active_workdir: None,
+            cwd: Some(&wd),
             env: Some(&env),
             managed_mcp_path: Some(&no_managed(&tmp)),
             ..Default::default()
         });
         assert!(resolved.servers.contains_key("srv-u"));
-        assert!(!resolved.servers.contains_key("srv-p")); // project 层未读
+        let p = &resolved.servers["srv-p"];
+        assert_eq!(p.origin, SettingsScope::Project);
+        assert!(!p.trusted_origin); // project 层 → 非受信、须门控
         assert_eq!(resolved.servers["srv-u"].origin, SettingsScope::User);
     }
 
@@ -1040,7 +1047,7 @@ mod tests {
             r#"{"inputs": [{"type":"PromptString","id":"tok","description":"p"}]}"#,
         );
         let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             managed_mcp_path: Some(&no_managed(&tmp)),
             ..Default::default()
@@ -1070,7 +1077,7 @@ mod tests {
             }}"#,
         );
         let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             managed_mcp_path: Some(&no_managed(&tmp)),
             ..Default::default()
@@ -1101,7 +1108,7 @@ mod tests {
             r#"{"servers": {"srv-y": {"type":"stdio","server_parameters":{"command":"pol"}}}}"#,
         );
         let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             managed_mcp_path: Some(&policy),
             ..Default::default()

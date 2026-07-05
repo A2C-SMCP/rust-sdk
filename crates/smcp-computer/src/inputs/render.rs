@@ -17,7 +17,8 @@
 //! - `${input:<id>}` → 经 `resolve_input` 回调走解析链（[`InputResolver`](super::resolver::InputResolver)）；
 //!   未找到 → 保持原样。
 //! - `${env:<VAR>}` → 进程 / 注入环境变量，缺失 → 空串 + WARN（VS Code parity）。
-//! - 预定义变量 `${workspaceFolder}` / `${userHome}` / `${pathSeparator}` → `variables` 取值，缺失 → 空串。
+//! - 预定义变量 `${userHome}` / `${pathSeparator}` → `variables` 取值，缺失 → 空串（#98：`${workspaceFolder}`
+//!   已随 workdir 概念瘦身移除，现作为未知占位符原样保留）。
 //! - 未知占位符 → 保持原样（向后兼容）。
 //!
 //! 同步设计：解析链（含交互 prompt）在 Rust 走同步 blocking（见 [`resolver`](super::resolver)），故渲染器同步；
@@ -33,7 +34,11 @@ use serde_json::Value;
 use crate::settings::scope::EnvMap;
 
 /// 预定义变量名 / predefined variable names。
-pub const PREDEFINED_VARS: &[&str] = &["workspaceFolder", "userHome", "pathSeparator"];
+///
+/// #98：`workspaceFolder` 已随 workdir 概念瘦身移除（对齐 protocol#10 / python-sdk#116）。
+/// `Computer` 不再持有 workspace 概念，故不再向渲染层注入工作区根；`${workspaceFolder}` 现作为
+/// 未知占位符原样保留（即便调用方在 `variables` 中提供该键——门控是静态成员判定）。
+pub const PREDEFINED_VARS: &[&str] = &["userHome", "pathSeparator"];
 
 /// `${...}` 占位符正则（惰性编译）/ the `${...}` placeholder regex (lazily compiled)。
 fn placeholder_re() -> &'static Regex {
@@ -116,7 +121,7 @@ impl ConfigRender {
     /// 递归渲染任意结构 / recursively render arbitrary structured data。
     ///
     /// - `resolve_input(id) -> Option<Value>`：`${input:id}` 取值；`None` = 未找到 → 保持原样。
-    /// - `variables`：预定义变量（workspaceFolder / userHome / pathSeparator）。
+    /// - `variables`：预定义变量（userHome / pathSeparator）。
     /// - `env`：`${env:VAR}` 取值来源（`None` → 进程环境）。
     pub fn render<F>(
         &self,
@@ -298,22 +303,40 @@ mod tests {
     }
 
     #[test]
+    fn predefined_vars_slimmed_to_two() {
+        // #98：workdir 概念瘦身——`workspaceFolder` 移出预定义变量集（对齐 python-sdk#116）。
+        assert_eq!(PREDEFINED_VARS, &["userHome", "pathSeparator"]);
+    }
+
+    #[test]
     fn render_env_and_predefined_and_unknown() {
         let render = ConfigRender::new();
         let mut env = EnvMap::new();
         env.insert("TOKEN".to_string(), "abc".to_string());
         let mut vars = HashMap::new();
-        vars.insert("workspaceFolder".to_string(), "/ws".to_string());
+        vars.insert("userHome".to_string(), "/home/me".to_string());
 
         let data = json!({
-            "url": "https://${env:TOKEN}@host/${workspaceFolder}/x",
+            "url": "https://${env:TOKEN}@host/${userHome}/x",
             "missing": "${env:NOPE}-tail",
             "unknown": "${weird:thing}",
         });
         let out = render.render(&data, &mut no_inputs, &vars, Some(&env));
-        assert_eq!(out["url"], json!("https://abc@host//ws/x"));
+        assert_eq!(out["url"], json!("https://abc@host//home/me/x"));
         assert_eq!(out["missing"], json!("-tail")); // 缺失 env → 空串
         assert_eq!(out["unknown"], json!("${weird:thing}")); // 未知 → 原样
+    }
+
+    #[test]
+    fn render_workspace_folder_left_verbatim_even_if_supplied() {
+        // #98：`${workspaceFolder}` 不再是预定义变量——即便调用方在 `variables` 里提供该键，
+        // 也应作为未知占位符原样保留（门控是静态成员判定，而非 map 是否含键）。
+        let render = ConfigRender::new();
+        let mut vars = HashMap::new();
+        vars.insert("workspaceFolder".to_string(), "/work".to_string());
+        let data = json!({ "path": "${workspaceFolder}/x" });
+        let out = render.render(&data, &mut no_inputs, &vars, None);
+        assert_eq!(out["path"], json!("${workspaceFolder}/x"));
     }
 
     #[test]

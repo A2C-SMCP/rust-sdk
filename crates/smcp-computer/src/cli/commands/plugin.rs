@@ -22,7 +22,7 @@
 * 启动期 MCP 批准框（`run_mcp_approval`）属 REPL/boot 范畴，由 CLI-03（#54）实现。
 */
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
@@ -72,13 +72,11 @@ fn installed_records(
         .unwrap_or_default()
 }
 
-/// 六层合并视图的 `enabledPlugins` 映射（`id → bool`，缺省视为启用）/ merged enabledPlugins map。
-fn enabled_plugins_view(
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
-    env: Option<&EnvMap>,
-) -> Map<String, Value> {
-    match resolved_settings(registered_workdirs, active_workdir, env, None).get("enabledPlugins") {
+/// 五层合并视图的 `enabledPlugins` 映射（`id → bool`，缺省视为启用）/ merged enabledPlugins map。
+///
+/// #98：project/local 锚定 `cwd`（`None` → 进程 cwd）。
+fn enabled_plugins_view(cwd: Option<&Path>, env: Option<&EnvMap>) -> Map<String, Value> {
+    match resolved_settings(cwd, env, None).get("enabledPlugins") {
         Some(Value::Object(map)) => map.clone(),
         _ => Map::new(),
     }
@@ -108,7 +106,7 @@ fn scope_of(rec: &InstalledPluginRecord) -> &str {
 pub struct PluginInstallOptions<'a> {
     /// 物化记录 scope（`user|project|local`，默认 `user`）/ install-record scope。
     pub scope: &'a str,
-    /// active workdir（`project|local` scope 必需）/ active workdir for project/local。
+    /// project/local scope 的锚定目录（#98：进程 cwd；`user` scope 不需要）/ anchor dir for project/local。
     pub project_path: Option<&'a str>,
     /// git tag/SHA 锁版本（`--version`）/ version override。
     pub version: Option<&'a str>,
@@ -351,13 +349,12 @@ pub async fn plugin_disable(
 pub fn plugin_list(
     home: &Path,
     env: Option<&EnvMap>,
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     available: bool,
     json_output: bool,
 ) -> i32 {
     let installed = load_installed_plugins(Some(home), env).account;
-    let enabled_map = enabled_plugins_view(registered_workdirs, active_workdir, env);
+    let enabled_map = enabled_plugins_view(cwd, env);
 
     let mut rows: Vec<Value> = Vec::new();
     for (pid, records) in &installed.plugins {
@@ -419,8 +416,7 @@ pub fn plugin_info(
     home: &Path,
     env: Option<&EnvMap>,
     plugin_id: &str,
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     json_output: bool,
 ) -> i32 {
     let records = installed_records(home, env, plugin_id);
@@ -432,8 +428,7 @@ pub fn plugin_info(
             None,
         );
     }
-    let enabled = enabled_plugins_view(registered_workdirs, active_workdir, env).get(plugin_id)
-        != Some(&Value::Bool(false));
+    let enabled = enabled_plugins_view(cwd, env).get(plugin_id) != Some(&Value::Bool(false));
 
     if json_output {
         print_json(&json!({ "id": plugin_id, "enabled": enabled, "records": records }));
@@ -472,13 +467,12 @@ pub async fn plugin_gc(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     teardown: Option<&dyn McpTeardown>,
     confirm: Option<&dyn Confirm>,
     json_output: bool,
 ) -> i32 {
-    let declared = resolved_settings(registered_workdirs, active_workdir, env, None);
+    let declared = resolved_settings(cwd, env, None);
     let store = file_store(home, env);
     let orphans = list_orphan_plugins(&declared, &store);
     if orphans.is_empty() {
@@ -599,13 +593,12 @@ mod tests {
         let env = test_env(home);
         seed_plugin(home, &env, "figma@acme", "user");
 
+        // cwd 注入 tempdir（无 .tfrobot）→ project/local 判空，隔离真实进程 cwd（接缝确定性）。
+        let cwd = Some(home);
         // 默认（enabledPlugins 缺省）→ 视为启用，list 展示、info enabled=true。
+        assert_eq!(plugin_list(home, Some(&env), cwd, false, true), EXIT_OK);
         assert_eq!(
-            plugin_list(home, Some(&env), &[], None, false, true),
-            EXIT_OK
-        );
-        assert_eq!(
-            plugin_info(home, Some(&env), "figma@acme", &[], None, true),
+            plugin_info(home, Some(&env), "figma@acme", cwd, true),
             EXIT_OK
         );
 
@@ -617,7 +610,7 @@ mod tests {
             serde_json::to_string(&json!({ "enabledPlugins": { "figma@acme": false } })).unwrap(),
         )
         .unwrap();
-        let view = enabled_plugins_view(&[], None, Some(&env));
+        let view = enabled_plugins_view(cwd, Some(&env));
         assert_eq!(view.get("figma@acme"), Some(&Value::Bool(false)));
     }
 
@@ -626,12 +619,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
         let mut registry = SkillRegistry::new();
+        // cwd 注入 tempdir → project/local 判空，隔离真实进程 cwd（接缝确定性）。
         let code = plugin_gc(
             &mut registry,
             dir.path(),
             Some(&env),
-            &[],
-            None,
+            Some(dir.path()),
             None,
             None,
             true,
@@ -648,7 +641,17 @@ mod tests {
         seed_plugin(home, &env, "ghost@acme", "user");
         let mut registry = SkillRegistry::new();
         // enabledPlugins 不声明 ghost@acme → 孤儿 → gc 清理（installPath 在 home 内，安全删）。
-        let code = plugin_gc(&mut registry, home, Some(&env), &[], None, None, None, true).await;
+        // cwd 注入 tempdir → project/local 判空，隔离真实进程 cwd（接缝确定性）。
+        let code = plugin_gc(
+            &mut registry,
+            home,
+            Some(&env),
+            Some(home),
+            None,
+            None,
+            true,
+        )
+        .await;
         assert_eq!(code, EXIT_OK);
         // 账本已无该 plugin。
         assert!(installed_records(home, Some(&env), "ghost@acme").is_empty());

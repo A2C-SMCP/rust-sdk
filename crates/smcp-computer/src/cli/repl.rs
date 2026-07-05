@@ -201,8 +201,8 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
     let pos = positionals(&args);
     let home = comp.skill_home();
     let reg_arc = comp.skill_registry_arc();
-    let active = comp.active_workdir();
-    let workdirs = comp.registered_workdirs();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
 
     match sub.as_str() {
         "install" => {
@@ -217,7 +217,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
             let scope = flag_value(&args, "--scope").unwrap_or_else(|| "user".to_string());
             let version = flag_value(&args, "--version");
             let project_path = if scope == "project" || scope == "local" {
-                active.as_deref().and_then(Path::to_str)
+                cwd.as_deref().and_then(Path::to_str)
             } else {
                 None
             };
@@ -300,8 +300,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
             plugin_list(
                 &home,
                 None,
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
                 has_flag(&args, "--available"),
                 json,
             );
@@ -311,7 +310,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 msg_warn("usage: plugin info <plugin>@<marketplace>");
                 return;
             };
-            plugin_info(&home, None, id, &workdirs, active.as_deref(), json);
+            plugin_info(&home, None, id, cwd.as_deref(), json);
         }
         "gc" => {
             let confirm = ReplConfirm;
@@ -321,8 +320,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 &mut registry,
                 &home,
                 None,
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
                 Some(&teardown),
                 Some(&confirm),
                 json,
@@ -344,16 +342,15 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
     let json = has_flag(&args, "--json");
     let pos = positionals(&args);
     let scope = flag_value(&args, "--scope");
-    let workdirs = comp.registered_workdirs();
-    let active = comp.active_workdir();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
 
     match sub.as_str() {
         "show" => {
             settings_show(
                 None,
                 scope.as_deref().unwrap_or("merged"),
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
                 flag_path,
                 json,
             );
@@ -369,8 +366,7 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
                 None,
                 key,
                 scope.as_deref().unwrap_or("merged"),
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
                 flag_path,
                 json,
             );
@@ -389,7 +385,7 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
                 key,
                 &value,
                 scope.as_deref().unwrap_or("user"),
-                active.as_deref(),
+                cwd.as_deref(),
                 json,
             );
             if code == EXIT_OK && is_emit_key(key) {
@@ -400,7 +396,7 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
             let code = settings_edit(
                 None,
                 scope.as_deref().unwrap_or("user"),
-                active.as_deref(),
+                cwd.as_deref(),
                 None,
                 json,
             );

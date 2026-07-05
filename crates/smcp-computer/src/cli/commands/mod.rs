@@ -19,7 +19,7 @@
 */
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 use console::style;
@@ -133,20 +133,19 @@ pub fn flag_value(args: &[String], flag: &str) -> Option<String> {
     }
 }
 
-/// 六层合并 settings（含 policy first-source-wins）/ six-layer merged settings incl. policy。
+/// 五层合并 settings（含 policy first-source-wins）/ five-layer merged settings incl. policy。
 ///
 /// plugin（`enabledPlugins` / gc 声明视图）与 settings（merged show / get）共用。policy 层承载企业
-/// allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。
+/// allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。#98：project/local 锚定
+/// `cwd`（注入接缝，`None` → 进程 cwd）。
 pub fn resolved_settings(
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     env: Option<&EnvMap>,
     flag_path: Option<&Path>,
 ) -> Map<String, Value> {
     let policy = resolve_policy_settings(env, None, None);
     resolve_settings(ResolveSettingsArgs {
-        registered_workdirs,
-        active_workdir,
+        cwd,
         env,
         flag_settings_path: flag_path,
         policy_settings: Some(&policy),

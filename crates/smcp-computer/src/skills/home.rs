@@ -52,8 +52,6 @@ const HOME_ENV: &str = "HOME";
 const A2C_DATA_SUBPATH: [&str; 2] = ["a2c", "skills"];
 /// fallback 分支相对布局 `.a2c/skills` / Fallback-branch layout fragments。
 const DOTDIR_SUBPATH: [&str; 2] = [".a2c", "skills"];
-/// workspace 登记工作目录内的 user 源 DropIn 子路径 `.tfrobot/skills` / Per-workdir DropIn subpath。
-const WORKDIR_SKILL_SUBPATH: [&str; 2] = [".tfrobot", "skills"];
 
 /// 每用户私有目录权限 / Per-user-private dir mode（防御性写，隔离交给 OS）。
 #[cfg(unix)]
@@ -198,17 +196,11 @@ pub fn user_skill_dir(home: &Path, skill: &str) -> PathBuf {
 }
 
 /// SKILL Home 内的 user 源 DropIn 发现根 / Global user-source DropIn root：`<home>/user/`。
+///
+/// #98：这是 user 源 DropIn 的**唯一**发现根（`Computer` 不再持有 workspace，故无 per-workdir
+/// `.tfrobot/skills/` 维度；workdir 范围 SKILL 改由 MCP `mcp` 源 + `skill://` 承载）。
 pub fn user_dropin_root(home: &Path) -> PathBuf {
     home.join(SOURCE_USER)
-}
-
-/// workspace 登记工作目录的 user 源 DropIn 发现根 / Per-workdir user-source DropIn root。
-///
-/// `<workdir>/.tfrobot/skills/`——**就地发现、不 staging 进 SKILL Home**（与 marketplace clone 树相反）。
-pub fn workdir_skill_root(workdir: &Path) -> PathBuf {
-    workdir
-        .join(WORKDIR_SKILL_SUBPATH[0])
-        .join(WORKDIR_SKILL_SUBPATH[1])
 }
 
 #[cfg(test)]
@@ -318,10 +310,6 @@ mod tests {
         assert_eq!(
             user_dropin_root(home),
             PathBuf::from("/home/u/.a2c/skills/user")
-        );
-        assert_eq!(
-            workdir_skill_root(Path::new("/work/proj")),
-            PathBuf::from("/work/proj/.tfrobot/skills")
         );
         // user / marketplace / mcp 三类根互不重叠。
         assert_ne!(home.join(SOURCE_USER), home.join(SOURCE_MARKETPLACE));

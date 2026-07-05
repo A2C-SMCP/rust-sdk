@@ -50,8 +50,7 @@ use smcp::A2CSkillRef;
 use crate::settings::{is_valid_marketplace_name, EnvMap};
 use crate::skills::frontmatter::parse_skill_frontmatter;
 use crate::skills::home::{
-    marketplace_skill_dir, mcp_skill_dir, user_dropin_root, workdir_skill_root, SOURCE_MARKETPLACE,
-    SOURCE_USER,
+    marketplace_skill_dir, mcp_skill_dir, user_dropin_root, SOURCE_MARKETPLACE, SOURCE_USER,
 };
 use crate::skills::manifest::{
     check_strict_conflict, entry_is_strict, plugin_root_base as resolve_plugin_root_base,
@@ -403,24 +402,6 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<(), SkillStagingError> {
 // ===========================================================================
 // user 源 DropIn（就地发现，不复制）/ user-source in-place DropIn
 // ===========================================================================
-/// user 源 DropIn 发现根，按优先级升序（低→高，后者覆盖）+ 解析去重 / Ascending-priority deduped roots。
-fn user_dropin_roots(home: &Path, workdirs: &[PathBuf]) -> Vec<PathBuf> {
-    let mut ordered: Vec<PathBuf> = vec![normalize_lexical(&user_dropin_root(home))];
-    ordered.extend(
-        workdirs
-            .iter()
-            .map(|wd| normalize_lexical(&workdir_skill_root(wd))),
-    );
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut deduped = Vec::new();
-    for root in ordered {
-        if seen.insert(root.clone()) {
-            deduped.push(root);
-        }
-    }
-    deduped
-}
-
 /// 枚举发现根下一级、含直接 `SKILL.md` 的 SKILL 目录（排序）/ One-level skill dirs with a direct SKILL.md。
 fn iter_user_skill_dirs(root: &Path) -> Vec<PathBuf> {
     if !root.is_dir() {
@@ -476,38 +457,35 @@ fn build_user_ref(name: &str, skill_dir: &Path) -> Option<A2CSkillRef> {
 
 /// 枚举 user 源 DropIn 并注册进 Registry（就地发现、不复制）/ Discover user-source DropIn skills in place。
 ///
-/// 扫 `<home>/user/` + 各 `<workdir>/.tfrobot/skills/`；name = 目录 basename（单段裸名）。同名按发现根优先级
-/// **后者覆盖前者**，覆盖时记 WARN。返回本次发现并成功注册/刷新的 name 列表（供 reconciler/watcher diff 孤儿）。
-pub fn stage_user_skills(
-    registry: &mut SkillRegistry,
-    home: &Path,
-    workdirs: &[PathBuf],
-) -> Vec<String> {
+/// #98：仅扫 home 级全局 DropIn 根 `<home>/user/`（`Computer` 不再持有 workspace；workdir 范围 SKILL 改由
+/// MCP `mcp` 源 + `skill://` 承载，对齐 protocol#10 / python-sdk#116）。name = 目录 basename（单段裸名）。
+/// 单根下 basename 唯一；同名冲突（不同 basename 归一为同 name）记 WARN、后者胜。返回本次发现并成功注册/刷新
+/// 的 name 列表（供 reconciler/watcher diff 孤儿）。
+pub fn stage_user_skills(registry: &mut SkillRegistry, home: &Path) -> Vec<String> {
     // name → (ref, 发现目录)；后者覆盖前者。保插入序便于确定性。
     let mut winners: indexmap::IndexMap<String, (A2CSkillRef, PathBuf)> = indexmap::IndexMap::new();
-    for root in user_dropin_roots(home, workdirs) {
-        for skill_dir in iter_user_skill_dirs(&root) {
-            let basename = skill_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            let name = match synthesize_user_name(basename) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(path = %skill_dir.display(), reason = %e.reason,
-                        "user DropIn skill dir name invalid, skipped");
-                    continue;
-                }
-            };
-            let Some(skill_ref) = build_user_ref(&name, &skill_dir) else {
+    let root = normalize_lexical(&user_dropin_root(home));
+    for skill_dir in iter_user_skill_dirs(&root) {
+        let basename = skill_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let name = match synthesize_user_name(basename) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(path = %skill_dir.display(), reason = %e.reason,
+                    "user DropIn skill dir name invalid, skipped");
                 continue;
-            };
-            if let Some((_, prev)) = winners.get(&name) {
-                tracing::warn!(name = %name, at = %skill_dir.display(), shadows = %prev.display(),
-                    "user SKILL shadows earlier DropIn (later root wins)");
             }
-            winners.insert(name, (skill_ref, skill_dir));
+        };
+        let Some(skill_ref) = build_user_ref(&name, &skill_dir) else {
+            continue;
+        };
+        if let Some((_, prev)) = winners.get(&name) {
+            tracing::warn!(name = %name, at = %skill_dir.display(), shadows = %prev.display(),
+                "user SKILL name collides with earlier DropIn (later entry wins)");
         }
+        winners.insert(name, (skill_ref, skill_dir));
     }
 
     let mut registered = Vec::new();
@@ -1551,9 +1529,10 @@ mod tests {
         assert_eq!(r.allowed_tools.as_deref(), Some(&["solo".to_string()][..]));
     }
 
-    // ---- user 源 staging（就地）/ user-source staging ----
+    // ---- user 源 staging（就地，仅 home 级）/ user-source staging (home-only) ----
     #[test]
-    fn test_stage_user_skills_in_place_and_override() {
+    fn test_stage_user_skills_home_only_no_workdir_dimension() {
+        // #98：仅扫 <home>/user/；workdir 的 .tfrobot/skills/ 不再是发现维度（对齐 python-sdk#116）。
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         // <home>/user/my-helper/SKILL.md
@@ -1564,34 +1543,31 @@ mod tests {
             "---\nname: my-helper\ndescription: from home\n---\nbody",
         )
         .unwrap();
-        // workdir/.tfrobot/skills/my-helper/SKILL.md（覆盖 home）+ another
-        let wd = tmp.path().join("wd");
-        let wd_skill = wd.join(".tfrobot/skills/my-helper");
-        fs::create_dir_all(&wd_skill).unwrap();
-        fs::write(
-            wd_skill.join("SKILL.md"),
-            "---\nname: my-helper\ndescription: from workdir\n---\nb",
-        )
-        .unwrap();
-        let wd_other = wd.join(".tfrobot/skills/other-skill");
-        fs::create_dir_all(&wd_other).unwrap();
-        fs::write(wd_other.join("SKILL.md"), "---\ndescription: other\n---\nb").unwrap();
+        // <home>/user/other-skill/SKILL.md
+        let other = home.join("user/other-skill");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("SKILL.md"), "---\ndescription: other\n---\nb").unwrap();
         // 非 kebab basename → 跳过。
-        let bad = wd.join(".tfrobot/skills/Bad_Name");
+        let bad = home.join("user/Bad_Name");
         fs::create_dir_all(&bad).unwrap();
         fs::write(bad.join("SKILL.md"), "---\ndescription: bad\n---\nb").unwrap();
+        // workdir/.tfrobot/skills/proj-a/SKILL.md —— #98 后**不**应被发现。
+        let wd_skill = tmp.path().join("wd/.tfrobot/skills/proj-a");
+        fs::create_dir_all(&wd_skill).unwrap();
+        fs::write(wd_skill.join("SKILL.md"), "---\ndescription: proj\n---\nb").unwrap();
 
         let mut reg = SkillRegistry::new();
-        let names = stage_user_skills(&mut reg, &home, std::slice::from_ref(&wd));
+        let names = stage_user_skills(&mut reg, &home);
         assert!(names.contains(&"my-helper".to_string()));
         assert!(names.contains(&"other-skill".to_string()));
         assert!(!names.contains(&"Bad_Name".to_string()));
-        // workdir 覆盖 home（就地 path 指向 workdir，description=from workdir）。
+        assert!(!names.contains(&"proj-a".to_string())); // workdir 维度已移除
+        assert!(reg.resolve("proj-a").is_none());
+        // home DropIn 就地注册。
         let r = reg.resolve("my-helper").unwrap();
-        assert_eq!(r.description, "from workdir");
+        assert_eq!(r.description, "from home");
         assert_eq!(r.source, "user");
         assert!(r.uri.is_none()); // user 源无 uri
-        assert!(r.path.contains(".tfrobot"));
     }
 
     // ---- marketplace 源 git staging（真实 git，离线 file://）/ real-git integration ----

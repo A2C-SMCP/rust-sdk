@@ -63,12 +63,11 @@ pub use recovery::{
 pub use schema::{
     is_valid_enabled_plugin_key, is_valid_git_url, is_valid_marketplace_name, validate_settings,
     ComputerSettings, GitSource, MarketplaceEntry, PermissionsBlock, SettingsScope,
-    SettingsValidationError, BOOL_FIELDS, CAPABILITY_FIELDS, POLICY_ONLY_FIELDS,
-    STRING_ARRAY_FIELDS,
+    SettingsValidationError, BOOL_FIELDS, POLICY_ONLY_FIELDS, STRING_ARRAY_FIELDS,
 };
 pub use scope::{
-    apply_write, filter_capability_fields, load_settings_file, merge_layers, merge_read,
-    resolve_settings, resolve_user_config_dir, user_settings_path, workdir_local_settings_path,
+    apply_write, load_settings_file, merge_layers, merge_read, resolve_settings,
+    resolve_user_config_dir, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, workdir_settings_dir, EnvMap, ResolveSettingsArgs,
     ResolvedSettings, WriteValue, LOCAL_SETTINGS_FILENAME, PROJECT_SETTINGS_FILENAME,
     TFROBOT_DIRNAME, USER_SETTINGS_FILENAME, XDG_CONFIG_HOME_ENV,

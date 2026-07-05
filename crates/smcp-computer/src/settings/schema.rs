@@ -31,17 +31,15 @@ use serde_json::Value;
 
 /// settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high).
 ///
-/// `Capability` 是 A2C 特有的**能力发现层**（最低优先级）：跨**全部登记工作目录**取
-/// `enabledPlugins` / `extraKnownMarketplaces` 并集，让 Agent 能力面稳定、不随 active workdir
-/// 跳变。其余五级 = Claude Code 完整对齐（user/project/local/flag/policy）。
+/// 五级 = Claude Code 完整对齐（user/project/local/flag/policy）。#98：能力发现层 `Capability`
+/// 已随 workdir 概念瘦身移除（对齐 protocol#10 / python-sdk#116）——project/local 现锚定进程 cwd，
+/// `enabledPlugins` / `extraKnownMarketplaces` 经常规 project/local 层进入，无需专门的能力并集层。
 ///
-/// 序列化为小写字符串，与 Python `StrEnum` 字面一致（`capability` / `user` / `project` /
-/// `local` / `flag` / `policy`）。
+/// 序列化为小写字符串，与 Python `StrEnum` 字面一致（`user` / `project` / `local` / `flag` /
+/// `policy`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SettingsScope {
-    /// 能力发现层（最低）/ capability-discovery (lowest)。
-    Capability,
     User,
     Project,
     Local,
@@ -54,7 +52,6 @@ impl SettingsScope {
     /// 返回 scope 的小写字面量（与序列化一致）/ Lowercase literal (matches serialization).
     pub fn as_str(self) -> &'static str {
         match self {
-            SettingsScope::Capability => "capability",
             SettingsScope::User => "user",
             SettingsScope::Project => "project",
             SettingsScope::Local => "local",
@@ -80,9 +77,6 @@ pub const FIELD_DISABLED_MCPJSON_SERVERS: &str = "disabledMcpjsonServers";
 pub const FIELD_ALLOWED_MCP_SERVERS: &str = "allowedMcpServers";
 pub const FIELD_DENIED_MCP_SERVERS: &str = "deniedMcpServers";
 pub const FIELD_PERMISSIONS: &str = "permissions";
-
-/// 仅能在能力发现层取并集的字段（合并时取并集，见 SET-02）/ Fields contributed by the capability layer.
-pub const CAPABILITY_FIELDS: &[&str] = &[FIELD_ENABLED_PLUGINS, FIELD_EXTRA_KNOWN_MARKETPLACES];
 
 /// policy-only 字段：出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
 /// Policy-only fields: filtered + recorded if seen outside the policy scope.
@@ -860,7 +854,6 @@ mod tests {
     #[test]
     fn test_settings_scope_serializes_lowercase() {
         let pairs = [
-            (SettingsScope::Capability, "capability"),
             (SettingsScope::User, "user"),
             (SettingsScope::Project, "project"),
             (SettingsScope::Local, "local"),
@@ -880,10 +873,6 @@ mod tests {
     // ---- 字段集合内容精确 ----
     #[test]
     fn test_field_sets_exact() {
-        assert_eq!(
-            CAPABILITY_FIELDS,
-            &["enabledPlugins", "extraKnownMarketplaces"]
-        );
         assert_eq!(
             POLICY_ONLY_FIELDS,
             &["allowedMcpServers", "deniedMcpServers"]

@@ -7,8 +7,9 @@
 * 依赖: clap, tokio, console, rustyline
 * 描述: CLI 模块入口 + 治理层子命令树 + 根级全局 flag 透传 / CLI entry + governance subcommand tree.
 *
-* 对标 Python `a2c_smcp/computer/cli/main.py`：根回调采集全局 flag（`--settings` / `--add-dir` / `--approve-all-mcp`）
+* 对标 Python `a2c_smcp/computer/cli/main.py`：根回调采集全局 flag（`--settings` / `--approve-all-mcp`）
 * 经 [`RootState`] 透传给**所有**子命令（含 `settings`）——修 #97「flag scope 恒空」bug（此前仅 `run` 路径拿到）。
+* #98：`--add-dir` 已随 workdir 概念瘦身移除；project/local scope 锚定进程 cwd。
 * 非交互子命令（marketplace/plugin/settings/skill）不 boot Computer，离线经 `rebuild_registry` 构上下文；
 * `run`（默认）进 REPL：建 Computer、banner、启动期 MCP 批准框、交互循环。
 */
@@ -81,10 +82,6 @@ pub struct Args {
     /// flag scope settings.json 路径（最低优先级，§5.5）/ flag-scope settings.json file
     #[arg(long)]
     pub settings: Option<PathBuf>,
-
-    /// 注册工作目录（可重复；首个作 active-workdir）/ register a workdir (repeatable; first = active)
-    #[arg(long = "add-dir")]
-    pub add_dir: Vec<PathBuf>,
 
     /// 启动期一次性批准全部待决 MCP server（不落盘）/ approve all pending MCP servers this run (no persist)
     #[arg(long)]
@@ -267,36 +264,7 @@ pub enum SkillCmd {
 #[derive(Debug, Clone, Default)]
 pub struct RootState {
     pub flag_path: Option<PathBuf>,
-    pub registered_workdirs: Vec<PathBuf>,
-    pub active_workdir: Option<PathBuf>,
     pub approve_all_mcp: bool,
-}
-
-/// `--add-dir` → `(registered_workdirs, active_workdir)`：绝对化、去重保序；active 取首个 / resolve workdirs。
-fn resolve_workdirs(add_dir: &[PathBuf]) -> (Vec<PathBuf>, Option<PathBuf>) {
-    let mut registered: Vec<PathBuf> = Vec::new();
-    for dir in add_dir {
-        let abs = absolutize(dir);
-        if !registered.contains(&abs) {
-            registered.push(abs);
-        }
-    }
-    let active = registered.first().cloned();
-    (registered, active)
-}
-
-fn absolutize(path: &Path) -> PathBuf {
-    // `~` 展开。
-    let expanded = if let Ok(rest) = path.strip_prefix("~") {
-        match dirs::home_dir() {
-            Some(home) => home.join(rest),
-            None => path.to_path_buf(),
-        }
-    } else {
-        path.to_path_buf()
-    };
-    // 词法绝对化（不要求存在，对齐 Python `Path.resolve(strict=False)`）。
-    std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
 fn skill_home() -> PathBuf {
@@ -315,11 +283,8 @@ pub fn main() {
 }
 
 async fn dispatch(mut args: Args) -> i32 {
-    let (registered_workdirs, active_workdir) = resolve_workdirs(&args.add_dir);
     let root = RootState {
         flag_path: args.settings.clone(),
-        registered_workdirs,
-        active_workdir,
         approve_all_mcp: args.approve_all_mcp,
     };
 
@@ -416,10 +381,11 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
     }
 }
 
-async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
+async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
     let home = skill_home();
     let mut registry = rebuild_registry(&home, None).await;
-    let active = root.active_workdir.as_deref();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
     match action {
         PluginCmd::Install {
             id,
@@ -428,7 +394,7 @@ async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
             json,
         } => {
             let project_path = if scope == "project" || scope == "local" {
-                active.and_then(Path::to_str)
+                cwd.as_deref().and_then(Path::to_str)
             } else {
                 None
             };
@@ -459,51 +425,30 @@ async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
         PluginCmd::Disable { id, json } => {
             plugin_disable(&mut registry, &home, None, &id, None, json).await
         }
-        PluginCmd::List { available, json } => plugin_list(
-            &home,
-            None,
-            &root.registered_workdirs,
-            active,
-            available,
-            json,
-        ),
-        PluginCmd::Info { id, json } => {
-            plugin_info(&home, None, &id, &root.registered_workdirs, active, json)
+        PluginCmd::List { available, json } => {
+            plugin_list(&home, None, cwd.as_deref(), available, json)
         }
+        PluginCmd::Info { id, json } => plugin_info(&home, None, &id, cwd.as_deref(), json),
         PluginCmd::Gc { json } => {
-            plugin_gc(
-                &mut registry,
-                &home,
-                None,
-                &root.registered_workdirs,
-                active,
-                None,
-                None,
-                json,
-            )
-            .await
+            plugin_gc(&mut registry, &home, None, cwd.as_deref(), None, None, json).await
         }
     }
 }
 
 fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
-    let active = root.active_workdir.as_deref();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
+    let cwd = cwd.as_deref();
     let flag = root.flag_path.as_deref();
     match action {
-        SettingsCmd::Show { scope, json } => settings_show(
-            None,
-            scope.as_deref().unwrap_or("merged"),
-            &root.registered_workdirs,
-            active,
-            flag,
-            json,
-        ),
+        SettingsCmd::Show { scope, json } => {
+            settings_show(None, scope.as_deref().unwrap_or("merged"), cwd, flag, json)
+        }
         SettingsCmd::Get { key, scope, json } => settings_get(
             None,
             &key,
             scope.as_deref().unwrap_or("merged"),
-            &root.registered_workdirs,
-            active,
+            cwd,
             flag,
             json,
         ),
@@ -517,11 +462,11 @@ fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
             &key,
             &value,
             scope.as_deref().unwrap_or("user"),
-            active,
+            cwd,
             json,
         ),
         SettingsCmd::Edit { scope, json } => {
-            settings_edit(None, scope.as_deref().unwrap_or("user"), active, None, json)
+            settings_edit(None, scope.as_deref().unwrap_or("user"), cwd, None, json)
         }
     }
 }
@@ -538,7 +483,7 @@ async fn dispatch_skill(action: SkillCmd) -> i32 {
 // ── REPL 运行模式 / REPL run mode ─────────────────────────────────────────────
 async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs: Option<PathBuf>) {
     let session = SilentSession::new("cli-session");
-    let mut computer = Computer::new(
+    let computer = Computer::new(
         "friday_hands",
         session,
         None,
@@ -546,9 +491,6 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
         args.auto_connect,
         args.auto_reconnect,
     );
-    if !root.registered_workdirs.is_empty() {
-        computer = computer.with_registered_workdirs(root.registered_workdirs.clone());
-    }
 
     let cli_config = commands::CliConfig {
         url: args.url.clone(),
@@ -669,26 +611,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_workdirs_absolutize_dedup_order() {
-        // 去重保序 + active=first。
-        let (registered, active) = resolve_workdirs(&[
-            PathBuf::from("/a/b"),
-            PathBuf::from("/a/b"),
-            PathBuf::from("/c"),
-        ]);
-        assert_eq!(registered, vec![PathBuf::from("/a/b"), PathBuf::from("/c")]);
-        assert_eq!(active, Some(PathBuf::from("/a/b")));
-        // 相对路径 → 绝对化（不要求存在）。
-        let (rel, rel_active) = resolve_workdirs(&[PathBuf::from("relative/dir")]);
-        assert!(rel[0].is_absolute());
-        assert_eq!(rel_active, Some(rel[0].clone()));
-        // 空 → 无 active。
-        let (empty, none) = resolve_workdirs(&[]);
-        assert!(empty.is_empty());
-        assert!(none.is_none());
-    }
-
-    #[test]
     fn settings_flag_scope_propagates_through_root_state() {
         // #97 回归：RootState.flag_path 经 dispatch_settings 透传给 settings handler。
         let tmp = tempdir().unwrap();
@@ -715,39 +637,6 @@ mod tests {
             SettingsCmd::Get {
                 key: "trustedMarketplaces".to_string(),
                 scope: Some("flag".to_string()),
-                json: true,
-            },
-            &RootState::default(),
-        );
-        assert_eq!(code, EXIT_USER_ERROR);
-    }
-
-    #[test]
-    fn add_dir_propagates_active_workdir_for_project_scope() {
-        // #97 回归：--add-dir 解析的 active_workdir 经 RootState 透传 → project scope 可写。
-        let tmp = tempdir().unwrap();
-        let root = RootState {
-            registered_workdirs: vec![tmp.path().to_path_buf()],
-            active_workdir: Some(tmp.path().to_path_buf()),
-            ..Default::default()
-        };
-        let code = dispatch_settings(
-            SettingsCmd::Set {
-                key: "foo".to_string(),
-                value: "1".to_string(),
-                scope: Some("project".to_string()),
-                json: true,
-            },
-            &root,
-        );
-        assert_eq!(code, EXIT_OK);
-
-        // 无 active_workdir → project scope 缺 active workdir → EXIT_USER_ERROR。
-        let code = dispatch_settings(
-            SettingsCmd::Set {
-                key: "foo".to_string(),
-                value: "1".to_string(),
-                scope: Some("project".to_string()),
                 json: true,
             },
             &RootState::default(),

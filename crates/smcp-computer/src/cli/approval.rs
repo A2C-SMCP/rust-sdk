@@ -80,10 +80,11 @@ pub async fn run_mcp_approval<S: Session>(
     approve_all: bool,
     flag_config: Option<&Path>,
 ) {
-    let active_workdir = comp.active_workdir();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
     // flag_config 是 settings.json（见模块文档）→ resolve_mcp_config 不收（避免当 mcp.json 误读）。
     let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
-        active_workdir: active_workdir.as_deref(),
+        cwd: cwd.as_deref(),
         env: None,
         flag_config_path: None,
         managed_mcp_path: None,
@@ -98,12 +99,7 @@ pub async fn run_mcp_approval<S: Session>(
         return;
     }
 
-    let settings = resolved_settings(
-        &comp.registered_workdirs(),
-        active_workdir.as_deref(),
-        None,
-        flag_config,
-    );
+    let settings = resolved_settings(cwd.as_deref(), None, flag_config);
     let home = comp.skill_home();
     let bundled = bundled_mcp_server_names(Some(&home), None);
     let statuses = gate_mcp_servers(&resolved, &settings, &bundled);
@@ -144,16 +140,16 @@ pub async fn run_mcp_approval<S: Session>(
                 ));
                 match ans.as_str() {
                     "a" | "all" => {
-                        let _ = approve_all_project_mcp(active_workdir.as_deref());
+                        let _ = approve_all_project_mcp(cwd.as_deref());
                         approved_all_session = true;
                         mount(comp, srv).await;
                     }
                     "y" | "yes" => {
-                        let _ = approve_mcp_server(name, active_workdir.as_deref());
+                        let _ = approve_mcp_server(name, cwd.as_deref());
                         mount(comp, srv).await;
                     }
                     _ => {
-                        let _ = deny_mcp_server(name, active_workdir.as_deref());
+                        let _ = deny_mcp_server(name, cwd.as_deref());
                         msg_dim(&format!(
                             "· denied MCP server {name:?} (written to local scope)"
                         ));

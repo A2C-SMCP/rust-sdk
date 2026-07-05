@@ -43,8 +43,8 @@ use crate::settings::recovery::GovernanceRecoveryReport;
 use crate::settings::scope::{resolve_settings, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
-    workdir_skill_root, AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer,
-    SkillFileWatcher, SkillRegistry, SkillResourceView, SkillSandboxError, SOURCE_USER,
+    AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer, SkillFileWatcher, SkillRegistry,
+    SkillResourceView, SkillSandboxError, SOURCE_USER,
 };
 use smcp::utils::env_truthy;
 use smcp::A2CSkillRef;
@@ -281,8 +281,6 @@ pub struct Computer<S: Session> {
     skill_home: Arc<StdRwLock<Option<PathBuf>>>,
     /// SKILL Home 覆盖（测试/部署注入）/ home override。
     skill_home_override: Option<PathBuf>,
-    /// 已登记工作目录（能力发现并集：user DropIn 扫描 + watcher 跨此）/ registered workdirs。
-    registered_workdirs: Arc<StdRwLock<Vec<PathBuf>>>,
     /// 多源 SKILL 变更去抖器（标脏 → 窗口合并 → invalidate 重扫 + 单次 emit）；`Arc` 供 watcher 线程共享。
     skill_debouncer: Arc<SkillEventDebouncer>,
     /// user 源 DropIn 文件 watcher（boot 启、shutdown 停）/ file watcher。
@@ -331,7 +329,7 @@ fn reconcile_orphans_in(
 /// merge a VS Code-style envFile's KEY=VALUE into a stdio server's env (explicit env wins)。
 ///
 /// 在 [`render_server_config`](Computer::render_server_config) 渲染后、反序列化前作用于 JSON 值：envFile
-/// 路径此时已展开（`${workspaceFolder}` 等）。仅对 stdio（`server_parameters` 含 `env`/`command`）生效；
+/// 路径此时已展开（`${input:...}` / `${userHome}` 等）。仅对 stdio（`server_parameters` 含 `env`/`command`）生效；
 /// 置于 sse/http 上记 WARN + 原样返回。envFile 缺失 / 空 / 文件为空 → 原样返回。对标 Python `_apply_env_file`。
 fn apply_env_file(mut rendered: serde_json::Value) -> serde_json::Value {
     let Some(env_file) = rendered
@@ -396,7 +394,6 @@ fn apply_env_file(mut rendered: serde_json::Value) -> serde_json::Value {
 fn build_skill_debouncer(
     skill_registry: &Arc<RwLock<SkillRegistry>>,
     skill_home: &Arc<StdRwLock<Option<PathBuf>>>,
-    registered_workdirs: &Arc<StdRwLock<Vec<PathBuf>>>,
     socketio_client: &Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
 ) -> SkillEventDebouncer {
     let emit_client = socketio_client.clone();
@@ -417,22 +414,18 @@ fn build_skill_debouncer(
 
     let inv_registry = skill_registry.clone();
     let inv_home = skill_home.clone();
-    let inv_workdirs = registered_workdirs.clone();
     let invalidate: AsyncCallback = Arc::new(
         move || -> Pin<Box<dyn Future<Output = CallbackResult> + Send>> {
             let registry = inv_registry.clone();
             let home_cell = inv_home.clone();
-            let workdirs_cell = inv_workdirs.clone();
             Box::pin(async move {
                 let home = home_cell.read().expect("skill_home poisoned").clone();
                 let Some(home) = home else {
                     return Ok(());
                 };
-                let workdirs = workdirs_cell.read().expect("workdirs poisoned").clone();
                 let mut reg = registry.write().await;
-                let discovered: HashSet<String> = stage_user_skills(&mut reg, &home, &workdirs)
-                    .into_iter()
-                    .collect();
+                let discovered: HashSet<String> =
+                    stage_user_skills(&mut reg, &home).into_iter().collect();
                 reconcile_orphans_in(&mut reg, &discovered, |s| s == SOURCE_USER);
                 Ok(())
             })
@@ -546,15 +539,12 @@ impl<S: Session> Computer<S> {
         let skill_registry: Arc<RwLock<SkillRegistry>> =
             Arc::new(RwLock::new(SkillRegistry::new()));
         let skill_home: Arc<StdRwLock<Option<PathBuf>>> = Arc::new(StdRwLock::new(None));
-        let registered_workdirs: Arc<StdRwLock<Vec<PathBuf>>> =
-            Arc::new(StdRwLock::new(Vec::new()));
         let socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>> =
             Arc::new(RwLock::new(None));
 
         let skill_debouncer = Arc::new(build_skill_debouncer(
             &skill_registry,
             &skill_home,
-            &registered_workdirs,
             &socketio_client,
         ));
 
@@ -573,7 +563,6 @@ impl<S: Session> Computer<S> {
             skill_registry,
             skill_home,
             skill_home_override: None,
-            registered_workdirs,
             skill_debouncer,
             skill_watcher: Arc::new(Mutex::new(None)),
             skill_watch_polling: env_truthy("A2C_SKILL_WATCH_POLLING"),
@@ -589,14 +578,6 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_skill_home(mut self, home: impl Into<PathBuf>) -> Self {
         self.skill_home_override = Some(home.into());
-        self
-    }
-
-    /// 注入已登记工作目录（能力发现并集 + watcher 监控根）/ Inject registered workdirs。
-    #[must_use]
-    pub fn with_registered_workdirs(self, workdirs: impl IntoIterator<Item = PathBuf>) -> Self {
-        *self.registered_workdirs.write().expect("workdirs poisoned") =
-            workdirs.into_iter().collect();
         self
     }
 
@@ -673,23 +654,6 @@ impl<S: Session> Computer<S> {
     /// SKILL Home 绝对根（CLI marketplace/skill 命令经此取物化根）/ the SKILL Home root。
     pub fn skill_home(&self) -> PathBuf {
         self.ensure_skill_home()
-    }
-
-    /// 绑定当前任务的 active-workdir 单根（首个登记 workdir；空闲 = `None`）/ the active workdir。
-    pub fn active_workdir(&self) -> Option<PathBuf> {
-        self.registered_workdirs
-            .read()
-            .expect("workdirs poisoned")
-            .first()
-            .cloned()
-    }
-
-    /// 已登记工作目录快照（plugin list / settings 六层合并的 `registered_workdirs` 视图）/ registered workdirs。
-    pub fn registered_workdirs(&self) -> Vec<PathBuf> {
-        self.registered_workdirs
-            .read()
-            .expect("workdirs poisoned")
-            .clone()
     }
 
     /// SKILL registry 的共享句柄 / shared SKILL registry handle。
@@ -895,8 +859,8 @@ impl<S: Session> Computer<S> {
     /// - **运行期显式调用会阻塞 skill 读**：阶段一对**全部** marketplace 串行 stage 且写锁跨 stage await。常态
     ///   （clone 树已存在、`refresh = false`）仅本地 FS、无网络，开销小；但 clone 树缺失需 clone 时单源最坏
     ///   `DEFAULT_GIT_TIMEOUT`，期间 `get_skills` 等 skill 读阻塞。宜**低频 / 受控**触发（恢复语义本就一次性）。
-    /// - **跨重启 disable 语义以 user scope 为准**：enabled 门控读合并 `declared`，其 project/local 层仅来自
-    ///   当前 `active_workdir` + 已登记 workdir 的能力发现层并集。写在**未登记 workdir 的 project/local scope**
+    /// - **跨重启 disable 语义以 user scope 为准**：enabled 门控读合并 `declared`，其 project/local 层来自
+    ///   **进程 cwd**（#98：`Computer` 不再持有 workspace）。写在**非进程-cwd 的 project/local scope**
     ///   的 `enabledPlugins=false` 在恢复时可能不可见 → 该 plugin 被复活。**跨重启可靠禁用应写 user scope**
     ///   （对齐 installer disable/enable 的 scope 契约：scope 须与安装 scope 一致、由调用方据上下文传）。
     ///
@@ -906,13 +870,10 @@ impl<S: Session> Computer<S> {
         hooks: Option<&dyn McpInstallHooks>,
     ) -> GovernanceRecoveryReport {
         let home = self.skill_home();
-        // 合并 `enabledPlugins` 声明视图（能力发现层并集 + user + policy）；env=None（进程环境）。
+        // 合并 `enabledPlugins` 声明视图（user + 进程 cwd 的 project/local + policy）；env/cwd=None（进程态）。
         let policy = resolve_policy_settings(None, None, None);
-        let workdirs = self.registered_workdirs();
-        let active = self.active_workdir();
         let declared = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: &workdirs,
-            active_workdir: active.as_deref(),
+            cwd: None,
             env: None,
             flag_settings_path: None,
             policy_settings: Some(&policy),
@@ -1055,15 +1016,8 @@ impl<S: Session> Computer<S> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return;
         };
-        let workdirs = self
-            .registered_workdirs
-            .read()
-            .expect("workdirs poisoned")
-            .clone();
         let mut reg = self.skill_registry.write().await;
-        let discovered: HashSet<String> = stage_user_skills(&mut reg, &home, &workdirs)
-            .into_iter()
-            .collect();
+        let discovered: HashSet<String> = stage_user_skills(&mut reg, &home).into_iter().collect();
         reconcile_orphans_in(&mut reg, &discovered, |s| s == SOURCE_USER);
     }
 
@@ -1128,7 +1082,10 @@ impl<S: Session> Computer<S> {
         }
     }
 
-    /// 启动 user 源 DropIn 文件 watcher（监控 `<home>/user/` + 各登记 `<workdir>/.tfrobot/skills/`）/ start watcher。
+    /// 启动 user 源 DropIn 文件 watcher（监控 `<home>/user/`）/ start watcher。
+    ///
+    /// #98：`Computer` 不再持有 workspace，故仅监控 home 级全局 DropIn 根 `<home>/user/`；workdir 范围
+    /// SKILL 改由 MCP 服务经 `mcp` 源 + `skill://` 承载（`ResourceListChanged` 自动重挂）。
     ///
     /// watcher 回调在 notify/Poll 观察者的**独立 OS 线程**触发——该线程**无 Tokio 运行时上下文**。
     /// 去抖器契约（见 [`skills::debouncer`](crate::skills) 线程模型）要求跨线程触发**先 marshal 回运行时**
@@ -1138,11 +1095,6 @@ impl<S: Session> Computer<S> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return;
         };
-        let workdirs = self
-            .registered_workdirs
-            .read()
-            .expect("workdirs poisoned")
-            .clone();
         let debouncer = Arc::clone(&self.skill_debouncer);
         // `start_skill_watcher` 是 async → 必在 Tokio 运行时内，`Handle::current()` 恒有效。
         let rt = tokio::runtime::Handle::current();
@@ -1154,8 +1106,7 @@ impl<S: Session> Computer<S> {
         let mut watcher = SkillFileWatcher::builder(on_change)
             .use_polling(self.skill_watch_polling)
             .build();
-        let mut roots: Vec<PathBuf> = vec![user_dropin_root(&home)];
-        roots.extend(workdirs.iter().map(|wd| workdir_skill_root(wd)));
+        let roots: Vec<PathBuf> = vec![user_dropin_root(&home)];
         if let Err(e) = watcher.watch(roots) {
             warn!(error = %e, "SKILL file watcher start failed, skipped");
             return;
@@ -1958,12 +1909,10 @@ impl<S: Session> Computer<S> {
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
             skill_home_override: self.skill_home_override.clone(),
-            registered_workdirs: Arc::clone(&self.registered_workdirs),
             // 去抖器按 detached socketio 重建：避免 handler 持有的 ops 经去抖器反向引用真 client。
             skill_debouncer: Arc::new(build_skill_debouncer(
                 &self.skill_registry,
                 &self.skill_home,
-                &self.registered_workdirs,
                 &detached_socketio,
             )),
             skill_watcher: Arc::new(Mutex::new(None)),
@@ -2138,11 +2087,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
             skill_home_override: self.skill_home_override.clone(),
-            registered_workdirs: Arc::clone(&self.registered_workdirs),
             skill_debouncer: Arc::new(build_skill_debouncer(
                 &self.skill_registry,
                 &self.skill_home,
-                &self.registered_workdirs,
                 &self.socketio_client,
             )),
             // watcher 属**运行时态**（非共享句柄）：克隆体重启时自建（同 inputs/mcp_servers 重置语义）。
@@ -2836,14 +2783,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_workdir_and_mark_dirty_no_panic() {
+    async fn build_without_workdir_and_mark_dirty_no_panic() {
+        // #98：Computer 不再持有 workspace（无 with_registered_workdirs / active_workdir）；
+        // 构建 + 标脏仍正常。
         let tmp = tempfile::TempDir::new().unwrap();
-        let wd = tmp.path().join("wd");
         let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(tmp.path().join("home"))
-            .with_blob_cache_root(tmp.path().join("blob"))
-            .with_registered_workdirs([wd.clone()]);
-        assert_eq!(computer.active_workdir(), Some(wd));
+            .with_blob_cache_root(tmp.path().join("blob"));
         // 去抖器存在 → mark_skills_dirty 不 panic（无 client → 结算 no-op）。
         computer.mark_skills_dirty();
     }

@@ -155,7 +155,7 @@ pub trait McpInstallHooks: Send + Sync {
 pub struct InstallOptions<'a> {
     /// 物化记录 scope（`user|project|local`，默认 `user`）/ install-record scope。
     pub scope: Option<&'a str>,
-    /// active workdir（`project|local` scope 必需）/ active workdir for project/local scope。
+    /// project/local scope 的锚定目录（#98：进程 cwd；`user` scope 不需要）/ anchor dir for project/local。
     pub project_path: Option<&'a str>,
     /// 记录版本覆盖（`--version`）；缺省按 entry > plugin.json > commitSha 解析 / version override。
     pub version: Option<&'a str>,
@@ -183,7 +183,7 @@ pub struct UninstallOptions<'a> {
 pub struct EnableOptions<'a> {
     /// 写 `enabledPlugins` 的 scope（须与安装 scope 一致；默认 `user`）/ scope for enabledPlugins write。
     pub scope: Option<&'a str>,
-    /// active workdir（`project|local` scope 必需）/ active workdir。
+    /// project/local scope 的锚定目录（#98：进程 cwd；`user` scope 不需要）/ anchor dir for project/local。
     pub project_path: Option<&'a str>,
     /// 单次 git 操作超时（`None` → [`DEFAULT_GIT_TIMEOUT`]）/ per-op git timeout。
     pub timeout: Option<Duration>,
@@ -196,7 +196,7 @@ pub struct EnableOptions<'a> {
 pub struct DisableOptions<'a> {
     /// 写 `enabledPlugins` 的 scope（须与安装 scope 一致；默认 `user`）/ scope for enabledPlugins write。
     pub scope: Option<&'a str>,
-    /// active workdir（`project|local` scope 必需）/ active workdir。
+    /// project/local scope 的锚定目录（#98：进程 cwd；`user` scope 不需要）/ anchor dir for project/local。
     pub project_path: Option<&'a str>,
     /// env 覆盖 / env overrides。
     pub env: Option<&'a EnvMap>,
@@ -230,7 +230,7 @@ fn settings_path_for_scope(
         "project" | "local" => {
             let wd = project_path.filter(|s| !s.is_empty()).ok_or_else(|| {
                 PluginInstallError::Precondition(format!(
-                    "scope {scope:?} requires project_path (active workdir)"
+                    "scope {scope:?} requires project_path (process cwd anchor)"
                 ))
             })?;
             let wd = Path::new(wd);

@@ -42,8 +42,7 @@ pub use naming::{
 
 pub use home::{
     ensure_skill_home, marketplace_skill_dir, mcp_skill_dir, resolve_skill_home, user_dropin_root,
-    user_skill_dir, workdir_skill_root, SKILL_HOME_ENV, SOURCE_MARKETPLACE, SOURCE_MCP,
-    SOURCE_USER, XDG_DATA_HOME_ENV,
+    user_skill_dir, SKILL_HOME_ENV, SOURCE_MARKETPLACE, SOURCE_MCP, SOURCE_USER, XDG_DATA_HOME_ENV,
 };
 
 pub use sources::{

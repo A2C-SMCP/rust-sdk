@@ -101,10 +101,10 @@ pub struct GovernanceRecoveryReport {
 /// 缺省（无 key）与 `true` 皆视为启用——匹配 [`install_plugin`](crate::settings::installer::install_plugin)
 /// 「装即活跃、无显式 enable 旗」语义；仅显式 `Bool(false)`（disable / enable-rollback 落定）视为禁用。
 ///
-/// ⚠️ `declared` 的**完整性由调用方负责**：仅当禁用旗所在 scope 已并入 `declared` 才生效。写在**未登记
-/// workdir 的 project/local scope** 的 `enabledPlugins=false` 可能不在 `declared` 内 → 此处误判为启用。跨重启
-/// 可靠禁用应写 user scope（见 [`Computer::reconcile_governance`](crate::computer::Computer::reconcile_governance)
-/// 调用方须知）。
+/// ⚠️ `declared` 的**完整性由调用方负责**：仅当禁用旗所在 scope 已并入 `declared` 才生效。#98 后 project/local
+/// 层来自**进程 cwd**（`Computer` 不再持有 workspace）——写在**非进程-cwd 的 project/local scope** 的
+/// `enabledPlugins=false` 可能不在 `declared` 内 → 此处误判为启用。跨重启可靠禁用应写 user scope（见
+/// [`Computer::reconcile_governance`](crate::computer::Computer::reconcile_governance) 调用方须知）。
 #[must_use]
 fn plugin_enabled(declared: &Map<String, Value>, pid: &str) -> bool {
     !matches!(
@@ -722,14 +722,14 @@ mod tests {
         assert!(fresh.resolve("lint:lint-skill").is_some());
     }
 
-    // ---- 🟡9：跨重启 disable 已知局限——禁用旗不在 declared（如写在未登记 workdir 的 project scope）→ 复活 ----
+    // ---- 🟡9：跨重启 disable 已知局限——禁用旗不在 declared（如写在非进程-cwd 的 project scope）→ 复活 ----
     #[tokio::test]
     async fn recover_revives_when_disable_flag_absent_from_declared() {
         // 钉记已知局限（recovery.rs plugin_enabled / reconcile_governance doc）：若 enabledPlugins=false 写在
-        // **未并入 declared** 的 scope（如未登记 workdir 的 project/local），恢复时不可见 → plugin 被视为启用复活。
+        // **未并入 declared** 的 scope（如非进程-cwd 的 project/local），恢复时不可见 → plugin 被视为启用复活。
         let tmp = TempDir::new().unwrap();
         let (home, _src) = setup_installed(&tmp).await;
-        // declared 缺该 pid 的 false 旗（模拟禁用写在未登记 workdir 的 project scope）。
+        // declared 缺该 pid 的 false 旗（模拟禁用写在非进程-cwd 的 project scope）。
         let declared = Map::new();
         let mut fresh = SkillRegistry::new();
         let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
