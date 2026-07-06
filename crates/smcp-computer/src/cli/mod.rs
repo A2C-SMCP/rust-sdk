@@ -500,7 +500,8 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
     };
 
     // 启动前缀（inputs/config 加载 → boot_up 子系统装配 → socket.io 连接）抽出为可测 helper。
-    let handler = prepare_handler(computer, cli_config, config, inputs).await;
+    let handler =
+        prepare_handler(computer, cli_config, config, inputs, root.flag_path.clone()).await;
 
     // 启动 banner（版本 / 协议版本 / home）。
     let home = handler.computer.skill_home();
@@ -538,6 +539,7 @@ async fn prepare_handler(
     cli_config: commands::CliConfig,
     config: Option<PathBuf>,
     inputs: Option<PathBuf>,
+    flag_path: Option<PathBuf>,
 ) -> CommandHandler {
     let url = cli_config.url.clone();
     let namespace = cli_config.namespace.clone();
@@ -561,6 +563,11 @@ async fn prepare_handler(
     if let Err(e) = handler.computer.boot_up().await {
         eprintln!("初始化 SKILL/blob 子系统失败: {e}");
     }
+
+    // #100 设计 Y：boot 仅恢复 skills；CLI 作为参考 client 经公共 API 显式重挂 enabled bundled MCP server
+    // （§4.8.2 conformance「重启恢复」；外部 client/GUI 照抄 run_governance_remount）。flag-aware（`--settings`
+    // scope 生效）、非阻塞、须在上线前完成。
+    commands::run_governance_remount(&handler.computer, flag_path.as_deref()).await;
 
     if let Some(url) = &url {
         if let Err(e) = handler
@@ -603,7 +610,7 @@ mod tests {
             auth: None,
             headers: None,
         };
-        let handler = prepare_handler(computer, cli_config, None, None).await;
+        let handler = prepare_handler(computer, cli_config, None, None, None).await;
 
         // 修复后：prepare_handler 内 boot_up 已发现 user 源 SKILL。
         assert_eq!(handler.computer.get_skills().await.len(), 1);

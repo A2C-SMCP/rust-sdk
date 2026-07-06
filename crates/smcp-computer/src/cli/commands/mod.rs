@@ -18,8 +18,8 @@
 *   - `flag_value` / `resolved_settings`：REPL 行解析与六层合并视图。
 */
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use console::style;
@@ -164,11 +164,19 @@ pub fn resolved_settings(
 ///
 /// `existing_server_names` 须同步返回（trait 约束），故在构造期**快照**当前 server 名集合——installer 的冲突
 /// 闸门在注册任何 bundled server 之前一次性读取，快照语义与之吻合。
+///
+/// **重挂场景**（[`new_remount`](Self::new_remount)，#100 治理恢复）：单次 `reconcile_governance` 会跨**多个**
+/// plugin 逐 server 回调，但本 hooks 只能持一份上下文。故 `roots`（`install_path → (plugin, marketplace)`）在
+/// 构造期从 `collect_enabled_bundled_servers` 建索引，[`inject_inputs`](McpInstallHooks::inject_inputs) 据
+/// `plugin_root` **按记录归属**前缀化注入（对齐 Python `_inject(record)` 从 record 取归属）；install/enable 单
+/// plugin 场景 `roots` 为空、回退到构造期绑定的 `plugin`/`marketplace`。
 pub struct CliMcpHooks<'a, S: Session> {
     comp: &'a Computer<S>,
     existing: HashSet<String>,
     plugin: Option<String>,
     marketplace: Option<String>,
+    /// 重挂归属索引：`install_path → (plugin, marketplace)`（单 plugin 场景为空）/ remount ownership index。
+    roots: HashMap<PathBuf, (String, String)>,
 }
 
 impl<'a, S: Session> CliMcpHooks<'a, S> {
@@ -189,6 +197,39 @@ impl<'a, S: Session> CliMcpHooks<'a, S> {
             existing,
             plugin,
             marketplace,
+            roots: HashMap::new(),
+        }
+    }
+
+    /// 治理重挂用 hooks（#100）：从 ledger 派生 `install_path → 归属` 索引 + 快照当前 server 名 / remount hooks。
+    ///
+    /// `roots` 用**调用方传入的同一份 `declared`** 建索引——[`run_governance_remount`] 把该 `declared` 同时喂给
+    /// [`Computer::reconcile_governance`](crate::computer::Computer::reconcile_governance)，故 `roots` 键
+    /// （`install_path`）与 `reconcile_governance` 传给 `inject_inputs` 的路径**逐字对齐**（含 flag scope 一致）。
+    pub async fn new_remount(
+        comp: &'a Computer<S>,
+        declared: &Map<String, Value>,
+    ) -> CliMcpHooks<'a, S> {
+        let home = comp.skill_home();
+        let mut roots: HashMap<PathBuf, (String, String)> = HashMap::new();
+        for rec in crate::settings::recovery::collect_enabled_bundled_servers(&home, None, declared)
+        {
+            roots
+                .entry(rec.install_path)
+                .or_insert((rec.plugin, rec.marketplace));
+        }
+        let existing = comp
+            .list_mcp_servers()
+            .await
+            .iter()
+            .map(|cfg| cfg.name().to_string())
+            .collect();
+        CliMcpHooks {
+            comp,
+            existing,
+            plugin: None,
+            marketplace: None,
+            roots,
         }
     }
 }
@@ -218,8 +259,13 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
     }
 
     async fn inject_inputs(&self, plugin_root: &Path) -> Result<(), McpHookError> {
-        // 仅 plugin install/enable 上下文（plugin+marketplace 齐备）注入；卸载级联无上下文 → no-op。
-        let (Some(plugin), Some(marketplace)) = (&self.plugin, &self.marketplace) else {
+        // 归属上下文：优先按 `install_path` 查重挂归属索引（一 hooks 跨多 plugin，#100）；回退构造期绑定的单
+        // plugin 上下文（install/enable）。二者皆无（卸载级联）→ no-op。
+        let (plugin, marketplace) = if let Some((p, m)) = self.roots.get(plugin_root) {
+            (p.as_str(), m.as_str())
+        } else if let (Some(p), Some(m)) = (&self.plugin, &self.marketplace) {
+            (p.as_str(), m.as_str())
+        } else {
             return Ok(());
         };
         let inputs_json = plugin_root
@@ -232,6 +278,42 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
                 .map_err(|e| McpHookError(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// 启动期治理重挂（#100 / python-sdk#117 设计 Y 的 client 接线**参考实现**）/ boot-time governance remount。
+///
+/// `boot_up` 已恢复 bundled SKILL（skills-only，§4.8 #93 边界：SDK 不擅自拉 MCP 进程）；此处 CLI 作为**参考
+/// client** 经公共 API [`Computer::reconcile_governance`] 显式重挂 enabled bundled MCP server（外部 client /
+/// 未来 GUI 照抄本函数）。对齐 Python `cli/commands/plugin.py::run_governance_remount`：
+/// - `existing_server_names` 取自活跃 `Computer`（[`CliMcpHooks::new_remount`] 构造期快照）→ 同名冲突由
+///   `reconcile_governance` 内部 **skip+WARN**（用户配置胜）；bundled **免批准**（§5.10 不走 project 信任门）；
+/// - inputs 注入先于 register（bundled server `${input:}` 经 D2 前缀回退解析，与 install/enable 流一致）；
+/// - `declared` 为 **flag-aware** 合并视图（`resolved_settings(_, _, flag_path)`，对齐 Python
+///   `run_governance_remount(flag_config=...)`）：`--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效；
+///   同一份 `declared` 既建归属索引又驱动重挂 → `roots` 键与迭代集对齐；
+/// - 单 server 失败不阻断；marketplace 降级仅 WARN；整体**非阻塞**（与 `a2c-computer run` 启动隔离策略一致）。
+///
+/// [`Computer::reconcile_governance`]: crate::computer::Computer::reconcile_governance
+pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: Option<&Path>) {
+    let declared = resolved_settings(None, None, flag_path);
+    let hooks = CliMcpHooks::new_remount(comp, &declared).await;
+    let report = comp
+        .reconcile_governance(Some(&hooks), Some(&declared))
+        .await;
+    if !report.restored_skills.is_empty() {
+        msg_ok(&format!(
+            "governance recovery: {} skill(s) restored",
+            report.restored_skills.len()
+        ));
+    }
+    for name in &report.remounted_servers {
+        msg_ok(&format!("restored bundled MCP server {name:?}"));
+    }
+    for marketplace in &report.failed_marketplaces {
+        msg_warn(&format!(
+            "⚠ marketplace {marketplace:?} degraded during governance recovery (skills/servers not restored)"
+        ));
     }
 }
 
@@ -286,5 +368,146 @@ mod tests {
         // inject 无 inputs.json → no-op（不 panic）。
         let tmp = std::env::temp_dir();
         assert!(hooks.inject_inputs(&tmp).await.is_ok());
+    }
+
+    /// #100 item1：`new_remount` 从 ledger 建 `install_path → 归属` 索引；`inject_inputs` **按记录归属**
+    /// 前缀化注入（plugin/marketplace 绑定为 `None`，仅靠 `roots` 才能命中——证明多-plugin 重挂正确前缀）。
+    #[tokio::test]
+    async fn new_remount_indexes_ownership_and_inject_uses_per_root_context() {
+        use crate::settings::store::update_installed_plugins;
+        use crate::settings::InstalledPluginRecord;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        // 造 plugin 安装树：<home>/plug/mcp-servers/{a-mcp.json, inputs.json}。
+        let install_path = home.join("plug");
+        let servers = install_path.join("mcp-servers");
+        std::fs::create_dir_all(&servers).unwrap();
+        std::fs::write(
+            servers.join("a-mcp.json"),
+            r#"{"type":"stdio","name":"a-mcp","server_parameters":{"command":"node","args":["${input:tok}"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            servers.join("inputs.json"),
+            r#"[{"id":"tok","type":"PromptString","description":"t"}]"#,
+        )
+        .unwrap();
+
+        // seed ledger（env=None → 与 new_remount / collect 的读取路径一致）。
+        update_installed_plugins(
+            |file| {
+                file.account.plugins.insert(
+                    "remounttest@acme".to_string(),
+                    vec![InstalledPluginRecord {
+                        install_path: Some(install_path.to_string_lossy().into_owned()),
+                        bundled_mcp_servers: vec!["a-mcp".to_string()],
+                        extra: Map::from_iter([("scope".to_string(), json!("user"))]),
+                    }],
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+
+        let comp = cli_computer().with_skill_home(home.to_path_buf());
+
+        // hermetic：显式空 `declared`（无 `enabledPlugins` 键 → 默认启用），**不**读真实用户配置。
+        let declared = Map::new();
+        // new_remount 建归属索引：install_path → (plugin, marketplace)。
+        let hooks = CliMcpHooks::new_remount(&comp, &declared).await;
+        assert_eq!(
+            hooks.roots.get(&install_path),
+            Some(&("remounttest".to_string(), "acme".to_string())),
+            "roots 应按 install_path 索引记录归属"
+        );
+
+        // inject_inputs 靠 roots 归属前缀化入池（绑定 plugin/marketplace=None，若不查 roots 则会 no-op）。
+        hooks.inject_inputs(&install_path).await.unwrap();
+        assert!(
+            comp.get_input("remounttest@acme/tok")
+                .await
+                .unwrap()
+                .is_some(),
+            "应按记录归属前缀化注入 <plugin>@<marketplace>/<id>"
+        );
+    }
+
+    /// #100 item1/3：**多 plugin 同批重挂**——各 `install_path` 的 inputs 按**各自**归属前缀化，前缀不串。
+    #[tokio::test]
+    async fn new_remount_multi_plugin_prefixes_do_not_cross() {
+        use crate::settings::store::update_installed_plugins;
+        use crate::settings::InstalledPluginRecord;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        // 两个 plugin 安装树，各含**同 id** `tok` 的 input，但归属不同 → 前缀须区分。
+        let mk = |name: &str| -> std::path::PathBuf {
+            let root = home.join(name);
+            let servers = root.join("mcp-servers");
+            std::fs::create_dir_all(&servers).unwrap();
+            std::fs::write(
+                servers.join(format!("{name}-mcp.json")),
+                format!(r#"{{"type":"stdio","name":"{name}-mcp","server_parameters":{{"command":"node"}}}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                servers.join("inputs.json"),
+                r#"[{"id":"tok","type":"PromptString","description":"t"}]"#,
+            )
+            .unwrap();
+            root
+        };
+        let alpha_root = mk("alpha");
+        let beta_root = mk("beta");
+
+        update_installed_plugins(
+            |file| {
+                file.account.plugins.insert(
+                    "alpha@m1".to_string(),
+                    vec![InstalledPluginRecord {
+                        install_path: Some(alpha_root.to_string_lossy().into_owned()),
+                        bundled_mcp_servers: vec!["alpha-mcp".to_string()],
+                        extra: Map::from_iter([("scope".to_string(), json!("user"))]),
+                    }],
+                );
+                file.account.plugins.insert(
+                    "beta@m2".to_string(),
+                    vec![InstalledPluginRecord {
+                        install_path: Some(beta_root.to_string_lossy().into_owned()),
+                        bundled_mcp_servers: vec!["beta-mcp".to_string()],
+                        extra: Map::from_iter([("scope".to_string(), json!("user"))]),
+                    }],
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+
+        let comp = cli_computer().with_skill_home(home.to_path_buf());
+        let declared = Map::new(); // hermetic：默认全启用。
+        let hooks = CliMcpHooks::new_remount(&comp, &declared).await;
+
+        // 两根各自归属正确（不混）。
+        assert_eq!(
+            hooks.roots.get(&alpha_root),
+            Some(&("alpha".to_string(), "m1".to_string()))
+        );
+        assert_eq!(
+            hooks.roots.get(&beta_root),
+            Some(&("beta".to_string(), "m2".to_string()))
+        );
+
+        // 各根注入 → 同 id `tok` 落到**各自**前缀键，不串。
+        hooks.inject_inputs(&alpha_root).await.unwrap();
+        hooks.inject_inputs(&beta_root).await.unwrap();
+        assert!(comp.get_input("alpha@m1/tok").await.unwrap().is_some());
+        assert!(comp.get_input("beta@m2/tok").await.unwrap().is_some());
     }
 }

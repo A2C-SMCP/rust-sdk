@@ -865,39 +865,79 @@ impl<S: Session> Computer<S> {
     ///   的 `enabledPlugins=false` 在恢复时可能不可见 → 该 plugin 被复活。**跨重启可靠禁用应写 user scope**
     ///   （对齐 installer disable/enable 的 scope 契约：scope 须与安装 scope 一致、由调用方据上下文传）。
     ///
+    /// ## 参数 / Params
+    /// - `hooks`：`None` = skills-only（boot 默认）；`Some` = client 经 hooks 重挂 bundled MCP server。
+    /// - `declared`：`enabledPlugins` 合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。
+    ///   `None` → 内部解析（进程 cwd 的 user/project/local/policy，**无** `--settings` flag scope）；CLI 参考
+    ///   接线传 **flag-aware** 视图使 `--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效。
+    ///
     /// 返回 [`GovernanceRecoveryReport`]（恢复 / 跳过 / 降级明细，供观测与测试）。
     pub async fn reconcile_governance(
         &self,
         hooks: Option<&dyn McpInstallHooks>,
+        declared: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> GovernanceRecoveryReport {
         let home = self.skill_home();
-        // 合并 `enabledPlugins` 声明视图（user + 进程 cwd 的 project/local + policy）；env/cwd=None（进程态）。
-        let policy = resolve_policy_settings(None, None, None);
-        let declared = resolve_settings(ResolveSettingsArgs {
-            cwd: None,
-            env: None,
-            flag_settings_path: None,
-            policy_settings: Some(&policy),
-        })
-        .settings;
+        // `declared` 覆盖：CLI 参考接线传 **flag-aware** 合并视图（`--settings` scope 生效，对齐 Python
+        // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（user + 进程 cwd 的 project/local +
+        // policy，**无** `--settings` flag scope；跨重启可靠 disable 请写 user scope）。env/cwd=None（进程态）。
+        let resolved_declared;
+        let declared: &serde_json::Map<String, serde_json::Value> = match declared {
+            Some(d) => d,
+            None => {
+                let policy = resolve_policy_settings(None, None, None);
+                resolved_declared = resolve_settings(ResolveSettingsArgs {
+                    cwd: None,
+                    env: None,
+                    flag_settings_path: None,
+                    policy_settings: Some(&policy),
+                })
+                .settings;
+                &resolved_declared
+            }
+        };
 
         // 阶段一：重挂 marketplace skills（持 `skill_registry` 写锁；stage 含 git await，boot 期无并发故安全）。
         let mut report = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, None, &declared)
+            crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, None, declared)
                 .await
         };
 
         // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
+        // 严格镜像 Python `computer.py::reconcile_governance` remount 臂（PR #119 / #100 设计 Y）：
+        // ① 同名冲突 → skip + WARN（additive-only，既有 / 用户配置胜，**不覆盖**）；
+        // ② 每 plugin 根仅 `inject_inputs` 一次（bundled server 的 `${input:}` 经 D2 前缀回退前置，与
+        //    install/enable 流一致）；注入失败 → **隔离该 server**（不 register、不阻断其余）；
+        // ③ 成功后把名字并入 `existing`，使同名 bundled server（跨 plugin）后见者亦被跳过（首见胜）。
         if let Some(h) = hooks {
+            let mut existing = h.existing_server_names();
+            let mut injected_roots: HashSet<PathBuf> = HashSet::new();
             for rec in
-                crate::settings::recovery::collect_enabled_bundled_servers(&home, None, &declared)
+                crate::settings::recovery::collect_enabled_bundled_servers(&home, None, declared)
             {
                 let name = rec.config.name().to_string();
+                if existing.contains(&name) {
+                    warn!(server = %name, plugin = %rec.plugin_id,
+                        "reconcile_governance: remount skipped (name conflicts with an existing server, existing wins)");
+                    continue;
+                }
+                // 每 plugin 根注入一次 inputs；注入失败 → 隔离该 server（roots 不入集，同根后续 server 会重试）。
+                if !injected_roots.contains(&rec.install_path) {
+                    if let Err(e) = h.inject_inputs(&rec.install_path).await {
+                        warn!(root = %rec.install_path.display(), plugin = %rec.plugin_id, error = %e,
+                            "reconcile_governance: remount inject_inputs failed (non-blocking)");
+                        continue;
+                    }
+                    injected_roots.insert(rec.install_path.clone());
+                }
                 match h.register_server(rec.config).await {
-                    Ok(()) => report.remounted_servers.push(name),
+                    Ok(()) => {
+                        existing.insert(name.clone());
+                        report.remounted_servers.push(name);
+                    }
                     Err(e) => {
-                        warn!(server = %name, error = %e,
+                        warn!(server = %name, plugin = %rec.plugin_id, error = %e,
                             "reconcile_governance: remount register_server failed (non-blocking)");
                     }
                 }
@@ -1203,7 +1243,7 @@ impl<S: Session> Computer<S> {
         // boot 时多为空——server 后续接入）+ 初次全量发现 user 源（= invalidate_user_skills）+ 启 watcher。
         // 各自失败隔离。对标 Python boot_up SKILL 子系统初始化。
         self.ensure_skill_home();
-        let recovery = self.reconcile_governance(None).await;
+        let recovery = self.reconcile_governance(None, None).await;
         if !recovery.restored_plugins.is_empty() || !recovery.failed_marketplaces.is_empty() {
             info!(
                 restored_plugins = recovery.restored_plugins.len(),
@@ -2512,29 +2552,41 @@ mod tests {
         format!("file://{}", repo.display())
     }
 
-    /// 记录式 `McpInstallHooks` 替身（重挂阶段二测试用；可注入注定失败的 `register_server`）/ recording hooks。
+    /// 记录式 `McpInstallHooks` 替身（重挂阶段二测试用；可注入注定失败的 `register_server` /
+    /// 预置 `existing` 名集测同名跳过 / 记录 `inject_inputs` 的 plugin 根）/ recording hooks。
     struct RecordingRemountHooks {
         registered: std::sync::Mutex<Vec<String>>,
+        injected_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
+        existing: std::collections::HashSet<String>,
         fail_register: Option<String>,
     }
     impl RecordingRemountHooks {
         fn new() -> Self {
             Self {
                 registered: std::sync::Mutex::new(Vec::new()),
+                injected_roots: std::sync::Mutex::new(Vec::new()),
+                existing: std::collections::HashSet::new(),
                 fail_register: None,
             }
         }
         fn failing(name: &str) -> Self {
             Self {
-                registered: std::sync::Mutex::new(Vec::new()),
                 fail_register: Some(name.to_string()),
+                ..Self::new()
+            }
+        }
+        /// 预置「既有 server 名」集（模拟用户配置已占名）→ 触发同名 skip / seed existing names。
+        fn with_existing(names: &[&str]) -> Self {
+            Self {
+                existing: names.iter().map(|n| (*n).to_string()).collect(),
+                ..Self::new()
             }
         }
     }
     #[async_trait::async_trait]
     impl McpInstallHooks for RecordingRemountHooks {
         fn existing_server_names(&self) -> std::collections::HashSet<String> {
-            std::collections::HashSet::new()
+            self.existing.clone()
         }
         async fn register_server(
             &self,
@@ -2553,6 +2605,16 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<(), crate::settings::installer::McpHookError> {
+            Ok(())
+        }
+        async fn inject_inputs(
+            &self,
+            plugin_root: &std::path::Path,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            self.injected_roots
+                .lock()
+                .unwrap()
+                .push(plugin_root.to_path_buf());
             Ok(())
         }
     }
@@ -2631,7 +2693,7 @@ mod tests {
             "新进程 registry 恢复前应为空"
         );
 
-        let report = comp_b.reconcile_governance(None).await;
+        let report = comp_b.reconcile_governance(None, None).await;
         assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
         assert_eq!(
             report.restored_skills,
@@ -2649,7 +2711,7 @@ mod tests {
         );
 
         // 幂等：再调一次仍恢复同一 skill、不重复 / 不 panic。
-        let report2 = comp_b.reconcile_governance(None).await;
+        let report2 = comp_b.reconcile_governance(None, None).await;
         assert_eq!(
             report2.restored_skills,
             vec!["audit:code-review".to_string()]
@@ -2672,7 +2734,7 @@ mod tests {
             .with_skill_home(home)
             .with_blob_cache_root(tmp.path().join("blob-b"));
         let hooks = RecordingRemountHooks::new();
-        let report = comp_b.reconcile_governance(Some(&hooks)).await;
+        let report = comp_b.reconcile_governance(Some(&hooks), None).await;
 
         // skills 恢复 + bundled server 经 hooks 重挂。
         assert_eq!(
@@ -2684,10 +2746,49 @@ mod tests {
             *hooks.registered.lock().unwrap(),
             vec!["audit-mcp".to_string()]
         );
+        // #100 item3：重挂前按 plugin 根注入一次 inputs（`${input:}` D2 前缀回退前置）。
+        assert_eq!(
+            hooks.injected_roots.lock().unwrap().len(),
+            1,
+            "每 plugin 根仅注入一次 inputs"
+        );
 
         // 幂等：二次调用仍重挂同一 server（register-or-update，by name 幂等）、不 panic。
-        let report2 = comp_b.reconcile_governance(Some(&hooks)).await;
+        let report2 = comp_b.reconcile_governance(Some(&hooks), None).await;
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
+    }
+
+    /// #100 item3：既有同名 server → 重挂**跳过**（additive-only，用户配置胜）；不 register 覆盖、不注入。
+    #[tokio::test]
+    async fn reconcile_governance_remount_skips_name_conflicting_with_existing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await; // 装 audit@acme（bundled server "audit-mcp"）。
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        // hooks 报告 "audit-mcp" 已被既有 server 占名（模拟用户配置先挂先占）。
+        let hooks = RecordingRemountHooks::with_existing(&["audit-mcp"]);
+        let report = comp_b.reconcile_governance(Some(&hooks), None).await;
+
+        // 同名冲突 → 跳过：不入 report.remounted、register 未被调用、跳过项不注入 inputs。
+        assert!(
+            report.remounted_servers.is_empty(),
+            "同名冲突 → skip，不重挂"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "同名冲突 → 不 register 覆盖用户配置"
+        );
+        assert!(
+            hooks.injected_roots.lock().unwrap().is_empty(),
+            "跳过项不注入 inputs"
+        );
+        // 阶段一 skills 恢复不受同名跳过影响。
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
     }
 
     /// 失败隔离铁律：`register_server` 注定失败 → 不 panic、不阻断、skills 仍恢复、failed server 不入 report。
@@ -2701,7 +2802,7 @@ mod tests {
             .with_blob_cache_root(tmp.path().join("blob-b"));
         let hooks = RecordingRemountHooks::failing("audit-mcp");
         // 不 panic、正常返回。
-        let report = comp_b.reconcile_governance(Some(&hooks)).await;
+        let report = comp_b.reconcile_governance(Some(&hooks), None).await;
 
         // skills 阶段不受 MCP 重挂失败影响，仍恢复。
         assert_eq!(
@@ -2922,7 +3023,7 @@ mod tests {
         let comp = Computer::new("b", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home)
             .with_blob_cache_root(tmp.path().join("blob"));
-        let report = comp.reconcile_governance(None).await;
+        let report = comp.reconcile_governance(None, None).await;
         assert!(report.restored_skills.is_empty());
         assert!(
             !comp.skill_settlement_pending(),
