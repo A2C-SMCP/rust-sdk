@@ -29,6 +29,7 @@ use crate::blob::{
     SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
+use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::settings::installer::{
     DisableOptions, EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError,
     UninstallOptions,
@@ -39,7 +40,7 @@ use crate::settings::lifecycle::{
 };
 use crate::settings::policy::resolve_policy_settings;
 use crate::settings::reconciler::InstalledPluginRecord;
-use crate::settings::recovery::GovernanceRecoveryReport;
+use crate::settings::recovery::{BundledServerRecord, GovernanceRecoveryReport};
 use crate::settings::scope::{resolve_settings, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
@@ -889,11 +890,11 @@ impl<S: Session> Computer<S> {
 
         // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
         if let Some(h) = hooks {
-            for cfg in
+            for rec in
                 crate::settings::recovery::collect_enabled_bundled_servers(&home, None, &declared)
             {
-                let name = cfg.name().to_string();
-                match h.register_server(cfg).await {
+                let name = rec.config.name().to_string();
+                match h.register_server(rec.config).await {
                     Ok(()) => report.remounted_servers.push(name),
                     Err(e) => {
                         warn!(server = %name, error = %e,
@@ -1829,6 +1830,90 @@ impl<S: Session> Computer<S> {
         servers.values().cloned().collect()
     }
 
+    /// 列出 MCP 服务器 + 归属 / 生命周期元数据（活跃 inventory）/ List MCP servers with ownership metadata.
+    ///
+    /// 面向 client（如 `tfrobot-client`）Skill / MCP tab：一次拿到「当前 Computer 有哪些 MCP server + 每条归
+    /// 谁（user vs plugin，含 marketplace / plugin / pluginId）+ 能否从普通 MCP tab 编辑 / 启停」，**无需**读
+    /// SDK ledger、**无需**解析 plugin manifest、**无需**持内存 ownership map。协议依据 a2c-smcp-protocol
+    /// v0.2.3 §4.8（归属 = boot 纯函数、每次可复现；enabled bundled server 进程未拉起也须可查询）。元数据类型
+    /// 见 [`crate::inventory`]，**SDK-facing、不进** Agent-facing `client:*` wire。
+    ///
+    /// 合并两个来源（去重按 server 名，运行期条目优先）：
+    /// 1. 运行期已物化集 `self.mcp_servers`——用户配置 server，或 client 经 `reconcile_governance(hooks)` 物化
+    ///    的 plugin bundled server；名字命中 ledger 派生 bundled 集 → `managedBy=plugin`，否则 `managedBy=user`。
+    /// 2. ledger 派生的**已启用但尚未物化**的 plugin bundled server（boot `hooks=None` 后即此态）——补入
+    ///    inventory 并标 `managedBy=plugin`，满足 §4.8「进程未拉起也可观测」（客户端据此物化或引导 Marketplace）。
+    ///
+    /// 结果按 server 名排序（`self.mcp_servers` 为 `HashMap`，排序保证稳定可测输出）。**不**含运行期「进程是否
+    /// 已启动」状态——那由 [`get_server_status`](Self::get_server_status) 单独提供。
+    ///
+    /// ## 归属 join key = server 名（限制与非目标）/ ownership join key = name
+    ///
+    /// 归属以 **server 名**为唯一 join key：运行期条目名命中 ledger 派生 bundled 集即标 `plugin`。故**同名冲突**
+    /// 会退化——用户配置一个与某启用 plugin bundled server **同名**的 server 会被标 `plugin`（只读）；两个 plugin
+    /// 的同名 bundled server 经首见去重、后者身份不出现。这**符合协议「name = 能力身份」**语义，且**可靠的冲突
+    /// 拦截是安装期职责**（[`install_plugin`](Self::install_plugin) 经 hooks `existing_server_names` 的冲突门），
+    /// **非**本只读投影的职责。#96 pt5「同名返回明确错误」属安装期契约、不在 #97（inventory 查询）范围。调用方若
+    /// 需强冲突保证，应经带 hooks 的安装路径拦截，而非依赖本查询。
+    pub async fn list_mcp_servers_with_metadata(&self) -> Vec<McpServerWithMetadata> {
+        // 由 [`BundledServerRecord`] 纯函数派生 `managedBy=plugin`（§4.8.3）。
+        let plugin_ownership = |rec: &BundledServerRecord| McpOwnership::Plugin {
+            marketplace: rec.marketplace.clone(),
+            plugin: rec.plugin.clone(),
+            plugin_id: rec.plugin_id.clone(),
+        };
+
+        // ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图；env/cwd=None）。
+        let home = self.skill_home();
+        let policy = resolve_policy_settings(None, None, None);
+        let declared = resolve_settings(ResolveSettingsArgs {
+            cwd: None,
+            env: None,
+            flag_settings_path: None,
+            policy_settings: Some(&policy),
+        })
+        .settings;
+        let bundled: HashMap<String, BundledServerRecord> =
+            crate::settings::recovery::collect_enabled_bundled_servers(&home, None, &declared)
+                .into_iter()
+                .map(|rec| (rec.config.name().to_string(), rec))
+                .collect();
+
+        let mut out: Vec<McpServerWithMetadata> = Vec::new();
+        let mut materialized: HashSet<String> = HashSet::new();
+
+        // 来源一：运行期已物化 server。命中 ledger bundled 集 → plugin，否则 user。
+        {
+            let servers = self.mcp_servers.read().await;
+            for (name, cfg) in servers.iter() {
+                materialized.insert(name.clone());
+                let managed_by = match bundled.get(name) {
+                    Some(rec) => plugin_ownership(rec),
+                    None => McpOwnership::User,
+                };
+                out.push(McpServerWithMetadata::new(
+                    name.clone(),
+                    cfg.disabled(),
+                    managed_by,
+                ));
+            }
+        }
+
+        // 来源二：已启用但尚未物化的 bundled server（不在运行期集 → 补入，标 plugin；§4.8 可观测）。
+        for (name, rec) in &bundled {
+            if !materialized.contains(name) {
+                out.push(McpServerWithMetadata::new(
+                    name.clone(),
+                    rec.config.disabled(),
+                    plugin_ownership(rec),
+                ));
+            }
+        }
+
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     /// 启动 MCP 客户端 / Start MCP client
     pub async fn start_mcp_client(&self, server_name: &str) -> ComputerResult<()> {
         let manager_guard = self.mcp_manager.read().await;
@@ -2655,6 +2740,127 @@ mod tests {
             "boot_up 后应从 ledger 恢复 marketplace skill"
         );
         comp_b.shutdown().await.unwrap();
+    }
+
+    // ── #97：list_mcp_servers_with_metadata 归属 + 活跃 inventory ─────────────────────
+    /// 构造一条禁用的用户 stdio server（配置态即可，disabled 免 boot 拉起进程）/ a disabled user server。
+    fn user_stdio_server97(name: &str) -> MCPServerConfig {
+        MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
+            name: name.to_string(),
+            disabled: true,
+            forbidden_tools: vec![],
+            tool_meta: std::collections::HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "node".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+            },
+        })
+    }
+
+    /// AC1：装+启用 plugin、以同一 `skill_home` 重建 Computer、boot 后——inventory 同时返回用户 server
+    /// （`managedBy=user`，可从 MCP tab 全权管）与 plugin bundled server（`managedBy=plugin` + 正确
+    /// marketplace/plugin/pluginId，只读）。后者虽经 boot(`hooks=None`) **未物化**进 `self.mcp_servers`，仍经
+    /// ledger 纯函数派生出现（§4.8「进程未拉起也可观测」）；client 据此无需读 ledger / 解析 manifest 即可判定
+    /// plugin server 不走用户生命周期入口。
+    #[tokio::test]
+    async fn list_mcp_servers_with_metadata_boot_reports_user_and_plugin_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        let mut user_servers = std::collections::HashMap::new();
+        user_servers.insert("user-fs".to_string(), user_stdio_server97("user-fs"));
+
+        let comp_b = Computer::new(
+            "b",
+            SilentSession::new("s"),
+            None,
+            Some(user_servers),
+            false,
+            false,
+        )
+        .with_skill_home(home)
+        .with_blob_cache_root(tmp.path().join("blob-b"));
+        comp_b.boot_up().await.unwrap();
+
+        let inv = comp_b.list_mcp_servers_with_metadata().await;
+
+        // 用户 server：managedBy=user，可从 MCP tab 全权管理（入口 mcp）。
+        let user = inv
+            .iter()
+            .find(|e| e.name == "user-fs")
+            .expect("用户 server 应在 active inventory");
+        assert_eq!(user.managed_by, McpOwnership::User);
+        assert!(user.disabled, "禁用旗应透传");
+        assert!(user.lifecycle.can_edit_from_mcp_tab);
+        assert!(user.lifecycle.can_start_from_mcp_tab);
+        assert_eq!(user.lifecycle.manage_from, "mcp");
+
+        // plugin bundled server：boot(hooks=None) 未物化，仍经 ledger 派生出现，带完整归属 + 只读生命周期。
+        let plugin = inv
+            .iter()
+            .find(|e| e.name == "audit-mcp")
+            .expect("plugin bundled server 应在 active inventory（§4.8 可观测）");
+        assert_eq!(
+            plugin.managed_by,
+            McpOwnership::Plugin {
+                marketplace: "acme".to_string(),
+                plugin: "audit".to_string(),
+                plugin_id: "audit@acme".to_string(),
+            }
+        );
+        assert!(!plugin.lifecycle.can_edit_from_mcp_tab);
+        assert!(!plugin.lifecycle.can_start_from_mcp_tab);
+        assert_eq!(plugin.lifecycle.manage_from, "marketplace");
+
+        comp_b.shutdown().await.unwrap();
+    }
+
+    /// AC2：uninstall plugin 后以同一 `skill_home` 重建 Computer——该 plugin 的 bundled MCP server 不再出现在
+    /// inventory（ledger 记录已删，`collect_enabled_bundled_servers` 采集为空）。uninstall 改的是 `home` 内
+    /// `installed_plugins.json`（hermetic，非 `~/.config`），故可在 Computer 层验证；disable(写 `enabledPlugins`
+    /// 到真实 user settings) 的门控由 recovery 层 `collect_returns_enabled_bundled_servers`/禁用用例覆盖。
+    #[tokio::test]
+    async fn list_mcp_servers_with_metadata_excludes_uninstalled_plugin_server() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        // 卸载前：inventory 含 plugin bundled server。
+        let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob-a"));
+        assert!(
+            comp_a
+                .list_mcp_servers_with_metadata()
+                .await
+                .iter()
+                .any(|e| e.name == "audit-mcp"),
+            "卸载前 plugin bundled server 应在 inventory"
+        );
+
+        // 卸载（改 home 内 installed_plugins.json；bundled server 未物化 → 无需 remove hooks）。
+        comp_a
+            .uninstall_plugin(
+                "audit@acme",
+                crate::settings::installer::UninstallOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 卸载后以同一 home 重建 Computer B：ledger 已无该记录 → inventory 不再出现其 bundled server。
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let inv = comp_b.list_mcp_servers_with_metadata().await;
+        assert!(
+            !inv.iter().any(|e| e.name == "audit-mcp"),
+            "uninstall 后 plugin bundled server 不应再出现在 inventory"
+        );
     }
 
     // ── #94/#95 follow-up：Computer 薄封装的接线（skill_home / 写锁 / mark_skills_dirty）冒烟 ──────

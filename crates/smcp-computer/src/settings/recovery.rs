@@ -54,7 +54,7 @@
 //!   经 hooks 取 mcp_manager 锁」的相反序死锁（见 computer.rs `restage_mcp_skills` 锁序注释）。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
@@ -205,14 +205,36 @@ pub async fn recover_marketplace_skills(
 }
 
 // ===========================================================================
-// 阶段二输入：待重挂 bundled server 配置采集 / Phase 2 input: bundled servers to remount
+// 阶段二输入：待重挂 bundled server 记录采集 / Phase 2 input: bundled servers to remount
 // ===========================================================================
-/// 采集**已装且启用** plugin 的 bundled MCP server 配置（供调用方经 hooks 重挂）/ Collect bundled servers。
+/// 一条**已启用 plugin 派生的 bundled MCP server** 恢复记录（携完整归属）/ one enabled bundled MCP server。
+///
+/// 对标 Python `a2c_smcp/computer/settings/recovery.py::BundledServerRecord`（严格同构：字段
+/// `plugin_id` / `plugin` / `marketplace` / `install_path` / `config`）。既是 boot 第二阶段经 hooks 重挂的
+/// 输入，也是 [`Computer::list_mcp_servers_with_metadata`](crate::computer::Computer::list_mcp_servers_with_metadata)
+/// 归属推导的**唯一**来源：归属为 ledger + manifest 的纯函数输出（protocol v0.2.3 §4.8.3——意图 + resolved
+/// location + manifest 重推导，每次 boot 可复现），**不**依赖任何调用方持有的内存 ownership map。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundledServerRecord {
+    /// plugin id：`<plugin>@<marketplace>` / plugin id。
+    pub plugin_id: String,
+    /// plugin 名（pid `@` 前段；本地-only 记录 = 整个 pid）/ plugin name。
+    pub plugin: String,
+    /// marketplace 名（pid `@` 后段；本地-only 记录留空）/ marketplace name。
+    pub marketplace: String,
+    /// plugin 物化落点（bundled server 从此解析）/ install path。
+    pub install_path: PathBuf,
+    /// bundled MCP server 配置 / bundled MCP server config。
+    pub config: MCPServerConfig,
+}
+
+/// 采集**已装且启用** plugin 的 bundled MCP server 记录（供调用方经 hooks 重挂 / 归属查询）/ Collect bundled servers。
 ///
 /// 从每条 [`InstalledPluginRecord`](crate::settings::reconciler::InstalledPluginRecord) 的 `installPath`
 /// 重解析 [`load_bundled_servers`]（与 [`enable_plugin`](crate::settings::installer::enable_plugin) 同源、
 /// 不重 clone）。enabled 门控同 [`recover_marketplace_skills`]：`enabledPlugins=false` 的 plugin **不**采集
-/// （其 server 保持下线，含已回滚的半装 plugin）。跨 plugin / scope 按 server 名去重（首见保留）。
+/// （其 server 保持下线，含已回滚的半装 plugin）。跨 plugin / scope 按 server 名去重（首见保留）。每条结果携
+/// 完整归属（[`BundledServerRecord`]），供 `list_mcp_servers_with_metadata` 直接映射 `managedBy=plugin`。
 ///
 /// **无锁、纯读**：不持任何 Registry / manager 锁；调用方在释放 skill 写锁后逐个 `register_server`，避免
 /// 「skill 写锁 → mcp_manager 锁」相反序死锁。解析失败 → WARN 跳过该 plugin（降级、不阻断）。
@@ -221,15 +243,21 @@ pub fn collect_enabled_bundled_servers(
     home: &Path,
     env: Option<&EnvMap>,
     declared: &Map<String, Value>,
-) -> Vec<MCPServerConfig> {
+) -> Vec<BundledServerRecord> {
     let installed = load_installed_plugins(Some(home), env).account;
     let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<MCPServerConfig> = Vec::new();
+    let mut out: Vec<BundledServerRecord> = Vec::new();
 
     for (pid, records) in &installed.plugins {
         if !plugin_enabled(declared, pid) {
             continue;
         }
+        // pid = `<plugin>@<marketplace>`；本地-only（无 '@'）记录**跳过**——与同文件 recover_marketplace_skills
+        // (`:146`) 及 Python `collect_enabled_bundled_servers`（`_split_pid` → continue）一致：非 marketplace
+        // plugin，归属恢复不涉及（严格同构；避免以退化 `marketplace:""` 归属误入 inventory）。
+        let Some((plugin, marketplace)) = pid.split_once('@') else {
+            continue;
+        };
         for rec in records {
             let Some(install_path) = rec.install_path.as_deref().filter(|s| !s.is_empty()) else {
                 continue;
@@ -238,7 +266,13 @@ pub fn collect_enabled_bundled_servers(
                 Ok(servers) => {
                     for cfg in servers {
                         if seen.insert(cfg.name().to_string()) {
-                            out.push(cfg);
+                            out.push(BundledServerRecord {
+                                plugin_id: pid.clone(),
+                                plugin: plugin.to_string(),
+                                marketplace: marketplace.to_string(),
+                                install_path: PathBuf::from(install_path),
+                                config: cfg,
+                            });
                         }
                     }
                 }
@@ -436,8 +470,13 @@ mod tests {
 
         let declared = Map::new(); // 缺省启用
         let servers = collect_enabled_bundled_servers(&home, None, &declared);
-        let names: Vec<&str> = servers.iter().map(MCPServerConfig::name).collect();
+        let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
         assert_eq!(names, vec!["audit-mcp"]);
+        // 归属为 ledger 纯函数输出（§4.8.3）：pid `audit@acme` → plugin/marketplace 分段。
+        let rec = &servers[0];
+        assert_eq!(rec.plugin_id, "audit@acme");
+        assert_eq!(rec.plugin, "audit");
+        assert_eq!(rec.marketplace, "acme");
     }
 
     // ---- 降级铁律：marketplace 源不可达 / clone 树缺失 → failed、不 panic、不阻断 -----
@@ -630,11 +669,33 @@ mod tests {
         seed_install_record(&home, "nopath@acme", None);
 
         let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
-        let names: Vec<&str> = servers.iter().map(MCPServerConfig::name).collect();
+        let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
         assert_eq!(
             names,
             vec!["good-mcp"],
             "损坏 JSON + 无 install_path 均跳过"
+        );
+    }
+
+    // ---- #97：collect 跳过无 '@' 的本地-only pid（与 recover_marketplace_skills / Python 一致）--------
+    #[tokio::test]
+    async fn collect_skips_local_only_pid_without_at() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        // 本地-only pid（无 '@'）虽带 bundled server，亦不采集——非 marketplace plugin，归属不涉及。
+        let local = plugin_root_with_server(&tmp.path().join("local"), "local-mcp");
+        seed_install_record(&home, "local-only", Some(&local));
+        // 对照：正常 marketplace pid 仍采集。
+        let good = plugin_root_with_server(&tmp.path().join("good"), "good-mcp");
+        seed_install_record(&home, "good@acme", Some(&good));
+
+        let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
+        let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
+        assert_eq!(
+            names,
+            vec!["good-mcp"],
+            "无 '@' 本地-only pid 的 bundled server 不采集（归属恢复不涉及）"
         );
     }
 
@@ -650,7 +711,7 @@ mod tests {
         seed_install_record(&home, "b@acme", Some(&b));
 
         let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
-        let names: Vec<&str> = servers.iter().map(MCPServerConfig::name).collect();
+        let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
         assert_eq!(names, vec!["shared-mcp"], "同名 server 跨 plugin 去重");
     }
 

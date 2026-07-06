@@ -13,6 +13,7 @@ pub mod computer;
 pub mod desktop;
 pub mod errors;
 pub mod inputs;
+pub mod inventory;
 pub mod mcp_clients;
 pub mod settings;
 pub mod skills;
