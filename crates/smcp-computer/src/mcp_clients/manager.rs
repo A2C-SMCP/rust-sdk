@@ -860,49 +860,61 @@ impl MCPServerManager {
         let mapping = self.tool_mapping.read().await;
         let alias_map = self.alias_mapping.read().await;
 
+        // 每 server 仅拉一次 tools/list，跨该 server 的多个 mapped tool 复用（对齐 Python `available_tools`
+        // 的 `servers_cached_tools`；修 #91：此前每 mapped tool 都调 list_tools → N 工具 = N 次冗余 tools/list
+        // 往返 + N 行重复 "Found N tools" 日志）。「每 server 一次」仅在 list_tools **成功**时成立：持续报错则
+        // 不写缓存、同 server 后续 mapped tool 会重试（与修复前逐 tool 吞错语义一致，不 panic、该 server 不暴露）。
+        let mut server_tools_cache: HashMap<ServerName, Vec<Tool>> = HashMap::new();
+
         for (display_name, server_name) in mapping.iter() {
             let client = {
                 let clients = self.active_clients.read().await;
                 clients.get(server_name).cloned()
             };
+            let Some(client) = client else { continue };
 
-            if let Some(client) = client {
-                // 获取原始工具名称 / Get original tool name
-                let original_name = alias_map
-                    .get(display_name)
-                    .map(|(_, original)| original.clone())
-                    .unwrap_or_else(|| display_name.clone());
+            // 该 server 首见 → 拉一次并缓存；拉取失败 → 跳过（保留原 `if let Ok` 的吞错、跳过语义）。
+            if !server_tools_cache.contains_key(server_name) {
+                match client.list_tools().await {
+                    Ok(list) => {
+                        server_tools_cache.insert(server_name.clone(), list);
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let tool_list = &server_tools_cache[server_name];
 
-                // 获取工具列表 / Get tool list
-                if let Ok(tool_list) = client.list_tools().await {
-                    if let Some(tool) = tool_list.into_iter().find(|t| t.name == original_name) {
-                        // 更新工具名称为显示名称 / Update tool name to display name
-                        let mut display_tool = tool;
-                        display_tool.name = display_name.clone().into();
+            // 获取原始工具名称 / Get original tool name
+            let original_name = alias_map
+                .get(display_name)
+                .map(|(_, original)| original.clone())
+                .unwrap_or_else(|| display_name.clone());
 
-                        // 合并工具元数据 / Merge tool metadata
-                        let config = {
-                            let configs = self.servers_config.read().await;
-                            configs.get(server_name).cloned()
-                        };
-                        if let Some(config) = config {
-                            if let Some(tool_meta) = self.merged_tool_meta(&config, &original_name)
-                            {
-                                if display_tool.meta.is_none() {
-                                    display_tool.meta = Some(rmcp::model::Meta::new());
-                                }
-                                if let Some(ref mut meta) = display_tool.meta {
-                                    meta.insert(
-                                        A2C_TOOL_META.to_string(),
-                                        serde_json::to_value(tool_meta).unwrap(),
-                                    );
-                                }
-                            }
+            // 从缓存查匹配项；命中则产出**改名副本**（缓存被复用，勿原地 mutate；与 Python 一致）。
+            if let Some(tool) = tool_list.iter().find(|t| t.name == original_name) {
+                let mut display_tool = tool.clone();
+                display_tool.name = display_name.clone().into();
+
+                // 合并工具元数据 / Merge tool metadata
+                let config = {
+                    let configs = self.servers_config.read().await;
+                    configs.get(server_name).cloned()
+                };
+                if let Some(config) = config {
+                    if let Some(tool_meta) = self.merged_tool_meta(&config, &original_name) {
+                        if display_tool.meta.is_none() {
+                            display_tool.meta = Some(rmcp::model::Meta::new());
                         }
-
-                        tools.push(display_tool);
+                        if let Some(ref mut meta) = display_tool.meta {
+                            meta.insert(
+                                A2C_TOOL_META.to_string(),
+                                serde_json::to_value(tool_meta).unwrap(),
+                            );
+                        }
                     }
                 }
+
+                tools.push(display_tool);
             }
         }
 
@@ -1684,6 +1696,123 @@ pub(crate) mod test_support {
             .write()
             .await
             .insert(name.to_string(), StdArc::new(MockToolsClient { tools }));
+    }
+
+    /// 计数版 [`MockToolsClient`]：`list_tools` 每次调用 `calls += 1`，供 #91「每 server 仅拉一次
+    /// `tools/list`」回归验证。A counting fake whose `list_tools` bumps a shared call counter.
+    pub(crate) struct CountingToolsClient {
+        pub(crate) tools: Vec<Tool>,
+        pub(crate) calls: StdArc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for CountingToolsClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// `list_tools` 恒返错误的假 client（供 #91 `list_available_tools` 的 `Err=>continue` 分支回归）/
+    /// a fake whose `list_tools` always errors.
+    pub(crate) struct ErrToolsClient;
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for ErrToolsClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Err(MCPClientError::ProtocolError("list_tools boom".into()))
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 注入 [`CountingToolsClient`] 到 `active_clients`，返回 `list_tools` 调用计数句柄 / inject + return counter.
+    pub(crate) async fn inject_counting_tools(
+        manager: &MCPServerManager,
+        name: &str,
+        tools: Vec<Tool>,
+    ) -> StdArc<std::sync::atomic::AtomicUsize> {
+        let calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        manager.active_clients.write().await.insert(
+            name.to_string(),
+            StdArc::new(CountingToolsClient {
+                tools,
+                calls: calls.clone(),
+            }),
+        );
+        calls
     }
 }
 
@@ -2467,7 +2596,7 @@ mod tests {
     }
 
     // ── forbidden_tools / alias 暴露面回归（对标 Python python-sdk #106/#107）─────────────────
-    use super::test_support::inject_tools;
+    use super::test_support::{inject_counting_tools, inject_tools, ErrToolsClient};
 
     /// 最小 Stdio 工具：仅 name + 空 object inputSchema（参照 `socketio_client::tests::make_tool`）。
     fn tool_named(name: &str) -> Tool {
@@ -2565,6 +2694,109 @@ mod tests {
             !names.contains(&"tool5".to_string()),
             "原始名不应出现: {names:?}"
         );
+    }
+
+    /// #91：一次 `list_available_tools` 对同一 server 只应发**一次** `tools/list`（此前每 mapped tool
+    /// 各发一次 → N 工具 = N 次冗余往返 + N 行重复 `Found N tools` 日志）。对齐 Python `available_tools`
+    /// 的 `servers_cached_tools` per-server 缓存。
+    #[tokio::test]
+    async fn list_available_tools_calls_list_tools_once_per_server() {
+        let manager = MCPServerManager::new();
+        // srv 暴露 3 个工具 → tool_mapping 三条都指向 srv。
+        let calls = inject_counting_tools(
+            &manager,
+            "srv",
+            vec![tool_named("a"), tool_named("b"), tool_named("c")],
+        )
+        .await;
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert("srv".to_string(), stdio_cfg("srv", vec![], HashMap::new()));
+        manager.refresh_tool_mapping().await.expect("refresh ok");
+
+        // 归零，隔离 refresh_tool_mapping 自身那次 list_tools —— 仅测 list_available_tools。
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let out = manager.list_available_tools().await;
+
+        assert_eq!(out.len(), 3, "3 个工具都应暴露");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "list_available_tools 应每 server 仅调用 list_tools 一次（#91）"
+        );
+    }
+
+    /// #91：缓存**按 server 键隔离** —— 多 server 各自仅一次 `list_tools`、工具不串（防「全局单缓存」退化，
+    /// 该退化在单 server 用例下无法暴露）。
+    #[tokio::test]
+    async fn list_available_tools_caches_per_server_not_globally() {
+        let manager = MCPServerManager::new();
+        let calls_a =
+            inject_counting_tools(&manager, "srvA", vec![tool_named("a1"), tool_named("a2")]).await;
+        let calls_b =
+            inject_counting_tools(&manager, "srvB", vec![tool_named("b1"), tool_named("b2")]).await;
+        {
+            let mut cfgs = manager.servers_config.write().await;
+            cfgs.insert(
+                "srvA".to_string(),
+                stdio_cfg("srvA", vec![], HashMap::new()),
+            );
+            cfgs.insert(
+                "srvB".to_string(),
+                stdio_cfg("srvB", vec![], HashMap::new()),
+            );
+        }
+        manager.refresh_tool_mapping().await.expect("refresh ok");
+
+        calls_a.store(0, std::sync::atomic::Ordering::SeqCst);
+        calls_b.store(0, std::sync::atomic::Ordering::SeqCst);
+        let out = manager.list_available_tools().await;
+        let names: Vec<String> = out.iter().map(|t| t.name.to_string()).collect();
+
+        assert_eq!(
+            calls_a.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "srvA 仅一次"
+        );
+        assert_eq!(
+            calls_b.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "srvB 仅一次"
+        );
+        assert_eq!(out.len(), 4, "两 server 4 个工具全暴露");
+        for n in ["a1", "a2", "b1", "b2"] {
+            assert!(
+                names.contains(&n.to_string()),
+                "{n} 应暴露且不串: {names:?}"
+            );
+        }
+    }
+
+    /// #91：`list_tools` 持续报错的 server 被**跳过**（不暴露其工具、不 panic），保留原吞错语义。
+    #[tokio::test]
+    async fn list_available_tools_skips_server_when_list_tools_errs() {
+        let manager = MCPServerManager::new();
+        // 直接注入常错 client + 手填 mapping（模拟此前已 mapped，但此刻 list_tools 失败），精确命中 Err 分支。
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert("srv".to_string(), StdArc::new(ErrToolsClient));
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert("srv".to_string(), stdio_cfg("srv", vec![], HashMap::new()));
+        manager
+            .tool_mapping
+            .write()
+            .await
+            .insert("t".to_string(), "srv".to_string());
+
+        let out = manager.list_available_tools().await;
+        assert!(out.is_empty(), "list_tools 失败的 server 不应暴露工具");
     }
 
     /// 两 server 同名 tool1，forbid 一侧后不再触发重名冲突，存活侧仍可寻址、不被误伤禁用。
