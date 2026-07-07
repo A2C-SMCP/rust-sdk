@@ -835,15 +835,16 @@ impl<S: Session> Computer<S> {
 
     /// 治理状态启动恢复（从 `skill_home` 持久化 ledger 重建边界内派生态）/ governance boot recovery（#95）。
     ///
-    /// 冷启动 / 进程重启后，从 `installed_plugins.json` + `known_marketplaces.json` 重挂**已装且启用**的
-    /// marketplace plugin skills；给定 `hooks` 时再经 [`McpInstallHooks`] 重挂其 bundled MCP server（SDK 决定
+    /// 冷启动 / 进程重启后，从 `installed_plugins_intent.json`（安装意图，v0.3.0 权威）+ `known_marketplaces.json`
+    /// 重挂**已装且启用**（intent ∧ `enabledPlugins==true`）的 marketplace plugin skills；给定 `hooks` 时再经
+    /// [`McpInstallHooks`] 重挂其 bundled MCP server（SDK 决定
     /// 「哪些」= 已装且启用 plugin 的 bundled server，client 经 hooks 决定「如何物化」）。由
     /// [`boot_up`](Self::boot_up)（`hooks = None`）自动调用，亦允许 client 显式调用驱动 MCP 重挂。
     ///
     /// - **幂等**：重复调用（boot 自动 + client 显式）结果一致，不重复注册 / 重复 staging。
-    /// - **enabled 门控**：仅 `enabledPlugins[pid] != false` 的已装 plugin 恢复——显式 `false`（disable / #94
-    ///   enable-rollback 落定）**不**复活，含已回滚的半装 plugin（窄残窗见
-    ///   [`installer`](crate::settings::installer) enable 回滚注释，本恢复据账本视其为启用、与持久化态一致）。
+    /// - **enabled 门控（v0.3.0 翻转）**：仅 `enabledPlugins[pid] == true` 的已装 plugin 恢复——`absent`/`false`
+    ///   均**不**激活（install 不再装即活跃；含 disable / #94 enable-rollback 落定 `false` 的半装 plugin）。install-set
+    ///   取自 `installedPlugins` 意图（账本 `installed_plugins.json` 仅供 installPath 等 materialization 细节）。
     /// - **降级铁律**：marketplace 源不可达 / clone 树缺失 → WARN 降级、**不**阻断；`register_server` 失败 →
     ///   WARN、**不**阻断（best-effort 重挂）。
     /// - **边界**（#93 Non-Goal）：只在**构造期固定的 `skill_home`** 内重建派生态，**不**改 `skill_home` /
@@ -860,10 +861,11 @@ impl<S: Session> Computer<S> {
     /// - **运行期显式调用会阻塞 skill 读**：阶段一对**全部** marketplace 串行 stage 且写锁跨 stage await。常态
     ///   （clone 树已存在、`refresh = false`）仅本地 FS、无网络，开销小；但 clone 树缺失需 clone 时单源最坏
     ///   `DEFAULT_GIT_TIMEOUT`，期间 `get_skills` 等 skill 读阻塞。宜**低频 / 受控**触发（恢复语义本就一次性）。
-    /// - **跨重启 disable 语义以 user scope 为准**：enabled 门控读合并 `declared`，其 project/local 层来自
+    /// - **跨重启 enable 语义以 user scope 为准（v0.3.0）**：enabled 门控读合并 `declared`，其 project/local 层来自
     ///   **进程 cwd**（#98：`Computer` 不再持有 workspace）。写在**非进程-cwd 的 project/local scope**
-    ///   的 `enabledPlugins=false` 在恢复时可能不可见 → 该 plugin 被复活。**跨重启可靠禁用应写 user scope**
-    ///   （对齐 installer disable/enable 的 scope 契约：scope 须与安装 scope 一致、由调用方据上下文传）。
+    ///   的 `enabledPlugins=true` 在恢复时可能不可见 → 该 plugin **不**激活。**跨重启可靠启用应写 user scope**；
+    ///   project/local-scoped plugin 的 enable 天然 cwd 相关（含存量 v0.2.x 迁移到 project scope 的记录，属 v0.3.0
+    ///   per-scope 语义，非疏漏——迁移「不熄灯」保证对 user scope 成立、对 project/local 以进程 cwd 为准）。
     ///
     /// ## 参数 / Params
     /// - `hooks`：`None` = skills-only（boot 默认）；`Some` = client 经 hooks 重挂 bundled MCP server。
@@ -1243,6 +1245,14 @@ impl<S: Session> Computer<S> {
         // boot 时多为空——server 后续接入）+ 初次全量发现 user 源（= invalidate_user_skills）+ 启 watcher。
         // 各自失败隔离。对标 Python boot_up SKILL 子系统初始化。
         self.ensure_skill_home();
+        // v0.3.0 一次性迁移（reconcile 之前）：把存量 v0.2.x「装即活跃」账本迁到 installedPlugins 意图 +
+        // enabledPlugins=true，避免升级后「absent = 未启用」使既有 plugin 熄灯。幂等靠意图文件存在性；失败仅 WARN
+        // （降级：迁移失败不阻断 boot，下次 boot 重试）。settings 写走进程 env（与 reconcile 读同源）。
+        if let Err(e) =
+            crate::settings::installer::migrate_ledger_to_intent_once(&self.skill_home(), None)
+        {
+            warn!(error = %e, "governance boot: v0.3.0 ledger→intent migration failed (non-blocking)");
+        }
         let recovery = self.reconcile_governance(None, None).await;
         if !recovery.restored_plugins.is_empty() || !recovery.failed_marketplaces.is_empty() {
             info!(
@@ -2644,6 +2654,15 @@ mod tests {
         home
     }
 
+    /// declared 视图：显式启用 `audit@acme`（v0.3.0：install 落 `installed_disabled`、不写 enabledPlugins；
+    /// Computer 层无 settings 注入 seam，故经 `reconcile_governance(declared=...)` 传入启用意图做 hermetic 恢复）。
+    fn declared_audit_enabled() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({ "enabledPlugins": { "audit@acme": true } })
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
     /// 冷启动恢复：Computer A 经 SDK API add+install（写 ledger），新 Computer B 同 skill_home
     /// 经 `reconcile_governance` 从 ledger 重挂 marketplace skill（registry 重启即空 → 恢复）+ 幂等。
     #[tokio::test]
@@ -2671,12 +2690,13 @@ mod tests {
             .install_plugin("audit@acme", InstallOptions::default(), None)
             .await
             .unwrap();
+        // v0.3.0：install = installed_disabled，comp_a registry 里 skill 为 orphan（不活跃）。
         assert!(comp_a
             .skill_registry_arc()
             .read()
             .await
             .resolve("audit:code-review")
-            .is_some());
+            .is_none());
         drop(comp_a);
 
         // ── 重启后：Computer B 同 skill_home、registry 为空 → reconcile_governance 从 ledger 恢复。
@@ -2693,7 +2713,8 @@ mod tests {
             "新进程 registry 恢复前应为空"
         );
 
-        let report = comp_b.reconcile_governance(None, None).await;
+        let declared = declared_audit_enabled();
+        let report = comp_b.reconcile_governance(None, Some(&declared)).await;
         assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
         assert_eq!(
             report.restored_skills,
@@ -2707,11 +2728,11 @@ mod tests {
                 .await
                 .resolve("audit:code-review")
                 .is_some(),
-            "冷启动应从 ledger 恢复 marketplace skill"
+            "冷启动应从 ledger 恢复 marketplace skill（enabled）"
         );
 
         // 幂等：再调一次仍恢复同一 skill、不重复 / 不 panic。
-        let report2 = comp_b.reconcile_governance(None, None).await;
+        let report2 = comp_b.reconcile_governance(None, Some(&declared)).await;
         assert_eq!(
             report2.restored_skills,
             vec!["audit:code-review".to_string()]
@@ -2734,7 +2755,9 @@ mod tests {
             .with_skill_home(home)
             .with_blob_cache_root(tmp.path().join("blob-b"));
         let hooks = RecordingRemountHooks::new();
-        let report = comp_b.reconcile_governance(Some(&hooks), None).await;
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
 
         // skills 恢复 + bundled server 经 hooks 重挂。
         assert_eq!(
@@ -2754,7 +2777,9 @@ mod tests {
         );
 
         // 幂等：二次调用仍重挂同一 server（register-or-update，by name 幂等）、不 panic。
-        let report2 = comp_b.reconcile_governance(Some(&hooks), None).await;
+        let report2 = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
     }
 
@@ -2769,7 +2794,9 @@ mod tests {
             .with_blob_cache_root(tmp.path().join("blob-b"));
         // hooks 报告 "audit-mcp" 已被既有 server 占名（模拟用户配置先挂先占）。
         let hooks = RecordingRemountHooks::with_existing(&["audit-mcp"]);
-        let report = comp_b.reconcile_governance(Some(&hooks), None).await;
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
 
         // 同名冲突 → 跳过：不入 report.remounted、register 未被调用、跳过项不注入 inputs。
         assert!(
@@ -2802,7 +2829,9 @@ mod tests {
             .with_blob_cache_root(tmp.path().join("blob-b"));
         let hooks = RecordingRemountHooks::failing("audit-mcp");
         // 不 panic、正常返回。
-        let report = comp_b.reconcile_governance(Some(&hooks), None).await;
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
 
         // skills 阶段不受 MCP 重挂失败影响，仍恢复。
         assert_eq!(
@@ -2823,22 +2852,24 @@ mod tests {
         assert!(hooks.registered.lock().unwrap().is_empty());
     }
 
-    /// acceptance #1 字面：`boot_up()` 后 marketplace skill 已从 ledger 恢复（走 boot 接线、非直调）。
+    /// v0.3.0：`boot_up()` 对仅 install（未 enable）的 plugin **不**激活——installed_disabled 惰性、skill 不投影。
+    /// （新 install 已写 `installedPlugins` 意图 → boot 迁移跳过；enabled plugin 的 boot 恢复由
+    /// `reconcile_governance(declared=enabled)` 覆盖——Computer 层无 settings 注入 seam，boot_up 无法 hermetic 传
+    /// 启用意图，见本模块 enabledPlugins 测试约定。）
     #[tokio::test]
-    async fn reconcile_governance_boot_up_restores_from_ledger() {
+    async fn boot_up_leaves_installed_disabled_plugin_lazy() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = cold_start_setup95(&tmp).await;
+        let home = cold_start_setup95(&tmp).await; // 仅 install（installed_disabled）。
 
         let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home)
             .with_blob_cache_root(tmp.path().join("blob-b"));
         comp_b.boot_up().await.unwrap();
 
-        // boot_up 经 reconcile_governance(None) 从 ledger 重挂 marketplace skill（boot 不带 hooks → 仅 skills）。
         let skills = comp_b.get_skills().await;
         assert!(
-            skills.iter().any(|s| s.name == "audit:code-review"),
-            "boot_up 后应从 ledger 恢复 marketplace skill"
+            !skills.iter().any(|s| s.name == "audit:code-review"),
+            "install 未 enable → boot_up 不激活（installed_disabled 惰性）"
         );
         comp_b.shutdown().await.unwrap();
     }
@@ -2863,13 +2894,11 @@ mod tests {
         })
     }
 
-    /// AC1：装+启用 plugin、以同一 `skill_home` 重建 Computer、boot 后——inventory 同时返回用户 server
-    /// （`managedBy=user`，可从 MCP tab 全权管）与 plugin bundled server（`managedBy=plugin` + 正确
-    /// marketplace/plugin/pluginId，只读）。后者虽经 boot(`hooks=None`) **未物化**进 `self.mcp_servers`，仍经
-    /// ledger 纯函数派生出现（§4.8「进程未拉起也可观测」）；client 据此无需读 ledger / 解析 manifest 即可判定
-    /// plugin server 不走用户生命周期入口。
+    /// v0.3.0：装（**未 enable**）plugin、以同一 `skill_home` 重建 Computer、boot 后——inventory 返回用户 server
+    /// （`managedBy=user`，可从 MCP tab 全权管），但 **不** 返回 installed_disabled plugin 的 bundled server
+    /// （§2.4 未启用不投影）。enabled plugin 的 `managedBy=plugin` 归属映射由 recovery/remount 测试覆盖。
     #[tokio::test]
-    async fn list_mcp_servers_with_metadata_boot_reports_user_and_plugin_ownership() {
+    async fn list_mcp_servers_with_metadata_boot_user_owned_hides_disabled_plugin() {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = cold_start_setup95(&tmp).await;
 
@@ -2901,49 +2930,38 @@ mod tests {
         assert!(user.lifecycle.can_start_from_mcp_tab);
         assert_eq!(user.lifecycle.manage_from, "mcp");
 
-        // plugin bundled server：boot(hooks=None) 未物化，仍经 ledger 派生出现，带完整归属 + 只读生命周期。
-        let plugin = inv
-            .iter()
-            .find(|e| e.name == "audit-mcp")
-            .expect("plugin bundled server 应在 active inventory（§4.8 可观测）");
-        assert_eq!(
-            plugin.managed_by,
-            McpOwnership::Plugin {
-                marketplace: "acme".to_string(),
-                plugin: "audit".to_string(),
-                plugin_id: "audit@acme".to_string(),
-            }
+        // v0.3.0：plugin 仅 install（installed_disabled、未 enable）→ 其 bundled server **不**进 active inventory
+        // （§2.4 未启用不投影；§4.8「可查询」仅约束 enabled bundled server）。enabled plugin 的 inventory 归属由
+        // recovery 层 `collect_returns_enabled_bundled_servers` + Computer 层 remount 测试覆盖。
+        assert!(
+            !inv.iter().any(|e| e.name == "audit-mcp"),
+            "installed_disabled plugin 的 bundled server 不进 inventory"
         );
-        assert!(!plugin.lifecycle.can_edit_from_mcp_tab);
-        assert!(!plugin.lifecycle.can_start_from_mcp_tab);
-        assert_eq!(plugin.lifecycle.manage_from, "marketplace");
 
         comp_b.shutdown().await.unwrap();
     }
 
-    /// AC2：uninstall plugin 后以同一 `skill_home` 重建 Computer——该 plugin 的 bundled MCP server 不再出现在
-    /// inventory（ledger 记录已删，`collect_enabled_bundled_servers` 采集为空）。uninstall 改的是 `home` 内
-    /// `installed_plugins.json`（hermetic，非 `~/.config`），故可在 Computer 层验证；disable(写 `enabledPlugins`
-    /// 到真实 user settings) 的门控由 recovery 层 `collect_returns_enabled_bundled_servers`/禁用用例覆盖。
+    /// v0.3.0：uninstall 从 `installedPlugins` 全局意图移除该 pid（改 `home` 内文件，hermetic，非 `~/.config`），
+    /// 卸载后 inventory 不再出现其 bundled server。（installed_disabled server 本就不在 inventory；本测聚焦
+    /// uninstall 对**安装意图**的移除——v0.3.0 权威 install-set。卸载从未 enable 的 plugin 不触碰 `~/.config`，
+    /// 见 installer `clear_enabled_plugin` 的存在性守卫。）
     #[tokio::test]
-    async fn list_mcp_servers_with_metadata_excludes_uninstalled_plugin_server() {
+    async fn uninstall_removes_plugin_from_intent_and_inventory() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = cold_start_setup95(&tmp).await;
+        let home = cold_start_setup95(&tmp).await; // install → 写 installedPlugins 意图（installed_disabled）。
 
-        // 卸载前：inventory 含 plugin bundled server。
+        // 装后：intent 含 audit@acme。
+        assert!(
+            crate::settings::store::load_installed_plugins_intent(Some(&home), None)
+                .account
+                .installed_plugins
+                .contains("audit@acme"),
+            "install 后 installedPlugins 意图含该 pid"
+        );
+
         let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home.clone())
             .with_blob_cache_root(tmp.path().join("blob-a"));
-        assert!(
-            comp_a
-                .list_mcp_servers_with_metadata()
-                .await
-                .iter()
-                .any(|e| e.name == "audit-mcp"),
-            "卸载前 plugin bundled server 应在 inventory"
-        );
-
-        // 卸载（改 home 内 installed_plugins.json；bundled server 未物化 → 无需 remove hooks）。
         comp_a
             .uninstall_plugin(
                 "audit@acme",
@@ -2953,14 +2971,23 @@ mod tests {
             .await
             .unwrap();
 
-        // 卸载后以同一 home 重建 Computer B：ledger 已无该记录 → inventory 不再出现其 bundled server。
+        // 卸载后：intent 移除该 pid。
+        assert!(
+            !crate::settings::store::load_installed_plugins_intent(Some(&home), None)
+                .account
+                .installed_plugins
+                .contains("audit@acme"),
+            "uninstall 从 installedPlugins 意图移除该 pid"
+        );
+
+        // 以同一 home 重建 Computer B：inventory 不再出现其 bundled server。
         let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home)
             .with_blob_cache_root(tmp.path().join("blob-b"));
         let inv = comp_b.list_mcp_servers_with_metadata().await;
         assert!(
             !inv.iter().any(|e| e.name == "audit-mcp"),
-            "uninstall 后 plugin bundled server 不应再出现在 inventory"
+            "uninstall 后 plugin bundled server 不应出现在 inventory"
         );
     }
 

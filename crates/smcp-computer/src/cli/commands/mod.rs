@@ -415,8 +415,21 @@ mod tests {
 
         let comp = cli_computer().with_skill_home(home.to_path_buf());
 
-        // hermetic：显式空 `declared`（无 `enabledPlugins` 键 → 默认启用），**不**读真实用户配置。
-        let declared = Map::new();
+        // v0.3.0：seed 安装意图 + 显式启用（absent 不再默认启用），hermetic 不读真实用户配置。
+        crate::settings::store::update_installed_plugins_intent(
+            |f| {
+                f.account
+                    .installed_plugins
+                    .insert("remounttest@acme".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        let declared = json!({ "enabledPlugins": { "remounttest@acme": true } })
+            .as_object()
+            .unwrap()
+            .clone();
         // new_remount 建归属索引：install_path → (plugin, marketplace)。
         let hooks = CliMcpHooks::new_remount(&comp, &declared).await;
         assert_eq!(
@@ -491,7 +504,20 @@ mod tests {
         .unwrap();
 
         let comp = cli_computer().with_skill_home(home.to_path_buf());
-        let declared = Map::new(); // hermetic：默认全启用。
+        // v0.3.0：seed 安装意图 + 两 plugin 显式启用。
+        crate::settings::store::update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("alpha@m1".to_string());
+                f.account.installed_plugins.insert("beta@m2".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        let declared = json!({ "enabledPlugins": { "alpha@m1": true, "beta@m2": true } })
+            .as_object()
+            .unwrap()
+            .clone();
         let hooks = CliMcpHooks::new_remount(&comp, &declared).await;
 
         // 两根各自归属正确（不混）。

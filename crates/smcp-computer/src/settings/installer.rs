@@ -55,8 +55,9 @@ use crate::settings::scope::{
     workdir_project_settings_path, EnvMap, WriteValue,
 };
 use crate::settings::store::{
-    self, load_installed_plugins, load_known_marketplaces, update_installed_plugins,
-    InstalledPluginsFile, SettingsStoreError,
+    self, load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
+    update_installed_plugins, update_installed_plugins_intent, InstalledPluginsFile,
+    SettingsStoreError,
 };
 use crate::skills::home::{marketplace_skill_dir, SOURCE_MARKETPLACE};
 use crate::skills::manifest::{
@@ -246,10 +247,33 @@ fn settings_path_for_scope(
     }
 }
 
-/// 写 `enabledPlugins[<plugin_id>] = value` 到指定 scope 的 settings.json（持锁原子 RMW）/ Write the flag。
+/// 对指定 scope 的 `enabledPlugins[<plugin_id>]` 施加一次写更新（持锁原子 RMW）/ apply one enabledPlugins write。
 ///
 /// 复用 store 旁车锁 + 原子写 + scope 的 [`load_settings_file`] / [`apply_write`]（仅改该 key、不毁兄弟）。
 /// settings.json 是人编意图层 → 无写保护头（[`store::atomic_write_settings_json`]）。
+fn apply_enabled_plugin_write(
+    plugin_id: &str,
+    wv: WriteValue,
+    scope: &str,
+    project_path: Option<&str>,
+    env: Option<&EnvMap>,
+) -> Result<(), PluginInstallError> {
+    let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
+    let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
+    inner.insert(plugin_id.to_string(), wv);
+    let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
+    updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
+
+    // 外层 `?`：锁失败（[`SettingsStoreError`]）；内层 `?`：写 I/O（[`io::Error`]）。
+    store::with_settings_lock(&path, || -> io::Result<()> {
+        let (existing, _errors) = load_settings_file(&path, scope_enum);
+        let updated = apply_write(&existing, &updates);
+        store::atomic_write_settings_json(&path, &Value::Object(updated))
+    })??;
+    Ok(())
+}
+
+/// 写 `enabledPlugins[<plugin_id>] = value`（enable/disable 用）/ Write the enable flag。
 fn write_enabled_plugin(
     plugin_id: &str,
     value: bool,
@@ -257,15 +281,67 @@ fn write_enabled_plugin(
     project_path: Option<&str>,
     env: Option<&EnvMap>,
 ) -> Result<(), PluginInstallError> {
-    let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
-    let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
-    inner.insert(plugin_id.to_string(), WriteValue::Set(Value::Bool(value)));
-    let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
-    updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
+    apply_enabled_plugin_write(
+        plugin_id,
+        WriteValue::Set(Value::Bool(value)),
+        scope,
+        project_path,
+        env,
+    )
+}
 
-    // 外层 `?`：锁失败（[`SettingsStoreError`]）；内层 `?`：写 I/O（[`io::Error`]）。
+/// 删除 `enabledPlugins[<plugin_id>]` 键（uninstall 清启用意图条目，协议 §2.4）/ Delete the enable flag key。
+///
+/// 清除后避免「uninstall → reinstall」残留 `true` 令新装绕过 `installed_disabled` 直接激活。**仅当该键实际存在
+/// 才写盘**——从未 enable 的 plugin 卸载时不触碰 settings.json（保 Computer 层 `env=None` 卸载对 `~/.config`
+/// 无副作用，见 computer.rs enabledPlugins 测试约定）。
+fn clear_enabled_plugin(
+    plugin_id: &str,
+    scope: &str,
+    project_path: Option<&str>,
+    env: Option<&EnvMap>,
+) -> Result<(), PluginInstallError> {
+    let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
     store::with_settings_lock(&path, || -> io::Result<()> {
         let (existing, _errors) = load_settings_file(&path, scope_enum);
+        let present = existing
+            .get("enabledPlugins")
+            .and_then(|v| v.get(plugin_id))
+            .is_some();
+        if !present {
+            return Ok(()); // 键不存在 → 无需写盘（不触碰文件）。
+        }
+        let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
+        inner.insert(plugin_id.to_string(), WriteValue::Delete);
+        let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
+        updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
+        let updated = apply_write(&existing, &updates);
+        store::atomic_write_settings_json(&path, &Value::Object(updated))
+    })??;
+    Ok(())
+}
+
+/// 写 `enabledPlugins[<plugin_id>] = true`**仅当该键在该 scope 缺席**（迁移用；不覆盖用户显式 true/false）/ set-if-absent。
+fn set_enabled_true_if_absent(
+    plugin_id: &str,
+    scope: &str,
+    project_path: Option<&str>,
+    env: Option<&EnvMap>,
+) -> Result<(), PluginInstallError> {
+    let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
+    store::with_settings_lock(&path, || -> io::Result<()> {
+        let (existing, _errors) = load_settings_file(&path, scope_enum);
+        let present = existing
+            .get("enabledPlugins")
+            .and_then(|v| v.get(plugin_id))
+            .is_some();
+        if present {
+            return Ok(()); // 已有显式值（true / 用户 disable 的 false）→ 不覆盖。
+        }
+        let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
+        inner.insert(plugin_id.to_string(), WriteValue::Set(Value::Bool(true)));
+        let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
+        updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
         let updated = apply_write(&existing, &updates);
         store::atomic_write_settings_json(&path, &Value::Object(updated))
     })??;
@@ -348,15 +424,20 @@ fn conflict_check(
 // ---------------------------------------------------------------------------
 // install / uninstall / enable / disable
 // ---------------------------------------------------------------------------
-/// 显式安装单个 plugin（**原子失败：冲突即抛、不留半装**）/ Install one plugin atomically。
+/// 显式安装单个 plugin = **物化 + 登记 `installed_disabled`，不激活**（v0.3.0，协议 §2.4）/ Install (staged, inactive)。
 ///
-/// 顺序（§10.6「预检-先于-变更」）：① 解析 id + mp source；② 要求 catalog 已 clone、读 marketplace.json
-/// 定位 entry；③ [`locate_plugin_root`] 定位 plugin 根（必要时 clone）；④ strict 冲突检测 +
-/// [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**（外来同名硬抛、零变更）；⑥-⑦ 过闸后注册
-/// servers → 注册 skills，任一失败 → **精确补偿回滚**（仅撤本次新增）→ 上抛、不写账本；⑧ **★最后**写账本。
+/// v0.3.0：install 与 enable 分离。install **只**物化并写声明式安装意图，**不**激活能力——其 SKILL 注册后即
+/// `orphan`（不进 `get_skills`），bundled MCP server **不**挂、inputs **不**注入、**不**写 `enabledPlugins`
+/// （absent = 未启用 → `installed_disabled`）。激活全部交给 [`enable_plugin`]。
+///
+/// 顺序：① 解析 id + mp source；② 要求 catalog 已 clone、读 marketplace.json 定位 entry；③ [`locate_plugin_root`]
+/// 定位 plugin 根（必要时 clone）；④ strict 冲突检测 + [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**
+/// （外来 MCP 同名硬抛、零变更——满足「install 拒绝 foreign name conflict」，虽本步不挂载）；⑥ stage skills →
+/// 立即 `mark_orphan`（不投影）；⑦ **config-first 写 `installedPlugins` 全局安装意图**（权威）→ ⑧ 写账本
+/// （派生缓存）。
 ///
 /// # Errors
-/// 见 [`PluginInstallError`]（冲突 / 前置 / manifest / 定位 / 注入 / 账本）。
+/// 见 [`PluginInstallError`]（冲突 / 前置 / manifest / 定位 / 意图 / 账本）。
 pub async fn install_plugin(
     plugin_id: &str,
     registry: &mut SkillRegistry,
@@ -413,70 +494,40 @@ pub async fn install_plugin(
         .unwrap_or_default();
     conflict_check(&servers, &existing, &owned)?;
 
-    // —— 过闸：开始变更，失败补偿回滚 ——
-    // 快照本 plugin 已活跃 skill：补偿只撤**本次新增**，避免重装中途失败误删既有 skill / 摘除 owned server。
-    let skills_before: HashSet<String> = plugin_skill_names(registry, &marketplace, &plugin)
-        .into_iter()
-        .collect();
+    // —— 过闸：物化但**不激活**（v0.3.0，协议 §2.4：install 落 `installed_disabled`）——
+    // 不挂 server、不注入 inputs（延到 [`enable_plugin`]）；skills 注册后立即 orphan（不进 `get_skills`）。
     let filter: HashSet<String> = std::iter::once(plugin.clone()).collect();
-    let mut registered: Vec<String> = Vec::new();
-    let mut staged_skills: Vec<String> = Vec::new();
-    let mut mutate_err: Option<PluginInstallError> = None;
-
-    'mutate: {
-        if let Some(h) = hooks {
-            // 注入 plugin-scoped inputs（须在 register 之前，#69 Group A，§9.3 D2）；失败走补偿回滚上抛。
-            if let Err(e) = h.inject_inputs(&plugin_root).await {
-                mutate_err = Some(e.into());
-                break 'mutate;
-            }
-            for cfg in &servers {
-                if let Err(e) = h.register_server(cfg.clone()).await {
-                    mutate_err = Some(e.into());
-                    break 'mutate;
-                }
-                registered.push(cfg.name().to_string());
-            }
-        }
-        // skills 注册：复用既有 clone（refresh 透传）；失败降级（返回 Vec、不抛）→ 不触发回滚。
-        // 捕获已注册 skill 名供成功日志带计数（观测信号；stage 的「降级不抛」契约见 #49）。
-        staged_skills = stage_marketplace_skills(
-            &marketplace,
-            &source,
-            registry,
-            home,
-            MarketplaceStageOptions {
-                plugin_filter: Some(&filter),
-                refresh: options.refresh,
-                timeout: Some(timeout),
-                env,
-                ..Default::default()
-            },
-        )
-        .await;
+    // skills 注册：复用既有 clone（refresh 透传）；失败降级（返回 Vec、不抛，见 #49）。计数供成功日志。
+    let staged_skills = stage_marketplace_skills(
+        &marketplace,
+        &source,
+        registry,
+        home,
+        MarketplaceStageOptions {
+            plugin_filter: Some(&filter),
+            refresh: options.refresh,
+            timeout: Some(timeout),
+            env,
+            ..Default::default()
+        },
+    )
+    .await;
+    // installed_disabled 末态：本 plugin 全部 skill 置 orphan（镜像 [`disable_plugin`]；enable 再翻活）。
+    for name in plugin_skill_names(registry, &marketplace, &plugin) {
+        registry.mark_orphan(&name);
     }
 
-    if let Some(e) = mutate_err {
-        // 精确回滚：仅注销本次新增 skill（不在 skills_before）、仅摘除本次新增 server（不在 owned）；再上抛。
-        for name in plugin_skill_names(registry, &marketplace, &plugin) {
-            if !skills_before.contains(&name) {
-                registry.unregister(&name);
-            }
-        }
-        if let Some(h) = hooks {
-            for sname in &registered {
-                if owned.contains(sname) {
-                    continue; // 自有 server（重装前已挂）：保留，不误摘。
-                }
-                if let Err(re) = h.remove_server(sname).await {
-                    tracing::warn!(server = %sname, error = %re, "install rollback: remove_server failed");
-                }
-            }
-        }
-        return Err(e);
-    }
+    // ⑦：★config-first 先写 `installedPlugins` 全局安装意图（权威）
+    let pid_intent = plugin_id.to_string();
+    update_installed_plugins_intent(
+        move |file| {
+            file.account.installed_plugins.insert(pid_intent);
+        },
+        Some(home),
+        env,
+    )?;
 
-    // ⑧：★最后写账本（仅全成功）
+    // ⑧：★再写账本（派生缓存，仅全成功）
     let bundled_names: Vec<String> = servers.iter().map(|c| c.name().to_string()).collect();
     let resolved_version = options
         .version
@@ -564,6 +615,32 @@ pub async fn uninstall_plugin(
     let records = match installed.account.plugins.get(plugin_id) {
         Some(r) if !r.is_empty() => r.clone(),
         _ => {
+            // 账本无记录：正常即「未安装」no-op。但若 `installedPlugins` 意图仍残留该 pid（config-first 下 install
+            // 写意图后写账本失败留下的悬挂条目）→ 收敛：从意图移除 + 清 enabledPlugins（否则 list/info 会永久显示
+            // 「已安装但无详情」，仅重装同 pid 才自愈；且 gc 的孤儿判定=账本∉意图，与此相反、清不掉）。
+            let dangling = load_installed_plugins_intent(Some(home), env)
+                .account
+                .installed_plugins
+                .contains(plugin_id);
+            if dangling {
+                let pid_intent = plugin_id.to_string();
+                update_installed_plugins_intent(
+                    move |file| {
+                        file.account.installed_plugins.shift_remove(&pid_intent);
+                    },
+                    Some(home),
+                    env,
+                )?;
+                // best-effort 清 user scope 残留旗（存在性守卫：无旗则不触碰文件）。
+                if let Err(e) = clear_enabled_plugin(plugin_id, "user", None, env) {
+                    tracing::warn!(plugin = plugin_id, error = %e, "uninstall: clear dangling enabledPlugins failed");
+                }
+                tracing::info!(
+                    plugin = plugin_id,
+                    "uninstall: converged dangling install-intent (no ledger record)"
+                );
+                return Ok(true);
+            }
             tracing::info!(plugin = plugin_id, "uninstall: not installed (no-op)");
             return Ok(false);
         }
@@ -600,9 +677,27 @@ pub async fn uninstall_plugin(
         }
     }
 
+    // 清启用意图前先收集 targeted scope（§2.4：uninstall 清 `enabledPlugins` 条目，避免 reinstall 残留旗）。
+    let scopes_to_clear: Vec<(String, Option<String>)> = targeted
+        .iter()
+        .map(|r| {
+            (
+                r.extra
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user")
+                    .to_string(),
+                r.extra
+                    .get("projectPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            )
+        })
+        .collect();
+
     let pid = plugin_id.to_string();
     let scope_owned = options.scope.map(String::from);
-    update_installed_plugins(
+    let ledger_after = update_installed_plugins(
         move |data: &mut InstalledPluginsFile| {
             let plugins = &mut data.account.plugins;
             match &scope_owned {
@@ -633,6 +728,26 @@ pub async fn uninstall_plugin(
         Some(home),
         env,
     )?;
+
+    // 该 pid 已无任何 scope 账本记录 → 从全局安装意图 `installedPlugins` 移除（config-first 权威随之收敛）。
+    if !ledger_after.account.plugins.contains_key(plugin_id) {
+        let pid_intent = plugin_id.to_string();
+        update_installed_plugins_intent(
+            move |file| {
+                file.account.installed_plugins.shift_remove(&pid_intent);
+            },
+            Some(home),
+            env,
+        )?;
+    }
+
+    // 清 targeted scope 的 `enabledPlugins[id]` 残留旗（best-effort：清理性，失败不回退已完成的卸载）。
+    for (scope, project_path) in &scopes_to_clear {
+        if let Err(e) = clear_enabled_plugin(plugin_id, scope, project_path.as_deref(), env) {
+            tracing::warn!(plugin = plugin_id, scope = %scope, error = %e, "uninstall: clear enabledPlugins failed (stale flag may 残留)");
+        }
+    }
+
     tracing::info!(plugin = plugin_id, "uninstalled plugin");
     Ok(true)
 }
@@ -782,6 +897,66 @@ pub async fn enable_plugin(
         "enabled plugin (skills recovered, servers remounted)"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.3.0 一次性迁移 / one-time migration
+// ---------------------------------------------------------------------------
+/// 把 v0.2.x「装即活跃」账本迁移到 v0.3.0 模型（`installedPlugins` 意图 + `enabledPlugins=true`）/ one-time migration。
+///
+/// **幂等靠 `installed_plugins_intent.json` 是否存在**：缺失 → 迁移（① 从账本 keys 回填 `installedPlugins` 意图；
+/// ② 每条记录按其 scope 写 `enabledPlugins=true`，**仅 absent 处**，不覆盖用户显式 `false`）→ 落意图文件即标记
+/// 完成；存在 → 跳过（返回 `false`）。boot 首步调用（reconcile 之前，见 `Computer::boot_up`），保住存量用户「升级
+/// 前 active」的 plugin 在 v0.3.0（absent = 未启用）下不熄灯。返回是否执行了迁移。
+///
+/// # Errors
+/// 意图 / settings 写失败（锁 / I/O）→ [`PluginInstallError`]。逐记录的 enabledPlugins 写为 best-effort（非法
+/// scope 等仅 WARN 跳过、不中断整体迁移）。
+pub fn migrate_ledger_to_intent_once(
+    home: &Path,
+    env: Option<&EnvMap>,
+) -> Result<bool, PluginInstallError> {
+    // 已有意图文件 → 迁移已跑过（或本就是 v0.3.0 新装），跳过。
+    if store::installed_plugins_intent_path(Some(home), env).exists() {
+        return Ok(false);
+    }
+    let ledger = load_installed_plugins(Some(home), env).account;
+    let pids: Vec<String> = ledger.plugins.keys().cloned().collect();
+
+    // ① 回填意图（即使账本为空，也落一个空意图文件以标记「迁移已跑」，避免下次 boot 重判）。
+    let pids_for_intent = pids.clone();
+    update_installed_plugins_intent(
+        move |file| {
+            for pid in pids_for_intent {
+                file.account.installed_plugins.insert(pid);
+            }
+        },
+        Some(home),
+        env,
+    )?;
+
+    // ② 每记录 scope 写 enabledPlugins=true（仅 absent；保用户 disable）。best-effort。
+    for (pid, records) in &ledger.plugins {
+        for rec in records {
+            let scope = rec
+                .extra
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let project_path = rec.extra.get("projectPath").and_then(Value::as_str);
+            if let Err(e) = set_enabled_true_if_absent(pid, scope, project_path, env) {
+                tracing::warn!(plugin = %pid, scope = %scope, error = %e, "migration: set enabledPlugins=true failed (skipped)");
+            }
+        }
+    }
+    if !pids.is_empty() {
+        tracing::info!(
+            migrated = pids.len(),
+            "migrated v0.2.x ledger → installedPlugins intent + enabledPlugins=true"
+        );
+    }
+    // true 表示实际迁移了 ≥1 存量 plugin；空账本仍落意图文件标记完成，但返回 false。
+    Ok(!pids.is_empty())
 }
 
 #[cfg(test)]
@@ -1009,44 +1184,22 @@ mod tests {
 
     // ---- install ------------------------------------------------------------
     #[tokio::test]
-    async fn install_ledger_only_registers_and_records() {
+    async fn install_only_disabled_inactive_and_records_intent() {
+        // v0.3.0：install = installed_disabled——skills orphan（不进 get_skills）、server 不挂、不写
+        // enabledPlugins，但登记 installedPlugins 意图 + 写账本（派生缓存）。
         let tmp = TempDir::new().unwrap();
         let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
-        let mut reg = SkillRegistry::new();
-        let record = install_plugin(
-            "audit@acme",
-            &mut reg,
-            &home,
-            InstallOptions {
-                env: Some(&env),
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        // skill 注册。
-        assert!(reg.resolve("audit:code-review").is_some());
-        // 账本记录：scope/installPath/bundledMcpServers/installedAt。
-        assert_eq!(record.bundled_mcp_servers, vec!["audit-mcp".to_string()]);
-        assert!(record.install_path.is_some());
-        assert_eq!(
-            record.extra.get("scope").and_then(Value::as_str),
-            Some("user")
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let mut env = env;
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
         );
-        assert!(record.extra.contains_key("installedAt"));
-        let recs = ledger_records(&home, &env, "audit@acme");
-        assert_eq!(recs.len(), 1);
-        assert!(installed_plugins_path(Some(&home), Some(&env)).is_file());
-    }
 
-    #[tokio::test]
-    async fn install_registers_servers_via_hooks() {
-        let tmp = TempDir::new().unwrap();
-        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
         let mut reg = SkillRegistry::new();
         let hooks = RecordingHooks::new();
-        install_plugin(
+        let record = install_plugin(
             "audit@acme",
             &mut reg,
             &home,
@@ -1058,10 +1211,91 @@ mod tests {
         )
         .await
         .unwrap();
+        // 不激活：skill orphan（resolve 排除孤儿）+ server 不挂。
+        assert!(
+            reg.resolve("audit:code-review").is_none(),
+            "install 不激活 skills（orphan）"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "install 不挂 bundled server（延到 enable）"
+        );
+        // 不写 enabledPlugins（absent = 未启用）。
+        assert_eq!(enabled_flag(&env, "audit@acme"), None);
+        // installedPlugins 意图登记该 id（权威 install-set）。
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(&home), Some(&env))
+            .account
+            .installed_plugins;
+        assert!(
+            intent.contains("audit@acme"),
+            "install config-first 写 installedPlugins 意图"
+        );
+        // 账本记录（派生缓存）：scope/installPath/bundledMcpServers/installedAt。
+        assert_eq!(record.bundled_mcp_servers, vec!["audit-mcp".to_string()]);
+        assert!(record.install_path.is_some());
+        assert_eq!(
+            record.extra.get("scope").and_then(Value::as_str),
+            Some("user")
+        );
+        assert!(record.extra.contains_key("installedAt"));
+        assert_eq!(ledger_records(&home, &env, "audit@acme").len(), 1);
+        assert!(installed_plugins_path(Some(&home), Some(&env)).is_file());
+    }
+
+    #[tokio::test]
+    async fn enable_after_install_activates_skills_and_servers() {
+        // v0.3.0：install 惰性；enable 才把 skills 与 bundled server 一并点亮。
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let mut env = env;
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        );
+
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            reg.resolve("audit:code-review").is_none(),
+            "install 后 orphan"
+        );
+
+        let hooks = RecordingHooks::new();
+        enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reg.resolve("audit:code-review").is_some(),
+            "enable 后 skill 活跃"
+        );
         assert_eq!(
             *hooks.registered.lock().unwrap(),
-            vec!["audit-mcp".to_string()]
+            vec!["audit-mcp".to_string()],
+            "enable 挂 bundled server"
         );
+        assert_eq!(enabled_flag(&env, "audit@acme"), Some(true));
     }
 
     #[tokio::test]
@@ -1090,13 +1324,25 @@ mod tests {
         assert!(ledger_records(&home, &env, "audit@acme").is_empty());
     }
 
+    // 注：v0.3.0 起 install **不**挂 server（延到 enable），故原 `install_rollback_on_register_failure` 已移除；
+    // server 挂载失败的原子回滚由 `enable_rollback_on_register_failure_redisables_and_reorphans` 覆盖。
+
+    // ---- uninstall ----------------------------------------------------------
     #[tokio::test]
-    async fn install_rollback_on_register_failure() {
+    async fn uninstall_removes_skills_ledger_servers_intent_and_enabled() {
         let tmp = TempDir::new().unwrap();
         let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let mut env = env;
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        );
+
         let mut reg = SkillRegistry::new();
-        let hooks = RecordingHooks::new().failing_register("audit-mcp");
-        let err = install_plugin(
+        let hooks = RecordingHooks::new();
+        install_plugin(
             "audit@acme",
             &mut reg,
             &home,
@@ -1107,25 +1353,13 @@ mod tests {
             Some(&hooks),
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, PluginInstallError::Hook(_)));
-        // register 在 stage 之前失败 → skills 未注册、账本未写；registered 为空（首个就失败）。
-        assert!(reg.resolve("audit:code-review").is_none());
-        assert!(ledger_records(&home, &env, "audit@acme").is_empty());
-    }
-
-    // ---- uninstall ----------------------------------------------------------
-    #[tokio::test]
-    async fn uninstall_removes_skills_ledger_and_servers() {
-        let tmp = TempDir::new().unwrap();
-        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
-        let mut reg = SkillRegistry::new();
-        let hooks = RecordingHooks::new();
-        install_plugin(
+        .unwrap();
+        // enable 激活（skill 活跃 + server 挂），再卸载验证全链摘除。
+        enable_plugin(
             "audit@acme",
             &mut reg,
             &home,
-            InstallOptions {
+            EnableOptions {
                 env: Some(&env),
                 ..Default::default()
             },
@@ -1150,6 +1384,18 @@ mod tests {
         assert!(removed);
         assert!(reg.resolve("audit:code-review").is_none());
         assert!(ledger_records(&home, &env, "audit@acme").is_empty());
+        // installedPlugins 意图移除 + enabledPlugins 条目清除（避免 reinstall 残留旗）。
+        assert!(
+            !crate::settings::store::load_installed_plugins_intent(Some(&home), Some(&env))
+                .account
+                .installed_plugins
+                .contains("audit@acme")
+        );
+        assert_eq!(
+            enabled_flag(&env, "audit@acme"),
+            None,
+            "uninstall 清 enabledPlugins 条目"
+        );
         assert_eq!(
             *hooks.removed.lock().unwrap(),
             vec!["audit-mcp".to_string()]
@@ -1232,7 +1478,25 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(reg.resolve("audit:code-review").is_some());
+        assert!(
+            reg.resolve("audit:code-review").is_none(),
+            "install 后 orphan（installed_disabled）"
+        );
+
+        // enable：激活 skill + 挂 server + enabledPlugins=true。
+        enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        assert!(reg.resolve("audit:code-review").is_some(), "enable 后活跃");
 
         // disable：enabledPlugins=false + 摘 server + orphan skill。
         disable_plugin(
@@ -1428,5 +1692,131 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, PluginInstallError::Precondition(_)));
+    }
+
+    // ---- v0.3.0 一次性迁移 / migration --------------------------------------
+    /// 直接写一条 v0.2.x 式账本记录（scope，无 installPath/bundled）/ seed a v0.2.x-style ledger record。
+    fn seed_ledger_record(home: &Path, pid: &str, scope: &str, env: &EnvMap) {
+        let pid = pid.to_string();
+        let mut extra = Map::new();
+        extra.insert("scope".to_string(), Value::String(scope.to_string()));
+        store::update_installed_plugins(
+            move |file| {
+                file.account.plugins.insert(
+                    pid,
+                    vec![InstalledPluginRecord {
+                        install_path: None,
+                        bundled_mcp_servers: Vec::new(),
+                        extra,
+                    }],
+                );
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_ledger_to_intent_backfills_enables_once_and_preserves_user_disable() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        ))
+        .collect();
+
+        // v0.2.x 态：两条账本记录、无意图文件、无 enabledPlugins；用户已显式 disable lint@acme。
+        seed_ledger_record(&home, "audit@acme", "user", &env);
+        seed_ledger_record(&home, "lint@acme", "user", &env);
+        write_enabled_plugin("lint@acme", false, "user", None, Some(&env)).unwrap();
+        assert!(!store::installed_plugins_intent_path(Some(&home), Some(&env)).exists());
+
+        // 迁移。
+        assert!(migrate_ledger_to_intent_once(&home, Some(&env)).unwrap());
+        // 意图回填两者。
+        let intent = store::load_installed_plugins_intent(Some(&home), Some(&env))
+            .account
+            .installed_plugins;
+        assert!(intent.contains("audit@acme") && intent.contains("lint@acme"));
+        // enabledPlugins：audit absent → 迁为 true；lint 保用户 false（不覆盖）。
+        assert_eq!(enabled_flag(&env, "audit@acme"), Some(true));
+        assert_eq!(
+            enabled_flag(&env, "lint@acme"),
+            Some(false),
+            "迁移不覆盖用户显式 disable"
+        );
+
+        // 幂等：意图文件已存在 → 二次迁移 no-op。
+        assert!(!migrate_ledger_to_intent_once(&home, Some(&env)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn migrate_empty_ledger_marks_done_without_rerun() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let env = EnvMap::new();
+        // 无账本 → 迁移落空意图文件、返回 false（无存量），但标记完成（下次跳过）。
+        assert!(!migrate_ledger_to_intent_once(&home, Some(&env)).unwrap());
+        assert!(store::installed_plugins_intent_path(Some(&home), Some(&env)).exists());
+        assert!(!migrate_ledger_to_intent_once(&home, Some(&env)).unwrap());
+    }
+
+    // 🟡2 回归：config-first 下 install 写 intent 后写账本失败留悬挂 intent 条目 → uninstall 须收敛（否则永久残留）。
+    #[tokio::test]
+    async fn uninstall_converges_dangling_intent_without_ledger_record() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let env = EnvMap::new();
+        // 模拟悬挂态：intent 有 pid、账本无记录。
+        store::update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("audit@acme".to_string());
+            },
+            Some(&home),
+            Some(&env),
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let removed = uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(removed, "悬挂 intent 应被收敛（返回 true）");
+        assert!(
+            !store::load_installed_plugins_intent(Some(&home), Some(&env))
+                .account
+                .installed_plugins
+                .contains("audit@acme")
+        );
+
+        // 再次卸载 → 真 no-op。
+        assert!(!uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap());
     }
 }

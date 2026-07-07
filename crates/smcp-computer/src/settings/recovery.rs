@@ -25,20 +25,22 @@
 //!   [`add_marketplace`](crate::settings::lifecycle::add_marketplace) 写 `known_marketplaces.json`）→ #94
 //!   Computer 级 lifecycle API 与 CLI 实际走的路径。
 //!
-//! 关键事实：`install_plugin` **不**写 `enabledPlugins=true`（装即活跃，无显式 enable 旗）。故
-//! [`reconcile`](crate::settings::reconciler::reconcile) 的 `enabled_plugin_names_for`（要求 `== true`）**无法**
-//! 恢复命令式安装的 plugin。#95 恢复的是**命令式 ledger** 态，故本模块直接读两份 ledger，复用 reconcile 的
-//! **后端原语**（[`stage_marketplace_skills`] / [`load_bundled_servers`] / store），**不**重写后端、**不**经
-//! `reconcile()` 入口（对齐 issue「复用 reconcile/prune/gc + FileSkillGovernanceStore，不重写后端」）。
+//! 关键事实（v0.3.0，协议 §2.4）：install 与 enable 分离——install 写 `installedPlugins` **全局安装意图** +
+//! 物化，**不**写 `enabledPlugins`、**不**激活；enable 才写 `enabledPlugins=true` 并激活。故 boot 活跃集 =
+//! 「已安装（`installedPlugins` 意图）」∧「`enabledPlugins` 合并为 `true`」，与
+//! [`reconcile`](crate::settings::reconciler::reconcile) 侧 `enabled_plugin_names_for`（`== true`）语义一致。
+//! 本模块 install-set 取自 `installedPlugins` 意图（账本 `installed_plugins.json` 仅供 `installPath` 等
+//! materialization 细节），复用 reconcile 的**后端原语**（[`stage_marketplace_skills`] /
+//! [`load_bundled_servers`] / store），**不**重写后端、**不**经 `reconcile()` 入口。
 //!
 //! ## 恢复语义（#95 范围）
 //!
-//! 1. **enabled 门控**：plugin 为「boot-active」⟺ 在 `installed_plugins.json` 且
-//!    `enabledPlugins[pid] != false`（缺省 / `true` 皆视为启用——匹配 install 装即活跃语义）。显式 `false`
-//!    （disable / enable-rollback 落定）→ **不**重挂 skills、**不**重挂 server。这条门控正是「boot 恢复**不得**
-//!    复活 Sub-A(#94) 中 hook 失败已回滚的半装 plugin」的实现机制：回滚落定 `enabledPlugins=false` → 不复活。
-//!    （#94 enable-rollback 的**窄残窗**：回写 false 这步也失败 → 账本残留 `true` → 本恢复据账本视其为启用并
-//!    重挂——与持久化态一致，属可容忍降级，见 [`installer`](crate::settings::installer) enable 回滚注释。）
+//! 1. **enabled 门控（v0.3.0 翻转）**：plugin 为「boot-active」⟺ 在 `installedPlugins` 意图 且
+//!    `enabledPlugins[pid] == true`（absent / `false` 均**不**激活——install 不再装即活跃）。故仅 install 未
+//!    enable 的 plugin 处于惰性 `installed_disabled`，boot **不**重挂其 skills / server。这条门控也承接「boot
+//!    **不得**复活 Sub-A(#94) 中 hook 失败已回滚的半装 plugin」：enable-rollback 落定 `enabledPlugins=false`
+//!    → 不复活。（#94 enable-rollback **窄残窗**：回写 false 也失败 → 账本残留 `true` → 据账本视其为启用重挂，
+//!    与持久化态一致，属可容忍降级，见 [`installer`](crate::settings::installer) enable 回滚注释。）
 //! 2. **additive-only**：只增不删（不 prune/gc 孤儿——那是 §7.3 显式入口）。重复调用幂等。
 //! 3. **离线优先**：`refresh = false` → 已存在 clone 树**复用、不触网**；clone 树缺失才尝试 clone。
 //! 4. **降级铁律**（§7.2）：marketplace 源不可达 / clone 树缺失且 clone 失败 → 该 marketplace 入
@@ -61,7 +63,9 @@ use serde_json::{Map, Value};
 
 use crate::mcp_clients::model::MCPServerConfig;
 use crate::settings::scope::EnvMap;
-use crate::settings::store::{load_installed_plugins, load_known_marketplaces};
+use crate::settings::store::{
+    load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
+};
 use crate::skills::home::marketplace_skill_dir;
 use crate::skills::manifest::load_bundled_servers;
 use crate::skills::registry::SkillRegistry;
@@ -96,22 +100,25 @@ pub struct GovernanceRecoveryReport {
 // ===========================================================================
 // enabled 门控 / Enabled gating
 // ===========================================================================
-/// plugin 是否「boot-active」：在 ledger 且 `enabledPlugins[pid] != false` / whether a plugin is boot-active。
+/// plugin 启用维度门控：`enabledPlugins[pid] == true`（v0.3.0 翻转）/ enabled gate。
 ///
-/// 缺省（无 key）与 `true` 皆视为启用——匹配 [`install_plugin`](crate::settings::installer::install_plugin)
-/// 「装即活跃、无显式 enable 旗」语义；仅显式 `Bool(false)`（disable / enable-rollback 落定）视为禁用。
+/// v0.3.0（协议 §2.4）：install 与 enable 分离后 install **不**写 `enabledPlugins`，故 **absent = 未启用**
+/// （惰性 `installed_disabled`），`false` 亦不启用，仅显式 `true` 才激活——与 reconcile 侧
+/// [`enabled_plugin_names_for`](crate::settings::reconciler) 的 `== true` 一致。boot 活跃集 =「已安装
+/// （`installedPlugins` 意图）」∧ 本 gate。存量 v0.2.x 账本（无 flag）经 boot 一次性迁移回填
+/// `enabledPlugins=true`，不受本翻转影响（见 [`Computer::boot_up`](crate::computer::Computer)）。
 ///
-/// ⚠️ `declared` 的**完整性由调用方负责**：仅当禁用旗所在 scope 已并入 `declared` 才生效。#98 后 project/local
-/// 层来自**进程 cwd**（`Computer` 不再持有 workspace）——写在**非进程-cwd 的 project/local scope** 的
-/// `enabledPlugins=false` 可能不在 `declared` 内 → 此处误判为启用。跨重启可靠禁用应写 user scope（见
+/// ⚠️ `declared` 的**完整性由调用方负责**：仅当启用旗所在 scope 已并入 `declared` 才生效。#98 后 project/local
+/// 层来自**进程 cwd**——写在**非进程-cwd 的 project/local scope** 的 `enabledPlugins=true` 可能不在 `declared`
+/// 内 → 此处误判为未启用。跨重启可靠启用应写 user scope（见
 /// [`Computer::reconcile_governance`](crate::computer::Computer::reconcile_governance) 调用方须知）。
 #[must_use]
 fn plugin_enabled(declared: &Map<String, Value>, pid: &str) -> bool {
-    !matches!(
+    matches!(
         declared
             .get("enabledPlugins")
             .and_then(|plugins| plugins.get(pid)),
-        Some(Value::Bool(false))
+        Some(Value::Bool(true))
     )
 }
 
@@ -135,14 +142,15 @@ pub async fn recover_marketplace_skills(
     env: Option<&EnvMap>,
     declared: &Map<String, Value>,
 ) -> GovernanceRecoveryReport {
-    let installed = load_installed_plugins(Some(home), env).account;
+    // install-set 取自 `installedPlugins` 意图（v0.3.0 权威）；账本仅供 materialization 细节，不再当 install-set。
+    let intent = load_installed_plugins_intent(Some(home), env).account;
     let known = load_known_marketplaces(Some(home), env).account;
 
     let mut report = GovernanceRecoveryReport::default();
-    // 按 marketplace 分组启用 plugin（保 ledger 首见顺序）：mp → (启用 plugin 名集, 启用 pid 列表)。
+    // 按 marketplace 分组启用 plugin（保意图首见顺序）：mp → (启用 plugin 名集, 启用 pid 列表)。
     let mut by_marketplace: IndexMap<String, (HashSet<String>, Vec<String>)> = IndexMap::new();
 
-    for pid in installed.plugins.keys() {
+    for pid in &intent.installed_plugins {
         let Some((plugin, marketplace)) = pid.split_once('@') else {
             // 无 '@'（本地-only 记录）→ 非 marketplace plugin，恢复不涉及。
             continue;
@@ -244,11 +252,17 @@ pub fn collect_enabled_bundled_servers(
     env: Option<&EnvMap>,
     declared: &Map<String, Value>,
 ) -> Vec<BundledServerRecord> {
+    // 权威 install-set = `installedPlugins` 意图；账本仅供 installPath / bundled 细节。
+    let intent = load_installed_plugins_intent(Some(home), env).account;
     let installed = load_installed_plugins(Some(home), env).account;
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<BundledServerRecord> = Vec::new();
 
     for (pid, records) in &installed.plugins {
+        // 不在安装意图的账本记录 = 陈旧派生缓存（已 uninstall / 待 gc），忽略。
+        if !intent.installed_plugins.contains(pid) {
+            continue;
+        }
         if !plugin_enabled(declared, pid) {
             continue;
         }
@@ -403,15 +417,15 @@ mod tests {
         (home, source)
     }
 
-    // ---- 冷启动恢复 happy path（enabledPlugins 缺省 = 启用）-----------------------
+    // ---- 冷启动恢复 happy path（installed ∧ enabledPlugins==true）--------------------
     #[tokio::test]
     async fn recover_restages_enabled_installed_plugin() {
         let tmp = TempDir::new().unwrap();
         let (home, _src) = setup_installed(&tmp).await;
 
-        // 模拟重启：全新空 registry + 空 declared（无 enabledPlugins → 缺省启用）。
+        // 模拟重启：全新空 registry + declared 显式启用 audit@acme（v0.3.0：absent 不再默认启用）。
         let mut fresh = SkillRegistry::new();
-        let declared = Map::new();
+        let declared = declared_enabled(&["audit@acme"]);
         let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
 
         assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
@@ -468,7 +482,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (home, _src) = setup_installed(&tmp).await;
 
-        let declared = Map::new(); // 缺省启用
+        let declared = declared_enabled(&["audit@acme"]);
         let servers = collect_enabled_bundled_servers(&home, None, &declared);
         let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
         assert_eq!(names, vec!["audit-mcp"]);
@@ -514,8 +528,9 @@ mod tests {
         )
         .unwrap();
 
+        seed_intent(&home, &["audit@acme"]);
         let mut fresh = SkillRegistry::new();
-        let declared = Map::new();
+        let declared = declared_enabled(&["audit@acme"]);
         let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
 
         assert_eq!(report.failed_marketplaces, vec!["acme".to_string()]);
@@ -543,8 +558,9 @@ mod tests {
         )
         .unwrap();
 
+        seed_intent(&home, &["audit@ghost"]);
         let mut fresh = SkillRegistry::new();
-        let declared = Map::new();
+        let declared = declared_enabled(&["audit@ghost"]);
         let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
         assert_eq!(report.failed_marketplaces, vec!["ghost".to_string()]);
         assert!(report.restored_plugins.is_empty());
@@ -563,14 +579,41 @@ mod tests {
         assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
     }
 
+    /// 建启用意图 declared map：`{"enabledPlugins": {pid: true, ...}}`（v0.3.0：absent 不再默认启用）/ enabled declared。
+    fn declared_enabled(pids: &[&str]) -> Map<String, Value> {
+        let mut inner = Map::new();
+        for pid in pids {
+            inner.insert((*pid).to_string(), Value::Bool(true));
+        }
+        let mut m = Map::new();
+        m.insert("enabledPlugins".to_string(), Value::Object(inner));
+        m
+    }
+
+    /// 写 `installedPlugins` 全局安装意图（v0.3.0：boot install-set 权威来源）/ seed the install intent。
+    fn seed_intent(home: &Path, pids: &[&str]) {
+        let owned: Vec<String> = pids.iter().map(|s| (*s).to_string()).collect();
+        crate::settings::store::update_installed_plugins_intent(
+            move |file| {
+                for pid in owned {
+                    file.account.installed_plugins.insert(pid);
+                }
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+    }
+
     // ---- 直接写 installed_plugins 记录（绕过 install）/ seed an install record -------
     fn seed_install_record(home: &Path, pid: &str, install_path: Option<&Path>) {
-        let pid = pid.to_string();
+        seed_intent(home, &[pid]); // v0.3.0：同时登记安装意图，否则 recover/collect 的 install-set 取不到。
+        let pid_owned = pid.to_string();
         let ip = install_path.map(|p| p.to_string_lossy().into_owned());
         crate::settings::store::update_installed_plugins(
             move |file| {
                 file.account.plugins.insert(
-                    pid,
+                    pid_owned,
                     vec![crate::settings::reconciler::InstalledPluginRecord {
                         install_path: ip,
                         bundled_mcp_servers: Vec::new(),
@@ -609,7 +652,9 @@ mod tests {
         fs::write(&manifest, b"{ not valid json").unwrap();
 
         let mut fresh = SkillRegistry::new();
-        let report = recover_marketplace_skills(&mut fresh, &home, None, &Map::new()).await;
+        let report =
+            recover_marketplace_skills(&mut fresh, &home, None, &declared_enabled(&["audit@acme"]))
+                .await;
         // clone 树存在 → 不算 failed；pid 计入 restored_plugins；但无 skill 注册。
         assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
         assert!(report.failed_marketplaces.is_empty(), "clone 存在不算降级");
@@ -668,7 +713,11 @@ mod tests {
         seed_install_record(&home, "bad@acme", Some(&bad));
         seed_install_record(&home, "nopath@acme", None);
 
-        let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
+        let servers = collect_enabled_bundled_servers(
+            &home,
+            None,
+            &declared_enabled(&["good@acme", "bad@acme", "nopath@acme"]),
+        );
         let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
         assert_eq!(
             names,
@@ -690,7 +739,8 @@ mod tests {
         let good = plugin_root_with_server(&tmp.path().join("good"), "good-mcp");
         seed_install_record(&home, "good@acme", Some(&good));
 
-        let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
+        let servers =
+            collect_enabled_bundled_servers(&home, None, &declared_enabled(&["good@acme"]));
         let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
         assert_eq!(
             names,
@@ -710,7 +760,8 @@ mod tests {
         seed_install_record(&home, "a@acme", Some(&a));
         seed_install_record(&home, "b@acme", Some(&b));
 
-        let servers = collect_enabled_bundled_servers(&home, None, &Map::new());
+        let servers =
+            collect_enabled_bundled_servers(&home, None, &declared_enabled(&["a@acme", "b@acme"]));
         let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
         assert_eq!(names, vec!["shared-mcp"], "同名 server 跨 plugin 去重");
     }
@@ -774,7 +825,13 @@ mod tests {
         seed_install_record(&home, "lint@acme", None);
 
         let mut fresh = SkillRegistry::new();
-        let report = recover_marketplace_skills(&mut fresh, &home, None, &Map::new()).await;
+        let report = recover_marketplace_skills(
+            &mut fresh,
+            &home,
+            None,
+            &declared_enabled(&["audit@acme", "lint@acme"]),
+        )
+        .await;
         assert_eq!(
             report.restored_plugins,
             vec!["audit@acme".to_string(), "lint@acme".to_string()]
@@ -783,21 +840,22 @@ mod tests {
         assert!(fresh.resolve("lint:lint-skill").is_some());
     }
 
-    // ---- 🟡9：跨重启 disable 已知局限——禁用旗不在 declared（如写在非进程-cwd 的 project scope）→ 复活 ----
+    // ---- 🟡9：v0.3.0 翻转——enable 旗不在 declared（absent）→ 不激活（installed_disabled 惰性）----
     #[tokio::test]
-    async fn recover_revives_when_disable_flag_absent_from_declared() {
-        // 钉记已知局限（recovery.rs plugin_enabled / reconcile_governance doc）：若 enabledPlugins=false 写在
-        // **未并入 declared** 的 scope（如非进程-cwd 的 project/local），恢复时不可见 → plugin 被视为启用复活。
+    async fn recover_skips_when_enable_flag_absent_from_declared() {
+        // v0.3.0（协议 §2.4）：absent enabledPlugins = 未启用。仅 install 未 enable、或 enable 旗写在**未并入
+        // declared** 的 scope（如非进程-cwd 的 project/local）→ plugin 处于惰性 installed_disabled，boot **不**
+        // 复活其 skills。跨重启可靠启用须写 user scope（与旧 v0.2.x「absent=启用默认复活」相反）。
         let tmp = TempDir::new().unwrap();
         let (home, _src) = setup_installed(&tmp).await;
-        // declared 缺该 pid 的 false 旗（模拟禁用写在非进程-cwd 的 project scope）。
-        let declared = Map::new();
+        let declared = Map::new(); // 无 enabledPlugins → 未启用
         let mut fresh = SkillRegistry::new();
         let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
-        assert_eq!(
-            report.restored_plugins,
-            vec!["audit@acme".to_string()],
-            "禁用旗不在 declared → 复活（已知局限，跨重启可靠禁用须 user scope）"
+        assert!(
+            report.restored_plugins.is_empty(),
+            "absent enable 旗 → 不激活（installed_disabled 惰性）"
         );
+        assert_eq!(report.skipped_disabled, vec!["audit@acme".to_string()]);
+        assert!(fresh.resolve("audit:code-review").is_none());
     }
 }

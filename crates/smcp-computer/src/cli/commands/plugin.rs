@@ -36,7 +36,7 @@ use crate::settings::installer::{
 };
 use crate::settings::reconciler::{gc_plugins, list_orphan_plugins, McpTeardown};
 use crate::settings::scope::EnvMap;
-use crate::settings::store::load_installed_plugins;
+use crate::settings::store::{load_installed_plugins, load_installed_plugins_intent};
 use crate::settings::InstalledPluginRecord;
 use crate::skills::SkillRegistry;
 
@@ -72,9 +72,9 @@ fn installed_records(
         .unwrap_or_default()
 }
 
-/// 五层合并视图的 `enabledPlugins` 映射（`id → bool`，缺省视为启用）/ merged enabledPlugins map。
+/// 五层合并视图的 `enabledPlugins` 映射（`id → bool`）/ merged enabledPlugins map。
 ///
-/// #98：project/local 锚定 `cwd`（`None` → 进程 cwd）。
+/// v0.3.0：调用方仅把 `== Some(true)` 视为启用（absent / `false` 均未启用）。#98：project/local 锚定 `cwd`（`None` → 进程 cwd）。
 fn enabled_plugins_view(cwd: Option<&Path>, env: Option<&EnvMap>) -> Map<String, Value> {
     match resolved_settings(cwd, env, None).get("enabledPlugins") {
         Some(Value::Object(map)) => map.clone(),
@@ -354,12 +354,17 @@ pub fn plugin_list(
     json_output: bool,
 ) -> i32 {
     let installed = load_installed_plugins(Some(home), env).account;
+    let intent = load_installed_plugins_intent(Some(home), env).account;
     let enabled_map = enabled_plugins_view(cwd, env);
 
     let mut rows: Vec<Value> = Vec::new();
     for (pid, records) in &installed.plugins {
-        // 缺省 / true = 启用；显式 false = 禁用。
-        let enabled = enabled_map.get(pid) != Some(&Value::Bool(false));
+        // v0.3.0：权威「已安装」= installedPlugins 意图；不在意图的账本记录 = 陈旧派生缓存（已 uninstall），跳过。
+        if !intent.installed_plugins.contains(pid) {
+            continue;
+        }
+        // v0.3.0：仅 enabledPlugins==true 视为启用（absent / false 均未启用，installed_disabled）。
+        let enabled = enabled_map.get(pid) == Some(&Value::Bool(true));
         if !enabled && !available {
             continue;
         }
@@ -419,8 +424,9 @@ pub fn plugin_info(
     cwd: Option<&Path>,
     json_output: bool,
 ) -> i32 {
-    let records = installed_records(home, env, plugin_id);
-    if records.is_empty() {
+    // v0.3.0：权威「已安装」= installedPlugins 意图（账本记录仅供详情展示）。
+    let intent = load_installed_plugins_intent(Some(home), env).account;
+    if !intent.installed_plugins.contains(plugin_id) {
         return plugin_err(
             &format!("plugin {plugin_id:?} not installed"),
             json_output,
@@ -428,7 +434,9 @@ pub fn plugin_info(
             None,
         );
     }
-    let enabled = enabled_plugins_view(cwd, env).get(plugin_id) != Some(&Value::Bool(false));
+    let records = installed_records(home, env, plugin_id);
+    // v0.3.0：仅 enabledPlugins==true 视为启用（absent / false 均未启用）。
+    let enabled = enabled_plugins_view(cwd, env).get(plugin_id) == Some(&Value::Bool(true));
 
     if json_output {
         print_json(&json!({ "id": plugin_id, "enabled": enabled, "records": records }));
@@ -461,20 +469,38 @@ pub fn plugin_info(
     EXIT_OK
 }
 
-/// 清理孤儿 plugin（所有 scope 都不再声明 enabledPlugins[id]）/ GC orphan plugins。
+/// 清理孤儿 plugin（账本有记录、但 pid 不在 `installedPlugins` 安装意图 = 陈旧派生缓存）/ GC orphan plugins。
+///
+/// v0.3.0：孤儿判定基于**安装意图**（非 `enabledPlugins`）——`installed_disabled` 仍是合法安装、绝不 gc。
 #[allow(clippy::too_many_arguments)]
 pub async fn plugin_gc(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
-    cwd: Option<&Path>,
+    _cwd: Option<&Path>,
     teardown: Option<&dyn McpTeardown>,
     confirm: Option<&dyn Confirm>,
     json_output: bool,
 ) -> i32 {
-    let declared = resolved_settings(cwd, env, None);
     let store = file_store(home, env);
-    let orphans = list_orphan_plugins(&declared, &store);
+    let ledger_count = load_installed_plugins(Some(home), env)
+        .account
+        .plugins
+        .len();
+    // v0.3.0：孤儿判定读 store 的 installedPlugins 意图；declared/enabledPlugins 已不参与（传空占位）。
+    let orphans = list_orphan_plugins(&Map::new(), &store);
+    // 安全阀（防数据丢失）：若「孤儿 == 全部账本记录」且账本非空 → 视为 intent 未初始化 / 迁移未落地 / 损坏空
+    // （intent 文件缺失或损坏被恢复为空皆落此），**拒绝** gc、绝不一次清空所有已装 plugin。正常态 intent 与账本
+    // 同步（install/uninstall 双写），孤儿至多是**子集**；「全量孤儿」必为异常。正常迁移已在 CLI 分发 / `boot_up`
+    // 跑过，此阀仅在迁移失败 / 文件损坏时兜底。
+    if ledger_count > 0 && orphans.len() == ledger_count {
+        return plugin_err(
+            "install intent empty/unmigrated while ledger is non-empty; refusing gc to avoid deleting all installed plugins — run 'a2c-computer run' to migrate, then retry",
+            json_output,
+            EXIT_USER_ERROR,
+            None,
+        );
+    }
     if orphans.is_empty() {
         if json_output {
             print_json(&json!({ "removed": [] }));
@@ -514,6 +540,15 @@ mod tests {
     use tempfile::tempdir;
 
     fn seed_plugin(home: &Path, env: &HashMap<String, String>, pid: &str, scope: &str) {
+        // v0.3.0：权威「已安装」= installedPlugins 意图（否则 list/info 视为未装）。
+        crate::settings::store::update_installed_plugins_intent(
+            |file| {
+                file.account.installed_plugins.insert(pid.to_string());
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
         update_installed_plugins(
             |file| {
                 file.account.plugins.insert(
@@ -595,8 +630,9 @@ mod tests {
 
         // cwd 注入 tempdir（无 .tfrobot）→ project/local 判空，隔离真实进程 cwd（接缝确定性）。
         let cwd = Some(home);
-        // 默认（enabledPlugins 缺省）→ 视为启用，list 展示、info enabled=true。
-        assert_eq!(plugin_list(home, Some(&env), cwd, false, true), EXIT_OK);
+        // v0.3.0：已装（在 installedPlugins 意图）→ list/info 均 EXIT_OK；enabledPlugins 缺省 = installed_disabled
+        // （info enabled=false、默认 list 不展示，须 --available）。
+        assert_eq!(plugin_list(home, Some(&env), cwd, true, true), EXIT_OK);
         assert_eq!(
             plugin_info(home, Some(&env), "figma@acme", cwd, true),
             EXIT_OK
@@ -634,13 +670,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_collects_orphan_when_installed_but_not_declared() {
+    async fn gc_collects_orphan_when_installed_but_not_in_intent() {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let env = test_env(home);
-        seed_plugin(home, &env, "ghost@acme", "user");
+        // v0.3.0：孤儿 = 账本有记录、但 pid **不在** installedPlugins 意图。keeper@acme 账本+意图都有（合法已装）；
+        // ghost@acme 仅账本、不在意图（真孤儿）。**部分**孤儿（非全量）→ 安全阀放行 → gc 清 ghost、留 keeper。
+        update_installed_plugins(
+            |file| {
+                for pid in ["keeper@acme", "ghost@acme"] {
+                    file.account.plugins.insert(
+                        pid.to_string(),
+                        vec![InstalledPluginRecord {
+                            install_path: Some(home.join(pid).to_string_lossy().into_owned()),
+                            bundled_mcp_servers: vec![],
+                            extra: Map::from_iter([("scope".to_string(), json!("user"))]),
+                        }],
+                    );
+                }
+            },
+            Some(home),
+            Some(&env),
+        )
+        .unwrap();
+        // 意图只含 keeper@acme（迁移已跑）→ ghost@acme 为真孤儿。
+        crate::settings::store::update_installed_plugins_intent(
+            |f| {
+                f.account
+                    .installed_plugins
+                    .insert("keeper@acme".to_string());
+            },
+            Some(home),
+            Some(&env),
+        )
+        .unwrap();
         let mut registry = SkillRegistry::new();
-        // enabledPlugins 不声明 ghost@acme → 孤儿 → gc 清理（installPath 在 home 内，安全删）。
         // cwd 注入 tempdir → project/local 判空，隔离真实进程 cwd（接缝确定性）。
         let code = plugin_gc(
             &mut registry,
@@ -653,7 +717,98 @@ mod tests {
         )
         .await;
         assert_eq!(code, EXIT_OK);
-        // 账本已无该 plugin。
+        // ghost 被清、keeper 保留。
         assert!(installed_records(home, Some(&env), "ghost@acme").is_empty());
+        assert!(
+            !installed_records(home, Some(&env), "keeper@acme").is_empty(),
+            "非孤儿 keeper 不得被删"
+        );
+    }
+
+    /// 只写账本、不写 intent（模拟未迁移 v0.2.x 态）+ 不跑迁移 → gc **不**得删已装 plugin。
+    fn seed_ledger_only(
+        home: &Path,
+        env: &HashMap<String, String>,
+        pid: &str,
+        install_path: &Path,
+    ) {
+        std::fs::create_dir_all(install_path).unwrap();
+        update_installed_plugins(
+            |file| {
+                file.account.plugins.insert(
+                    pid.to_string(),
+                    vec![InstalledPluginRecord {
+                        install_path: Some(install_path.to_string_lossy().into_owned()),
+                        bundled_mcp_servers: vec![],
+                        extra: Map::from_iter([("scope".to_string(), json!("user"))]),
+                    }],
+                );
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
+    }
+
+    // 🔴 回归：v0.2.x 账本 + intent 文件缺失（迁移未跑）→ gc **拒绝**、绝不静默删已装 plugin（数据丢失防线）。
+    #[tokio::test]
+    async fn gc_refuses_when_intent_missing_but_ledger_nonempty() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let env = test_env(home);
+        let install_path = home.join("plug");
+        seed_ledger_only(home, &env, "legacy@acme", &install_path);
+        assert!(
+            !crate::settings::store::installed_plugins_intent_path(Some(home), Some(&env)).exists()
+        );
+
+        let mut registry = SkillRegistry::new();
+        let code = plugin_gc(
+            &mut registry,
+            home,
+            Some(&env),
+            Some(home),
+            None,
+            None,
+            true,
+        )
+        .await;
+        // 安全阀：拒绝（用户错），账本记录仍在、物化树未删。
+        assert_eq!(code, EXIT_USER_ERROR);
+        assert!(
+            !installed_records(home, Some(&env), "legacy@acme").is_empty(),
+            "未迁移时 gc 不得删已装 plugin（防数据丢失）"
+        );
+        assert!(install_path.exists(), "物化树不得被删");
+    }
+
+    // 迁移后 intent 含已装 plugin → 非孤儿 → gc 保留（🔴 修复的正向验证）。
+    #[tokio::test]
+    async fn gc_after_migration_keeps_installed_plugin() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let env = test_env(home);
+        let install_path = home.join("plug");
+        seed_ledger_only(home, &env, "legacy@acme", &install_path);
+        // 模拟 CLI 分发 / boot 的一次性迁移。
+        crate::settings::installer::migrate_ledger_to_intent_once(home, Some(&env)).unwrap();
+
+        let mut registry = SkillRegistry::new();
+        let code = plugin_gc(
+            &mut registry,
+            home,
+            Some(&env),
+            Some(home),
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(code, EXIT_OK);
+        assert!(
+            !installed_records(home, Some(&env), "legacy@acme").is_empty(),
+            "迁移后 intent 含该 plugin → 非孤儿 → gc 保留"
+        );
+        assert!(install_path.exists());
     }
 }

@@ -38,7 +38,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -108,6 +108,18 @@ pub struct InstalledPlugins {
     pub plugins: IndexMap<String, Vec<InstalledPluginRecord>>,
 }
 
+/// `installed_plugins_intent.json` 全量：**全局安装意图（权威）** / the global install-intent file。
+///
+/// v0.3.0（协议 §2.4）：install/uninstall 的权威写入入口。区别于 [`InstalledPlugins`] 账本——账本是
+/// materialization 派生缓存（`installPath` / `bundledMcpServers` 等），可从本意图重建；本意图记「应装哪些」，
+/// 是 boot 活跃集（= 已安装 ∧ 启用）中「已安装」维度的唯一权威来源。删账本无损、删本意图才真丢安装集。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledPluginsIntent {
+    /// 已安装 `<plugin>@<marketplace>` 集合（保序）/ ordered set of installed plugin ids。
+    #[serde(default, rename = "installedPlugins")]
+    pub installed_plugins: IndexSet<String>,
+}
+
 /// SKILL 治理存储接缝（#67 SET-04 实现真 store、#68 INT-01 注入）/ governance store seam。
 ///
 /// reconciler 经本 trait 读/改两份账本，**不**自持久化（原子写 + 恢复归 #67）。同一对象经
@@ -122,6 +134,18 @@ pub trait SkillGovernanceStore: KnownMarketplaceRecorder {
     fn load_installed_plugins(&self) -> InstalledPlugins;
     /// RMW 修改 `installed_plugins.json` / Read-modify-write。
     fn update_installed_plugins(&self, mutate: &mut dyn FnMut(&mut InstalledPlugins));
+    /// 读取 `installed_plugins_intent.json`（全局安装意图，v0.3.0）快照 / Load the install-intent snapshot。
+    ///
+    /// 默认返回空（供 test 替身无痛适配）；真实 store（[`FileSkillGovernanceStore`](crate::settings::store::FileSkillGovernanceStore)）覆盖之。
+    fn load_installed_plugins_intent(&self) -> InstalledPluginsIntent {
+        InstalledPluginsIntent::default()
+    }
+    /// RMW 修改 `installed_plugins_intent.json` / Read-modify-write the install intent。默认 no-op（见上）。
+    fn update_installed_plugins_intent(
+        &self,
+        _mutate: &mut dyn FnMut(&mut InstalledPluginsIntent),
+    ) {
+    }
     /// 向上转型为 staging 记录器（避免依赖 trait upcasting 语言特性）/ upcast to the staging recorder。
     fn as_recorder(&self) -> &dyn KnownMarketplaceRecorder;
 }
@@ -447,19 +471,22 @@ pub fn prune_marketplaces(
     removed
 }
 
-/// 列出"所有 scope 都不再声明"的孤儿 plugin（installed 有、enabledPlugins 无此 key）/ List orphan plugins。
+/// 列出孤儿 plugin：账本有记录、但 pid **不在 `installedPlugins` 安装意图**（= 陈旧派生缓存）/ List orphan plugins。
 ///
-/// `false` = 声明禁用（key 仍在）→ **非**孤儿；仅 key 完全缺失才算孤儿。返回保持物化顺序。
+/// v0.3.0（协议 §2.4）：孤儿判定改用**安装意图**而非 `enabledPlugins`——install 不再写 `enabledPlugins`，
+/// `installed_disabled`（已装未启用）plugin 仍是**合法安装、非孤儿**，绝不能被 gc 误删。正常操作下 install/uninstall
+/// 同步写意图与账本，故孤儿仅出现于账本被外部改动 / 迁移残留等。`_declared` 保留仅为 API 兼容（v0.3.0 起不参与判定）。
+/// 返回保持物化顺序。
 pub fn list_orphan_plugins(
-    declared: &Map<String, Value>,
+    _declared: &Map<String, Value>,
     store: &dyn SkillGovernanceStore,
 ) -> Vec<String> {
-    let declared_ids = declared_plugin_ids(declared);
+    let intent = store.load_installed_plugins_intent();
     let installed = store.load_installed_plugins();
     installed
         .plugins
         .keys()
-        .filter(|pid| !declared_ids.contains(*pid))
+        .filter(|pid| !intent.installed_plugins.contains(*pid))
         .cloned()
         .collect()
 }
@@ -526,6 +553,7 @@ mod tests {
     struct MemStore {
         known: Mutex<KnownMarketplaces>,
         installed: Mutex<InstalledPlugins>,
+        intent: Mutex<InstalledPluginsIntent>,
     }
 
     impl KnownMarketplaceRecorder for MemStore {
@@ -563,6 +591,15 @@ mod tests {
         }
         fn update_installed_plugins(&self, mutate: &mut dyn FnMut(&mut InstalledPlugins)) {
             mutate(&mut self.installed.lock().unwrap());
+        }
+        fn load_installed_plugins_intent(&self) -> InstalledPluginsIntent {
+            self.intent.lock().unwrap().clone()
+        }
+        fn update_installed_plugins_intent(
+            &self,
+            mutate: &mut dyn FnMut(&mut InstalledPluginsIntent),
+        ) {
+            mutate(&mut self.intent.lock().unwrap());
         }
         fn as_recorder(&self) -> &dyn KnownMarketplaceRecorder {
             self
@@ -744,10 +781,12 @@ mod tests {
             );
         });
 
-        // 声明只剩 lint@acme（disabled 也算声明）→ audit@acme 为孤儿。
-        let d = declared(serde_json::json!({
-            "enabledPlugins": {"lint@acme": false}
-        }));
+        // v0.3.0：安装意图只含 lint@acme → 账本里的 audit@acme 无对应意图 = 孤儿（陈旧派生缓存）。
+        // （enabledPlugins 不再参与孤儿判定：installed_disabled 仍是合法安装，绝不 gc。）
+        store.update_installed_plugins_intent(&mut |i| {
+            i.installed_plugins.insert("lint@acme".to_string());
+        });
+        let d = declared(serde_json::json!({}));
         assert_eq!(
             list_orphan_plugins(&d, &store),
             vec!["audit@acme".to_string()]

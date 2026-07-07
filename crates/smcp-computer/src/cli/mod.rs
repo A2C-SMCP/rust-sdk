@@ -306,9 +306,19 @@ async fn dispatch(mut args: Args) -> i32 {
     }
 }
 
+/// v0.3.0 一次性迁移收口：非交互一次性子命令**不 boot Computer**（故 `boot_up` 的迁移不跑），若 v0.2.x 账本
+/// 尚未迁移，intent 缺失会让已装 plugin 被判「未安装」——`plugin list`/`info` 空、`plugin gc` 更会**静默删光**
+/// 全部已装 plugin。故所有非交互治理入口读 intent 前必须先跑此迁移（idempotent：intent 文件存在即跳过）。
+fn migrate_governance_once(home: &Path) {
+    if let Err(e) = crate::settings::installer::migrate_ledger_to_intent_once(home, None) {
+        eprintln!("v0.3.0 迁移失败（非阻塞，将在下次重试）: {e}");
+    }
+}
+
 // ── 非交互子命令分发（不 boot Computer；离线 registry）/ non-interactive dispatch ──
 async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
     let home = skill_home();
+    migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
     match action {
         MarketplaceCmd::Add {
@@ -383,6 +393,7 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
 
 async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
     let home = skill_home();
+    migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
     // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
     let cwd = std::env::current_dir().ok();
