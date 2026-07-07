@@ -20,9 +20,9 @@ pub mod scope;
 pub mod store;
 
 pub use installer::{
-    disable_plugin, enable_plugin, install_plugin, uninstall_plugin, DisableOptions, EnableOptions,
-    InstallOptions, McpHookError, McpInstallHooks, McpServerNameConflictError, PluginInstallError,
-    UninstallOptions,
+    disable_plugin, enable_plugin, install_plugin, materialize_plugin_record, uninstall_plugin,
+    DisableOptions, EnableOptions, InstallOptions, McpHookError, McpInstallHooks,
+    McpServerNameConflictError, PluginInstallError, UninstallOptions,
 };
 
 pub use lifecycle::{
@@ -57,8 +57,8 @@ pub use reconciler::{
 };
 
 pub use recovery::{
-    collect_enabled_bundled_servers, recover_marketplace_skills, BundledServerRecord,
-    GovernanceRecoveryReport,
+    collect_enabled_bundled_servers, recover_marketplace_skills,
+    rematerialize_missing_ledger_records, BundledServerRecord, GovernanceRecoveryReport,
 };
 
 pub use schema::{

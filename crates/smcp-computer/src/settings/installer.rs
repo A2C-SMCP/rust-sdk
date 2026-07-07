@@ -422,33 +422,51 @@ fn conflict_check(
 }
 
 // ---------------------------------------------------------------------------
-// install / uninstall / enable / disable
+// 物化原语（install 与账本重建共享）/ shared materialization primitives
 // ---------------------------------------------------------------------------
-/// 显式安装单个 plugin = **物化 + 登记 `installed_disabled`，不激活**（v0.3.0，协议 §2.4）/ Install (staged, inactive)。
+/// 物化前置产物（install 与账本重建 [`materialize_plugin_record`] 共享）/ shared materialization output。
 ///
-/// v0.3.0：install 与 enable 分离。install **只**物化并写声明式安装意图，**不**激活能力——其 SKILL 注册后即
-/// `orphan`（不进 `get_skills`），bundled MCP server **不**挂、inputs **不**注入、**不**写 `enabledPlugins`
-/// （absent = 未启用 → `installed_disabled`）。激活全部交给 [`enable_plugin`]。
+/// 由 [`materialize_plugin`] 产出：解析 marketplace 源 → 定位 plugin root（可 git clone）→ 载入 bundled
+/// servers → 解析版本。承载 install 下游（冲突闸 / 注册 / 账本）与账本重建所需的全部字段；`entry` / `manifest`
+/// / `plugin_manifest` 等 prologue-only 中间态不逃逸（`resolved_version` 已在 [`materialize_plugin`] 内先算）。
+struct MaterializedPlugin {
+    /// plugin 名（pid `@` 前段）/ plugin name。
+    plugin: String,
+    /// marketplace 名（pid `@` 后段）/ marketplace name。
+    marketplace: String,
+    /// marketplace git source（供 skills staging 复用）/ marketplace source。
+    source: Value,
+    /// plugin 物化落点（bundled server 从此解析 + 账本 `installPath`）/ install path。
+    plugin_root: PathBuf,
+    /// 解析出的 bundled MCP server 配置 / bundled MCP server configs。
+    servers: Vec<MCPServerConfig>,
+    /// 版本回退（git HEAD / catalog sha，账本 `commitSha`）/ version fallback sha。
+    version_fallback: Option<String>,
+    /// 最终解析版本（账本 `version`）/ resolved version。
+    resolved_version: Option<String>,
+}
+
+/// 物化 plugin 前置：解析源 → 定位 root（`refresh=false` 离线复用既有 clone）→ 载入 bundled servers →
+/// 解析版本 / Resolve source, locate root, load bundled servers, resolve version。
 ///
-/// 顺序：① 解析 id + mp source；② 要求 catalog 已 clone、读 marketplace.json 定位 entry；③ [`locate_plugin_root`]
-/// 定位 plugin 根（必要时 clone）；④ strict 冲突检测 + [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**
-/// （外来 MCP 同名硬抛、零变更——满足「install 拒绝 foreign name conflict」，虽本步不挂载）；⑥ stage skills →
-/// 立即 `mark_orphan`（不投影）；⑦ **config-first 写 `installedPlugins` 全局安装意图**（权威）→ ⑧ 写账本
-/// （派生缓存）。
+/// install 与账本重建（[`materialize_plugin_record`]）复用此原语，**杜绝两条物化路径漂移**——重建出的
+/// `installPath` / bundled 名集必与 install 当初写入的一致。`strict_check=true` 时执行 §4.4 strict 冲突门
+/// （install 用；账本重建免检，见 [`materialize_plugin_record`]）。
 ///
 /// # Errors
-/// 见 [`PluginInstallError`]（冲突 / 前置 / manifest / 定位 / 意图 / 账本）。
-pub async fn install_plugin(
+/// marketplace 未添加 / catalog 未 clone / manifest 畸形 / plugin 不在清单 / 定位失败（源不可达）/ bundled
+/// server JSON 畸形 / strict 冲突 → [`PluginInstallError`]。
+#[allow(clippy::too_many_arguments)]
+async fn materialize_plugin(
     plugin_id: &str,
-    registry: &mut SkillRegistry,
     home: &Path,
-    options: InstallOptions<'_>,
-    hooks: Option<&dyn McpInstallHooks>,
-) -> Result<InstalledPluginRecord, PluginInstallError> {
+    env: Option<&EnvMap>,
+    refresh: bool,
+    timeout: Duration,
+    version_override: Option<&str>,
+    strict_check: bool,
+) -> Result<MaterializedPlugin, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
-    let scope = options.scope.unwrap_or("user");
-    let timeout = options.timeout.unwrap_or(DEFAULT_GIT_TIMEOUT);
-    let env = options.env;
     let (source, commit_sha) = resolve_marketplace_source(&marketplace, home, env)?;
 
     let catalog_dir = marketplace_skill_dir(home, &marketplace, &[]);
@@ -476,84 +494,71 @@ pub async fn install_plugin(
         &root_base,
         home,
         commit_sha.as_deref(),
-        options.refresh,
+        refresh,
         timeout,
         env,
     )
     .await?;
-    // plugin.json 读一次复用（冲突检测 + version 解析共用）/ read once, reuse。
+    // plugin.json 读一次复用（strict 检测 + version 解析共用）/ read once, reuse。
     let plugin_manifest = read_plugin_metadata(&plugin_root);
-    // strict mode 冲突检测（§4.4）：早检——挂 server / 注册 skill 前拦截，保证原子失败。
-    check_strict_conflict(entry, &plugin_manifest)?;
-    let servers = load_bundled_servers(&plugin_root)?;
-
-    // ⑤：★冲突闸门（零变更）。owned = 自有同名白名单（上次记录的 bundledMcpServers）。
-    let owned = bundled_servers_of(home, plugin_id, env);
-    let existing = hooks
-        .map(McpInstallHooks::existing_server_names)
-        .unwrap_or_default();
-    conflict_check(&servers, &existing, &owned)?;
-
-    // —— 过闸：物化但**不激活**（v0.3.0，协议 §2.4：install 落 `installed_disabled`）——
-    // 不挂 server、不注入 inputs（延到 [`enable_plugin`]）；skills 注册后立即 orphan（不进 `get_skills`）。
-    let filter: HashSet<String> = std::iter::once(plugin.clone()).collect();
-    // skills 注册：复用既有 clone（refresh 透传）；失败降级（返回 Vec、不抛，见 #49）。计数供成功日志。
-    let staged_skills = stage_marketplace_skills(
-        &marketplace,
-        &source,
-        registry,
-        home,
-        MarketplaceStageOptions {
-            plugin_filter: Some(&filter),
-            refresh: options.refresh,
-            timeout: Some(timeout),
-            env,
-            ..Default::default()
-        },
-    )
-    .await;
-    // installed_disabled 末态：本 plugin 全部 skill 置 orphan（镜像 [`disable_plugin`]；enable 再翻活）。
-    for name in plugin_skill_names(registry, &marketplace, &plugin) {
-        registry.mark_orphan(&name);
+    if strict_check {
+        // strict mode 冲突检测（§4.4）：早检——挂 server / 注册 skill 前拦截，保证原子失败。
+        check_strict_conflict(entry, &plugin_manifest)?;
     }
-
-    // ⑦：★config-first 先写 `installedPlugins` 全局安装意图（权威）
-    let pid_intent = plugin_id.to_string();
-    update_installed_plugins_intent(
-        move |file| {
-            file.account.installed_plugins.insert(pid_intent);
-        },
-        Some(home),
-        env,
-    )?;
-
-    // ⑧：★再写账本（派生缓存，仅全成功）
-    let bundled_names: Vec<String> = servers.iter().map(|c| c.name().to_string()).collect();
-    let resolved_version = options
-        .version
+    let servers = load_bundled_servers(&plugin_root)?;
+    // entry 借用自 manifest、不可逃逸 → 在此算 resolved_version（借用检查强制，非仅风格）。
+    let resolved_version = version_override
         .map(String::from)
         .or_else(|| resolve_plugin_version(entry, &plugin_manifest, version_fallback.as_deref()));
+
+    Ok(MaterializedPlugin {
+        plugin,
+        marketplace,
+        source,
+        plugin_root,
+        servers,
+        version_fallback,
+        resolved_version,
+    })
+}
+
+/// 由物化产物构造账本派生记录 + 写入（同 scope 替换、异 scope 保留数组合并）/ Build & upsert the ledger record.
+///
+/// install 与账本重建复用。`extra` 组装 scope/projectPath?/version?/commitSha?/installedAt/lastUpdated；
+/// `installedAt` 取当前时刻（账本重建时即重建时刻，原值不可复原）。返回写入的记录。
+///
+/// # Errors
+/// 账本写失败（锁 / I/O）→ [`PluginInstallError`]。
+fn write_ledger_record(
+    home: &Path,
+    plugin_id: &str,
+    scope: &str,
+    project_path: Option<&str>,
+    m: &MaterializedPlugin,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginRecord, PluginInstallError> {
+    let bundled_names: Vec<String> = m.servers.iter().map(|c| c.name().to_string()).collect();
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let mut extra: Map<String, Value> = Map::new();
     extra.insert("scope".into(), Value::String(scope.to_string()));
-    if let Some(pp) = options.project_path.filter(|s| !s.is_empty()) {
+    if let Some(pp) = project_path.filter(|s| !s.is_empty()) {
         extra.insert(
             "projectPath".into(),
             Value::String(Path::new(pp).to_string_lossy().into_owned()),
         );
     }
-    if let Some(v) = &resolved_version {
+    if let Some(v) = &m.resolved_version {
         extra.insert("version".into(), Value::String(v.clone()));
     }
-    if let Some(sha) = &version_fallback {
+    if let Some(sha) = &m.version_fallback {
         extra.insert("commitSha".into(), Value::String(sha.clone()));
     }
     extra.insert("installedAt".into(), Value::String(now.clone()));
     extra.insert("lastUpdated".into(), Value::String(now));
 
     let record = InstalledPluginRecord {
-        install_path: Some(plugin_root.to_string_lossy().into_owned()),
+        install_path: Some(m.plugin_root.to_string_lossy().into_owned()),
         bundled_mcp_servers: bundled_names,
         extra,
     };
@@ -583,6 +588,123 @@ pub async fn install_plugin(
         Some(home),
         env,
     )?;
+    Ok(record)
+}
+
+/// 从 `installedPlugins` 意图为单个 plugin **重物化账本派生缓存**（`installPath` + `bundledMcpServers`）/ rebuild ledger record from intent.
+///
+/// v0.3.0 conformance §63（账本删除无损）：账本 `installed_plugins.json` 被外部删除/损坏后，boot / reconcile
+/// 据 `installedPlugins` 意图重建其派生缓存，使 enabled plugin 的 bundled server 与归属重现。复用
+/// [`materialize_plugin`]（`refresh=false` 离线复用既有 clone）+ [`write_ledger_record`]，故重建的 `installPath`
+/// / bundled 名集与 install 当初一致。
+///
+/// **只写账本**：不写 `installedPlugins` 意图（本就是重建依据）、不写 `enabledPlugins`、不 stage skills（phase 1
+/// [`recover_marketplace_skills`](crate::settings::recovery::recover_marketplace_skills) 负责）、不挂 server
+/// （phase 2 经 hooks 负责）。**不得**以 `install_plugin(hooks=None)` 实现——install 末尾 `mark_orphan` 会反向
+/// orphan phase 1 刚复活的 enabled skill。
+///
+/// **两条 intent-inherent 降级**：① 记录固定写 `scope="user"`（意图是扁平集、无 scope，原 project/local scope
+/// 不可复原——与「跨重启可靠启用写 user scope」指引一致）；② `installedAt` 为重建时刻（原值丢失）。
+/// **`strict_check=false`**（与 phase 1 `stage_one_plugin` 的再检查不对称是刻意）：pid 已在装机时过 strict，
+/// `refresh=false` 复用同一 manifest，重建期不重复门控（避免 catalog 漂移令恢复误失败）。
+///
+/// # Errors
+/// 见 [`materialize_plugin`] / [`write_ledger_record`]（源不可达 / manifest 畸形 / 账本写失败）。调用方（boot
+/// 恢复 [`rematerialize_missing_ledger_records`](crate::settings::recovery::rematerialize_missing_ledger_records)）
+/// 遇 `Err` 应降级记录、不阻断其余恢复。
+pub async fn materialize_plugin_record(
+    plugin_id: &str,
+    home: &Path,
+    env: Option<&EnvMap>,
+    timeout: Duration,
+) -> Result<InstalledPluginRecord, PluginInstallError> {
+    let m = materialize_plugin(plugin_id, home, env, false, timeout, None, false).await?;
+    write_ledger_record(home, plugin_id, "user", None, &m, env)
+}
+
+// ---------------------------------------------------------------------------
+// install / uninstall / enable / disable
+// ---------------------------------------------------------------------------
+/// 显式安装单个 plugin = **物化 + 登记 `installed_disabled`，不激活**（v0.3.0，协议 §2.4）/ Install (staged, inactive)。
+///
+/// v0.3.0：install 与 enable 分离。install **只**物化并写声明式安装意图，**不**激活能力——其 SKILL 注册后即
+/// `orphan`（不进 `get_skills`），bundled MCP server **不**挂、inputs **不**注入、**不**写 `enabledPlugins`
+/// （absent = 未启用 → `installed_disabled`）。激活全部交给 [`enable_plugin`]。
+///
+/// 顺序：① 解析 id + mp source；② 要求 catalog 已 clone、读 marketplace.json 定位 entry；③ [`locate_plugin_root`]
+/// 定位 plugin 根（必要时 clone）；④ strict 冲突检测 + [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**
+/// （外来 MCP 同名硬抛、零变更——满足「install 拒绝 foreign name conflict」，虽本步不挂载）；⑥ stage skills →
+/// 立即 `mark_orphan`（不投影）；⑦ **config-first 写 `installedPlugins` 全局安装意图**（权威）→ ⑧ 写账本
+/// （派生缓存）。
+///
+/// # Errors
+/// 见 [`PluginInstallError`]（冲突 / 前置 / manifest / 定位 / 意图 / 账本）。
+pub async fn install_plugin(
+    plugin_id: &str,
+    registry: &mut SkillRegistry,
+    home: &Path,
+    options: InstallOptions<'_>,
+    hooks: Option<&dyn McpInstallHooks>,
+) -> Result<InstalledPluginRecord, PluginInstallError> {
+    let scope = options.scope.unwrap_or("user");
+    let timeout = options.timeout.unwrap_or(DEFAULT_GIT_TIMEOUT);
+    let env = options.env;
+
+    // ①-④：解析 mp source + 定位 plugin 根（必要时 clone）+ strict 冲突检测 + 载入 bundled servers（注册前
+    // 畸形即抛 → 原子前置）。install 与账本重建 [`materialize_plugin_record`] 共享此原语，杜绝物化路径漂移。
+    let m = materialize_plugin(
+        plugin_id,
+        home,
+        env,
+        options.refresh,
+        timeout,
+        options.version,
+        true,
+    )
+    .await?;
+
+    // ⑤：★冲突闸门（零变更）。owned = 自有同名白名单（上次记录的 bundledMcpServers）。
+    let owned = bundled_servers_of(home, plugin_id, env);
+    let existing = hooks
+        .map(McpInstallHooks::existing_server_names)
+        .unwrap_or_default();
+    conflict_check(&m.servers, &existing, &owned)?;
+
+    // —— 过闸：物化但**不激活**（v0.3.0，协议 §2.4：install 落 `installed_disabled`）——
+    // 不挂 server、不注入 inputs（延到 [`enable_plugin`]）；skills 注册后立即 orphan（不进 `get_skills`）。
+    let filter: HashSet<String> = std::iter::once(m.plugin.clone()).collect();
+    // skills 注册：复用既有 clone（refresh 透传）；失败降级（返回 Vec、不抛，见 #49）。计数供成功日志。
+    let staged_skills = stage_marketplace_skills(
+        &m.marketplace,
+        &m.source,
+        registry,
+        home,
+        MarketplaceStageOptions {
+            plugin_filter: Some(&filter),
+            refresh: options.refresh,
+            timeout: Some(timeout),
+            env,
+            ..Default::default()
+        },
+    )
+    .await;
+    // installed_disabled 末态：本 plugin 全部 skill 置 orphan（镜像 [`disable_plugin`]；enable 再翻活）。
+    for name in plugin_skill_names(registry, &m.marketplace, &m.plugin) {
+        registry.mark_orphan(&name);
+    }
+
+    // ⑦：★config-first 先写 `installedPlugins` 全局安装意图（权威）
+    let pid_intent = plugin_id.to_string();
+    update_installed_plugins_intent(
+        move |file| {
+            file.account.installed_plugins.insert(pid_intent);
+        },
+        Some(home),
+        env,
+    )?;
+
+    // ⑧：★再写账本（派生缓存，仅全成功；与账本重建复用 [`write_ledger_record`]）
+    let record = write_ledger_record(home, plugin_id, scope, options.project_path, &m, env)?;
     tracing::info!(
         plugin = plugin_id,
         skills_staged = staged_skills.len(),

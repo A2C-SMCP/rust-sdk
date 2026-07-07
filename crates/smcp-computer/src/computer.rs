@@ -906,6 +906,18 @@ impl<S: Session> Computer<S> {
                 .await
         };
 
+        // 阶段一·五：账本派生缓存补全（§63 账本删除无损，#104）。**已释放 skill 写锁**、无锁纯 FS/git，故置于
+        // phase 1 与 phase 2 之间：意图有 enabled pid 但账本缺记录 → 从意图重物化账本 `installPath`，使随后 phase 2
+        // 的 `collect_enabled_bundled_servers` 与 `list_mcp_servers_with_metadata` 归属查询得以重现。**无条件执行**
+        // （不看 hooks）：boot 走 `reconcile_governance(None, None)`，须先补回账本供其后查询/重挂读到。
+        crate::settings::recovery::rematerialize_missing_ledger_records(
+            &home,
+            None,
+            declared,
+            &mut report,
+        )
+        .await;
+
         // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
         // 严格镜像 Python `computer.py::reconcile_governance` remount 臂（PR #119 / #100 设计 Y）：
         // ① 同名冲突 → skip + WARN（additive-only，既有 / 用户配置胜，**不覆盖**）；
@@ -2781,6 +2793,61 @@ mod tests {
             .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
             .await;
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
+    }
+
+    /// §63（#104）：账本被外部删除后，reconcile_governance 从 `installedPlugins` 意图重建账本派生缓存
+    /// （phase 1.5），enabled plugin 的 bundled server 经 hooks 重挂重现——恢复不受账本删除影响。
+    #[tokio::test]
+    async fn reconcile_governance_rebuilds_ledger_and_remounts_after_deletion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await; // install audit@acme（写 ledger + 意图）。
+
+        // 外部删除账本（`installedPlugins` 意图仍在）。
+        let ledger = crate::settings::store::installed_plugins_path(Some(&home), None);
+        std::fs::remove_file(&ledger).unwrap();
+        assert!(!ledger.exists(), "前置：账本已删");
+        assert!(
+            crate::settings::store::load_installed_plugins_intent(Some(&home), None)
+                .account
+                .installed_plugins
+                .contains("audit@acme"),
+            "前置：installedPlugins 意图仍含该 pid"
+        );
+
+        // 新进程 Computer B：reconcile_governance 应先重建账本（phase 1.5）再经 hooks 重挂（phase 2）。
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+
+        // §63：账本从意图重建。
+        assert_eq!(
+            report.rematerialized_plugins,
+            vec!["audit@acme".to_string()],
+            "账本删除后应从 installedPlugins 意图重建"
+        );
+        assert!(report.failed_rematerialize.is_empty());
+        // 重建后账本文件重现、记录含非空 installPath + bundled server 名。
+        assert!(ledger.exists(), "重建后账本文件应重现");
+        let recs = crate::settings::store::load_installed_plugins(Some(&home), None).account;
+        let rebuilt = recs.plugins.get("audit@acme").expect("重建账本含该 pid");
+        assert!(
+            rebuilt
+                .iter()
+                .any(|r| r.install_path.as_deref().is_some_and(|s| !s.is_empty())
+                    && r.bundled_mcp_servers.iter().any(|n| n == "audit-mcp")),
+            "重建记录含非空 installPath + bundled server 名"
+        );
+
+        // bundled server 经 hooks 重挂重现（恢复不受账本删除影响）。
+        assert_eq!(report.remounted_servers, vec!["audit-mcp".to_string()]);
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()]
+        );
     }
 
     /// #100 item3：既有同名 server → 重挂**跳过**（additive-only，用户配置胜）；不 register 覆盖、不注入。

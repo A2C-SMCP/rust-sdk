@@ -46,13 +46,15 @@
 //! 4. **降级铁律**（§7.2）：marketplace 源不可达 / clone 树缺失且 clone 失败 → 该 marketplace 入
 //!    `failed_marketplaces` + WARN，**不**阻断恢复其余、**不**抛。
 //!
-//! ## 两阶段（锁纪律）/ Two phases (lock discipline)
+//! ## 阶段划分（锁纪律）/ Phases (lock discipline)
 //!
-//! 本模块只提供两个**独立**入口，由 [`Computer`](crate::computer::Computer) 编排以**断开**潜在 ABBA：
-//! - [`recover_marketplace_skills`]（持 `skill_registry` 写锁）：重挂 marketplace skills。
-//! - [`collect_enabled_bundled_servers`]（**不**持任何锁，纯读 ledger + 解析）：产出待重挂的 bundled server
-//!   配置；调用方在**释放 skill 写锁后**经 [`McpInstallHooks`](crate::settings::installer::McpInstallHooks)
-//!   逐个 `register_server`（client 拥有「如何物化」，SDK 决定「哪些」）。两阶段分离避免「持 skill 写锁 →
+//! 本模块提供**独立**入口，由 [`Computer`](crate::computer::Computer) 编排以**断开**潜在 ABBA：
+//! - 阶段一 [`recover_marketplace_skills`]（持 `skill_registry` 写锁）：重挂 marketplace skills。
+//! - 阶段一·五 [`rematerialize_missing_ledger_records`]（**不**持任何锁，纯 FS/git）：账本被外部删除后从
+//!   `installedPlugins` 意图重建缺失的账本派生缓存（`installPath`），使阶段二得以解析 bundled server（§63）。
+//! - 阶段二 [`collect_enabled_bundled_servers`]（**不**持任何锁，纯读 ledger + 解析）：产出待重挂的 bundled
+//!   server 配置；调用方在**释放 skill 写锁后**经 [`McpInstallHooks`](crate::settings::installer::McpInstallHooks)
+//!   逐个 `register_server`（client 拥有「如何物化」，SDK 决定「哪些」）。阶段分离避免「持 skill 写锁 →
 //!   经 hooks 取 mcp_manager 锁」的相反序死锁（见 computer.rs `restage_mcp_skills` 锁序注释）。
 
 use std::collections::HashSet;
@@ -62,6 +64,7 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value};
 
 use crate::mcp_clients::model::MCPServerConfig;
+use crate::settings::installer::materialize_plugin_record;
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
     load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
@@ -69,7 +72,9 @@ use crate::settings::store::{
 use crate::skills::home::marketplace_skill_dir;
 use crate::skills::manifest::load_bundled_servers;
 use crate::skills::registry::SkillRegistry;
-use crate::skills::staging::{stage_marketplace_skills, MarketplaceStageOptions};
+use crate::skills::staging::{
+    stage_marketplace_skills, MarketplaceStageOptions, DEFAULT_GIT_TIMEOUT,
+};
 
 // ===========================================================================
 // 恢复报告 / Recovery report
@@ -95,6 +100,10 @@ pub struct GovernanceRecoveryReport {
     pub failed_marketplaces: Vec<String>,
     /// 显式 `enabledPlugins=false` 故**刻意跳过**的已装 plugin id（不复活）/ deliberately-skipped disabled。
     pub skipped_disabled: Vec<String>,
+    /// 账本缺记录、从 `installedPlugins` 意图**重物化派生缓存成功**的 enabled plugin id（§63）/ rebuilt from intent。
+    pub rematerialized_plugins: Vec<String>,
+    /// 账本缺记录但**重物化失败**（源不可达等）的 enabled plugin id（降级、未阻断其余）/ degraded rematerialize。
+    pub failed_rematerialize: Vec<String>,
 }
 
 // ===========================================================================
@@ -303,6 +312,68 @@ pub fn collect_enabled_bundled_servers(
     out
 }
 
+// ===========================================================================
+// 阶段一·五：账本派生缓存补全（§63 账本删除无损）/ Phase 1.5: rebuild ledger from intent
+// ===========================================================================
+/// 账本删除/损坏后从 `installedPlugins` 意图**重物化缺失的账本派生缓存**（conformance §63）/ Rebuild missing ledger records。
+///
+/// v0.3.0 权威模型：`installedPlugins` 意图是「已安装」唯一权威，账本 `installed_plugins.json` 是可从意图重建的
+/// 派生缓存。skills 恢复（[`recover_marketplace_skills`]）已不依赖账本，但 bundled MCP server 恢复
+/// （[`collect_enabled_bundled_servers`]）仍需账本记录的 `installPath`。故账本被外部删除后，「意图有 enabled pid
+/// 但账本无记录」的 plugin 其 bundled server 会静默丢失。本函数补齐这一步：遍历意图，为 enabled 且账本缺记录的
+/// marketplace plugin 调 [`materialize_plugin_record`] 重建，之后 `collect` / 归属查询即可重现。
+///
+/// **门控**（与 phase 1 / phase 2 同构）：仅 `<plugin>@<marketplace>`（本地-only 无 bundled 归属恢复）且
+/// `enabledPlugins[pid] == true` 才重建；账本已有**非空 `installPath`** 记录则跳过（幂等 + 自愈）。
+///
+/// **降级铁律**（§7.2）：单个 plugin 重物化失败（源不可达 / manifest 畸形）→ 记入
+/// [`failed_rematerialize`](GovernanceRecoveryReport::failed_rematerialize) + WARN，**不 panic、不阻断其余**。
+///
+/// **无锁、离线优先**：不持任何 Registry / manager 锁；`materialize_plugin_record` 内 `refresh=false` 复用既有
+/// clone（catalog 通常已由 phase 1 clone）。编排方（[`Computer::reconcile_governance`](crate::computer::Computer::reconcile_governance)）
+/// 在 phase 1 释放 skill 写锁后、phase 2 之前调用（断开 ABBA）。
+pub async fn rematerialize_missing_ledger_records(
+    home: &Path,
+    env: Option<&EnvMap>,
+    declared: &Map<String, Value>,
+    report: &mut GovernanceRecoveryReport,
+) {
+    // 权威 install-set = `installedPlugins` 意图；单次账本快照供「已有记录」判定（逐 pid 只写自身、pid 唯一 →
+    // 快照跨迭代无 staleness）。
+    let intent = load_installed_plugins_intent(Some(home), env).account;
+    let installed = load_installed_plugins(Some(home), env).account;
+
+    for pid in &intent.installed_plugins {
+        // 仅 marketplace plugin（本地-only 无 '@' → 无 bundled 归属恢复，与 collect/recover 同构）。
+        if pid.split_once('@').is_none() {
+            continue;
+        }
+        // 惰性 installed_disabled 不重建（活跃集 = 已安装 ∧ 启用）。
+        if !plugin_enabled(declared, pid) {
+            continue;
+        }
+        // 账本已有非空 installPath 记录 → 派生缓存健在，无需重建（幂等）。
+        let has_usable_record = installed.plugins.get(pid).is_some_and(|recs| {
+            recs.iter()
+                .any(|r| r.install_path.as_deref().is_some_and(|s| !s.is_empty()))
+        });
+        if has_usable_record {
+            continue;
+        }
+        // 从意图重物化派生缓存（离线优先；失败降级、不阻断其余）。
+        match materialize_plugin_record(pid, home, env, DEFAULT_GIT_TIMEOUT).await {
+            Ok(_) => {
+                tracing::info!(plugin = %pid, "recover: rebuilt ledger record from installedPlugins intent (§63)");
+                report.rematerialized_plugins.push(pid.clone());
+            }
+            Err(e) => {
+                tracing::warn!(plugin = %pid, error = %e, "recover: rematerialize ledger record failed (degraded, non-blocking)");
+                report.failed_rematerialize.push(pid.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // 注意（#94 教训）：本模块是**非 CLI** 层，测试**不得**依赖 cli-gated 的 `crate::cli::commands::test_env`，
@@ -491,6 +562,174 @@ mod tests {
         assert_eq!(rec.plugin_id, "audit@acme");
         assert_eq!(rec.plugin, "audit");
         assert_eq!(rec.marketplace, "acme");
+    }
+
+    // ---- §63：账本删除后从 installedPlugins 意图重建 bundled server（#104）----------
+    #[tokio::test]
+    async fn rematerialize_rebuilds_bundled_server_after_ledger_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _src) = setup_installed(&tmp).await;
+        let declared = declared_enabled(&["audit@acme"]);
+
+        // 前置：账本在 → collect 有 audit-mcp。
+        assert_eq!(
+            collect_enabled_bundled_servers(&home, None, &declared).len(),
+            1,
+            "前置：账本在时应有 1 个 bundled server"
+        );
+
+        // 删账本（模拟外部删除/损坏）——`installedPlugins` 意图仍在。
+        fs::remove_file(crate::settings::store::installed_plugins_path(
+            Some(&home),
+            None,
+        ))
+        .unwrap();
+        // 缺口现状：collect 从（已删）账本取不到 installPath → 空。
+        assert!(
+            collect_enabled_bundled_servers(&home, None, &declared).is_empty(),
+            "缺口现状：删账本后 collect 为空"
+        );
+
+        // §63 重建：从意图重物化账本派生缓存。
+        let mut report = GovernanceRecoveryReport::default();
+        rematerialize_missing_ledger_records(&home, None, &declared, &mut report).await;
+        assert_eq!(
+            report.rematerialized_plugins,
+            vec!["audit@acme".to_string()],
+            "enabled plugin 的账本记录应被重建"
+        );
+        assert!(report.failed_rematerialize.is_empty());
+
+        // 重建后 collect 重现 bundled server + 归属（恢复不受影响）。这三段归属字段正是
+        // `Computer::list_mcp_servers_with_metadata` 的 `plugin_ownership` 纯映射输入（§4.8.3：
+        // `managedBy=Plugin{marketplace,plugin,plugin_id}`），故归属重现由此确定性传递（inventory 层归属映射
+        // 因 Computer 无 settings 注入 seam 无法 hermetic 断言，按项目惯例在 collect 层覆盖）。
+        let servers = collect_enabled_bundled_servers(&home, None, &declared);
+        let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
+        assert_eq!(names, vec!["audit-mcp"], "重建后 bundled server 应重现");
+        assert_eq!(servers[0].plugin_id, "audit@acme");
+        assert_eq!(servers[0].plugin, "audit");
+        assert_eq!(servers[0].marketplace, "acme");
+    }
+
+    // ---- §63 降级：catalog 从未 clone（前置早退）→ failed_rematerialize、不 panic、不阻断（#104）----
+    #[tokio::test]
+    async fn rematerialize_degrades_when_catalog_missing() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        // 意图有 enabled pid，但无账本、无 catalog clone、known_marketplaces 指向不存在 repo。
+        let bad = format!("file://{}/nonexistent-repo", tmp.path().display());
+        update_known_marketplaces(
+            move |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    crate::settings::reconciler::KnownMarketplaceEntry {
+                        source: json!({"type": "git", "url": bad}),
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+        seed_intent(&home, &["audit@acme"]);
+
+        let declared = declared_enabled(&["audit@acme"]);
+        let mut report = GovernanceRecoveryReport::default();
+        rematerialize_missing_ledger_records(&home, None, &declared, &mut report).await;
+
+        assert_eq!(
+            report.failed_rematerialize,
+            vec!["audit@acme".to_string()],
+            "不可达 → 降级记入 failed_rematerialize"
+        );
+        assert!(report.rematerialized_plugins.is_empty());
+        // 未重建 → collect 仍空（不 panic、不阻断）。
+        assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
+    }
+
+    // ---- §63 降级：catalog 在但 plugin 根缺失（locate 期失败，非前置早退）→ failed_rematerialize（#104）----
+    #[tokio::test]
+    async fn rematerialize_degrades_when_plugin_root_missing() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _src) = setup_installed(&tmp).await;
+        let declared = declared_enabled(&["audit@acme"]);
+
+        // 删账本 + 删 catalog 内 plugin 源子树：catalog/known_marketplaces 仍在 → 过 catalog 前置 + manifest +
+        // find_entry，但 `locate_plugin_root` 解析出的 plugin 根非目录 → 真正的 locate 期 Err（区别于 catalog 未 clone）。
+        fs::remove_file(crate::settings::store::installed_plugins_path(
+            Some(&home),
+            None,
+        ))
+        .unwrap();
+        let plugin_root = marketplace_skill_dir(&home, "acme", &[]).join("plugins/audit");
+        fs::remove_dir_all(&plugin_root).unwrap();
+
+        let mut report = GovernanceRecoveryReport::default();
+        rematerialize_missing_ledger_records(&home, None, &declared, &mut report).await;
+        assert_eq!(
+            report.failed_rematerialize,
+            vec!["audit@acme".to_string()],
+            "plugin 根缺失 → locate 期降级"
+        );
+        assert!(report.rematerialized_plugins.is_empty());
+        assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
+    }
+
+    // ---- §63：disabled plugin 账本删也不重建（惰性 installed_disabled，#104）-----------
+    #[tokio::test]
+    async fn rematerialize_skips_disabled_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _src) = setup_installed(&tmp).await;
+        fs::remove_file(crate::settings::store::installed_plugins_path(
+            Some(&home),
+            None,
+        ))
+        .unwrap();
+
+        // declared 未启用 audit@acme（absent = 未启用）。
+        let declared = Map::new();
+        let mut report = GovernanceRecoveryReport::default();
+        rematerialize_missing_ledger_records(&home, None, &declared, &mut report).await;
+
+        assert!(
+            report.rematerialized_plugins.is_empty(),
+            "禁用 plugin 不重建"
+        );
+        assert!(report.failed_rematerialize.is_empty());
+        assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
+    }
+
+    // ---- §63：重建幂等（已有非空 installPath 记录则跳过，#104）------------------------
+    #[tokio::test]
+    async fn rematerialize_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _src) = setup_installed(&tmp).await;
+        let declared = declared_enabled(&["audit@acme"]);
+        fs::remove_file(crate::settings::store::installed_plugins_path(
+            Some(&home),
+            None,
+        ))
+        .unwrap();
+
+        // 首次重建。
+        let mut r1 = GovernanceRecoveryReport::default();
+        rematerialize_missing_ledger_records(&home, None, &declared, &mut r1).await;
+        assert_eq!(r1.rematerialized_plugins, vec!["audit@acme".to_string()]);
+
+        // 再次调用：账本已有非空 installPath 记录 → 跳过、不重复重建。
+        let mut r2 = GovernanceRecoveryReport::default();
+        rematerialize_missing_ledger_records(&home, None, &declared, &mut r2).await;
+        assert!(r2.rematerialized_plugins.is_empty(), "已有记录 → 幂等跳过");
+        assert!(r2.failed_rematerialize.is_empty());
+        // collect 仍正常。
+        assert_eq!(
+            collect_enabled_bundled_servers(&home, None, &declared).len(),
+            1
+        );
     }
 
     // ---- 降级铁律：marketplace 源不可达 / clone 树缺失 → failed、不 panic、不阻断 -----
