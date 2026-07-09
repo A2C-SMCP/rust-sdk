@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 // Re-export MCP protocol types from rmcp
@@ -26,6 +27,52 @@ pub const A2C_VRL_TRANSFORMED: &str = "a2c_vrl_transformed";
 // 类型别名 / Type aliases
 pub type ServerName = String;
 pub type ToolName = String;
+
+/// MCP Server 运行期变化通知的种类（#106）/ Kind of a runtime MCP server change notification。
+///
+/// 由各 MCP 客户端（stdio 经 rmcp `ClientHandler`；sse/http 经其常驻通知流）在收到服务器主动通知时构造，
+/// 经 [`ClientNotifyCtx`] 的 channel 上报给 Computer 的单消费者任务，触发对应的 emit / 回拉链。
+/// 生产端**只发 channel、不做任何 peer 请求**（避免在通知回调上下文里重入；见 stdio handler 注释）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpChangeKind {
+    /// `notifications/tools/list_changed` —— 工具集变化 / tool set changed。
+    ToolListChanged,
+    /// `notifications/resources/list_changed` —— 资源集变化（window:// / skill:// 需消费方重枚举）。
+    ResourceListChanged,
+    /// `notifications/resources/updated` —— 指定 URI 内容更新 / a specific resource's content updated。
+    ResourceUpdated { uri: String },
+}
+
+/// 携带来源 server 名的 MCP 变化通知 / An MCP change notification tagged with its origin server。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerNotification {
+    /// 触发变化的 MCP Server 逻辑名（manager 映射的 key）/ logical server name。
+    pub server: ServerName,
+    /// 变化种类 / change kind。
+    pub kind: McpChangeKind,
+}
+
+/// 注入给单个 MCP 客户端的通知上报接缝（#106）/ per-client notification-forwarding seam。
+///
+/// `client_factory` 在创建客户端时注入：`server_name` 让客户端能给通知打上来源标签（客户端本身不知道自己
+/// 的逻辑名——见 [`super::utils::client_factory`]），`tx` 是喂给 Computer 单消费者任务的发送端。
+#[derive(Debug, Clone)]
+pub struct ClientNotifyCtx {
+    /// 该客户端对应的 MCP Server 逻辑名 / this client's logical server name。
+    pub server_name: ServerName,
+    /// 变化通知发送端（Computer 侧持有接收端）/ change-notification sender。
+    pub tx: mpsc::UnboundedSender<McpServerNotification>,
+}
+
+impl ClientNotifyCtx {
+    /// 构造一条 [`McpServerNotification`] 并非阻塞发送（channel 关闭时静默丢弃）/ build & send, drop on closed。
+    pub fn notify(&self, kind: McpChangeKind) {
+        let _ = self.tx.send(McpServerNotification {
+            server: self.server_name.clone(),
+            kind,
+        });
+    }
+}
 
 /// MCP工具元数据 / MCP tool metadata
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

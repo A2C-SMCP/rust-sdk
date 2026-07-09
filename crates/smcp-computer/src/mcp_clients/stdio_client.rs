@@ -13,12 +13,14 @@ use super::{ResourceCache, SubscriptionManager};
 use async_trait::async_trait;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParam, CancelledNotificationParam, ClientInfo, ClientRequest,
-    Implementation, PaginatedRequestParam, ReadResourceRequestParam, ServerResult,
-    SubscribeRequestParam, UnsubscribeRequestParam,
+    Implementation, PaginatedRequestParam, ReadResourceRequestParam,
+    ResourceUpdatedNotificationParam, ServerResult, SubscribeRequestParam, UnsubscribeRequestParam,
 };
-use rmcp::service::{PeerRequestOptions, RequestHandle, RunningService, ServiceExt};
+use rmcp::service::{
+    NotificationContext, PeerRequestOptions, RequestHandle, RunningService, ServiceExt,
+};
 use rmcp::transport::TokioChildProcess;
-use rmcp::RoleClient;
+use rmcp::{ClientHandler, RoleClient};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,18 +46,84 @@ fn resolve_cwd(explicit_cwd: Option<&String>) -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|home| home.join(DEFAULT_CWD_DIR_NAME))
 }
 
+/// STDIO 客户端的 rmcp `ClientHandler`（#106）：把服务器主动通知转成 [`McpServerNotification`] 上报 channel。
+///
+/// 替换 rmcp 裸 `ClientInfo`（其 `ClientHandler` 三个 `on_*` 均 no-op，导致 tools/resources 变化被收到即丢弃）。
+/// 回调**只发 channel、不做任何 peer 请求**——刷新/emit 由 event-loop 外的 Computer 消费者任务承担，
+/// 从根上规避"在通知回调里内联 list_tools"的会话级重入风险（虽 rmcp 0.11 的通知在 event loop 外的 detached
+/// task 执行、内联本不会死锁，但解耦更稳、且可串行去抖突发通知）。`get_info` 返回构造时的 `ClientInfo`。
+#[derive(Clone)]
+pub(crate) struct A2cClientHandler {
+    info: ClientInfo,
+    notify: Option<ClientNotifyCtx>,
+}
+
+impl A2cClientHandler {
+    /// 用 A2C 默认 `ClientInfo`（name=`a2c-smcp-rust`, version=CARGO_PKG_VERSION）+ 可选通知接缝构造。
+    /// 供 stdio/http 两个 rmcp 客户端共享（#106）。
+    pub(crate) fn new(notify: Option<ClientNotifyCtx>) -> Self {
+        Self {
+            info: ClientInfo {
+                protocol_version: Default::default(),
+                capabilities: Default::default(),
+                client_info: Implementation {
+                    name: "a2c-smcp-rust".to_string(),
+                    title: None,
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    icons: None,
+                    website_url: None,
+                },
+            },
+            notify,
+        }
+    }
+}
+
+impl ClientHandler for A2cClientHandler {
+    fn get_info(&self) -> ClientInfo {
+        self.info.clone()
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        if let Some(n) = &self.notify {
+            debug!(server = %n.server_name, "MCP tools/list_changed received");
+            n.notify(McpChangeKind::ToolListChanged);
+        }
+    }
+
+    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        if let Some(n) = &self.notify {
+            debug!(server = %n.server_name, "MCP resources/list_changed received");
+            n.notify(McpChangeKind::ResourceListChanged);
+        }
+    }
+
+    async fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        if let Some(n) = &self.notify {
+            debug!(server = %n.server_name, uri = %params.uri, "MCP resources/updated received");
+            n.notify(McpChangeKind::ResourceUpdated { uri: params.uri });
+        }
+    }
+}
+
 /// STDIO MCP客户端 / STDIO MCP client
 pub struct StdioMCPClient {
     /// 基础客户端 / Base client
     base: BaseMCPClient<StdioServerParameters>,
     /// rmcp 运行服务 / rmcp running service
-    running_service: Arc<Mutex<Option<RunningService<RoleClient, ClientInfo>>>>,
+    running_service: Arc<Mutex<Option<RunningService<RoleClient, A2cClientHandler>>>>,
     /// stderr 消费任务 / Background task draining child stderr
     stderr_drain_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// 订阅管理器 / Subscription manager
     subscription_manager: SubscriptionManager,
     /// 资源缓存 / Resource cache
     resource_cache: ResourceCache,
+    /// 运行期变化通知上报接缝（#106，None=不转发）/ runtime change-notification seam。
+    notify: Option<ClientNotifyCtx>,
 }
 
 impl std::fmt::Debug for StdioMCPClient {
@@ -77,7 +145,17 @@ impl StdioMCPClient {
             stderr_drain_task: Arc::new(Mutex::new(None)),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)),
+            notify: None,
         }
+    }
+
+    /// 注入运行期变化通知上报接缝（#106）/ attach the runtime change-notification seam。
+    ///
+    /// 由 [`client_factory`](super::utils::client_factory) 在 manager 启动客户端时调用；须在 `connect` 前设置
+    /// （`connect` 据此构造 [`A2cClientHandler`] 传给 `.serve()`）。
+    pub fn with_notify(mut self, notify: Option<ClientNotifyCtx>) -> Self {
+        self.notify = notify;
+        self
     }
 
     // ========== 订阅管理 API / Subscription Management API ==========
@@ -134,7 +212,7 @@ impl StdioMCPClient {
     async fn get_service(
         &self,
     ) -> Result<
-        tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ClientInfo>>>,
+        tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, A2cClientHandler>>>,
         MCPClientError,
     > {
         let guard = self.running_service.lock().await;
@@ -201,21 +279,12 @@ impl MCPClientProtocol for StdioMCPClient {
         });
         *self.stderr_drain_task.lock().await = stderr_task;
 
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: Default::default(),
-            client_info: Implementation {
-                name: "a2c-smcp-rust".to_string(),
-                title: None,
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                icons: None,
-                website_url: None,
-            },
-        };
+        // #106：用自定义 handler 取代裸 ClientInfo，使运行期 tools/resources 变化通知被转发给 Computer 消费者。
+        let handler = A2cClientHandler::new(self.notify.clone());
 
         let service = tokio::time::timeout(
             Duration::from_secs(CONNECT_TIMEOUT_SECS),
-            client_info.serve(transport),
+            handler.serve(transport),
         )
         .await
         .map_err(|_| {

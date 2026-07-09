@@ -9,29 +9,45 @@
 */
 use super::base_client::BaseMCPClient;
 use super::model::*;
+use super::stdio_client::A2cClientHandler;
 use super::{ResourceCache, SubscriptionManager};
 use async_trait::async_trait;
-use reqwest::Client;
-use serde_json;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParam, CancelledNotificationParam, ClientRequest,
+    PaginatedRequestParam, ReadResourceRequestParam, ServerResult, SubscribeRequestParam,
+    UnsubscribeRequestParam,
+};
+use rmcp::service::{PeerRequestOptions, RequestHandle, RunningService, ServiceExt};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::RoleClient;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+
+/// HTTP 客户端连接超时时间（秒）/ Connect timeout for HTTP client (seconds)
+const CONNECT_TIMEOUT_SECS: u64 = 30;
 
 /// HTTP MCP客户端 / HTTP MCP client
+///
+/// #106：改用 rmcp 官方 [`StreamableHttpClientTransport`] + [`RunningService`]，与 stdio 客户端共享同一
+/// [`A2cClientHandler`] 通知接缝。方法体退化为 `peer` 委托（同 stdio），删去了手写的 JSON-RPC POST /
+/// 会话管理 / SSE 解析——rmcp 传输负责 Streamable HTTP 的会话（Mcp-Session-Id）、SSE 响应流、GET 通知流与重连。
+/// A2C 业务语义（auth 4006/4007 分流、VRL、tool_meta、window://、skill://）仍在 manager 层，不受影响。
 pub struct HttpMCPClient {
     /// 基础客户端 / Base client
     base: BaseMCPClient<HttpServerParameters>,
-    /// HTTP客户端 / HTTP client
-    http_client: Client,
-    /// 会话ID / Session ID
-    session_id: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
-    /// initialize 时缓存的 server `resources` 能力声明（INT-04 #78）。`None` = 未初始化/未知；
-    /// 供 `list_resources_page` 的 4015 预检，使 http 的能力语义与 stdio 一致。
-    /// Cached `resources` capability from initialize; drives the 4015 pre-check in `list_resources_page`.
-    capabilities_resources: std::sync::Arc<tokio::sync::Mutex<Option<bool>>>,
+    /// rmcp 运行服务（Streamable HTTP 传输）/ rmcp running service (Streamable HTTP transport)
+    running_service: Arc<Mutex<Option<RunningService<RoleClient, A2cClientHandler>>>>,
     /// 订阅管理器 / Subscription manager
     subscription_manager: SubscriptionManager,
     /// 资源缓存 / Resource cache
     resource_cache: ResourceCache,
+    /// 运行期变化通知上报接缝（#106，None=不转发）/ runtime change-notification seam。
+    notify: Option<ClientNotifyCtx>,
 }
 
 impl std::fmt::Debug for HttpMCPClient {
@@ -47,175 +63,39 @@ impl std::fmt::Debug for HttpMCPClient {
 impl HttpMCPClient {
     /// 创建新的HTTP客户端 / Create new HTTP client
     pub fn new(params: HttpServerParameters) -> Self {
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
-
         Self {
             base: BaseMCPClient::new(params),
-            http_client,
-            session_id: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            capabilities_resources: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            running_service: Arc::new(Mutex::new(None)),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
+            notify: None,
         }
     }
 
-    /// 发送JSON-RPC请求 / Send JSON-RPC request
-    async fn send_request(
+    /// 注入运行期变化通知上报接缝（#106）/ attach the runtime change-notification seam。
+    ///
+    /// 由 [`client_factory`](super::utils::client_factory) 在 manager 启动客户端时调用；须在 `connect` 前设置
+    /// （`connect` 据此构造 [`A2cClientHandler`] 传给 `.serve()`）。
+    pub fn with_notify(mut self, notify: Option<ClientNotifyCtx>) -> Self {
+        self.notify = notify;
+        self
+    }
+
+    /// 获取 running service 的 guard，验证 service 可用（同 stdio 客户端语义）。
+    /// Get running service guard, verifying service is available.
+    async fn get_service(
         &self,
-        method: &str,
-        params: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value, MCPClientError> {
-        let url = &self.base.params.url;
-
-        let mut request_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-        });
-
-        if let Some(p) = params {
-            request_body["params"] = p;
-        }
-
-        // 通知类消息不需要等待响应 / Notifications don't need a response
-        let is_notification = method.starts_with("notifications/");
-
-        // 仅非 notification 时添加请求ID / Only add request ID for non-notifications
-        if !is_notification {
-            request_body["id"] = serde_json::Value::Number(serde_json::Number::from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64,
+    ) -> Result<
+        tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, A2cClientHandler>>>,
+        MCPClientError,
+    > {
+        let guard = self.running_service.lock().await;
+        if guard.is_none() {
+            return Err(MCPClientError::ConnectionError(
+                "Service not available".to_string(),
             ));
         }
-
-        debug!("Sending HTTP request to {}: {}", url, request_body);
-
-        let mut request = self.http_client.post(url);
-
-        // 添加headers / Add headers
-        for (key, value) in &self.base.params.headers {
-            request = request.header(key, value);
-        }
-
-        // 添加content-type / Add content-type
-        request = request.header("Content-Type", "application/json");
-        request = request.header("Accept", "application/json, text/event-stream");
-
-        // 添加会话ID / Add session ID
-        if let Some(ref sid) = *self.session_id.lock().await {
-            request = request.header("Mcp-Session-Id", sid.as_str());
-        }
-
-        let response =
-            request.json(&request_body).send().await.map_err(|e| {
-                MCPClientError::ConnectionError(format!("HTTP request failed: {}", e))
-            })?;
-
-        let status = response.status();
-
-        // 202/204 表示通知类请求，无响应体 / 202/204 means notification, no response body
-        if status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::NO_CONTENT {
-            return Ok(serde_json::json!({}));
-        }
-
-        if !status.is_success() {
-            return Err(MCPClientError::ConnectionError(format!(
-                "HTTP error: {}",
-                status
-            )));
-        }
-
-        // 从响应头提取 Mcp-Session-Id / Extract Mcp-Session-Id from response headers
-        if let Some(sid) = response
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|v| v.to_str().ok())
-        {
-            *self.session_id.lock().await = Some(sid.to_string());
-        }
-
-        // 根据 Content-Type 分支处理 / Branch by Content-Type
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let response_body: serde_json::Value = if content_type.contains("text/event-stream") {
-            // 解析 SSE 响应体，提取 data: 行中的 JSON-RPC
-            let text = response.text().await.map_err(|e| {
-                MCPClientError::ProtocolError(format!("Failed to read SSE response: {}", e))
-            })?;
-            parse_sse_response(&text)?
-        } else {
-            response.json().await.map_err(|e| {
-                MCPClientError::ProtocolError(format!("Failed to parse response: {}", e))
-            })?
-        };
-
-        debug!("Received HTTP response: {}", response_body);
-
-        Ok(response_body)
-    }
-
-    /// 初始化会话 / Initialize session
-    async fn initialize_session(&self) -> Result<(), MCPClientError> {
-        let params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {},
-                "resources": {}
-            },
-            "clientInfo": {
-                "name": "a2c-smcp-rust",
-                "version": "0.1.0"
-            }
-        });
-
-        let response = self.send_request("initialize", Some(params)).await?;
-
-        // 检查响应 / Check response
-        if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!(
-                "Initialize error: {}",
-                error
-            )));
-        }
-
-        // 无 `result` 即无合法 InitializeResult → 视为初始化失败（与 stdio rmcp 握手对齐），消除
-        // "已连接但能力未捕获 → 误判 4015"的窄路径（#78 fix-review）。
-        let Some(result) = response.get("result") else {
-            return Err(MCPClientError::ProtocolError(
-                "Initialize response missing 'result' (no valid InitializeResult)".to_string(),
-            ));
-        };
-        // session_id 从 header 提取为主，body 中的 sessionId 作为 fallback
-        if self.session_id.lock().await.is_none() {
-            if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
-                *self.session_id.lock().await = Some(session_id.to_string());
-            }
-        }
-        // 缓存 server 的 `resources` 能力声明，供 list_resources_page 的 4015 预检（INT-04 #78）。
-        *self.capabilities_resources.lock().await =
-            Some(super::utils::server_declares_resources(result));
-
-        // 发送initialized通知 / Send initialized notification
-        self.send_request("notifications/initialized", Some(serde_json::json!({})))
-            .await?;
-
-        info!("HTTP session initialized successfully");
-        Ok(())
-    }
-
-    /// server 是否声明 `resources` 能力（initialize 时缓存）。未知/未初始化 → `false`（默认拒绝，对齐
-    /// stdio `peer_info` 预检）。Whether the server declared `resources`; unknown → false (default-deny).
-    async fn supports_resources(&self) -> bool {
-        self.capabilities_resources.lock().await.unwrap_or(false)
+        Ok(guard)
     }
 
     // ========== 订阅管理 API / Subscription Management API ==========
@@ -283,10 +163,49 @@ impl MCPClientProtocol for HttpMCPClient {
             )));
         }
 
-        // 初始化会话 / Initialize session
-        self.initialize_session().await?;
+        // 用户配置的 headers 预置进 reqwest client 的 default_headers（rmcp Streamable HTTP 传输的 config
+        // 仅支持单一 auth_header，任意自定义 header 需经预置 client 注入）。非法 header 名/值跳过并告警。
+        let mut header_map = HeaderMap::new();
+        for (key, value) in &self.base.params.headers {
+            match (
+                HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(val)) => {
+                    header_map.insert(name, val);
+                }
+                _ => warn!("Skipping invalid HTTP header: {}={}", key, value),
+            }
+        }
 
-        // 更新状态 / Update state
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .default_headers(header_map)
+            .build()
+            .map_err(|e| {
+                MCPClientError::ConnectionError(format!("Failed to build HTTP client: {}", e))
+            })?;
+
+        let config = StreamableHttpClientTransportConfig::with_uri(self.base.params.url.clone());
+        let transport = StreamableHttpClientTransport::with_client(http_client, config);
+
+        // #106：与 stdio 共享 A2cClientHandler，运行期 tools/resources 变化通知走同一上报接缝。
+        let handler = A2cClientHandler::new(self.notify.clone());
+
+        let service = tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            handler.serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            MCPClientError::TimeoutError(format!(
+                "HTTP connect timed out after {}s",
+                CONNECT_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
+
+        *self.running_service.lock().await = Some(service);
         self.base.update_state(ClientState::Connected).await;
         info!("HTTP client connected successfully");
 
@@ -302,20 +221,15 @@ impl MCPClientProtocol for HttpMCPClient {
             )));
         }
 
-        // 尝试优雅关闭 / Try graceful shutdown
-        if let Err(e) = self.send_request("shutdown", None).await {
-            warn!("Failed to send shutdown request: {}", e);
+        // rmcp 传输 cancel 负责优雅关闭（含 DELETE session）/ transport cancel handles graceful shutdown.
+        let service = self.running_service.lock().await.take();
+        if let Some(service) = service {
+            match service.cancel().await {
+                Ok(reason) => debug!("Service stopped with reason: {:?}", reason),
+                Err(e) => error!("Error stopping service: {}", e),
+            }
         }
 
-        // 发送exit通知 / Send exit notification
-        if let Err(e) = self.send_request("exit", None).await {
-            warn!("Failed to send exit notification: {}", e);
-        }
-
-        // 清理会话ID / Clear session ID
-        *self.session_id.lock().await = None;
-
-        // 更新状态 / Update state
         self.base.update_state(ClientState::Disconnected).await;
         info!("HTTP client disconnected successfully");
 
@@ -327,30 +241,16 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let response = self
-            .send_request("tools/list", Some(serde_json::json!({})))
-            .await?;
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
 
-        if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!(
-                "List tools error: {}",
-                error
-            )));
-        }
+        let tools = service
+            .list_all_tools()
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("List tools error: {}", e)))?;
 
-        if let Some(result) = response.get("result") {
-            if let Some(tools) = result.get("tools").and_then(|v| v.as_array()) {
-                let mut tool_list = Vec::new();
-                for tool in tools {
-                    if let Ok(parsed_tool) = serde_json::from_value::<Tool>(tool.clone()) {
-                        tool_list.push(parsed_tool);
-                    }
-                }
-                return Ok(tool_list);
-            }
-        }
-
-        Ok(vec![])
+        info!("Found {} tools", tools.len());
+        Ok(tools)
     }
 
     async fn call_tool(
@@ -362,28 +262,74 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let call_params = serde_json::json!({
-            "name": tool_name,
-            "arguments": params
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
+
+        let result = service
+            .call_tool(CallToolRequestParam {
+                name: tool_name.to_string().into(),
+                arguments: params.as_object().cloned(),
+            })
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// 可取消 tool_call：与 stdio 客户端同构（低层 `send_request_with_option` 捕获 rmcp `request_id`，
+    /// 再把「等待响应」与「取消信号」`select!` 竞速；取消胜出经 `request_id` best-effort 补发
+    /// `notifications/cancelled`，time-box 2s）。详见 stdio 客户端同名方法。
+    async fn call_tool_cancellable(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<CancellableCallOutcome, MCPClientError> {
+        if self.base.get_state().await != ClientState::Connected {
+            return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+
+        let guard = self.get_service().await?;
+
+        let request = ClientRequest::CallToolRequest(CallToolRequest {
+            method: Default::default(),
+            params: CallToolRequestParam {
+                name: tool_name.to_string().into(),
+                arguments: params.as_object().cloned(),
+            },
+            extensions: Default::default(),
         });
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+        drop(guard);
+        let request_id = handle.id.clone();
+        let RequestHandle { rx, peer, .. } = handle;
 
-        let response = self.send_request("tools/call", Some(call_params)).await?;
-
-        if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!(
-                "Call tool error: {}",
-                error
-            )));
+        tokio::select! {
+            biased;
+            resp = rx => match resp {
+                Ok(Ok(ServerResult::CallToolResult(r))) => Ok(CancellableCallOutcome::Completed(r)),
+                Ok(Ok(_)) => Err(MCPClientError::ProtocolError(
+                    "Unexpected response variant for tools/call".to_string(),
+                )),
+                Ok(Err(e)) => Err(MCPClientError::ProtocolError(format!("Call tool error: {}", e))),
+                Err(_) => Err(MCPClientError::ConnectionError("MCP transport closed".to_string())),
+            },
+            _ = cancel.cancelled() => {
+                let notify = peer.notify_cancelled(CancelledNotificationParam {
+                    request_id,
+                    reason: Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
+                });
+                if tokio::time::timeout(Duration::from_secs(2), notify).await.is_err() {
+                    warn!("emit MCP notifications/cancelled timed out (best-effort, ignored)");
+                }
+                Ok(CancellableCallOutcome::Cancelled)
+            }
         }
-
-        if let Some(result) = response.get("result") {
-            let call_result: CallToolResult = serde_json::from_value(result.clone())?;
-            return Ok(call_result);
-        }
-
-        Err(MCPClientError::ProtocolError(
-            "Invalid response".to_string(),
-        ))
     }
 
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
@@ -391,53 +337,15 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        // 支持分页获取资源 / Support pagination for resources
-        let mut all_resources = Vec::new();
-        let mut cursor: Option<String> = None;
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
 
-        loop {
-            let params = Some(match cursor.as_ref() {
-                Some(c) => serde_json::json!({ "cursor": c }),
-                None => serde_json::json!({}),
-            });
-
-            let response = self.send_request("resources/list", params).await?;
-
-            if let Some(error) = response.get("error") {
-                return Err(MCPClientError::ProtocolError(format!(
-                    "List resources error: {}",
-                    error
-                )));
-            }
-
-            if let Some(result) = response.get("result") {
-                // 解析资源列表 / Parse resource list
-                if let Some(resources) = result.get("resources").and_then(|v| v.as_array()) {
-                    for resource in resources {
-                        if let Ok(parsed_resource) =
-                            serde_json::from_value::<Resource>(resource.clone())
-                        {
-                            all_resources.push(parsed_resource);
-                        }
-                    }
-                }
-
-                // 检查是否有下一页 / Check if there's a next page
-                cursor = result
-                    .get("nextCursor")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                if cursor.is_none() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+        let all_resources = service
+            .list_all_resources()
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
 
         // 过滤 window:// 资源并按 priority 降序排序（v0.2 元数据下沉，逻辑共享）
-        // Filter window:// resources and sort by priority desc (shared v0.2 metadata sink).
         Ok(crate::desktop::metadata::filter_and_sort_window_resources(
             all_resources,
         ))
@@ -451,45 +359,29 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        // 4015 能力预检：server 未声明 `resources` → CapabilityNotSupported（上层映射 4015），与 stdio 一致。
-        // INT-04 #78：initialize 时缓存 `capabilities.resources`，三传输统一 4015 语义，不再随传输退化为
-        // ProtocolError。Capability gate mirroring stdio: undeclared `resources` ⇒ 4015 (not ProtocolError).
-        if !self.supports_resources().await {
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
+
+        // 能力校验：未声明 `resources` → CapabilityNotSupported（上层映射 4015）；改用 rmcp `peer_info`
+        // （initialize 握手结果），三传输 4015 语义统一，无需再手动缓存 capabilities（INT-04 #78 一致）。
+        let supports_resources = service
+            .peer_info()
+            .map(|info| info.capabilities.resources.is_some())
+            .unwrap_or(false);
+        if !supports_resources {
             return Err(MCPClientError::CapabilityNotSupported(
                 "resources".to_string(),
             ));
         }
 
-        // 单页透传：cursor 进/出，不聚合（区别于 list_windows 的穷举翻页）、不过滤、不返回 resourceTemplates。
-        // Single-page passthrough (vs list_windows' pagination loop).
-        let params = Some(match cursor.as_ref() {
-            Some(c) => serde_json::json!({ "cursor": c }),
-            None => serde_json::json!({}),
-        });
-        let response = self.send_request("resources/list", params).await?;
-        if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!(
-                "List resources error: {}",
-                error
-            )));
-        }
+        // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
+        let param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
+        let result = service
+            .list_resources(param)
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
 
-        let mut resources = Vec::new();
-        let mut next_cursor = None;
-        if let Some(result) = response.get("result") {
-            if let Some(arr) = result.get("resources").and_then(|v| v.as_array()) {
-                for resource in arr {
-                    if let Ok(parsed) = serde_json::from_value::<Resource>(resource.clone()) {
-                        resources.push(parsed);
-                    }
-                }
-            }
-            next_cursor = result
-                .get("nextCursor")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        Ok((resources, next_cursor))
+        Ok((result.resources, result.next_cursor))
     }
 
     async fn get_window_detail(
@@ -500,27 +392,17 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let params = serde_json::json!({
-            "uri": resource.uri
-        });
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
 
-        let response = self.send_request("resources/read", Some(params)).await?;
+        let result = service
+            .read_resource(ReadResourceRequestParam {
+                uri: resource.uri.clone(),
+            })
+            .await
+            .map_err(|e| MCPClientError::ProtocolError(format!("Read resource error: {}", e)))?;
 
-        if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!(
-                "Read resource error: {}",
-                error
-            )));
-        }
-
-        if let Some(result) = response.get("result") {
-            let read_result: ReadResourceResult = serde_json::from_value(result.clone())?;
-            return Ok(read_result);
-        }
-
-        Err(MCPClientError::ProtocolError(
-            "Invalid response".to_string(),
-        ))
+        Ok(result)
     }
 
     async fn subscribe_window(&self, resource: Resource) -> Result<(), MCPClientError> {
@@ -528,20 +410,19 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let params = serde_json::json!({
-            "uri": resource.uri
-        });
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
 
-        let response = self
-            .send_request("resources/subscribe", Some(params))
-            .await?;
+        service
+            .subscribe(SubscribeRequestParam {
+                uri: resource.uri.clone(),
+            })
+            .await
+            .map_err(|e| {
+                MCPClientError::ProtocolError(format!("Subscribe resource error: {}", e))
+            })?;
 
-        if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!(
-                "Subscribe resource error: {}",
-                error
-            )));
-        }
+        drop(guard);
 
         // 订阅成功后，更新本地订阅状态
         let _ = self
@@ -574,20 +455,19 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let params = serde_json::json!({
-            "uri": resource.uri
-        });
+        let guard = self.get_service().await?;
+        let service = guard.as_ref().unwrap();
 
-        let response = self
-            .send_request("resources/unsubscribe", Some(params))
-            .await?;
+        service
+            .unsubscribe(UnsubscribeRequestParam {
+                uri: resource.uri.clone(),
+            })
+            .await
+            .map_err(|e| {
+                MCPClientError::ProtocolError(format!("Unsubscribe resource error: {}", e))
+            })?;
 
-        if let Some(error) = response.get("error") {
-            return Err(MCPClientError::ProtocolError(format!(
-                "Unsubscribe resource error: {}",
-                error
-            )));
-        }
+        drop(guard);
 
         // 取消订阅成功后，移除本地订阅状态
         let _ = self
@@ -603,58 +483,16 @@ impl MCPClientProtocol for HttpMCPClient {
     }
 }
 
-/// 从 SSE 响应体中提取最后一个 JSON-RPC 消息
-/// Parse the last JSON-RPC message from SSE response body `data:` lines
-fn parse_sse_response(text: &str) -> Result<serde_json::Value, MCPClientError> {
-    let mut last_json = None;
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            let data = data.trim();
-            if !data.is_empty() {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
-                    // 取包含 "result" 或 "error" 的 JSON-RPC 响应，否则取最后一个
-                    if value.get("result").is_some() || value.get("error").is_some() {
-                        return Ok(value);
-                    }
-                    last_json = Some(value);
-                }
-            }
-        }
-    }
-    last_json.ok_or_else(|| {
-        MCPClientError::ProtocolError(format!(
-            "No JSON-RPC message found in SSE response: {}",
-            text.chars().take(200).collect::<String>()
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
 
-    #[test]
-    fn test_parse_sse_response_basic() {
-        let sse =
-            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
-        let result = parse_sse_response(sse).unwrap();
-        assert!(result.get("result").is_some());
-    }
-
-    #[test]
-    fn test_parse_sse_response_multiple_data_lines() {
-        let sse = "data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
-        let result = parse_sse_response(sse).unwrap();
-        assert_eq!(result["result"]["ok"], json!(true));
-    }
-
-    #[test]
-    fn test_parse_sse_response_no_data() {
-        let sse = "event: endpoint\n: comment\n\n";
-        assert!(parse_sse_response(sse).is_err());
-    }
+    // 注（#106）：本模块原有若干测试直接验证手写 JSON-RPC 层的内部实现（`parse_sse_response` /
+    // `send_request` / `session_id` / `capabilities_resources` / `initialize_session`）。该层已随 HTTP 客户端
+    // 迁移到 rmcp `StreamableHttpClientTransport` 删除，相关测试一并移除；真实的连接/工具/资源行为改由真链路
+    // e2e（真 Streamable HTTP server + 真 rmcp 传输）覆盖。此处保留与传输无关的状态门控/构造/Debug 单测。
 
     #[tokio::test]
     async fn test_http_client_creation() {
@@ -684,53 +522,6 @@ mod tests {
             client.base.params.headers.get("Authorization"),
             Some(&"Bearer token123".to_string())
         );
-    }
-
-    #[tokio::test]
-    async fn test_session_id_management() {
-        let params = HttpServerParameters {
-            url: "http://localhost:8080".to_string(),
-            headers: HashMap::new(),
-        };
-
-        let client = HttpMCPClient::new(params);
-
-        // 初始会话ID应该为空 / Initial session ID should be None
-        let session_id = client.session_id.lock().await;
-        assert!(session_id.is_none());
-        drop(session_id);
-
-        // 设置会话ID / Set session ID
-        *client.session_id.lock().await = Some("session123".to_string());
-        let session_id = client.session_id.lock().await;
-        assert_eq!(session_id.as_ref().unwrap(), "session123");
-    }
-
-    #[tokio::test]
-    async fn test_send_request_format() {
-        let params = HttpServerParameters {
-            url: "http://localhost:8080".to_string(),
-            headers: HashMap::new(),
-        };
-
-        let client = HttpMCPClient::new(params);
-
-        // 注意：这个测试需要一个 mock HTTP 服务器来实际验证请求格式
-        // Note: This test would need a mock HTTP server to actually verify request format
-        // 这里我们只验证请求构建逻辑不会 panic
-        // Here we only verify that request building doesn't panic
-
-        let method = "test/method";
-        let params = Some(json!({"param1": "value1"}));
-
-        // 由于没有实际的服务器，这个测试会失败，但我们可以验证错误处理
-        // Since there's no actual server, this test will fail, but we can verify error handling
-        let result = client.send_request(method, params).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            MCPClientError::ConnectionError(_)
-        ));
     }
 
     #[tokio::test]
@@ -825,44 +616,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_resources_page_4015_when_capability_absent() {
-        // INT-04 #78：连接后若 server 未声明 `resources` 能力 → 在发请求前返回 CapabilityNotSupported
-        // （上层映射 4015），与 stdio 一致，不再退化为 ProtocolError。门控先于网络发送。
-        let params = HttpServerParameters {
-            url: "http://localhost:8080".to_string(),
-            headers: HashMap::new(),
-        };
-        let client = HttpMCPClient::new(params);
-        client.base.update_state(ClientState::Connected).await;
-        *client.capabilities_resources.lock().await = Some(false);
-
-        let err = client.list_resources_page(None).await.unwrap_err();
-        assert!(
-            matches!(err, MCPClientError::CapabilityNotSupported(ref c) if c == "resources"),
-            "expected CapabilityNotSupported(resources), got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_list_resources_page_passes_gate_when_capability_present() {
-        // 声明了 `resources` → 预检通过；后续因无真实 server 而失败于非 4015 错误，证明门控不误伤
-        // 支持 resources 的 server（断言「非 CapabilityNotSupported」对网络结果鲁棒）。
-        let params = HttpServerParameters {
-            url: "http://localhost:8080".to_string(),
-            headers: HashMap::new(),
-        };
-        let client = HttpMCPClient::new(params);
-        client.base.update_state(ClientState::Connected).await;
-        *client.capabilities_resources.lock().await = Some(true);
-
-        let err = client.list_resources_page(None).await.unwrap_err();
-        assert!(
-            !matches!(err, MCPClientError::CapabilityNotSupported(_)),
-            "gate should pass for declared resources; got {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_get_window_detail_requires_connection() {
         let params = HttpServerParameters {
             url: "http://localhost:8080".to_string(),
@@ -883,42 +636,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initialize_session_request_format() {
+    async fn test_disconnect_transitions_state_from_connected() {
+        // #106：迁 rmcp 后无 session_id/无真实 service，disconnect 从 Connected 态 take() 到 None → 跳过
+        // cancel → 置 Disconnected。验证状态机收尾正确（会话/传输清理由 rmcp service.cancel 负责）。
         let params = HttpServerParameters {
             url: "http://localhost:8080".to_string(),
             headers: HashMap::new(),
         };
 
         let client = HttpMCPClient::new(params);
-
-        // 由于没有实际服务器，初始化会失败，但我们可以验证请求格式
-        let result = client.initialize_session().await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_disconnect_cleanup() {
-        let params = HttpServerParameters {
-            url: "http://localhost:8080".to_string(),
-            headers: HashMap::new(),
-        };
-
-        let client = HttpMCPClient::new(params);
-
-        // 设置会话ID
-        *client.session_id.lock().await = Some("session123".to_string());
-
-        // 设置为已连接状态
         client.base.update_state(ClientState::Connected).await;
 
-        // 断开连接（即使失败也应该清理会话ID）
         let _ = client.disconnect().await;
 
-        // 验证会话ID被清理
-        let session_id = client.session_id.lock().await;
-        assert!(session_id.is_none());
-
-        // 验证状态变为已断开
         assert_eq!(client.base.get_state().await, ClientState::Disconnected);
     }
 

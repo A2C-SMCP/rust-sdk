@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use smcp::{
     A2CSkillRef, EnterOfficeNotification, LeaveOfficeNotification, SMCPTool,
-    UpdateMCPConfigNotification,
+    UpdateMCPConfigNotification, UpdateToolListNotification,
 };
 
 /// 异步事件处理器trait
@@ -44,6 +44,26 @@ pub trait AsyncAgentEventHandler: Send + Sync {
         _agent: &AsyncSmcpAgent,
     ) -> Result<(), crate::error::SmcpAgentError> {
         tracing::info!("Computer updated config: {:?}", data);
+        Ok(())
+    }
+
+    /// 收到 `notify:update_tool_list` 时的**预清回调**（#106，对标 python-sdk #127）。
+    ///
+    /// 触发时机 / Trigger：在 Agent 自动重拉 `get_tools` → [`on_tools_received`](Self::on_tools_received)
+    /// **之前**派发，语义对齐 [`on_computer_update_config`](Self::on_computer_update_config)。
+    ///
+    /// **为何需要 / Why**：`on_tools_received` 交付的是 Computer 当前**全量**工具集，但**加法式**下游消费方
+    /// （只 add 不 remove，如 TFRobotServer）无法据此感知**移除 / 同名换 schema**——旧定义会残留。消费方可在此
+    /// 预清回调里先清空该 computer 的既有工具视图，形成「预清 → 回拉 → 重加」三段式，使移除/换 schema 正确生效。
+    ///
+    /// 向后兼容 / Backward-compat：默认实现仅记录日志（no-op），旧处理器无需改动——以默认实现取代 Python 的
+    /// `hasattr` 运行时探测。
+    async fn on_computer_update_tool_list(
+        &self,
+        data: UpdateToolListNotification,
+        _agent: &AsyncSmcpAgent,
+    ) -> Result<(), crate::error::SmcpAgentError> {
+        tracing::info!("Computer tool list updated (pre-clear hook): {:?}", data);
         Ok(())
     }
 
@@ -124,6 +144,17 @@ pub trait AgentEventHandler: Send + Sync {
         _agent: &SyncSmcpAgent,
     ) -> Result<(), crate::error::SmcpAgentError> {
         tracing::info!("Computer updated config: {:?}", data);
+        Ok(())
+    }
+
+    /// 收到 `notify:update_tool_list` 时的**预清回调**（#106，同步版；语义同
+    /// [`AsyncAgentEventHandler::on_computer_update_tool_list`]）。默认 no-op，向后兼容。
+    fn on_computer_update_tool_list(
+        &self,
+        data: UpdateToolListNotification,
+        _agent: &SyncSmcpAgent,
+    ) -> Result<(), crate::error::SmcpAgentError> {
+        tracing::info!("Computer tool list updated (pre-clear hook): {:?}", data);
         Ok(())
     }
 

@@ -18,7 +18,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
-use tokio::sync::{Mutex, RwLock};
+use std::sync::Weak;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -59,7 +61,8 @@ use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{
         content_as_text, is_call_tool_error, CallToolResult, CancellableCallOutcome, Content,
-        MCPServerConfig, MCPServerInput, ReadResourceResult, Resource, Tool,
+        MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification, ReadResourceResult,
+        Resource, Tool,
     },
     ConfigRender, RenderError,
 };
@@ -305,6 +308,14 @@ pub struct Computer<S: Session> {
     /// `Arc` 共享——clone 体与原 Computer 命中**同一**注册表，使任意 clone 上的 `acancel_tool` 生效。
     /// In-flight cancellable tool-call registry; `acancel_tool` fires the matching token.
     inflight_tool_tasks: Arc<StdMutex<HashMap<String, CancellationToken>>>,
+
+    // ── #106：MCP 运行期变化检测 / runtime MCP change detection ──────────────────
+    /// 上次已知的 `window://` URI 集合（desktop 集合去抖缓存）。`ResourceListChanged` 到达时与新集合比较，
+    /// 仅集合变化才 emit `server:update_desktop`（对齐 desktop.md §变化检测）；`Arc` 供消费者任务共享。
+    /// Last-known window:// URI set for desktop set-diff debouncing.
+    desktop_window_uris: Arc<RwLock<HashSet<String>>>,
+    /// MCP 变化通知单消费者任务句柄（boot 起、disconnect 停）/ MCP change-notification consumer task handle。
+    mcp_notify_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 /// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
@@ -572,6 +583,8 @@ impl<S: Session> Computer<S> {
             toolspool_store: Arc::new(RwLock::new(None)),
             blob_resolvers: Arc::new(RwLock::new(HashMap::new())),
             inflight_tool_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            desktop_window_uris: Arc::new(RwLock::new(HashSet::new())),
+            mcp_notify_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1087,12 +1100,14 @@ impl<S: Session> Computer<S> {
     /// `stage_mcp_skills` 内部按 SKILL 仅在 `finalize`（FS rename + 内存注册，同步无 await）**短持写锁**，
     /// `archive` 网络下载 / `resources` MCP `read_resource` 期间**不持任何 Registry 锁**。慢/卡 fetch 不再阻塞
     /// `get_skills` / `get_skill_ref` 读（修复 Python 单事件循环掩盖、Rust 暴露的尾延迟竞争）。孤儿对账亦短持写锁。
-    /// **锁序（注意，CLI-03 #54 后）**：本路径取 `mcp_manager.read` → `skill_registry.write`；而 CLI REPL 的
-    /// governance 路径（`cli::repl`）取 `skill_registry.write` → 经 `CliMcpHooks` 调 `add_or_update_server`/
-    /// `remove_server` 间接取 `mcp_manager` 锁——**相反序**，构成潜在 ABBA。当前**不可达**：`restage_mcp_skills`
-    /// 仅由 `boot_up`（REPL 起步前）调用，MCP `ResourceListChanged`/`ResourceUpdated` 通知 → restage 的并发接线
-    /// **尚未落地**（INT 收尾时再接）。#77 后写锁窗口已收窄到 per-SKILL finalize，但接线并发 restage 时**仍须统一锁序**
-    /// （建议两路均 `mcp_manager` 先于 `skill_registry`），否则并发 restage 与 REPL governance 命令仍可能死锁。
+    /// **锁序（#106 并发接线后）**：本路径（含 [`McpChangeReactor`] 消费者，运行期由 MCP
+    /// `ResourceListChanged`/`ResourceUpdated` 通知驱动，**已可达**）取 `mcp_manager.read` → `skill_registry.write`；
+    /// CLI REPL 的 governance 路径（`cli::repl`）取 `skill_registry.write` → 经 `CliMcpHooks` 调
+    /// `add_or_update_server`/`remove_server` 取 `mcp_manager` 锁。为消除相反序 ABBA，已把
+    /// [`add_or_update_server`](Self::add_or_update_server) 的惰性初始化改为「先 read 探测、仅 None 才 write」，
+    /// 使 post-boot 的 governance 路径退化为 `skill_registry.write` → `mcp_manager.read`——与本路径的 `mcp_manager.read`
+    /// **读读相容**，不再循环等待（`remove_server` 本就只取 `mcp_manager.read`）。#77 后写锁窗口已收窄到 per-SKILL
+    /// finalize。回归见 `tests/mcp_change_notifications.rs` 的并发死锁守卫用例。
     pub async fn restage_mcp_skills(&self, server_name: Option<&str>) -> Vec<String> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return Vec::new();
@@ -1102,21 +1117,36 @@ impl<S: Session> Computer<S> {
             return Vec::new();
         };
         // #77：写锁不再跨 materialize 网络持有——stage_mcp_skills 内部按 SKILL 在 finalize 阶段短持写锁。
-        let registered =
-            match stage_mcp_skills(manager, &self.skill_registry, &home, server_name, None).await {
-                Ok(names) => names,
-                Err(e) => {
-                    error!(error = %e, "restage_mcp_skills failed (non-blocking)");
-                    return Vec::new();
-                }
-            };
-        // 仅全量重物化做孤儿对账（限定 `mcp:` 源，不误标 user/marketplace）；短持写锁，纯内存、不跨网络。
-        if server_name.is_none() {
-            let present: HashSet<String> = registered.iter().cloned().collect();
-            let mut reg = self.skill_registry.write().await;
-            reconcile_orphans_in(&mut reg, &present, |s| s.starts_with("mcp:"));
+        // #106：物化 + `mcp:` 源孤儿对账抽为共享自由函数，与 [`McpChangeReactor`] 复用（见 restage_mcp_skills_into）。
+        restage_mcp_skills_into(manager, &self.skill_registry, &home, server_name).await
+    }
+
+    /// 直接处理一条 MCP 运行期变化通知（#106）：刷新工具映射 / desktop 集合去抖 / MCP 源 skill 重挂，并触发
+    /// 对应 `server:update_*` emit。供**测试直调**与**消费者任务**共用（消费者持 [`McpChangeReactor`]，
+    /// 此方法即时构建等价 reactor）。无 socketio / 未入房间 → emit 均为 no-op。
+    pub async fn handle_mcp_notification(&self, notif: McpServerNotification) {
+        self.mcp_change_reactor().handle(notif).await;
+    }
+
+    /// 从 `self` 的共享状态构建一个 [`McpChangeReactor`]（manager 取 `Weak` 以断开 sender 自持环）。
+    fn mcp_change_reactor(&self) -> McpChangeReactor {
+        McpChangeReactor {
+            manager: Arc::downgrade(&self.mcp_manager),
+            socketio_client: Arc::clone(&self.socketio_client),
+            skill_registry: Arc::clone(&self.skill_registry),
+            skill_home: Arc::clone(&self.skill_home),
+            skill_debouncer: Arc::clone(&self.skill_debouncer),
+            desktop_window_uris: Arc::clone(&self.desktop_window_uris),
         }
-        registered
+    }
+
+    /// 停止 MCP 变化通知消费者任务（由 [`shutdown`](Self::shutdown) 调用；`disconnect_socketio` **不**调用——
+    /// 断开 socket 后重连仍应继续检测 MCP 变化，故消费者只在整机关停时停）/ stop the consumer (called by shutdown)。
+    pub async fn stop_mcp_notify_consumer(&self) {
+        if let Some(handle) = self.mcp_notify_task.lock().await.take() {
+            handle.abort();
+            debug!("MCP change-notification consumer aborted");
+        }
     }
 
     /// 去抖器结算末端：推送 `server:update_skills`（无 client / 未入房间 → no-op）/ emit now。
@@ -1201,6 +1231,11 @@ impl<S: Session> Computer<S> {
         // 创建MCP服务器管理器 / Create MCP server manager
         let manager = MCPServerManager::new();
 
+        // #106：建 MCP 运行期变化通知 channel，并在**客户端启动前**把 sender 注入 manager（start_client 据此
+        // 为每个新客户端携带 ClientNotifyCtx）。stdio/sse/http 三传输的服务器主动通知经此 channel 汇聚。
+        let (change_tx, change_rx) = mpsc::unbounded_channel::<McpServerNotification>();
+        manager.set_change_sender(change_tx).await;
+
         // 渲染并验证服务器配置 / Render and validate server configurations
         let servers = self.mcp_servers.read().await;
         let mut validated_servers = Vec::new();
@@ -1225,6 +1260,26 @@ impl<S: Session> Computer<S> {
 
         // 设置管理器到实例 / Set manager to instance
         *self.mcp_manager.write().await = Some(manager);
+
+        // #106：起 MCP 变化通知单消费者任务。reactor 持 Weak manager（断 sender 自持环——sender 存于 manager，
+        // 若强持 manager 则 rx 永不关闭）+ 强持 socketio/skill/desktop 缓存；逐条 recv → 反应（刷新工具映射 /
+        // desktop 集合去抖 / skill 重挂 → 对应 emit）。
+        //
+        // **停止契约**：`shutdown()` 显式 abort 本任务（`stop_mcp_notify_consumer`），是**确定性**的停止路径。
+        // rx 关闭需所有 sender 克隆 drop：stdio/http 客户端的 sender 随 rmcp `RunningService`（客户端 drop）一并
+        // 释放；**SSE 客户端的常驻流任务是 detached spawn、持 sender 克隆**，仅在其 SSE 连接结束或 `disconnect`
+        // 时才释放。故「drop 而不 shutdown」时本任务可能滞留到 SSE 流结束——推荐经 `shutdown()` 收尾。
+        {
+            let reactor = self.mcp_change_reactor();
+            let mut change_rx = change_rx;
+            let handle = tokio::spawn(async move {
+                while let Some(notif) = change_rx.recv().await {
+                    reactor.handle(notif).await;
+                }
+                debug!("MCP change-notification consumer exited");
+            });
+            *self.mcp_notify_task.lock().await = Some(handle);
+        }
 
         // ── INT-01 #68：SKILL / blob 子系统装配 / SKILL & blob subsystem wiring ──
         // blob：建内容寻址暂存 + 装配 resolver 表（toolspool 完整；skill 由 resolve_blob async 处理）。
@@ -1350,8 +1405,15 @@ impl<S: Session> Computer<S> {
 
     /// 动态添加或更新服务器配置 / Add or update server configuration dynamically
     pub async fn add_or_update_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
-        // 确保管理器已初始化 / Ensure manager is initialized
-        {
+        // 确保管理器已初始化 / Ensure manager is initialized。
+        //
+        // #106 死锁修复：**先 read 探测，仅在确实为 None 时才升级为 write**。governance 路径（CLI
+        // `plugin install` 全程持 `skill_registry` 写锁 → hooks → 此方法）若在此对 `mcp_manager` 取**写锁**，
+        // 与 MCP 变化消费者 [`McpChangeReactor`]「`mcp_manager` 读 → `skill_registry` 写」构成 ABBA 死锁
+        // （原 computer.rs / repl.rs 注释已预警：并发接线 restage 后须统一锁序）。post-boot 管理器恒为
+        // `Some`，此处只取读锁，使 governance 路径退化为「`skill_registry` 写 → `mcp_manager` 读」，与消费者
+        // 的读锁相容（读读不互斥），死锁消除。仅首次（boot 前）冷启动才升级为写锁，彼时消费者尚未 spawn，无并发。
+        if self.mcp_manager.read().await.is_none() {
             let mut manager_guard = self.mcp_manager.write().await;
             if manager_guard.is_none() {
                 *manager_guard = Some(MCPServerManager::new());
@@ -2069,6 +2131,9 @@ impl<S: Session> Computer<S> {
             toolspool_store: Arc::clone(&self.toolspool_store),
             blob_resolvers: Arc::clone(&self.blob_resolvers),
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
+            // desktop 缓存共享（clone 与本体同一 window:// 集合视图）；通知任务句柄不复制（仅本体持有消费者）。
+            desktop_window_uris: Arc::clone(&self.desktop_window_uris),
+            mcp_notify_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2190,6 +2255,9 @@ impl<S: Session> Computer<S> {
     pub async fn shutdown(&self) -> ComputerResult<()> {
         info!("Shutting down Computer: {}", self.name);
 
+        // #106：先停 MCP 变化通知消费者，避免其在 manager stop 期间仍反应残留通知。
+        self.stop_mcp_notify_consumer().await;
+
         // INT-01 #68：停 SKILL watcher + 关去抖器（防停机竞态遗留任务）/ stop watcher + close debouncer。
         {
             let mut guard = self.skill_watcher.lock().await;
@@ -2249,6 +2317,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
             blob_resolvers: Arc::clone(&self.blob_resolvers),
             // 取消注册表属**共享态**：clone 体与原 Computer 须命中同一表，否则跨 clone 的 acancel_tool 失效。
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
+            // desktop 缓存共享（clone 与本体同一 window:// 集合视图）；通知任务句柄不复制（仅本体持有消费者）。
+            desktop_window_uris: Arc::clone(&self.desktop_window_uris),
+            mcp_notify_task: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2339,47 +2410,164 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
     }
 }
 
-/// 用于管理器变更通知的trait / Trait for manager change notification
-#[async_trait]
-pub trait ManagerChangeHandler: Send + Sync {
-    /// 处理管理器变更 / Handle manager change
-    async fn on_change(&self, message: ManagerChangeMessage) -> ComputerResult<()>;
+/// MCP 源 SKILL 重物化的共享自由函数（#106）：`Computer::restage_mcp_skills` 与 [`McpChangeReactor`] 共用，
+/// 避免消费者任务依赖 `&Computer<S>`（Session 泛型）。语义与原 `restage_mcp_skills` 一致：
+/// `stage_mcp_skills` 物化 + 全量重物化时按 `mcp:` 源做孤儿对账。staging 失败 → 记 ERROR + 空列表（失败隔离）。
+async fn restage_mcp_skills_into(
+    manager: &MCPServerManager,
+    skill_registry: &Arc<RwLock<SkillRegistry>>,
+    home: &std::path::Path,
+    server_name: Option<&str>,
+) -> Vec<String> {
+    let registered = match stage_mcp_skills(manager, skill_registry, home, server_name, None).await
+    {
+        Ok(names) => names,
+        Err(e) => {
+            error!(error = %e, "restage_mcp_skills failed (non-blocking)");
+            return Vec::new();
+        }
+    };
+    if server_name.is_none() {
+        let present: HashSet<String> = registered.iter().cloned().collect();
+        let mut reg = skill_registry.write().await;
+        reconcile_orphans_in(&mut reg, &present, |s| s.starts_with("mcp:"));
+    }
+    registered
 }
 
-/// 管理器变更消息 / Manager change message
-#[derive(Debug, Clone)]
-pub enum ManagerChangeMessage {
-    /// 工具列表变更 / Tool list changed
-    ToolListChanged,
-    /// 资源列表变更 / Resource list changed,
-    ResourceListChanged { windows: Vec<String> },
-    /// 资源更新 / Resource updated
-    ResourceUpdated { uri: String },
+/// MCP 运行期变化的单一反应器（#106）：把一条 [`McpServerNotification`] 转成对应的刷新/emit 动作。
+///
+/// **持锁/断环设计**：持 `Weak` 管理器 cell —— 变化通知的 sender 存于 `MCPServerManager.change_tx`，消费任务
+/// 持 `rx`；若 reactor 强持 manager cell，则 sender 永不 drop → `rx` 永不关闭 → 消费任务泄漏。用 `Weak` 让
+/// Computer drop 时 manager cell（连同所有 sender）随之释放，`rx` 关闭、消费任务自然退出。socketio / skill /
+/// desktop 缓存不含 sender，强持无环。由 `boot_up` 构建并移入消费任务；`Computer::handle_mcp_notification`
+/// 也即时构建等价 reactor（供测试/直调）。
+struct McpChangeReactor {
+    /// `Weak` 管理器 cell（断开 sender 自持环，见类型注释）。
+    manager: Weak<RwLock<Option<MCPServerManager>>>,
+    socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+    skill_registry: Arc<RwLock<SkillRegistry>>,
+    skill_home: Arc<StdRwLock<Option<PathBuf>>>,
+    skill_debouncer: Arc<SkillEventDebouncer>,
+    desktop_window_uris: Arc<RwLock<HashSet<String>>>,
 }
 
-#[async_trait]
-impl<S: Session> ManagerChangeHandler for Computer<S> {
-    async fn on_change(&self, message: ManagerChangeMessage) -> ComputerResult<()> {
-        match message {
-            ManagerChangeMessage::ToolListChanged => {
-                debug!("Tool list changed, notifying Socket.IO client");
-                let socketio_ref = self.socketio_client.read().await;
-                if let Some(ref client) = *socketio_ref {
-                    // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
-                    // Use Arc<SmcpComputerClient> directly, no need to upgrade
-                    client.emit_update_tool_list().await?;
-                }
+impl McpChangeReactor {
+    /// 反应一条 MCP 变化通知。协议映射（events.md §server:update_* / desktop.md / skill.md §8）：
+    /// - `tools/list_changed` → 刷新 tool_mapping 后 emit `server:update_tool_list`；
+    /// - `resources/list_changed` → desktop 集合去抖 emit + MCP 源 skill 重挂（去抖 emit_update_skills）；
+    /// - `resources/updated{uri}` → `window://` 直接刷桌面 / `skill://` 重挂该源 / 其它忽略。
+    async fn handle(&self, notif: McpServerNotification) {
+        match notif.kind {
+            McpChangeKind::ToolListChanged => self.on_tool_list_changed().await,
+            McpChangeKind::ResourceListChanged => {
+                // 一条 resources/list_changed 同时驱动 desktop 与 skill 两条链（skill.md §8.1 / desktop.md）。
+                self.on_desktop_maybe_changed().await;
+                // 集合级变化**可能含移除**：走**全量** restage（server=None）以触发 `mcp:` 源孤儿对账，
+                // 使运行期消失的 skill:// 从 registry 剔除（scoped restage 只注册"当前存在"、不清理已移除，
+                // 会残留陈旧项——与工具侧"预清全清重建"理念对齐）。语义同 boot_up 的全量重挂。
+                self.on_skills_changed(None).await;
             }
-            ManagerChangeMessage::ResourceListChanged { windows: _ } => {
-                debug!("Resource list changed, checking for window updates");
-                // TODO: 实现窗口变更检测逻辑 / TODO: Implement window change detection logic
-            }
-            ManagerChangeMessage::ResourceUpdated { uri } => {
-                debug!("Resource updated: {}", uri);
-                // TODO: 检查是否为window://资源 / TODO: Check if it's a window:// resource
+            McpChangeKind::ResourceUpdated { uri } => {
+                self.on_resource_updated(&notif.server, &uri).await
             }
         }
-        Ok(())
+    }
+
+    async fn on_tool_list_changed(&self) {
+        // 先刷新 tool_mapping 再 emit：保证 Agent 回拉 get_tools 时 mapping 已含运行期新增工具（修"坑 1"），
+        // 并顺带修 execute_tool 路由校验对新工具的可见性。消费者任务不在 rmcp event loop 内，调用安全无死锁。
+        if let Some(mgr_cell) = self.manager.upgrade() {
+            let guard = mgr_cell.read().await;
+            if let Some(mgr) = guard.as_ref() {
+                if let Err(e) = mgr.refresh_tool_mapping().await {
+                    warn!(error = %e, "refresh_tool_mapping on tools/list_changed failed");
+                }
+            }
+        }
+        self.emit_tool_list().await;
+    }
+
+    async fn on_desktop_maybe_changed(&self) {
+        let Some(windows) = self.collect_window_uris().await else {
+            return;
+        };
+        // 集合去抖：仅 window:// URI 集合变化才 emit（desktop.md §变化检测）。
+        let changed = {
+            let mut cache = self.desktop_window_uris.write().await;
+            if *cache != windows {
+                *cache = windows;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.emit_desktop().await;
+        } else {
+            debug!("window:// set unchanged, skip server:update_desktop");
+        }
+    }
+
+    async fn on_skills_changed(&self, server: Option<&str>) {
+        let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
+            return;
+        };
+        if let Some(mgr_cell) = self.manager.upgrade() {
+            let guard = mgr_cell.read().await;
+            if let Some(mgr) = guard.as_ref() {
+                let _ = restage_mcp_skills_into(mgr, &self.skill_registry, &home, server).await;
+            }
+        }
+        // 去抖 emit_update_skills（与本地 watcher 路径合流；标脏 → 窗口合并 → 单次 emit）。
+        self.skill_debouncer.mark_dirty();
+    }
+
+    async fn on_resource_updated(&self, server: &str, uri: &str) {
+        if uri.starts_with("window://") {
+            // 内容级更新：直接刷桌面（不比集合，降延迟）；同步刷新集合缓存避免后续集合比较误判。
+            if let Some(windows) = self.collect_window_uris().await {
+                *self.desktop_window_uris.write().await = windows;
+            }
+            self.emit_desktop().await;
+        } else if uri.starts_with("skill://") {
+            self.on_skills_changed(Some(server)).await;
+        } else {
+            debug!(
+                uri,
+                "resources/updated for non-window/non-skill URI, ignored"
+            );
+        }
+    }
+
+    /// 汇总所有活跃 server 的 `window://` URI 集合（manager 不可达 → None，调用方跳过）。
+    async fn collect_window_uris(&self) -> Option<HashSet<String>> {
+        let mgr_cell = self.manager.upgrade()?;
+        let guard = mgr_cell.read().await;
+        let mgr = guard.as_ref()?;
+        Some(
+            mgr.list_all_windows(None)
+                .await
+                .into_iter()
+                .map(|(_, r)| r.uri.to_string())
+                .collect(),
+        )
+    }
+
+    async fn emit_tool_list(&self) {
+        if let Some(client) = self.socketio_client.read().await.clone() {
+            if let Err(e) = client.emit_update_tool_list().await {
+                debug!(error = %e, "emit_update_tool_list failed, skipped");
+            }
+        }
+    }
+
+    async fn emit_desktop(&self) {
+        if let Some(client) = self.socketio_client.read().await.clone() {
+            if let Err(e) = client.emit_update_desktop().await {
+                debug!(error = %e, "emit_update_desktop failed, skipped");
+            }
+        }
     }
 }
 
@@ -4031,6 +4219,94 @@ mod tests {
         // 单 server 重物化（server_name=Some）：不做孤儿对账，仍返回该名。
         let again = computer.restage_mcp_skills(Some("tfrobot-tools")).await;
         assert_eq!(again, vec!["mcp:tfrobot-tools:real-name".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_no_abba_deadlock_governance_vs_reactor_skill_restage() {
+        // #106 回归守卫：反应器 skill 重挂（`mcp_manager.read` → `skill_registry.write`）与 governance
+        // `add_or_update_server`（`skill_registry.write` → `mcp_manager` 锁）曾构成 ABBA 死锁。修复把
+        // `add_or_update_server` 惰性初始化改为「先 read 探测、仅 None 才 write」，post-boot 只取
+        // `mcp_manager.read`，与反应器读锁相容。守卫：多轮并发下两侧均须在超时内完成（未修复则死锁 → 超时 panic）。
+        use crate::mcp_clients::manager::test_support::{
+            inject, skill_resource_mounted, MockSkillClient,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::write(
+            mount.join("SKILL.md"),
+            "---\nname: real-name\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        let mgr = MCPServerManager::new();
+        inject(
+            &mgr,
+            "tfrobot-tools",
+            MockSkillClient {
+                pages: vec![vec![skill_resource_mounted(
+                    "skill://tfrobot-tools/leaf",
+                    Some("mounted"),
+                    mount.to_str().unwrap(),
+                )]],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            },
+        )
+        .await;
+        *computer.mcp_manager.write().await = Some(mgr);
+
+        let computer = Arc::new(computer);
+        let cfg = MCPServerConfig::Stdio(crate::mcp_clients::model::StdioServerConfig {
+            env_file: None,
+            name: "gov".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: crate::mcp_clients::model::StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+
+        for _ in 0..25 {
+            let ca = Arc::clone(&computer);
+            let cfg_a = cfg.clone();
+            let a = tokio::spawn(async move {
+                // governance 侧：持 `skill_registry` 写锁跨对 `mcp_manager` 的访问。
+                let reg = ca.skill_registry_arc();
+                let g = reg.write().await;
+                tokio::task::yield_now().await; // 给 B 抢 mcp_manager.read 的窗口，最大化命中旧 ABBA
+                let _ = ca.add_or_update_server(cfg_a).await;
+                drop(g);
+            });
+            let cb = Arc::clone(&computer);
+            let b = tokio::spawn(async move {
+                // reactor 侧：`mcp_manager.read` → `skill_registry.write`（经 on_skills_changed(None)）。
+                cb.handle_mcp_notification(McpServerNotification {
+                    server: "tfrobot-tools".to_string(),
+                    kind: McpChangeKind::ResourceListChanged,
+                })
+                .await;
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let _ = a.await;
+                let _ = b.await;
+            })
+            .await
+            .expect("ABBA 死锁：governance 与 reactor skill 重挂未在 5s 内完成");
+        }
     }
 
     // ── INT-02 #70：取消最后一公里（acancel_tool 幂等 / 守卫退场 / 结果级 meta 标记）──────────

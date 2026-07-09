@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Arc as StdArc;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -62,6 +62,13 @@ pub struct MCPServerManager {
     health_monitor_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// 重试计数器（服务器名 -> 重试次数）/ Retry counters (server name -> retry count)
     retry_counts: Arc<RwLock<HashMap<ServerName, u32>>>,
+    /// MCP 运行期变化通知发送端（#106）/ runtime MCP change-notification sender。
+    ///
+    /// 由 `Computer::boot_up` 在**客户端启动前**经 [`set_change_sender`](Self::set_change_sender) 注入；
+    /// [`start_client`](Self::start_client) 据此为每个新客户端构造 [`ClientNotifyCtx`]，使 stdio/sse/http
+    /// 三传输的服务器主动通知（tools/resources list_changed / resource updated）能上报给 Computer 消费者任务。
+    /// 未注入（None）时客户端不转发通知，行为与历史一致。
+    change_tx: Arc<RwLock<Option<mpsc::UnboundedSender<McpServerNotification>>>>,
 }
 
 /// 管理器状态 / Manager state
@@ -95,6 +102,7 @@ impl MCPServerManager {
             reconnect_policy: Arc::new(RwLock::new(ReconnectPolicy::default())),
             health_monitor_handle: Arc::new(RwLock::new(None)),
             retry_counts: Arc::new(RwLock::new(HashMap::new())),
+            change_tx: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -118,12 +126,33 @@ impl MCPServerManager {
             reconnect_policy: Arc::new(RwLock::new(reconnect_policy)),
             health_monitor_handle: Arc::new(RwLock::new(None)),
             retry_counts: Arc::new(RwLock::new(HashMap::new())),
+            change_tx: Arc::new(RwLock::new(None)),
         }
     }
 
     /// 获取状态通知器 / Get state notifier
     pub fn get_state_notifier(&self) -> watch::Receiver<ManagerState> {
         self.state_notifier.subscribe()
+    }
+
+    /// 注入 MCP 运行期变化通知发送端（#106）/ inject the runtime MCP change-notification sender。
+    ///
+    /// 必须在 [`start_client`](Self::start_client) / [`start_all`](Self::start_all) **之前**调用，才能让随后
+    /// 创建的客户端携带 [`ClientNotifyCtx`]。已激活客户端不追溯注入（对齐"启动前接线"约定）。
+    pub async fn set_change_sender(&self, tx: mpsc::UnboundedSender<McpServerNotification>) {
+        *self.change_tx.write().await = Some(tx);
+    }
+
+    /// 为指定 server 构造通知上报接缝（发送端已注入时）/ build a per-client notify seam if a sender is set。
+    async fn notify_ctx_for(&self, server_name: &str) -> Option<ClientNotifyCtx> {
+        self.change_tx
+            .read()
+            .await
+            .as_ref()
+            .map(|tx| ClientNotifyCtx {
+                server_name: server_name.to_string(),
+                tx: tx.clone(),
+            })
     }
 
     /// 更新管理器状态 / Update manager state
@@ -264,8 +293,9 @@ impl MCPServerManager {
             }
         }
 
-        // 创建客户端 / Create client
-        let client = client_factory(config);
+        // 创建客户端（注入通知上报接缝，使运行期变化通知能上报给 Computer 消费者，#106）/ Create client
+        let notify = self.notify_ctx_for(server_name).await;
+        let client = client_factory(config, notify);
 
         // 连接服务器 / Connect to server
         client.connect().await.map_err(|e| {
@@ -367,7 +397,11 @@ impl MCPServerManager {
     }
 
     /// 刷新工具映射 / Refresh tool mapping
-    async fn refresh_tool_mapping(&self) -> Result<(), ComputerError> {
+    ///
+    /// #106：运行期 `tools/list_changed` 到达时，Computer 消费者任务须在 `emit_update_tool_list` **之前**重建
+    /// 此映射，否则新增工具不进 `tool_mapping` → `list_available_tools` 迭代漏掉 → Agent 回拉看不到（"坑 1"）。
+    /// 故公开此方法供消费者任务调用。stdio 场景下由 event-loop 外的消费者任务调用，不在 rmcp 通知回调内联，无重入风险。
+    pub async fn refresh_tool_mapping(&self) -> Result<(), ComputerError> {
         // 清空现有映射 / Clear existing mappings
         self.tool_mapping.write().await.clear();
         self.alias_mapping.write().await.clear();

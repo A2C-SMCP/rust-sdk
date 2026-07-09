@@ -158,9 +158,19 @@ impl AsyncSmcpAgent {
                         }
                     }
                     NotificationMessage::UpdateToolList(data) => {
-                        // Python 的自动行为：收到 update_tool_list 后自动触发 get_tools
-                        // Auto behavior: fetch tools when tool list is updated
+                        // #106 三段式（预清 → 回拉 → 重加，对标 python#127）：先派发预清回调
+                        // on_computer_update_tool_list，让加法式下游消费方清空该 computer 的旧工具视图，再自动
+                        // 重拉 get_tools → on_tools_received 重加——使运行期**移除 / 同名换 schema**正确生效
+                        // （否则纯回拉+加法式 merge 会残留旧定义）。预清失败独立捕获、不阻断后续回拉。
+                        //
+                        // 预清与回拉**成对**，故一并 gate 在 auto_fetch_tools 内：若消费方显式关闭 auto_fetch，
+                        // 则既不预清也不回拉（由消费方自管），避免「清空却因不回拉而永不重填 → 工具凭空消失」。
                         if auto_fetch_tools {
+                            if let Some(ref handler) = event_handler {
+                                let _ = handler
+                                    .on_computer_update_tool_list(data.clone(), &agent_clone)
+                                    .await;
+                            }
                             match agent_clone.get_tools(&data.computer).await {
                                 Ok(tools) => {
                                     debug!(

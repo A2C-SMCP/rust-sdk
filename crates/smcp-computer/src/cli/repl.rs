@@ -11,9 +11,11 @@
 * registry/home/session）；变更后触发去抖 emit（`mark_skills_dirty`）。Rust 经 `Computer::skill_registry_arc`
 * 取写锁拿 `&mut SkillRegistry`，`CliMcpHooks` 装配 MCP 注入回调，`ReplConfirm`/`ReplTeardown` 走 stdin 交互。
 *
-* **锁序（注意）**：本路径取 `skill_registry.write` → 经 hooks 间接取 `mcp_manager` 锁，与 `Computer::restage_mcp_skills`
-* 的 `mcp_manager.read` → `skill_registry.write` 相反。当前安全（restage 仅 boot_up 调、无并发 MCP 通知接线，
-* 见 computer.rs `restage_mcp_skills` 注释）；写锁在 `mark_skills_dirty` 前均显式 `drop`（去抖 emit 不同步回锁）。
+ * **锁序（#106 后）**：本路径取 `skill_registry.write` → 经 hooks 调 `add_or_update_server`/`remove_server`
+ * 取 `mcp_manager` 锁。运行期 MCP 变化消费者（McpChangeReactor）已并发接线、取 `mcp_manager.read` →
+ * `skill_registry.write`（相反序）；为消除 ABBA，`add_or_update_server` 惰性初始化改为「先 read 探测、仅 None 才
+ * write」，使 post-boot 本路径退化为 `skill_registry.write` → `mcp_manager.read`，与消费者读锁读读相容（详见
+ * computer.rs `add_or_update_server` / `restage_mcp_skills` 注释）；写锁在 `mark_skills_dirty` 前均显式 `drop`。
 */
 
 use std::path::Path;

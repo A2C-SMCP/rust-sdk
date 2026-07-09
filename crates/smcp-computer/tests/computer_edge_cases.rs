@@ -1,8 +1,8 @@
 use smcp_computer::{
-    computer::{Computer, ManagerChangeMessage, SilentSession},
+    computer::{Computer, SilentSession},
     mcp_clients::model::{
-        MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
-        StdioServerParameters,
+        MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification, PromptStringInput,
+        StdioServerConfig, StdioServerParameters,
     },
 };
 /**
@@ -312,33 +312,35 @@ async fn test_computer_batch_update_inputs() {
 }
 
 #[tokio::test]
-async fn test_computer_manager_change_handler() {
-    use smcp_computer::computer::ManagerChangeHandler;
-
+async fn test_computer_handle_mcp_notification_no_deps() {
+    // #106：未 boot（mcp_manager 为 None）、无 Socket.IO 客户端时，handle_mcp_notification 应对三类通知
+    // 均安全 no-op（reactor 的 manager.upgrade()/read() 命中 None → 跳过；emit 无 client → no-op），不 panic。
     let session = SilentSession::new("test");
     let computer = Computer::new("test_computer", session, None, None, false, false);
 
-    // 测试工具列表变更消息 / Test tool list change message
-    let result = computer
-        .on_change(ManagerChangeMessage::ToolListChanged)
-        .await;
-    assert!(result.is_ok()); // 应该成功，即使没有Socket.IO客户端
-
-    // 测试资源列表变更消息 / Test resource list change message
-    let result = computer
-        .on_change(ManagerChangeMessage::ResourceListChanged {
-            windows: vec!["window1".to_string(), "window2".to_string()],
+    computer
+        .handle_mcp_notification(McpServerNotification {
+            server: "srv".to_string(),
+            kind: McpChangeKind::ToolListChanged,
         })
         .await;
-    assert!(result.is_ok());
 
-    // 测试资源更新消息 / Test resource update message
-    let result = computer
-        .on_change(ManagerChangeMessage::ResourceUpdated {
-            uri: "file:///test.txt".to_string(),
+    computer
+        .handle_mcp_notification(McpServerNotification {
+            server: "srv".to_string(),
+            kind: McpChangeKind::ResourceListChanged,
         })
         .await;
-    assert!(result.is_ok());
+
+    computer
+        .handle_mcp_notification(McpServerNotification {
+            server: "srv".to_string(),
+            kind: McpChangeKind::ResourceUpdated {
+                uri: "window://1".to_string(),
+            },
+        })
+        .await;
+    // 到达此处即证明三类通知在无依赖时均安全返回。
 }
 
 #[tokio::test]
