@@ -9,6 +9,7 @@
 *       Computer governance-layer settings module (intent-layer settings.json schema & validation)
 */
 
+pub mod config;
 pub mod installer;
 pub mod lifecycle;
 pub mod mcp_config;
