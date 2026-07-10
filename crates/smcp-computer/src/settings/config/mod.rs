@@ -11,10 +11,15 @@
 */
 
 pub mod snapshot;
+pub mod write_target;
 
 pub use snapshot::{
     resolve_snapshot, ComputerConfigSnapshot, ConfigRevision, EntityKey, InputDefsView,
     MarketplaceGovView, MarketplaceView, McpConfigView, McpServerView, PluginConfigView,
     PluginEnablementView, PluginRecordView, ProvenanceScope, RuntimeDefaults, SkillConfigView,
     SnapshotArgs, SNAPSHOT_VERSION,
+};
+pub use write_target::{
+    resolve_write_target, ConfigEntity, EditIntent, ScopeAnchors, WritePlan, WriteScope,
+    WriteTargetError, WriteTargetOp, WriteTargetOptions,
 };

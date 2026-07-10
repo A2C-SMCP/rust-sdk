@@ -126,7 +126,7 @@ enum WriteTargetError {
 |---|---|---|---|
 | **Upsert** 新实体 | 声明它 | `config_dir` 对应 scope（默认 project）；caller 可显式覆盖 | — |
 | **Upsert** 改已有 | 就地改声明 | origin scope（若可写） | `ReadOnlyOrigin`（policy 恒最高、改不动） |
-| **Remove** | 让它不再被声明 | 删**所有可写 scope**中该实体的条目（真"删干净"） | 可写部分删除 + 返回 partial：仍从 policy 解析 |
+| **Remove** | 让它不再被声明 | 删**所有可写 scope**中该实体的条目（真"删干净"） | `ReadOnlyOrigin`（origin=policy/flag 硬错，不 partial；#109 已拍板） |
 | **Disable** | 我这层盖掉它 | 写负向 override 到**固定 disable-scope**（默认 local），**不动 origin** | 合法：override 高盖低 |
 | **Enable** | 撤销压制 | 删除/翻正 disable-scope 的 override | 合法 |
 
@@ -219,7 +219,7 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 
 ## 12. 风险 / 待议
 
-- **R1 多 scope remove 策略**：§5.3 取"删所有可写 scope + policy 命中返 partial"。若团队更想要"只删 origin（最高可写）"，是一处可切换的策略常量，需拍死默认。
+- **R1 多 scope remove 策略**：✅ **已拍板（#109）**=删**所有可写 scope**（真删干净）；origin=policy/flag → `ReadOnlyOrigin` 硬错（非 partial）。执行器（S3）须对 no-change 写跳过落盘（`apply_write` 缺失父键会物化空对象，非干净 noop），否则 fan-out 会散布空 `{"servers":{}}` 文件。
 - **R2 revision 语义**：capability revision 与 config revision 是否同一单调计数？建议分离（config 改不一定改 capability）。
 - **R3 value_store 退役的兼容**：现有落盘明文值的用户升级路径——一次性迁移到 resolver 注入，或读时告警不写。需 migration note。
 - **R4 duplicate/import 跨机**：协议 §5.8「install path 非权威、boot 重校验」——duplicate 到新 `config_dir` 后物化账本须重建，不可照搬 installPath。
