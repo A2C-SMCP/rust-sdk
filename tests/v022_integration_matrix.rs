@@ -43,7 +43,8 @@ use tempfile::TempDir;
 
 use smcp::{
     events, is_protocol_error_payload, AgentCallData, GetBlobReq, GetBlobRet, GetDesktopReq,
-    GetResourcesReq, GetSkillReq, GetSkillsReq, ReqId, Role, ToolCallReq, PROTOCOL_VERSION,
+    GetResourcesReq, GetSkillReq, GetSkillsReq, ProtocolVersion, ReqId, Role, ToolCallReq,
+    PROTOCOL_VERSION,
 };
 
 use harness::{
@@ -78,8 +79,10 @@ async fn handshake_tristate_http() {
     assert_eq!(body["code"], 400);
     assert!(hdr.is_none());
 
-    // 不兼容
-    let (status, hdr, body) = http_get(&format!("{base}&a2c_version=0.1.0")).await;
+    // 不兼容：从 PROTOCOL_VERSION 派生一个**必然不兼容**的 client（MAJOR+1），与具体协议版本解耦。
+    let server_v = ProtocolVersion::parse(PROTOCOL_VERSION).unwrap();
+    let client_v = ProtocolVersion::new(server_v.major + 1, server_v.minor, server_v.patch);
+    let (status, hdr, body) = http_get(&format!("{base}&a2c_version={client_v}")).await;
     assert_eq!(status, 400, "incompatible 应 400");
     assert_eq!(body["code"], 4008, "不兼容应回 4008, body={body}");
     assert_eq!(
@@ -87,10 +90,17 @@ async fn handshake_tristate_http() {
         Some("4008"),
         "mismatch 应带 X-A2C-Error-Code: 4008"
     );
+    // 诊断字段从 server_v 派生（min/max = server 的 MAJOR.MINOR.{0,999}），不与具体版本耦合。
     assert_eq!(body["server_version"], PROTOCOL_VERSION);
-    assert_eq!(body["client_version"], "0.1.0");
-    assert_eq!(body["min_supported"], "0.2.0");
-    assert_eq!(body["max_supported"], "0.2.999");
+    assert_eq!(body["client_version"], client_v.to_string());
+    assert_eq!(
+        body["min_supported"],
+        format!("{}.{}.0", server_v.major, server_v.minor)
+    );
+    assert_eq!(
+        body["max_supported"],
+        format!("{}.{}.999", server_v.major, server_v.minor)
+    );
 
     // 兼容 → 放行（200）
     let (status, hdr, _body) = http_get(&format!("{base}&a2c_version={PROTOCOL_VERSION}")).await;

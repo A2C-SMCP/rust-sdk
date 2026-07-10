@@ -23,16 +23,17 @@ pub const SMCP_NAMESPACE: &str = "/smcp";
 
 /// A2C-SMCP 协议版本号 / A2C-SMCP protocol version
 ///
-/// 锁定为 `MAJOR.MINOR` = `0.2.0`。SKILL（v0.2.1）与通用二进制传输（v0.2.1）等均为**加性升级**，
-/// 不改变 `MAJOR.MINOR`，因此该常量保持 `"0.2.0"`，用于 HTTP 握手阶段的版本协商。
+/// `MAJOR.MINOR` = `0.3.0`。v0.3.0 为 plugin install/enable 生命周期分离（`computer-management.md` §2.4，
+/// 非加性、破坏性），故从 `0.2.x` bump 到 `0.3.0`，用于 HTTP 握手阶段的版本协商。**v0.x 阶段 MINOR 严格相等**
+/// （见 [`version::is_compatible`]）——三方（Agent/Computer/Server）必须同为 `0.3.x` 才能握手，`0.2.x` 与
+/// `0.3.x` 互不兼容（4008）。PATCH 不影响兼容性。
 ///
-/// Locked to `MAJOR.MINOR` = `0.2.0`. SKILL (v0.2.1) and generic binary transfer (v0.2.1) are
-/// **additive** upgrades that do not bump `MAJOR.MINOR`; this constant stays `"0.2.0"` and is used
-/// for version negotiation during the HTTP handshake.
+/// `MAJOR.MINOR` = `0.3.0`. v0.3.0 splits the plugin install/enable lifecycle (breaking, not additive),
+/// bumping from `0.2.x`. In v0.x MINOR must match exactly, so all three roles must be `0.3.x` to handshake.
 ///
 /// 协议依据 / Protocol: `a2c-smcp-protocol` versioning.md。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py`。
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 /// 标准错误码模块 / Standard error codes module
 ///
@@ -1541,8 +1542,15 @@ mod tests {
 
     #[test]
     fn test_protocol_version_constant() {
-        // PROTOCOL_VERSION 锁定 MAJOR.MINOR = 0.2.0（SKILL/blob 为加性升级，不改主次版本）
-        assert_eq!(PROTOCOL_VERSION, "0.2.0");
+        // 不与具体值耦合（协议版本会随发布演进）：仅校验 PROTOCOL_VERSION 是**合法且规范**（解析后往返一致）
+        // 的 3 段版本——这是握手中间件 `parse().expect()` 依赖的唯一不变式。升级协议版本时本测试无需改。
+        let v = crate::version::ProtocolVersion::parse(PROTOCOL_VERSION)
+            .expect("PROTOCOL_VERSION must be a valid 3-segment version");
+        assert_eq!(
+            v.to_string(),
+            PROTOCOL_VERSION,
+            "PROTOCOL_VERSION 应为规范形（无前导零 / 恰好 3 段）"
+        );
     }
 
     #[test]

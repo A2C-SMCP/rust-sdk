@@ -246,30 +246,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_incompatible_version_4008_with_header_and_fields() {
-        // server 默认 0.2.0；client 0.1.0 → 不兼容
+        // server 默认 0.3.0（=PROTOCOL_VERSION）；client 0.1.0 → 不兼容
+        // server = 默认（=PROTOCOL_VERSION）；client 取 MAJOR+1 → **必然不兼容**（与具体协议版本解耦）。
+        let server_v = ProtocolVersion::parse(PROTOCOL_VERSION).unwrap();
+        let client_v = ProtocolVersion::new(server_v.major + 1, server_v.minor, server_v.patch);
         let s = svc();
         let r = s
-            .call(req(
-                "http://h/socket.io/?transport=websocket&a2c_version=0.1.0",
-            ))
+            .call(req(&format!(
+                "http://h/socket.io/?transport=websocket&a2c_version={client_v}"
+            )))
             .await
             .unwrap();
         let (status, hdr, json) = body_json(r).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["code"], 4008);
         assert_eq!(hdr.as_deref(), Some("4008"));
-        assert_eq!(json["server_version"], "0.2.0");
-        assert_eq!(json["client_version"], "0.1.0");
-        assert_eq!(json["min_supported"], "0.2.0");
-        assert_eq!(json["max_supported"], "0.2.999");
+        // 诊断字段全部从 server_v 派生（min/max = server 的 MAJOR.MINOR.{0,999}），不与具体版本耦合。
+        assert_eq!(json["server_version"], PROTOCOL_VERSION);
+        assert_eq!(json["client_version"], client_v.to_string());
+        assert_eq!(
+            json["min_supported"],
+            format!("{}.{}.0", server_v.major, server_v.minor)
+        );
+        assert_eq!(
+            json["max_supported"],
+            format!("{}.{}.999", server_v.major, server_v.minor)
+        );
         assert!(json.get("error").is_none());
     }
 
     #[tokio::test]
     async fn test_compatible_version_passthrough() {
         let s = svc();
-        // 同 minor 不同 patch 仍兼容
-        for v in ["0.2.0", "0.2.5", "0.2.999"] {
+        // 与 server（=PROTOCOL_VERSION）同 MAJOR.MINOR、不同 PATCH 仍兼容（PATCH 不影响判定）。从
+        // PROTOCOL_VERSION 派生 patch 变体，与具体协议版本解耦。
+        let sv = ProtocolVersion::parse(PROTOCOL_VERSION).unwrap();
+        for patch in [0u64, 5, 999] {
+            let v = format!("{}.{}.{}", sv.major, sv.minor, patch);
             let r = s
                 .call(req(&format!(
                     "http://h/socket.io/?transport=polling&a2c_version={v}"
