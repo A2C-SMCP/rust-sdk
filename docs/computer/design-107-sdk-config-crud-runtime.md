@@ -171,10 +171,22 @@ enum WriteTargetError {
 | `add/refresh/remove marketplace` | 同名（`:699–:736`） | — |
 | `execute_tool` / `cancel` | `execute_tool[_cancellable]` / `acancel_tool`（`:1690–:1918`） | — |
 | `connect/disconnect/join/leave` | 同名（`:2143–:2226`） | — |
-| `status()` / `subscribe_events()` | 部分（`get_server_status:1942`） | **补 `ComputerStatusSnapshot` + event stream + revision** |
-| `add_or_update_server`/`remove_server` | 同名（`:1407/:1445`） | **⚠️ 补落盘**（当前纯内存） |
+| `status()` / `subscribe_events()` | ✅ **S7 已落地（#114）**：`status.rs` 补 `ComputerStatusSnapshot` + `broadcast` event stream + 分离单调 revision | — |
+| `add_or_update_server`/`remove_server` | 同名（`:1407/:1445`） | **⚠️ 补落盘**（当前纯内存，S6） |
 
 **核心接线**：所有 mutate 方法从"只改内存"改为"经 Config-CRUD + 写目标消解器落盘 → reload 投影 → bump revision → emit update"。
+
+> **✅ S7 已落地（#114，`status.rs`）**：新增 [`crate::status`] 模块——`RuntimeStatus`（`Arc` 跨 clone 共享）持
+> ① `LifecycleState`（协议 §3 状态的 Rust 映射，`AtomicU8` 无锁，serde snake_case 对齐协议用词）；② **分离**的两个
+> 单调 revision（`config_revision` ⊥ `capability_revision`，`AtomicU64`，§12 R2）；③ 公开诊断（`last_error` /
+> `degraded_reason`）；④ `tokio::sync::broadcast` 事件通道（`ComputerEvent`：LifecycleChanged / ConfigRevisionBumped /
+> CapabilityRevisionBumped）。`Computer` 新增 `status()`（cheap 非阻塞快照：状态/revision/诊断 + 内存投影计数 MCP/工具/
+> SKILL，**不做 ledger IO**——plugin/marketplace 明细仍走 `list_mcp_servers_with_metadata`）、`subscribe_events()`、
+> `config_revision()`/`capability_revision()`/`lifecycle_state()`。**生命周期迁移接线**：boot（Starting→Started，
+> marketplace 部分失败→Degraded+诊断）/ connect（Connected）/ join（JoinedOffice）/ leave（Connected）/ disconnect
+> （Started）/ shutdown（Shutdown）；**capability revision bump** 于 boot 与 start/stop MCP（工具投影变化，§12 R2）。
+> **shutdown 闸门**（契约 §4.7）：`enter_shutdown` 发唯一终态事件后闸断——此后不再发 stale 事件、bump 降 no-op。
+> `config_revision` 的 mutate-bump 入口 `bump_config_revision()` 已备（S6 落盘成功后调用；S7 落地时暂无生产调用者）。
 
 ---
 
@@ -218,8 +230,8 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 | S3 Config CRUD | 2 | S1,S2 | 是 |
 | S4 validate/migrate/import/export ✅#111 | 3,4 | S3 | 半（validate 已有底子）|
 | S5 inputs 边界订正 ✅#112 | （D1 派生） | S1 | 改造 |
-| S6 runtime 落盘接线 | 5,7 | S3,S7 | 接线 |
-| S7 status snapshot + events | 7 | S1 | 半 |
+| S6 runtime 落盘接线 | 5,7 | S3,S7 ✅ | 接线（S7 已解锁）|
+| S7 status snapshot + events ✅#114 | 7 | S1 | 半（已落地）|
 | S8 连接态 robot 同步 | 8 | S6 | 接线（已有 emit_update_config） |
 
 ---
@@ -242,6 +254,6 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 ## 12. 风险 / 待议
 
 - **R1 多 scope remove 策略**：✅ **已拍板（#109）**=删**所有可写 scope**（真删干净）；origin=policy/flag → `ReadOnlyOrigin` 硬错（非 partial）。✅ **执行器已落地（#110，`config/executor.rs`）**：no-change 判定用**精确语义比对**（`is_no_change`/`strip_fresh_scaffold`——只剥「本次写新物化、且在 existing 缺失/非对象」的空对象脚手架，**不**对称剥两侧，故既不凭空建 `{"servers":{}}`、也不误跳磁盘上空对象值 server 的真实删除）。多文件 fan-out 落盘前加 pre-flight 只读探测（corrupt/IO），收窄半落盘窗口。
-- **R2 revision 语义**：capability revision 与 config revision 是否同一单调计数？建议分离（config 改不一定改 capability）。
+- **R2 revision 语义**：✅ **已拍板并落地（#114 S7）**=**分离**两个独立单调计数（`config_revision` ⊥ `capability_revision`），因 config 改不一定改 capability（如 disable 一个本未激活的 server）。`status.rs` 的 `RuntimeStatus` 各持一个 `AtomicU64`；capability 于 boot / MCP start·stop bump，config 于 S6 mutate 落盘 bump。
 - **R3 value_store 退役的兼容**：✅ **已拍板（#112，用户决策=硬退役）**=删 `inputs/value_store.rs` 读写，旧 `input-values.json` 残留**孤儿化**（不再读取）。「无损迁移」验收项**显式豁免**（换取代码零残留 + 立即停止明文依赖）；升级迁移路径=用户经 `RuntimeOptions.input_resolver` 或 env `A2C_INPUT_<ID>` 重新提供该值。`secret_store.rs`（keyring，加密非明文）**保留**为 `KeyringSecretResolver`（opt-in secret resolver），非退役目标。
 - **R4 duplicate/import 跨机**：协议 §5.8「install path 非权威、boot 重校验」——duplicate 到新 `config_dir` 后物化账本须重建，不可照搬 installPath。

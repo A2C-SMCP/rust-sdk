@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
 use std::sync::Weak;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -70,6 +70,7 @@ use crate::mcp_clients::{
     ConfigRender, RenderError,
 };
 use crate::socketio_client::{SmcpComputerClient, SmcpComputerClientBuilder};
+use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
 /// 确认回调函数类型 / Confirmation callback function type
 type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>;
@@ -327,6 +328,11 @@ pub struct Computer<S: Session> {
     /// client 注入的 secret resolver（= `RuntimeOptions.secret_resolver`；缺省 None）。仅 `password:true` input 走此，
     /// SDK 不落盘 secret 明文 / client-provided secret resolver。
     secret_resolver: Option<Arc<dyn SecretValueResolver>>,
+
+    // ── #114 S7：runtime status / observability / runtime status surface ──────────
+    /// runtime 生命周期状态 + 分离单调 revision（config ⊥ capability）+ 公开诊断 + 事件广播。`Arc` 跨 clone 共享，
+    /// 使 handler-detached 克隆与本体观测同一视图。见 [`crate::status`] / status snapshot + monotonic revisions。
+    status: Arc<RuntimeStatus>,
 }
 
 /// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
@@ -626,6 +632,8 @@ impl<S: Session> Computer<S> {
             mcp_notify_task: Arc::new(Mutex::new(None)),
             input_resolver: None,
             secret_resolver: None,
+            // #114 S7：初始生命周期 = Created（尚未 boot 初始化本地资源）/ status starts at Created。
+            status: Arc::new(RuntimeStatus::new()),
         }
     }
 
@@ -1288,6 +1296,8 @@ impl<S: Session> Computer<S> {
     /// 启动Computer / Boot up the computer
     pub async fn boot_up(&self) -> ComputerResult<()> {
         info!("Starting Computer: {}", self.name);
+        // #114 S7：进入 Starting（加载 config / 解析本地状态 / 启动 MCP 资源，契约 §3）。
+        self.status.transition(LifecycleState::Starting);
 
         // 创建MCP服务器管理器 / Create MCP server manager
         let manager = MCPServerManager::new();
@@ -1317,7 +1327,15 @@ impl<S: Session> Computer<S> {
         }
 
         // 初始化管理器 / Initialize manager
-        manager.initialize(validated_servers).await?;
+        // #114 S7：boot 的唯一硬失败点。失败 → 落 `Error` 状态 + 公开诊断（不含 secret，仅错误类别串），使观测面
+        // 反映「boot 失败」而非卡在 `Starting`（契约 §3 `error` 语义）。诊断用 `error_code` + 简述，避免透传可能
+        // 含渲染细节的 Display 全文。
+        if let Err(e) = manager.initialize(validated_servers).await {
+            self.status
+                .set_last_error(Some(format!("boot failed to initialize MCP manager (code {})", e.error_code())));
+            self.status.transition(LifecycleState::Error);
+            return Err(e);
+        }
 
         // 设置管理器到实例 / Set manager to instance
         *self.mcp_manager.write().await = Some(manager);
@@ -1393,6 +1411,23 @@ impl<S: Session> Computer<S> {
         self.restage_mcp_skills(None).await;
         self.invalidate_user_skills().await;
         self.start_skill_watcher().await;
+
+        // #114 S7：本地 runtime 已初始化 → 能力投影首次就绪，bump capability revision（能力变化计数，§12 R2）。
+        // marketplace 源部分失败 → Degraded + 公开诊断（契约 §3/§5.2「其它 sources 可继续」），否则 Started。
+        // boot 成功完成 → 清除上一轮可能残留的 boot `last_error`（重启语义）。
+        self.status.bump_capability();
+        self.status.set_last_error(None);
+        if recovery.failed_marketplaces.is_empty() {
+            self.status.set_degraded_reason(None);
+            self.status.transition(LifecycleState::Started);
+        } else {
+            self.status.set_degraded_reason(Some(format!(
+                "{} marketplace source(s) failed to sync: {}",
+                recovery.failed_marketplaces.len(),
+                recovery.failed_marketplaces.join(", ")
+            )));
+            self.status.transition(LifecycleState::Degraded);
+        }
 
         info!("Computer {} started successfully", self.name);
         Ok(())
@@ -2097,6 +2132,80 @@ impl<S: Session> Computer<S> {
         }
     }
 
+    // ── #114 S7：runtime status / observability 公开面 / runtime status surface ──────────
+
+    /// runtime 状态快照（#114 S7）：生命周期 + 分离单调 revision + 能力汇总 + 公开诊断 / runtime status snapshot。
+    ///
+    /// **cheap、非阻塞**：状态 / revision / 诊断取自 [`RuntimeStatus`]（原子无锁），汇总计数为当次对内存态的只读
+    /// 投影（MCP 声明集 / 活跃集 / **已注册工具映射** / 活跃 SKILL 集）——**不做 ledger / 磁盘 IO / MCP RPC**。
+    /// 工具数取 [`MCPServerManager::tool_count`] 的**已缓存映射长度**（非 `list_available_tools` 的逐 server
+    /// `tools/list` 往返），避免观测端点自身阻塞于不健康的 MCP server。plugin / marketplace 明细留给专用 inventory
+    /// API（[`list_mcp_servers_with_metadata`](Self::list_mcp_servers_with_metadata)）。满足契约 §3「暴露生命周期状态
+    /// 或等价公开诊断」，且反映**已加载的 desired state**（未 boot 时 manager=None → 活跃/工具计数为 0，`mcp_servers`
+    /// 仍反映已声明集）。
+    ///
+    /// 锁纪律：三把读锁**逐次取、至多同时持一把**（`mcp_servers` → `mcp_manager` → `skill_registry`，各在语句/块
+    /// 结束即释放），故不参与 #106 的 mcp/skill ABBA 环。
+    pub async fn status(&self) -> ComputerStatusSnapshot {
+        let mcp_servers = self.mcp_servers.read().await.len();
+        let (active_mcp_servers, tools) = {
+            let manager_guard = self.mcp_manager.read().await;
+            if let Some(ref manager) = *manager_guard {
+                let active = manager
+                    .get_server_status()
+                    .await
+                    .into_iter()
+                    .filter(|(_, active, _)| *active)
+                    .count();
+                // 廉价：读已缓存 tool_mapping 长度，不发 tools/list RPC（🟡 修复：status 不因 MCP server 挂起而阻塞）。
+                let tools = manager.tool_count().await;
+                (active, tools)
+            } else {
+                (0, 0)
+            }
+        };
+        let skills = self.skill_registry.read().await.active_refs().len();
+        self.status
+            .snapshot(mcp_servers, active_mcp_servers, tools, skills)
+    }
+
+    /// 订阅 runtime 观测事件流（#114 S7）/ subscribe to runtime observability events。
+    ///
+    /// 返回 [`tokio::sync::broadcast::Receiver`]：生命周期迁移 / revision 增长逐条广播。**shutdown 后**（契约
+    /// §4.7）除进入 shutdown 时的终态 [`ComputerEvent::LifecycleChanged`]`(shutdown)` 外不再收到新事件。滞后订阅者
+    /// 会收到 `Lagged`——可经 [`status`](Self::status) 重新拉取全量快照对齐。
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ComputerEvent> {
+        self.status.subscribe()
+    }
+
+    /// 当前 config revision（声明式配置内容单调计数；S6 mutate 落盘时 bump）/ current config revision。
+    #[must_use]
+    pub fn config_revision(&self) -> u64 {
+        self.status.config_revision()
+    }
+
+    /// 当前 capability revision（Agent-facing 能力投影单调计数）/ current capability revision。
+    #[must_use]
+    pub fn capability_revision(&self) -> u64 {
+        self.status.capability_revision()
+    }
+
+    /// 当前生命周期状态 / current lifecycle state。
+    #[must_use]
+    pub fn lifecycle_state(&self) -> LifecycleState {
+        self.status.state()
+    }
+
+    /// bump config revision（#113 S6 mutate 落盘接线入口；单调 +1 并广播）/ bump config revision (S6 entry)。
+    ///
+    /// S7 只提供本原语与 [`RuntimeStatus`] 底座；config revision 的 mutate-bump 由 S6 在写目标落盘成功后调用
+    /// （config ⊥ capability 分离，设计 §12 R2）。**S7 落地时其生产调用点（S6 mutate 方法）尚未接入**，故非 test
+    /// 构建下暂无调用者——`allow(dead_code)` 仅豁免该过渡态，S6 接线后移除。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn bump_config_revision(&self) -> u64 {
+        self.status.bump_config()
+    }
+
     /// 列出 MCP 服务器配置 / List MCP server configurations
     pub async fn list_mcp_servers(&self) -> Vec<MCPServerConfig> {
         let servers = self.mcp_servers.read().await;
@@ -2189,34 +2298,48 @@ impl<S: Session> Computer<S> {
 
     /// 启动 MCP 客户端 / Start MCP client
     pub async fn start_mcp_client(&self, server_name: &str) -> ComputerResult<()> {
-        let manager_guard = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager_guard {
-            if server_name == "all" {
-                manager.start_all().await
+        let result = {
+            let manager_guard = self.mcp_manager.read().await;
+            if let Some(ref manager) = *manager_guard {
+                if server_name == "all" {
+                    manager.start_all().await
+                } else {
+                    manager.start_client(server_name).await
+                }
             } else {
-                manager.start_client(server_name).await
+                Err(ComputerError::InvalidState(
+                    "MCP Manager not initialized".to_string(),
+                ))
             }
-        } else {
-            Err(ComputerError::InvalidState(
-                "MCP Manager not initialized".to_string(),
-            ))
+        };
+        // #114 S7：MCP 起停改变 Agent-facing 工具投影 → 成功时 bump capability revision（§12 R2）。
+        if result.is_ok() {
+            self.status.bump_capability();
         }
+        result
     }
 
     /// 停止 MCP 客户端 / Stop MCP client
     pub async fn stop_mcp_client(&self, server_name: &str) -> ComputerResult<()> {
-        let manager_guard = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager_guard {
-            if server_name == "all" {
-                manager.stop_all().await
+        let result = {
+            let manager_guard = self.mcp_manager.read().await;
+            if let Some(ref manager) = *manager_guard {
+                if server_name == "all" {
+                    manager.stop_all().await
+                } else {
+                    manager.stop_client(server_name).await
+                }
             } else {
-                manager.stop_client(server_name).await
+                Err(ComputerError::InvalidState(
+                    "MCP Manager not initialized".to_string(),
+                ))
             }
-        } else {
-            Err(ComputerError::InvalidState(
-                "MCP Manager not initialized".to_string(),
-            ))
+        };
+        // #114 S7：同 start——停 MCP 亦改变工具投影，成功时 bump capability revision。
+        if result.is_ok() {
+            self.status.bump_capability();
         }
+        result
     }
 
     /// 检查 MCP Manager 是否已初始化 / Check if MCP Manager is initialized
@@ -2286,6 +2409,8 @@ impl<S: Session> Computer<S> {
             // resolver 注入随 clone 保留（handler 路径不渲染 server config，仅占位满足 struct 完整性）。
             input_resolver: self.input_resolver.clone(),
             secret_resolver: self.secret_resolver.clone(),
+            // #114 S7：detached 克隆共享同一 RuntimeStatus（观测视图对本体一致）。
+            status: Arc::clone(&self.status),
         }
     }
 
@@ -2344,6 +2469,9 @@ impl<S: Session> Computer<S> {
         let client_arc = Arc::new(client);
         self.set_socketio_client(client_arc.clone()).await;
 
+        // #114 S7：Socket.IO 已连接（Office join 可能未完成，契约 §3）/ connected。
+        self.status.transition(LifecycleState::Connected);
+
         info!(
             "Connected to SMCP server at {} with computer name: {}",
             url, self.name
@@ -2356,6 +2484,9 @@ impl<S: Session> Computer<S> {
     pub async fn disconnect_socketio(&self) -> ComputerResult<()> {
         let mut socketio_ref = self.socketio_client.write().await;
         *socketio_ref = None;
+        // #114 S7：断开 Socket.IO 后本地 runtime 仍存活 → 回 Started（契约 §4.5：断开后不再向旧 Office 发
+        // `server:update_*`——由 client=None 天然保证；本地管理操作可继续）。已 shutdown 则 transition 为 no-op。
+        self.status.transition(LifecycleState::Started);
         info!("Disconnected from server");
         Ok(())
     }
@@ -2367,6 +2498,8 @@ impl<S: Session> Computer<S> {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
             client.join_office(office_id).await?;
+            // #114 S7：已加入 Office，可接收路由来的 `client:*`（契约 §3）/ joined office。
+            self.status.transition(LifecycleState::JoinedOffice);
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -2382,6 +2515,8 @@ impl<S: Session> Computer<S> {
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
             let current_office_id = client.get_current_office_id().await?;
             client.leave_office(&current_office_id).await?;
+            // #114 S7：离开 Office 但连接仍在 → 回 Connected（契约 §3）/ back to connected。
+            self.status.transition(LifecycleState::Connected);
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -2406,6 +2541,12 @@ impl<S: Session> Computer<S> {
     /// 关闭Computer / Shutdown computer
     pub async fn shutdown(&self) -> ComputerResult<()> {
         info!("Shutting down Computer: {}", self.name);
+
+        // #114 S7：**在拆除资源之前**即进入 Shutdown 终态并闸断观测事件流（契约 §4.7「shutdown 开始即阻断 stale
+        // callbacks / emissions」）。放在开头而非结尾——否则若下方 `stop_all().await?` 失败提前 return，闸门将永不
+        // engage、状态卡在非终态。`enter_shutdown` 幂等：发唯一终态 `LifecycleChanged(Shutdown)` 后所有后续
+        // transition/emit/bump 均 no-op。
+        self.status.enter_shutdown();
 
         // #106：先停 MCP 变化通知消费者，避免其在 manager stop 期间仍反应残留通知。
         self.stop_mcp_notify_consumer().await;
@@ -2475,6 +2616,8 @@ impl<S: Session + Clone> Clone for Computer<S> {
             // resolver 注入随 clone 保留（handler 路径不渲染 server config，仅占位满足 struct 完整性）。
             input_resolver: self.input_resolver.clone(),
             secret_resolver: self.secret_resolver.clone(),
+            // #114 S7：status 共享（clone 与本体同一观测视图）。
+            status: Arc::clone(&self.status),
         }
     }
 }
@@ -2742,6 +2885,127 @@ mod tests {
         assert_eq!(computer.name, "test_computer");
         assert!(computer.auto_connect);
         assert!(computer.auto_reconnect);
+    }
+
+    // ── #114 S7：runtime status / revision / events ──────────────────────────────
+
+    #[tokio::test]
+    async fn status_reflects_loaded_desired_state() {
+        // 未 boot：manager=None → 活跃/工具计数 0；但 status 仍反映**已声明** desired MCP 集（构造注入）。
+        let mut declared = HashMap::new();
+        declared.insert("srv-a".to_string(), user_stdio_server97("srv-a"));
+        declared.insert("srv-b".to_string(), user_stdio_server97("srv-b"));
+        let computer = Computer::new("c", SilentSession::new("s"), None, Some(declared), false, false);
+
+        let snap = computer.status().await;
+        assert_eq!(snap.lifecycle, LifecycleState::Created);
+        assert_eq!(snap.mcp_servers, 2, "已声明 desired MCP 集");
+        assert_eq!(snap.active_mcp_servers, 0, "未 boot → 无活跃进程");
+        assert_eq!(snap.tools, 0);
+        assert_eq!(snap.skills, 0);
+        assert_eq!(snap.config_revision, 0);
+        assert_eq!(snap.capability_revision, 0);
+        assert!(snap.last_error.is_none());
+        assert!(snap.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_revision_bumps_and_is_observable() {
+        // S6（#113）落盘接线入口：bump_config_revision 单调 +1、广播事件、快照可见；capability 独立（§12 R2）。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let mut rx = computer.subscribe_events();
+        assert_eq!(computer.config_revision(), 0);
+
+        assert_eq!(computer.bump_config_revision(), 1);
+        assert_eq!(computer.config_revision(), 1);
+        assert_eq!(computer.status().await.config_revision, 1);
+        // config bump 不动 capability（分离单调）。
+        assert_eq!(computer.capability_revision(), 0);
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            ComputerEvent::ConfigRevisionBumped { revision: 1 }
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_enters_terminal_state_and_silences_events() {
+        // 契约 §4.7：shutdown 后除终态事件外不再发；revision bump 降 no-op。无需 boot（manager/watcher 均 None-safe）。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let mut rx = computer.subscribe_events();
+
+        computer.shutdown().await.unwrap();
+        assert_eq!(computer.lifecycle_state(), LifecycleState::Shutdown);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            ComputerEvent::LifecycleChanged {
+                state: LifecycleState::Shutdown
+            }
+        );
+
+        // shutdown 后 bump 为 no-op（不发事件、不推进 revision）。
+        assert_eq!(computer.bump_config_revision(), 0);
+        assert_eq!(computer.config_revision(), 0);
+        // 通道再无新事件。
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn clone_shares_runtime_status() {
+        // 守卫「三处构造点共享同一 Arc<RuntimeStatus>」不变量：任一 clone 上的 bump/状态迁移对本体可见。
+        // 若某构造点误写成 `Arc::new(RuntimeStatus::new())`（观测视图割裂），本测试即失败。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let clone = computer.clone();
+        assert_eq!(clone.bump_config_revision(), 1);
+        assert_eq!(computer.config_revision(), 1, "clone 的 bump 须对本体可见");
+        // 反向：本体 bump → clone 可见。
+        assert_eq!(computer.bump_config_revision(), 2);
+        assert_eq!(clone.config_revision(), 2);
+        // 第三个构造点 clone_for_handlers（socketio-detached handler 克隆）亦须共享同一 status Arc——
+        // 否则 handler 路径触发的观测变化对本体割裂不可见。
+        let handler_clone = computer.clone_for_handlers();
+        assert_eq!(handler_clone.config_revision(), 2, "handler 克隆须共享 status");
+        assert_eq!(handler_clone.bump_config_revision(), 3);
+        assert_eq!(computer.config_revision(), 3, "handler 克隆的 bump 须对本体可见");
+    }
+
+    #[tokio::test]
+    async fn status_transitions_and_capability_bumps_across_boot_and_mcp_lifecycle() {
+        // 验收 1 的**实义分支**（已加载 = 已 boot）+ boot/start/stop 的生命周期接线回归守卫。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        // boot 前：Created、revision 皆 0。
+        assert_eq!(computer.lifecycle_state(), LifecycleState::Created);
+        assert_eq!(computer.capability_revision(), 0);
+
+        // boot：无 marketplace 失败 → Started；能力投影就绪 → capability bump。
+        computer.boot_up().await.unwrap();
+        let snap = computer.status().await;
+        assert_eq!(snap.lifecycle, LifecycleState::Started);
+        assert!(snap.capability_revision >= 1, "boot 应 bump capability revision");
+        assert!(snap.degraded_reason.is_none());
+        assert!(snap.last_error.is_none());
+
+        // start/stop MCP（空配置 → Ok）改变工具投影 → 各 bump 一次 capability（单调）。
+        let cap_after_boot = computer.capability_revision();
+        computer.start_mcp_client("all").await.unwrap();
+        let cap_after_start = computer.capability_revision();
+        assert!(cap_after_start > cap_after_boot, "start 应 bump capability");
+        computer.stop_mcp_client("all").await.unwrap();
+        assert!(
+            computer.capability_revision() > cap_after_start,
+            "stop 应 bump capability"
+        );
+
+        // shutdown → 终态 + 闸断。
+        computer.shutdown().await.unwrap();
+        assert_eq!(computer.lifecycle_state(), LifecycleState::Shutdown);
     }
 
     // ── INT-01 #68：SKILL / blob 编排集成测试 ────────────────────────────────

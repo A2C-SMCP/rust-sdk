@@ -18,12 +18,16 @@ pub mod mcp_clients;
 pub mod settings;
 pub mod skills;
 pub mod socketio_client;
+pub mod status;
 
 #[cfg(feature = "cli")]
 pub mod cli;
 
 #[cfg(test)]
 pub use errors::{ComputerError, ComputerResult};
+
+/// #107 S7（#114）：runtime status / 事件公开面 re-export / runtime status surface re-export。
+pub use status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
 /// Computer模块的版本号 / Version of the Computer module
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -387,6 +387,16 @@ impl MCPServerManager {
         self.disabled_tools.write().await.clear();
     }
 
+    /// 已注册（mapped）工具数——读**已缓存**的 `tool_mapping`，**不发** `tools/list` RPC（#114 S7 status 用）。
+    /// Registered/mapped tool count from the cached mapping; issues no MCP RPC (cheap for status snapshots)。
+    ///
+    /// 与 [`list_available_tools`](Self::list_available_tools) 的区别：后者为产出完整 `Tool` 会对每个活跃 server 拉
+    /// 一次 `tools/list`（网络/子进程往返）；本方法只取映射长度。映射由 start/stop/refresh 维护，反映 desired 已加载
+    /// 工具集，适合廉价、非阻塞的 status 计数。
+    pub async fn tool_count(&self) -> usize {
+        self.tool_mapping.read().await.len()
+    }
+
     /// 关闭管理器 / Close manager
     pub async fn close(&self) -> Result<(), ComputerError> {
         self.stop_all().await?;
