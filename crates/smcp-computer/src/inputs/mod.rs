@@ -16,8 +16,9 @@ pub mod utils;
 pub mod plugin_pool;
 pub mod render;
 pub mod resolver;
+// D1 运行期注入契约（#107 S5 / #112）/ D1 runtime injection contract
+pub mod runtime_resolver;
 pub mod secret_store;
-pub mod value_store;
 
 // 重新导出核心类型 / Re-export core types
 pub use handler::InputHandler;
@@ -31,7 +32,8 @@ pub use render::{load_env_file, ConfigRender, PREDEFINED_VARS};
 pub use resolver::{
     env_var_name, InputResolveError, InputResolver, NonInteractivePrompter, Prompter,
 };
-pub use secret_store::{keyring_available, KeyringBackend, OsKeyring, SecretStore, SERVICE_NAME};
-pub use value_store::{
-    resolve_value_store_path, ValueStore, VALUE_STORE_FILENAME, XDG_STATE_HOME_ENV,
+// D1 运行期注入契约 re-export（#112 S5）/ D1 runtime injection contract re-export
+pub use runtime_resolver::{
+    InputKind, InputResolutionError, InputValueResolver, KeyringSecretResolver, SecretValueResolver,
 };
+pub use secret_store::{keyring_available, KeyringBackend, OsKeyring, SecretStore, SERVICE_NAME};

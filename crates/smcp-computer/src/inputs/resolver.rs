@@ -4,25 +4,25 @@
 * 创建日期: 2026/06/04
 * 最后修改日期: 2026/06/04
 * 版权: 2023 JQQ. All rights reserved.
-* 依赖: serde_json, mcp_clients::model, inputs::{secret_store,value_store,plugin_pool}
-* 描述: inputs 解析链（env→keyring→value store→prompt）+ 按类持久化。
-*       Inputs resolution chain (env→keyring→value store→prompt) + per-type persistence.
+* 依赖: serde_json, mcp_clients::model, inputs::{secret_store,plugin_pool}
+* 描述: inputs 交互解析链（env→keyring→prompt）；D1（#112 S5）后**不再落盘任何明文值**。
+*       Inputs interactive resolution chain (env→keyring→prompt); no plaintext persistence after D1 (#112 S5).
 */
 
-//! inputs 解析器：按 id 惰性解析 + 解析链取值 + 按类持久化（§9.3，对标 VS Code SecretStorage）。
+//! inputs 交互解析器：按 id 惰性解析 + 解析链取值（§9.3，对标 VS Code SecretStorage）。
 //!
-//! 对标 Python 治理层资产 `a2c_smcp/computer/inputs/resolver.py`（v0.2.1 #65）。
+//! 对标 Python 治理层资产 `a2c_smcp/computer/inputs/resolver.py`（v0.2.1 #65）。此为 CLI-02（#51）面向的**交互**
+//! 解析链参考实现；运行期（server-start）的 client 注入契约见 [`runtime_resolver`](super::runtime_resolver)。
 //!
 //! 解析链（命中即返回、并按解析后池 id 进程内缓存）：
 //! 1. **定位定义**：裸 id 未命中且给了 plugin 上下文 → 回退查带前缀池条目（`<plugin>@<mp>/<id>`，§9.3 D2）。
 //! 2. **进程内 cache**（按解析后池 id，避免不同 plugin 同裸 id 串味）。
-//! 3. **环境变量** `A2C_INPUT_<ID>`（编排层注入，命中**不**落盘）。
+//! 3. **环境变量** `A2C_INPUT_<ID>`（编排层注入）。
 //! 4. **OS keyring**（仅 `password:true`）。
-//! 5. **明文 value store**（仅非密钥 promptString / pickString）。
-//! 6. **交互 prompt**——password 在 headless（无 env + 无 keyring + 无 TTY）下**硬错误**，绝不落明文。
+//! 5. **交互 prompt**——password 在 headless（无 env + 无 keyring + 无 TTY）下**硬错误**，绝不落明文。
 //!
-//! 持久化（仅**交互 prompt 得值**时）：password → keyring（不可用 → 仅会话缓存、绝不明文）；非密钥 → 明文
-//! value store。env 命中 / command / headless 默认回退**不**持久化。
+//! **D1（#112 S5）：明文 value store 已硬退役**——非密钥值不再落盘，交互得值仅进程内缓存（会话级）。password
+//! 交互得值仍写 OS keyring（加密、非明文；keyring 不可用 → 仅会话缓存）。env 命中 / command **不**持久化。
 //!
 //! 同步设计：交互 prompt 经 [`Prompter`] seam（blocking）；真实 CLI prompter（rustyline / rpassword + 命令执行）
 //! 接线归 CLI-02（#51），本模块提供 trait + headless 默认实现 + 测试替身，令解析链可确定性单测。
@@ -37,7 +37,6 @@ use crate::settings::scope::EnvMap;
 
 use super::plugin_pool::prefix_input_id;
 use super::secret_store::SecretStore;
-use super::value_store::ValueStore;
 
 /// 把 input id 映射为环境变量名 `A2C_INPUT_<ID_UPPER>`（非 `[A-Z0-9]` → `_`）/ map id to env var name。
 ///
@@ -117,12 +116,11 @@ impl Prompter for NonInteractivePrompter {
     }
 }
 
-/// 输入解析器：基于 id 的惰性解析、解析链取值与按类持久化 / lazy per-id resolver with chain + persistence。
+/// 输入解析器：基于 id 的惰性解析与解析链取值（D1 后不落盘明文）/ lazy per-id interactive resolver。
 pub struct InputResolver {
     inputs: HashMap<String, MCPServerInput>,
     cache: Mutex<HashMap<String, Value>>,
     env: EnvMap,
-    value_store: ValueStore,
     secret_store: SecretStore,
     prompter: Box<dyn Prompter>,
 }
@@ -130,17 +128,15 @@ pub struct InputResolver {
 impl InputResolver {
     /// 构造解析器 / construct a resolver。
     ///
-    /// - `env` = `None` → 进程环境；`value_store` / `secret_store` = `None` → 默认（env 解析路径 / OS keyring）。
+    /// - `env` = `None` → 进程环境；`secret_store` = `None` → 默认（OS keyring）。
     /// - `prompter` 注入交互 seam（headless 用 [`NonInteractivePrompter`]）。
     pub fn new(
         inputs: impl IntoIterator<Item = MCPServerInput>,
         prompter: Box<dyn Prompter>,
         env: Option<EnvMap>,
-        value_store: Option<ValueStore>,
         secret_store: Option<SecretStore>,
     ) -> Self {
         let env = env.unwrap_or_else(|| std::env::vars().collect());
-        let value_store = value_store.unwrap_or_else(|| ValueStore::new(Some(&env)));
         let secret_store = secret_store.unwrap_or_default();
         let inputs = inputs
             .into_iter()
@@ -150,13 +146,12 @@ impl InputResolver {
             inputs,
             cache: Mutex::new(HashMap::new()),
             env,
-            value_store,
             secret_store,
             prompter,
         }
     }
 
-    /// 按 id 惰性解析（解析链 + 缓存 + 按类持久化）/ resolve by id (chain + cache + persistence)。
+    /// 按 id 惰性解析（解析链 + 会话缓存；secret 交互得值写 keyring，非密钥不落盘）/ resolve by id (chain + cache)。
     pub fn resolve_by_id(
         &self,
         input_id: &str,
@@ -185,12 +180,8 @@ impl InputResolver {
 
         let is_password =
             matches!(&cfg, MCPServerInput::PromptString(p) if p.password.unwrap_or(false));
-        let is_plain_persistable = matches!(
-            &cfg,
-            MCPServerInput::PromptString(_) | MCPServerInput::PickString(_)
-        ) && !is_password;
 
-        // 3. 环境变量 A2C_INPUT_<ID>（命中不落盘）
+        // 3. 环境变量 A2C_INPUT_<ID>（编排层注入）
         if let Some(env_val) = self.env.get(&env_var_name(&resolved_id)) {
             let v = Value::String(env_val.clone());
             self.cache.lock().unwrap().insert(resolved_id, v.clone());
@@ -206,18 +197,7 @@ impl InputResolver {
             }
         }
 
-        // 5. 明文 value store（仅非密钥）
-        if is_plain_persistable {
-            if let Some(stored) = self.value_store.get(&resolved_id) {
-                self.cache
-                    .lock()
-                    .unwrap()
-                    .insert(resolved_id.clone(), stored.clone());
-                return Ok(stored);
-            }
-        }
-
-        // 6. 交互 prompt——password 在 headless 下硬错误，绝不落明文。
+        // 5. 交互 prompt——password 在 headless 下硬错误，绝不落明文。
         let has_tty = self.prompter.is_interactive();
         if is_password && !has_tty {
             return Err(InputResolveError::Secret(
@@ -228,17 +208,10 @@ impl InputResolver {
 
         let value = self.prompt_value(&cfg, &resolved_id)?;
 
-        // 解析后持久化（仅交互 prompt 得值时）：password → keyring；非密钥 → 明文 value store。
-        if has_tty {
-            if is_password {
-                if !self.secret_store.set(&resolved_id, &value_as_str(&value)) {
-                    tracing::debug!(id = %resolved_id, "keyring unavailable, secret cached only (not plaintext)");
-                }
-            } else if is_plain_persistable {
-                if let Err(e) = self.value_store.set(&resolved_id, value.clone()) {
-                    tracing::warn!(id = %resolved_id, error = %e, "failed to persist non-secret value");
-                }
-            }
+        // 解析后持久化：D1（#112 S5）已硬退役明文 value store——非密钥值**不再落盘**，仅进程内缓存（会话级）。
+        // password 交互得值仍写 OS keyring（加密、非明文）；keyring 不可用 → 仅会话缓存、绝不明文。
+        if has_tty && is_password && !self.secret_store.set(&resolved_id, &value_as_str(&value)) {
+            tracing::debug!(id = %resolved_id, "keyring unavailable, secret cached only (not plaintext)");
         }
 
         self.cache
@@ -335,7 +308,6 @@ mod tests {
     use crate::mcp_clients::model::{CommandInput, PickStringInput, PromptStringInput};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
-    use tempfile::TempDir;
 
     // ---- 测试替身 / test doubles -------------------------------------------
     struct FakeKeyring {
@@ -408,10 +380,6 @@ mod tests {
         })
     }
 
-    fn value_store(dir: &TempDir) -> ValueStore {
-        ValueStore::with_path(dir.path().join("input-values.json"))
-    }
-
     // ---- env_var_name -------------------------------------------------------
     #[test]
     fn env_var_name_normalizes() {
@@ -424,8 +392,7 @@ mod tests {
 
     // ---- 解析链顺序 / chain ordering ---------------------------------------
     #[test]
-    fn env_beats_keyring_and_value_store() {
-        let dir = TempDir::new().unwrap();
+    fn env_beats_keyring() {
         let mut env = EnvMap::new();
         env.insert("A2C_INPUT_TOK".to_string(), "from-env".to_string());
         let ks = secret_store(true);
@@ -434,7 +401,6 @@ mod tests {
             [prompt_input("tok", true)],
             Box::new(NonInteractivePrompter),
             Some(env),
-            Some(value_store(&dir)),
             Some(ks),
         );
         assert_eq!(
@@ -445,14 +411,12 @@ mod tests {
 
     #[test]
     fn keyring_used_for_password_secret() {
-        let dir = TempDir::new().unwrap();
         let ks = secret_store(true);
         ks.set("tok", "kr-secret");
         let resolver = InputResolver::new(
             [prompt_input("tok", true)],
             Box::new(NonInteractivePrompter),
             Some(EnvMap::new()),
-            Some(value_store(&dir)),
             Some(ks),
         );
         assert_eq!(
@@ -462,31 +426,11 @@ mod tests {
     }
 
     #[test]
-    fn value_store_used_for_non_secret() {
-        let dir = TempDir::new().unwrap();
-        let vs = value_store(&dir);
-        vs.set("region", json!("us-east-1")).unwrap();
-        let resolver = InputResolver::new(
-            [prompt_input("region", false)],
-            Box::new(NonInteractivePrompter),
-            Some(EnvMap::new()),
-            Some(vs),
-            Some(secret_store(true)),
-        );
-        assert_eq!(
-            resolver.resolve_by_id("region", None, None).unwrap(),
-            json!("us-east-1")
-        );
-    }
-
-    #[test]
     fn password_headless_hard_errors_never_plaintext() {
-        let dir = TempDir::new().unwrap();
         let resolver = InputResolver::new(
             [prompt_input("secret", true)],
             Box::new(NonInteractivePrompter), // 无 TTY
             Some(EnvMap::new()),
-            Some(value_store(&dir)),
             Some(secret_store(false)), // keyring 不可用
         );
         match resolver.resolve_by_id("secret", None, None) {
@@ -500,7 +444,6 @@ mod tests {
 
     #[test]
     fn interactive_prompt_persists_secret_to_keyring_and_caches() {
-        let dir = TempDir::new().unwrap();
         let ks = secret_store(true);
         let resolver = InputResolver::new(
             [prompt_input("apikey", true)],
@@ -509,7 +452,6 @@ mod tests {
                 prompted: StdMutex::new(vec![]),
             }),
             Some(EnvMap::new()),
-            Some(value_store(&dir)),
             Some(ks),
         );
         // 首次：prompt → 持久化 keyring
@@ -525,31 +467,50 @@ mod tests {
     }
 
     #[test]
-    fn non_secret_prompt_persists_to_value_store() {
-        let dir = TempDir::new().unwrap();
-        let vs = value_store(&dir);
+    fn non_secret_prompt_resolves_and_caches_without_persistence() {
+        // D1（#112 S5）：明文 value store 已硬退役——非密钥交互得值不再落盘，仅进程内缓存。二次解析命中缓存、不再 prompt。
+        let prompter = std::sync::Arc::new(RecordingPrompter {
+            answer: "eu".into(),
+            prompted: StdMutex::new(vec![]),
+        });
+        struct SharedPrompter(std::sync::Arc<RecordingPrompter>);
+        impl Prompter for SharedPrompter {
+            fn is_interactive(&self) -> bool {
+                self.0.is_interactive()
+            }
+            fn prompt_string(&self, m: &str, p: bool, d: Option<&str>) -> std::io::Result<String> {
+                self.0.prompt_string(m, p, d)
+            }
+            fn pick_string(
+                &self,
+                m: &str,
+                o: &[String],
+                d: Option<usize>,
+            ) -> std::io::Result<String> {
+                self.0.pick_string(m, o, d)
+            }
+        }
         let resolver = InputResolver::new(
             [prompt_input("region", false)],
-            Box::new(RecordingPrompter {
-                answer: "eu".into(),
-                prompted: StdMutex::new(vec![]),
-            }),
+            Box::new(SharedPrompter(prompter.clone())),
             Some(EnvMap::new()),
-            Some(ValueStore::with_path(vs.path().to_path_buf())),
             Some(secret_store(true)),
         );
         assert_eq!(
             resolver.resolve_by_id("region", None, None).unwrap(),
             json!("eu")
         );
-        // 落了明文 value store / persisted to plaintext store
-        assert_eq!(vs.get("region"), Some(json!("eu")));
+        assert_eq!(
+            resolver.resolve_by_id("region", None, None).unwrap(),
+            json!("eu")
+        );
+        // 仅 prompt 一次（二次命中会话缓存）；期间从未落盘明文。
+        assert_eq!(prompter.prompted.lock().unwrap().len(), 1);
     }
 
     // ---- 池前缀回退 / prefixed-pool fallback --------------------------------
     #[test]
     fn bare_id_falls_back_to_prefixed_pool_entry() {
-        let dir = TempDir::new().unwrap();
         // 池里只有带前缀的 figma@acme/token；plugin 上下文用裸 token 引用
         let prefixed = MCPServerInput::PromptString(PromptStringInput {
             id: "figma@acme/token".to_string(),
@@ -563,7 +524,6 @@ mod tests {
             [prefixed],
             Box::new(NonInteractivePrompter),
             Some(env),
-            Some(value_store(&dir)),
             Some(secret_store(true)),
         );
         assert_eq!(
@@ -582,7 +542,6 @@ mod tests {
     // ---- pick（交互 seam）---------------------------------------------------
     #[test]
     fn pick_resolves_via_prompter() {
-        let dir = TempDir::new().unwrap();
         let pick = MCPServerInput::PickString(PickStringInput {
             id: "env".to_string(),
             description: String::new(),
@@ -596,7 +555,6 @@ mod tests {
                 prompted: StdMutex::new(vec![]),
             }),
             Some(EnvMap::new()),
-            Some(value_store(&dir)),
             Some(secret_store(true)),
         );
         assert_eq!(
@@ -608,7 +566,6 @@ mod tests {
     // ---- command 非交互：headless 照常执行（parity 修复）---------------------
     #[test]
     fn command_resolves_headless_via_subprocess() {
-        let dir = TempDir::new().unwrap();
         let cmd = MCPServerInput::Command(CommandInput {
             id: "greeting".to_string(),
             description: String::new(),
@@ -620,7 +577,6 @@ mod tests {
             [cmd],
             Box::new(NonInteractivePrompter),
             Some(EnvMap::new()),
-            Some(value_store(&dir)),
             Some(secret_store(true)),
         );
         assert_eq!(

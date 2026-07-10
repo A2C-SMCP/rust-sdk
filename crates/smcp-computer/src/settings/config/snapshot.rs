@@ -570,7 +570,6 @@ fn get_object(map: &Map<String, Value>, key: &str) -> BTreeMap<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inputs::value_store::ValueStore;
     use crate::settings::reconciler::{InstalledPluginRecord, KnownMarketplaceEntry};
     use crate::settings::store::{
         empty_known_marketplaces, save_known_marketplaces, update_installed_plugins,
@@ -787,8 +786,9 @@ mod tests {
 
     #[test]
     fn snapshot_never_injects_store_values_or_renders_placeholders() {
-        // 非欺骗性守护验收 #3：即便 value_store 里存有 tok 的明文，快照也绝不注入它、绝不渲染 ${input:tok}。
-        // 判定标准：若实现回归为读 store 并渲染，`SUPER_SECRET_XYZ` 会出现在 TOKEN 里 → 断言失败。
+        // 非欺骗性守护验收 #3：即便磁盘上残留旧明文（legacy input-values.json），快照也绝不读它、绝不渲染 ${input:tok}。
+        // 判定标准：若实现回归为读盘并渲染，`SUPER_SECRET_XYZ` 会出现在 TOKEN 里 → 断言失败。
+        // 注：明文 value store 已于 #112 S5 硬退役，此处直接投放 legacy 文件模拟旧版本残留。
         let tmp = TempDir::new().unwrap();
         let mut env = xdg_env(&tmp);
         env.insert(
@@ -804,10 +804,14 @@ mod tests {
                 "inputs": [{"type":"PromptString","id":"tok","description":"a token","password":true}]
             }"#,
         );
-        // 在 store 投放明文——快照必须不带出它（同 env 路径，回归读 store 即会命中）。
-        ValueStore::new(Some(&env))
-            .set("tok", json!("SUPER_SECRET_XYZ"))
-            .unwrap();
+        // 直接在 legacy XDG state 路径投放明文残留——快照必须不带出它（回归读盘即会命中）。
+        write(
+            &tmp.path()
+                .join("state")
+                .join("a2c")
+                .join("input-values.json"),
+            r#"{"tok":"SUPER_SECRET_XYZ"}"#,
+        );
 
         let snap = resolve_snapshot(SnapshotArgs {
             cwd: Some(&wd),

@@ -14,8 +14,15 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum RenderError {
+    /// 占位符引用的 input **未定义**（不在 inputs 池中）——**保留占位符原样、不报错**（VS Code parity）。
+    /// Placeholder references an undefined input → left verbatim, not an error.
     #[error("Input not found: {0}")]
     InputNotFound(String),
+    /// 占位符引用的 input **已定义但无法解析**（无 resolver / env / 默认值，#112 S5 D1）——**向上传播**，
+    /// 由调用方映射为结构化 [`ComputerError::InputResolution`](crate::errors::ComputerError::InputResolution)。
+    /// 与 [`RenderError::InputNotFound`] 的「保留原样」语义**刻意区分**：这是必填值缺失，绝不静默用空串。
+    #[error("Input unresolved: {0}")]
+    InputUnresolved(String),
     #[error("Render depth exceeded")]
     DepthExceeded,
     #[error("Invalid placeholder format")]

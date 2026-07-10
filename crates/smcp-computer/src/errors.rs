@@ -120,6 +120,12 @@ pub enum ComputerError {
     #[error("Render error: {0}")]
     /// 渲染错误 / Render error
     RenderError(String),
+
+    #[error("Input resolution error: {0}")]
+    /// D1 运行期 input/secret 解析错误（#112 S5）：必填 input 未解析且无默认值 → 结构化错误（**非仅日志**），
+    /// 由 client 经 `RuntimeOptions.input_resolver` / `secret_resolver` 补录。SDK 不落盘明文值/secret。
+    /// Structured input-resolution error surfaced instead of silently defaulting to an empty string。
+    InputResolution(#[from] crate::inputs::runtime_resolver::InputResolutionError),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {
@@ -160,6 +166,7 @@ impl ComputerError {
             ComputerError::ValidationError(_) => 400,    // BAD_REQUEST
             ComputerError::InvalidConfiguration(_) => 400, // BAD_REQUEST
             ComputerError::RenderError(_) => 400,        // BAD_REQUEST
+            ComputerError::InputResolution(_) => 400, // BAD_REQUEST（client 须补录 input/secret）
 
             // 连接错误 / Connection errors
             ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR

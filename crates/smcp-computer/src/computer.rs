@@ -56,7 +56,10 @@ use crate::errors::{ComputerError, ComputerResult};
 use crate::inputs::handler::InputHandler;
 use crate::inputs::load_env_file;
 use crate::inputs::model::InputValue;
-use crate::inputs::utils::run_command;
+use crate::inputs::runtime_resolver::{
+    InputKind, InputResolutionError, InputValueResolver, SecretValueResolver,
+};
+use crate::inputs::{env_var_name, utils::run_command};
 use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{
@@ -316,6 +319,14 @@ pub struct Computer<S: Session> {
     desktop_window_uris: Arc<RwLock<HashSet<String>>>,
     /// MCP 变化通知单消费者任务句柄（boot 起、disconnect 停）/ MCP change-notification consumer task handle。
     mcp_notify_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    // ── #112 S5：D1 运行期 input/secret 注入契约 / D1 runtime input/secret injection ──────────
+    /// client 注入的 input 值 resolver（= `RuntimeOptions.input_resolver`；缺省 None）。D1：SDK 不落盘明文值，
+    /// server-start 渲染 `${input:*}` 时经此向 client 取值 / client-provided input resolver。
+    input_resolver: Option<Arc<dyn InputValueResolver>>,
+    /// client 注入的 secret resolver（= `RuntimeOptions.secret_resolver`；缺省 None）。仅 `password:true` input 走此，
+    /// SDK 不落盘 secret 明文 / client-provided secret resolver。
+    secret_resolver: Option<Arc<dyn SecretValueResolver>>,
 }
 
 /// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
@@ -335,6 +346,34 @@ fn reconcile_orphans_in(
     for name in to_orphan {
         registry.mark_orphan(&name);
     }
+}
+
+/// 递归扫描配置 JSON，收集所有 `${input:<id>}` 引用的 input id（#112 S5）/ collect referenced input ids。
+///
+/// 与 [`ConfigRender`](crate::mcp_clients::ConfigRender) 同一占位符文法（`\$\{input:<id>}`）。供
+/// [`render_server_config`](Computer::render_server_config) **只解析被引用的 input**——未被引用者不 resolve，从而不触发
+/// 其 resolver / keyring / command 副作用，也天然容忍其缺失。占位符替换不递归到替换值内，故单次扫描原始配置即完整。
+fn collect_referenced_input_ids(config: &serde_json::Value) -> HashSet<String> {
+    // 与 `mcp_clients::render::ConfigRender` 同一占位符文法；hoist 为 static 避免每次渲染重新编译。
+    static INPUT_PLACEHOLDER_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\$\{input:([^}]+)}").expect("static input-placeholder regex")
+        });
+    fn walk(v: &serde_json::Value, re: &regex::Regex, out: &mut HashSet<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                for cap in re.captures_iter(s) {
+                    out.insert(cap[1].to_string());
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, re, out)),
+            serde_json::Value::Object(m) => m.values().for_each(|x| walk(x, re, out)),
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    walk(config, &INPUT_PLACEHOLDER_RE, &mut out);
+    out
 }
 
 /// 合并 VS Code 风格 `envFile` 的 `KEY=VALUE` 进 stdio `server_parameters.env`（显式 env 胜，§9.1）/
@@ -585,6 +624,8 @@ impl<S: Session> Computer<S> {
             inflight_tool_tasks: Arc::new(StdMutex::new(HashMap::new())),
             desktop_window_uris: Arc::new(RwLock::new(HashSet::new())),
             mcp_notify_task: Arc::new(Mutex::new(None)),
+            input_resolver: None,
+            secret_resolver: None,
         }
     }
 
@@ -1212,6 +1253,26 @@ impl<S: Session> Computer<S> {
         self
     }
 
+    /// 注入 D1 运行期 input resolver（#112 S5）/ Inject the client input resolver。
+    ///
+    /// server-start 渲染 `${input:<id>}` 时，非密钥 input 优先经此向 client 取值；缺省不注入则回退
+    /// env / session / 定义默认值，仍缺 → 结构化 [`ComputerError::InputResolution`]。SDK 不落盘明文值。
+    #[must_use]
+    pub fn with_input_resolver(mut self, resolver: Arc<dyn InputValueResolver>) -> Self {
+        self.input_resolver = Some(resolver);
+        self
+    }
+
+    /// 注入 D1 运行期 secret resolver（#112 S5）/ Inject the client secret resolver。
+    ///
+    /// 仅 `password:true` input 走此（如 [`KeyringSecretResolver`](crate::inputs::KeyringSecretResolver)）；SDK 不落盘
+    /// secret 明文。缺省不注入则该 secret 走 env / session / 默认值，仍缺 → 结构化 [`ComputerError::InputResolution`]。
+    #[must_use]
+    pub fn with_secret_resolver(mut self, resolver: Arc<dyn SecretValueResolver>) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
     /// 获取计算机名称 / Get computer name
     pub fn name(&self) -> &str {
         &self.name
@@ -1337,6 +1398,74 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
+    /// D1（#112 S5）运行期解析单个 input：SDK 不落盘明文值/secret，缺失且无默认值 → 结构化错误（**非仅日志**）。
+    ///
+    /// 解析序：**client resolver**（`secret_resolver` / `input_resolver`，D1 权威源）→ **env** `A2C_INPUT_<ID>`
+    /// （编排注入）→ **session**（自定义交互 Session 给真值 / `SilentSession` 给 default-or-empty；Command 经此执行）
+    /// → **定义默认值** → [`InputResolutionError::Missing`]。仅当既无 resolver/env/session 命中**且**无默认值时硬错
+    /// （有默认值仍回退默认，保后向兼容）。value store 明文已硬退役——本路径不落盘任何明文。
+    async fn resolve_one_input(&self, input: &MCPServerInput) -> ComputerResult<serde_json::Value> {
+        // Command：非交互 subprocess，经 session 执行（无默认值；失败即 Err，不静默）。
+        if let MCPServerInput::Command(_) = input {
+            return self.session.resolve_input(input).await;
+        }
+
+        let is_secret =
+            matches!(input, MCPServerInput::PromptString(p) if p.password.unwrap_or(false));
+        let kind = if is_secret {
+            InputKind::Secret
+        } else {
+            InputKind::Value
+        };
+
+        // 1. client resolver（D1 权威源；keyring 亦作为一种 secret resolver 由 client opt-in 注入）。
+        if is_secret {
+            if let Some(resolver) = &self.secret_resolver {
+                if let Some(secret) = resolver.resolve_secret(input).await? {
+                    return Ok(serde_json::Value::String(secret));
+                }
+            }
+        } else if let Some(resolver) = &self.input_resolver {
+            if let Some(value) = resolver.resolve_input(input).await? {
+                return Ok(value);
+            }
+        }
+
+        // 2. 环境变量 A2C_INPUT_<ID>（编排层注入）。
+        if let Ok(env_val) = std::env::var(env_var_name(input.id())) {
+            return Ok(serde_json::Value::String(env_val));
+        }
+
+        // 3. session（自定义交互 Session 可给真值；SilentSession 给 default-or-empty）。
+        //    - Ok(空串) 仅在「有默认值」时算有意义（显式空默认），否则视作未命中继续回退——区分「无默认值缺失」与「解析到空」。
+        //    - Err（自定义 Session 硬失败，如 GUI 关闭 / IPC 断）：有默认值则回退默认（后向兼容），否则**上抛真实错误**
+        //      优于误导性 Missing（SilentSession 永不 Err，故仅影响自定义 Session）。
+        match self.session.resolve_input(input).await {
+            Ok(value) => {
+                let is_empty_string =
+                    matches!(&value, serde_json::Value::String(s) if s.is_empty());
+                if !is_empty_string || input.default().is_some() {
+                    return Ok(value);
+                }
+            }
+            Err(e) => {
+                if input.default().is_none() {
+                    return Err(e);
+                }
+            }
+        }
+
+        // 4. 定义默认值（后向兼容：有默认值绝不硬错）。
+        if let Some(default) = input.default() {
+            return Ok(default);
+        }
+
+        // 5. 无 resolver / env / session / 默认值 → 结构化缺失错误（非仅日志，绝不静默用空串）。
+        Err(ComputerError::InputResolution(
+            InputResolutionError::missing(input.id(), kind),
+        ))
+    }
+
     /// 渲染服务器配置 / Render server configuration
     /// 解析配置中的 ${input:xxx} 占位符，通过 Session 获取输入值
     /// Parse ${input:xxx} placeholders in config, get input values through Session
@@ -1355,43 +1484,63 @@ impl<S: Session> Computer<S> {
         let inputs_clone: std::collections::HashMap<String, MCPServerInput> = inputs.clone();
         drop(inputs); // 释放读锁 / Release read lock
 
-        // 首先预解析所有输入值 / Pre-resolve all input values first
-        // 这样可以在闭包中使用解析后的值
-        // This allows using resolved values in the closure
+        // 预解析 input 值（D1 #112 S5：client resolver → env → session → 默认值 → 结构化缺失，见
+        // [`resolve_one_input`](Self::resolve_one_input)）。**只解析本 server 配置真正引用（`${input:<id>}`）的
+        // input**——未被引用的 input 根本不 resolve，从而既不触发其 resolver / keyring / command 副作用，也天然容忍
+        // 其缺失（不误伤本次渲染）。resolve 失败先不上抛，仅在渲染真正取用时才 surface 结构化错误。
+        // Resolve only inputs actually referenced by this config: no side effects & natural tolerance for the rest.
+        let referenced = collect_referenced_input_ids(&config_json);
         let mut resolved_values: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
-        for (input_id, input) in inputs_clone.iter() {
-            match self.session.resolve_input(input).await {
+        let mut deferred_errors: std::collections::HashMap<String, ComputerError> =
+            std::collections::HashMap::new();
+        for input_id in &referenced {
+            // 未定义的引用（不在 inputs 池）→ 跳过，闭包将回退 `InputNotFound` → 保留占位符原样（VS Code parity）。
+            let Some(input) = inputs_clone.get(input_id) else {
+                continue;
+            };
+            match self.resolve_one_input(input).await {
                 Ok(value) => {
                     resolved_values.insert(input_id.clone(), value);
                 }
                 Err(e) => {
-                    debug!(
-                        "Failed to resolve input '{}': {}, will use default",
-                        input_id, e
-                    );
-                    // 使用默认值作为回退 / Use default value as fallback
-                    if let Some(default) = input.default() {
-                        resolved_values.insert(input_id.clone(), default);
-                    }
+                    // 未解析（无默认值的结构化缺失 / resolver 硬失败 / command 执行失败 / session 硬失败）→ 暂存；引用取用时上抛。
+                    deferred_errors.insert(input_id.clone(), e);
                 }
             }
         }
 
-        // 创建输入解析闭包 / Create input resolver closure
-        let resolver = |input_id: String| {
-            let values = resolved_values.clone();
-            async move {
-                if let Some(value) = values.get(&input_id) {
-                    Ok(value.clone())
-                } else {
-                    Err(RenderError::InputNotFound(input_id))
+        // 渲染配置。输入解析闭包：命中 → 值；已定义但未解析 → `InputUnresolved`（向上传播）；未定义 →
+        // `InputNotFound`（保留原样）。闭包内联（非具名 local）——其对 `resolved_values`/`deferred_errors` 的不可变
+        // 借用随本语句 `;` 结束，故下方 match 可安全 `remove(&id)`。`render_result` 自身不带借用。
+        let render_result = renderer
+            .render(config_json, |input_id: String| {
+                let value = resolved_values.get(&input_id).cloned();
+                let is_deferred = deferred_errors.contains_key(&input_id);
+                async move {
+                    match value {
+                        Some(v) => Ok(v),
+                        None if is_deferred => Err(RenderError::InputUnresolved(input_id)),
+                        None => Err(RenderError::InputNotFound(input_id)),
+                    }
                 }
-            }
-        };
+            })
+            .await;
 
-        // 渲染配置 / Render config
-        let rendered_json = renderer.render(config_json, resolver).await?;
+        // 引用到「已定义但无法解析」的 input → 上抛暂存的结构化错误（非静默空串）；未定义占位符 → 已被 renderer 保留原样。
+        // A referenced-but-unresolvable input surfaces its structured error instead of silently defaulting.
+        let rendered_json = match render_result {
+            Ok(v) => v,
+            Err(RenderError::InputUnresolved(id)) => {
+                return Err(deferred_errors.remove(&id).unwrap_or_else(|| {
+                    ComputerError::InputResolution(InputResolutionError::missing(
+                        id,
+                        InputKind::Value,
+                    ))
+                }));
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // #68：envFile 合并——把渲染后 envFile 的 `KEY=VALUE` 并入 stdio `server_parameters.env`（显式胜）。
         // envFile merge: fold envFile's KEY=VALUE into stdio env (explicit env wins).
@@ -2134,6 +2283,9 @@ impl<S: Session> Computer<S> {
             // desktop 缓存共享（clone 与本体同一 window:// 集合视图）；通知任务句柄不复制（仅本体持有消费者）。
             desktop_window_uris: Arc::clone(&self.desktop_window_uris),
             mcp_notify_task: Arc::new(Mutex::new(None)),
+            // resolver 注入随 clone 保留（handler 路径不渲染 server config，仅占位满足 struct 完整性）。
+            input_resolver: self.input_resolver.clone(),
+            secret_resolver: self.secret_resolver.clone(),
         }
     }
 
@@ -2320,6 +2472,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
             // desktop 缓存共享（clone 与本体同一 window:// 集合视图）；通知任务句柄不复制（仅本体持有消费者）。
             desktop_window_uris: Arc::clone(&self.desktop_window_uris),
             mcp_notify_task: Arc::new(Mutex::new(None)),
+            // resolver 注入随 clone 保留（handler 路径不渲染 server config，仅占位满足 struct 完整性）。
+            input_resolver: self.input_resolver.clone(),
+            secret_resolver: self.secret_resolver.clone(),
         }
     }
 }
@@ -4020,6 +4175,242 @@ mod tests {
             }
             _ => panic!("Expected Stdio config"),
         }
+    }
+
+    // ── #112 S5：D1 运行期 resolver 契约 + 结构化缺失 / D1 runtime resolver contract + structured missing ──
+
+    /// 测试用 map-backed input resolver / test double。
+    struct MapInputResolver(HashMap<String, serde_json::Value>);
+    #[async_trait]
+    impl crate::inputs::runtime_resolver::InputValueResolver for MapInputResolver {
+        async fn resolve_input(
+            &self,
+            def: &MCPServerInput,
+        ) -> Result<Option<serde_json::Value>, InputResolutionError> {
+            Ok(self.0.get(def.id()).cloned())
+        }
+    }
+
+    /// 测试用 map-backed secret resolver / test double。
+    struct MapSecretResolver(HashMap<String, String>);
+    #[async_trait]
+    impl crate::inputs::runtime_resolver::SecretValueResolver for MapSecretResolver {
+        async fn resolve_secret(
+            &self,
+            def: &MCPServerInput,
+        ) -> Result<Option<String>, InputResolutionError> {
+            Ok(self.0.get(def.id()).cloned())
+        }
+    }
+
+    fn prompt_def(id: &str, default: Option<&str>, password: bool) -> MCPServerInput {
+        MCPServerInput::PromptString(PromptStringInput {
+            id: id.to_string(),
+            description: String::new(),
+            default: default.map(|s| s.to_string()),
+            password: Some(password),
+        })
+    }
+
+    fn stdio_with_arg(arg: &str) -> MCPServerConfig {
+        MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
+            name: "s".to_string(),
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: std::collections::HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![arg.to_string()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+            },
+        })
+    }
+
+    fn rendered_arg0(cfg: MCPServerConfig) -> String {
+        match cfg {
+            MCPServerConfig::Stdio(c) => c.server_parameters.args[0].clone(),
+            _ => panic!("Expected Stdio config"),
+        }
+    }
+
+    #[tokio::test]
+    async fn render_errors_structured_when_no_default_no_resolver_referenced() {
+        // D1 验收：引用到「已定义、无默认值、无 resolver/env」的 input → 结构化 InputResolution（非静默空串）。
+        let mut inputs = HashMap::new();
+        inputs.insert("s5_tok".to_string(), prompt_def("s5_tok", None, false));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true);
+        let err = computer
+            .render_server_config(&stdio_with_arg("${input:s5_tok}"))
+            .await
+            .unwrap_err();
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::Missing { id, .. }) => {
+                assert_eq!(id, "s5_tok");
+            }
+            other => panic!("expected structured InputResolution::Missing, got {other:?}"),
+        }
+        assert_eq!(err.error_code(), 400);
+    }
+
+    #[tokio::test]
+    async fn render_resolves_no_default_input_via_injected_resolver() {
+        // D1：无默认值 input 经 client input_resolver 取值（SDK 不落盘明文）。
+        let mut inputs = HashMap::new();
+        inputs.insert("s5_url".to_string(), prompt_def("s5_url", None, false));
+        let mut m = HashMap::new();
+        m.insert(
+            "s5_url".to_string(),
+            serde_json::Value::String("https://injected".to_string()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:s5_url}"))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "https://injected");
+    }
+
+    #[tokio::test]
+    async fn render_resolves_secret_via_injected_secret_resolver() {
+        // D1：password:true input 经 client secret_resolver 取值（SDK 不落盘 secret 明文）。
+        let mut inputs = HashMap::new();
+        inputs.insert("s5_key".to_string(), prompt_def("s5_key", None, true));
+        let mut m = HashMap::new();
+        m.insert("s5_key".to_string(), "sk-injected".to_string());
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_secret_resolver(Arc::new(MapSecretResolver(m)));
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:s5_key}"))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "sk-injected");
+    }
+
+    #[tokio::test]
+    async fn render_tolerates_unreferenced_unresolvable_input() {
+        // 容忍：全局池里有个无法解析的 input，但本 server 不引用它 → 渲染照常成功（不误伤）。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "s5_orphan".to_string(),
+            prompt_def("s5_orphan", None, false),
+        );
+        inputs.insert(
+            "s5_used".to_string(),
+            prompt_def("s5_used", Some("U"), false),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true);
+        // 仅引用 s5_used（有默认值）；s5_orphan 无法解析但未被引用。
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:s5_used}"))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "U");
+    }
+
+    /// 恒硬失败的 input resolver / always-failing test double。
+    struct FailingInputResolver;
+    #[async_trait]
+    impl crate::inputs::runtime_resolver::InputValueResolver for FailingInputResolver {
+        async fn resolve_input(
+            &self,
+            def: &MCPServerInput,
+        ) -> Result<Option<serde_json::Value>, InputResolutionError> {
+            Err(InputResolutionError::resolver_failed(def.id(), "boom"))
+        }
+    }
+
+    #[tokio::test]
+    async fn render_propagates_resolver_hard_failure() {
+        // resolver 侧硬失败（Err）→ 引用取用时 propagate（区别于「未提供」的 Ok(None) 回退）。
+        let mut inputs = HashMap::new();
+        inputs.insert("s5_fail".to_string(), prompt_def("s5_fail", None, false));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(FailingInputResolver));
+        let err = computer
+            .render_server_config(&stdio_with_arg("${input:s5_fail}"))
+            .await
+            .unwrap_err();
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::ResolverFailed { id, .. }) => {
+                assert_eq!(id, "s5_fail");
+            }
+            other => panic!("expected ResolverFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn render_secret_input_not_resolved_by_input_resolver() {
+        // 安全隔离：仅注入 input_resolver（含同 id 值），input 为 password:true → secret 绝不走 input_resolver，
+        // 落到结构化 Missing{kind:Secret}（而非泄漏 input_resolver 里的值）。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "s5_sec_iso".to_string(),
+            prompt_def("s5_sec_iso", None, true),
+        );
+        let mut m = HashMap::new();
+        m.insert(
+            "s5_sec_iso".to_string(),
+            serde_json::Value::String("LEAKED".to_string()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let err = computer
+            .render_server_config(&stdio_with_arg("${input:s5_sec_iso}"))
+            .await
+            .unwrap_err();
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::Missing { id, kind, .. }) => {
+                assert_eq!(id, "s5_sec_iso");
+                assert_eq!(*kind, InputKind::Secret);
+            }
+            other => panic!("expected Missing(Secret), got {other:?}"),
+        }
+        assert!(
+            !format!("{err}").contains("LEAKED"),
+            "input_resolver 值绝不得泄漏到 secret 解析"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_resolves_input_via_env_fallback() {
+        // env `A2C_INPUT_<ID>` 回退（= 豁免无损迁移后用户重新提供值的迁移路径）。用唯一 id 避免跨测污染。
+        let id = "s5_env_hit_uid";
+        let var = env_var_name(id); // A2C_INPUT_S5_ENV_HIT_UID
+        std::env::set_var(&var, "from-env-fallback");
+        let mut inputs = HashMap::new();
+        inputs.insert(id.to_string(), prompt_def(id, None, false));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true);
+        let rendered = computer
+            .render_server_config(&stdio_with_arg(&format!("${{input:{id}}}")))
+            .await;
+        std::env::remove_var(&var);
+        assert_eq!(rendered_arg0(rendered.unwrap()), "from-env-fallback");
+    }
+
+    #[tokio::test]
+    async fn render_resolves_command_input_via_session() {
+        // Command input：经 session subprocess 执行、渲染其输出（resolve_one_input 的 Command 分支）。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "s5_cmd".to_string(),
+            MCPServerInput::Command(CommandInput {
+                id: "s5_cmd".to_string(),
+                description: String::new(),
+                command: "echo cmd-out".to_string(),
+                args: None,
+            }),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true);
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:s5_cmd}"))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "cmd-out");
     }
 
     #[test]
