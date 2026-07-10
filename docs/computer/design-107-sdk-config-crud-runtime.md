@@ -234,7 +234,20 @@ S1 ──> S7 ComputerStatusSnapshot + revision + event stream(补 status/subscr
 S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:update_*)
 ```
 
-**建议顺序**：`S1 → S2 →（S3, S5 并行）→ S4 → S7 → S6 → S8`。
+**建议顺序**：`S1 → S2 →（S3, S5 并行）→ S4 → S7 → S6 → S8`。**全部子任务已落地（#108/#109/#110/#111/#112/#113/#114/#115）**。
+
+> **S8（#115）落地要点**（`tests/config_runtime_regression.rs`，纯集成回归 + 吸收 S6 审查遗留 R1）：
+> - **集成回归**（11 例）逐条守护 #107 验收：CRUD roundtrip（runtime mutate→落盘→fresh reload）、migration 幂等、
+>   `validate_config` schema-only（不探测环境）、D1 inputs 边界 + import/export 脱敏（引用留/明文去/丢 local 层）、
+>   **disable≠remove**（override 落 `*.local.json`、声明不动、不 bump config revision）、只读 policy origin→`ReadOnlyOrigin`
+>   整批零落盘、runtime mutate→`config_revision ⊥ capability_revision` + `ComputerEvent` 广播、**Http→`streamable`
+>   全链路往返**（S6 审查 R2）、enable/disable→resolved-scope 落盘（非恒定 user）、lifecycle 不变量（boot/shutdown
+>   终态 + 未连接 gate）、跨-SDK 快照 schema 桩（python 未实现前守顶层形态漂移）。
+> - **R1（S6 审查遗留，方案 A）落地**：enable/disable_plugin 从**无条件 bump** 改为**内容真变才 bump**——installer
+>   `apply_enabled_plugin_write`/`write_enabled_plugin`/`enable_plugin`/`disable_plugin` 改返 `Result<bool>`（据实际写盘
+>   结果），Computer wrapper 仅 `changed` 时 bump config revision + `emit_update_config`。**false-negative 安全**（写了即真
+>   变、no-op 跳写盘），对齐 add/remove 的对称语义。隔离审查（Step7）无 🔴，两 🟡（回归测试自身隔离硬化 env 注入 /
+>   补 enable wrapper 幂等断言）+ 一 🟢（rustdoc 同步）全修。
 **先落地价值最高**：S1 + S2（地基）与 S6（补 `#96/#102` 同源的"改动落盘"洞）。
 
 | 子任务 | 对应 #107 建议拆分 | 依赖 | 是否 greenfield |
@@ -246,7 +259,7 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 | S5 inputs 边界订正 ✅#112 | （D1 派生） | S1 | 改造 |
 | S6 runtime 落盘接线 ✅#113 | 5,7 | S3,S7 ✅ | 接线（已落地）|
 | S7 status snapshot + events ✅#114 | 7 | S1 | 半（已落地）|
-| S8 连接态 robot 同步 | 8 | S6 | 接线（已有 emit_update_config） |
+| S8 集成回归守护 ✅#115 | 8 | S4,S5,S6,S7 | 纯测试（末端汇聚）|
 
 ---
 

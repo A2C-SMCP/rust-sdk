@@ -900,8 +900,9 @@ impl<S: Session> Computer<S> {
     /// 启用单个 plugin（廉价复原：复活 skills + 重挂 server；hook 失败原子回滚）/ enable a plugin。
     ///
     /// **scope（#113 S6）**：`options.scope` 缺省时从 ledger 安装记录**消解**（[`resolve_plugin_install_scope`]，
-    /// **非恒定 user**，守「与安装 scope 一致」契约）；显式传入则原样尊重。成功后 bump **config** revision +
-    /// `emit_update_config`（`enabledPlugins` 变；bundled server 若翻活经 hooks 走 [`mount_server`] 另 bump capability）。
+    /// **非恒定 user**，守「与安装 scope 一致」契约）；显式传入则原样尊重。**仅当 `enabledPlugins` 内容真变**时
+    /// bump **config** revision + `emit_update_config`（#115 R1：installer 据实际写盘返回 `changed`，幂等 re-enable
+    /// 不虚假 bump / 不惊动 robot）；bundled server 若翻活经 hooks 走 [`mount_server`] 另 bump capability（§12 R2 正交）。
     ///
     /// [`resolve_plugin_install_scope`]: Self::resolve_plugin_install_scope
     ///
@@ -931,22 +932,28 @@ impl<S: Session> Computer<S> {
             crate::settings::installer::enable_plugin(plugin_id, &mut reg, &home, effective, hooks)
                 .await
         };
-        if res.is_ok() {
-            self.mark_skills_dirty();
-            // enabledPlugins 变 → config revision +1（§12 R2）+ 通知 robot / notify robot of config change。
-            // ⚠️ S8 跟进（审查 R1）：此处**无条件** bump，不像 add/remove 那样「内容真变才 bump」——installer 对已
-            // 启用再 enable 返回幂等 Ok，故会有一次幂等 re-enable 的虚假 bump。对称门控需比对跨 scope enabledPlugins
-            // 投影（有 false-negative 风险，须整合测试起底），故随 R2 的 http 全链路往返一并入 S8 集成回归。
-            self.bump_config_revision();
-            let _ = self.emit_update_config().await;
+        match res {
+            Ok(changed) => {
+                // skills 可能因孤儿复活而变（installer 无条件 re-stage），故 mark_skills_dirty 不受 changed 门控。
+                self.mark_skills_dirty();
+                // #115 R1（方案 A）：只在 `enabledPlugins` **内容真变**时 bump config revision + 通知 robot——
+                // installer 据实际写盘结果返回 `changed`；幂等 re-enable（已启用）→ false → 不虚假 bump、不惊动
+                // robot（对齐 add/remove「真变才 bump」，false-negative 安全：写了即真变）。§12 R2：config ⊥
+                // capability——server 重挂的能力变化由 MCP start/stop 各自 bump capability，与此正交。
+                if changed {
+                    self.bump_config_revision();
+                    let _ = self.emit_update_config().await;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        res
     }
 
     /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；可经 [`enable_plugin`] 复原）/ disable。
     ///
-    /// **scope（#113 S6）**：同 [`enable_plugin`](Self::enable_plugin)——缺省时按安装记录消解、成功后 bump config
-    /// revision + `emit_update_config`。
+    /// **scope（#113 S6）**：同 [`enable_plugin`](Self::enable_plugin)——缺省时按安装记录消解；**仅当 `enabledPlugins`
+    /// 内容真变**时 bump config revision + `emit_update_config`（#115 R1：重复 disable 不虚假 bump）。
     ///
     /// # Errors
     /// 见 [`PluginInstallError`]（id 非法 / settings 写 / `remove_server` 失败）。
@@ -972,16 +979,21 @@ impl<S: Session> Computer<S> {
             crate::settings::installer::disable_plugin(plugin_id, &mut reg, &home, effective, hooks)
                 .await
         };
-        if res.is_ok() {
-            self.mark_skills_dirty();
-            // enabledPlugins 变 → config revision +1（§12 R2）+ 通知 robot / notify robot of config change。
-            // ⚠️ S8 跟进（审查 R1）：此处**无条件** bump，不像 add/remove 那样「内容真变才 bump」——installer 对已
-            // 启用再 enable 返回幂等 Ok，故会有一次幂等 re-enable 的虚假 bump。对称门控需比对跨 scope enabledPlugins
-            // 投影（有 false-negative 风险，须整合测试起底），故随 R2 的 http 全链路往返一并入 S8 集成回归。
-            self.bump_config_revision();
-            let _ = self.emit_update_config().await;
+        match res {
+            Ok(changed) => {
+                // skills orphan / server 停摘幂等，projection 可能变 → mark_skills_dirty 不受 changed 门控。
+                self.mark_skills_dirty();
+                // #115 R1（方案 A）：只在 `enabledPlugins` **内容真变**时 bump config revision + 通知 robot——
+                // installer 据实际写盘结果返回 `changed`；已禁用再禁用 → false → 不虚假 bump。§12 R2：config ⊥
+                // capability——server 停摘的能力变化由 MCP stop 各自 bump capability，与此正交。
+                if changed {
+                    self.bump_config_revision();
+                    let _ = self.emit_update_config().await;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        res
     }
 
     /// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联停摘 bundled server + 删账本）/ uninstall。

@@ -279,7 +279,7 @@ pub async fn plugin_enable(
         )
         .await;
         match res {
-            Ok(()) => {}
+            Ok(_changed) => {}
             Err(PluginInstallError::Conflict(e)) => {
                 return plugin_err(
                     &e.to_string(),

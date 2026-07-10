@@ -257,7 +257,7 @@ fn apply_enabled_plugin_write(
     scope: &str,
     project_path: Option<&str>,
     env: Option<&EnvMap>,
-) -> Result<(), PluginInstallError> {
+) -> Result<bool, PluginInstallError> {
     let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
     let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
     inner.insert(plugin_id.to_string(), wv);
@@ -265,12 +265,19 @@ fn apply_enabled_plugin_write(
     updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
 
     // 外层 `?`：锁失败（[`SettingsStoreError`]）；内层 `?`：写 I/O（[`io::Error`]）。
-    store::with_settings_lock(&path, || -> io::Result<()> {
+    // 返回 `changed`＝enabledPlugins 内容**真变**（#115 R1，方案 A）：内容未变（幂等 re-enable /
+    // 重复 disable）→ **跳过写盘**（不扰 mtime、无文件 churn），供 Computer 层据「实际写盘结果」
+    // **只在真变时** bump config revision + 通知 robot——false-negative 安全（写了就是真变）。
+    let changed = store::with_settings_lock(&path, || -> io::Result<bool> {
         let (existing, _errors) = load_settings_file(&path, scope_enum);
         let updated = apply_write(&existing, &updates);
-        store::atomic_write_settings_json(&path, &Value::Object(updated))
+        if updated == existing {
+            return Ok(false); // 内容未变 → 不触碰文件。
+        }
+        store::atomic_write_settings_json(&path, &Value::Object(updated))?;
+        Ok(true)
     })??;
-    Ok(())
+    Ok(changed)
 }
 
 /// 写 `enabledPlugins[<plugin_id>] = value`（enable/disable 用）/ Write the enable flag。
@@ -280,7 +287,7 @@ fn write_enabled_plugin(
     scope: &str,
     project_path: Option<&str>,
     env: Option<&EnvMap>,
-) -> Result<(), PluginInstallError> {
+) -> Result<bool, PluginInstallError> {
     apply_enabled_plugin_write(
         plugin_id,
         WriteValue::Set(Value::Bool(value)),
@@ -885,6 +892,9 @@ pub async fn uninstall_plugin(
 /// parity，由调用方决策）。⚠️ **非原子**：先写 settings 再摘 server / orphan skill；`remove_server` 抛错留半态——靠
 /// reconcile 兜底。
 ///
+/// # Returns
+/// `Ok(changed)`＝`enabledPlugins[id]` 是否真的从 true→false（#115 R1）；已禁用再禁用 → `Ok(false)`。
+///
 /// # Errors
 /// id 非法 / settings 写失败 / `remove_server` 失败 → [`PluginInstallError`]。
 pub async fn disable_plugin(
@@ -893,10 +903,12 @@ pub async fn disable_plugin(
     home: &Path,
     options: DisableOptions<'_>,
     hooks: Option<&dyn McpInstallHooks>,
-) -> Result<(), PluginInstallError> {
+) -> Result<bool, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
     let scope = options.scope.unwrap_or("user");
-    write_enabled_plugin(plugin_id, false, scope, options.project_path, options.env)?;
+    // `changed`＝enabledPlugins 真的从 true→false（#115 R1）；已 disable 再 disable → false。server 停摘 /
+    // skill orphan 幂等、仍无条件执行（不因 no-op 而漏兜底），仅**配置内容**变化由 `changed` 表达上抛。
+    let changed = write_enabled_plugin(plugin_id, false, scope, options.project_path, options.env)?;
     if let Some(h) = hooks {
         let mut names: Vec<String> = bundled_servers_of(home, plugin_id, options.env)
             .into_iter()
@@ -914,7 +926,7 @@ pub async fn disable_plugin(
         scope,
         "disabled plugin (servers detached, skills orphaned)"
     );
-    Ok(())
+    Ok(changed)
 }
 
 /// 启用单个 plugin（廉价复原，**无需重 clone/重装**）/ Enable = cheap restore (no re-clone)。
@@ -925,6 +937,9 @@ pub async fn disable_plugin(
 ///
 /// ⚠️ **scope 契约**：同 [`disable_plugin`]。
 ///
+/// # Returns
+/// `Ok(changed)`＝`enabledPlugins[id]` 是否真的从非-true→true（#115 R1）；幂等 re-enable → `Ok(false)`。
+///
 /// # Errors
 /// id 非法 / 未安装 / manifest 畸形 / 冲突 / settings 写失败 / 注入失败 → [`PluginInstallError`]。
 pub async fn enable_plugin(
@@ -933,7 +948,7 @@ pub async fn enable_plugin(
     home: &Path,
     options: EnableOptions<'_>,
     hooks: Option<&dyn McpInstallHooks>,
-) -> Result<(), PluginInstallError> {
+) -> Result<bool, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
     let scope = options.scope.unwrap_or("user");
     let timeout = options.timeout.unwrap_or(DEFAULT_GIT_TIMEOUT);
@@ -961,8 +976,10 @@ pub async fn enable_plugin(
         .unwrap_or_default();
     conflict_check(&servers, &existing, &owned)?;
 
-    // ② 写 enabledPlugins[id]=true（冲突预检通过后）。
-    write_enabled_plugin(plugin_id, true, scope, options.project_path, env)?;
+    // ② 写 enabledPlugins[id]=true（冲突预检通过后）。`changed`＝真的从非-true→true（#115 R1）；
+    //    幂等 re-enable（已 true）→ false。skill 复活 / server 重挂幂等、仍无条件跑（半态修复），仅
+    //    **配置内容**变化由 `changed` 上抛供 Computer 决定是否 bump config revision + 通知 robot。
+    let changed = write_enabled_plugin(plugin_id, true, scope, options.project_path, env)?;
 
     // ③ 复活 skills（re-stage：register_or_update 翻活孤儿；复用既有 clone）。
     let (source, _commit_sha) = resolve_marketplace_source(&marketplace, home, env)?;
@@ -1018,7 +1035,7 @@ pub async fn enable_plugin(
         scope,
         "enabled plugin (skills recovered, servers remounted)"
     );
-    Ok(())
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1664,6 +1681,27 @@ mod tests {
         );
         let txt = fs::read_to_string(&user_settings).unwrap();
         assert!(txt.contains("true"));
+
+        // #115 R1（方案 A）：幂等 re-enable（已启用再 enable）→ enabledPlugins 内容未变 → 返回 changed=false，
+        // 供 Computer 层不虚假 bump config revision（步骤 ③④ 的 skill 复活 / server 重挂仍幂等跑，仅**内容**
+        // delta 由 changed 表达）。对齐 disable 的对称语义（首次真变=true）。
+        let hooks3 = RecordingHooks::new();
+        let changed = enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks3),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !changed,
+            "幂等 re-enable（已启用）→ changed=false（不虚假 bump）"
+        );
     }
 
     #[tokio::test]
@@ -1837,6 +1875,42 @@ mod tests {
             Some(env),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn write_enabled_plugin_returns_changed_only_on_real_content_change() {
+        // #115 R1（方案 A）：`apply_enabled_plugin_write` 据**实际写盘**返回 changed——首写真变=true、
+        // 幂等重写同值=false（不写盘）。这是 Computer「只在真变时 bump config revision + 通知 robot」的
+        // 授权信号源，false-negative 安全（写了即真变）。
+        let tmp = TempDir::new().unwrap();
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        ))
+        .collect();
+
+        assert!(
+            write_enabled_plugin("a@mp", true, "user", None, Some(&env)).unwrap(),
+            "首次写 true → 真变"
+        );
+        assert!(
+            !write_enabled_plugin("a@mp", true, "user", None, Some(&env)).unwrap(),
+            "幂等重写同值 true → 无变化（no-op）"
+        );
+        assert!(
+            write_enabled_plugin("a@mp", false, "user", None, Some(&env)).unwrap(),
+            "翻到 false → 真变"
+        );
+        assert!(
+            !write_enabled_plugin("a@mp", false, "user", None, Some(&env)).unwrap(),
+            "重复 disable（false→false）→ 无变化（no-op）"
+        );
+        assert!(
+            write_enabled_plugin("a@mp", true, "user", None, Some(&env)).unwrap(),
+            "再翻 true → 真变"
+        );
     }
 
     #[tokio::test]
