@@ -20,10 +20,12 @@
 *     **胜出 origin**、不带 per-scope 存在性，无法预判哪些 scope 真声明了该实体，故对三个可写 scope **盲发** Delete。
 *     origin ∈ {policy, flag} → 结构化错 `ReadOnlyOrigin`（#109 验收）。
 *
-* ⚠️ **执行器契约（S3 必须遵守）/ Executor contract (S3 MUST honor)**：
+* ⚠️ **执行器契约（S3 已兑现，见 `executor.rs`）/ Executor contract (honored by `executor.rs`)**：
 *   - `apply_write`（`scope.rs`）对**缺失父键**的 `WriteValue::Object{..Delete}` 会**物化空对象**（如
-*     `{"servers":{}}`），**不是**干净 noop。故 S3 落盘前**必须**比对 `apply_write` 结果与 existing，**相等则跳过写**
-*     （no-change → 不落盘）。否则本函数 Remove 的 fan-out 会在**从未声明该实体**的 scope 凭空创建空 `{"servers":{}}` 文件。
+*     `{"servers":{}}`），**不是**干净 noop。故落盘前须判 no-change 跳过写——但**字节级** `updated == existing`
+*     **不够**（`{"servers":{}}` ≠ `{}` 仍会误写）；正确规则是**语义比对**：剥离两侧的纯空对象脚手架后相等则跳过
+*     （`executor::apply_value_op` 实现）。否则本函数 Remove 的 fan-out 会在**从未声明该实体**的 scope 凭空建空
+*     `{"servers":{}}` 文件。
 *   - `StringSetInsert/Remove`：S3 读-改-写目标 scope 的该数组——insert **去重**、对**缺失字段** insert 则**新建数组**、
 *     对缺失成员/缺失字段 remove 为 **noop**。这两个 op 是本函数对「复用 `WriteValue`」的必要偏离（`WriteValue::Set`
 *     整体替换数组、无法表达成员增删，且 S1 未投影 `disabledMcpjsonServers` 现值故纯函数无法就地构造新数组）。

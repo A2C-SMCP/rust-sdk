@@ -219,7 +219,7 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 
 ## 12. 风险 / 待议
 
-- **R1 多 scope remove 策略**：✅ **已拍板（#109）**=删**所有可写 scope**（真删干净）；origin=policy/flag → `ReadOnlyOrigin` 硬错（非 partial）。执行器（S3）须对 no-change 写跳过落盘（`apply_write` 缺失父键会物化空对象，非干净 noop），否则 fan-out 会散布空 `{"servers":{}}` 文件。
+- **R1 多 scope remove 策略**：✅ **已拍板（#109）**=删**所有可写 scope**（真删干净）；origin=policy/flag → `ReadOnlyOrigin` 硬错（非 partial）。✅ **执行器已落地（#110，`config/executor.rs`）**：no-change 判定用**精确语义比对**（`is_no_change`/`strip_fresh_scaffold`——只剥「本次写新物化、且在 existing 缺失/非对象」的空对象脚手架，**不**对称剥两侧，故既不凭空建 `{"servers":{}}`、也不误跳磁盘上空对象值 server 的真实删除）。多文件 fan-out 落盘前加 pre-flight 只读探测（corrupt/IO），收窄半落盘窗口。
 - **R2 revision 语义**：capability revision 与 config revision 是否同一单调计数？建议分离（config 改不一定改 capability）。
 - **R3 value_store 退役的兼容**：现有落盘明文值的用户升级路径——一次性迁移到 resolver 注入，或读时告警不写。需 migration note。
 - **R4 duplicate/import 跨机**：协议 §5.8「install path 非权威、boot 重校验」——duplicate 到新 `config_dir` 后物化账本须重建，不可照搬 installPath。

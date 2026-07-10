@@ -10,6 +10,8 @@
 * 子任务地基 / foundation of #107 sub-tasks: S1 快照(本模块) → S2 写目标消解器 → S3 CRUD → …（见 design-107 §9）。
 */
 
+pub mod crud;
+pub mod executor;
 pub mod snapshot;
 pub mod write_target;
 
@@ -22,4 +24,9 @@ pub use snapshot::{
 pub use write_target::{
     resolve_write_target, ConfigEntity, EditIntent, ScopeAnchors, WritePlan, WriteScope,
     WriteTargetError, WriteTargetOp, WriteTargetOptions,
+};
+pub use executor::{execute_write_plans, ExecutorError};
+pub use crud::{
+    delete_config, duplicate_config, init_config, load_config, load_project_config_doc,
+    save_config, update_config, ConfigContext, ConfigCrudError, ConfigEdit, ProjectConfigDoc,
 };
