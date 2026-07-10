@@ -171,6 +171,17 @@ enum WriteTargetError {
 
 只做 **schema validation**（现 `schema.rs` 已是此姿态）：version 受支持 / 必填 section / ID 唯一合法 / enum 合法 / 引用**语法**合法。**不**做：secret 可解析、文件存在、marketplace 可达、plugin 可下载、MCP 可启动——这些归 runtime preflight / diagnostics / start。
 
+> **✅ S4 已落地（#111，`config/{validate,portability}.rs`）**：`validate_config(&ProjectConfigDoc)` 复用运行期
+> 校验器（`schema::validate_settings` + `mcp_config::{validate_server,validate_input}`，后二者提为 `pub(crate)`）
+> 逐文件产报告，**零环境探测**；唯一刻意更严=同文件重复 input id（§8「ID 唯一」，loader 静默去重）。
+> `migrate_config` = **幂等形态规范化**（意图层 versionless，**不发明 version 字段**）：settings 采 loader cleaned 形
+> （有损：移除 loader 本就忽略的畸形条目，运行行为无损）、mcp body 逐字保留、只写内容真变的文件。
+> `export_config`/`import_config` 作用于 `ProjectConfigDoc`，**双管脱敏**：① 丢 client-owned 面（`*.local.json` 整层
+> + server `envFile` 机器本地路径）；② **分段脱敏** mcp secret 面（stdio `env` / sse·http `headers` 值 + `url`
+> 内联 userinfo + password 输入 `default`）——逐字保留合法闭合可识别的 `${input:*}`/`${env:*}` 引用、其余每段字面
+> 抹为 `${REDACTED}`（**欠脱敏是危险方向**：整值含任何非引用字面即抹，不因串里出现 `${` 就整值放行）。best-effort：
+> `command`/`args` 密码 flag、url 敏感 query 属未覆盖面（文档如实声明）。import 先脱敏后校验后落盘。
+
 ---
 
 ## 9. 子任务拆解与依赖序（DAG）
@@ -194,7 +205,7 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 | S1 快照 schema + provenance | 1 | — | 是 |
 | S2 写目标消解器 | （新增，#107 未显式列） | — | **是（核心）** |
 | S3 Config CRUD | 2 | S1,S2 | 是 |
-| S4 validate/migrate/import/export | 3,4 | S3 | 半（validate 已有底子） |
+| S4 validate/migrate/import/export ✅#111 | 3,4 | S3 | 半（validate 已有底子）|
 | S5 inputs 边界订正 | （D1 派生） | S1 | 改造 |
 | S6 runtime 落盘接线 | 5,7 | S3,S7 | 接线 |
 | S7 status snapshot + events | 7 | S1 | 半 |

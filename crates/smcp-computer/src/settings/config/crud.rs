@@ -28,12 +28,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use super::super::mcp_config::{
-    workdir_mcp_config_path, workdir_mcp_local_config_path,
-};
-use super::super::scope::{
-    workdir_local_settings_path, workdir_project_settings_path, EnvMap,
-};
+use super::super::mcp_config::{workdir_mcp_config_path, workdir_mcp_local_config_path};
+use super::super::scope::{workdir_local_settings_path, workdir_project_settings_path, EnvMap};
 use super::super::store::{atomic_write_settings_json, with_settings_lock};
 use super::executor::{execute_write_plans, ExecutorError};
 use super::snapshot::{resolve_snapshot, ComputerConfigSnapshot, SnapshotArgs};
@@ -360,10 +356,7 @@ fn remove_if_present(path: &Path) -> Result<(), ConfigCrudError> {
 }
 
 /// 在目标文件旁车锁下执行一次 `io::Result` 操作，双层错误映射到 [`ConfigCrudError::Io`]。
-fn io_locked(
-    path: &Path,
-    work: impl FnOnce() -> io::Result<()>,
-) -> Result<(), ConfigCrudError> {
+fn io_locked(path: &Path, work: impl FnOnce() -> io::Result<()>) -> Result<(), ConfigCrudError> {
     let to_io = |reason: String| ConfigCrudError::Io {
         path: path.to_path_buf(),
         reason,
@@ -443,7 +436,10 @@ mod tests {
         // 幂等：已存在的用户内容不被覆盖。
         write(&mcp, r#"{"servers": {"srv": {"type": "stdio"}}}"#);
         init_config(&fx.wd).unwrap();
-        assert_eq!(read_json(&mcp), json!({"servers": {"srv": {"type": "stdio"}}}));
+        assert_eq!(
+            read_json(&mcp),
+            json!({"servers": {"srv": {"type": "stdio"}}})
+        );
     }
 
     #[test]
@@ -471,7 +467,9 @@ mod tests {
             &ctx,
             &[ConfigEdit::new(
                 ConfigEntity::McpServer("srv".into()),
-                EditIntent::Upsert(json!({"type": "stdio", "server_parameters": {"command": "edited"}})),
+                EditIntent::Upsert(
+                    json!({"type": "stdio", "server_parameters": {"command": "edited"}}),
+                ),
             )],
         )
         .unwrap();
@@ -590,7 +588,10 @@ mod tests {
         assert!(!workdir_mcp_config_path(&fx.wd).exists());
         // 非 SDK 文件 + user ambient 保留。
         assert!(non_sdk.exists(), "非 SDK 文件不得删");
-        assert!(user_mcp_config_path(Some(&fx.env)).exists(), "user ambient 不得碰");
+        assert!(
+            user_mcp_config_path(Some(&fx.env)).exists(),
+            "user ambient 不得碰"
+        );
     }
 
     #[test]
@@ -602,7 +603,10 @@ mod tests {
             &workdir_mcp_config_path(&fx.wd),
             r#"{"servers": {"srv": {"type": "stdio"}}}"#,
         );
-        write(&workdir_project_settings_path(&fx.wd), r#"{"strictKnownMarketplaces": true}"#);
+        write(
+            &workdir_project_settings_path(&fx.wd),
+            r#"{"strictKnownMarketplaces": true}"#,
+        );
         // ambient home 账本（带 installPath）——不应被 duplicate 搬运。
         update_installed_plugins(
             |file| {
@@ -639,7 +643,10 @@ mod tests {
         // ambient home 账本原封不动（duplicate 未触碰）。
         let ledger_after =
             std::fs::read_to_string(installed_plugins_path(Some(&fx.home), None)).unwrap();
-        assert_eq!(ledger_before, ledger_after, "ambient home 账本不得被 duplicate 触碰");
+        assert_eq!(
+            ledger_before, ledger_after,
+            "ambient home 账本不得被 duplicate 触碰"
+        );
     }
 
     #[test]
@@ -738,6 +745,9 @@ mod tests {
             read_json(&workdir_local_settings_path(&fx.wd)),
             json!({"disabledMcpjsonServers": ["srv"]})
         );
-        assert_eq!(before, after, "mcp disable 是 gating 变更、非 config 声明变更 → config revision 稳定");
+        assert_eq!(
+            before, after,
+            "mcp disable 是 gating 变更、非 config 声明变更 → config revision 稳定"
+        );
     }
 }

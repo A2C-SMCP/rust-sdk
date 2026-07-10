@@ -12,21 +12,25 @@
 
 pub mod crud;
 pub mod executor;
+pub mod portability;
 pub mod snapshot;
+pub mod validate;
 pub mod write_target;
 
+pub use crud::{
+    delete_config, duplicate_config, init_config, load_config, load_project_config_doc,
+    save_config, update_config, ConfigContext, ConfigCrudError, ConfigEdit, ProjectConfigDoc,
+};
+pub use executor::{execute_write_plans, ExecutorError};
+pub use portability::{export_config, import_config, REDACTED_PLACEHOLDER};
 pub use snapshot::{
     resolve_snapshot, ComputerConfigSnapshot, ConfigRevision, EntityKey, InputDefsView,
     MarketplaceGovView, MarketplaceView, McpConfigView, McpServerView, PluginConfigView,
     PluginEnablementView, PluginRecordView, ProvenanceScope, RuntimeDefaults, SkillConfigView,
     SnapshotArgs, SNAPSHOT_VERSION,
 };
+pub use validate::{migrate_config, validate_config, ValidationReport};
 pub use write_target::{
     resolve_write_target, ConfigEntity, EditIntent, ScopeAnchors, WritePlan, WriteScope,
     WriteTargetError, WriteTargetOp, WriteTargetOptions,
-};
-pub use executor::{execute_write_plans, ExecutorError};
-pub use crud::{
-    delete_config, duplicate_config, init_config, load_config, load_project_config_doc,
-    save_config, update_config, ConfigContext, ConfigCrudError, ConfigEdit, ProjectConfigDoc,
 };

@@ -81,7 +81,9 @@ impl std::fmt::Display for ExecutorError {
                     file.display()
                 )
             }
-            ExecutorError::Internal { reason } => write!(f, "executor invariant violated: {reason}"),
+            ExecutorError::Internal { reason } => {
+                write!(f, "executor invariant violated: {reason}")
+            }
         }
     }
 }
@@ -120,11 +122,14 @@ fn execute_one(plan: &WritePlan) -> Result<(), ExecutorError> {
         };
         match next {
             None => Ok(()), // no-change → 不落盘
-            Some(updated) => atomic_write_settings_json(path, &Value::Object(updated))
-                .map_err(|e| ExecutorError::Io {
-                    file: path.to_path_buf(),
-                    reason: e.to_string(),
-                }),
+            Some(updated) => {
+                atomic_write_settings_json(path, &Value::Object(updated)).map_err(|e| {
+                    ExecutorError::Io {
+                        file: path.to_path_buf(),
+                        reason: e.to_string(),
+                    }
+                })
+            }
         }
     })
     .map_err(|e| ExecutorError::Lock {
@@ -322,7 +327,10 @@ mod tests {
         };
         // 首次：文件不存在 → 新建。
         execute_write_plans(std::slice::from_ref(&plan)).unwrap();
-        assert_eq!(read_json(&path), json!({"servers": {"srv": {"type": "stdio"}}}));
+        assert_eq!(
+            read_json(&path),
+            json!({"servers": {"srv": {"type": "stdio"}}})
+        );
         // 记录 mtime，再次执行相同 plan → 语义无变化 → 跳过写（文件不被触碰）。
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         execute_write_plans(std::slice::from_ref(&plan)).unwrap();
@@ -369,7 +377,10 @@ mod tests {
             json!({"servers": {}})
         );
         // project/local：从未声明 → 未凭空建文件。
-        assert!(!project.exists(), "project 从未声明 srv → 不得建空脚手架文件");
+        assert!(
+            !project.exists(),
+            "project 从未声明 srv → 不得建空脚手架文件"
+        );
         assert!(!local.exists(), "local 从未声明 srv → 不得建空脚手架文件");
     }
 
@@ -389,7 +400,10 @@ mod tests {
         };
         execute_write_plans(std::slice::from_ref(&plan)).unwrap();
         // a 删、兄弟 b 保留。
-        assert_eq!(read_json(&path), json!({"servers": {"b": {"type": "http"}}}));
+        assert_eq!(
+            read_json(&path),
+            json!({"servers": {"b": {"type": "http"}}})
+        );
     }
 
     #[test]
@@ -440,7 +454,10 @@ mod tests {
         // 成员存在 → 移除并落盘。
         write(&path, r#"{"disabledMcpjsonServers": ["srv", "keep"]}"#);
         execute_write_plans(std::slice::from_ref(&plan)).unwrap();
-        assert_eq!(read_json(&path), json!({"disabledMcpjsonServers": ["keep"]}));
+        assert_eq!(
+            read_json(&path),
+            json!({"disabledMcpjsonServers": ["keep"]})
+        );
     }
 
     #[test]

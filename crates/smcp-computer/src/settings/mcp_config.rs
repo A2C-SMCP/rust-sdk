@@ -327,7 +327,9 @@ pub fn load_mcp_config_file(
 ///
 /// map **key 即 server 身份**：注入 `name=<key>`；若 `sdef` 内显式 `name` 与 key 冲突 → 判废。剥离
 /// [`VSCODE_EXT_KEYS`] 入 `ext`，其余校验为 [`MCPServerConfig`]。
-fn validate_server(
+///
+/// `pub(crate)`：S4（`config::validate`）复用为 schema-only 校验单元（对内存 doc 校验，无 I/O）。
+pub(crate) fn validate_server(
     name: &str,
     sdef: &Value,
     scope: SettingsScope,
@@ -389,7 +391,9 @@ fn validate_server(
 }
 
 /// 校验单个 input 定义 → [`MCPServerInput`]（畸形 → `None` + 错误，**不抛**）/ Validate one input def。
-fn validate_input(
+///
+/// `pub(crate)`：S4（`config::validate`）复用为 schema-only 校验单元。
+pub(crate) fn validate_input(
     idef: &Value,
     scope: SettingsScope,
     source: Option<&str>,
