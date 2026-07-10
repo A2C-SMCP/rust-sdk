@@ -32,6 +32,9 @@ use crate::blob::{
 };
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
+use crate::settings::config::{
+    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent,
+};
 use crate::settings::installer::{
     DisableOptions, EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError,
     UninstallOptions,
@@ -160,6 +163,33 @@ fn json_to_input_value(value: serde_json::Value) -> ComputerResult<InputValue> {
             "Unsupported value type".to_string(),
         )),
     }
+}
+
+/// 落盘前把类型化 `MCPServerConfig` 的序列化体归一化为 `mcp.json` 规范形（#113 S6）/ canonicalize the persist body。
+///
+/// 两处订正，保**跨 SDK（Python）可读** + Rust 自身重启回读：
+/// 1. 剥内嵌 `name`——map key 即身份（见 [`crate::settings::mcp_config`]，内嵌 `name` 与 key 冲突则判废）。
+/// 2. `type` 判别符归一化为协议 §9.1 规范**小写**：Rust enum 变体名序列化为 `Stdio`/`Sse`/`Http`，改写为
+///    `stdio`/`sse`/`streamable`（Python `Literal` **大小写敏感**；`streamable` 对齐 `StreamableHttpServerConfig`）。
+///    Rust 读端经 `alias` 接受该规范形（见 [`crate::mcp_clients::model::MCPServerConfig`]），故往返无损。
+fn canonicalize_persist_body(mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("name");
+        let canonical = obj.get("type").and_then(serde_json::Value::as_str).map(|t| {
+            match t {
+                "Stdio" => "stdio",
+                "Sse" => "sse",
+                "Http" => "streamable",
+                // 已是规范小写（防御：body 本就规范则原样）/ already canonical.
+                other => other,
+            }
+            .to_string()
+        });
+        if let Some(t) = canonical {
+            obj.insert("type".to_string(), serde_json::Value::String(t));
+        }
+    }
+    body
 }
 
 /// 工具调用历史记录 / Tool call history record
@@ -333,6 +363,12 @@ pub struct Computer<S: Session> {
     /// runtime 生命周期状态 + 分离单调 revision（config ⊥ capability）+ 公开诊断 + 事件广播。`Arc` 跨 clone 共享，
     /// 使 handler-detached 克隆与本体观测同一视图。见 [`crate::status`] / status snapshot + monotonic revisions。
     status: Arc<RuntimeStatus>,
+
+    // ── #113 S6：config 落盘锚点 / config persistence anchor ──────────────────
+    /// SDK-owned config CRUD 的 project 锚点目录（缺省进程 cwd，#98；测试/部署可经 [`with_config_dir`] 注入）。
+    /// runtime mutate（`add_or_update_server`/`remove_server`）落盘经此锚点的 project/local scope，**只碰
+    /// project 含 local、不碰 home**（D1/§2.3 四根边界）。构造期 seam，跨 clone 保留（与 `skill_home_override` 同）。
+    config_dir: Option<PathBuf>,
 }
 
 /// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
@@ -632,6 +668,7 @@ impl<S: Session> Computer<S> {
             mcp_notify_task: Arc::new(Mutex::new(None)),
             input_resolver: None,
             secret_resolver: None,
+            config_dir: None,
             // #114 S7：初始生命周期 = Created（尚未 boot 初始化本地资源）/ status starts at Created。
             status: Arc::new(RuntimeStatus::new()),
         }
@@ -656,6 +693,24 @@ impl<S: Session> Computer<S> {
     pub fn with_blob_thresholds(mut self, thresholds: BlobThresholds) -> Self {
         self.blob_thresholds = thresholds;
         self
+    }
+
+    /// 注入 config 落盘锚点（缺省进程 cwd）/ Inject the config-persistence anchor (default: process cwd)。
+    ///
+    /// #113 S6：`add_or_update_server` / `remove_server` 落盘经此目录的 project/local scope（#98 project 锚点）。
+    /// 测试/部署据此定向落盘目录，避免污染真实进程 cwd。**只碰 project 含 local、不碰 home**。
+    #[must_use]
+    pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config_dir = Some(dir.into());
+        self
+    }
+
+    // ── #113 S6：config 落盘锚点解析 / config anchor resolution ──────────────────
+    /// 解析 config 落盘锚点：override > 进程 cwd（#98：`Computer` 不再持有 workspace，project/local 锚进程 cwd）。
+    fn config_dir(&self) -> PathBuf {
+        self.config_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 
     // ── INT-01 #68：SKILL Home 解析 / SKILL Home resolution ──────────────────
@@ -823,9 +878,32 @@ impl<S: Session> Computer<S> {
         res
     }
 
+    /// 从 ledger 安装记录解析 plugin 的 enable/disable 落盘 scope（#113 S6，DoD item2）/ resolve enable scope from record。
+    ///
+    /// `enabledPlugins` 写入 scope **须与安装 scope 一致**（§5.1）。[`installer`](crate::settings::installer) 层刻意
+    /// **不**回查（账本可含多 scope 记录、回查有歧义，保 Python 行为），把消解托付给 SDK 接线层——本方法即该层：
+    /// **确定性**取该 plugin **首条**安装记录的 `scope`（= 最早安装 / 主 scope）。无安装记录 → `None`（installer
+    /// 回退默认 `user`；enable 本就要求已安装，故正常路径必有记录）。**只读**账本，不改任何状态。
+    fn resolve_plugin_install_scope(
+        &self,
+        plugin_id: &str,
+        home: &std::path::Path,
+        env: Option<&crate::settings::scope::EnvMap>,
+    ) -> Option<String> {
+        let installed = crate::settings::store::load_installed_plugins(Some(home), env);
+        let records = installed.account.plugins.get(plugin_id)?;
+        records
+            .iter()
+            .find_map(|r| r.extra.get("scope").and_then(|v| v.as_str()).map(String::from))
+    }
+
     /// 启用单个 plugin（廉价复原：复活 skills + 重挂 server；hook 失败原子回滚）/ enable a plugin。
     ///
-    /// ⚠️ **scope 契约**：`options.scope` 须与安装 scope 一致（产品 client 从账本 `record.scope` 解析后传）。
+    /// **scope（#113 S6）**：`options.scope` 缺省时从 ledger 安装记录**消解**（[`resolve_plugin_install_scope`]，
+    /// **非恒定 user**，守「与安装 scope 一致」契约）；显式传入则原样尊重。成功后 bump **config** revision +
+    /// `emit_update_config`（`enabledPlugins` 变；bundled server 若翻活经 hooks 走 [`mount_server`] 另 bump capability）。
+    ///
+    /// [`resolve_plugin_install_scope`]: Self::resolve_plugin_install_scope
     ///
     /// # Errors
     /// 见 [`PluginInstallError`]（未安装 / 冲突 / manifest / settings 写 / 注入）。
@@ -836,20 +914,39 @@ impl<S: Session> Computer<S> {
         hooks: Option<&dyn McpInstallHooks>,
     ) -> Result<(), PluginInstallError> {
         let home = self.skill_home();
+        // scope 缺省 → 按安装记录消解（非恒定 user）；resolved 为本地 String，effective 借其，二者同域存活。
+        let resolved_scope = if options.scope.is_none() {
+            self.resolve_plugin_install_scope(plugin_id, &home, options.env)
+        } else {
+            None
+        };
+        let effective = EnableOptions {
+            scope: options.scope.or(resolved_scope.as_deref()),
+            project_path: options.project_path,
+            timeout: options.timeout,
+            env: options.env,
+        };
         let res = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::installer::enable_plugin(plugin_id, &mut reg, &home, options, hooks)
+            crate::settings::installer::enable_plugin(plugin_id, &mut reg, &home, effective, hooks)
                 .await
         };
         if res.is_ok() {
             self.mark_skills_dirty();
+            // enabledPlugins 变 → config revision +1（§12 R2）+ 通知 robot / notify robot of config change。
+            // ⚠️ S8 跟进（审查 R1）：此处**无条件** bump，不像 add/remove 那样「内容真变才 bump」——installer 对已
+            // 启用再 enable 返回幂等 Ok，故会有一次幂等 re-enable 的虚假 bump。对称门控需比对跨 scope enabledPlugins
+            // 投影（有 false-negative 风险，须整合测试起底），故随 R2 的 http 全链路往返一并入 S8 集成回归。
+            self.bump_config_revision();
+            let _ = self.emit_update_config().await;
         }
         res
     }
 
     /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；可经 [`enable_plugin`] 复原）/ disable。
     ///
-    /// ⚠️ **scope 契约**：同 [`enable_plugin`](Self::enable_plugin)。
+    /// **scope（#113 S6）**：同 [`enable_plugin`](Self::enable_plugin)——缺省时按安装记录消解、成功后 bump config
+    /// revision + `emit_update_config`。
     ///
     /// # Errors
     /// 见 [`PluginInstallError`]（id 非法 / settings 写 / `remove_server` 失败）。
@@ -860,13 +957,29 @@ impl<S: Session> Computer<S> {
         hooks: Option<&dyn McpInstallHooks>,
     ) -> Result<(), PluginInstallError> {
         let home = self.skill_home();
+        let resolved_scope = if options.scope.is_none() {
+            self.resolve_plugin_install_scope(plugin_id, &home, options.env)
+        } else {
+            None
+        };
+        let effective = DisableOptions {
+            scope: options.scope.or(resolved_scope.as_deref()),
+            project_path: options.project_path,
+            env: options.env,
+        };
         let res = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::installer::disable_plugin(plugin_id, &mut reg, &home, options, hooks)
+            crate::settings::installer::disable_plugin(plugin_id, &mut reg, &home, effective, hooks)
                 .await
         };
         if res.is_ok() {
             self.mark_skills_dirty();
+            // enabledPlugins 变 → config revision +1（§12 R2）+ 通知 robot / notify robot of config change。
+            // ⚠️ S8 跟进（审查 R1）：此处**无条件** bump，不像 add/remove 那样「内容真变才 bump」——installer 对已
+            // 启用再 enable 返回幂等 Ok，故会有一次幂等 re-enable 的虚假 bump。对称门控需比对跨 scope enabledPlugins
+            // 投影（有 false-negative 风险，须整合测试起底），故随 R2 的 http 全链路往返一并入 S8 集成回归。
+            self.bump_config_revision();
+            let _ = self.emit_update_config().await;
         }
         res
     }
@@ -1587,16 +1700,36 @@ impl<S: Session> Computer<S> {
         Ok(rendered_config)
     }
 
-    /// 动态添加或更新服务器配置 / Add or update server configuration dynamically
-    pub async fn add_or_update_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
-        // 确保管理器已初始化 / Ensure manager is initialized。
-        //
-        // #106 死锁修复：**先 read 探测，仅在确实为 None 时才升级为 write**。governance 路径（CLI
-        // `plugin install` 全程持 `skill_registry` 写锁 → hooks → 此方法）若在此对 `mcp_manager` 取**写锁**，
-        // 与 MCP 变化消费者 [`McpChangeReactor`]「`mcp_manager` 读 → `skill_registry` 写」构成 ABBA 死锁
-        // （原 computer.rs / repl.rs 注释已预警：并发接线 restage 后须统一锁序）。post-boot 管理器恒为
-        // `Some`，此处只取读锁，使 governance 路径退化为「`skill_registry` 写 → `mcp_manager` 读」，与消费者
-        // 的读锁相容（读读不互斥），死锁消除。仅首次（boot 前）冷启动才升级为写锁，彼时消费者尚未 spawn，无并发。
+    /// 仅运行期物化 server（render + manager + 内存投影 + capability bump + emit），**不落盘** / mount at runtime only。
+    ///
+    /// #113 S6：**治理物化**路径专用——[`McpInstallHooks`] 重挂 bundled server、boot 批准挂载、gc teardown 的对侧。
+    /// bundled server 归属 ledger 意图，**绝不能**经此写入 project `mcp.json`（否则卸载后孤儿化、每次 boot remount
+    /// 重写用户配置文件、意图双物化）。**用户声明**的 server 走 [`add_or_update_server`]（先落盘再调本方法）。
+    ///
+    /// - `#106` ABBA：manager 惰性初始化**先 read 探测、仅 None 才升写锁**（governance 路径持 `skill_registry`
+    ///   写锁 → hooks → 此方法；post-boot manager 恒 `Some` 只取读锁，与 [`McpChangeReactor`] 的读锁相容）。
+    /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期物化不改持久 config）。
+    ///
+    /// 生产调用方均在 `cli` 参考 client（[`McpInstallHooks`] 实现 / boot 批准挂载）；非 `cli` 构建下无生产调用者
+    /// （外部 client 亦经此 hooks-facing API 驱动 MCP 重挂），故 gate dead_code / hooks-facing, cli-only in-tree。
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+    pub(crate) async fn mount_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
+        // 渲染并验证配置（**唯一一次** render——resolver 可能有副作用如 keyring/交互取值，禁重复调用）。
+        let validated = self.render_server_config(&server).await?;
+        self.mount_rendered(server, validated).await
+    }
+
+    /// 运行期物化**核心**：入 manager + 内存投影 + capability bump + emit，**不 render、不落盘** / mount core。
+    ///
+    /// #113 S6：抽出以复用于 [`mount_server`]（治理物化，render 后调）与 [`add_or_update_server`]（用户声明，
+    /// 落盘前已 render 一次后调）——二者共用同一次 `render` 结果，**避免重复触发 input/secret resolver 副作用**。
+    /// `raw` 存内存投影（保留 `${input:*}` 引用，与落盘一致）、`validated` 入 manager（渲染后运行期用）。
+    async fn mount_rendered(
+        &self,
+        raw: MCPServerConfig,
+        validated: MCPServerConfig,
+    ) -> ComputerResult<()> {
+        // 确保管理器已初始化（read-first 探测，仅 boot 前冷启动升写锁，彼时消费者尚未 spawn，无并发）。
         if self.mcp_manager.read().await.is_none() {
             let mut manager_guard = self.mcp_manager.write().await;
             if manager_guard.is_none() {
@@ -1604,20 +1737,22 @@ impl<S: Session> Computer<S> {
             }
         }
 
-        // 渲染并验证配置 / Render and validate configuration
-        let validated = self.render_server_config(&server).await?;
-
         // 添加到管理器 / Add to manager
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
-            manager.add_or_update_server(validated).await?;
+        {
+            let manager = self.mcp_manager.read().await;
+            if let Some(ref manager) = *manager {
+                manager.add_or_update_server(validated).await?;
+            }
         }
 
-        // 更新本地配置映射 / Update local configuration map
+        // 更新本地配置映射（存原始引用，与落盘一致）/ Update local configuration map
         {
             let mut servers = self.mcp_servers.write().await;
-            servers.insert(server.name().to_string(), server);
+            servers.insert(raw.name().to_string(), raw);
         }
+
+        // 工具投影变化 → capability revision +1（§12 R2）。
+        self.status.bump_capability();
 
         // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
         let _ = self.emit_update_config().await;
@@ -1625,11 +1760,16 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
-    /// 移除服务器配置 / Remove server configuration
-    pub async fn remove_server(&self, server_name: &str) -> ComputerResult<()> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
-            manager.remove_server(server_name).await?;
+    /// 仅运行期停摘 server（manager + 内存投影 + capability bump + emit），**不落盘** / unmount at runtime only。
+    ///
+    /// #113 S6：**治理级联停摘**专用（uninstall/disable 级联、gc teardown）——不删 project `mcp.json` 声明
+    /// （bundled server 本不在用户 config 层）。**用户删除**走 [`remove_server`]（先落盘删声明再调本方法）。
+    pub(crate) async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
+        {
+            let manager = self.mcp_manager.read().await;
+            if let Some(ref manager) = *manager {
+                manager.remove_server(server_name).await?;
+            }
         }
 
         // 从本地配置映射移除 / Remove from local configuration map
@@ -1638,10 +1778,80 @@ impl<S: Session> Computer<S> {
             servers.remove(server_name);
         }
 
+        // 工具投影变化 → capability revision +1（§12 R2）。
+        self.status.bump_capability();
+
         // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
         let _ = self.emit_update_config().await;
 
         Ok(())
+    }
+
+    /// 动态添加或更新服务器配置（**落盘 + 运行期物化**）/ Add or update a server config (persist + mount)。
+    ///
+    /// #113 S6（补 #96 洞）：用户经此声明的 server 现**落盘**（重启不丢），再运行期物化。
+    /// - **D1 安全**：落盘的是**原始** `server`（保留 `${input:*}`/`${env:*}` 引用），**绝不**落渲染后的明文值/secret。
+    /// - **落盘经 S2 消解器 + S3 执行器**（[`update_config`]）：新 server → project scope；改已有 → 其 origin scope
+    ///   （只碰 project 含 local、不碰 home）。bundled server 名 → 消解器拒（[`WriteTargetError::Synthesized`]）。
+    /// - **§12 R2**：落盘成功后 bump **config** revision；随后运行期物化 bump **capability**。
+    /// - 治理物化（bundled 重挂）**不**走此路径（走 [`mount_server`]），避免 ledger 意图重复写入 mcp.json。
+    ///
+    /// # Errors
+    /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；落盘失败
+    /// （[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期物化失败（manager 错）。
+    pub async fn add_or_update_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
+        // 先 render 校验：非法 config / 无法解析的 input 早失败，**不落盘**（**唯一一次** render，下方物化复用其结果，
+        // 避免重复触发 resolver 副作用）/ validate before persist; single render reused by mount_rendered below。
+        let validated = self.render_server_config(&server).await?;
+
+        // 落盘（原始引用；D1 不落 secret）→ 经 S2 消解器定 scope + S3 执行器两阶段写。
+        let config_dir = self.config_dir();
+        let name = server.name().to_string();
+        let body = canonicalize_persist_body(serde_json::to_value(&server)?);
+        let ctx = ConfigContext::new(&config_dir);
+        // 内容摘要 revision（S1）：仅当真落盘（内容变）才 bump config，避免 no-op/幂等 mutate 虚假 bump（§12 R2）。
+        let before_rev = load_config(&ctx).revision;
+        let edit = ConfigEdit::new(ConfigEntity::McpServer(name), EditIntent::Upsert(body));
+        let after = update_config(&ctx, std::slice::from_ref(&edit))
+            .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
+
+        // 落盘且内容真变 → config revision +1（§12 R2；capability 于 mount_rendered bump）。
+        if after.revision != before_rev {
+            self.bump_config_revision();
+        }
+
+        // 运行期物化（复用上面已 render 的 validated，不重复 render）+ 内存投影 + capability bump + emit。
+        self.mount_rendered(server, validated).await
+    }
+
+    /// 移除服务器配置（**落盘删声明 + 运行期停摘**）/ Remove a server config (persist + unmount)。
+    ///
+    /// #113 S6：删**所有可写 scope** 的声明（S2 R1：真删干净）→ config revision +1 → 运行期停摘。
+    /// 不存在于任何 config scope（如纯运行期实例）→ 落盘幂等 no-op；随后仍停摘运行期实例。bundled server 名 →
+    /// 消解器拒（[`WriteTargetError::Synthesized`]，用户不应经 config 删 plugin 拥有的 server，应 uninstall plugin）。
+    ///
+    /// # Errors
+    /// 落盘失败（[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期停摘失败（manager 错）。
+    pub async fn remove_server(&self, server_name: &str) -> ComputerResult<()> {
+        // 落盘删所有可写 scope 声明（S2 R1）→ 经 S3 执行器 / persist the removal first。
+        let config_dir = self.config_dir();
+        let ctx = ConfigContext::new(&config_dir);
+        // 内容摘要 revision（S1）：删一个不在任何 config scope 的 server → 空计划零落盘 → 不 bump（§12 R2）。
+        let before_rev = load_config(&ctx).revision;
+        let edit = ConfigEdit::new(
+            ConfigEntity::McpServer(server_name.to_string()),
+            EditIntent::Remove,
+        );
+        let after = update_config(&ctx, std::slice::from_ref(&edit))
+            .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
+
+        // 落盘且内容真变 → config revision +1（§12 R2）。
+        if after.revision != before_rev {
+            self.bump_config_revision();
+        }
+
+        // 运行期停摘（manager + 内存投影 + capability bump + emit）。
+        self.unmount_server(server_name).await
     }
 
     /// 更新inputs定义 / Update inputs definition
@@ -2198,10 +2408,10 @@ impl<S: Session> Computer<S> {
 
     /// bump config revision（#113 S6 mutate 落盘接线入口；单调 +1 并广播）/ bump config revision (S6 entry)。
     ///
-    /// S7 只提供本原语与 [`RuntimeStatus`] 底座；config revision 的 mutate-bump 由 S6 在写目标落盘成功后调用
-    /// （config ⊥ capability 分离，设计 §12 R2）。**S7 落地时其生产调用点（S6 mutate 方法）尚未接入**，故非 test
-    /// 构建下暂无调用者——`allow(dead_code)` 仅豁免该过渡态，S6 接线后移除。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// config revision 的 mutate-bump 由 S6 在写目标**落盘成功且内容真变**后调用（config ⊥ capability 分离，
+    /// 设计 §12 R2）。生产调用点：[`add_or_update_server`](Self::add_or_update_server) /
+    /// [`remove_server`](Self::remove_server) / [`enable_plugin`](Self::enable_plugin) /
+    /// [`disable_plugin`](Self::disable_plugin)。
     pub(crate) fn bump_config_revision(&self) -> u64 {
         self.status.bump_config()
     }
@@ -2411,6 +2621,8 @@ impl<S: Session> Computer<S> {
             secret_resolver: self.secret_resolver.clone(),
             // #114 S7：detached 克隆共享同一 RuntimeStatus（观测视图对本体一致）。
             status: Arc::clone(&self.status),
+            // #113 S6：config 锚点是构造期 seam，随 clone 保留（handler 路径不 mutate config，占位满足完整性）。
+            config_dir: self.config_dir.clone(),
         }
     }
 
@@ -2618,6 +2830,8 @@ impl<S: Session + Clone> Clone for Computer<S> {
             secret_resolver: self.secret_resolver.clone(),
             // #114 S7：status 共享（clone 与本体同一观测视图）。
             status: Arc::clone(&self.status),
+            // #113 S6：config 锚点构造期 seam，随 clone 保留。
+            config_dir: self.config_dir.clone(),
         }
     }
 }
@@ -2926,6 +3140,208 @@ mod tests {
             rx.recv().await.unwrap(),
             ComputerEvent::ConfigRevisionBumped { revision: 1 }
         );
+    }
+
+    // ── #113 S6：runtime mutate 落盘接线 / persist-on-mutate wiring ─────────────────
+
+    /// add_or_update_server 落盘到 project scope（重启不丢，补 #96 洞）+ config revision +1（§12 R2）。
+    #[tokio::test]
+    async fn add_or_update_server_persists_to_project_and_survives_reload() {
+        use crate::settings::config::{load_config, ConfigContext};
+        use crate::settings::mcp_config::workdir_mcp_config_path;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path());
+
+        computer
+            .add_or_update_server(user_stdio_server97("persisted"))
+            .await
+            .unwrap();
+
+        // 落盘成功 → config revision 前进；capability 亦 +1（mount_server，工具投影变化）。
+        assert_eq!(computer.config_revision(), 1);
+        assert_eq!(computer.capability_revision(), 1);
+
+        // 落 project mcp.json（**非** user/local；默认 upsert_new_scope=Project）。
+        assert!(
+            workdir_mcp_config_path(tmp.path()).exists(),
+            "应落 project mcp.json"
+        );
+
+        // 「重启」= 以同一 config_dir 重投影快照 → server 仍在（不丢）。
+        let snap = load_config(&ConfigContext::new(tmp.path()));
+        assert!(
+            snap.mcp.servers.iter().any(|s| s.name == "persisted"),
+            "add_or_update_server 应落盘、重投影可读"
+        );
+    }
+
+    /// mount_server（治理物化路径）**不落盘**、只 bump capability 不 bump config——bundled server 归属 ledger
+    /// 意图，不得重复写入 project mcp.json（否则卸载后孤儿化、每次 boot remount 重写用户配置）。
+    #[tokio::test]
+    async fn mount_server_does_not_persist_and_bumps_only_capability() {
+        use crate::settings::config::{load_config, ConfigContext};
+        use crate::settings::mcp_config::workdir_mcp_config_path;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path());
+
+        computer
+            .mount_server(user_stdio_server97("bundled-like"))
+            .await
+            .unwrap();
+
+        // 运行期物化：capability +1，config 不动（分离单调，§12 R2）。
+        assert_eq!(computer.capability_revision(), 1);
+        assert_eq!(computer.config_revision(), 0);
+        // 未落盘：project mcp.json 不存在、快照不含该 server。
+        assert!(
+            !workdir_mcp_config_path(tmp.path()).exists(),
+            "mount_server 不得落盘"
+        );
+        let snap = load_config(&ConfigContext::new(tmp.path()));
+        assert!(!snap.mcp.servers.iter().any(|s| s.name == "bundled-like"));
+    }
+
+    /// remove_server 落盘删声明（S2 R1：删所有可写 scope）+ config revision +1；重投影不再见该 server。
+    #[tokio::test]
+    async fn remove_server_persists_removal_and_bumps_config() {
+        use crate::settings::config::{load_config, ConfigContext};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path());
+
+        computer
+            .add_or_update_server(user_stdio_server97("gone"))
+            .await
+            .unwrap();
+        assert_eq!(computer.config_revision(), 1);
+        assert!(load_config(&ConfigContext::new(tmp.path()))
+            .mcp
+            .servers
+            .iter()
+            .any(|s| s.name == "gone"));
+
+        computer.remove_server("gone").await.unwrap();
+        assert_eq!(computer.config_revision(), 2, "删声明落盘 → config revision 再 +1");
+        assert!(
+            !load_config(&ConfigContext::new(tmp.path()))
+                .mcp
+                .servers
+                .iter()
+                .any(|s| s.name == "gone"),
+            "remove_server 应落盘删声明"
+        );
+    }
+
+    /// DoD item2：enable/disable 落盘 scope 由**安装记录**消解（非恒定 user）——installer 层刻意不回查，SDK
+    /// 接线层从 ledger `record.scope` 确定性取值。缺省时读账本、显式传入时尊重原值。
+    #[tokio::test]
+    async fn resolve_plugin_install_scope_reads_record_scope_not_constant_user() {
+        use crate::settings::store::installed_plugins_path;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().to_path_buf();
+        // 播种账本：plugin `p@m` 装在 **project** scope（非 user）。
+        std::fs::write(
+            installed_plugins_path(Some(&home), None),
+            r#"{"plugins": {"p@m": [{"installPath": "x", "scope": "project"}]}}"#,
+        )
+        .unwrap();
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(&home);
+
+        // 消解到安装记录的 scope（project），而非硬编码 user。
+        assert_eq!(
+            computer.resolve_plugin_install_scope("p@m", &home, None),
+            Some("project".to_string())
+        );
+        // 无记录 → None（installer 回退默认 user；enable 本要求已安装）。
+        assert_eq!(
+            computer.resolve_plugin_install_scope("absent@m", &home, None),
+            None
+        );
+    }
+
+    /// 归一化纯函数：剥内嵌 name + `type` 判别符归协议 §9.1 规范小写（Stdio→stdio / Sse→sse / Http→streamable）。
+    #[test]
+    fn canonicalize_persist_body_strips_name_and_lowercases_type() {
+        use serde_json::json;
+        let out = canonicalize_persist_body(
+            json!({"type": "Stdio", "name": "s", "server_parameters": {"command": "x"}}),
+        );
+        assert_eq!(out["type"], json!("stdio"), "Rust 变体名 Stdio → 规范小写 stdio");
+        assert!(out.get("name").is_none(), "map key 即身份，剥内嵌 name");
+        assert_eq!(out["server_parameters"]["command"], json!("x"), "其余字段保真");
+        assert_eq!(canonicalize_persist_body(json!({"type": "Sse"}))["type"], json!("sse"));
+        // Http → streamable（对齐 Python StreamableHttpServerConfig 的 Literal["streamable"]）。
+        assert_eq!(
+            canonicalize_persist_body(json!({"type": "Http"}))["type"],
+            json!("streamable")
+        );
+        // 已规范则原样（防御）。
+        assert_eq!(canonicalize_persist_body(json!({"type": "stdio"}))["type"], json!("stdio"));
+    }
+
+    /// 🔴 回归守卫：落盘的 `mcp.json` 用协议规范小写判别符（跨 SDK/Python 可读），**非** Rust 变体名 "Stdio"；
+    /// 且经 Rust 读端（alias）往返无损。
+    #[tokio::test]
+    async fn persisted_mcp_json_uses_protocol_canonical_type_token_and_roundtrips() {
+        use crate::settings::config::{load_config, ConfigContext};
+        use crate::settings::mcp_config::workdir_mcp_config_path;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path());
+        computer
+            .add_or_update_server(user_stdio_server97("x"))
+            .await
+            .unwrap();
+
+        // 落盘原始字节：规范小写 `stdio`（非 `Stdio`）、无内嵌 name。
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(workdir_mcp_config_path(tmp.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw["servers"]["x"]["type"],
+            serde_json::json!("stdio"),
+            "跨 SDK 可读需协议规范小写判别符"
+        );
+        assert!(raw["servers"]["x"].get("name").is_none(), "map key 即身份");
+
+        // Rust 读端往返无损（重投影仍解析出该 server）。
+        let snap = load_config(&ConfigContext::new(tmp.path()));
+        assert!(snap.mcp.servers.iter().any(|s| s.name == "x"));
+    }
+
+    /// 🟡 §12 R2：幂等 re-add / no-op remove **不**虚假 bump config revision（内容真变才 bump）。
+    #[tokio::test]
+    async fn idempotent_readd_and_noop_remove_do_not_bump_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path());
+
+        // 首次 add：内容变 → config +1。
+        computer
+            .add_or_update_server(user_stdio_server97("x"))
+            .await
+            .unwrap();
+        assert_eq!(computer.config_revision(), 1);
+
+        // 同内容幂等 re-add：零落盘 → config **不**再 bump。
+        computer
+            .add_or_update_server(user_stdio_server97("x"))
+            .await
+            .unwrap();
+        assert_eq!(computer.config_revision(), 1, "幂等 re-add 不虚假 bump config");
+
+        // 删不存在的 server：空计划零落盘 → config **不** bump。
+        computer.remove_server("never-existed").await.unwrap();
+        assert_eq!(computer.config_revision(), 1, "no-op remove 不虚假 bump config");
+
+        // 真删已存在 → config +1。
+        computer.remove_server("x").await.unwrap();
+        assert_eq!(computer.config_revision(), 2);
     }
 
     #[tokio::test]
@@ -3963,7 +4379,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_management() {
         let session = SilentSession::new("test");
-        let computer = Computer::new("test_computer", session, None, None, true, true);
+        // #113 S6：add/remove_server 现落盘 → 注入隔离 config_dir，避免污染进程 cwd / inject isolated config anchor。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("test_computer", session, None, None, true, true)
+            .with_config_dir(tmp.path());
 
         // 添加服务器配置 / Add server configuration
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
@@ -4939,11 +5358,12 @@ mod tests {
             let ca = Arc::clone(&computer);
             let cfg_a = cfg.clone();
             let a = tokio::spawn(async move {
-                // governance 侧：持 `skill_registry` 写锁跨对 `mcp_manager` 的访问。
+                // governance 侧：持 `skill_registry` 写锁跨对 `mcp_manager` 的访问。#113 S6：治理重挂现经
+                // **运行期物化** `mount_server`（hooks.register_server 的落点；不落盘），与真实 governance 路径一致。
                 let reg = ca.skill_registry_arc();
                 let g = reg.write().await;
                 tokio::task::yield_now().await; // 给 B 抢 mcp_manager.read 的窗口，最大化命中旧 ABBA
-                let _ = ca.add_or_update_server(cfg_a).await;
+                let _ = ca.mount_server(cfg_a).await;
                 drop(g);
             });
             let cb = Arc::clone(&computer);

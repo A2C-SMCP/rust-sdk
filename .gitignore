@@ -21,3 +21,6 @@ target
 .idea/
 coverage-report/
 /.claude/scheduled_tasks.lock
+
+# #113 S6: test config-persistence artifacts (config_dir defaults to process cwd)
+.tfrobot/

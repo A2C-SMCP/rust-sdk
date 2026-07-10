@@ -73,7 +73,8 @@ struct ReplTeardown<'a, S: Session> {
 impl<S: Session> McpTeardown for ReplTeardown<'_, S> {
     async fn teardown(&self, servers: Vec<String>) {
         for name in servers {
-            let _ = self.comp.remove_server(&name).await;
+            // #113 S6：gc 停摘 bundled server 走**运行期卸载**（不删 config 声明）——bundled 归属 ledger、非用户 config。
+            let _ = self.comp.unmount_server(&name).await;
         }
     }
 }

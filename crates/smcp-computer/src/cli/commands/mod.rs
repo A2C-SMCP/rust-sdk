@@ -245,15 +245,17 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
         // `${input:id}` 经 resolver D2 前缀回退命中带前缀池条目（Python `_plugin_register_cb` 已传上下文；
         // 当前 Computer::add_or_update_server 尚不接受该上下文——故 inject_inputs 前缀注入、register 不透传，
         // 暂以「显式引用带前缀 id」可用，裸 id 回退待 #74）。
+        // #113 S6：治理物化走**运行期挂载**（不落盘）——bundled server 归属 ledger 意图，不得写入 project mcp.json。
         self.comp
-            .add_or_update_server(cfg)
+            .mount_server(cfg)
             .await
             .map_err(|e| McpHookError(e.to_string()))
     }
 
     async fn remove_server(&self, name: &str) -> Result<(), McpHookError> {
+        // #113 S6：治理级联停摘走**运行期卸载**（不删 config 声明）——bundled server 本不在用户 config 层。
         self.comp
-            .remove_server(name)
+            .unmount_server(name)
             .await
             .map_err(|e| McpHookError(e.to_string()))
     }

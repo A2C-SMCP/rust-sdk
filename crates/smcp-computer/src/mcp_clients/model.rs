@@ -120,7 +120,10 @@ pub enum MCPServerConfig {
     #[serde(alias = "sse", alias = "SSE")]
     Sse(SseServerConfig),
     /// HTTP类型服务器 / HTTP type server
-    #[serde(alias = "http", alias = "HTTP")]
+    ///
+    /// `streamable` = 协议 §9.1 / Python `StreamableHttpServerConfig` 的**规范判别符**（跨 SDK 一致）；
+    /// `http`/`HTTP` 为 Rust 历史别名。#113 S6 落盘时归一化写 `streamable`，故读端须接受之（否则重启不回读）。
+    #[serde(alias = "http", alias = "HTTP", alias = "streamable")]
     Http(HttpServerConfig),
 }
 

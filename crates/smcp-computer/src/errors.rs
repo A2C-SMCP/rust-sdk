@@ -126,6 +126,13 @@ pub enum ComputerError {
     /// 由 client 经 `RuntimeOptions.input_resolver` / `secret_resolver` 补录。SDK 不落盘明文值/secret。
     /// Structured input-resolution error surfaced instead of silently defaulting to an empty string。
     InputResolution(#[from] crate::inputs::runtime_resolver::InputResolutionError),
+
+    #[error("Config persistence error: {0}")]
+    /// #113 S6：SDK-owned config CRUD 落盘失败（只读 origin / synthesized bundled / 文件锁 / I/O / 损坏文件）。
+    /// 消息由 [`crate::settings::config::ConfigCrudError`] 的 Display 派生——**只含写目标 / 路径 / 原因，无 secret
+    /// 值**（落盘的是原始 `${input:*}` 引用，D1/§4.6.6）。runtime mutate（add_or_update/remove_server）经此报错。
+    /// Config-layer persistence failure surfaced from `update_config`; carries no secret values。
+    ConfigPersist(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {
@@ -199,6 +206,9 @@ impl ComputerError {
 
             // 运行时错误 / Runtime errors
             ComputerError::RuntimeError(_) => 500, // INTERNAL_ERROR
+
+            // #113 S6：config 落盘错误（只读 origin / synthesized / I/O）/ config persistence errors
+            ComputerError::ConfigPersist(_) => 400, // BAD_REQUEST（写目标不可写 / 非法实体）
         }
     }
 }

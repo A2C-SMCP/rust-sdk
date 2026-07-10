@@ -674,6 +674,11 @@ mod tests {
 
     /// 创建测试用的 Computer 实例 / Create test Computer instance
     async fn create_test_computer() -> Computer<SilentSession> {
+        // #113 S6：add/remove_server 现落盘 → 定向到隔离临时目录，避免污染进程 cwd。TempDir 唯一，`forget`
+        // 保留至进程退出（测试期定向落盘、不清理；助手不返回 TempDir 句柄故显式 leak）/ isolated config anchor。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
         Computer::new(
             "test_computer",
             SilentSession::new("test_session"),
@@ -682,6 +687,7 @@ mod tests {
             false,
             false,
         )
+        .with_config_dir(config_dir)
     }
 
     /// 创建测试用的 CommandHandler 实例 / Create test CommandHandler instance

@@ -11,8 +11,10 @@ use tempfile::TempDir;
 /// INT-01 #68：boot_up 起 FS 副作用（建 ~/.a2c/.blobspool + watch ~/.a2c/skills）→ 隔离到 TempDir。
 /// Isolate boot_up's FS side-effects to a TempDir so tests never touch the real home。
 fn isolate_boot(c: Computer<SilentSession>, td: &TempDir) -> Computer<SilentSession> {
+    // #113 S6：add/remove_server 现落盘到 config_dir（缺省进程 cwd）→ 隔离到 TempDir，避免污染仓库工作树。
     c.with_skill_home(td.path().join("skills"))
         .with_blob_cache_root(td.path().join("blob"))
+        .with_config_dir(td.path().join("config"))
 }
 /**
 * 文件名: computer_integration

@@ -67,7 +67,9 @@ fn prompt_line(prompt: &str) -> String {
 
 async fn mount<S: Session>(comp: &Computer<S>, srv: &ResolvedMcpServer) {
     let name = srv.name.clone();
-    match comp.add_or_update_server(merge_mount_config(srv)).await {
+    // #113 S6：boot 批准挂载读的是**已在盘**的 `.tfrobot/mcp.json` 定义 → 走**运行期挂载**（不回写落盘，
+    // 否则重复写用户已声明的 server、可能 scope 漂移）。用户新增走 `Computer::add_or_update_server`。
+    match comp.mount_server(merge_mount_config(srv)).await {
         Ok(()) => msg_ok(&format!("mounted MCP server {name:?}")),
         // 单个 server 挂载失败不阻断其余。
         Err(e) => msg_err(&format!("failed to mount MCP server {name:?}: {e}")),

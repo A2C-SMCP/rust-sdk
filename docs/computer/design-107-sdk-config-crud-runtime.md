@@ -167,12 +167,12 @@ enum WriteTargetError {
 |---|---|---|
 | `list_mcp_servers` / `get_mcp_server` | `list_mcp_servers` / `list_mcp_servers_with_metadata`（`:1952/:1982`） | 补 runtime status 汇总 + revision |
 | `start/stop_mcp_server` | `start/stop_mcp_client`（`:2042/:2058`） | — |
-| `install/enable/disable/uninstall_plugin` | 同名（`:759–:831`） | 接**落盘经消解器**（现 enable/disable scope 靠 caller 传/默认 user） |
+| `install/enable/disable/uninstall_plugin` | 同名 | ✅ **S6 已落地（#113）**：enable/disable scope 由**安装记录消解**（`resolve_plugin_install_scope`，非恒定 user）+ 成功后 bump config revision + emit |
 | `add/refresh/remove marketplace` | 同名（`:699–:736`） | — |
 | `execute_tool` / `cancel` | `execute_tool[_cancellable]` / `acancel_tool`（`:1690–:1918`） | — |
 | `connect/disconnect/join/leave` | 同名（`:2143–:2226`） | — |
 | `status()` / `subscribe_events()` | ✅ **S7 已落地（#114）**：`status.rs` 补 `ComputerStatusSnapshot` + `broadcast` event stream + 分离单调 revision | — |
-| `add_or_update_server`/`remove_server` | 同名（`:1407/:1445`） | **⚠️ 补落盘**（当前纯内存，S6） |
+| `add_or_update_server`/`remove_server` | 同名 | ✅ **S6 已落地（#113）**：经 S2 消解器 + S3 执行器落盘到 project scope → 内容真变才 bump config revision → 运行期物化 |
 
 **核心接线**：所有 mutate 方法从"只改内存"改为"经 Config-CRUD + 写目标消解器落盘 → reload 投影 → bump revision → emit update"。
 
@@ -187,6 +187,20 @@ enum WriteTargetError {
 > （Started）/ shutdown（Shutdown）；**capability revision bump** 于 boot 与 start/stop MCP（工具投影变化，§12 R2）。
 > **shutdown 闸门**（契约 §4.7）：`enter_shutdown` 发唯一终态事件后闸断——此后不再发 stale 事件、bump 降 no-op。
 > `config_revision` 的 mutate-bump 入口 `bump_config_revision()` 已备（S6 落盘成功后调用；S7 落地时暂无生产调用者）。
+
+> **✅ S6 已落地（#113，`computer.rs`）**：runtime mutate 落盘接线（补 #96 洞）。**核心=区隔两类写**：抽
+> `pub(crate) mount_server`/`mount_rendered`/`unmount_server`（**仅运行期物化**：render+manager+内存投影+capability
+> bump+emit，**不落盘**）——**治理物化**路径（`CliMcpHooks::register_server`/`remove_server`、`approval::mount`、
+> `ReplTeardown`、installer 级联）改指向之，使 ledger 拥有的 bundled server **不被写进 project `mcp.json`**（否则卸载
+> 后孤儿化 / 每次 boot remount 重写用户配置）。公开 `add_or_update_server`/`remove_server` = 经 **S2 消解器 + S3 执行器**
+> （`update_config`）落盘到 **project scope**（新 server；改已有落 origin scope）→ **内容真变才** bump config revision
+> （§12 R2；no-op/幂等 mutate 不虚假 bump）→ 运行期物化。**D1 安全**：落盘**原始** `server`（保留 `${input:*}` 引用），
+> **绝不**落渲染后明文/secret；render **仅一次**（`mount_rendered` 复用，避免 resolver 副作用放大）。**跨 SDK 保真**：
+> 落盘前 `canonicalize_persist_body` 剥内嵌 `name`（map key 即身份）+ `type` 判别符归协议 §9.1 规范小写
+> （`Stdio/Sse/Http`→`stdio/sse/streamable`，对齐 Python `Literal`；读端加 `alias="streamable"` 保往返）。**config_dir
+> seam**：新增 `with_config_dir`（缺省进程 cwd，#98 project 锚点）。**plugin scope**：`enable/disable_plugin` scope 缺省
+> 时从 ledger 安装记录 `record.scope` 消解（`resolve_plugin_install_scope`，非恒定 user；installer 层刻意不回查）+ 成功后
+> bump config revision + emit。新增 `ComputerError::ConfigPersist`（400，无 secret）。
 
 ---
 
@@ -230,7 +244,7 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 | S3 Config CRUD | 2 | S1,S2 | 是 |
 | S4 validate/migrate/import/export ✅#111 | 3,4 | S3 | 半（validate 已有底子）|
 | S5 inputs 边界订正 ✅#112 | （D1 派生） | S1 | 改造 |
-| S6 runtime 落盘接线 | 5,7 | S3,S7 ✅ | 接线（S7 已解锁）|
+| S6 runtime 落盘接线 ✅#113 | 5,7 | S3,S7 ✅ | 接线（已落地）|
 | S7 status snapshot + events ✅#114 | 7 | S1 | 半（已落地）|
 | S8 连接态 robot 同步 | 8 | S6 | 接线（已有 emit_update_config） |
 
