@@ -1715,7 +1715,17 @@ impl<S: Session> Computer<S> {
         let rendered_json = apply_env_file(rendered_json);
 
         // 反序列化回配置类型 / Deserialize back to config type
-        let rendered_config: MCPServerConfig = serde_json::from_value(rendered_json)?;
+        let mut rendered_config: MCPServerConfig = serde_json::from_value(rendered_json)?;
+
+        // 协议 0.3.0 §connection-identity = **raw**（a2c-smcp-protocol#17）：bundle_id 缺省生成 MUST 用**未渲染**
+        // 连接身份（`${input:*}` 占位按字面）。故从 **raw `config`**（占位仍在）派生并 stamp 到渲染后配置，使
+        // manager 不从渲染后连接身份派生——否则无名 server 的引用 input/secret 轮换会漂移 bundle_id / exposed 名。
+        // 具名 server 无差（bundle_id = 规范化 name，与 render 无关）；仅无名 fallback 受影响。显式 bundle_id 则保留。
+        if rendered_config.bundle_id().is_none() {
+            rendered_config.set_bundle_id(Some(crate::mcp_clients::bundle_id::derive_bundle_id(
+                config,
+            )));
+        }
 
         Ok(rendered_config)
     }
@@ -5008,6 +5018,51 @@ mod tests {
             other => panic!("expected structured InputResolution::Missing, got {other:?}"),
         }
         assert_eq!(err.error_code(), 400);
+    }
+
+    #[tokio::test]
+    async fn render_stamps_raw_derived_bundle_id_for_nameless_server() {
+        // 协议 0.3.0 §connection-identity=raw（a2c-smcp-protocol#17）：无名 server 的 bundle_id 缺省生成 MUST 用
+        // **未渲染**连接身份（`${input:*}` 占位字面）。render_server_config 须 stamp 从 raw 派生的 bundle_id，
+        // **即便 input 已成功解析**。期望值 = 一致性向量「无名 + stdio env 含 ${input:*}」的 raw 值。
+        let mut inputs = HashMap::new();
+        inputs.insert("api_key".to_string(), prompt_def("api_key", None, false));
+        let mut m = HashMap::new();
+        m.insert(
+            "api_key".to_string(),
+            serde_json::Value::String("secret-xyz".to_string()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+
+        // 无名 stdio（name=""），env 含 ${input:api_key} 占位——与协议向量同构。
+        let mut env = HashMap::new();
+        env.insert("API_KEY".to_string(), "${input:api_key}".to_string());
+        let raw = MCPServerConfig::Stdio(StdioServerConfig::new(
+            "",
+            StdioServerParameters {
+                command: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                env,
+                cwd: None,
+            },
+        ));
+
+        let validated = computer.render_server_config(&raw).await.unwrap();
+        // stamped bundle_id 来自 raw 占位字面（raw 决策），而非渲染后值。
+        assert_eq!(
+            validated.bundle_id(),
+            Some("bundle_68ae00fea9122c01"),
+            "无名 server 应 stamp raw 派生 bundle_id（占位字面），非渲染后值"
+        );
+        // 佐证渲染确实替换了占位（证明 raw≠rendered，测试有区分力）。
+        match &validated {
+            MCPServerConfig::Stdio(vc) => assert_eq!(
+                vc.server_parameters.env.get("API_KEY").map(String::as_str),
+                Some("secret-xyz")
+            ),
+            _ => panic!("expected stdio"),
+        }
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
   "algorithm": {
     "normalize": "按 Unicode 码点迭代 name：非 [A-Za-z0-9_-] → '_'；折叠连续 '_'（含原文 __）为单个、不折叠 '-'；裁首尾 [_-]；不做大小写折叠。",
     "fallback": "normalize 结果为空 → 'bundle_' + lowercase_hex(SHA-256(connection_identity_tlv)[:8])（前 8 字节 = 16 hex）。",
+    "input_state": "connection-identity 取 raw / 未注入配置：${input:*} / ${env:*} / secret 占位按字面参与摘要，MUST NOT 先渲染。故 bundle_id（及 no-double-open 去重键）跨渲染阶段稳定一致。",
     "connection_identity_tlv": "长度前缀字节帧（非 JSON）：字符串字段 = u32-BE 字节长度 ‖ UTF-8 字节；字符串列表 = u32-BE 元素数 ‖ 元素*；字符串映射 = 按 key 升序（UTF-8 字节序=码点序）u32-BE 条目数 ‖ (key‖value)*。stdio = type('stdio') ‖ command ‖ args-list ‖ env-map；streamable/sse = type('streamable'|'sse') ‖ url ‖ headers-map。",
     "explicit": "config.bundle_id 显式给定时直接采用（不生成）；显式值须满足字符集 [A-Za-z0-9_-] 且无 '__'（否则 SDK 报配置错误，不在本向量覆盖）。"
   },
@@ -20,6 +21,8 @@
     {"desc": "CJK 名 → fallback（stdio，env 按 key 排序纳入）", "name": "服务器", "config": {"type": "stdio", "command": "node", "args": ["a.js"], "env": {"TOKEN": "x", "DEBUG": "1"}}, "expected_bundle_id": "bundle_05020ad7c2cc048d"},
     {"desc": "空名 → fallback（streamable http，空 headers）", "name": "", "config": {"type": "streamable", "url": "https://api.example.com/mcp", "headers": {}}, "expected_bundle_id": "bundle_b413b61fe2e77b15"},
     {"desc": "空名 → fallback（streamable http，headers 纳入）", "name": "", "config": {"type": "streamable", "url": "https://api.example.com/mcp", "headers": {"Authorization": "Bearer z"}}, "expected_bundle_id": "bundle_0706e7b45613df7a"},
-    {"desc": "空名 → fallback（sse，与同 url 的 http 因 type 判别符不同而不同）", "name": "", "config": {"type": "sse", "url": "https://api.example.com/sse", "headers": {}}, "expected_bundle_id": "bundle_e1d7b1216a270815"}
+    {"desc": "空名 → fallback（sse，与同 url 的 http 因 type 判别符不同而不同）", "name": "", "config": {"type": "sse", "url": "https://api.example.com/sse", "headers": {}}, "expected_bundle_id": "bundle_e1d7b1216a270815"},
+    {"desc": "无名 + stdio env 含 ${input:*} 占位 → fallback 取 raw（占位字面，MUST NOT 渲染；渲染实现会得不同值）", "name": "", "config": {"type": "stdio", "command": "node", "args": ["server.js"], "env": {"API_KEY": "${input:api_key}"}}, "expected_bundle_id": "bundle_68ae00fea9122c01"},
+    {"desc": "无名 + http header 含 ${input:*} 占位 → fallback 取 raw（占位字面）", "name": "", "config": {"type": "streamable", "url": "https://api.example.com/mcp", "headers": {"Authorization": "Bearer ${input:token}"}}, "expected_bundle_id": "bundle_6366b4fd89f56f6a"}
   ]
 }

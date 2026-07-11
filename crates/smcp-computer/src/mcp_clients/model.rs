@@ -154,6 +154,19 @@ impl MCPServerConfig {
         }
     }
 
+    /// 设置 `bundle_id` 字段（**derive-on-load 物化用**，非回写配置源）/ set the bundle_id field。
+    ///
+    /// 协议 0.3.0 §connection-identity = **raw**：缺省生成须用**未渲染**连接身份。Computer 在 render 后把从
+    /// **raw config**（占位字面）派生的 `bundle_id` stamp 到渲染后配置上，使 manager 不再从渲染后连接身份派生
+    /// （避免无名 server 的 `${input:*}` 轮换致 bundle_id / exposed_tool_name 漂移）。仅改内存投影，**不写 mcp.json**。
+    pub fn set_bundle_id(&mut self, bundle_id: Option<BundleId>) {
+        match self {
+            MCPServerConfig::Stdio(config) => config.bundle_id = bundle_id,
+            MCPServerConfig::Sse(config) => config.bundle_id = bundle_id,
+            MCPServerConfig::Http(config) => config.bundle_id = bundle_id,
+        }
+    }
+
     /// 获取是否禁用标志 / Get disabled flag
     pub fn disabled(&self) -> bool {
         match self {

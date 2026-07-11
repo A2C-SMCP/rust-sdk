@@ -88,8 +88,8 @@ fn bundle_id_conformance_vectors_pass() {
     let doc: serde_json::Value = serde_json::from_str(VECTORS).expect("valid vectors JSON");
     let vectors = doc["vectors"].as_array().expect("vectors array");
     assert!(
-        vectors.len() >= 14,
-        "向量应覆盖全部分叉点，实得 {}",
+        vectors.len() >= 16,
+        "向量应覆盖全部分叉点（含 raw 占位 2 条），实得 {}",
         vectors.len()
     );
 

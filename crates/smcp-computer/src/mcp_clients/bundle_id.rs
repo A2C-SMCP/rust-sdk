@@ -21,6 +21,12 @@
 //! 3. 结果**为空**（name 全为符号 / CJK / 空串）→ `bundle_` + `sha256([connection-identity TLV])[:8]` 小写 hex。
 //!
 //! ## connection-identity TLV 字节帧（[`connection_identity_bytes`]，rust 首版参考实现）
+//!
+//! **input_state = raw**（协议 §connection-identity，a2c-smcp-protocol#17）：摘要输入取 **raw / 未注入**配置——
+//! `${input:*}` / `${env:*}` / secret 占位**按字面**参与，**MUST NOT** 先渲染。本模块的函数 render-agnostic（只序列化
+//! 所给 config 的 env/headers 当前值），**raw 契约由调用方保证**：`Computer::render_server_config` 从 **raw config**
+//! 派生 bundle_id 并 stamp 到渲染后配置（见其实现），使无名 server 的引用 input/secret 轮换**不**漂移 bundle_id。
+//!
 //! 为避免 JSON 跨语言序列化漂移，缺省生成 fallback 的摘要输入用**长度前缀（TLV）字节帧**、**非 JSON**：
 //! - **字符串字段**：`u32-BE 字节长度 ‖ UTF-8 字节`。
 //! - **字符串列表**：`u32-BE 元素数 ‖ 元素(字符串字段)*`（保序）。
