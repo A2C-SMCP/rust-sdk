@@ -97,6 +97,7 @@ mod tests {
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: "test_stdio".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: HashMap::new(),
@@ -119,6 +120,7 @@ mod tests {
         let config = MCPServerConfig::Http(HttpServerConfig {
             env_file: None,
             name: "test_http".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: HashMap::new(),
@@ -139,6 +141,7 @@ mod tests {
         let config = MCPServerConfig::Sse(SseServerConfig {
             env_file: None,
             name: "test_sse".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: HashMap::new(),

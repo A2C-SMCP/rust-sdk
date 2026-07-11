@@ -44,21 +44,15 @@ pub async fn create_test_computer_with_servers() -> Computer<SilentSession> {
     // 添加测试服务器配置 / Add test server config
     servers.insert(
         "test_server".to_string(),
-        MCPServerConfig::Stdio(StdioServerConfig {
-            env_file: None,
-            name: "test_server".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            server_parameters: StdioServerParameters {
+        MCPServerConfig::Stdio(StdioServerConfig::new(
+            "test_server",
+            StdioServerParameters {
                 command: "echo".to_string(),
                 args: vec!["hello".to_string()],
                 env: HashMap::new(),
                 cwd: None,
             },
-        }),
+        )),
     );
 
     let mut inputs = HashMap::new();

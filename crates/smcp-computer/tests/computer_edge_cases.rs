@@ -155,21 +155,15 @@ async fn test_computer_edge_case_servers() {
     computer.boot_up().await.unwrap();
 
     // 测试空服务器名称 / Test empty server name
-    let empty_server = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let empty_server = MCPServerConfig::Stdio(StdioServerConfig::new(
+        "",
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
     // 应该能添加空名称服务器
     // Should be able to add empty name server
@@ -177,42 +171,30 @@ async fn test_computer_edge_case_servers() {
 
     // 测试超长服务器名称 / Test very long server name
     let long_name = "a".repeat(10000);
-    let long_server = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: long_name.clone(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let long_server = MCPServerConfig::Stdio(StdioServerConfig::new(
+        long_name.clone(),
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
     computer.add_or_update_server(long_server).await.unwrap();
     computer.remove_server(&long_name).await.unwrap();
 
     // 测试特殊字符服务器名称 / Test special character server name
     let special_name = "!@#$%^&*()".to_string();
-    let special_server = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: special_name.clone(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let special_server = MCPServerConfig::Stdio(StdioServerConfig::new(
+        special_name.clone(),
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
     computer.add_or_update_server(special_server).await.unwrap();
     computer.remove_server(&special_name).await.unwrap();

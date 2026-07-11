@@ -175,16 +175,19 @@ fn json_to_input_value(value: serde_json::Value) -> ComputerResult<InputValue> {
 fn canonicalize_persist_body(mut body: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = body.as_object_mut() {
         obj.remove("name");
-        let canonical = obj.get("type").and_then(serde_json::Value::as_str).map(|t| {
-            match t {
-                "Stdio" => "stdio",
-                "Sse" => "sse",
-                "Http" => "streamable",
-                // 已是规范小写（防御：body 本就规范则原样）/ already canonical.
-                other => other,
-            }
-            .to_string()
-        });
+        let canonical = obj
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(|t| {
+                match t {
+                    "Stdio" => "stdio",
+                    "Sse" => "sse",
+                    "Http" => "streamable",
+                    // 已是规范小写（防御：body 本就规范则原样）/ already canonical.
+                    other => other,
+                }
+                .to_string()
+            });
         if let Some(t) = canonical {
             obj.insert("type".to_string(), serde_json::Value::String(t));
         }
@@ -892,9 +895,12 @@ impl<S: Session> Computer<S> {
     ) -> Option<String> {
         let installed = crate::settings::store::load_installed_plugins(Some(home), env);
         let records = installed.account.plugins.get(plugin_id)?;
-        records
-            .iter()
-            .find_map(|r| r.extra.get("scope").and_then(|v| v.as_str()).map(String::from))
+        records.iter().find_map(|r| {
+            r.extra
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
     }
 
     /// 启用单个 plugin（廉价复原：复活 skills + 重挂 server；hook 失败原子回滚）/ enable a plugin。
@@ -1456,8 +1462,10 @@ impl<S: Session> Computer<S> {
         // 反映「boot 失败」而非卡在 `Starting`（契约 §3 `error` 语义）。诊断用 `error_code` + 简述，避免透传可能
         // 含渲染细节的 Display 全文。
         if let Err(e) = manager.initialize(validated_servers).await {
-            self.status
-                .set_last_error(Some(format!("boot failed to initialize MCP manager (code {})", e.error_code())));
+            self.status.set_last_error(Some(format!(
+                "boot failed to initialize MCP manager (code {})",
+                e.error_code()
+            )));
             self.status.transition(LifecycleState::Error);
             return Err(e);
         }
@@ -2102,10 +2110,10 @@ impl<S: Session> Computer<S> {
     ) -> ComputerResult<CallToolResult> {
         let manager = self.mcp_manager.read().await;
         if let Some(ref manager) = *manager {
-            // 验证工具调用 / Validate tool call
-            let (server_name, tool_name) =
+            // 验证工具调用（协议 0.3.0：入参为 exposed_tool_name，返回 bundle_id + 展示名 + 原始工具名）。
+            let (bundle_id, server_name, tool_name) =
                 manager.validate_tool_call(tool_name, &parameters).await?;
-            let server_name = server_name.to_string();
+            let server_name = server_name.to_string(); // 人类可读名，供确认回调/历史记录
             let tool_name = tool_name.to_string();
 
             let timestamp = Utc::now();
@@ -2127,7 +2135,7 @@ impl<S: Session> Computer<S> {
                         let timeout_duration = timeout.map(std::time::Duration::from_secs_f64);
                         result = manager
                             .call_tool(
-                                &server_name,
+                                &bundle_id,
                                 &tool_name,
                                 parameters_for_call,
                                 timeout_duration,
@@ -2149,7 +2157,7 @@ impl<S: Session> Computer<S> {
                 let timeout_duration = timeout.map(std::time::Duration::from_secs_f64);
                 result = manager
                     .call_tool(
-                        &server_name,
+                        &bundle_id,
                         &tool_name,
                         parameters_for_call,
                         timeout_duration,
@@ -2223,10 +2231,10 @@ impl<S: Session> Computer<S> {
             ));
         };
 
-        // 校验并解析真实 server/tool（含别名解析）/ validate + resolve real server/tool (alias-aware).
-        let (server_name, resolved_tool) =
+        // 校验并解析真实 bundle_id/server/tool（协议 0.3.0：入参为 exposed_tool_name）。
+        let (bundle_id, server_name, resolved_tool) =
             manager.validate_tool_call(tool_name, &parameters).await?;
-        let server_name = server_name.to_string();
+        let server_name = server_name.to_string(); // 人类可读名，供历史记录
         let resolved_tool = resolved_tool.to_string();
 
         // 登记取消令牌；RAII 守卫覆盖所有返回路径（含本 future 被 drop 的外层取消）注销注册表。
@@ -2245,7 +2253,7 @@ impl<S: Session> Computer<S> {
 
         let outcome = manager
             .call_tool_cancellable(
-                &server_name,
+                &bundle_id,
                 &resolved_tool,
                 parameters.clone(),
                 timeout_duration,
@@ -3121,7 +3129,14 @@ mod tests {
         let mut declared = HashMap::new();
         declared.insert("srv-a".to_string(), user_stdio_server97("srv-a"));
         declared.insert("srv-b".to_string(), user_stdio_server97("srv-b"));
-        let computer = Computer::new("c", SilentSession::new("s"), None, Some(declared), false, false);
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("s"),
+            None,
+            Some(declared),
+            false,
+            false,
+        );
 
         let snap = computer.status().await;
         assert_eq!(snap.lifecycle, LifecycleState::Created);
@@ -3235,7 +3250,11 @@ mod tests {
             .any(|s| s.name == "gone"));
 
         computer.remove_server("gone").await.unwrap();
-        assert_eq!(computer.config_revision(), 2, "删声明落盘 → config revision 再 +1");
+        assert_eq!(
+            computer.config_revision(),
+            2,
+            "删声明落盘 → config revision 再 +1"
+        );
         assert!(
             !load_config(&ConfigContext::new(tmp.path()))
                 .mcp
@@ -3282,17 +3301,31 @@ mod tests {
         let out = canonicalize_persist_body(
             json!({"type": "Stdio", "name": "s", "server_parameters": {"command": "x"}}),
         );
-        assert_eq!(out["type"], json!("stdio"), "Rust 变体名 Stdio → 规范小写 stdio");
+        assert_eq!(
+            out["type"],
+            json!("stdio"),
+            "Rust 变体名 Stdio → 规范小写 stdio"
+        );
         assert!(out.get("name").is_none(), "map key 即身份，剥内嵌 name");
-        assert_eq!(out["server_parameters"]["command"], json!("x"), "其余字段保真");
-        assert_eq!(canonicalize_persist_body(json!({"type": "Sse"}))["type"], json!("sse"));
+        assert_eq!(
+            out["server_parameters"]["command"],
+            json!("x"),
+            "其余字段保真"
+        );
+        assert_eq!(
+            canonicalize_persist_body(json!({"type": "Sse"}))["type"],
+            json!("sse")
+        );
         // Http → streamable（对齐 Python StreamableHttpServerConfig 的 Literal["streamable"]）。
         assert_eq!(
             canonicalize_persist_body(json!({"type": "Http"}))["type"],
             json!("streamable")
         );
         // 已规范则原样（防御）。
-        assert_eq!(canonicalize_persist_body(json!({"type": "stdio"}))["type"], json!("stdio"));
+        assert_eq!(
+            canonicalize_persist_body(json!({"type": "stdio"}))["type"],
+            json!("stdio")
+        );
     }
 
     /// 🔴 回归守卫：落盘的 `mcp.json` 用协议规范小写判别符（跨 SDK/Python 可读），**非** Rust 变体名 "Stdio"；
@@ -3345,11 +3378,19 @@ mod tests {
             .add_or_update_server(user_stdio_server97("x"))
             .await
             .unwrap();
-        assert_eq!(computer.config_revision(), 1, "幂等 re-add 不虚假 bump config");
+        assert_eq!(
+            computer.config_revision(),
+            1,
+            "幂等 re-add 不虚假 bump config"
+        );
 
         // 删不存在的 server：空计划零落盘 → config **不** bump。
         computer.remove_server("never-existed").await.unwrap();
-        assert_eq!(computer.config_revision(), 1, "no-op remove 不虚假 bump config");
+        assert_eq!(
+            computer.config_revision(),
+            1,
+            "no-op remove 不虚假 bump config"
+        );
 
         // 真删已存在 → config +1。
         computer.remove_server("x").await.unwrap();
@@ -3395,9 +3436,17 @@ mod tests {
         // 第三个构造点 clone_for_handlers（socketio-detached handler 克隆）亦须共享同一 status Arc——
         // 否则 handler 路径触发的观测变化对本体割裂不可见。
         let handler_clone = computer.clone_for_handlers();
-        assert_eq!(handler_clone.config_revision(), 2, "handler 克隆须共享 status");
+        assert_eq!(
+            handler_clone.config_revision(),
+            2,
+            "handler 克隆须共享 status"
+        );
         assert_eq!(handler_clone.bump_config_revision(), 3);
-        assert_eq!(computer.config_revision(), 3, "handler 克隆的 bump 须对本体可见");
+        assert_eq!(
+            computer.config_revision(),
+            3,
+            "handler 克隆的 bump 须对本体可见"
+        );
     }
 
     #[tokio::test]
@@ -3416,7 +3465,10 @@ mod tests {
         computer.boot_up().await.unwrap();
         let snap = computer.status().await;
         assert_eq!(snap.lifecycle, LifecycleState::Started);
-        assert!(snap.capability_revision >= 1, "boot 应 bump capability revision");
+        assert!(
+            snap.capability_revision >= 1,
+            "boot 应 bump capability revision"
+        );
         assert!(snap.degraded_reason.is_none());
         assert!(snap.last_error.is_none());
 
@@ -3982,6 +4034,7 @@ mod tests {
         MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: name.to_string(),
+            bundle_id: None,
             disabled: true,
             forbidden_tools: vec![],
             tool_meta: std::collections::HashMap::new(),
@@ -4250,6 +4303,7 @@ mod tests {
             MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
                 name: "server1".to_string(),
+                bundle_id: None,
                 disabled: false,
                 forbidden_tools: vec![],
                 tool_meta: std::collections::HashMap::new(),
@@ -4400,6 +4454,7 @@ mod tests {
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: "test_server".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: std::collections::HashMap::new(),
@@ -4423,6 +4478,7 @@ mod tests {
         let updated_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: "test_server".to_string(),
+            bundle_id: None,
             disabled: true, // 更新为禁用状态 / Update to disabled state
             forbidden_tools: vec!["tool1".to_string()],
             tool_meta: std::collections::HashMap::new(),
@@ -4805,6 +4861,7 @@ mod tests {
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: "test_server".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: std::collections::HashMap::new(),
@@ -4847,6 +4904,7 @@ mod tests {
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: "test_server".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: std::collections::HashMap::new(),
@@ -4911,6 +4969,7 @@ mod tests {
         MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: "s".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: std::collections::HashMap::new(),
@@ -5353,6 +5412,7 @@ mod tests {
         let cfg = MCPServerConfig::Stdio(crate::mcp_clients::model::StdioServerConfig {
             env_file: None,
             name: "gov".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: HashMap::new(),

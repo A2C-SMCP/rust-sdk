@@ -145,21 +145,15 @@ async fn test_computer_server_lifecycle() {
     computer.boot_up().await.unwrap();
 
     // 添加服务器 / Add server
-    let server_config = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "test_server".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let server_config = MCPServerConfig::Stdio(StdioServerConfig::new(
+        "test_server",
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec!["test".to_string()],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
     computer.add_or_update_server(server_config).await.unwrap();
 
@@ -271,56 +265,46 @@ async fn test_computer_multiple_servers() {
     computer.boot_up().await.unwrap();
 
     // 添加多个服务器 / Add multiple servers
-    let server1 = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "server1".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let server1 = MCPServerConfig::Stdio(StdioServerConfig::new(
+        "server1",
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
-    let server2 = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "server2".to_string(),
-        disabled: false,
-        forbidden_tools: vec!["dangerous_tool".to_string()],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
-            command: "cat".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            cwd: None,
-        },
+    let server2 = MCPServerConfig::Stdio({
+        let mut c = StdioServerConfig::new(
+            "server2",
+            StdioServerParameters {
+                command: "cat".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.forbidden_tools = vec!["dangerous_tool".to_string()];
+        c
     });
 
     computer.add_or_update_server(server1).await.unwrap();
     computer.add_or_update_server(server2).await.unwrap();
 
     // 更新服务器配置 / Update server configuration
-    let updated_server1 = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "server1".to_string(),
-        disabled: true, // 禁用服务器 / Disable server
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
-            command: "echo".to_string(),
-            args: vec!["updated".to_string()],
-            env: HashMap::new(),
-            cwd: None,
-        },
+    let updated_server1 = MCPServerConfig::Stdio({
+        let mut c = StdioServerConfig::new(
+            "server1",
+            StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["updated".to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.disabled = true; // 禁用服务器 / Disable server
+        c
     });
 
     computer

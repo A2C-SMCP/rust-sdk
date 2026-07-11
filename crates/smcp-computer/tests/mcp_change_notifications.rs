@@ -29,21 +29,15 @@ fn mutable_server_path() -> String {
 }
 
 fn stdio_config(name: &str) -> MCPServerConfig {
-    MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: name.to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    MCPServerConfig::Stdio(StdioServerConfig::new(
+        name,
+        StdioServerParameters {
             command: "node".to_string(),
             args: vec![mutable_server_path()],
             env: HashMap::new(),
             cwd: None,
         },
-    })
+    ))
 }
 
 fn tool_names(tools: &[smcp_computer::mcp_clients::model::Tool]) -> Vec<String> {

@@ -19,21 +19,15 @@ fn echo_server_path() -> String {
 }
 
 fn stdio_config(name: &str) -> MCPServerConfig {
-    MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: name.to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    MCPServerConfig::Stdio(StdioServerConfig::new(
+        name,
+        StdioServerParameters {
             command: "node".to_string(),
             args: vec![echo_server_path()],
             env: HashMap::new(),
             cwd: None,
         },
-    })
+    ))
 }
 
 async fn setup_manager() -> MCPServerManager {

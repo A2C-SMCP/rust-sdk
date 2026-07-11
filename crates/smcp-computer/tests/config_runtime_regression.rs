@@ -72,38 +72,26 @@ fn read_json(path: &Path) -> Value {
 
 /// 最小合法 stdio server。
 fn stdio(name: &str) -> MCPServerConfig {
-    MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: name.to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    MCPServerConfig::Stdio(StdioServerConfig::new(
+        name,
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec!["hi".to_string()],
             env: HashMap::new(),
             cwd: None,
         },
-    })
+    ))
 }
 
 /// 最小合法 Http（streamable）server。
 fn http(name: &str, url: &str) -> MCPServerConfig {
-    MCPServerConfig::Http(HttpServerConfig {
-        env_file: None,
-        name: name.to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: HttpServerParameters {
+    MCPServerConfig::Http(HttpServerConfig::new(
+        name,
+        HttpServerParameters {
             url: url.to_string(),
             headers: HashMap::new(),
         },
-    })
+    ))
 }
 
 // ---------------------------------------------------------------------------

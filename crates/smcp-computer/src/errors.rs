@@ -16,13 +16,6 @@ pub type ComputerResult<T> = Result<T, ComputerError>;
 /// Computer模块的错误类型 / Error type for Computer module
 #[derive(Debug, Error)]
 pub enum ComputerError {
-    #[error("Tool name duplicated: {tool_name} in servers: {servers:?}")]
-    /// 工具名称重复 / Tool name duplicated
-    ToolNameDuplicated {
-        tool_name: String,
-        servers: Vec<String>,
-    },
-
     #[error("Input not found: {input_id}")]
     /// 输入项未找到 / Input not found
     InputNotFound { input_id: String },
@@ -153,7 +146,6 @@ impl ComputerError {
     pub fn error_code(&self) -> i32 {
         match self {
             // 工具相关错误 / Tool related errors
-            ComputerError::ToolNameDuplicated { .. } => 4002, // TOOL_DISABLED
             ComputerError::ToolExecutionTimeout { .. } => 4004, // TOOL_TIMEOUT
 
             // 输入相关错误 / Input related errors

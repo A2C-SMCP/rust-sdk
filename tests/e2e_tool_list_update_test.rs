@@ -131,21 +131,15 @@ async fn tool_list_update_full_chain_add_rename_remove() {
     let mut servers = HashMap::new();
     servers.insert(
         "mutable".to_string(),
-        MCPServerConfig::Stdio(StdioServerConfig {
-            env_file: None,
-            name: "mutable".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            server_parameters: StdioServerParameters {
+        MCPServerConfig::Stdio(StdioServerConfig::new(
+            "mutable",
+            StdioServerParameters {
                 command: "node".to_string(),
                 args: vec![mutable_server_path()],
                 env: HashMap::new(),
                 cwd: None,
             },
-        }),
+        )),
     );
 
     let computer = Computer::new(

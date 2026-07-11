@@ -22,12 +22,17 @@ async fn test_complete_workflow() {
     let mut configs = Vec::new();
 
     // STDIO服务器配置 / STDIO server configuration
-    configs.push(MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "calculator_server".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: {
+    configs.push(MCPServerConfig::Stdio({
+        let mut c = StdioServerConfig::new(
+            "calculator_server",
+            StdioServerParameters {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.tool_meta = {
             let mut meta = HashMap::new();
             meta.insert("add".to_string(), ToolMeta {
                 auto_apply: Some(true),
@@ -42,35 +47,27 @@ async fn test_complete_workflow() {
                 ret_object_mapper: None,
             });
             meta
-        },
-        default_tool_meta: Some(ToolMeta {
+        };
+        c.default_tool_meta = Some(ToolMeta {
             auto_apply: Some(false),
             alias: None,
             tags: Some(vec!["default".to_string()]),
             ret_object_mapper: None,
-        }),
-        vrl: None,
-        server_parameters: StdioServerParameters {
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
-            env: HashMap::new(),
-            cwd: None,
-        },
+        });
+        c
     }));
 
     // HTTP服务器配置 / HTTP server configuration
-    configs.push(MCPServerConfig::Http(HttpServerConfig {
-        env_file: None,
-        name: "http_server".to_string(),
-        disabled: true, // 禁用以避免实际连接 / Disable to avoid actual connection
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: HttpServerParameters {
-            url: "http://localhost:8080".to_string(),
-            headers: HashMap::new(),
-        },
+    configs.push(MCPServerConfig::Http({
+        let mut c = HttpServerConfig::new(
+            "http_server",
+            HttpServerParameters {
+                url: "http://localhost:8080".to_string(),
+                headers: HashMap::new(),
+            },
+        );
+        c.disabled = true; // 禁用以避免实际连接 / Disable to avoid actual connection
+        c
     }));
 
     // 3. 初始化管理器 / Initialize manager
@@ -203,35 +200,39 @@ async fn test_concurrent_operations() {
     for i in 0..5 {
         let manager_clone = manager.clone();
         let handle = tokio::spawn(async move {
-            let config = MCPServerConfig::Stdio(StdioServerConfig {
-                env_file: None,
-                name: format!("calculator_{}", i),
-                disabled: false,
-                forbidden_tools: vec![],
-                tool_meta: {
+            let config = MCPServerConfig::Stdio({
+                let mut c = StdioServerConfig::new(
+                    format!("calculator_{}", i),
+                    StdioServerParameters {
+                        command: "sh".to_string(),
+                        args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
+                        env: HashMap::new(),
+                        cwd: None,
+                    },
+                );
+                c.tool_meta = {
                     let mut meta = HashMap::new();
-                    meta.insert("add".to_string(), ToolMeta {
-                        auto_apply: Some(true),
-                        alias: Some(format!("calc_add_{}", i)), // 为每个服务器添加唯一别名
-                        tags: Some(vec!["math".to_string(), "calculator".to_string()]),
-                        ret_object_mapper: None,
-                    });
-                    meta.insert("echo".to_string(), ToolMeta {
-                        auto_apply: Some(true),
-                        alias: Some(format!("calc_echo_{}", i)), // 为每个服务器添加唯一别名
-                        tags: Some(vec!["utility".to_string()]),
-                        ret_object_mapper: None,
-                    });
+                    meta.insert(
+                        "add".to_string(),
+                        ToolMeta {
+                            auto_apply: Some(true),
+                            alias: Some(format!("calc_add_{}", i)), // 为每个服务器添加唯一别名
+                            tags: Some(vec!["math".to_string(), "calculator".to_string()]),
+                            ret_object_mapper: None,
+                        },
+                    );
+                    meta.insert(
+                        "echo".to_string(),
+                        ToolMeta {
+                            auto_apply: Some(true),
+                            alias: Some(format!("calc_echo_{}", i)), // 为每个服务器添加唯一别名
+                            tags: Some(vec!["utility".to_string()]),
+                            ret_object_mapper: None,
+                        },
+                    );
                     meta
-                },
-                default_tool_meta: None,
-                vrl: None,
-                server_parameters: StdioServerParameters {
-                    command: "sh".to_string(),
-                    args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
-                    env: HashMap::new(),
-                    cwd: None,
-                },
+                };
+                c
             });
 
             manager_clone.add_or_update_server(config).await

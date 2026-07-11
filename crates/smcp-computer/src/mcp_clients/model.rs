@@ -27,6 +27,10 @@ pub const A2C_VRL_TRANSFORMED: &str = "a2c_vrl_transformed";
 // 类型别名 / Type aliases
 pub type ServerName = String;
 pub type ToolName = String;
+/// MCP Server 唯一标识（BundleID）/ MCP Server unique identity (BundleID)。见 [`super::bundle_id`]。
+pub type BundleId = String;
+/// 聚合后暴露给 LLM 的工具名 `{bundle_id}__{alias ?? 原始名}` / aggregated exposed tool name。
+pub type ExposedToolName = String;
 
 /// MCP Server 运行期变化通知的种类（#106）/ Kind of a runtime MCP server change notification。
 ///
@@ -137,6 +141,19 @@ impl MCPServerConfig {
         }
     }
 
+    /// 获取**显式** `bundle_id`（若配置了）/ Get the **explicit** bundle_id if configured。
+    ///
+    /// 返回 `None` 表示未显式配置——此时**唯一身份**须经 [`super::bundle_id::resolve_bundle_id`]（或
+    /// [`derive_bundle_id`](super::bundle_id::derive_bundle_id)）从 `name` 缺省生成。**恒有值的身份**用
+    /// [`resolve_bundle_id`](super::bundle_id::resolve_bundle_id)，本访问器只暴露原始显式字段（如用于落盘保真）。
+    pub fn bundle_id(&self) -> Option<&str> {
+        match self {
+            MCPServerConfig::Stdio(config) => config.bundle_id.as_deref(),
+            MCPServerConfig::Sse(config) => config.bundle_id.as_deref(),
+            MCPServerConfig::Http(config) => config.bundle_id.as_deref(),
+        }
+    }
+
     /// 获取是否禁用标志 / Get disabled flag
     pub fn disabled(&self) -> bool {
         match self {
@@ -193,10 +210,18 @@ impl MCPServerConfig {
 }
 
 /// STDIO服务器配置 / STDIO server configuration
+///
+/// `#[non_exhaustive]`：跨 crate 禁结构体字面量构造，须经 [`StdioServerConfig::new`]（协议 0.3.0
+/// bundle_id 已算 breaking，一步到位杜绝未来加字段 source-break 外部消费者，rust-sdk#117）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StdioServerConfig {
-    /// 服务器名称 / Server name
+    /// 服务器名称（人类可读，非唯一身份）/ Server name (human-readable, not the unique identity)。
     pub name: ServerName,
+    /// MCP Server 唯一标识（BundleID）。省略时由 `name` 经确定性算法缺省生成（[`super::bundle_id`]，
+    /// **derive-on-load、不回写 mcp.json**）。显式非法值（含 `.` / `__` / 越界）在注册边界报错。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<BundleId>,
     /// 是否禁用 / Whether disabled
     #[serde(default)]
     pub disabled: bool,
@@ -226,10 +251,16 @@ pub struct StdioServerConfig {
 }
 
 /// SSE服务器配置 / SSE server configuration
+///
+/// `#[non_exhaustive]`：跨 crate 须经 [`SseServerConfig::new`]（见 [`StdioServerConfig`]，rust-sdk#117）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SseServerConfig {
-    /// 服务器名称 / Server name
+    /// 服务器名称（人类可读，非唯一身份）/ Server name (human-readable, not the unique identity)。
     pub name: ServerName,
+    /// MCP Server 唯一标识（BundleID），省略时缺省生成（见 [`StdioServerConfig::bundle_id`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<BundleId>,
     /// 是否禁用 / Whether disabled
     #[serde(default)]
     pub disabled: bool,
@@ -258,10 +289,16 @@ pub struct SseServerConfig {
 }
 
 /// HTTP服务器配置 / HTTP server configuration
+///
+/// `#[non_exhaustive]`：跨 crate 须经 [`HttpServerConfig::new`]（见 [`StdioServerConfig`]，rust-sdk#117）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HttpServerConfig {
-    /// 服务器名称 / Server name
+    /// 服务器名称（人类可读，非唯一身份）/ Server name (human-readable, not the unique identity)。
     pub name: ServerName,
+    /// MCP Server 唯一标识（BundleID），省略时缺省生成（见 [`StdioServerConfig::bundle_id`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<BundleId>,
     /// 是否禁用 / Whether disabled
     #[serde(default)]
     pub disabled: bool,
@@ -287,6 +324,60 @@ pub struct HttpServerConfig {
     pub env_file: Option<String>,
     /// HTTP服务器参数 / HTTP server parameters
     pub server_parameters: HttpServerParameters,
+}
+
+impl StdioServerConfig {
+    /// 构造一个 stdio server 配置（其余字段取默认；`#[non_exhaustive]` 下跨 crate 唯一构造入口）。
+    ///
+    /// 缺省：`bundle_id = None`（触发缺省生成）、`disabled = false`、`forbidden_tools`/`tool_meta` 为空、
+    /// `default_tool_meta`/`vrl`/`env_file` 为 `None`。字段均 `pub`，构造后可按需赋值。
+    pub fn new(name: impl Into<ServerName>, server_parameters: StdioServerParameters) -> Self {
+        Self {
+            name: name.into(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: Vec::new(),
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            env_file: None,
+            server_parameters,
+        }
+    }
+}
+
+impl SseServerConfig {
+    /// 构造一个 SSE server 配置（其余字段取默认；见 [`StdioServerConfig::new`]）。
+    pub fn new(name: impl Into<ServerName>, server_parameters: SseServerParameters) -> Self {
+        Self {
+            name: name.into(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: Vec::new(),
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            env_file: None,
+            server_parameters,
+        }
+    }
+}
+
+impl HttpServerConfig {
+    /// 构造一个 streamable-HTTP server 配置（其余字段取默认；见 [`StdioServerConfig::new`]）。
+    pub fn new(name: impl Into<ServerName>, server_parameters: HttpServerParameters) -> Self {
+        Self {
+            name: name.into(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: Vec::new(),
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            env_file: None,
+            server_parameters,
+        }
+    }
 }
 
 fn null_to_empty_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>

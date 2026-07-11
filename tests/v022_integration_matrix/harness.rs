@@ -192,21 +192,15 @@ pub async fn spawn_computer(
     let mut servers = HashMap::new();
     servers.insert(
         MCP_NAME.to_string(),
-        MCPServerConfig::Stdio(StdioServerConfig {
-            name: MCP_NAME.into(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            env_file: None,
-            server_parameters: StdioServerParameters {
+        MCPServerConfig::Stdio(StdioServerConfig::new(
+            MCP_NAME,
+            StdioServerParameters {
                 command: "node".into(),
                 args: vec![mcp_server_path()],
                 env: HashMap::new(),
                 cwd: None,
             },
-        }),
+        )),
     );
 
     let mut computer = Computer::new(

@@ -149,20 +149,18 @@ async fn test_vrl_integration_with_manager() {
         .timestamp_added = "2025-12-16"
     "#;
 
-    let config = StdioServerConfig {
-        env_file: None,
-        name: "vrl_test_server".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: std::collections::HashMap::new(),
-        default_tool_meta: None,
-        vrl: Some(vrl_script.to_string()),
-        server_parameters: StdioServerParameters {
-            command: "echo".to_string(),
-            args: vec!["test".to_string()],
-            env: std::collections::HashMap::new(),
-            cwd: None,
-        },
+    let config = {
+        let mut c = StdioServerConfig::new(
+            "vrl_test_server",
+            StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["test".to_string()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.vrl = Some(vrl_script.to_string());
+        c
     };
 
     let manager = MCPServerManager::new();
@@ -200,35 +198,31 @@ async fn test_vrl_multiple_server_configs() {
     };
 
     let configs = vec![
-        MCPServerConfig::Stdio(StdioServerConfig {
-            env_file: None,
-            name: "server1".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: std::collections::HashMap::new(),
-            default_tool_meta: None,
-            vrl: Some(".server = 1".to_string()),
-            server_parameters: StdioServerParameters {
-                command: "echo".to_string(),
-                args: vec!["server1".to_string()],
-                env: std::collections::HashMap::new(),
-                cwd: None,
-            },
+        MCPServerConfig::Stdio({
+            let mut c = StdioServerConfig::new(
+                "server1",
+                StdioServerParameters {
+                    command: "echo".to_string(),
+                    args: vec!["server1".to_string()],
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+            );
+            c.vrl = Some(".server = 1".to_string());
+            c
         }),
-        MCPServerConfig::Stdio(StdioServerConfig {
-            env_file: None,
-            name: "server2".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: std::collections::HashMap::new(),
-            default_tool_meta: None,
-            vrl: Some(".server = 2".to_string()),
-            server_parameters: StdioServerParameters {
-                command: "echo".to_string(),
-                args: vec!["server2".to_string()],
-                env: std::collections::HashMap::new(),
-                cwd: None,
-            },
+        MCPServerConfig::Stdio({
+            let mut c = StdioServerConfig::new(
+                "server2",
+                StdioServerParameters {
+                    command: "echo".to_string(),
+                    args: vec!["server2".to_string()],
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+            );
+            c.vrl = Some(".server = 2".to_string());
+            c
         }),
     ];
 
@@ -427,21 +421,15 @@ async fn test_auto_reconnect_semantics() {
     let manager = MCPServerManager::new();
 
     // 创建初始配置
-    let config1 = StdioServerConfig {
-        env_file: None,
-        name: "test".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: std::collections::HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let config1 = StdioServerConfig::new(
+        "test",
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec!["v1".to_string()],
             env: std::collections::HashMap::new(),
             cwd: None,
         },
-    };
+    );
 
     // 初始化
     manager

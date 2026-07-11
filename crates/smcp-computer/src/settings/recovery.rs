@@ -63,6 +63,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
 
+use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::MCPServerConfig;
 use crate::settings::installer::materialize_plugin_record;
 use crate::settings::scope::EnvMap;
@@ -288,7 +289,10 @@ pub fn collect_enabled_bundled_servers(
             match load_bundled_servers(Path::new(install_path)) {
                 Ok(servers) => {
                     for cfg in servers {
-                        if seen.insert(cfg.name().to_string()) {
+                        // no-double-open：按 `bundle_id` first-wins 去重（协议 0.3.0，rust-sdk#117）。bundled
+                        // config 未 render，无名 server 的 fallback 摘要基于未注入 inputs 的连接身份——对 collect
+                        // 自身的去重内部自洽即可（manager 注册期会以 rendered config 再次按 bundle_id 去重兜底）。
+                        if seen.insert(resolve_bundle_id(&cfg)) {
                             out.push(BundledServerRecord {
                                 plugin_id: pid.clone(),
                                 plugin: plugin.to_string(),
