@@ -95,7 +95,7 @@ async fn test_manager_get_windows_details() {
         "expected at least one window with details"
     );
 
-    for (server_name, resource, detail) in &details {
+    for (_bundle_id, server_name, resource, detail) in &details {
         assert_eq!(server_name, "echo-server");
         assert!(resource.uri.starts_with("window://"));
         assert!(
@@ -110,9 +110,9 @@ async fn test_manager_get_windows_details() {
     // Verify actual content text to ensure end-to-end JSON serialization correctness
     let status_detail = details
         .iter()
-        .find(|(_, r, _)| r.uri.as_str() == "window://echo.mcp.test/status?priority=10")
+        .find(|(_, _, r, _)| r.uri.as_str() == "window://echo.mcp.test/status?priority=10")
         .expect("expected status window in details");
-    let status_content = &status_detail.2.contents[0];
+    let status_content = &status_detail.3.contents[0];
     match status_content {
         ResourceContents::TextResourceContents { text, .. } => {
             assert_eq!(text, "System status: OK");

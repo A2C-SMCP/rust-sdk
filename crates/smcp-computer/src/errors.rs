@@ -32,10 +32,10 @@ pub enum ComputerError {
     #[error("MCP capability '{capability}' not supported by server '{server_name}'")]
     /// MCP Server 未声明所需 capability（`get_resources` → 处理器映射 4015）/ required capability not
     /// declared (`get_resources` → handler maps 4015)。对标 Python `MCPCapabilityNotSupportedError`。
-    /// 结构化分流字段：`server_name` + `capability` 供 #72 handler 直接平铺为 flat ErrorPayload 顶层
-    /// `mcp_server_name`/`capability`（`with_mcp_server_name`/`with_capability`），无需再解析字符串。
+    /// 结构化分流字段：`server_name`（值 = **bundle_id**，协议 0.3.0 #18）+ `capability` 供 handler 直接平铺为
+    /// flat ErrorPayload 顶层 `mcp_server`/`capability`（`with_mcp_server`/`with_capability`），无需再解析字符串。
     McpCapabilityNotSupported {
-        /// 目标 MCP Server 名（顶层 `mcp_server_name`）。
+        /// 目标 MCP Server 的 bundle_id（顶层 `mcp_server`）。
         server_name: String,
         /// 缺失的 capability 名（顶层 `capability`，如 `"resources"`）。
         capability: String,

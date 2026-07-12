@@ -41,6 +41,7 @@ fn window_with_meta(
         last_modified: None,
     });
     WindowInfo {
+        bundle_id: server.to_string(),
         server_name: server.to_string(),
         resource: Annotated::new(raw, annotations),
         read_result: ReadResourceResult {
@@ -108,6 +109,7 @@ fn test_multi_server_organization() {
 
     // 设置历史记录让server_b优先
     let history = vec![ToolCallRecord {
+        bundle_id: "server_b".to_string(),
         server: "server_b".to_string(),
         tool: "test_tool".to_string(),
         timestamp: 1234567890,
@@ -127,6 +129,7 @@ fn test_multi_server_organization() {
 #[test]
 fn test_complex_content_rendering() {
     let windows = vec![WindowInfo {
+        bundle_id: "server".to_string(),
         server_name: "server".to_string(),
         resource: make_resource(
             "window://server.mcp.com/complex",
@@ -160,6 +163,7 @@ fn test_complex_content_rendering() {
 fn test_size_limit_across_servers() {
     let windows = vec![
         WindowInfo {
+            bundle_id: "server_a".to_string(),
             server_name: "server_a".to_string(),
             resource: make_resource("window://server_a.mcp.com/window1", "Window A1", None, None),
             read_result: ReadResourceResult {
@@ -170,6 +174,7 @@ fn test_size_limit_across_servers() {
             },
         },
         WindowInfo {
+            bundle_id: "server_a".to_string(),
             server_name: "server_a".to_string(),
             resource: make_resource("window://server_a.mcp.com/window2", "Window A2", None, None),
             read_result: ReadResourceResult {
@@ -180,6 +185,7 @@ fn test_size_limit_across_servers() {
             },
         },
         WindowInfo {
+            bundle_id: "server_b".to_string(),
             server_name: "server_b".to_string(),
             resource: make_resource("window://server_b.mcp.com/window1", "Window B1", None, None),
             read_result: ReadResourceResult {
@@ -193,6 +199,7 @@ fn test_size_limit_across_servers() {
 
     // 设置size=1，且server_a优先
     let history = vec![ToolCallRecord {
+        bundle_id: "server_a".to_string(),
         server: "server_a".to_string(),
         tool: "test_tool".to_string(),
         timestamp: 1234567890,
@@ -212,6 +219,7 @@ fn test_window_uri_parsing_errors() {
     let windows = vec![
         // 有效的窗口
         WindowInfo {
+            bundle_id: "server".to_string(),
             server_name: "server".to_string(),
             resource: make_resource("window://server.mcp.com/valid", "Valid Window", None, None),
             read_result: ReadResourceResult {
@@ -223,6 +231,7 @@ fn test_window_uri_parsing_errors() {
         },
         // 无效scheme的窗口
         WindowInfo {
+            bundle_id: "server".to_string(),
             server_name: "server".to_string(),
             resource: make_resource(
                 "http://server.mcp.com/invalid",
@@ -239,6 +248,7 @@ fn test_window_uri_parsing_errors() {
         },
         // 缺少host的窗口
         WindowInfo {
+            bundle_id: "server".to_string(),
             server_name: "server".to_string(),
             resource: make_resource("window:///nohost", "No Host Window", None, None),
             read_result: ReadResourceResult {

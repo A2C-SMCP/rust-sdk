@@ -19,7 +19,10 @@ pub type ServerName = String;
 /// 工具调用记录 / Tool call record
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCallRecord {
-    /// 服务器名称 / Server name
+    /// 服务器身份键（`bundle_id`）——desktop 分组/最近排序按此关联（协议 0.3.0 §身份正交性 #18）。
+    /// Server identity key (bundle_id); desktop grouping/recency correlates on this。
+    pub bundle_id: ServerName,
+    /// 服务器展示名（display，非身份）/ Server display name (not identity)。
     pub server: ServerName,
     /// 工具名称 / Tool name
     pub tool: String,
@@ -33,7 +36,10 @@ pub struct ToolCallRecord {
 /// 窗口信息 / Window information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WindowInfo {
-    /// 服务器名称 / Server name
+    /// 服务器身份键（`bundle_id`）——desktop **分组键**（协议 0.3.0 §身份正交性 #18：避免同名 server 窗口误并）。
+    /// Server identity key (bundle_id); the desktop **grouping key**。
+    pub bundle_id: ServerName,
+    /// 服务器展示名（display，非身份、非分组键）/ Server display name (not identity/grouping key)。
     pub server_name: ServerName,
     /// 资源 / Resource
     pub resource: Resource,
@@ -44,11 +50,13 @@ pub struct WindowInfo {
 impl WindowInfo {
     /// 创建新的窗口信息 / Create new window info
     pub fn new(
+        bundle_id: ServerName,
         server_name: ServerName,
         resource: Resource,
         read_result: ReadResourceResult,
     ) -> Self {
         Self {
+            bundle_id,
             server_name,
             resource,
             read_result,
@@ -76,7 +84,12 @@ mod tests {
             )],
         };
 
-        let window_info = WindowInfo::new("test_server".to_string(), resource, read_result);
+        let window_info = WindowInfo::new(
+            "test_server".to_string(),
+            "test_server".to_string(),
+            resource,
+            read_result,
+        );
 
         assert_eq!(window_info.server_name, "test_server");
         assert_eq!(window_info.resource.name, "Test Window");
@@ -86,6 +99,7 @@ mod tests {
     #[test]
     fn test_tool_call_record() {
         let record = ToolCallRecord {
+            bundle_id: "test_server".to_string(),
             server: "test_server".to_string(),
             tool: "test_tool".to_string(),
             timestamp: 1234567890,

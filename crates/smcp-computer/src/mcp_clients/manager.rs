@@ -214,17 +214,6 @@ impl MCPServerManager {
             .then(|| server_name.to_string())
     }
 
-    /// 身份键（`bundle_id`）→ 人类可读名：查 `servers_config` 取 `config.name()`，缺失则回退用键本身。
-    /// 用于把内部身份键映射回对外展示名（如授权错误结果的 `mcp_server` 诊断字段）。
-    async fn display_name_for_key(&self, bundle_id: &str) -> ServerName {
-        self.servers_config
-            .read()
-            .await
-            .get(bundle_id)
-            .map(|c| c.name().to_string())
-            .unwrap_or_else(|| bundle_id.to_string())
-    }
-
     /// 初始化管理器 / Initialize manager
     ///
     /// **no-double-open（加载期 first-wins）**：按传入顺序解析每个 server 的 `bundle_id`，重复 `bundle_id`
@@ -793,14 +782,9 @@ impl MCPServerManager {
             Err(e) => match auth_error::classify_auth_error(&e) {
                 Some(code) => {
                     let hint = auth_error::build_default_auth_hint(code);
-                    // 授权错误结果的 `mcp_server` 诊断字段上 wire，须用**人类可读名**（形参 server_name 实为
-                    // bundle_id 身份键，协议 0.3.0 re-key 后）。ASCII 名多数无差，无名/含空格/改名 server 有差。
-                    let display_name = self.display_name_for_key(server_name).await;
-                    return Ok(auth_error::build_auth_error_result(
-                        &display_name,
-                        code,
-                        hint,
-                    ));
+                    // 协议 0.3.0 §身份正交性（#18）：授权错误 `meta.mcp_server` = **bundle_id**（形参 server_name
+                    // 即 call_tool 传入的 bundle_id 身份键），与 `get_config` 归属一致，Agent 可 correlate 到具体 server。
+                    return Ok(auth_error::build_auth_error_result(server_name, code, hint));
                 }
                 None => {
                     return Err(ComputerError::ProtocolError(format!(
@@ -923,8 +907,10 @@ impl MCPServerManager {
 
     /// 获取所有服务器配置（用于 GetComputerConfigRet）
     /// Get all server configurations (for GetComputerConfigRet)
-    /// 返回格式：{ server_name: { type, status, disabled, ... } }
-    /// Returns format: { server_name: { type, status, disabled, ... } }
+    ///
+    /// **协议 0.3.0 §身份正交性（#18）**：返回字典 **key = `bundle_id`**（server 唯一身份，非 `name`）；每个 value
+    /// 额外带 `name`（纯 display，key 不再人类可读，故须显式暴露展示名）。
+    /// Returns format: `{ bundle_id: { name, type, status, disabled, ... } }`。
     pub async fn get_server_configs(&self) -> serde_json::Value {
         let configs = self.servers_config.read().await;
         let clients = self.active_clients.read().await;
@@ -944,6 +930,12 @@ impl MCPServerManager {
 
             // 构建服务器配置信息 / Build server config info
             let mut server_info = serde_json::Map::new();
+
+            // 展示名（key 现为 bundle_id，须显式带 name 供 display / tool→server 归属）/ display name。
+            server_info.insert(
+                "name".to_string(),
+                serde_json::Value::String(config.name().to_string()),
+            );
 
             // 添加类型信息 / Add type info
             let server_type = match config {
@@ -1014,10 +1006,8 @@ impl MCPServerManager {
                 }
             }
 
-            result.insert(
-                config.name().to_string(),
-                serde_json::Value::Object(server_info),
-            );
+            // key = bundle_id（server 唯一身份，协议 0.3.0 #18）；name 已作为 value 字段暴露。
+            result.insert(bundle_id.clone(), serde_json::Value::Object(server_info));
         }
 
         serde_json::Value::Object(result)
@@ -1203,39 +1193,37 @@ impl MCPServerManager {
         results
     }
 
-    /// 单页透传指定 MCP Server 的 `resources/list`（v0.2 `client:get_resources` 路由层）。
-    /// Single-page passthrough of a named server's `resources/list` (the v0.2 `client:get_resources` router)。
+    /// 单页透传指定 MCP Server 的 `resources/list`（`client:get_resources` 路由层）。
+    /// Single-page passthrough of a server's `resources/list` (the `client:get_resources` router)。
     ///
-    /// 仅作透传：定位命名 client → 调 [`list_resources_page`](MCPClientProtocol::list_resources_page)，
-    /// 不做 scheme/元数据过滤、不聚合，翻页由调用方经 cursor 控制。未注册 server →
-    /// [`ComputerError::McpServerNotFound`]（映射 4014）；无 `resources` 能力 →
-    /// [`ComputerError::McpCapabilityNotSupported`]（映射 4015）。
+    /// **协议 0.3.0 §身份正交性（#18）**：入参 `bundle_id` = `get_resources.mcp_server`（server 唯一身份，**非
+    /// name**），**直查** `active_clients`——不经 name 解析（wire 契约已定 bundle_id）。仅作透传：定位 client →
+    /// 调 [`list_resources_page`](MCPClientProtocol::list_resources_page)，不做 scheme/元数据过滤、不聚合，翻页由
+    /// 调用方经 cursor 控制。未命中 bundle_id → [`ComputerError::McpServerNotFound`]（携 bundle_id，映射 4014）；
+    /// 无 `resources` 能力 → [`ComputerError::McpCapabilityNotSupported`]（映射 4015）。
     pub async fn list_resources(
         &self,
-        server_name: &str,
+        bundle_id: &str,
         cursor: Option<String>,
     ) -> Result<(Vec<Resource>, Option<String>), ComputerError> {
-        // 名称寻址：解析为身份键后取 client（未注册名 → McpServerNotFound 携原名，映射 4014）。
-        let client = match self.active_client_key(server_name).await {
-            Some(bundle_id) => {
-                let clients = self.active_clients.read().await;
-                clients.get(&bundle_id).cloned()
-            }
-            None => None,
+        // bundle_id 寻址：直查 active_clients（身份键 == 键，不经 name 解析）。未命中 → 4014 携 bundle_id。
+        let client = {
+            let clients = self.active_clients.read().await;
+            clients.get(bundle_id).cloned()
         };
         let client =
-            client.ok_or_else(|| ComputerError::McpServerNotFound(server_name.to_string()))?;
+            client.ok_or_else(|| ComputerError::McpServerNotFound(bundle_id.to_string()))?;
 
         match client.list_resources_page(cursor).await {
             Ok(pair) => Ok(pair),
             Err(MCPClientError::CapabilityNotSupported(cap)) => {
                 Err(ComputerError::McpCapabilityNotSupported {
-                    server_name: server_name.to_string(),
+                    server_name: bundle_id.to_string(),
                     capability: cap,
                 })
             }
             Err(e) => Err(ComputerError::ProtocolError(format!(
-                "list_resources '{server_name}': {e}"
+                "list_resources '{bundle_id}': {e}"
             ))),
         }
     }
@@ -1243,14 +1231,29 @@ impl MCPServerManager {
     /// 获取所有窗口资源的详情 / Get details of all window resources
     /// 复用 list_all_windows 聚合窗口列表，再逐个获取内容
     /// Reuses list_all_windows to aggregate window list, then fetches each detail
+    /// 返回每个 window 详情，附 **`bundle_id`（分组键）** + `server_name`（展示名）（协议 0.3.0 §身份正交性 #18：
+    /// desktop 按 bundle_id 分组避免同名 server 误并）。`window://` host 仍属 MCP 自选、透传不解释、正交。
     pub async fn get_windows_details(
         &self,
         window_uri: Option<&str>,
-    ) -> Vec<(ServerName, Resource, ReadResourceResult)> {
-        // 直接以 (name, client) 快照迭代——避免拿到 name 后再按 name 反查（active_clients 键为 bundle_id）。
-        let entries = self.active_clients_by_name().await;
+    ) -> Vec<(BundleId, ServerName, Resource, ReadResourceResult)> {
+        // (bundle_id, name, client) 快照：bundle_id = active_clients 键（分组），name 从 servers_config 取（展示）。
+        let entries: Vec<(BundleId, ServerName, StdArc<dyn MCPClientProtocol>)> = {
+            let clients = self.active_clients.read().await;
+            let configs = self.servers_config.read().await;
+            clients
+                .iter()
+                .map(|(bundle_id, client)| {
+                    let name = configs
+                        .get(bundle_id)
+                        .map(|c| c.name().to_string())
+                        .unwrap_or_else(|| bundle_id.clone());
+                    (bundle_id.clone(), name, client.clone())
+                })
+                .collect()
+        };
         let mut results = Vec::new();
-        for (server_name, client) in entries {
+        for (bundle_id, server_name, client) in entries {
             let windows = match client.list_windows().await {
                 Ok(w) => w,
                 Err(e) => {
@@ -1269,7 +1272,7 @@ impl MCPServerManager {
                 }
                 match client.get_window_detail(resource.clone()).await {
                     Ok(detail) => {
-                        results.push((server_name.clone(), resource, detail));
+                        results.push((bundle_id.clone(), server_name.clone(), resource, detail));
                     }
                     Err(e) => {
                         warn!(
@@ -1902,6 +1905,55 @@ pub(crate) mod test_support {
         }
     }
 
+    /// 返回一个固定 `window://` 资源 + 空 detail 的假 client，供 `get_windows_details` 的 bundle_id 投影测试（#118）。
+    pub(crate) struct WindowMockClient {
+        pub(crate) uri: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for WindowMockClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![make_resource(&self.uri, "w", None, None)])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult { contents: vec![] })
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
     /// 用给定工具集构造 [`MockToolsClient`] 并注入 `active_clients`；配套 `ServerConfig` 由调用方写入
     /// `servers_config`（`refresh_tool_mapping` 同时读两者）。Inject a `MockToolsClient` into `active_clients`.
     pub(crate) async fn inject_tools(manager: &MCPServerManager, name: &str, tools: Vec<Tool>) {
@@ -2428,6 +2480,74 @@ mod tests {
         assert!(
             !manager.get_retry_counts().await.contains_key("bid"),
             "按名重置应解析到 bundle_id 键并清除"
+        );
+    }
+
+    /// #118 P1：`get_config` 输出 `servers` 字典 **key = bundle_id**（非 name），value 带 `name` display 字段。
+    #[tokio::test]
+    async fn get_config_keyed_by_bundle_id_with_name_field_118() {
+        let manager = MCPServerManager::new();
+        // 展示名 "display-name" ≠ 显式 bundle_id "id_x"，以区分 key/name。
+        manager.servers_config.write().await.insert(
+            "id_x".to_string(),
+            stdio_cfg_with_bundle("display-name", Some("id_x")),
+        );
+
+        let cfg = manager.get_server_configs().await;
+        let obj = cfg.as_object().expect("object");
+        assert!(obj.contains_key("id_x"), "key 应为 bundle_id: {obj:?}");
+        assert!(!obj.contains_key("display-name"), "key 不应为 name");
+        assert_eq!(
+            obj["id_x"]["name"],
+            serde_json::json!("display-name"),
+            "value 应带 name display 字段（key 不再人类可读）"
+        );
+    }
+
+    /// #118 P2/P3：`get_resources` 按 bundle_id 未命中 → `McpServerNotFound`（4014），载荷携 **bundle_id**。
+    #[tokio::test]
+    async fn get_resources_miss_returns_4014_with_bundle_id_118() {
+        let manager = MCPServerManager::new();
+        let err = manager
+            .list_resources("no_such_bundle", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), 4014);
+        match err {
+            ComputerError::McpServerNotFound(id) => {
+                assert_eq!(id, "no_such_bundle", "4014 载荷应回显未命中的 bundle_id")
+            }
+            other => panic!("expected McpServerNotFound, got {other:?}"),
+        }
+    }
+
+    /// #118 P5：`get_windows_details` 投影——`.0` = **bundle_id**（active_clients 键），`.1` = 展示名
+    /// （servers_config），window://host 属 MCP 自选、原样保留（正交）。用 bundle_id ≠ name 端到端区分该链。
+    #[tokio::test]
+    async fn get_windows_details_projects_bundle_id_and_name_118() {
+        use super::test_support::WindowMockClient;
+        let manager = MCPServerManager::new();
+        // bundle_id "id_x" ≠ 展示名 "display-name"。
+        manager.servers_config.write().await.insert(
+            "id_x".to_string(),
+            stdio_cfg_with_bundle("display-name", Some("id_x")),
+        );
+        manager.active_clients.write().await.insert(
+            "id_x".to_string(),
+            StdArc::new(WindowMockClient {
+                uri: "window://a.mcp.com/w".to_string(),
+            }),
+        );
+
+        let details = manager.get_windows_details(None).await;
+        assert_eq!(details.len(), 1, "应返回一个 window 详情");
+        let (bundle_id, name, resource, _detail) = &details[0];
+        assert_eq!(bundle_id, "id_x", ".0 应为 bundle_id（active_clients 键）");
+        assert_eq!(name, "display-name", ".1 应为展示名（servers_config）");
+        assert_eq!(
+            resource.uri.as_str(),
+            "window://a.mcp.com/w",
+            "window://host 属 MCP 自选、原样保留（正交，不受 #118 改动）"
         );
     }
 

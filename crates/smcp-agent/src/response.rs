@@ -194,7 +194,7 @@ mod tests {
         let resp = json!({
             "code": 4014,
             "message": "MCP Server not registered",
-            "mcp_server_name": "srv-x"
+            "mcp_server": "srv-x"
         });
         let err = parse_get_resources_response(&resp, "R1").unwrap_err();
         assert!(matches!(err, SmcpAgentError::Protocol(_)), "got {err:?}");
@@ -206,7 +206,7 @@ mod tests {
         let resp = json!({
             "code": 4015,
             "message": "capability not supported",
-            "mcp_server_name": "srv-x",
+            "mcp_server": "srv-x",
             "capability": "resources"
         });
         let err = parse_get_resources_response(&resp, "R1").unwrap_err();

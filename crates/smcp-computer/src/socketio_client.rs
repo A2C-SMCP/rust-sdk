@@ -1016,8 +1016,8 @@ impl SmcpComputerClient {
                 let raw_windows = mgr.get_windows_details(req.window.as_deref()).await;
                 let windows: Vec<WindowInfo> = raw_windows
                     .into_iter()
-                    .map(|(server_name, resource, read_result)| {
-                        WindowInfo::new(server_name, resource, read_result)
+                    .map(|(bundle_id, server_name, resource, read_result)| {
+                        WindowInfo::new(bundle_id, server_name, resource, read_result)
                     })
                     .collect();
                 organize_desktop(windows, req.desktop_size.map(|s| s as usize), &[])
@@ -1039,8 +1039,8 @@ impl SmcpComputerClient {
     ///
     /// 透明转发指定 MCP Server 的 `resources/list`：单页透传（cursor 入参/`next_cursor` 出参原样转发），
     /// **不**聚合、**不**做 scheme/元数据过滤、**不**返回 `resourceTemplates`。错误经 ACK 第一参回传
-    /// **flat ErrorPayload**（禁止嵌套 envelope）：未知 `mcp_server` → 4014（顶层平铺 `mcp_server_name`）；
-    /// 目标 server 未声明 `resources` 能力 → 4015（顶层平铺 `mcp_server_name` + `capability`）。对齐
+    /// **flat ErrorPayload**（禁止嵌套 envelope）：未知 `mcp_server` → 4014（顶层平铺 `mcp_server`）；
+    /// 目标 server 未声明 `resources` 能力 → 4015（顶层平铺 `mcp_server` + `capability`）。对齐
     /// Python `on_get_resources`（RES-01 #30，协议 0.2.0 `client:get_resources`）。
     async fn handle_get_resources_with_ack(
         payload: Payload,
@@ -1098,7 +1098,7 @@ impl SmcpComputerClient {
                     smcp::ErrorCode::McpServerNotFound,
                     "MCP Server not registered",
                 )
-                .with_mcp_server_name(server);
+                .with_mcp_server(server);
                 Ok((ack_id, serde_json::to_value(payload)?))
             }
             // capability 不支持 → 4015 flat ErrorPayload。
@@ -1114,7 +1114,7 @@ impl SmcpComputerClient {
                     smcp::ErrorCode::McpCapabilityNotSupported,
                     "MCP Server does not support the requested capability",
                 )
-                .with_mcp_server_name(server_name)
+                .with_mcp_server(server_name)
                 .with_capability(capability);
                 Ok((ack_id, serde_json::to_value(payload)?))
             }
@@ -1963,11 +1963,11 @@ mod tests {
         .await
         .unwrap();
 
-        // flat ErrorPayload 4014（经 ACK 第一参回传），顶层平铺 mcp_server_name。
+        // flat ErrorPayload 4014（经 ACK 第一参回传），顶层平铺 mcp_server。
         assert_eq!(ack, Some(3));
         let err: smcp::ErrorPayload = serde_json::from_value(value).unwrap();
         assert_eq!(err.code, 4014);
-        assert_eq!(err.mcp_server_name.as_deref(), Some("missing"));
+        assert_eq!(err.mcp_server.as_deref(), Some("missing"));
         // 无嵌套 envelope：顶层即 code。
         assert!(err.capability.is_none());
     }
@@ -1988,10 +1988,10 @@ mod tests {
         .await
         .unwrap();
 
-        // flat ErrorPayload 4015，顶层平铺 mcp_server_name + capability。
+        // flat ErrorPayload 4015，顶层平铺 mcp_server + capability。
         let err: smcp::ErrorPayload = serde_json::from_value(value).unwrap();
         assert_eq!(err.code, 4015);
-        assert_eq!(err.mcp_server_name.as_deref(), Some("srv-1"));
+        assert_eq!(err.mcp_server.as_deref(), Some("srv-1"));
         assert_eq!(err.capability.as_deref(), Some("resources"));
     }
 

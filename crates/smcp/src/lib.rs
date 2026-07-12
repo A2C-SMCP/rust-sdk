@@ -202,9 +202,9 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// `total=False` TypedDict）：
 /// - 4008（协议版本不兼容）→ `server_version` / `client_version` / `min_supported` /
 ///   `max_supported`（HS-01 #21 / HS-02 #22；构造见 [`ErrorPayload::version_mismatch`]）。
-/// - 4014（MCP Server 未命中）→ `mcp_server_name`；4015（能力不支持）→ `mcp_server_name` /
-///   `capability`（SRV-01 #47 / AUTH-01 #23；构造见 [`ErrorPayload::with_mcp_server_name`] /
-///   [`ErrorPayload::with_capability`]）。
+/// - 4014（MCP Server 未命中）→ `mcp_server`（值 = **bundle_id**，协议 0.3.0 §身份正交性 #18）；
+///   4015（能力不支持）→ `mcp_server`（bundle_id）/ `capability`（SRV-01 #47 / AUTH-01 #23；构造见
+///   [`ErrorPayload::with_mcp_server`] / [`ErrorPayload::with_capability`]）。
 /// - 4016 / 4017 / 4018 的 code-specific 字段下沉到 `details` 子对象（无顶层平铺新字段）。
 ///
 /// 未知顶层字段由 [`ErrorPayload::extra`]（`#[serde(flatten)]`）**捕获并保留**，跨-SDK 往返
@@ -231,9 +231,10 @@ pub struct ErrorPayload {
     /// 4008 顶层分流：服务端支持的最大版本 / top-level for 4008: max supported。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_supported: Option<String>,
-    /// 4014 / 4015 顶层分流：未命中 / 缺能力的 MCP Server 名 / top-level for 4014&4015: MCP server name。
+    /// 4014 / 4015 顶层分流：未命中 / 缺能力的 MCP Server 的 **bundle_id**（协议 0.3.0 §身份正交性 #18）。
+    /// top-level for 4014&4015: the target MCP server's bundle_id。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_server_name: Option<String>,
+    pub mcp_server: Option<String>,
     /// 4015 顶层分流：缺失的 capability 名（如 `"resources"`）/ top-level for 4015: missing capability。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
@@ -255,7 +256,7 @@ impl ErrorPayload {
             client_version: None,
             min_supported: None,
             max_supported: None,
-            mcp_server_name: None,
+            mcp_server: None,
             capability: None,
             extra: serde_json::Map::new(),
         }
@@ -296,9 +297,9 @@ impl ErrorPayload {
         self
     }
 
-    /// 顶层平铺 `mcp_server_name`（4014 / 4015 分流字段）/ Set top-level `mcp_server_name` (4014/4015).
-    pub fn with_mcp_server_name(mut self, name: impl Into<String>) -> Self {
-        self.mcp_server_name = Some(name.into());
+    /// 顶层平铺 `mcp_server`（4014 / 4015 分流字段，值 = **bundle_id**，协议 0.3.0 #18）/ Set top-level `mcp_server`.
+    pub fn with_mcp_server(mut self, bundle_id: impl Into<String>) -> Self {
+        self.mcp_server = Some(bundle_id.into());
         self
     }
 
@@ -322,7 +323,7 @@ impl ErrorPayload {
             client_version: Some(client.to_string()),
             min_supported: Some(format!("{}.{}.0", server.major, server.minor)),
             max_supported: Some(format!("{}.{}.999", server.major, server.minor)),
-            mcp_server_name: None,
+            mcp_server: None,
             capability: None,
             extra: serde_json::Map::new(),
         }
@@ -1369,12 +1370,12 @@ mod tests {
     fn test_error_payload_with_details_serialization() {
         // details 以对象形式平铺在顶层 details 容器内
         let payload = ErrorPayload::new(4014, "boom")
-            .with_detail("mcp_server_name", "srv-a")
+            .with_detail("mcp_server", "srv-a")
             .with_detail("hint", "retry");
         let v = serde_json::to_value(&payload).unwrap();
 
         assert_eq!(v["code"], 4014);
-        assert_eq!(v["details"]["mcp_server_name"], "srv-a");
+        assert_eq!(v["details"]["mcp_server"], "srv-a");
         assert_eq!(v["details"]["hint"], "retry");
     }
 
@@ -1471,17 +1472,17 @@ mod tests {
         let v = serde_json::to_value(&payload).unwrap();
         assert!(is_protocol_error_payload(&v));
         // 顶层分流字段未设置时不序列化
-        assert!(v.get("mcp_server_name").is_none());
+        assert!(v.get("mcp_server").is_none());
         assert!(v.get("capability").is_none());
         assert!(v.get("details").is_none());
     }
 
     #[test]
     fn test_error_payload_4014_top_level_field() {
-        // 4014：mcp_server_name 顶层平铺（非 details 子对象）
+        // 4014：mcp_server 顶层平铺（非 details 子对象）
         let v = serde_json::to_value(
             ErrorPayload::from_error_code(ErrorCode::McpServerNotFound, "not found")
-                .with_mcp_server_name("filesystem"),
+                .with_mcp_server("filesystem"),
         )
         .unwrap();
         assert_eq!(
@@ -1489,17 +1490,17 @@ mod tests {
             serde_json::json!({
                 "code": 4014,
                 "message": "not found",
-                "mcp_server_name": "filesystem"
+                "mcp_server": "filesystem"
             })
         );
     }
 
     #[test]
     fn test_error_payload_4015_top_level_fields_python_shape() {
-        // 4015：mcp_server_name + capability 双顶层字段，与 Python smcp.py:484 total=False 形态一致
+        // 4015：mcp_server + capability 双顶层字段，与 Python smcp.py:484 total=False 形态一致
         let v = serde_json::to_value(
             ErrorPayload::from_error_code(ErrorCode::McpCapabilityNotSupported, "unsupported")
-                .with_mcp_server_name("docs-server")
+                .with_mcp_server("docs-server")
                 .with_capability("resources"),
         )
         .unwrap();
@@ -1508,7 +1509,7 @@ mod tests {
             serde_json::json!({
                 "code": 4015,
                 "message": "unsupported",
-                "mcp_server_name": "docs-server",
+                "mcp_server": "docs-server",
                 "capability": "resources"
             })
         );
@@ -1520,7 +1521,7 @@ mod tests {
         let wire = serde_json::json!({
             "code": 4014,
             "message": "x",
-            "mcp_server_name": "srv",   // 已建模顶层字段 → 落入 typed field，不进 extra
+            "mcp_server": "srv",   // 已建模顶层字段 → 落入 typed field，不进 extra
             "future_string": "keep-me", // 未建模 → 落入 extra
             "future_object": { "nested": true },
             "future_number": 7
@@ -1528,8 +1529,8 @@ mod tests {
         let payload: ErrorPayload = serde_json::from_value(wire.clone()).unwrap();
 
         // 已建模字段不污染 extra
-        assert_eq!(payload.mcp_server_name.as_deref(), Some("srv"));
-        assert!(!payload.extra.contains_key("mcp_server_name"));
+        assert_eq!(payload.mcp_server.as_deref(), Some("srv"));
+        assert!(!payload.extra.contains_key("mcp_server"));
         assert!(!payload.extra.contains_key("code"));
         // 未建模字段被 extra 捕获
         assert_eq!(payload.extra.get("future_string").unwrap(), "keep-me");

@@ -2080,10 +2080,13 @@ impl<S: Session> Computer<S> {
     }
 
     /// 获取所有窗口资源的详情 / Get details of all window resources
+    ///
+    /// 元组 = `(bundle_id, server_name, resource, read_result)`：`bundle_id` = desktop 分组键（协议 0.3.0 #18），
+    /// `server_name` = 展示名。
     pub async fn get_windows_details(
         &self,
         window_uri: Option<&str>,
-    ) -> ComputerResult<Vec<(String, Resource, ReadResourceResult)>> {
+    ) -> ComputerResult<Vec<(String, String, Resource, ReadResourceResult)>> {
         let manager = self.mcp_manager.read().await;
         if let Some(ref manager) = *manager {
             Ok(manager.get_windows_details(window_uri).await)

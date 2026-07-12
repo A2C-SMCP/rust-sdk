@@ -23,7 +23,7 @@ use serde_json::Value;
 ///
 /// 当 Agent SDK 在 Socket.IO ack 中识别到 flat ErrorPayload（顶层含 `code` 且属协议错误码闭集）
 /// 时产出。覆盖 / Covers:
-/// - `client:get_resources`：`4014` / `4015`（顶层平铺 `mcp_server_name` / `capability`）。
+/// - `client:get_resources`：`4014` / `4015`（顶层平铺 `mcp_server` / `capability`）。
 /// - `client:get_skill[s]`：`4014` 复用 / `4016` Invalid Name / `4017` Resource Not Accessible
 ///   （v0.2.1 `details.reason`）。
 /// - `client:get_blob`：`4018 Blob Not Accessible`（v0.2.1 `details.reason`）。
@@ -43,7 +43,7 @@ pub struct SmcpProtocolError {
     /// 人类可读错误描述（缺省回退空串）/ human-readable message (defaults to empty).
     pub message: String,
     /// 4014 / 4015 顶层分流字段 / top-level code-specific field (4014 / 4015)。
-    pub mcp_server_name: Option<String>,
+    pub mcp_server: Option<String>,
     /// 4015 顶层分流：缺失的 capability 名 / top-level for 4015: missing capability。
     pub capability: Option<String>,
     /// 诊断容器（4016 / 4017 / 4018 的 code-specific 字段下沉于此）/ diagnostic container。
@@ -74,7 +74,7 @@ impl SmcpProtocolError {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            mcp_server_name: get("mcp_server_name")
+            mcp_server: get("mcp_server")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             capability: get("capability")
@@ -132,11 +132,11 @@ mod tests {
         let err = raise_for_error_payload(&json!({
             "code": 4015,
             "message": "capability not supported",
-            "mcp_server_name": "docs-server",
+            "mcp_server": "docs-server",
             "capability": "resources"
         }))
         .unwrap_err();
-        assert_eq!(err.mcp_server_name.as_deref(), Some("docs-server"));
+        assert_eq!(err.mcp_server.as_deref(), Some("docs-server"));
         assert_eq!(err.capability.as_deref(), Some("resources"));
         assert!(err.reason.is_none());
     }
@@ -181,16 +181,16 @@ mod tests {
         let err = raise_for_error_payload(&json!({
             "code": 4015,
             "message": "x",
-            "mcp_server_name": "srv",
+            "mcp_server": "srv",
             "future_top_level": {"k": 1}
         }))
         .unwrap_err();
         // 便捷字段照常提取
-        assert_eq!(err.mcp_server_name.as_deref(), Some("srv"));
+        assert_eq!(err.mcp_server.as_deref(), Some("srv"));
         // 原始整包保留全部顶层字段（含未建模的）
         assert_eq!(err.payload.get("code").and_then(Value::as_i64), Some(4015));
         assert_eq!(
-            err.payload.get("mcp_server_name").and_then(Value::as_str),
+            err.payload.get("mcp_server").and_then(Value::as_str),
             Some("srv")
         );
         assert_eq!(err.payload.get("future_top_level"), Some(&json!({"k": 1})));

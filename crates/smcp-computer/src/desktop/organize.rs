@@ -32,6 +32,11 @@ use std::collections::{HashMap, HashSet};
 ///
 /// # 返回值 / Returns
 /// 桌面内容列表 / List of desktop content
+///
+/// **recency 关联现状（#118 备案）**：第 2 步「按 `history` 的 `rec.bundle_id` 排最近使用优先」当前仅在**单测**中
+/// 生效——**唯一生产调用点**（`socketio_client::handle_get_desktop_with_ack`）传入空 `history`（`&[]`）。且运行期真实
+/// 工具调用历史用的是 [`crate::computer::ToolCallRecord`]（另一类型，无 `bundle_id` 字段、从不喂给本函数）。若未来要
+/// 让 recency 在生产生效，须把真实历史桥接进来并按 `bundle_id` 关联——现状 `history` 空时该步为 no-op（不影响分组）。
 pub fn organize_desktop(
     windows: Vec<WindowInfo>,
     size: Option<usize>,
@@ -86,17 +91,18 @@ pub fn organize_desktop(
             original_index: idx,
         };
 
-        grouped.entry(window.server_name).or_default().push(item);
+        // 协议 0.3.0 §身份正交性（#18）：**按 bundle_id 分组**（server 唯一身份），避免同名 server 窗口误并。
+        grouped.entry(window.bundle_id).or_default().push(item);
     }
 
-    // 2) 服务器优先级：根据最近工具调用历史，倒序去重
+    // 2) 服务器优先级：根据最近工具调用历史，倒序去重（按 bundle_id 关联，与分组键一致）
     let mut recent_servers: Vec<ServerName> = Vec::new();
     let mut seen: HashSet<ServerName> = HashSet::new();
 
     for rec in history.iter().rev() {
-        if grouped.contains_key(&rec.server) && !seen.contains(&rec.server) {
-            seen.insert(rec.server.clone());
-            recent_servers.push(rec.server.clone());
+        if grouped.contains_key(&rec.bundle_id) && !seen.contains(&rec.bundle_id) {
+            seen.insert(rec.bundle_id.clone());
+            recent_servers.push(rec.bundle_id.clone());
         }
     }
 
@@ -260,12 +266,36 @@ mod tests {
         let resource = Annotated::new(raw, annotations);
 
         WindowInfo {
+            // 测试中 server 串同时充当 bundle_id（分组键）与 server_name（展示名）。
+            bundle_id: server.to_string(),
             server_name: server.to_string(),
             resource,
             read_result: ReadResourceResult {
                 contents: vec![ResourceContents::text(content, uri.to_string())],
             },
         }
+    }
+
+    /// #118 §身份正交性回归：两窗 `server_name` 相同、`bundle_id` 不同 → 按 **bundle_id** 分组**不合并**。
+    /// 用 fullscreen 制造区分力：误按 name 分组 → 合并 1 组 → 仅取 1 个 fullscreen → 输出 1 条（错）；
+    /// 按 bundle_id 分组 → 2 组 → 各取 1 fullscreen → 输出 2 条（对）。window://host 各自 MCP 自选、正交保留。
+    #[test]
+    fn desktop_groups_by_bundle_id_not_name_118() {
+        let mut w1 = create_test_window("x", "window://a.mcp.com/w", "A", 0, true);
+        w1.server_name = "shared".to_string();
+        w1.bundle_id = "bundle_a".to_string();
+        let mut w2 = create_test_window("x", "window://b.mcp.com/w", "B", 0, true);
+        w2.server_name = "shared".to_string();
+        w2.bundle_id = "bundle_b".to_string();
+
+        let result = organize_desktop(vec![w1, w2], None, &[]);
+        assert_eq!(
+            result.len(),
+            2,
+            "同名不同 bundle_id 应各成一组、不合并: {result:?}"
+        );
+        let joined = result.join("\n");
+        assert!(joined.contains("window://a.mcp.com/w") && joined.contains("window://b.mcp.com/w"));
     }
 
     #[test]
@@ -381,6 +411,7 @@ mod tests {
         ];
 
         let history = vec![ToolCallRecord {
+            bundle_id: "server2".to_string(),
             server: "server2".to_string(),
             tool: "test_tool".to_string(),
             timestamp: 1234567890,
@@ -430,6 +461,7 @@ mod tests {
     #[test]
     fn test_organize_desktop_empty_content() {
         let windows = vec![WindowInfo {
+            bundle_id: "server1".to_string(),
             server_name: "server1".to_string(),
             resource: make_resource("window://server1.mcp.com/window1", "Window 1", None, None),
             read_result: ReadResourceResult {
@@ -463,6 +495,7 @@ mod tests {
     fn test_organize_desktop_invalid_uri_is_skipped() {
         let windows = vec![
             WindowInfo {
+                bundle_id: "server1".to_string(),
                 server_name: "server1".to_string(),
                 resource: make_resource(":::this_is_not_a_uri", "Bad Window", None, None),
                 read_result: ReadResourceResult {
@@ -542,12 +575,14 @@ mod tests {
         // 最近使用顺序：C -> A（B 未使用）
         let history = vec![
             ToolCallRecord {
+                bundle_id: "serverA".to_string(),
                 server: "serverA".to_string(),
                 tool: "test_tool".to_string(),
                 timestamp: 1234567890,
                 metadata: HashMap::new(),
             },
             ToolCallRecord {
+                bundle_id: "serverC".to_string(),
                 server: "serverC".to_string(),
                 tool: "test_tool".to_string(),
                 timestamp: 1234567891,
@@ -580,6 +615,7 @@ mod tests {
 
         // history 让 A 在前
         let history = vec![ToolCallRecord {
+            bundle_id: "serverA".to_string(),
             server: "serverA".to_string(),
             tool: "test_tool".to_string(),
             timestamp: 1234567890,
@@ -604,6 +640,7 @@ mod tests {
 
         // 使用 history 让 A 在前，size=1 使得在进入 B 时触发服务器层级的 break
         let history = vec![ToolCallRecord {
+            bundle_id: "serverA".to_string(),
             server: "serverA".to_string(),
             tool: "test_tool".to_string(),
             timestamp: 1234567890,
@@ -661,6 +698,7 @@ mod tests {
         // 无 annotations 的窗口：priority 视为缺省 0.0，应排在高 priority 窗口之后。
         let raw = RawResource::new("window://server1.mcp.com/no-ann", "no-ann");
         let bare = WindowInfo {
+            bundle_id: "server1".to_string(),
             server_name: "server1".to_string(),
             resource: Annotated::new(raw, None),
             read_result: ReadResourceResult {
@@ -696,12 +734,14 @@ mod tests {
         // history 包含不存在的 server
         let history = vec![
             ToolCallRecord {
+                bundle_id: "nonexistent".to_string(),
                 server: "nonexistent".to_string(),
                 tool: "test_tool".to_string(),
                 timestamp: 1234567890,
                 metadata: HashMap::new(),
             },
             ToolCallRecord {
+                bundle_id: "serverB".to_string(),
                 server: "serverB".to_string(),
                 tool: "test_tool".to_string(),
                 timestamp: 1234567891,
