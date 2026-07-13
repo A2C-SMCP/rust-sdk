@@ -47,6 +47,7 @@ use crate::settings::policy::resolve_policy_settings;
 use crate::settings::reconciler::InstalledPluginRecord;
 use crate::settings::recovery::{BundledServerRecord, GovernanceRecoveryReport};
 use crate::settings::scope::{resolve_settings, ResolveSettingsArgs};
+use crate::settings::EnvMap;
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
     AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer, SkillFileWatcher, SkillRegistry,
@@ -369,9 +370,14 @@ pub struct Computer<S: Session> {
 
     // ── #113 S6：config 落盘锚点 / config persistence anchor ──────────────────
     /// SDK-owned config CRUD 的 project 锚点目录（缺省进程 cwd，#98；测试/部署可经 [`with_config_dir`] 注入）。
-    /// runtime mutate（`add_or_update_server`/`remove_server`）落盘经此锚点的 project/local scope，**只碰
-    /// project 含 local、不碰 home**（D1/§2.3 四根边界）。构造期 seam，跨 clone 保留（与 `skill_home_override` 同）。
+    /// runtime mutate（`add_or_update_server`/`remove_server`）落盘经此锚点解析 project/local scope；user scope
+    /// 必须由 `config_env` 约束在同一实例内。构造期 seam，跨 clone 保留（与 `skill_home_override` 同）。
     config_dir: Option<PathBuf>,
+    /// config 多 scope 解析使用的环境映射。`None` 保持 CLI 的进程环境语义；嵌入式 client 应显式注入，
+    /// 避免实例 CRUD 意外读取或改写宿主进程的 user scope。
+    config_env: Option<EnvMap>,
+    /// config snapshot / CRUD 使用的 SKILL Home。治理账本与配置解析必须指向同一实例根。
+    config_home: Option<PathBuf>,
 }
 
 /// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
@@ -672,6 +678,8 @@ impl<S: Session> Computer<S> {
             input_resolver: None,
             secret_resolver: None,
             config_dir: None,
+            config_env: None,
+            config_home: None,
             // #114 S7：初始生命周期 = Created（尚未 boot 初始化本地资源）/ status starts at Created。
             status: Arc::new(RuntimeStatus::new()),
         }
@@ -700,11 +708,23 @@ impl<S: Session> Computer<S> {
 
     /// 注入 config 落盘锚点（缺省进程 cwd）/ Inject the config-persistence anchor (default: process cwd)。
     ///
-    /// #113 S6：`add_or_update_server` / `remove_server` 落盘经此目录的 project/local scope（#98 project 锚点）。
-    /// 测试/部署据此定向落盘目录，避免污染真实进程 cwd。**只碰 project 含 local、不碰 home**。
+    /// #113 S6：`add_or_update_server` / `remove_server` 经此目录解析 project/local scope（#98 project 锚点）。
+    /// 测试/部署据此定向落盘目录；嵌入式 client 还应调用 [`with_config_resolution_context`](Self::with_config_resolution_context)
+    /// 隔离 user scope 与治理账本。
     #[must_use]
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config_dir = Some(dir.into());
+        self
+    }
+
+    /// 注入 config 多 scope 解析上下文 / Inject config multi-scope resolution context.
+    ///
+    /// 嵌入式 client 必须传入实例隔离的 `env` 与 `home`，使 runtime mutate 与 config adapter 对 user scope、
+    /// plugin ledger 和 project scope 使用完全相同的解析根。CLI 可不调用本方法，继续使用进程环境。
+    #[must_use]
+    pub fn with_config_resolution_context(mut self, env: EnvMap, home: impl Into<PathBuf>) -> Self {
+        self.config_env = Some(env);
+        self.config_home = Some(home.into());
         self
     }
 
@@ -714,6 +734,13 @@ impl<S: Session> Computer<S> {
         self.config_dir
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    fn config_context<'a>(&'a self, config_dir: &'a std::path::Path) -> ConfigContext<'a> {
+        let mut context = ConfigContext::new(config_dir);
+        context.env = self.config_env.as_ref();
+        context.home = self.config_home.as_deref();
+        context
     }
 
     // ── INT-01 #68：SKILL Home 解析 / SKILL Home resolution ──────────────────
@@ -1743,7 +1770,7 @@ impl<S: Session> Computer<S> {
     /// 生产调用方均在 `cli` 参考 client（[`McpInstallHooks`] 实现 / boot 批准挂载）；非 `cli` 构建下无生产调用者
     /// （外部 client 亦经此 hooks-facing API 驱动 MCP 重挂），故 gate dead_code / hooks-facing, cli-only in-tree。
     #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    pub(crate) async fn mount_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
+    pub async fn mount_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
         // 渲染并验证配置（**唯一一次** render——resolver 可能有副作用如 keyring/交互取值，禁重复调用）。
         let validated = self.render_server_config(&server).await?;
         self.mount_rendered(server, validated).await
@@ -1794,7 +1821,7 @@ impl<S: Session> Computer<S> {
     ///
     /// #113 S6：**治理级联停摘**专用（uninstall/disable 级联、gc teardown）——不删 project `mcp.json` 声明
     /// （bundled server 本不在用户 config 层）。**用户删除**走 [`remove_server`]（先落盘删声明再调本方法）。
-    pub(crate) async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
+    pub async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
         {
             let manager = self.mcp_manager.read().await;
             if let Some(ref manager) = *manager {
@@ -1838,7 +1865,7 @@ impl<S: Session> Computer<S> {
         let config_dir = self.config_dir();
         let name = server.name().to_string();
         let body = canonicalize_persist_body(serde_json::to_value(&server)?);
-        let ctx = ConfigContext::new(&config_dir);
+        let ctx = self.config_context(&config_dir);
         // 内容摘要 revision（S1）：仅当真落盘（内容变）才 bump config，避免 no-op/幂等 mutate 虚假 bump（§12 R2）。
         let before_rev = load_config(&ctx).revision;
         let edit = ConfigEdit::new(ConfigEntity::McpServer(name), EditIntent::Upsert(body));
@@ -1865,7 +1892,7 @@ impl<S: Session> Computer<S> {
     pub async fn remove_server(&self, server_name: &str) -> ComputerResult<()> {
         // 落盘删所有可写 scope 声明（S2 R1）→ 经 S3 执行器 / persist the removal first。
         let config_dir = self.config_dir();
-        let ctx = ConfigContext::new(&config_dir);
+        let ctx = self.config_context(&config_dir);
         // 内容摘要 revision（S1）：删一个不在任何 config scope 的 server → 空计划零落盘 → 不 bump（§12 R2）。
         let before_rev = load_config(&ctx).revision;
         let edit = ConfigEdit::new(
@@ -2656,6 +2683,8 @@ impl<S: Session> Computer<S> {
             status: Arc::clone(&self.status),
             // #113 S6：config 锚点是构造期 seam，随 clone 保留（handler 路径不 mutate config，占位满足完整性）。
             config_dir: self.config_dir.clone(),
+            config_env: self.config_env.clone(),
+            config_home: self.config_home.clone(),
         }
     }
 
@@ -2865,6 +2894,8 @@ impl<S: Session + Clone> Clone for Computer<S> {
             status: Arc::clone(&self.status),
             // #113 S6：config 锚点构造期 seam，随 clone 保留。
             config_dir: self.config_dir.clone(),
+            config_env: self.config_env.clone(),
+            config_home: self.config_home.clone(),
         }
     }
 }
@@ -3213,6 +3244,53 @@ mod tests {
         assert!(
             snap.mcp.servers.iter().any(|s| s.name == "persisted"),
             "add_or_update_server 应落盘、重投影可读"
+        );
+    }
+
+    /// 嵌入式 client 注入的 config context 必须参与 origin 消解；否则同名 user 声明会回退到宿主进程环境，
+    /// 造成跨 Computer 实例或全局用户配置污染。
+    #[tokio::test]
+    async fn runtime_mutation_uses_injected_config_resolution_context() {
+        use crate::settings::mcp_config::{user_mcp_config_path, workdir_mcp_config_path};
+        use crate::settings::{EnvMap, XDG_CONFIG_HOME_ENV};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let xdg = tmp.path().join("instance-xdg");
+        let home = tmp.path().join("skill-home");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert(
+            XDG_CONFIG_HOME_ENV.to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        let user_path = user_mcp_config_path(Some(&env));
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_path,
+            r#"{"servers":{"shared":{"type":"stdio","server_parameters":{"command":"old"}}}}"#,
+        )
+        .unwrap();
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&project)
+            .with_config_resolution_context(env, home);
+        computer
+            .add_or_update_server(user_stdio_server97("shared"))
+            .await
+            .unwrap();
+
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&user_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["servers"]["shared"]["server_parameters"]["command"],
+            "node"
+        );
+        assert!(
+            !workdir_mcp_config_path(&project).exists(),
+            "existing user origin must be updated in the injected instance context"
         );
     }
 
