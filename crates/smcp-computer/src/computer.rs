@@ -33,7 +33,8 @@ use crate::blob::{
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::settings::config::{
-    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent,
+    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent, WriteScope,
+    WriteTargetOptions,
 };
 use crate::settings::installer::{
     DisableOptions, EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError,
@@ -748,14 +749,23 @@ impl<S: Session> Computer<S> {
     /// 补 #113 只锚 project 的洞：`env` 注入使 User-scope（`~/.config/a2c/mcp.json`）解析锚定**本实例**、不回退宿主
     /// 进程 `$HOME`/`$XDG`；`home` 注入使 home DropIn / 账本源亦锚定本实例。`config_dir` / `home` 借用须与返回的
     /// context 同域存活（调用方持有 owned `PathBuf` 局部）。
+    ///
+    /// #123（协议#19 加固）：`upsert_new_scope` 决定**新** server 声明的落盘 scope——公开 CRUD 默认 `Local`
+    /// （`mcp.local.json`，不入 git；仍 boot 读取→重启存活），避免 API/UI 加的 server 静默污染团队共享层；
+    /// `remove` 不 upsert，此参数对其无影响。
     fn instance_config_context<'a>(
         &'a self,
         config_dir: &'a std::path::Path,
         home: &'a std::path::Path,
+        upsert_new_scope: WriteScope,
     ) -> ConfigContext<'a> {
         ConfigContext {
             env: self.config_env(),
             home: Some(home),
+            opts: WriteTargetOptions {
+                upsert_new_scope,
+                ..WriteTargetOptions::default()
+            },
             ..ConfigContext::new(config_dir)
         }
     }
@@ -1786,20 +1796,28 @@ impl<S: Session> Computer<S> {
         Ok(rendered_config)
     }
 
-    /// 仅运行期物化 server（render + manager + 内存投影 + capability bump + emit），**不落盘** / mount at runtime only。
+    /// **运行期挂载** MCP server（render + manager + 内存投影 + capability bump + emit），**不落盘** /
+    /// mount an MCP server at runtime only (no persistence)。
     ///
-    /// #113 S6：**治理物化**路径专用——[`McpInstallHooks`] 重挂 bundled server、boot 批准挂载、gc teardown 的对侧。
-    /// bundled server 归属 ledger 意图，**绝不能**经此写入 project `mcp.json`（否则卸载后孤儿化、每次 boot remount
-    /// 重写用户配置文件、意图双物化）。**用户声明**的 server 走 [`add_or_update_server`]（先落盘再调本方法）。
+    /// #122：这是供 **plugin / 治理 Hook**（[`McpInstallHooks`] 实现，含 **SDK 外部** client，如 tfrobot-client）
+    /// 使用的 runtime-only 生命周期通道——把归属 plugin ledger 意图的 bundled server 挂进当前 Computer runtime，
+    /// 而**不**写入用户 `mcp.json`。其 durability 由 ledger（`installedPlugins` / `enabledPlugins`）承载、每次 boot 由
+    /// `reconcile_governance` 从意图重新派生重挂；经本方法挂载的 server **绝不能**落进 project `mcp.json`（否则形成
+    /// 双事实来源：卸载后孤儿化、每次 boot remount 重写用户配置、disable 后跨重启复活并漂移为 `User` ownership）。
+    ///
+    /// **何时用哪条**（与 [`add_or_update_server`](Self::add_or_update_server) 的区别）：
+    /// - **本方法（transient-mount）**：server 的真相在别处（plugin ledger）、只需运行期投影 → 挂进 runtime、**不落盘**、
+    ///   只 bump **capability** revision。
+    /// - [`add_or_update_server`](Self::add_or_update_server)（**declare-durable**）：**用户显式声明**、真相就是这份声明、
+    ///   须重启存活 → **落盘** project `mcp.json`（bump **config** revision）后再运行期物化。
     ///
     /// - `#106` ABBA：manager 惰性初始化**先 read 探测、仅 None 才升写锁**（governance 路径持 `skill_registry`
-    ///   写锁 → hooks → 此方法；post-boot manager 恒 `Some` 只取读锁，与 [`McpChangeReactor`] 的读锁相容）。
+    ///   写锁 → hooks → 此方法；post-boot manager 恒 `Some` 只取读锁，与 `McpChangeReactor` 的读锁相容）。
     /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期物化不改持久 config）。
     ///
-    /// 生产调用方均在 `cli` 参考 client（[`McpInstallHooks`] 实现 / boot 批准挂载）；非 `cli` 构建下无生产调用者
-    /// （外部 client 亦经此 hooks-facing API 驱动 MCP 重挂），故 gate dead_code / hooks-facing, cli-only in-tree。
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    pub(crate) async fn mount_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
+    /// # Errors
+    /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；运行期物化失败（manager 错）。
+    pub async fn mount_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
         // 渲染并验证配置（**唯一一次** render——resolver 可能有副作用如 keyring/交互取值，禁重复调用）。
         let validated = self.render_server_config(&server).await?;
         self.mount_rendered(server, validated).await
@@ -1846,14 +1864,19 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
-    /// 仅运行期停摘 server（**名称寻址**；manager + 内存投影 + capability bump + emit），**不落盘** / unmount by name。
+    /// **运行期停摘** MCP server（**名称寻址**；manager + 内存投影 + capability bump + emit），**不落盘** /
+    /// unmount an MCP server at runtime only, by name (no persistence)。
     ///
-    /// #113 S6：**治理级联停摘**专用（plugin uninstall/disable 级联、gc teardown 经 `McpInstallHooks::remove_server`
-    /// 按 bundled server 名停摘）——不删 project `mcp.json` 声明（bundled server 本不在用户 config 层）。**用户删除**
-    /// 走 [`remove_server`]（bundle_id 寻址：落盘删声明后经 [`unmount_server_by_id`](Self::unmount_server_by_id) 停摘）。
-    /// 当前仅治理级联（`cli` feature 下的 hooks / repl）调用，故非-cli 构建下按 dead_code 豁免。
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    pub(crate) async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
+    /// #122：[`mount_server`](Self::mount_server) 的对侧——供 **plugin / 治理 Hook**（[`McpInstallHooks`] 的
+    /// `remove_server` 实现，含 **SDK 外部** client）按 bundled server 名停摘运行期实例，**不删** project `mcp.json`
+    /// 声明（bundled server 本不在用户 config 层，其增减由 plugin enablement 意图驱动）。**用户删除**声明走
+    /// [`remove_server`](Self::remove_server)（bundle_id 寻址：落盘删声明后经运行期臂 `unmount_server_by_id` 停摘）。
+    ///
+    /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期停摘不改持久 config）。
+    ///
+    /// # Errors
+    /// 运行期停摘失败（manager 错）。
+    pub async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
         {
             let manager = self.mcp_manager.read().await;
             if let Some(ref manager) = *manager {
@@ -1910,9 +1933,12 @@ impl<S: Session> Computer<S> {
     /// 动态添加或更新服务器配置（**落盘 + 运行期物化**）/ Add or update a server config (persist + mount)。
     ///
     /// #113 S6（补 #96 洞）：用户经此声明的 server 现**落盘**（重启不丢），再运行期物化。
+    /// - **新 server 默认落 `local` scope**（`mcp.local.json`，**不入 git**；#123 / 协议#19 加固）——避免 API/UI
+    ///   加的 server 静默污染团队共享的 `mcp.json`；local 仍 boot 读取→**重启存活**（不损失 #113 收益）。想入 git
+    ///   团队共享 → 用 [`add_or_update_server_in_scope`](Self::add_or_update_server_in_scope) 显式选 `Project`/`User`。
     /// - **D1 安全**：落盘的是**原始** `server`（保留 `${input:*}`/`${env:*}` 引用），**绝不**落渲染后的明文值/secret。
-    /// - **落盘经 S2 消解器 + S3 执行器**（[`update_config`]）：新 server → project scope；改已有 → 其 origin scope
-    ///   （只碰 project 含 local、不碰 home）。bundled server 名 → 消解器拒（[`WriteTargetError::Synthesized`]）。
+    /// - **改已有 server** → 恒落其 **origin scope**（`upsert_new_scope` 只作用于新声明）。bundled server 名 →
+    ///   消解器拒（[`WriteTargetError::Synthesized`]）。
     /// - **§12 R2**：落盘成功后 bump **config** revision；随后运行期物化 bump **capability**。
     /// - 治理物化（bundled 重挂）**不**走此路径（走 [`mount_server`]），避免 ledger 意图重复写入 mcp.json。
     ///
@@ -1920,6 +1946,24 @@ impl<S: Session> Computer<S> {
     /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；落盘失败
     /// （[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期物化失败（manager 错）。
     pub async fn add_or_update_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
+        // #123（协议#19 加固）：默认 `Local`（不入 git、机器本地、重启存活）。
+        self.add_or_update_server_in_scope(server, WriteScope::Local)
+            .await
+    }
+
+    /// 同 [`add_or_update_server`]，但**显式指定新 server 的落盘 scope**（opt-in 团队共享 `Project` / 用户全局 `User`）。
+    ///
+    /// #123（协议#19 加固）：`upsert_new_scope` **只作用于新声明**——更新已有 server 恒落其 origin scope，与本参数无关。
+    /// `Local` = `<cwd>/.tfrobot/mcp.local.json`（不入 git）；`Project` = `<cwd>/.tfrobot/mcp.json`（入 git、团队共享）；
+    /// `User` = `~/.config/a2c/mcp.json`（用户全局）。
+    ///
+    /// # Errors
+    /// 同 [`add_or_update_server`]。
+    pub async fn add_or_update_server_in_scope(
+        &self,
+        server: MCPServerConfig,
+        upsert_new_scope: WriteScope,
+    ) -> ComputerResult<()> {
         // 先 render 校验：非法 config / 无法解析的 input 早失败，**不落盘**（**唯一一次** render，下方物化复用其结果，
         // 避免重复触发 resolver 副作用）/ validate before persist; single render reused by mount_rendered below。
         let validated = self.render_server_config(&server).await?;
@@ -1930,7 +1974,7 @@ impl<S: Session> Computer<S> {
         let home = self.skill_home();
         let name = server.name().to_string();
         let body = canonicalize_persist_body(serde_json::to_value(&server)?);
-        let ctx = self.instance_config_context(&config_dir, &home);
+        let ctx = self.instance_config_context(&config_dir, &home, upsert_new_scope);
         // 内容摘要 revision（S1）：仅当真落盘（内容变）才 bump config，避免 no-op/幂等 mutate 虚假 bump（§12 R2）。
         let before_rev = load_config(&ctx).revision;
         let edit = ConfigEdit::new(ConfigEntity::McpServer(name), EditIntent::Upsert(body));
@@ -1963,9 +2007,10 @@ impl<S: Session> Computer<S> {
     /// 落盘失败（[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期停摘失败（manager 错）。
     pub async fn remove_server(&self, bundle_id: &str) -> ComputerResult<()> {
         // #121 A：以本实例上下文（含 User env + Skill Home）解析 config，绝不误读/误删宿主 User config。
+        // remove 不 upsert（删所有可写 scope，S2 R1），`upsert_new_scope` 对其无影响，占位传 `Local`。
         let config_dir = self.config_dir();
         let home = self.skill_home();
-        let ctx = self.instance_config_context(&config_dir, &home);
+        let ctx = self.instance_config_context(&config_dir, &home, WriteScope::Local);
 
         // bundle_id → 声明名（去重）。快照 `McpServerView.config` 为 raw，`resolve_bundle_id` 与 manager 注册期同键。
         let snap = load_config(&ctx);
@@ -3327,17 +3372,18 @@ mod tests {
 
     // ── #113 S6：runtime mutate 落盘接线 / persist-on-mutate wiring ─────────────────
 
-    /// add_or_update_server 落盘到 project scope（重启不丢，补 #96 洞）+ config revision +1（§12 R2）。
+    /// add_or_update_server_in_scope(Project) 显式落 project scope（团队共享，opt-in）+ config revision +1（§12 R2）。
+    /// #123（协议#19 加固）：默认已改 local，团队共享须**显式** opt-in project——本测试守护该 opt-in 路径。
     #[tokio::test]
-    async fn add_or_update_server_persists_to_project_and_survives_reload() {
-        use crate::settings::config::{load_config, ConfigContext};
-        use crate::settings::mcp_config::workdir_mcp_config_path;
+    async fn add_or_update_server_in_scope_project_persists_and_survives_reload() {
+        use crate::settings::config::{load_config, ConfigContext, WriteScope};
+        use crate::settings::mcp_config::{workdir_mcp_config_path, workdir_mcp_local_config_path};
         let tmp = tempfile::TempDir::new().unwrap();
         let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
             .with_config_dir(tmp.path());
 
         computer
-            .add_or_update_server(user_stdio_server97("persisted"))
+            .add_or_update_server_in_scope(user_stdio_server97("persisted"), WriteScope::Project)
             .await
             .unwrap();
 
@@ -3345,17 +3391,54 @@ mod tests {
         assert_eq!(computer.config_revision(), 1);
         assert_eq!(computer.capability_revision(), 1);
 
-        // 落 project mcp.json（**非** user/local；默认 upsert_new_scope=Project）。
+        // 显式 opt-in → 落 project mcp.json（**非** local）。
         assert!(
             workdir_mcp_config_path(tmp.path()).exists(),
-            "应落 project mcp.json"
+            "显式 Project 应落 project mcp.json"
+        );
+        assert!(
+            !workdir_mcp_local_config_path(tmp.path()).exists(),
+            "显式 Project 不应落 local"
         );
 
         // 「重启」= 以同一 config_dir 重投影快照 → server 仍在（不丢）。
         let snap = load_config(&ConfigContext::new(tmp.path()));
         assert!(
             snap.mcp.servers.iter().any(|s| s.name == "persisted"),
-            "add_or_update_server 应落盘、重投影可读"
+            "add_or_update_server_in_scope 应落盘、重投影可读"
+        );
+    }
+
+    /// #123（协议#19 加固）：`add_or_update_server`（默认）新 server 落 **local**（不入 git）、**不**碰 project mcp.json；
+    /// local 仍重投影可读（重启存活）。
+    #[tokio::test]
+    async fn add_or_update_server_defaults_to_local_scope_not_git_shared() {
+        use crate::settings::config::{load_config, ConfigContext};
+        use crate::settings::mcp_config::{workdir_mcp_config_path, workdir_mcp_local_config_path};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path());
+
+        computer
+            .add_or_update_server(user_stdio_server97("declared"))
+            .await
+            .unwrap();
+
+        // 落 local（不入 git），**不**落 project（team-shared）。
+        assert!(
+            workdir_mcp_local_config_path(tmp.path()).exists(),
+            "默认应落 local mcp.local.json"
+        );
+        assert!(
+            !workdir_mcp_config_path(tmp.path()).exists(),
+            "默认**不得**静默污染 git 共享的 project mcp.json（#123 / 协议#19 加固）"
+        );
+
+        // local 仍重投影可读 → 重启存活（不损失 #113 收益）。
+        let snap = load_config(&ConfigContext::new(tmp.path()));
+        assert!(
+            snap.mcp.servers.iter().any(|s| s.name == "declared"),
+            "local scope 声明须重投影可读（重启存活）"
         );
     }
 
@@ -3533,7 +3616,7 @@ mod tests {
     #[tokio::test]
     async fn persisted_mcp_json_uses_protocol_canonical_type_token_and_roundtrips() {
         use crate::settings::config::{load_config, ConfigContext};
-        use crate::settings::mcp_config::workdir_mcp_config_path;
+        use crate::settings::mcp_config::workdir_mcp_local_config_path;
         let tmp = tempfile::TempDir::new().unwrap();
         let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
             .with_config_dir(tmp.path());
@@ -3542,9 +3625,9 @@ mod tests {
             .await
             .unwrap();
 
-        // 落盘原始字节：规范小写 `stdio`（非 `Stdio`）、无内嵌 name。
+        // 落盘原始字节：规范小写 `stdio`（非 `Stdio`）、无内嵌 name。#123：默认落 local（不入 git）。
         let raw: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(workdir_mcp_config_path(tmp.path())).unwrap(),
+            &std::fs::read_to_string(workdir_mcp_local_config_path(tmp.path())).unwrap(),
         )
         .unwrap();
         assert_eq!(

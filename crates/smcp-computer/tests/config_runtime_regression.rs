@@ -17,7 +17,7 @@
 //! 10. lifecycle 不变量（boot/shutdown 终态 + 未连接 gate）
 //! 11. 跨-SDK 快照 fixture round-trip **桩**（python 未实现，守护 schema 漂移）
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use tempfile::TempDir;
@@ -41,6 +41,7 @@ use smcp_computer::settings::scope::{
     workdir_local_settings_path, workdir_project_settings_path, EnvMap,
 };
 use smcp_computer::settings::store::installed_plugins_path;
+use smcp_computer::settings::{McpHookError, McpInstallHooks};
 use smcp_computer::{ComputerEvent, LifecycleState};
 
 use serde_json::{json, Value};
@@ -119,12 +120,20 @@ async fn runtime_add_server_persists_and_survives_fresh_reload() {
         snap.mcp.servers.iter().any(|s| s.name == "srv1"),
         "add_or_update_server 落盘后必须能被独立 load_config 读回"
     );
-    // 盘上判别符是协议 §9.1 规范小写 stdio（跨 SDK 可读），非 Rust 变体名 Stdio。
-    let disk = read_json(&workdir_mcp_config_path(&cd));
+    // #123（协议#19 加固）：新 server 默认落 **local**（`mcp.local.json`，不入 git），**非** project `mcp.json`。
+    let disk = read_json(&workdir_mcp_local_config_path(&cd));
     assert_eq!(disk["servers"]["srv1"]["type"], json!("stdio"));
     assert!(
         disk["servers"]["srv1"].get("name").is_none(),
         "内嵌 name 应被剥（map key 即身份）"
+    );
+    // 默认不写团队共享的 project `mcp.json`。
+    assert!(
+        !workdir_mcp_config_path(&cd).exists()
+            || read_json(&workdir_mcp_config_path(&cd))["servers"]
+                .get("srv1")
+                .is_none(),
+        "默认落 local，不得静默污染 git 共享的 project mcp.json（#123）"
     );
 
     computer.shutdown().await.unwrap();
@@ -468,7 +477,8 @@ async fn http_server_persists_as_streamable_token_and_roundtrips_back_to_http() 
         .unwrap();
 
     // 盘上判别符=协议 §9.1 规范 token "streamable"（对齐 Python Literal，跨 SDK 可读），非 Rust 变体名 Http。
-    let disk = read_json(&workdir_mcp_config_path(&cd));
+    // #123：新 server 默认落 local（不入 git）。
+    let disk = read_json(&workdir_mcp_local_config_path(&cd));
     assert_eq!(disk["servers"]["hsrv"]["type"], json!("streamable"));
 
     // 全链路往返：独立 load_config（内部读 alias="streamable"）读回 → 仍是 Http 变体。
@@ -803,4 +813,188 @@ async fn issue121_remove_addresses_by_bundle_id_not_name() {
             .any(|s| s.name == name),
         "按 bundle_id（身份键）删应移除声明"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #122：runtime-only 外部通道（mount_server / unmount_server 对外公开）
+// ---------------------------------------------------------------------------
+//
+// 外部 client 实现 `McpInstallHooks`（plugin / 治理 hook）须能经**运行期挂载/卸载**通道，把 plugin
+// ledger 派生的 bundled server 挂进当前 Computer runtime 而**不落盘**——其 durability 由 ledger
+// （installedPlugins / enabledPlugins）承载、每次 boot 由 `reconcile_governance` 重新派生重挂，绝不
+// 该进用户 `mcp.json`。修复前该通道（`mount_server` / `unmount_server`）为 `pub(crate)`，SDK 外部
+// crate 够不着 → 外部 hook 被迫用会**落盘**的 `add_or_update_server` / `remove_server`，把 plugin 派生
+// server 误写进用户 mcp.json（双事实来源、config revision 噪声、teardown 失败后跨重启复活为 `User`）。
+//
+// 本节以**外部 crate 视角**（`tests/` = 独立编译单元，正是外部 consumer 的观测点）实现一个最小治理
+// hook 驱动该通道——**修复前整个测试 binary 因 `mount_server` 私有而编译失败（= 红灯，与根因「对外
+// 不可达」一致）；翻 `pub` 后编译通过并绿灯**。用户显式 `add/remove` 仍落盘的对照锚点见本文件既有
+// `runtime_add_server_persists_and_survives_fresh_reload`。
+
+/// 最小外部治理 hook：register → 运行期挂载（不落盘），remove → 运行期卸载（可注入 teardown 失败）。
+/// 镜像 SDK 自带 `CliMcpHooks` 的接线，但**从 SDK 外部**驱动 `mount_server` / `unmount_server`——即
+/// #122 要打通的场景（如 tfrobot-client 的插件治理 hook）。
+struct ExternalGovernanceHooks<'a> {
+    comp: &'a Computer<SilentSession>,
+    /// `true` → `remove_server` 返错，模拟 disable 在 MCP teardown 阶段失败（issue 复现步骤 4）。
+    fail_teardown: bool,
+}
+
+#[async_trait::async_trait]
+impl McpInstallHooks for ExternalGovernanceHooks<'_> {
+    fn existing_server_names(&self) -> HashSet<String> {
+        // 冲突门控非本测试关注点（#122 只验运行期通道的对外可达 + 不落盘契约）。
+        HashSet::new()
+    }
+
+    async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError> {
+        // #122 关键行：治理物化走**运行期通道**（不落盘）。修复前此调用无法编译（mount_server 私有）。
+        self.comp
+            .mount_server(cfg)
+            .await
+            .map_err(|e| McpHookError(e.to_string()))
+    }
+
+    async fn remove_server(&self, name: &str) -> Result<(), McpHookError> {
+        if self.fail_teardown {
+            return Err(McpHookError("injected teardown failure".into()));
+        }
+        // #122 关键行：治理级联停摘走**运行期通道**（不删 config 声明）。修复前无法编译（unmount_server 私有）。
+        self.comp
+            .unmount_server(name)
+            .await
+            .map_err(|e| McpHookError(e.to_string()))
+    }
+}
+
+/// #122：外部治理 hook 经 runtime-only 通道挂/卸 → **不落盘**、只 bump capability、不 bump config revision。
+///
+/// 直接守护 issue「期望行为」①（runtime-only 挂载只影响 runtime 与 capability revision，不写 config
+/// 文件/快照、不增 config revision）与「正常 disable 不产生 config 文件/revision 噪声」。
+#[tokio::test]
+async fn issue122_external_hook_runtime_mount_does_not_persist() {
+    let td = TempDir::new().unwrap();
+    let cd = config_dir_of(&td);
+    let computer = isolate_boot(
+        Computer::new("c", SilentSession::new("s"), None, None, false, false),
+        &td,
+    );
+    computer.boot_up().await.unwrap();
+    let cap0 = computer.capability_revision();
+    assert_eq!(
+        computer.config_revision(),
+        0,
+        "boot 不 bump config revision"
+    );
+
+    let hooks = ExternalGovernanceHooks {
+        comp: &computer,
+        fail_teardown: false,
+    };
+
+    // register（= plugin enable 级联挂 bundled server）→ 运行期可见、盘上无痕。
+    hooks.register_server(stdio("audit-mcp")).await.unwrap();
+    assert!(
+        computer
+            .list_mcp_servers()
+            .await
+            .iter()
+            .any(|s| s.name() == "audit-mcp"),
+        "runtime 应含挂载的 server"
+    );
+    assert!(
+        !workdir_mcp_config_path(&cd).exists(),
+        "runtime-only 挂载不得落盘（bundled server 归属 ledger 意图，非用户 mcp.json）"
+    );
+    assert_eq!(
+        computer.config_revision(),
+        0,
+        "runtime-only 挂载不 bump config revision（无 config 噪声）"
+    );
+    assert!(
+        computer.capability_revision() > cap0,
+        "运行期物化 bump capability revision（§12 R2）"
+    );
+
+    // remove（= plugin disable 级联摘）→ 运行期消失、仍无盘上痕迹、config revision 全程恒 0。
+    hooks.remove_server("audit-mcp").await.unwrap();
+    assert!(
+        !computer
+            .list_mcp_servers()
+            .await
+            .iter()
+            .any(|s| s.name() == "audit-mcp"),
+        "卸载后 runtime 不含该 server"
+    );
+    assert!(
+        !workdir_mcp_config_path(&cd).exists(),
+        "正常 disable/卸载亦不产生空 mcp.json"
+    );
+    assert_eq!(
+        computer.config_revision(),
+        0,
+        "全程无 config revision 噪声（正常 disable 无痕）"
+    );
+
+    computer.shutdown().await.unwrap();
+}
+
+/// #122（P1 核心）：teardown 失败后进程重启，plugin 派生的 server **不得从用户 mcp.json 复活**、更不得
+/// 漂移为 `User` ownership——因 runtime-only 通道从不落盘，无可复活来源。
+///
+/// 守护 issue「期望行为」③与验收「remove hook 失败后重建 Computer 不出现残留 server 或 ownership 漂移」。
+/// 用绝对**不在场**断言证明「无漂移」：server 若从未落盘、重启后既不在 inventory 也不在 config 快照，
+/// 便无从被 `list_mcp_servers_with_metadata` 误判为 `User`（不在场 ⟹ 无归属漂移）。
+#[tokio::test]
+async fn issue122_teardown_failure_then_rebuild_has_no_resurrection() {
+    let td = TempDir::new().unwrap();
+    let cd = config_dir_of(&td);
+
+    // Computer A：外部治理 hook 经 runtime-only 通道挂 bundled server，随后 teardown 注入失败。
+    {
+        let comp_a = isolate_boot(
+            Computer::new("a", SilentSession::new("s"), None, None, false, false),
+            &td,
+        );
+        comp_a.boot_up().await.unwrap();
+        let hooks = ExternalGovernanceHooks {
+            comp: &comp_a,
+            fail_teardown: true,
+        };
+        hooks.register_server(stdio("audit-mcp")).await.unwrap();
+
+        // 模拟 disable 的 MCP teardown 阶段失败（issue 复现步骤 4）：remove hook 返错、server 未摘。
+        assert!(
+            hooks.remove_server("audit-mcp").await.is_err(),
+            "注入 teardown 失败"
+        );
+
+        // 即便 teardown 失败，runtime-only 通道也从未落盘 → 无 mcp.json。
+        assert!(
+            !workdir_mcp_config_path(&cd).exists(),
+            "teardown 失败也不产生 mcp.json（无跨重启复活来源）"
+        );
+        comp_a.shutdown().await.unwrap();
+    }
+
+    // Computer B：以**同一 config 根**重建 + boot（= 进程重启）。
+    let comp_b = isolate_boot(
+        Computer::new("b", SilentSession::new("s"), None, None, false, false),
+        &td,
+    );
+    comp_b.boot_up().await.unwrap();
+
+    // 无残留 server、无 ownership 漂移：mcp.json 从无该条目，重投影 / inventory 皆不含。
+    let inv = comp_b.list_mcp_servers_with_metadata().await;
+    assert!(
+        !inv.iter().any(|e| e.name == "audit-mcp"),
+        "teardown 失败 + 重启后，runtime-only 挂载的 server 不得复活（更不漂移为 User）"
+    );
+    let snap = load_config(&ConfigContext::new(&cd));
+    assert!(
+        !snap.mcp.servers.iter().any(|s| s.name == "audit-mcp"),
+        "config 快照亦不含该 server（从未落盘）"
+    );
+
+    comp_b.shutdown().await.unwrap();
 }
