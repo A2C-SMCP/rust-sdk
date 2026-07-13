@@ -31,6 +31,10 @@ use crate::blob::{
     SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
+use crate::governance::{
+    resolve_governance_snapshot, GovernanceArgs, GovernanceQueryError, GovernanceRuntimeOverlay,
+    GovernanceSnapshot, ListPluginsOptions, MarketplaceSnapshot, PluginSnapshot, PluginStatus,
+};
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::settings::config::{
     load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent, WriteScope,
@@ -851,6 +855,21 @@ impl<S: Session> Computer<S> {
     // 只读，**无** setter），`env = None`（进程环境）。`McpInstallHooks` 保持可注入，让产品 client 把 plugin
     // bundled MCP server 物化到自己的 MCP 配置模型。**不**含 boot 恢复 / `reconcile_governance()`（归 Sub-B）。
 
+    /// #124：治理声明式内容变更后统一发信号——bump **config** revision（经 [`subscribe_events`](Self::subscribe_events)
+    /// 发 [`ComputerEvent::ConfigRevisionBumped`]，使 GUI 无需轮询内部文件即可观察治理生命周期变更）+ fire-and-forget
+    /// socketio `update_config` 通知（未连接 → `InvalidState` 静默，绝不 panic）。
+    ///
+    /// **调用契约（无虚假 bump）**：仅在 mutator **成功且确有内容变更**的路径调用——`add_marketplace` / `remove_marketplace`
+    /// 对重复/未知目标返 `Err`（[`GovernanceError::DuplicateMarketplace`] / `UnknownMarketplace`）、`install_plugin`
+    /// 成功即真实（重）物化账本、`uninstall_plugin` 仅在 `Ok(true)`（确有移除）调用，故成功即真变，无需再门控。
+    /// 这与 `enable/disable_plugin` **刻意**用 `changed` 门控（#115 R1：re-enable 已启用者是返 `Ok` 的**真 no-op**、
+    /// 须避免虚假 bump）的差异**是有意的**——install/uninstall/add/remove 的成功语义本身已排除 no-op。§12 R2：
+    /// config ⊥ capability——bundled server 重挂的能力变化由 MCP start/stop 各自 bump capability，与此正交。
+    async fn emit_governance_config_change(&self) {
+        self.bump_config_revision();
+        let _ = self.emit_update_config().await;
+    }
+
     /// 添加 marketplace（归一 URL + 派生名 + clone/stage 或仅注册意图）/ add a marketplace。
     ///
     /// 信任门（user-scope `trustedMarketplaces`）由产品 client 在调用前自理——**不**属 `skill_home` 治理边界。
@@ -870,6 +889,7 @@ impl<S: Session> Computer<S> {
         };
         if res.is_ok() {
             self.mark_skills_dirty();
+            self.emit_governance_config_change().await;
         }
         res
     }
@@ -907,6 +927,7 @@ impl<S: Session> Computer<S> {
         };
         if res.is_ok() {
             self.mark_skills_dirty();
+            self.emit_governance_config_change().await;
         }
         res
     }
@@ -931,6 +952,7 @@ impl<S: Session> Computer<S> {
         };
         if res.is_ok() {
             self.mark_skills_dirty();
+            self.emit_governance_config_change().await;
         }
         res
     }
@@ -1083,6 +1105,7 @@ impl<S: Session> Computer<S> {
         };
         if matches!(res, Ok(true)) {
             self.mark_skills_dirty();
+            self.emit_governance_config_change().await;
         }
         res
     }
@@ -2728,6 +2751,110 @@ impl<S: Session> Computer<S> {
 
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    // ── #124：高层 governance snapshot/inventory（SDK-facing，只读）─────────────────
+    /// 采集轻量 live 叠加（bundled skills / 已物化 server），供治理快照富化——**不入 revision**。
+    ///
+    /// bundled skills 从活跃 SKILL registry 按 plugin_id 分组（`source == "marketplace:<mp>"` +
+    /// name `"<plugin>:<skill>"` → `"<plugin>@<mp>"`）；materialized 取当前运行期已物化 server 名集。
+    /// 均为已缓存读、非阻塞（不发 MCP RPC）。
+    async fn governance_overlay(&self) -> GovernanceRuntimeOverlay {
+        let mut bundled_skills_by_plugin: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for r in self.skill_registry.read().await.active_refs() {
+            if let Some(mp) = r.source.strip_prefix("marketplace:") {
+                if let Some((plugin, _)) = r.name.split_once(':') {
+                    bundled_skills_by_plugin
+                        .entry(format!("{plugin}@{mp}"))
+                        .or_default()
+                        .push(r.name.clone());
+                }
+            }
+        }
+        for v in bundled_skills_by_plugin.values_mut() {
+            v.sort();
+        }
+        let materialized_mcp_servers: std::collections::BTreeSet<String> =
+            self.mcp_servers.read().await.keys().cloned().collect();
+        GovernanceRuntimeOverlay {
+            bundled_skills_by_plugin,
+            materialized_mcp_servers,
+        }
+    }
+
+    /// 统一治理快照（Marketplace/plugin 完整列表 + 详情）/ unified governance snapshot（#124）。
+    ///
+    /// 面向集成 client（GUI/Tauri）：**只经本 `Computer` + [`crate::governance`] DTO** 即可查询治理状态。
+    /// 以本实例注入的 `skill_home` / `config_env` / config directory 解析，**绝不回退宿主 env/home**。只读、
+    /// 非阻塞、不隐式 clone/refresh。`installedPlugins` 意图为安装权威；单项损坏 → `Degraded` + diagnostic，
+    /// 不吞成空。`list_*` / `get_*` 均由本快照派生，故共享同一状态语义与 `revision`。
+    pub async fn governance_snapshot(&self) -> Result<GovernanceSnapshot, GovernanceQueryError> {
+        let home = self.skill_home();
+        let config_dir = self.config_dir();
+        let overlay = self.governance_overlay().await;
+        Ok(resolve_governance_snapshot(
+            GovernanceArgs {
+                cwd: Some(&config_dir),
+                env: self.config_env(),
+                home: Some(&home),
+                ..Default::default()
+            },
+            &overlay,
+        ))
+    }
+
+    /// 列出全部已知 marketplace（含详情）/ list marketplaces（#124）。
+    pub async fn list_marketplaces(
+        &self,
+    ) -> Result<Vec<MarketplaceSnapshot>, GovernanceQueryError> {
+        Ok(self.governance_snapshot().await?.marketplaces)
+    }
+
+    /// 按名取单个 marketplace（未知 → `None`）/ get one marketplace（#124）。
+    pub async fn get_marketplace(
+        &self,
+        name: &str,
+    ) -> Result<Option<MarketplaceSnapshot>, GovernanceQueryError> {
+        Ok(self
+            .governance_snapshot()
+            .await?
+            .marketplaces
+            .into_iter()
+            .find(|m| m.name == name))
+    }
+
+    /// 列出 plugin（按 [`ListPluginsOptions`] 过滤）/ list plugins（#124）。
+    ///
+    /// 默认仅返回已安装项；`include_available=true` 追加 catalog 可用（未安装）项；`marketplace` 限定归属。
+    pub async fn list_plugins(
+        &self,
+        options: ListPluginsOptions,
+    ) -> Result<Vec<PluginSnapshot>, GovernanceQueryError> {
+        let plugins = self.governance_snapshot().await?.plugins;
+        Ok(plugins
+            .into_iter()
+            .filter(|p| options.include_available || p.status != PluginStatus::Available)
+            .filter(|p| {
+                options
+                    .marketplace
+                    .as_deref()
+                    .is_none_or(|m| p.marketplace == m)
+            })
+            .collect())
+    }
+
+    /// 按 id（`<plugin>@<marketplace>`）取单个 plugin（未知 → `None`）/ get one plugin（#124）。
+    pub async fn get_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<PluginSnapshot>, GovernanceQueryError> {
+        Ok(self
+            .governance_snapshot()
+            .await?
+            .plugins
+            .into_iter()
+            .find(|p| p.id == plugin_id))
     }
 
     /// 启动 MCP 客户端 / Start MCP client

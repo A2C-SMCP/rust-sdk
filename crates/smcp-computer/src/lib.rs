@@ -12,6 +12,7 @@ pub mod blob;
 pub mod computer;
 pub mod desktop;
 pub mod errors;
+pub mod governance;
 pub mod inputs;
 pub mod inventory;
 pub mod mcp_clients;
@@ -28,6 +29,13 @@ pub use errors::{ComputerError, ComputerResult};
 
 /// #107 S7（#114）：runtime status / 事件公开面 re-export / runtime status surface re-export。
 pub use status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
+
+/// #124：高层 governance snapshot/inventory 公开面 re-export（SDK-facing，consumer 仅经此 + `Computer`）。
+pub use governance::{
+    GovernanceDecision, GovernanceDiagnostic, GovernanceQueryError, GovernanceRevision,
+    GovernanceSnapshot, ListPluginsOptions, MarketplaceSnapshot, MarketplaceStatus, PluginSnapshot,
+    PluginStatus, ProvenanceScope,
+};
 
 /// Computer模块的版本号 / Version of the Computer module
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
