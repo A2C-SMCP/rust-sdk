@@ -2515,18 +2515,23 @@ impl<S: Session> Computer<S> {
             plugin_id: rec.plugin_id.clone(),
         };
 
-        // ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图；env/cwd=None）。
-        let home = self.skill_home();
-        let policy = resolve_policy_settings(None, None, None);
+        // ledger 派生的已启用 bundled server（归属纯函数，与 config CRUD 使用同一嵌入式解析上下文）。
+        let config_dir = self.config_dir();
+        let env = self.config_env.as_ref();
+        let home = self
+            .config_home
+            .clone()
+            .unwrap_or_else(|| self.skill_home());
+        let policy = resolve_policy_settings(env, None, None);
         let declared = resolve_settings(ResolveSettingsArgs {
-            cwd: None,
-            env: None,
+            cwd: Some(&config_dir),
+            env,
             flag_settings_path: None,
             policy_settings: Some(&policy),
         })
         .settings;
         let bundled: HashMap<String, BundledServerRecord> =
-            crate::settings::recovery::collect_enabled_bundled_servers(&home, None, &declared)
+            crate::settings::recovery::collect_enabled_bundled_servers(&home, env, &declared)
                 .into_iter()
                 .map(|rec| (rec.config.name().to_string(), rec))
                 .collect();
