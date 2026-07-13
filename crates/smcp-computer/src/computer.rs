@@ -1809,11 +1809,18 @@ impl<S: Session> Computer<S> {
     /// - **本方法（transient-mount）**：server 的真相在别处（plugin ledger）、只需运行期投影 → 挂进 runtime、**不落盘**、
     ///   只 bump **capability** revision。
     /// - [`add_or_update_server`](Self::add_or_update_server)（**declare-durable**）：**用户显式声明**、真相就是这份声明、
-    ///   须重启存活 → **落盘** project `mcp.json`（bump **config** revision）后再运行期物化。
+    ///   须重启存活 → **落盘**（#123：新 server 默认落非 git 共享的 local `mcp.local.json`；`add_or_update_server_in_scope`
+    ///   可显式选 project/user；bump **config** revision）后再运行期物化。
     ///
     /// - `#106` ABBA：manager 惰性初始化**先 read 探测、仅 None 才升写锁**（governance 路径持 `skill_registry`
     ///   写锁 → hooks → 此方法；post-boot manager 恒 `Some` 只取读锁，与 `McpChangeReactor` 的读锁相容）。
     /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期物化不改持久 config）。
+    ///
+    /// # Preconditions
+    /// 本方法**不执行** §10.6 名称冲突门（install/enable 流程经 [`McpInstallHooks::existing_server_names`] 预检属其职责）。
+    /// **绕过**标准安装/启用路径**直接**驱动本方法者，须自行确保 server 名不与已声明 server 冲突——否则运行期投影
+    /// （name-keyed）会**覆盖**同名条目（仅内存、不落盘、重启即复原，非持久边界击穿）。经 [`McpInstallHooks`] 标准
+    /// 路径挂载（installer 已做冲突门）无此顾虑。
     ///
     /// # Errors
     /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；运行期物化失败（manager 错）。

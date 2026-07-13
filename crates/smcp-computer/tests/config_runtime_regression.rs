@@ -963,6 +963,17 @@ async fn issue122_teardown_failure_then_rebuild_has_no_resurrection() {
         };
         hooks.register_server(stdio("audit-mcp")).await.unwrap();
 
+        // 正向前置：确认挂载**真生效**（自足守护——若 mount_server 退化为静默 no-op，本测试的「重启不复活」
+        // 断言本会假绿；此断言令复活守护不依赖同套件其它测试）。
+        assert!(
+            comp_a
+                .list_mcp_servers()
+                .await
+                .iter()
+                .any(|s| s.name() == "audit-mcp"),
+            "register 后运行期应含该 server（挂载确已生效）"
+        );
+
         // 模拟 disable 的 MCP teardown 阶段失败（issue 复现步骤 4）：remove hook 返错、server 未摘。
         assert!(
             hooks.remove_server("audit-mcp").await.is_err(),
