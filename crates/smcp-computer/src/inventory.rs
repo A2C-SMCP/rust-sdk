@@ -112,8 +112,12 @@ impl McpOwnership {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerWithMetadata {
-    /// server 名（inventory 主键）/ server name。
+    /// server 名（人类可读 display；协议 §身份：可碰撞、非身份键）/ server name (display only)。
     pub name: String,
+    /// server 软件唯一身份（协议 0.3.0 BundleID）——管理/删除的**寻址键**（#121）/ MCP server identity。
+    /// `#[serde(default)]`：新增字段，容忍旧 schema 载荷反序列化（缺失 → 空串），SDK-facing 无 wire 契约破坏。
+    #[serde(default)]
+    pub bundle_id: String,
     /// 是否禁用（配置态）/ disabled flag from config。
     pub disabled: bool,
     /// 归属：用户 vs 插件 / ownership。
@@ -123,12 +127,18 @@ pub struct McpServerWithMetadata {
 }
 
 impl McpServerWithMetadata {
-    /// 由 `name` + `disabled` + 归属组装（`lifecycle` 从归属派生）/ assemble from name + disabled + ownership。
+    /// 由 `name` + `bundle_id` + `disabled` + 归属组装（`lifecycle` 从归属派生）/ assemble the inventory entry。
     #[must_use]
-    pub fn new(name: impl Into<String>, disabled: bool, managed_by: McpOwnership) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        bundle_id: impl Into<String>,
+        disabled: bool,
+        managed_by: McpOwnership,
+    ) -> Self {
         let lifecycle = managed_by.lifecycle();
         Self {
             name: name.into(),
+            bundle_id: bundle_id.into(),
             disabled,
             managed_by,
             lifecycle,
@@ -142,13 +152,15 @@ mod tests {
 
     #[test]
     fn user_ownership_serializes_camelcase_and_grants_full_lifecycle() {
-        let entry = McpServerWithMetadata::new("everything", false, McpOwnership::User);
+        let entry =
+            McpServerWithMetadata::new("everything", "everything", false, McpOwnership::User);
         assert!(entry.lifecycle.can_edit_from_mcp_tab);
         assert!(entry.lifecycle.can_start_from_mcp_tab);
         assert_eq!(entry.lifecycle.manage_from, "mcp");
 
         let v = serde_json::to_value(&entry).unwrap();
         assert_eq!(v["name"], "everything");
+        assert_eq!(v["bundleId"], "everything");
         assert_eq!(v["disabled"], false);
         assert_eq!(v["managedBy"]["type"], "user");
         assert_eq!(v["lifecycle"]["canEditFromMcpTab"], true);
@@ -159,6 +171,7 @@ mod tests {
     #[test]
     fn plugin_ownership_serializes_camelcase_and_is_read_only() {
         let entry = McpServerWithMetadata::new(
+            "audit-mcp",
             "audit-mcp",
             false,
             McpOwnership::Plugin {
@@ -183,6 +196,7 @@ mod tests {
     #[test]
     fn metadata_roundtrips_through_serde() {
         let entry = McpServerWithMetadata::new(
+            "audit-mcp",
             "audit-mcp",
             true,
             McpOwnership::Plugin {

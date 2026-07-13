@@ -125,7 +125,10 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
                 "server add <json|@file>",
                 "添加或更新 MCP 配置 / add or update config",
             ),
-            ("server rm <name>", "移除 MCP 配置 / remove config"),
+            (
+                "server rm <bundle_id>",
+                "移除 MCP 配置（按 bundle_id，可经 status 查看）/ remove config (by bundle_id)",
+            ),
             ("start <name>|all", "启动客户端 / start client(s)"),
             ("stop <name>|all", "停止客户端 / stop client(s)"),
         ],

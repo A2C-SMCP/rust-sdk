@@ -187,18 +187,30 @@ impl MCPServerManager {
         Ok(bundle_id::resolve_bundle_id(config))
     }
 
-    /// 名称 → `bundle_id` 解析（扫描 `servers_config` 取一个同名匹配）/ resolve a server name to its bundle_id。
+    /// 名称 → `bundle_id` 解析（扫描 `servers_config` 取同名匹配）/ resolve a server name to its bundle_id。
     ///
-    /// 公开生命周期 / desktop / skill 方法以**人类可读名**寻址（`window://` / `skill://` URI、CLI 等），内部经此
-    /// 映射到身份键。**歧义**：两个不同 `bundle_id` 的同名 server 共存时（仅显式指定不同 `bundle_id` 可致），
-    /// 匹配到哪个取决于 `HashMap` 迭代序、**跨运行不确定**——与既有 name-based URI 的固有歧义一致，需消歧则用
-    /// 唯一 `name`/`bundle_id`。
+    /// 内部桥：`window://` / `skill://` URI、CLI start/stop 等仍以**人类可读名**寻址，经此映射到身份键。
+    /// **消歧（#121）**：两个不同 `bundle_id` 的同名 server 共存时（仅显式指定不同 `bundle_id` 可致），取**字典序
+    /// 最小**的 `bundle_id`——**跨运行确定**（此前 `HashMap.find` 迭代序不确定，协议 §身份「name 永不做键」告警的
+    /// 正是此非确定性）；命中多个时 WARN 提示以唯一 `bundle_id` 消歧。销毁性操作（`remove_server`）应改走
+    /// `remove_server_by_id` 直接按 `bundle_id` 寻址，不经本桥。
     async fn bundle_id_for_name(&self, server_name: &str) -> Option<BundleId> {
         let configs = self.servers_config.read().await;
-        configs
+        let mut matches: Vec<&BundleId> = configs
             .iter()
-            .find(|(_, c)| c.name() == server_name)
-            .map(|(bid, _)| bid.clone())
+            .filter(|(_, c)| c.name() == server_name)
+            .map(|(bid, _)| bid)
+            .collect();
+        matches.sort(); // 字典序 → 跨运行确定（消除 HashMap 迭代序非确定性）。
+        if matches.len() > 1 {
+            warn!(
+                name = %server_name,
+                candidates = ?matches,
+                "name maps to multiple bundle_ids; picking lexicographically-smallest deterministically \
+                 (disambiguate by bundle_id — protocol: name MUST NOT be used as identity)"
+            );
+        }
+        matches.first().map(|bid| (*bid).clone())
     }
 
     /// 定位一个活动客户端的键（`bundle_id`）：先按 server **名**解析（生产路径，`window://` / `skill://` 用名），
@@ -314,21 +326,38 @@ impl MCPServerManager {
         Ok(())
     }
 
-    /// 移除服务器配置（名称寻址，内部解析为 `bundle_id`）/ Remove server configuration (name-addressed)。
+    /// 移除服务器配置（**名称寻址**，内部解析为 `bundle_id`）/ Remove server configuration (name-addressed)。
+    ///
+    /// 保留供治理级联（plugin disable/uninstall 停摘 bundled server，按名）与既有内部调用；名→bundle_id 经
+    /// [`bundle_id_for_name`](Self::bundle_id_for_name)（已确定性消歧）。**用户 CRUD 删除**应走
+    /// [`remove_server_by_id`](Self::remove_server_by_id) 直接按身份寻址（协议 §身份 MUST 用 bundle_id）。
     pub async fn remove_server(&self, server_name: &str) -> Result<(), ComputerError> {
         let Some(bundle_id) = self.bundle_id_for_name(server_name).await else {
             // 名称未注册：与 HashMap.remove 缺失键一致，视为幂等 no-op（仍刷新路由保持一致）。
             self.refresh_tool_routes().await?;
             return Ok(());
         };
+        self.remove_server_by_id(&bundle_id).await
+    }
 
-        // 停止客户端 / Stop client
-        self.stop_client_by_id(&bundle_id).await?;
+    /// 移除服务器配置（**bundle_id 寻址**，协议 §身份 MUST 用 bundle_id）/ Remove by bundle_id (identity key)。
+    ///
+    /// 直接按身份键操作，**无** name→bundle_id 桥的歧义（对齐 Python `aremove_server(bundle_id)`）。未注册 →
+    /// 幂等 no-op（仍刷新路由保持一致）。
+    pub async fn remove_server_by_id(&self, bundle_id: &str) -> Result<(), ComputerError> {
+        let exists = { self.servers_config.read().await.contains_key(bundle_id) };
+        if !exists {
+            self.refresh_tool_routes().await?;
+            return Ok(());
+        }
+
+        // 停止客户端（按 bundle_id）/ Stop client (by bundle_id)
+        self.stop_client_by_id(bundle_id).await?;
 
         // 移除配置 / Remove configuration
         {
             let mut configs = self.servers_config.write().await;
-            configs.remove(&bundle_id);
+            configs.remove(bundle_id);
         }
 
         // 刷新工具路由 / Refresh tool routes

@@ -46,7 +46,7 @@ use crate::settings::lifecycle::{
 use crate::settings::policy::resolve_policy_settings;
 use crate::settings::reconciler::InstalledPluginRecord;
 use crate::settings::recovery::{BundledServerRecord, GovernanceRecoveryReport};
-use crate::settings::scope::{resolve_settings, ResolveSettingsArgs};
+use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
     AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer, SkillFileWatcher, SkillRegistry,
@@ -372,6 +372,14 @@ pub struct Computer<S: Session> {
     /// runtime mutate（`add_or_update_server`/`remove_server`）落盘经此锚点的 project/local scope，**只碰
     /// project 含 local、不碰 home**（D1/§2.3 四根边界）。构造期 seam，跨 clone 保留（与 `skill_home_override` 同）。
     config_dir: Option<PathBuf>,
+
+    // ── #121：per-Computer User-config 环境上下文 / per-instance User-config env context ──────────
+    /// SDK-owned config 解析的 **User-scope 环境映射**（HOME / XDG_CONFIG_HOME）。缺省 `None` → 走进程环境
+    /// （CLI / ambient，与今日一致）。嵌入式多实例 client 经 [`with_config_env`] 注入，使 runtime add/update/remove
+    /// 的**来源解析 + 写目标 + 重载**、以及 ownership inventory / boot 恢复，全部锚定**本实例**的 User config，
+    /// **绝不**读/改/删宿主或其他实例的 `~/.config/a2c/mcp.json`（补 #113 只锚 project 的 env-context 洞）。
+    /// 构造期 seam，跨 clone 保留（与 `config_dir` / `skill_home_override` 同）。
+    config_env: Option<EnvMap>,
 }
 
 /// 孤儿对账（按源谓词限定）：当前活跃、`source_pred(source)` 命中、但本轮 `present` 未出现的 SKILL →
@@ -672,6 +680,7 @@ impl<S: Session> Computer<S> {
             input_resolver: None,
             secret_resolver: None,
             config_dir: None,
+            config_env: None,
             // #114 S7：初始生命周期 = Created（尚未 boot 初始化本地资源）/ status starts at Created。
             status: Arc::new(RuntimeStatus::new()),
         }
@@ -708,12 +717,47 @@ impl<S: Session> Computer<S> {
         self
     }
 
+    /// 注入 User-config 环境上下文（HOME / XDG_CONFIG_HOME）/ Inject the User-config env context。
+    ///
+    /// #121：嵌入式多实例 client 为**单个** `Computer` 提供固定的 User-scope 解析环境。注入后，runtime
+    /// `add_or_update_server` / `remove_server` 的来源解析与写目标、`list_mcp_servers_with_metadata` 的归属门控、
+    /// 以及 boot 的 `reconcile_governance` 恢复，全部锚定**本实例** User config，**不**回退宿主进程 `$HOME`/`$XDG`。
+    /// 缺省（未注入）→ `None` → 走进程环境（CLI / ambient，行为与今日一致，守 #121 DoD「未注入保持 ambient」）。
+    #[must_use]
+    pub fn with_config_env(mut self, env: impl Into<EnvMap>) -> Self {
+        self.config_env = Some(env.into());
+        self
+    }
+
     // ── #113 S6：config 落盘锚点解析 / config anchor resolution ──────────────────
     /// 解析 config 落盘锚点：override > 进程 cwd（#98：`Computer` 不再持有 workspace，project/local 锚进程 cwd）。
     fn config_dir(&self) -> PathBuf {
         self.config_dir
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    // ── #121：User-config 环境上下文解析 / User-config env resolution ──────────────────
+    /// 本实例的 User-config 环境映射（`None` → 进程环境，与今日一致）/ this instance's User-config env (None → process env)。
+    fn config_env(&self) -> Option<&EnvMap> {
+        self.config_env.as_ref()
+    }
+
+    /// #121：以本实例上下文（project 锚点 + User env + Skill Home）组装 [`ConfigContext`]，供 runtime config CRUD。
+    ///
+    /// 补 #113 只锚 project 的洞：`env` 注入使 User-scope（`~/.config/a2c/mcp.json`）解析锚定**本实例**、不回退宿主
+    /// 进程 `$HOME`/`$XDG`；`home` 注入使 home DropIn / 账本源亦锚定本实例。`config_dir` / `home` 借用须与返回的
+    /// context 同域存活（调用方持有 owned `PathBuf` 局部）。
+    fn instance_config_context<'a>(
+        &'a self,
+        config_dir: &'a std::path::Path,
+        home: &'a std::path::Path,
+    ) -> ConfigContext<'a> {
+        ConfigContext {
+            env: self.config_env(),
+            home: Some(home),
+            ..ConfigContext::new(config_dir)
+        }
     }
 
     // ── INT-01 #68：SKILL Home 解析 / SKILL Home resolution ──────────────────
@@ -921,9 +965,13 @@ impl<S: Session> Computer<S> {
         hooks: Option<&dyn McpInstallHooks>,
     ) -> Result<(), PluginInstallError> {
         let home = self.skill_home();
+        // #121：`options.env` 缺省时回退**本实例** `config_env`（与 runtime CRUD / boot 迁移同源），避免注入实例
+        // 上下文的嵌入式 client 忘传 env 时「enable 写宿主、inventory/reconcile 读实例」的 split-brain；未注入 →
+        // None → ambient（CLI 不变）。显式传入 `options.env` 仍优先（override）。
+        let env = options.env.or_else(|| self.config_env());
         // scope 缺省 → 按安装记录消解（非恒定 user）；resolved 为本地 String，effective 借其，二者同域存活。
         let resolved_scope = if options.scope.is_none() {
-            self.resolve_plugin_install_scope(plugin_id, &home, options.env)
+            self.resolve_plugin_install_scope(plugin_id, &home, env)
         } else {
             None
         };
@@ -931,7 +979,7 @@ impl<S: Session> Computer<S> {
             scope: options.scope.or(resolved_scope.as_deref()),
             project_path: options.project_path,
             timeout: options.timeout,
-            env: options.env,
+            env,
         };
         let res = {
             let mut reg = self.skill_registry.write().await;
@@ -970,15 +1018,18 @@ impl<S: Session> Computer<S> {
         hooks: Option<&dyn McpInstallHooks>,
     ) -> Result<(), PluginInstallError> {
         let home = self.skill_home();
+        // #121：同 [`enable_plugin`](Self::enable_plugin)——`options.env` 缺省时回退**本实例** `config_env`，避免
+        // 「disable 写宿主、inventory 读实例」的 split-brain；未注入 → None → ambient；显式传入仍优先。
+        let env = options.env.or_else(|| self.config_env());
         let resolved_scope = if options.scope.is_none() {
-            self.resolve_plugin_install_scope(plugin_id, &home, options.env)
+            self.resolve_plugin_install_scope(plugin_id, &home, env)
         } else {
             None
         };
         let effective = DisableOptions {
             scope: options.scope.or(resolved_scope.as_deref()),
             project_path: options.project_path,
-            env: options.env,
+            env,
         };
         let res = {
             let mut reg = self.skill_registry.write().await;
@@ -1073,9 +1124,11 @@ impl<S: Session> Computer<S> {
         declared: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> GovernanceRecoveryReport {
         let home = self.skill_home();
+        // #121 A：以**本实例** User env 解析 settings / 账本，绝不混入宿主 ambient（守 boot 重启的归属一致）。
+        let env = self.config_env();
         // `declared` 覆盖：CLI 参考接线传 **flag-aware** 合并视图（`--settings` scope 生效，对齐 Python
         // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（user + 进程 cwd 的 project/local +
-        // policy，**无** `--settings` flag scope；跨重启可靠 disable 请写 user scope）。env/cwd=None（进程态）。
+        // policy，**无** `--settings` flag scope；跨重启可靠 disable 请写 user scope）。cwd=None（进程态）。
         let resolved_declared;
         let declared: &serde_json::Map<String, serde_json::Value> = match declared {
             Some(d) => d,
@@ -1083,7 +1136,7 @@ impl<S: Session> Computer<S> {
                 let policy = resolve_policy_settings(None, None, None);
                 resolved_declared = resolve_settings(ResolveSettingsArgs {
                     cwd: None,
-                    env: None,
+                    env,
                     flag_settings_path: None,
                     policy_settings: Some(&policy),
                 })
@@ -1095,7 +1148,7 @@ impl<S: Session> Computer<S> {
         // 阶段一：重挂 marketplace skills（持 `skill_registry` 写锁；stage 含 git await，boot 期无并发故安全）。
         let mut report = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, None, declared)
+            crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, env, declared)
                 .await
         };
 
@@ -1105,7 +1158,7 @@ impl<S: Session> Computer<S> {
         // （不看 hooks）：boot 走 `reconcile_governance(None, None)`，须先补回账本供其后查询/重挂读到。
         crate::settings::recovery::rematerialize_missing_ledger_records(
             &home,
-            None,
+            env,
             declared,
             &mut report,
         )
@@ -1121,7 +1174,7 @@ impl<S: Session> Computer<S> {
             let mut existing = h.existing_server_names();
             let mut injected_roots: HashSet<PathBuf> = HashSet::new();
             for rec in
-                crate::settings::recovery::collect_enabled_bundled_servers(&home, None, declared)
+                crate::settings::recovery::collect_enabled_bundled_servers(&home, env, declared)
             {
                 let name = rec.config.name().to_string();
                 if existing.contains(&name) {
@@ -1526,10 +1579,13 @@ impl<S: Session> Computer<S> {
         self.ensure_skill_home();
         // v0.3.0 一次性迁移（reconcile 之前）：把存量 v0.2.x「装即活跃」账本迁到 installedPlugins 意图 +
         // enabledPlugins=true，避免升级后「absent = 未启用」使既有 plugin 熄灯。幂等靠意图文件存在性；失败仅 WARN
-        // （降级：迁移失败不阻断 boot，下次 boot 重试）。settings 写走进程 env（与 reconcile 读同源）。
-        if let Err(e) =
-            crate::settings::installer::migrate_ledger_to_intent_once(&self.skill_home(), None)
-        {
+        // （降级：迁移失败不阻断 boot，下次 boot 重试）。#121：settings 写目标经 **本实例** `config_env` 解析
+        // （与紧随其后的 `reconcile_governance` 读**同源**）——注入实例上下文时，enabledPlugins 迁移写**本实例**
+        // User settings，**绝不**误写宿主 `~/.config/.../settings.json`（守 #121 不变量：未注入 → None → ambient）。
+        if let Err(e) = crate::settings::installer::migrate_ledger_to_intent_once(
+            &self.skill_home(),
+            self.config_env(),
+        ) {
             warn!(error = %e, "governance boot: v0.3.0 ledger→intent migration failed (non-blocking)");
         }
         let recovery = self.reconcile_governance(None, None).await;
@@ -1790,10 +1846,13 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
-    /// 仅运行期停摘 server（manager + 内存投影 + capability bump + emit），**不落盘** / unmount at runtime only。
+    /// 仅运行期停摘 server（**名称寻址**；manager + 内存投影 + capability bump + emit），**不落盘** / unmount by name。
     ///
-    /// #113 S6：**治理级联停摘**专用（uninstall/disable 级联、gc teardown）——不删 project `mcp.json` 声明
-    /// （bundled server 本不在用户 config 层）。**用户删除**走 [`remove_server`]（先落盘删声明再调本方法）。
+    /// #113 S6：**治理级联停摘**专用（plugin uninstall/disable 级联、gc teardown 经 `McpInstallHooks::remove_server`
+    /// 按 bundled server 名停摘）——不删 project `mcp.json` 声明（bundled server 本不在用户 config 层）。**用户删除**
+    /// 走 [`remove_server`]（bundle_id 寻址：落盘删声明后经 [`unmount_server_by_id`](Self::unmount_server_by_id) 停摘）。
+    /// 当前仅治理级联（`cli` feature 下的 hooks / repl）调用，故非-cli 构建下按 dead_code 豁免。
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
         {
             let manager = self.mcp_manager.read().await;
@@ -1806,6 +1865,37 @@ impl<S: Session> Computer<S> {
         {
             let mut servers = self.mcp_servers.write().await;
             servers.remove(server_name);
+        }
+
+        // 工具投影变化 → capability revision +1（§12 R2）。
+        self.status.bump_capability();
+
+        // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
+        let _ = self.emit_update_config().await;
+
+        Ok(())
+    }
+
+    /// 仅运行期停摘 server（**bundle_id 寻址**）/ unmount at runtime only, by bundle_id（#121 B）。
+    ///
+    /// [`remove_server`](Self::remove_server) 的运行期臂：按软件唯一身份 `bundle_id` 从 manager（bundle_id-keyed）
+    /// 与本地投影（name-keyed，按 `resolve_bundle_id` 匹配删）双双停摘——无 name→bundle_id 桥的歧义。
+    pub(crate) async fn unmount_server_by_id(&self, bundle_id: &str) -> ComputerResult<()> {
+        {
+            let manager = self.mcp_manager.read().await;
+            if let Some(ref manager) = *manager {
+                manager.remove_server_by_id(bundle_id).await?;
+            }
+        }
+
+        // 从本地投影移除：投影按 name 键（`mount_rendered` 一贯 name 键），按 `resolve_bundle_id` 匹配删所有命中项。
+        // 注：本地投影按 name 键，两个同名 + 显式不同 bundle_id 的 server 在此会**折叠**（后写覆盖先写）——属既有
+        // name-keying 局限、非本次引入；manager（bundle_id 键）为路由权威、始终正确。删单一身份此处逻辑正确。
+        {
+            let mut servers = self.mcp_servers.write().await;
+            servers.retain(|_name, cfg| {
+                crate::mcp_clients::bundle_id::resolve_bundle_id(cfg) != bundle_id
+            });
         }
 
         // 工具投影变化 → capability revision +1（§12 R2）。
@@ -1835,10 +1925,12 @@ impl<S: Session> Computer<S> {
         let validated = self.render_server_config(&server).await?;
 
         // 落盘（原始引用；D1 不落 secret）→ 经 S2 消解器定 scope + S3 执行器两阶段写。
+        // #121：以本实例上下文（含 User env + Skill Home）解析写目标，绝不误写宿主 User config。
         let config_dir = self.config_dir();
+        let home = self.skill_home();
         let name = server.name().to_string();
         let body = canonicalize_persist_body(serde_json::to_value(&server)?);
-        let ctx = ConfigContext::new(&config_dir);
+        let ctx = self.instance_config_context(&config_dir, &home);
         // 内容摘要 revision（S1）：仅当真落盘（内容变）才 bump config，避免 no-op/幂等 mutate 虚假 bump（§12 R2）。
         let before_rev = load_config(&ctx).revision;
         let edit = ConfigEdit::new(ConfigEntity::McpServer(name), EditIntent::Upsert(body));
@@ -1854,34 +1946,57 @@ impl<S: Session> Computer<S> {
         self.mount_rendered(server, validated).await
     }
 
-    /// 移除服务器配置（**落盘删声明 + 运行期停摘**）/ Remove a server config (persist + unmount)。
+    /// 移除服务器配置（**bundle_id 寻址**；落盘删声明 + 运行期停摘）/ Remove a server config by bundle_id (persist + unmount)。
     ///
-    /// #113 S6：删**所有可写 scope** 的声明（S2 R1：真删干净）→ config revision +1 → 运行期停摘。
-    /// 不存在于任何 config scope（如纯运行期实例）→ 落盘幂等 no-op；随后仍停摘运行期实例。bundled server 名 →
-    /// 消解器拒（[`WriteTargetError::Synthesized`]，用户不应经 config 删 plugin 拥有的 server，应 uninstall plugin）。
+    /// #121（B）：**按 `bundle_id`（软件唯一身份）寻址**，对齐协议 §身份「MUST 用 bundle_id、MUST NOT 用 name」
+    /// 与 Python `aremove_server(bundle_id)`。此前按 `name` 寻址经 manager 的 `bundle_id_for_name` 桥，在同名 +
+    /// 不同显式 `bundle_id` 时**跨运行非确定**（协议告警场景）；改直接身份寻址后消除该歧义。
+    ///
+    /// - **落盘删声明**：从**本实例** config 快照（#121 A：`config_env` 锚定，不误读宿主）解析 `bundle_id` → 声明
+    ///   `name`（`resolve_bundle_id` 与 manager 同键，含显式 `bundle_id`），再按 name 删**所有可写 scope**（mcp.json
+    ///   是 name-keyed；S2 R1 真删干净）。匹配多个声明名（no-double-open 冲突）→ 全删。
+    /// - 不在任何 config scope（纯运行期实例）→ 落盘 no-op；随后仍按 `bundle_id` 停摘运行期实例。
+    /// - bundled server 的身份 → 消解器拒（[`WriteTargetError::Synthesized`]，用户不应经 config 删 plugin server，应
+    ///   uninstall/disable plugin）。
     ///
     /// # Errors
     /// 落盘失败（[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期停摘失败（manager 错）。
-    pub async fn remove_server(&self, server_name: &str) -> ComputerResult<()> {
-        // 落盘删所有可写 scope 声明（S2 R1）→ 经 S3 执行器 / persist the removal first。
+    pub async fn remove_server(&self, bundle_id: &str) -> ComputerResult<()> {
+        // #121 A：以本实例上下文（含 User env + Skill Home）解析 config，绝不误读/误删宿主 User config。
         let config_dir = self.config_dir();
-        let ctx = ConfigContext::new(&config_dir);
-        // 内容摘要 revision（S1）：删一个不在任何 config scope 的 server → 空计划零落盘 → 不 bump（§12 R2）。
-        let before_rev = load_config(&ctx).revision;
-        let edit = ConfigEdit::new(
-            ConfigEntity::McpServer(server_name.to_string()),
-            EditIntent::Remove,
-        );
-        let after = update_config(&ctx, std::slice::from_ref(&edit))
-            .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
+        let home = self.skill_home();
+        let ctx = self.instance_config_context(&config_dir, &home);
 
-        // 落盘且内容真变 → config revision +1（§12 R2）。
-        if after.revision != before_rev {
-            self.bump_config_revision();
+        // bundle_id → 声明名（去重）。快照 `McpServerView.config` 为 raw，`resolve_bundle_id` 与 manager 注册期同键。
+        let snap = load_config(&ctx);
+        let mut seen = HashSet::new();
+        let names: Vec<String> = snap
+            .mcp
+            .servers
+            .iter()
+            .filter(|v| crate::mcp_clients::bundle_id::resolve_bundle_id(&v.config) == bundle_id)
+            .map(|v| v.name.clone())
+            .filter(|n| seen.insert(n.clone()))
+            .collect();
+        // names 已 collect（拥有所有权），此后移出 revision 不影响；snap 余部随作用域自然析构。
+        let before_rev = snap.revision;
+
+        // 落盘删声明（每个匹配名一条 Remove；bundled 身份 → 消解器拒 Synthesized）。无匹配 → 空计划、不落盘。
+        if !names.is_empty() {
+            let edits: Vec<ConfigEdit> = names
+                .into_iter()
+                .map(|n| ConfigEdit::new(ConfigEntity::McpServer(n), EditIntent::Remove))
+                .collect();
+            let after = update_config(&ctx, &edits)
+                .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
+            // 落盘且内容真变 → config revision +1（§12 R2）。
+            if after.revision != before_rev {
+                self.bump_config_revision();
+            }
         }
 
-        // 运行期停摘（manager + 内存投影 + capability bump + emit）。
-        self.unmount_server(server_name).await
+        // 运行期停摘（按 bundle_id；manager + 内存投影 + capability bump + emit）。
+        self.unmount_server_by_id(bundle_id).await
     }
 
     /// 更新inputs定义 / Update inputs definition
@@ -2375,6 +2490,23 @@ impl<S: Session> Computer<S> {
         }
     }
 
+    /// 运行期已物化 server 的 `name → bundle_id` 映射（#121 B）/ name→bundle_id for materialized servers。
+    ///
+    /// 供 client / CLI 展示软件唯一身份 `bundle_id`——`remove_server` 现按 bundle_id 寻址（协议 §身份，name 非
+    /// 身份键），此映射使调用方从人类可读名找到寻址键。从 raw config `resolve_bundle_id`，与 manager 注册期同键。
+    pub async fn materialized_server_bundle_ids(&self) -> HashMap<String, String> {
+        let servers = self.mcp_servers.read().await;
+        servers
+            .iter()
+            .map(|(name, cfg)| {
+                (
+                    name.clone(),
+                    crate::mcp_clients::bundle_id::resolve_bundle_id(cfg),
+                )
+            })
+            .collect()
+    }
+
     // ── #114 S7：runtime status / observability 公开面 / runtime status surface ──────────
 
     /// runtime 状态快照（#114 S7）：生命周期 + 分离单调 revision + 能力汇总 + 公开诊断 / runtime status snapshot。
@@ -2488,18 +2620,20 @@ impl<S: Session> Computer<S> {
             plugin_id: rec.plugin_id.clone(),
         };
 
-        // ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图；env/cwd=None）。
+        // ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图）。
+        // #121 A：以**本实例** env 解析 `enabledPlugins` 门控与账本，绝不混入宿主 ambient settings。
         let home = self.skill_home();
+        let env = self.config_env();
         let policy = resolve_policy_settings(None, None, None);
         let declared = resolve_settings(ResolveSettingsArgs {
             cwd: None,
-            env: None,
+            env,
             flag_settings_path: None,
             policy_settings: Some(&policy),
         })
         .settings;
         let bundled: HashMap<String, BundledServerRecord> =
-            crate::settings::recovery::collect_enabled_bundled_servers(&home, None, &declared)
+            crate::settings::recovery::collect_enabled_bundled_servers(&home, env, &declared)
                 .into_iter()
                 .map(|rec| (rec.config.name().to_string(), rec))
                 .collect();
@@ -2516,8 +2650,11 @@ impl<S: Session> Computer<S> {
                     Some(rec) => plugin_ownership(rec),
                     None => McpOwnership::User,
                 };
+                // #121 B：暴露 bundle_id（管理/删除寻址键）；从 raw config 派生，与 manager 同键。
+                let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(cfg);
                 out.push(McpServerWithMetadata::new(
                     name.clone(),
+                    bundle_id,
                     cfg.disabled(),
                     managed_by,
                 ));
@@ -2527,8 +2664,10 @@ impl<S: Session> Computer<S> {
         // 来源二：已启用但尚未物化的 bundled server（不在运行期集 → 补入，标 plugin；§4.8 可观测）。
         for (name, rec) in &bundled {
             if !materialized.contains(name) {
+                let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
                 out.push(McpServerWithMetadata::new(
                     name.clone(),
+                    bundle_id,
                     rec.config.disabled(),
                     plugin_ownership(rec),
                 ));
@@ -2656,6 +2795,8 @@ impl<S: Session> Computer<S> {
             status: Arc::clone(&self.status),
             // #113 S6：config 锚点是构造期 seam，随 clone 保留（handler 路径不 mutate config，占位满足完整性）。
             config_dir: self.config_dir.clone(),
+            // #121：User-config env 上下文亦是构造期 seam，随 clone 保留（实例上下文对 detached 克隆一致）。
+            config_env: self.config_env.clone(),
         }
     }
 
@@ -2865,6 +3006,8 @@ impl<S: Session + Clone> Clone for Computer<S> {
             status: Arc::clone(&self.status),
             // #113 S6：config 锚点构造期 seam，随 clone 保留。
             config_dir: self.config_dir.clone(),
+            // #121：User-config env 上下文构造期 seam，随 clone 保留。
+            config_env: self.config_env.clone(),
         }
     }
 }
@@ -3275,6 +3418,50 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "gone"),
             "remove_server 应落盘删声明"
+        );
+    }
+
+    /// #121 🔴（隔离复审发现）：boot 期 v0.2.x→v0.3.0 迁移的 `enabledPlugins` 写目标须经**本实例** `config_env`
+    /// 解析——绝不误写宿主 User settings。此前 boot 硬传 `env=None` → 迁移写 ambient 宿主 `~/.config/.../settings.json`
+    /// （污染宿主）、且对本实例无效（reconcile 读实例、迁移写宿主，本实例存量 plugin 不点亮）。
+    #[tokio::test]
+    async fn boot_migration_writes_enabled_plugins_to_injected_instance_settings() {
+        use crate::settings::scope::user_settings_path;
+        use crate::settings::store::installed_plugins_path;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // 本实例 User-config 环境（XDG → 实例目录，与宿主进程环境隔离）。
+        let inst_cfg = tmp.path().join("instance-xdg");
+        let mut env = EnvMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            inst_cfg.to_string_lossy().into_owned(),
+        );
+
+        // v0.2.x 态：账本一条 enabled 记录（scope=user）、无意图文件、无 enabledPlugins → boot 触发迁移。
+        std::fs::write(
+            installed_plugins_path(Some(&home), None),
+            r#"{"plugins": {"p@m": [{"installPath": "x", "scope": "user"}]}}"#,
+        )
+        .unwrap();
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(&home)
+            .with_config_env(env.clone())
+            .with_config_dir(tmp.path().join("proj"))
+            .with_blob_cache_root(tmp.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        // 迁移把 enabledPlugins=true 写到**注入的实例** User settings（config_env 锚定），而非宿主 ambient。
+        // 修复前（env=None）此文件不会被创建/写入 → 断言失败（RED，且宿主被污染）。
+        let inst_settings = user_settings_path(Some(&env));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&inst_settings).unwrap()).unwrap();
+        assert_eq!(
+            v["enabledPlugins"]["p@m"],
+            serde_json::json!(true),
+            "boot 迁移须把 enabledPlugins=true 写到注入的实例 User settings（#121：config_env 锚定，不误写宿主）"
         );
     }
 

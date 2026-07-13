@@ -24,6 +24,7 @@ use tempfile::TempDir;
 
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::errors::ComputerError;
+use smcp_computer::mcp_clients::bundle_id::resolve_bundle_id;
 use smcp_computer::mcp_clients::model::{
     HttpServerConfig, HttpServerParameters, MCPServerConfig, StdioServerConfig,
     StdioServerParameters,
@@ -33,7 +34,9 @@ use smcp_computer::settings::config::{
     ConfigContext, ConfigCrudError, ConfigEdit, ConfigEntity, EditIntent, ProjectConfigDoc,
     ProvenanceScope, WriteTargetError, REDACTED_PLACEHOLDER,
 };
-use smcp_computer::settings::mcp_config::{workdir_mcp_config_path, workdir_mcp_local_config_path};
+use smcp_computer::settings::mcp_config::{
+    user_mcp_config_path, workdir_mcp_config_path, workdir_mcp_local_config_path,
+};
 use smcp_computer::settings::scope::{
     workdir_local_settings_path, workdir_project_settings_path, EnvMap,
 };
@@ -643,5 +646,161 @@ fn cross_sdk_snapshot_schema_shape_is_pinned_stub() {
     assert!(
         obj["revision"].as_str().unwrap().starts_with("sha256:"),
         "revision 应为 sha256 内容摘要"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #121：实例 User-config 上下文（env/home 注入）+ CRUD bundle_id 寻址
+// ---------------------------------------------------------------------------
+
+/// 实例 User-config 环境（XDG_CONFIG_HOME → 隔离目录，与宿主进程环境解耦）。
+fn instance_env(td: &TempDir) -> EnvMap {
+    let mut env = EnvMap::new();
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        td.path()
+            .join("instance-xdg")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    env
+}
+
+/// 指定 command 的最小 stdio server（区分 before/after 落盘内容）。
+fn stdio_cmd(name: &str, command: &str) -> MCPServerConfig {
+    MCPServerConfig::Stdio(StdioServerConfig::new(
+        name,
+        StdioServerParameters {
+            command: command.to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+        },
+    ))
+}
+
+/// #121 A：`add_or_update_server` 落到**注入的实例 User scope**，不误落宿主 ambient / project。
+///
+/// 修复前（`config_env` 未接线）：env 被忽略 → 快照读宿主 ambient（无此唯一探针）→ 视为新 server → 落 project
+/// scope（tempdir）→ 实例 User 文件保持 `before` → 断言失败（RED，且不污染真实 `~/.config`）。
+#[tokio::test]
+async fn issue121_add_or_update_targets_injected_user_scope_not_ambient() {
+    let td = TempDir::new().unwrap();
+    let env = instance_env(&td);
+    let probe = "a2c-issue121-upsert-probe";
+    let user_mcp = user_mcp_config_path(Some(&env));
+    seed(
+        &user_mcp,
+        &format!(
+            r#"{{"servers":{{"{probe}":{{"type":"stdio","server_parameters":{{"command":"before","args":[]}}}}}}}}"#
+        ),
+    );
+
+    let computer = isolate_boot(
+        Computer::new("c", SilentSession::new("s"), None, None, false, false),
+        &td,
+    )
+    .with_config_env(env.clone());
+    computer.boot_up().await.unwrap();
+
+    computer
+        .add_or_update_server(stdio_cmd(probe, "after"))
+        .await
+        .unwrap();
+
+    let disk = read_json(&user_mcp);
+    assert_eq!(
+        disk["servers"][probe]["server_parameters"]["command"], "after",
+        "add_or_update 必须更新注入的实例 User scope（env-context 未继承时会误落宿主 ambient / project）"
+    );
+
+    // inventory 亦以实例 env 解析；新增 bundle_id 字段（管理/删除寻址键）。
+    let inv = computer.list_mcp_servers_with_metadata().await;
+    let entry = inv
+        .iter()
+        .find(|e| e.name == probe)
+        .expect("探针应出现在 inventory");
+    assert_eq!(
+        entry.bundle_id,
+        resolve_bundle_id(&stdio_cmd(probe, "after")),
+        "inventory 须暴露 bundle_id（= raw config 派生，与 manager 同键）"
+    );
+}
+
+/// #121 A+B：`remove_server(bundle_id)` 从**注入的实例 User scope** 删声明，不误删宿主同名 MCP。
+///
+/// 唯一探针名杜绝命中真实用户 server；修复前 remove 目标为宿主 ambient → 探针不在其中 → 实例文件仍含探针（RED）。
+#[tokio::test]
+async fn issue121_remove_by_bundle_id_targets_injected_user_scope() {
+    let td = TempDir::new().unwrap();
+    let env = instance_env(&td);
+    let probe = "a2c-issue121-rm-probe";
+    let user_mcp = user_mcp_config_path(Some(&env));
+    seed(
+        &user_mcp,
+        &format!(
+            r#"{{"servers":{{"{probe}":{{"type":"stdio","server_parameters":{{"command":"x","args":[]}}}}}}}}"#
+        ),
+    );
+
+    let computer = isolate_boot(
+        Computer::new("c", SilentSession::new("s"), None, None, false, false),
+        &td,
+    )
+    .with_config_env(env.clone());
+    computer.boot_up().await.unwrap();
+
+    let bid = resolve_bundle_id(&stdio_cmd(probe, "x"));
+    computer.remove_server(&bid).await.unwrap();
+
+    let disk = read_json(&user_mcp);
+    assert!(
+        disk["servers"].get(probe).is_none(),
+        "remove_server(bundle_id) 必须从注入的实例 User scope 删声明（env-context 未继承时会误删宿主同名 MCP）"
+    );
+}
+
+/// #121 B：CRUD 按 **bundle_id（软件唯一身份）** 寻址，非 name（协议 §身份 MUST 用 bundle_id）。
+///
+/// 用 name ≠ bundle_id 的 server（`my__server` 折叠 `__` → bundle_id `my_server`）验证：按 name 删是 no-op、
+/// 按 bundle_id 删才真删——消除此前 name 寻址在同名 + 显式 bundle_id 时的非确定性。
+#[tokio::test]
+async fn issue121_remove_addresses_by_bundle_id_not_name() {
+    let td = TempDir::new().unwrap();
+    let cd = config_dir_of(&td);
+    let computer = isolate_boot(
+        Computer::new("c", SilentSession::new("s"), None, None, false, false),
+        &td,
+    );
+    computer.boot_up().await.unwrap();
+
+    let name = "my__server";
+    computer
+        .add_or_update_server(stdio_cmd(name, "echo"))
+        .await
+        .unwrap();
+    let bid = resolve_bundle_id(&stdio_cmd(name, "echo"));
+    assert_ne!(bid, name, "该名规范化后 bundle_id ≠ name（折叠连续 `_`）");
+
+    // 按 name（非身份键）删 → no-op：声明仍在。
+    computer.remove_server(name).await.unwrap();
+    assert!(
+        load_config(&ConfigContext::new(&cd))
+            .mcp
+            .servers
+            .iter()
+            .any(|s| s.name == name),
+        "按 name（非身份键）删应 no-op"
+    );
+
+    // 按 bundle_id（身份键）删 → 真删。
+    computer.remove_server(&bid).await.unwrap();
+    assert!(
+        !load_config(&ConfigContext::new(&cd))
+            .mcp
+            .servers
+            .iter()
+            .any(|s| s.name == name),
+        "按 bundle_id（身份键）删应移除声明"
     );
 }

@@ -60,7 +60,7 @@ impl CommandHandler {
         println!("  tools                     列出可用工具 / list tools");
         println!("  mcp                       显示当前 MCP 配置 / show current MCP config");
         println!("  server add <json|@file>   添加或更新 MCP 配置 / add or update config");
-        println!("  server rm <name>          移除 MCP 配置 / remove config");
+        println!("  server rm <bundle_id>     移除 MCP 配置（按 bundle_id）/ remove config (by bundle_id)");
         println!("  start <name>|all          启动客户端 / start client(s)");
         println!("  stop <name>|all           停止客户端 / stop client(s)");
         println!("  inputs load <@file>       从文件加载 inputs 定义 / load inputs");
@@ -118,6 +118,9 @@ impl CommandHandler {
             println!("  MCP Manager: 已初始化 / Initialized");
             println!("  Active Servers: {}", active_count);
 
+            // #121 B：一并展示 bundle_id（软件唯一身份）——`server rm` 现按 bundle_id 寻址。
+            let bundle_ids = self.computer.materialized_server_bundle_ids().await;
+
             // 显示每个服务器的状态
             for (name, active, state) in server_status {
                 let status = if active {
@@ -125,7 +128,8 @@ impl CommandHandler {
                 } else {
                     "已停止 / Stopped"
                 };
-                println!("    - {}: {} ({})", name, status, state);
+                let bundle_id = bundle_ids.get(&name).map(String::as_str).unwrap_or("-");
+                println!("    - {name} [bundle_id={bundle_id}]: {status} ({state})");
             }
 
             // 获取可用工具数量
@@ -233,11 +237,11 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// 移除服务器配置
-    pub async fn remove_server(&mut self, name: &str) -> Result<(), CommandError> {
-        // 移除服务器
-        self.computer.remove_server(name).await?;
-        println!("已移除服务器配置 '{}' / Removed server config", name);
+    /// 移除服务器配置（**按 bundle_id 寻址**，协议 §身份；bundle_id 可经 `status` 查看）/ remove by bundle_id。
+    pub async fn remove_server(&mut self, bundle_id: &str) -> Result<(), CommandError> {
+        // 按软件唯一身份 bundle_id 移除（#121 B：name 是 human display、非身份键）。
+        self.computer.remove_server(bundle_id).await?;
+        println!("已移除服务器配置 (bundle_id={bundle_id}) / Removed server config");
         Ok(())
     }
 

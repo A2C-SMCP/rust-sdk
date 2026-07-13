@@ -142,7 +142,10 @@ async fn handle_command(
                 }
                 "rm" | "remove" => {
                     if parts.len() < 3 {
-                        return Err(CommandError::InvalidCommand("缺少服务器名称".to_string()));
+                        return Err(CommandError::InvalidCommand(
+                            "用法: server rm <bundle_id>（bundle_id 可经 status 查看）/ Usage: server rm <bundle_id>"
+                                .to_string(),
+                        ));
                     }
                     handler.remove_server(parts[2]).await?;
                 }
