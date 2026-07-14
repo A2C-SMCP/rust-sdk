@@ -32,9 +32,9 @@ pub use status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeS
 
 /// #124：高层 governance snapshot/inventory 公开面 re-export（SDK-facing，consumer 仅经此 + `Computer`）。
 pub use governance::{
-    GovernanceDecision, GovernanceDiagnostic, GovernanceQueryError, GovernanceRevision,
-    GovernanceSnapshot, ListPluginsOptions, MarketplaceSnapshot, MarketplaceStatus, PluginSnapshot,
-    PluginStatus, ProvenanceScope,
+    DeclaredCapabilities, GovernanceDecision, GovernanceDiagnostic, GovernanceQueryError,
+    GovernanceRevision, GovernanceSnapshot, ListPluginsOptions, MarketplaceSnapshot,
+    MarketplaceStatus, PluginSnapshot, PluginStatus, ProvenanceScope,
 };
 
 /// Computer模块的版本号 / Version of the Computer module

@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::{
-    GovernanceDecision, GovernanceDiagnostic, GovernanceRevision, GovernanceSnapshot,
-    ListPluginsOptions, MarketplaceSnapshot, MarketplaceStatus, PluginSnapshot, PluginStatus,
-    ProvenanceScope,
+    DeclaredCapabilities, GovernanceDecision, GovernanceDiagnostic, GovernanceRevision,
+    GovernanceSnapshot, ListPluginsOptions, MarketplaceSnapshot, MarketplaceStatus, PluginSnapshot,
+    PluginStatus, ProvenanceScope,
 };
 
 /// 仅用高层类型即可写出完整消费函数——签名不依赖任何低层 SDK 类型。
@@ -67,6 +67,14 @@ fn read_all_fields(mp: &MarketplaceSnapshot, p: &PluginSnapshot) {
     let _: &Vec<String> = &p.bundled_mcp_servers;
     let _: &Vec<String> = &p.bundled_skills;
     let _: &Vec<String> = &p.materialized_mcp_servers;
+    // #125：目录声明能力（安装前预览）——`Option` 区分「未知」与「确实无」，字段类型自足、不 import 低层。
+    let _declared: Option<&DeclaredCapabilities> = p.declared.as_ref();
+    if let Some(caps) = p.declared.as_ref() {
+        let _: Option<&String> = caps.version.as_ref();
+        let _: Option<&String> = caps.description.as_ref();
+        let _: &Vec<String> = &caps.mcp_servers;
+        let _: &Vec<String> = &caps.skills;
+    }
     let _: &Vec<GovernanceDiagnostic> = &p.diagnostics;
 }
 

@@ -505,3 +505,289 @@ async fn corrupt_plugin_manifest_surfaces_diagnostic_without_over_degrading() {
     );
     assert!(x.installed);
 }
+
+// ---------------------------------------------------------------------------
+// 9. #125：available plugin 从 catalog/clone 内省「目录声明能力」（version/desc/mcp/skill）
+// ---------------------------------------------------------------------------
+
+/// 在 `<catalog>` 播种含 **local-source** plugin `foo` 的真实 marketplace clone 树：
+/// - `.tfrobot-plugin/marketplace.json`（pluginRoot=./plugins，foo local source）
+/// - `plugins/foo/.tfrobot-plugin/plugin.json`（version + description）
+/// - `plugins/foo/mcp-servers/audit-mcp.json`（bundled MCP server，文件名 stem = 声明名）
+/// - `plugins/foo/skills/preview-skill/SKILL.md`（bundled skill）
+///
+/// 返回 plugin root（供「安装后」阶段作 install_path）。
+fn seed_local_plugin_marketplace(td: &TempDir) -> std::path::PathBuf {
+    let home = home_of(td);
+    let catalog = td.path().join("catalog");
+    let plugin_root = catalog.join("plugins").join("foo");
+
+    write(
+        &catalog.join(".tfrobot-plugin").join("marketplace.json"),
+        &serde_json::to_string(&json!({
+            "name": "mp",
+            "metadata": { "pluginRoot": "./plugins" },
+            "plugins": [{ "name": "foo", "source": "./plugins/foo" }],
+        }))
+        .unwrap(),
+    );
+    write(
+        &plugin_root.join(".tfrobot-plugin").join("plugin.json"),
+        &serde_json::to_string(&json!({
+            "version": "3.4.5",
+            "description": "Foo plugin desc",
+        }))
+        .unwrap(),
+    );
+    write(
+        &plugin_root.join("mcp-servers").join("audit-mcp.json"),
+        &serde_json::to_string(&json!({
+            "name": "audit-mcp", "type": "stdio", "command": "echo",
+        }))
+        .unwrap(),
+    );
+    write(
+        &plugin_root
+            .join("skills")
+            .join("preview-skill")
+            .join("SKILL.md"),
+        "---\ndescription: preview skill\n---\n# Preview\n",
+    );
+
+    update_known_marketplaces(
+        |f| {
+            let mut extra = Map::new();
+            extra.insert(
+                "installLocation".to_string(),
+                json!(catalog.to_string_lossy()),
+            );
+            f.account.marketplaces.insert(
+                "mp".to_string(),
+                KnownMarketplaceEntry {
+                    source: json!({"type": "git", "url": "https://example.com/mp.git"}),
+                    extra,
+                },
+            );
+        },
+        Some(&home),
+        None,
+    )
+    .unwrap();
+
+    plugin_root
+}
+
+#[tokio::test]
+async fn available_plugin_exposes_declared_catalog_capabilities() {
+    let td = TempDir::new().unwrap();
+    let plugin_root = seed_local_plugin_marketplace(&td);
+    // intent 空 → foo 仅 catalog 可用（未安装）。
+    let computer = make_computer(&td);
+
+    // --- 安装前：从 catalog/clone 内省目录声明能力 ---
+    let foo = computer.get_plugin("foo@mp").await.unwrap().unwrap();
+    assert_eq!(
+        foo.status,
+        PluginStatus::Available,
+        "catalog 有但未装 → available"
+    );
+    assert!(!foo.installed);
+
+    let declared = foo
+        .declared
+        .as_ref()
+        .expect("available local-source plugin 应内省出目录声明能力（Some）");
+    assert_eq!(
+        declared.mcp_servers,
+        vec!["audit-mcp".to_string()],
+        "目录声明的 bundled MCP server 应从 clone 的 mcp-servers/*.json 派生"
+    );
+    assert_eq!(
+        declared.skills,
+        vec!["foo:preview-skill".to_string()],
+        "目录声明的 bundled skill 应从 clone 的 skills/<skill>/SKILL.md 派生（<plugin>:<skill>）"
+    );
+    assert_eq!(declared.version.as_deref(), Some("3.4.5"));
+    assert_eq!(declared.description.as_deref(), Some("Foo plugin desc"));
+
+    // 实际物化字段仍空（未安装）——声明 ≠ 实际，验收 2 的正交性。
+    assert!(
+        foo.bundled_mcp_servers.is_empty(),
+        "未安装 → 实际 bundled_mcp_servers 为空（与 declared 正交）"
+    );
+    assert!(foo.materialized_mcp_servers.is_empty());
+
+    // --- 安装后：实际物化字段反映 ledger，declared 仍展示目录声明 ---
+    update_installed_plugins_intent(
+        |f| {
+            f.account.installed_plugins.insert("foo@mp".to_string());
+        },
+        Some(&home_of(&td)),
+        None,
+    )
+    .unwrap();
+    update_installed_plugins(
+        |f| {
+            f.account.plugins.insert(
+                "foo@mp".to_string(),
+                vec![ledger_record(Some(&plugin_root), "3.4.5", &["audit-mcp"])],
+            );
+        },
+        Some(&home_of(&td)),
+        None,
+    )
+    .unwrap();
+
+    let foo2 = computer.get_plugin("foo@mp").await.unwrap().unwrap();
+    assert!(foo2.installed);
+    assert_eq!(
+        foo2.bundled_mcp_servers,
+        vec!["audit-mcp".to_string()],
+        "安装后实际物化 bundled_mcp_servers 反映 ledger 记录"
+    );
+    // declared 仍反映目录声明（正交，不因安装而消失）。
+    let d2 = foo2
+        .declared
+        .as_ref()
+        .expect("安装后 declared 仍应反映目录声明");
+    assert_eq!(d2.mcp_servers, vec!["audit-mcp".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// 10. #125：remote(git)-source available plugin 的声明能力 = 未知（None，非空数组）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn available_remote_source_declared_is_unknown_not_empty() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let catalog = td.path().join("catalog");
+    // bar = github(remote) source：实体不在 marketplace clone 内 → 安装前无法内省 → 声明能力未知。
+    write(
+        &catalog.join(".tfrobot-plugin").join("marketplace.json"),
+        &serde_json::to_string(&json!({
+            "name": "mp",
+            "plugins": [{ "name": "bar", "source": { "source": "github", "repo": "acme/bar" } }],
+        }))
+        .unwrap(),
+    );
+    update_known_marketplaces(
+        |f| {
+            let mut extra = Map::new();
+            extra.insert(
+                "installLocation".to_string(),
+                json!(catalog.to_string_lossy()),
+            );
+            f.account.marketplaces.insert(
+                "mp".to_string(),
+                KnownMarketplaceEntry {
+                    source: json!({"type": "git", "url": "https://example.com/mp.git"}),
+                    extra,
+                },
+            );
+        },
+        Some(&home),
+        None,
+    )
+    .unwrap();
+    let computer = make_computer(&td);
+
+    let bar = computer.get_plugin("bar@mp").await.unwrap().unwrap();
+    assert_eq!(bar.status, PluginStatus::Available);
+    assert!(
+        bar.declared.is_none(),
+        "remote-source plugin 安装前声明能力未知 → None（非空数组，验收 2）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. #125：available plugin 的 per-item 韧性——单个 local plugin 破损（root 缺失）→ Degraded +
+//     diagnostic，同 marketplace 的健康兄弟项仍 Available + declared 完整（验收 3，经公开 API 守护）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn available_plugin_corruption_degrades_per_item_not_siblings() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let catalog = td.path().join("catalog");
+    // catalog 声明两个 local-source plugin：good（实体齐全）、broken（source 指向 clone 内不存在的目录）。
+    write(
+        &catalog.join(".tfrobot-plugin").join("marketplace.json"),
+        &serde_json::to_string(&json!({
+            "name": "mp",
+            "metadata": { "pluginRoot": "./plugins" },
+            "plugins": [
+                { "name": "good", "source": "./plugins/good" },
+                { "name": "broken", "source": "./plugins/broken" },
+            ],
+        }))
+        .unwrap(),
+    );
+    // 仅播种 good 的实体；broken 目录刻意不建 → root 缺失。
+    let good_root = catalog.join("plugins").join("good");
+    write(
+        &good_root.join("mcp-servers").join("good-mcp.json"),
+        r#"{"name":"good-mcp","type":"stdio","command":"echo"}"#,
+    );
+    write(
+        &good_root.join("skills").join("good-skill").join("SKILL.md"),
+        "---\ndescription: good skill\n---\n",
+    );
+    update_known_marketplaces(
+        |f| {
+            let mut extra = Map::new();
+            extra.insert(
+                "installLocation".to_string(),
+                json!(catalog.to_string_lossy()),
+            );
+            f.account.marketplaces.insert(
+                "mp".to_string(),
+                KnownMarketplaceEntry {
+                    source: json!({"type": "git", "url": "https://example.com/mp.git"}),
+                    extra,
+                },
+            );
+        },
+        Some(&home),
+        None,
+    )
+    .unwrap();
+    let computer = make_computer(&td);
+
+    // broken：局部破损 → Degraded + plugin_root_missing diagnostic + declared 未知（None）。
+    let broken = computer.get_plugin("broken@mp").await.unwrap().unwrap();
+    assert_eq!(
+        broken.status,
+        PluginStatus::Degraded,
+        "local root 缺失 → 该项 Degraded"
+    );
+    assert!(
+        broken
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "plugin_root_missing"),
+        "破损项须挂结构化 diagnostic，不得静默"
+    );
+    assert!(broken.declared.is_none(), "破损项声明能力未知 → None");
+
+    // good：不受兄弟项破损拖累 → 仍 Available + declared 完整。
+    let good = computer.get_plugin("good@mp").await.unwrap().unwrap();
+    assert_eq!(
+        good.status,
+        PluginStatus::Available,
+        "健康兄弟项不受 per-item 破损影响"
+    );
+    let d = good.declared.as_ref().expect("健康项 declared 完整");
+    assert_eq!(d.mcp_servers, vec!["good-mcp".to_string()]);
+    assert_eq!(d.skills, vec!["good:good-skill".to_string()]);
+
+    // 全表非空：单破损项未拖垮整个查询。
+    let plugins = computer
+        .list_plugins(ListPluginsOptions {
+            include_available: true,
+            marketplace: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(plugins.len(), 2);
+}

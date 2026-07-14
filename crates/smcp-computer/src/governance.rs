@@ -39,9 +39,15 @@ use sha2::{Digest, Sha256};
 use crate::settings::config::snapshot::{resolve_snapshot, SnapshotArgs};
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{load_installed_plugins, load_known_marketplaces};
+use crate::skills::frontmatter::parse_skill_frontmatter;
 use crate::skills::manifest::{
-    iter_plugin_entries, read_marketplace_manifest, MARKETPLACE_MANIFEST_DIR, PLUGIN_MANIFEST,
+    check_strict_conflict, entry_is_strict, enumerate_bundled_server_files, iter_plugin_entries,
+    plugin_root_base, read_marketplace_manifest, read_plugin_metadata, resolve_plugin_version,
+    resolve_skill_override_dirs, MARKETPLACE_MANIFEST_DIR, PLUGIN_MANIFEST,
 };
+use crate::skills::naming::{synthesize_name, SkillNameSpec};
+use crate::skills::sources::{resolve_plugin_source, ResolvedPluginSource};
+use crate::skills::staging::{SKILLS_SUBDIR, SKILL_MD};
 
 /// 每实体来源 scope（provenance）——re-export，使 consumer 从高层拿到 scope 枚举、不 import `settings::*`。
 pub use crate::settings::config::ProvenanceScope;
@@ -174,6 +180,28 @@ pub enum PluginStatus {
     Degraded,
 }
 
+/// plugin **目录声明能力**（安装前可预览；来自 marketplace clone 内省）/ catalog-declared capabilities。
+///
+/// 与「安装后**实际物化**能力」（[`PluginSnapshot::bundled_mcp_servers`] / `materialized_mcp_servers`）
+/// **语义正交**：本类型是 catalog/manifest **声明**的、安装前即可读的静态能力；后者是 install 后 ledger 记录
+/// 的实际物化 / live 已挂载子集。二者刻意分离——不得用同一字段承载（#125 验收 2）。
+///
+/// 承载它的 [`PluginSnapshot::declared`] 用 `Option` 区分「未知」与「确实无」；本类型的 `mcp_servers` /
+/// `skills` **空 vec** 表示「已内省且明确声明无该类能力」（≠ 未知，未知由外层 `None` 承载）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DeclaredCapabilities {
+    /// 声明版本（`entry.version` → `plugin.json.version`）/ declared version。
+    pub version: Option<String>,
+    /// 声明描述（`entry.description` → `plugin.json.description`）/ declared description。
+    pub description: Option<String>,
+    /// 目录声明的 bundled MCP server 名（clone 内 `mcp-servers/*.json` 文件名 stem，排序）。空 = 明确声明无。
+    pub mcp_servers: Vec<String>,
+    /// 目录声明的 bundled skill 名（`<plugin>:<skill>`，clone 内 `skills/<skill>/SKILL.md`，排序）。空 = 明确声明无。
+    pub skills: Vec<String>,
+}
+
 /// 一个 plugin 的高层治理投影 / one plugin governance projection。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -209,6 +237,12 @@ pub struct PluginSnapshot {
     pub bundled_skills: Vec<String>,
     /// 当前已物化的 bundled MCP server 子集（live 叠加）/ currently materialized bundled servers (live)。
     pub materialized_mcp_servers: Vec<String>,
+    /// **目录声明能力**（安装前预览；与上面「实际物化」字段正交）/ catalog-declared capabilities。
+    ///
+    /// **`Some(caps)` = 已从 marketplace clone 内省**（`caps.mcp_servers`/`skills` 空 = 明确声明无能力）；
+    /// **`None` = 未知**——remote(git)-source 未随 marketplace 克隆入 catalog / 无 catalog 条目 / local root
+    /// 缺失不可内省。用 `Option` 而非空数组，精确区分「未知」与「确实无」（#125 验收 2）。
+    pub declared: Option<DeclaredCapabilities>,
     /// 结构化诊断（含降级原因，即「最近一次结构化错误」）/ per-item diagnostics。
     pub diagnostics: Vec<GovernanceDiagnostic>,
 }
@@ -349,6 +383,16 @@ pub(crate) fn resolve_governance_snapshot(
     let mut decision_by_mp: BTreeMap<String, GovernanceDecision> = BTreeMap::new();
     // 每 mp 的可用 catalog id（供 plugin 阶段派生 available 项）。
     let mut available_by_mp: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // #125：plugin id → (目录声明能力, probe 诊断, root_broken)。marketplace 阶段一次性内省，plugin 阶段挂载。
+    #[allow(clippy::type_complexity)]
+    let mut declared_by_id: BTreeMap<
+        String,
+        (
+            Option<DeclaredCapabilities>,
+            Vec<GovernanceDiagnostic>,
+            bool,
+        ),
+    > = BTreeMap::new();
 
     for (name, entry) in mk_entries {
         let source_url = entry
@@ -385,11 +429,22 @@ pub(crate) fn resolve_governance_snapshot(
             None => (MarketplaceStatus::Known, Vec::new()),
             Some(loc) => match read_marketplace_manifest(Path::new(loc)) {
                 Ok(manifest) => {
-                    let mut ids: Vec<String> = iter_plugin_entries(&manifest)
-                        .iter()
-                        .filter_map(|e| e.get("name").and_then(Value::as_str))
-                        .map(|pn| format!("{pn}@{name}"))
-                        .collect();
+                    // #125：读 catalog 时对每个条目内省目录声明能力（local source only，无网络），
+                    // 存入 `declared_by_id` 供 plugin 阶段挂载。仍产出排序后的 available id 集。
+                    let base = plugin_root_base(&manifest);
+                    let loc_path = Path::new(loc);
+                    let mut ids: Vec<String> = Vec::new();
+                    for e in iter_plugin_entries(&manifest) {
+                        let Some(pn) = e.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let id = format!("{pn}@{name}");
+                        declared_by_id.insert(
+                            id.clone(),
+                            probe_declared_capabilities(loc_path, &base, pn, e),
+                        );
+                        ids.push(id);
+                    }
                     // 排序：与 `plugin_ids` 一致、DTO 输出确定（不依赖 catalog 文件内条目排布）。
                     ids.sort();
                     (MarketplaceStatus::Available, ids)
@@ -480,6 +535,9 @@ pub(crate) fn resolve_governance_snapshot(
             .get(marketplace)
             .copied()
             .unwrap_or(GovernanceDecision::Allowed);
+        // #125：挂目录声明能力（informative；status/diagnostic 仍由上面 install_path 健康逻辑决定，
+        // 零行为变更——catalog clone 破损不 degrade 已装 plugin）。无 catalog 条目 → None。
+        let declared = declared_by_id.get(id).and_then(|(caps, _, _)| caps.clone());
 
         plugins.push(PluginSnapshot {
             id: id.clone(),
@@ -497,6 +555,7 @@ pub(crate) fn resolve_governance_snapshot(
             bundled_mcp_servers,
             bundled_skills: Vec::new(),
             materialized_mcp_servers: Vec::new(),
+            declared,
             diagnostics,
         });
     }
@@ -512,13 +571,26 @@ pub(crate) fn resolve_governance_snapshot(
                 .get(mp)
                 .copied()
                 .unwrap_or(GovernanceDecision::Allowed);
+            // #125：挂目录声明能力 + probe 诊断；catalog 破损（local root 缺失）→ Degraded（验收 3）。
+            let (declared, diagnostics, status) = match declared_by_id.get(id) {
+                Some((caps, diags, root_broken)) => (
+                    caps.clone(),
+                    diags.clone(),
+                    if *root_broken {
+                        PluginStatus::Degraded
+                    } else {
+                        PluginStatus::Available
+                    },
+                ),
+                None => (None, Vec::new(), PluginStatus::Available),
+            };
             plugins.push(PluginSnapshot {
                 id: id.clone(),
                 plugin: plugin.to_string(),
                 marketplace: mp.clone(),
                 name: Some(plugin.to_string()),
                 version: None,
-                status: PluginStatus::Available,
+                status,
                 installed: false,
                 enabled: false,
                 enablement_scope: None,
@@ -528,7 +600,8 @@ pub(crate) fn resolve_governance_snapshot(
                 bundled_mcp_servers: Vec::new(),
                 bundled_skills: Vec::new(),
                 materialized_mcp_servers: Vec::new(),
-                diagnostics: Vec::new(),
+                declared,
+                diagnostics,
             });
         }
     }
@@ -608,6 +681,154 @@ fn plugin_manifest_diagnostic(install_path: &str) -> Option<GovernanceDiagnostic
 /// 取 extra map 中的字符串字段（非 str → None）/ string field from extra map。
 fn extra_str(extra: &Map<String, Value>, key: &str) -> Option<String> {
     extra.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// 从 marketplace clone 内省一个 catalog plugin 条目的**目录声明能力**（#125，仅 local source，无网络）。
+///
+/// 返回 `(declared, diagnostics, root_broken)`：
+/// - **local source 且 root 存在** → `(Some(caps), diags, false)`：`mcp_servers` 取 clone 内 `mcp-servers/*.json`
+///   文件名 stem、`skills` 取 `skills/<skill>/SKILL.md`（+ override 目录）合成 `<plugin>:<skill>`；
+///   `version`/`description` 取 `entry` → `plugin.json`；plugin.json 存在但损坏 → 挂 `plugin_manifest_unreadable`
+///   （不 degrade，可选元数据）。
+/// - **local source 但 root 缺失** → `(None, [plugin_root_missing], true)`：catalog 声明 local plugin 但 clone 内
+///   目录不在 → 破损；调用方对 available plugin 翻 `Degraded`（验收 3）。
+/// - **remote(git) source** → `(None, [], false)`：实体在 install 时才独立 clone，安装前**合法未知**（无诊断）。
+/// - **无 source** → `(None, [], false)`（沿用 #124 无 source catalog 条目的既有行为，不扰动）；
+///   **source 解析失败** → `(None, [plugin_source_unresolved], false)`（不吞错、不 degrade）。
+///
+/// **只读、无网络、无隐式 clone**——严守 governance 快照契约（remote source 绝不触发 git）。
+fn probe_declared_capabilities(
+    catalog_dir: &Path,
+    root_base: &str,
+    plugin_name: &str,
+    entry: &Map<String, Value>,
+) -> (
+    Option<DeclaredCapabilities>,
+    Vec<GovernanceDiagnostic>,
+    bool,
+) {
+    let Some(raw_source) = entry.get("source") else {
+        return (None, Vec::new(), false);
+    };
+    let local = match resolve_plugin_source(raw_source, root_base) {
+        Ok(ResolvedPluginSource::Local(l)) => l,
+        // remote：实体不在 marketplace clone 内，安装前无法内省 → 合法未知。
+        Ok(ResolvedPluginSource::Git(_)) => return (None, Vec::new(), false),
+        Err(e) => {
+            return (
+                None,
+                vec![GovernanceDiagnostic::new(
+                    "plugin_source_unresolved",
+                    format!("plugin catalog source is malformed: {e}"),
+                )],
+                false,
+            );
+        }
+    };
+    let plugin_root = catalog_dir.join(&local.rel_path);
+    if !plugin_root.is_dir() {
+        return (
+            None,
+            vec![GovernanceDiagnostic::new(
+                "plugin_root_missing",
+                "catalog declares a local-source plugin but its root is absent in the marketplace clone",
+            )],
+            true,
+        );
+    }
+
+    let metadata = read_plugin_metadata(&plugin_root);
+    let version = resolve_plugin_version(entry, &metadata, None);
+    let description =
+        extra_str(entry, "description").or_else(|| extra_str(&metadata, "description"));
+
+    let mut diagnostics: Vec<GovernanceDiagnostic> = Vec::new();
+    // plugin.json 存在但损坏：不吞错，挂诊断（version/description 已尽力从 entry 取）；不 degrade（可选元数据）。
+    let root_str = plugin_root.to_string_lossy();
+    if let Some(diag) = plugin_manifest_diagnostic(&root_str) {
+        diagnostics.push(diag);
+    }
+    // strict=false 且 plugin.json 声明组件 → 该 plugin 安装期硬失败（marketplace-v1 §4.4），声明预览如实提示
+    // （不 degrade：这是可用性告警，非结构损坏；consumer 据此知「此项虽有声明但装不进」）。
+    if check_strict_conflict(entry, &metadata).is_err() {
+        diagnostics.push(GovernanceDiagnostic::new(
+            "strict_conflict",
+            "strict=false but plugin.json declares components; this plugin would fail to install (marketplace-v1 §4.4)",
+        ));
+    }
+
+    // 目录声明的 bundled MCP server（文件名 stem，排序去重）。
+    let mut mcp_servers: Vec<String> = enumerate_bundled_server_files(&plugin_root)
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .collect();
+    mcp_servers.sort();
+    mcp_servers.dedup();
+
+    // 目录声明的 bundled skill（`<plugin>:<skill>`）：skills 约定容器 + override 目录（与 staging 同源判定）。
+    let mut skill_dirs = vec![plugin_root.join(SKILLS_SUBDIR)];
+    skill_dirs.extend(resolve_skill_override_dirs(
+        entry,
+        &metadata,
+        &plugin_root,
+        entry_is_strict(entry),
+    ));
+    let mut skills = probe_declared_skill_names(plugin_name, &skill_dirs);
+    skills.sort();
+    skills.dedup();
+
+    (
+        Some(DeclaredCapabilities {
+            version,
+            description,
+            mcp_servers,
+            skills,
+        }),
+        diagnostics,
+        false,
+    )
+}
+
+/// 扫 skill 容器目录，产出目录声明的 SKILL 名（`<plugin>:<skill>`）/ Enumerate declared bundled skill names。
+///
+/// 与 staging（`scan_and_register_plugin_skills`）**同源准入**，使 `declared.skills` = 该 plugin 安装时**实际
+/// 会物化**的 skill 集（避免安装前/后关联误差）：skill 包 = 含直接 `SKILL.md` **且 frontmatter 有非空
+/// `description`** 的一级子目录（缺 description → staging 跳过不注册，故此处亦不计入）；name 经协议合成
+/// [`synthesize_name`]（合成失败的目录跳过，与 staging 一致）。
+fn probe_declared_skill_names(plugin_name: &str, skill_dirs: &[std::path::PathBuf]) -> Vec<String> {
+    let mut names = Vec::new();
+    for dir in skill_dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in rd.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // SKILL.md 存在 + frontmatter 非空 description（与 staging 准入一致，否则安装期不注册）。
+            let Ok(text) = std::fs::read_to_string(path.join(SKILL_MD)) else {
+                continue;
+            };
+            let has_description = parse_skill_frontmatter(&text)
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_description {
+                continue;
+            }
+            let Some(basename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Ok(name) = synthesize_name(SkillNameSpec::Marketplace {
+                plugin: plugin_name,
+                skill: basename,
+            }) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// 已安装 plugin 版本：ledger `version` → plugin.json `version`（若 install_path 存在）/ resolve version。
@@ -879,6 +1100,116 @@ mod tests {
         assert_eq!(
             derive_decision(false, false, true),
             GovernanceDecision::Restricted
+        );
+    }
+
+    // ── #125：probe_declared_capabilities 直测 ────────────────────────────────
+    fn obj(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap()
+    }
+    /// 在 `<catalog>/plugins/foo` 播种含 bundled MCP + skill + plugin.json 的 local plugin 树。
+    fn seed_local_plugin(catalog: &Path) {
+        let root = catalog.join("plugins").join("foo");
+        std::fs::create_dir_all(root.join("mcp-servers")).unwrap();
+        std::fs::write(
+            root.join("mcp-servers").join("audit-mcp.json"),
+            r#"{"name":"audit-mcp","type":"stdio","command":"echo"}"#,
+        )
+        .unwrap();
+        // inputs.json 应被排除，不计入声明。
+        std::fs::write(root.join("mcp-servers").join("inputs.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("skills").join("preview-skill")).unwrap();
+        std::fs::write(
+            root.join("skills").join("preview-skill").join("SKILL.md"),
+            "---\ndescription: x\n---\n",
+        )
+        .unwrap();
+        // 无 SKILL.md 的目录不算 skill 包。
+        std::fs::create_dir_all(root.join("skills").join("not-a-skill")).unwrap();
+        // 有 SKILL.md 但 frontmatter 缺 description → staging 不注册，declared 亦不计入（同源准入）。
+        std::fs::create_dir_all(root.join("skills").join("no-desc-skill")).unwrap();
+        std::fs::write(
+            root.join("skills").join("no-desc-skill").join("SKILL.md"),
+            "---\nname: no-desc\n---\n# no description\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            root.join(".tfrobot-plugin").join("plugin.json"),
+            r#"{"version":"3.4.5","description":"Foo plugin desc"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn probe_local_source_introspects_declared_capabilities() {
+        let td = TempDir::new().unwrap();
+        seed_local_plugin(td.path());
+        let entry = obj(json!({"name": "foo", "source": "./plugins/foo"}));
+        let (declared, diags, root_broken) =
+            probe_declared_capabilities(td.path(), "./plugins", "foo", &entry);
+        assert!(!root_broken && diags.is_empty());
+        let caps = declared.expect("local source 应内省出 Some");
+        assert_eq!(
+            caps.mcp_servers,
+            vec!["audit-mcp".to_string()],
+            "排除 inputs.json"
+        );
+        // 仅 preview-skill 计入：not-a-skill（无 SKILL.md）与 no-desc-skill（缺 description）均被排除。
+        assert_eq!(caps.skills, vec!["foo:preview-skill".to_string()]);
+        assert_eq!(caps.version.as_deref(), Some("3.4.5"));
+        assert_eq!(caps.description.as_deref(), Some("Foo plugin desc"));
+    }
+
+    #[test]
+    fn probe_remote_source_is_unknown_not_empty() {
+        let td = TempDir::new().unwrap();
+        let entry = obj(json!({"name": "bar", "source": {"source": "github", "repo": "acme/bar"}}));
+        let (declared, diags, root_broken) =
+            probe_declared_capabilities(td.path(), "./plugins", "bar", &entry);
+        assert!(declared.is_none(), "remote source 安装前未知 → None");
+        assert!(diags.is_empty() && !root_broken, "remote 非破损、无诊断");
+    }
+
+    #[test]
+    fn probe_missing_local_root_degrades() {
+        let td = TempDir::new().unwrap();
+        // catalog 声明 local plugin 但 clone 内目录不存在。
+        let entry = obj(json!({"name": "gone", "source": "./plugins/gone"}));
+        let (declared, diags, root_broken) =
+            probe_declared_capabilities(td.path(), "./plugins", "gone", &entry);
+        assert!(declared.is_none());
+        assert!(root_broken, "local root 缺失 → 破损（调用方翻 Degraded）");
+        assert!(diags.iter().any(|d| d.code == "plugin_root_missing"));
+    }
+
+    #[test]
+    fn probe_missing_source_is_unknown_without_diagnostic() {
+        let td = TempDir::new().unwrap();
+        let entry = obj(json!({"name": "x"})); // 无 source（#124 seed_catalog 形态）
+        let (declared, diags, root_broken) =
+            probe_declared_capabilities(td.path(), "./plugins", "x", &entry);
+        assert!(declared.is_none() && diags.is_empty() && !root_broken);
+    }
+
+    #[test]
+    fn probe_strict_false_with_plugin_json_components_flags_conflict() {
+        let td = TempDir::new().unwrap();
+        // strict=false + plugin.json 声明组件 → 安装期硬失败（marketplace-v1 §4.4）；声明预览挂 strict_conflict。
+        let root = td.path().join("plugins").join("s");
+        std::fs::create_dir_all(root.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            root.join(".tfrobot-plugin").join("plugin.json"),
+            r#"{"skills":["extra"]}"#,
+        )
+        .unwrap();
+        let entry = obj(json!({"name": "s", "source": "./plugins/s", "strict": false}));
+        let (declared, diags, root_broken) =
+            probe_declared_capabilities(td.path(), "./plugins", "s", &entry);
+        assert!(declared.is_some() && !root_broken, "结构在 → Some、非破损");
+        assert!(
+            diags.iter().any(|d| d.code == "strict_conflict"),
+            "strict=false 声明组件冲突须挂 strict_conflict 诊断"
         );
     }
 }
