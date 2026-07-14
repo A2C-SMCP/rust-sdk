@@ -37,8 +37,8 @@ use crate::governance::{
 };
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::settings::config::{
-    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent, WriteScope,
-    WriteTargetOptions,
+    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent, EntityKey,
+    WriteScope, WriteTargetError, WriteTargetOptions,
 };
 use crate::settings::installer::{
     DisableOptions, EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError,
@@ -1967,8 +1967,10 @@ impl<S: Session> Computer<S> {
     ///   加的 server 静默污染团队共享的 `mcp.json`；local 仍 boot 读取→**重启存活**（不损失 #113 收益）。想入 git
     ///   团队共享 → 用 [`add_or_update_server_in_scope`](Self::add_or_update_server_in_scope) 显式选 `Project`/`User`。
     /// - **D1 安全**：落盘的是**原始** `server`（保留 `${input:*}`/`${env:*}` 引用），**绝不**落渲染后的明文值/secret。
-    /// - **改已有 server** → 恒落其 **origin scope**（`upsert_new_scope` 只作用于新声明）。bundled server 名 →
-    ///   消解器拒（[`WriteTargetError::Synthesized`]）。
+    /// - **改已有 server** → 恒落其 **origin scope**（`upsert_new_scope` 只作用于新声明）。
+    /// - **#126 归属门控**：名字被**启用中**插件占用、且用户在 config 中**无任何同名声明**（pure plugin-owned）→
+    ///   拒（[`WriteTargetError::Synthesized`]，用户应停用/卸载 plugin）。用户**自己声明的**同名 server（含撞
+    ///   bundled 名者）可正常更新——**停用该 plugin 后**该名亦可自由新增（归属 enabled-gated，与 managedBy 查询同源）。
     /// - **§12 R2**：落盘成功后 bump **config** revision；随后运行期物化 bump **capability**。
     /// - 治理物化（bundled 重挂）**不**走此路径（走 [`mount_server`]），避免 ledger 意图重复写入 mcp.json。
     ///
@@ -1994,19 +1996,43 @@ impl<S: Session> Computer<S> {
         server: MCPServerConfig,
         upsert_new_scope: WriteScope,
     ) -> ComputerResult<()> {
+        // #121：以本实例上下文（含 User env + Skill Home）解析写目标，绝不误写宿主 User config。
+        let config_dir = self.config_dir();
+        let home = self.skill_home();
+        let name = server.name().to_string();
+        let ctx = self.instance_config_context(&config_dir, &home, upsert_new_scope);
+        let snapshot = load_config(&ctx);
+
+        // #126 归属门控（早于 render/落盘，快速失败）：名字被**启用中**插件占用、且用户在 config 中**无任何声明**
+        // （pure plugin-owned）→ 拒绝直接声明（用户应停用/卸载该 plugin，或经治理 mount 通道，不经此写用户 config）。
+        // 用户**已有**同名声明（origin=Some）则放行——writable 走下方 update_config 编辑其 origin scope、只读 origin
+        // 由 write_target 返回 `ReadOnlyOrigin`。归属集与 `list_mcp_servers_with_metadata`（managedBy）**同源**。
+        let declared_origin = snapshot
+            .provenance
+            .get(&EntityKey::Mcp(name.clone()))
+            .copied();
+        if declared_origin.is_none()
+            && self
+                .enabled_bundled_ownership()
+                .iter()
+                .any(|rec| rec.config.name() == name)
+        {
+            return Err(ComputerError::ConfigPersist(
+                WriteTargetError::Synthesized {
+                    entity: format!("mcp:{name}"),
+                }
+                .to_string(),
+            ));
+        }
+
         // 先 render 校验：非法 config / 无法解析的 input 早失败，**不落盘**（**唯一一次** render，下方物化复用其结果，
         // 避免重复触发 resolver 副作用）/ validate before persist; single render reused by mount_rendered below。
         let validated = self.render_server_config(&server).await?;
 
         // 落盘（原始引用；D1 不落 secret）→ 经 S2 消解器定 scope + S3 执行器两阶段写。
-        // #121：以本实例上下文（含 User env + Skill Home）解析写目标，绝不误写宿主 User config。
-        let config_dir = self.config_dir();
-        let home = self.skill_home();
-        let name = server.name().to_string();
         let body = canonicalize_persist_body(serde_json::to_value(&server)?);
-        let ctx = self.instance_config_context(&config_dir, &home, upsert_new_scope);
         // 内容摘要 revision（S1）：仅当真落盘（内容变）才 bump config，避免 no-op/幂等 mutate 虚假 bump（§12 R2）。
-        let before_rev = load_config(&ctx).revision;
+        let before_rev = snapshot.revision;
         let edit = ConfigEdit::new(ConfigEntity::McpServer(name), EditIntent::Upsert(body));
         let after = update_config(&ctx, std::slice::from_ref(&edit))
             .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
@@ -2029,9 +2055,10 @@ impl<S: Session> Computer<S> {
     /// - **落盘删声明**：从**本实例** config 快照（#121 A：`config_env` 锚定，不误读宿主）解析 `bundle_id` → 声明
     ///   `name`（`resolve_bundle_id` 与 manager 同键，含显式 `bundle_id`），再按 name 删**所有可写 scope**（mcp.json
     ///   是 name-keyed；S2 R1 真删干净）。匹配多个声明名（no-double-open 冲突）→ 全删。
-    /// - 不在任何 config scope（纯运行期实例）→ 落盘 no-op；随后仍按 `bundle_id` 停摘运行期实例。
-    /// - bundled server 的身份 → 消解器拒（[`WriteTargetError::Synthesized`]，用户不应经 config 删 plugin server，应
-    ///   uninstall/disable plugin）。
+    /// - 不在任何 config scope 且**非**启用插件占用（纯运行期实例）→ 落盘 no-op；随后仍按 `bundle_id` 停摘运行期实例。
+    /// - **#126 归属门控**：无匹配用户声明、但该 `bundle_id` 属**启用中**插件的 bundled server → 拒
+    ///   （[`WriteTargetError::Synthesized`]，用户应停用/卸载 plugin）。用户**自己声明的**同名 server 可正常删除
+    ///   （归属 enabled-gated，与 managedBy 查询同源；停用该 plugin 后该名亦可自由删除）。
     ///
     /// # Errors
     /// 落盘失败（[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期停摘失败（manager 错）。
@@ -2056,7 +2083,23 @@ impl<S: Session> Computer<S> {
         // names 已 collect（拥有所有权），此后移出 revision 不影响；snap 余部随作用域自然析构。
         let before_rev = snap.revision;
 
-        // 落盘删声明（每个匹配名一条 Remove；bundled 身份 → 消解器拒 Synthesized）。无匹配 → 空计划、不落盘。
+        // #126 归属门控：无匹配用户声明、但该 `bundle_id` 属**启用中**插件的 bundled server → 拒绝直接删除
+        // （用户应停用/卸载 plugin，不经 config 删 plugin server）。有用户声明（names 非空）则删其声明、放行。
+        // 归属集与 `list_mcp_servers_with_metadata`（managedBy）**同源**（#126 验收#3）；停用插件后不占名（D3）。
+        if names.is_empty() {
+            if let Some(rec) = self.enabled_bundled_ownership().into_iter().find(|rec| {
+                crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config) == bundle_id
+            }) {
+                return Err(ComputerError::ConfigPersist(
+                    WriteTargetError::Synthesized {
+                        entity: format!("mcp:{}", rec.config.name()),
+                    }
+                    .to_string(),
+                ));
+            }
+        }
+
+        // 落盘删声明（每个匹配名一条 Remove）。无匹配（纯运行期实例、非 plugin-owned）→ 空计划、不落盘。
         if !names.is_empty() {
             let edits: Vec<ConfigEdit> = names
                 .into_iter()
@@ -2662,6 +2705,34 @@ impl<S: Session> Computer<S> {
         servers.values().cloned().collect()
     }
 
+    /// 本实例 enabled-bundled 归属集（intent ∧ `enabledPlugins==true` 门控）/ enabled bundled ownership set。
+    ///
+    /// [`list_mcp_servers_with_metadata`](Self::list_mcp_servers_with_metadata) 的 `managedBy=plugin` 与 runtime
+    /// CRUD 归属门控（#126：[`add_or_update_server`](Self::add_or_update_server) /
+    /// [`remove_server`](Self::remove_server)）的**唯一同源**——保证「查询归属」与「增删可否」一致（#126 验收#3）。
+    /// #121 A：以**本实例** env（`config_env`）解析账本 + `enabledPlugins`，绝不混入宿主 ambient settings。**停用的
+    /// plugin 不在结果内**（#126 D3：停用插件后同名 server 可自由增删——issue 记录的规避路径）。
+    ///
+    /// **join key（#126 有意的非对称）**：`add_or_update_server` 按 **name** 判占用（config 落 `mcp.json` 的 name key、
+    /// 与 `list_mcp_servers_with_metadata` 的 name-join 归属一致，见其「归属 join key = name」限制）；`remove_server` 按
+    /// **bundle_id** 判占用（其公开入参即 bundle_id，#121）。二者仅在「用户声明与某启用插件 bundled server **同名但显式
+    /// 设了不同 `bundle_id`**」这一病态场景分歧——此时 `remove_server(用户自己的 bundle_id)` 放行删**用户自己的**声明
+    /// （更正确），而查询因 name-collision 标 `managedBy=plugin`。这不是 bug（默认 `bundle_id=normalize(name)`，需人为
+    /// 显式差异才触发），彻底 bundle_id 化归属属 #97/#117 的独立议题、不在 #126 范围。
+    fn enabled_bundled_ownership(&self) -> Vec<BundledServerRecord> {
+        let home = self.skill_home();
+        let env = self.config_env();
+        let policy = resolve_policy_settings(None, None, None);
+        let declared = resolve_settings(ResolveSettingsArgs {
+            cwd: None,
+            env,
+            flag_settings_path: None,
+            policy_settings: Some(&policy),
+        })
+        .settings;
+        crate::settings::recovery::collect_enabled_bundled_servers(&home, env, &declared)
+    }
+
     /// 列出 MCP 服务器 + 归属 / 生命周期元数据（活跃 inventory）/ List MCP servers with ownership metadata.
     ///
     /// 面向 client（如 `tfrobot-client`）Skill / MCP tab：一次拿到「当前 Computer 有哪些 MCP server + 每条归
@@ -2696,22 +2767,11 @@ impl<S: Session> Computer<S> {
         };
 
         // ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图）。
-        // #121 A：以**本实例** env 解析 `enabledPlugins` 门控与账本，绝不混入宿主 ambient settings。
-        let home = self.skill_home();
-        let env = self.config_env();
-        let policy = resolve_policy_settings(None, None, None);
-        let declared = resolve_settings(ResolveSettingsArgs {
-            cwd: None,
-            env,
-            flag_settings_path: None,
-            policy_settings: Some(&policy),
-        })
-        .settings;
-        let bundled: HashMap<String, BundledServerRecord> =
-            crate::settings::recovery::collect_enabled_bundled_servers(&home, env, &declared)
-                .into_iter()
-                .map(|rec| (rec.config.name().to_string(), rec))
-                .collect();
+        let bundled: HashMap<String, BundledServerRecord> = self
+            .enabled_bundled_ownership()
+            .into_iter()
+            .map(|rec| (rec.config.name().to_string(), rec))
+            .collect();
 
         let mut out: Vec<McpServerWithMetadata> = Vec::new();
         let mut materialized: HashSet<String> = HashSet::new();
@@ -4511,6 +4571,127 @@ mod tests {
         );
 
         comp_b.shutdown().await.unwrap();
+    }
+
+    // ── #126：同名用户 MCP vs 插件 bundled server 的归属门控 ────────────────────────────
+
+    /// 本实例 User-config 环境（XDG → tmp/inst-xdg，与宿主进程环境隔离）。
+    fn instance_xdg_env_126(tmp: &tempfile::TempDir) -> EnvMap {
+        let mut env = EnvMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("inst-xdg").to_string_lossy().into_owned(),
+        );
+        env
+    }
+
+    /// 写本实例 User settings（`enabledPlugins` 门控源——与 `enabled_bundled_ownership` 的 `resolve_settings` 同源）。
+    fn seed_user_settings_126(env: &EnvMap, settings: serde_json::Value) {
+        let path = crate::settings::scope::user_settings_path(Some(env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&settings).unwrap()).unwrap();
+    }
+
+    /// #126 验收#1（复现 issue）：用户在插件**停用**期添加了与插件 bundled server 同名的 server（真实用户声明）；
+    /// 随后**启用**插件（用户 server 仍是自己的声明）→ 更新 / 删除该声明**应成功**。此前 bug：`write_target` 按 ledger
+    /// bundled 名（未门控）误判 `Synthesized` 拒绝持久化 CRUD。
+    #[tokio::test]
+    async fn same_name_user_server_editable_and_removable_after_plugin_enabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await; // 装 audit@acme（bundling audit-mcp），installed_disabled。
+        let env = instance_xdg_env_126(&tmp);
+        let proj = tmp.path().join("proj");
+        let comp = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_env(env.clone())
+            .with_config_dir(&proj);
+
+        // 步骤 2：插件停用（未 seed enabledPlugins）→ 归属集空 → 用户添加同名 audit-mcp 成功落盘。
+        comp.add_or_update_server(user_stdio_server97("audit-mcp"))
+            .await
+            .expect("停用插件期同名 server 应可添加");
+        assert_eq!(comp.config_revision(), 1);
+
+        // 步骤 3：启用 audit@acme（enabledPlugins 落本实例 User settings）→ audit-mcp 变 enabled-plugin-owned。
+        seed_user_settings_126(
+            &env,
+            serde_json::json!({ "enabledPlugins": { "audit@acme": true } }),
+        );
+
+        // 步骤 4：更新用户**自己**的同名声明（改 command）→ 应成功（有 writable 声明，归属门控放行、write_target
+        // 编辑其 origin scope），落盘 bump。
+        let mut updated = user_stdio_server97("audit-mcp");
+        if let MCPServerConfig::Stdio(ref mut s) = updated {
+            s.server_parameters.command = "deno".to_string();
+        }
+        comp.add_or_update_server(updated.clone())
+            .await
+            .expect("用户自己声明的同名 server 应可更新（不被 bundled 名冲突拦截）");
+        assert_eq!(comp.config_revision(), 2, "更新同名用户声明应落盘 bump");
+
+        // 删除用户声明（按 bundle_id）→ 应成功，落盘 bump。
+        let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&updated);
+        comp.remove_server(&bundle_id)
+            .await
+            .expect("用户自己声明的同名 server 应可删除");
+        assert_eq!(comp.config_revision(), 3, "删除同名用户声明应落盘 bump");
+    }
+
+    /// #126 验收#2（守护，不过度矫正）：名字被**启用中**插件占用、用户**无**同名声明（pure plugin-owned）→ 直接
+    /// `add_or_update_server` / `remove_server` 拒（`Synthesized`）；**停用**插件后同名 add 放行（issue 记录的规避
+    /// 路径 / enabled-gating）。归属集与 `list_mcp_servers_with_metadata`（managedBy）同源，守护验收#3 一致性。
+    #[tokio::test]
+    async fn pure_plugin_owned_name_rejects_crud_but_disabled_allows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let env = instance_xdg_env_126(&tmp);
+        let proj = tmp.path().join("proj");
+        let comp = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_env(env.clone())
+            .with_config_dir(&proj);
+
+        // 启用 audit@acme → audit-mcp = enabled-plugin-owned；用户无同名声明。
+        seed_user_settings_126(
+            &env,
+            serde_json::json!({ "enabledPlugins": { "audit@acme": true } }),
+        );
+
+        // add 同名 → 拒（pure plugin-owned），零落盘。
+        let err = comp
+            .add_or_update_server(user_stdio_server97("audit-mcp"))
+            .await
+            .expect_err("pure plugin-owned 名字直接 add 应拒");
+        assert!(matches!(
+            err,
+            crate::errors::ComputerError::ConfigPersist(_)
+        ));
+        assert_eq!(comp.config_revision(), 0, "拒绝应零落盘");
+
+        // remove 插件 bundled server 的 bundle_id → 拒。
+        let inv = comp.list_mcp_servers_with_metadata().await;
+        let plugin_srv = inv
+            .iter()
+            .find(|e| e.name == "audit-mcp")
+            .expect("enabled bundled server 应可查询（§4.8）");
+        let err2 = comp
+            .remove_server(&plugin_srv.bundle_id)
+            .await
+            .expect_err("pure plugin-owned bundle_id 直接 remove 应拒");
+        assert!(matches!(
+            err2,
+            crate::errors::ComputerError::ConfigPersist(_)
+        ));
+
+        // 停用 audit@acme → 归属集空 → 同名 add 放行（规避路径 / D3）。
+        seed_user_settings_126(
+            &env,
+            serde_json::json!({ "enabledPlugins": { "audit@acme": false } }),
+        );
+        comp.add_or_update_server(user_stdio_server97("audit-mcp"))
+            .await
+            .expect("停用插件后同名 server 应可添加");
+        assert_eq!(comp.config_revision(), 1, "停用后 add 落盘 bump");
     }
 
     /// v0.3.0：uninstall 从 `installedPlugins` 全局意图移除该 pid（改 `home` 内文件，hermetic，非 `~/.config`），

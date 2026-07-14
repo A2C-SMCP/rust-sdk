@@ -12,10 +12,12 @@
 * 核心语义 / core semantics（design-107 §5 / §6）:
 *   - **disable ≠ remove**：`Remove` 动**声明**（删 mcp.json 里的 server key）；`Disable` 动**override**
 *     （写 `disabledMcpjsonServers` / `enabledPlugins[id]=false` 到固定 writable scope，**不碰声明**、天然可逆）。
-*   - **对称纯函数**：无 I/O；输入 = 实体 + 意图 + S1 快照（provenance/bundled）+ scope 锚点；输出 = `WritePlan` 计划。
-*   - **asset-class-aware**（§6 三类）：独立 MCP → `disabledMcpjsonServers`（§9.2 ③ 跨 scope override）；
-*     plugin → `enabledPlugins[id]`；plugin-bundled MCP → `Synthesized`（无独立可编辑文件，须操作属主 plugin，
-*     **MUST NOT 走 project 信任门**，§5.10）。
+*   - **对称纯函数**：无 I/O；输入 = 实体 + 意图 + S1 快照（**provenance**，定 origin）+ scope 锚点；输出 = `WritePlan` 计划。
+*   - **asset-class-aware**（§6）：独立 MCP → `disabledMcpjsonServers`（§9.2 ③ 跨 scope override）；
+*     plugin → `enabledPlugins[id]`。⚠️ #126：本层**对插件归属无感知**——bundled server 的配置来自插件安装目录、
+*     runtime-only 挂载、**从不落 `mcp.json`**（#122），故凡进 config 快照的 server 必有可编辑声明文件，`Synthesized`
+*     不再在此按 `bundled` 名冲突产出。"插件占用同名"的归属门控上移到 **Computer 层**
+*     （`add_or_update_server`/`remove_server`，复用 `managedBy` 查询同源的 enabled-bundled 归属集），与 config-file 层解耦。
 *   - **Remove 策略**（design §12 R1 已拍板）：删**所有可写 scope**的声明（真删干净）。因 S1 快照只暴露
 *     **胜出 origin**、不带 per-scope 存在性，无法预判哪些 scope 真声明了该实体，故对三个可写 scope **盲发** Delete。
 *     origin ∈ {policy, flag} → 结构化错 `ReadOnlyOrigin`（#109 验收）。
@@ -30,8 +32,8 @@
 *     对缺失成员/缺失字段 remove 为 **noop**。这两个 op 是本函数对「复用 `WriteValue`」的必要偏离（`WriteValue::Set`
 *     整体替换数组、无法表达成员增删，且 S1 未投影 `disabledMcpjsonServers` 现值故纯函数无法就地构造新数组）。
 *
-* 消费 S1（[`ComputerConfigSnapshot`]）：读 `provenance`（定 origin）+ `mcp.servers[].bundled`（定 asset class）。
-* WriteScope 只含 {User, Project, Local}（可写子集）；Flag/Policy/Intent 只读。
+* 消费 S1（[`ComputerConfigSnapshot`]）：**只读 `provenance`（定 origin）**——#126 起本层不再读 `mcp.servers[].bundled`
+* （插件归属门控上移 Computer 层，见上）。WriteScope 只含 {User, Project, Local}（可写子集）；Flag/Policy/Intent 只读。
 */
 
 use std::collections::BTreeMap;
@@ -77,7 +79,7 @@ impl From<WriteScope> for SettingsScope {
 /// 待落盘的实体（本函数解析 scope-file 写目标；install/uninstall 归 installer）/ target entity。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigEntity {
-    /// MCP server（key = server name；bundled 与否由快照判定）。
+    /// MCP server（key = server name；#126 起本层不判 bundled，插件归属门控在 Computer 层）。
     McpServer(String),
     /// plugin（key = `<plugin>@<marketplace>` id；仅 enable/disable，install/uninstall 归 installer）。
     Plugin(String),
@@ -264,16 +266,12 @@ fn resolve_mcp_server(
 ) -> Result<Vec<WritePlan>, WriteTargetError> {
     let entity_key = format!("mcp:{name}");
 
-    // plugin-bundled server：无独立可编辑文件、启停归属主 plugin（§5.10 MUST NOT 走信任门）。
-    let bundled = snapshot
-        .mcp
-        .servers
-        .iter()
-        .any(|s| s.name == name && s.bundled);
-    if bundled {
-        return Err(WriteTargetError::Synthesized { entity: entity_key });
-    }
-
+    // #126：本层**只认 config 声明**、对插件归属无感知。凡出现在 config 快照里的 server 必有可编辑声明
+    // 文件——bundled server 的配置来自插件安装目录、runtime-only 挂载、**从不落 `mcp.json`**（#122），故绝
+    // 无法在此被 provenance 命中。据此按 origin 决策即可：writable→编辑该 scope、flag/policy→`ReadOnlyOrigin`、
+    // 无声明→新建/幂等。**"插件占用同名"的归属门控（`Synthesized`）改由 Computer 层强制**
+    // （`add_or_update_server`/`remove_server`，复用 `managedBy` 查询同源的 enabled-bundled 归属集），不再靠
+    // `mcp.servers[].bundled` 名冲突在此误拦用户自己的真实声明。
     let origin = snapshot
         .provenance
         .get(&EntityKey::Mcp(name.to_string()))
@@ -667,7 +665,10 @@ mod tests {
     }
 
     #[test]
-    fn mcp_disable_bundled_is_synthesized() {
+    fn mcp_bundled_name_disable_is_override_not_synthesized() {
+        // #126：同名用户声明的 Disable = 正常 override（写 disabledMcpjsonServers、不碰声明），
+        // 不再因 bundled 名冲突返回 Synthesized——该名冲突 guard 已从本层移除，"插件占用同名" 的归属
+        // 门控上移到 Computer 层（`add_or_update_server`/`remove_server`）。本层对插件归属无感知。
         let fx = Fixture::new();
         write(
             &user_mcp_config_path(Some(&fx.env)),
@@ -688,10 +689,126 @@ mod tests {
             None,
         )
         .unwrap();
-        let snap = fx.snapshot(); // bundled-srv.bundled=true
-        for intent in [EditIntent::Disable, EditIntent::Remove] {
+        let snap = fx.snapshot();
+        let plans = resolve_write_target(
+            &ConfigEntity::McpServer("bundled-srv".into()),
+            &EditIntent::Disable,
+            &snap,
+            &fx.anchors(),
+            &OPTS,
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].op,
+            WriteTargetOp::StringSetInsert {
+                field: "disabledMcpjsonServers".into(),
+                value: "bundled-srv".into(),
+            },
+            "同名用户声明 Disable → override（不再 Synthesized）"
+        );
+    }
+
+    #[test]
+    fn mcp_bundled_name_with_user_declaration_is_editable() {
+        // #126：用户在自己 mcp.json 声明的 server，名字撞已装插件 bundled server（同名冲突）时，
+        // 仍是 writable origin 的**真实声明** → Upsert 落其 origin scope、Remove 删所有可写 scope，
+        // 绝不因 bundled 名冲突被误判为 Synthesized（"无可编辑文件"——但它明明有可编辑声明文件）。
+        let fx = Fixture::new();
+        write(
+            &user_mcp_config_path(Some(&fx.env)),
+            r#"{"servers": {"audit-mcp": {"type":"stdio","server_parameters":{"command":"u"}}}}"#,
+        );
+        update_installed_plugins(
+            |file| {
+                file.account.plugins.insert(
+                    "plug@mp".into(),
+                    vec![InstalledPluginRecord {
+                        install_path: None,
+                        bundled_mcp_servers: vec!["audit-mcp".into()],
+                        extra: Map::new(),
+                    }],
+                );
+            },
+            Some(&fx.home),
+            None,
+        )
+        .unwrap();
+        let snap = fx.snapshot(); // audit-mcp origin=User（可写）+ bundled 名冲突。
+
+        // Upsert（改已有）→ 落 origin scope（User），不 Synthesized。
+        let upsert = resolve_write_target(
+            &ConfigEntity::McpServer("audit-mcp".into()),
+            &EditIntent::Upsert(json!({"type": "stdio"})),
+            &snap,
+            &fx.anchors(),
+            &OPTS,
+        )
+        .unwrap();
+        assert_eq!(upsert.len(), 1);
+        assert_eq!(
+            upsert[0].scope,
+            SettingsScope::User,
+            "同名用户声明改动应落其 origin scope，不被 bundled 名冲突拦截"
+        );
+
+        // Remove → 删所有可写 scope（真删干净），不 Synthesized。
+        let remove = resolve_write_target(
+            &ConfigEntity::McpServer("audit-mcp".into()),
+            &EditIntent::Remove,
+            &snap,
+            &fx.anchors(),
+            &OPTS,
+        )
+        .unwrap();
+        assert_eq!(
+            remove.len(),
+            3,
+            "同名用户声明删除应产出三条可写 scope 删计划"
+        );
+        let expected_op = WriteTargetOp::Value(mcp_server_write("audit-mcp", WriteValue::Delete));
+        assert!(remove.iter().all(|p| p.op == expected_op));
+    }
+
+    #[test]
+    fn mcp_readonly_origin_with_bundled_name_is_readonly_not_synthesized() {
+        // #126：名字既是**只读 origin**（policy）声明、又命中 ledger bundled 名 → 仍返回 `ReadOnlyOrigin`
+        // （bundled 名冲突不改变错误类型；write_target 完全无视 bundled）。守护「bundled 名不改只读 origin 契约」。
+        let fx = Fixture::new();
+        let managed = fx._tmp.path().join("managed-mcp.json");
+        write(
+            &managed,
+            r#"{"servers": {"audit-mcp": {"type":"stdio","server_parameters":{"command":"p"}}}}"#,
+        );
+        update_installed_plugins(
+            |file| {
+                file.account.plugins.insert(
+                    "plug@mp".into(),
+                    vec![InstalledPluginRecord {
+                        install_path: None,
+                        bundled_mcp_servers: vec!["audit-mcp".into()],
+                        extra: Map::new(),
+                    }],
+                );
+            },
+            Some(&fx.home),
+            None,
+        )
+        .unwrap();
+        // audit-mcp origin=Policy（只读）+ ledger bundled 名。
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&fx.wd),
+            env: Some(&fx.env),
+            home: Some(&fx.home),
+            managed_mcp_path: Some(&managed),
+            ..Default::default()
+        });
+        for intent in [
+            EditIntent::Upsert(json!({"type": "stdio"})),
+            EditIntent::Remove,
+        ] {
             let err = resolve_write_target(
-                &ConfigEntity::McpServer("bundled-srv".into()),
+                &ConfigEntity::McpServer("audit-mcp".into()),
                 &intent,
                 &snap,
                 &fx.anchors(),
@@ -700,10 +817,11 @@ mod tests {
             .unwrap_err();
             assert_eq!(
                 err,
-                WriteTargetError::Synthesized {
-                    entity: "mcp:bundled-srv".into()
+                WriteTargetError::ReadOnlyOrigin {
+                    entity: "mcp:audit-mcp".into(),
+                    origin: ProvenanceScope::Policy,
                 },
-                "bundled server 任何直接写 → Synthesized"
+                "只读 origin + bundled 名 → ReadOnlyOrigin（非 Synthesized）"
             );
         }
     }

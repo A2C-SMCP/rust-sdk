@@ -146,10 +146,12 @@ pub struct McpServerView {
     pub origin: ProvenanceScope,
     /// origin ∈ {user, flag, policy} → 免批准门控 / pre-trusted。
     pub trusted_origin: bool,
-    /// plugin-bundled server（属主 plugin enablement 管、**MUST NOT 走 project 信任门**，§5.10）/ owned by a plugin.
+    /// **信息位**：该 server 名命中某已装插件的 bundled 名集（`bundled_mcp_server_names`，**不分启用态**）。
     ///
-    /// 写目标消解（S2）asset-class-aware 判定的地基：bundled server 无独立可编辑文件 → `Synthesized`。
-    /// 派生自安装账本（`bundled_mcp_server_names`）。
+    /// ⚠️ #126：这**不是** CRUD 权威——凡进 config 快照的 server 必有可编辑声明文件（bundled 配置来自插件安装目录、
+    /// runtime-only 挂载、从不落 `mcp.json`，#122），故名冲突**不代表**"无可编辑文件"。"插件占用同名"的归属门控
+    /// （`Synthesized`）已上移 **Computer 层**（`add_or_update_server`/`remove_server`，**enabled-gated**、与
+    /// `managedBy` 查询同源）；`write_target` 不再读此位。此位仅供客户端提示"名字与某已装插件 bundled server 撞名"。
     pub bundled: bool,
     /// 校验后的 A2C 配置（**含占位符、未渲染**——不解析 `${input:*}`/`${env:*}`、不读 store）/ placeholders unrendered.
     ///
