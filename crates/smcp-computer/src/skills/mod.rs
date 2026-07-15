@@ -34,10 +34,9 @@ pub mod staging;
 pub mod watcher;
 
 pub use naming::{
-    is_valid_skill_name, normalize_mcp_server_segment, parse_skill_name,
-    synthesize_marketplace_name, synthesize_mcp_name, synthesize_name, synthesize_user_name,
-    ParsedSkillName, SkillNameError, SkillNameKind, SkillNameSpec, MAX_SEGMENT_LEN, MCP_SEGMENT,
-    SEPARATOR,
+    is_valid_skill_name, parse_skill_name, synthesize_marketplace_name, synthesize_mcp_name,
+    synthesize_name, synthesize_user_name, ParsedSkillName, SkillNameError, SkillNameKind,
+    SkillNameSpec, MAX_SEGMENT_LEN, MCP_SEGMENT, SEPARATOR,
 };
 
 pub use home::{

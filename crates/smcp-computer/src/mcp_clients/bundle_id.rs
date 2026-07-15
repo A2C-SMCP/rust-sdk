@@ -63,11 +63,12 @@ pub enum BundleIdError {
     },
 }
 
-/// 判定字符是否属 BundleID 字符集 `[A-Za-z0-9_-]`（**显式 ASCII 类**，非 Unicode-aware `\w`）。
-#[inline]
-fn is_bundle_id_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '-'
-}
+/// BundleID 字符集判据——**单一权威**在协议 crate（[`smcp::utils::bundle_id`]），本模块只 re-use。
+///
+/// 不在此另写等价谓词：SKILL 的 mcp `<server>` 段**就是** `bundle_id`（skill.md §1.3），其判据由
+/// `smcp::skill_name` 消费；两处若各写一份，一旦漂移即令合法 `bundle_id` 的 SKILL 对 Agent 隐身
+/// （rust-sdk#127 / python-sdk#142 要消灭的失效模式）。
+use smcp::utils::bundle_id::is_bundle_id_char;
 
 /// Step 1：规范化 `name` → 候选 `bundle_id`（可能为空，空时走 [`derive_bundle_id`] 的 fallback）。
 ///
@@ -177,22 +178,29 @@ pub fn resolve_bundle_id(config: &MCPServerConfig) -> String {
 }
 
 /// 校验**显式** `bundle_id`：非空、无 `__`、字符集 `[A-Za-z0-9_-]`（含 `.` 判为 [`BundleIdError::IllegalChar`]）。
+///
+/// **判决完全委托** [`smcp::utils::bundle_id::is_valid_bundle_id`]（单一权威），本函数**只在已知非法时**
+/// 做结构化**分类**——accept/reject 的边界因此**由构造保证**与 SKILL 侧（`smcp::skill_name` 的 mcp
+/// `<server>` 段）一致，而非靠人同步维护两份规则集。
+///
+/// 曾经的写法是在此重写一遍「非空 + 字符集 + 无 `__`」：彼时与权威等价纯属巧合，协议一旦新增规则（如
+/// 「MUST NOT 以 `-` 开头」）而只改权威，本函数就会在注册边界**放行**、SKILL 层却**判废** → 合法
+/// `bundle_id` 的 SKILL 对 Agent 隐身，即 rust-sdk#127 / python-sdk#142 的失效模式上移一层复发。
 pub fn validate_bundle_id(value: &str) -> Result<(), BundleIdError> {
+    if smcp::utils::bundle_id::is_valid_bundle_id(value) {
+        return Ok(());
+    }
+    // 已知非法 → 仅做结构化分类（分类顺序不影响 accept/reject 判决，判决已由上方权威给出）。
     if value.is_empty() {
         return Err(BundleIdError::Empty);
     }
-    for c in value.chars() {
-        if !is_bundle_id_char(c) {
-            return Err(BundleIdError::IllegalChar {
-                value: value.to_string(),
-                ch: c,
-            });
-        }
+    if let Some(ch) = value.chars().find(|c| !is_bundle_id_char(*c)) {
+        return Err(BundleIdError::IllegalChar {
+            value: value.to_string(),
+            ch,
+        });
     }
-    if value.contains("__") {
-        return Err(BundleIdError::ReservedSeparator(value.to_string()));
-    }
-    Ok(())
+    Err(BundleIdError::ReservedSeparator(value.to_string()))
 }
 
 /// `exposed_tool_name = bundle_id + "__" + (alias ?? original_tool_name)`。
@@ -291,6 +299,41 @@ mod tests {
         assert_eq!(normalize_name("***"), "");
         assert_eq!(normalize_name(""), "");
         assert_eq!(normalize_name("   "), "");
+    }
+
+    /// #127 隔离审查 🟡：`validate_bundle_id`（结构化）与权威 `is_valid_bundle_id`（bool）**判决恒等**。
+    ///
+    /// 前者已委托后者判决、只做分类，故本测试是**防回退网**：若日后有人把规则集重新在此手写一份，
+    /// 语料一旦分歧即红。分歧的真实后果是注册边界放行、SKILL 层判废 → 合法 `bundle_id` 的 SKILL 隐身。
+    #[test]
+    fn validate_bundle_id_verdict_matches_authority_127() {
+        let long = "a".repeat(256);
+        let corpus = [
+            // 合法
+            "tfrobot-tools",
+            "my_api",
+            "MyServer",
+            "bundle_a1b2c3d4e5f60718",
+            "a",
+            "_leading-ok",
+            "trailing-ok_",
+            &long, // 无长度上限
+            // 非法
+            "",
+            "my.api",
+            "a__b",
+            "__lead",
+            "trail__",
+            "服务器",
+            "a b",
+        ];
+        for v in corpus {
+            assert_eq!(
+                validate_bundle_id(v).is_ok(),
+                smcp::utils::bundle_id::is_valid_bundle_id(v),
+                "判决须与权威一致: {v:?}"
+            );
+        }
     }
 
     // ---- derive_bundle_id（缺省生成）----

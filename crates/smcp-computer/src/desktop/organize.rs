@@ -43,12 +43,12 @@ pub fn organize_desktop(
     history: &[ToolCallRecord],
 ) -> Vec<Desktop> {
     // MCP-01：`window://` host **SHOULD** 跨 MCP Server 唯一。冲突仅记 lint-style WARN（不阻塞组织）。
-    // desktop 组织按 MCP Server 名分组、不依赖 host 唯一，故冲突不影响下方逻辑，仅作引导。
+    // desktop 组织按 **bundle_id** 分组、不依赖 host 唯一，故冲突不影响下方逻辑，仅作引导。
     // MCP-01: window:// host SHOULD be unique across MCP servers; collisions only WARN (non-blocking).
     for (host, servers) in detect_host_collisions(&windows) {
         tracing::warn!(
             host = %host,
-            servers = ?servers,
+            bundle_ids = ?servers,
             "window:// host 跨 MCP Server 冲突（SHOULD 唯一，仅 lint 引导，不阻塞）/ \
              window:// host collides across MCP servers (SHOULD be unique; lint-only, non-blocking)"
         );
@@ -165,14 +165,17 @@ pub fn organize_desktop(
 /// 检测跨 MCP Server 的 `window://` host 冲突（MCP-01）/ detect cross-server window:// host collisions。
 ///
 /// host **SHOULD**（非 MUST）跨 MCP Server 唯一（协议 desktop §host）。本函数为**纯检测**：返回被
-/// **≥2 个不同 MCP Server** 暴露的 host 及其 server 名集合（host 升序、server 名升序，稳定输出），由
-/// 调用方据此发 lint-style WARN——**不阻塞**注册/组织。desktop 组织按 MCP Server 名分组、不依赖 host
-/// 唯一，故冲突不影响功能。Rust 侧从未构建 host 反向索引（无 `HostConflictError`/`find_server_by_host`），
-/// 对齐 Python 参考实现「host 唯一性降级为 WARN、移除反向索引」。
+/// **≥2 个不同 MCP Server**（按 **`bundle_id`** 判「不同」）暴露的 host 及其 `bundle_id` 集合（host 升序、
+/// `bundle_id` 升序，稳定输出），由调用方据此发 lint-style WARN——**不阻塞**注册/组织。desktop 组织按
+/// `bundle_id` 分组、不依赖 host 唯一，故冲突不影响功能。Rust 侧从未构建 host 反向索引（无
+/// `HostConflictError`/`find_server_by_host`），对齐 Python 参考实现「host 唯一性降级为 WARN、移除反向索引」。
 ///
-/// Pure detector: returns hosts exposed by ≥2 distinct MCP servers (sorted, stable). Callers emit a
-/// non-blocking lint WARN; desktop organizing groups by server name and does not depend on host
-/// uniqueness. No reverse host index exists (mirrors the Python reference).
+/// **#127**：按 `bundle_id` 而非 display 名去重——两个 display 名相同、`bundle_id` 不同的合法共存 server
+/// 暴露同一 host 时，按名去重会折成一条、`len() > 1` 不成立 → **漏报**该冲突。
+///
+/// Pure detector: returns hosts exposed by ≥2 distinct MCP servers (distinctness by `bundle_id`; sorted,
+/// stable). Callers emit a non-blocking lint WARN; desktop organizing groups by `bundle_id` and does not
+/// depend on host uniqueness. No reverse host index exists (mirrors the Python reference).
 pub(crate) fn detect_host_collisions(windows: &[WindowInfo]) -> Vec<(String, Vec<ServerName>)> {
     use std::collections::BTreeMap;
 
@@ -186,8 +189,8 @@ pub(crate) fn detect_host_collisions(windows: &[WindowInfo]) -> Vec<(String, Vec
             continue;
         };
         let servers = by_host.entry(uri.mcp_id().to_string()).or_default();
-        if !servers.contains(&w.server_name) {
-            servers.push(w.server_name.clone());
+        if !servers.contains(&w.bundle_id) {
+            servers.push(w.bundle_id.clone());
         }
     }
 
@@ -771,6 +774,33 @@ mod tests {
         assert_eq!(collisions[0].0, "shared.app");
         // server 名升序稳定输出
         assert_eq!(collisions[0].1, vec!["serverA", "serverB"]);
+    }
+
+    /// #127 扫漏：host 冲突检测按 **bundle_id** 判「不同 server」，非 display 名。
+    ///
+    /// 两个 display 名相同、`bundle_id` 不同的合法共存 server 暴露同一 host：旧实现按 display 名去重
+    /// 折成一条 → `servers.len() > 1` 不成立 → **漏报**冲突。lint-only 路径，影响为漏诊断而非路由错。
+    #[test]
+    fn detect_host_collisions_distinguishes_by_bundle_id_127() {
+        let mut w1 = create_test_window("x", "window://shared.app/w1", "a", 0, false);
+        w1.server_name = "same-display-name".to_string();
+        w1.bundle_id = "bundle_a".to_string();
+        let mut w2 = create_test_window("x", "window://shared.app/w2", "b", 0, false);
+        w2.server_name = "same-display-name".to_string();
+        w2.bundle_id = "bundle_b".to_string();
+
+        let collisions = detect_host_collisions(&[w1, w2]);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "两个不同 bundle_id 的 server 暴露同一 host 应报冲突（旧实现按 display 名折叠 → 漏报）"
+        );
+        assert_eq!(collisions[0].0, "shared.app");
+        assert_eq!(
+            collisions[0].1,
+            vec!["bundle_a", "bundle_b"],
+            "应以身份键 bundle_id 报告涉事 server"
+        );
     }
 
     #[test]

@@ -174,9 +174,12 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 // 布局助手 / Layout helpers
 // ---------------------------------------------------------------------------
-/// mcp 源安装目录 / mcp-source install dir：`<home>/mcp/<server>/<skill>/`。
-pub fn mcp_skill_dir(home: &Path, server: &str, skill: &str) -> PathBuf {
-    home.join(SOURCE_MCP).join(server).join(skill)
+/// mcp 源安装目录 / mcp-source install dir：`<home>/mcp/<bundle_id>/<skill>/`。
+///
+/// 分组段取 MCP Server 的**唯一身份 `bundle_id`**（#127；协议 skill.md §1.3），非 display `name`——后者
+/// 允许碰撞，会让两个合法共存的同名 server 的 SKILL 落到同一目录、互相覆盖。
+pub fn mcp_skill_dir(home: &Path, bundle_id: &str, skill: &str) -> PathBuf {
+    home.join(SOURCE_MCP).join(bundle_id).join(skill)
 }
 
 /// marketplace 源安装目录 / marketplace-source install dir：`<home>/marketplace/<repo>/<...inner>/`。

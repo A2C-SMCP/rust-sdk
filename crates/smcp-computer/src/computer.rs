@@ -71,9 +71,9 @@ use crate::inputs::{env_var_name, utils::run_command};
 use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{
-        content_as_text, is_call_tool_error, CallToolResult, CancellableCallOutcome, Content,
-        MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification, ReadResourceResult,
-        Resource, Tool,
+        content_as_text, is_call_tool_error, BundleId, CallToolResult, CancellableCallOutcome,
+        Content, MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification,
+        ReadResourceResult, Resource, ServerName, Tool,
     },
     ConfigRender, RenderError,
 };
@@ -300,8 +300,14 @@ pub struct Computer<S: Session> {
     /// 使用 Arc 以便与 Socket.IO 客户端共享
     /// Using Arc to share with Socket.IO client
     inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
-    /// MCP服务器配置映射 / MCP server configurations map (name -> config)
-    mcp_servers: RwLock<HashMap<String, MCPServerConfig>>,
+    /// MCP 服务器配置映射（键 = `bundle_id`，server 唯一身份）/ MCP server configs keyed by bundle_id。
+    ///
+    /// #127：键从 display `name` 改为 `bundle_id`——协议 §身份正交性规定 `name` 允许碰撞、永不做键。
+    /// name-keyed 时两个同名 + 显式不同 `bundle_id` 的合法共存 server 会在此**折叠**（后写覆盖先写），
+    /// 使 `list_mcp_servers` / inventory 归属 / CLI `status` 少一条身份、并令 `server rm <bundle_id>`
+    /// 删错对象。存 **raw** config（保留 `${input:*}` 引用，与落盘一致）；键取 `render_server_config`
+    /// 已 stamp 的值（从 raw 派生，#117：不在此重派生，避免 raw/rendered 连接身份漂移）。
+    mcp_servers: RwLock<HashMap<BundleId, MCPServerConfig>>,
     /// 输入处理器 / Input handler
     input_handler: Arc<RwLock<InputHandler>>,
     /// 自动连接标志 / Auto connect flag
@@ -631,6 +637,16 @@ impl Drop for InflightCancelGuard {
 
 impl<S: Session> Computer<S> {
     /// 创建新的Computer实例 / Create new Computer instance
+    ///
+    /// **`mcp_servers` 入参键被忽略（#127）**：内部投影按 `bundle_id`（server 唯一身份）建键，键由每条
+    /// config **自身**经 `resolve_bundle_id` 派生，**不采信调用方给的键**。历史契约是 `name -> config`，
+    /// 而调用方通常直接从 name-keyed 的 `mcp.json`（协议 §9.1 合法 name-keyed）播种；若原样搬入，键 ≠
+    /// 真身份时（`name` 含 `.`/CJK、或配置显式设了 `bundle_id`）会污染整个投影——`BundleId = String` 是类型
+    /// 别名，编译期无信号。派生而非采信亦与 `boot_up` 一致（它一贯忽略键、只读 config）。
+    ///
+    /// 同一 `bundle_id` 的多条 config 会互相覆盖（入参 `HashMap` 本就无序，无稳定 first-wins 可言）；
+    /// 需要确定性 no-double-open 语义请改走 [`mount_server`](Self::mount_server) 或 boot 后的
+    /// `MCPServerManager::initialize`（按配置顺序 first-wins + 诊断）。
     pub fn new(
         name: impl Into<String>,
         session: S,
@@ -641,7 +657,12 @@ impl<S: Session> Computer<S> {
     ) -> Self {
         let name = name.into();
         let inputs = inputs.unwrap_or_default();
-        let mcp_servers = mcp_servers.unwrap_or_default();
+        // 按 bundle_id 重建键（丢弃调用方键，见上方 rustdoc）。
+        let mcp_servers: HashMap<BundleId, MCPServerConfig> = mcp_servers
+            .unwrap_or_default()
+            .into_values()
+            .map(|cfg| (crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg), cfg))
+            .collect();
 
         // 共享 Arc 句柄先建，供去抖器回调捕获（避免 Computer ↔ debouncer 强引用环）。
         // Pre-create shared handles so debouncer callbacks capture clones, not Computer itself.
@@ -1357,9 +1378,10 @@ impl<S: Session> Computer<S> {
 
     /// 物化 mcp 源 `skill://` → 注册进 Registry（全量 → `mcp:` 源孤儿对账）/ materialize & register mcp-source skills。
     ///
-    /// `server_name` 给定则仅重物化该 server（单 server 重枚举，不对账）；否则全部活跃 server + 孤儿对账
-    /// （本轮未出现的 `mcp:` 源 SKILL → 标孤儿，保留以便 source 回归时恢复）。SKILL Home 未就绪 / 无
-    /// manager → 空列表；staging 失败 → 记 ERROR + 空列表（失败隔离，对标 Python `_restage_mcp_skills`）。
+    /// `bundle_id`（server 唯一身份，**非** display 名——#127）给定则仅重物化该 server（单 server 重枚举，
+    /// 不对账）；否则全部活跃 server + 孤儿对账（本轮未出现的 `mcp:` 源 SKILL → 标孤儿，保留以便 source
+    /// 回归时恢复）。SKILL Home 未就绪 / 无 manager → 空列表；staging 失败 → 记 ERROR + 空列表（失败隔离，
+    /// 对标 Python `_restage_mcp_skills`）。
     /// 由 boot_up 与 MCP `ResourceListChanged`/`ResourceUpdated` 通知处理器（INT-03 #72）触发。
     ///
     /// **持锁语义（#77 两阶段化后）**：`skill_registry` 写锁**不再**跨 `stage_mcp_skills` 的网络 await 持有——
@@ -1374,7 +1396,7 @@ impl<S: Session> Computer<S> {
     /// 使 post-boot 的 governance 路径退化为 `skill_registry.write` → `mcp_manager.read`——与本路径的 `mcp_manager.read`
     /// **读读相容**，不再循环等待（`remove_server` 本就只取 `mcp_manager.read`）。#77 后写锁窗口已收窄到 per-SKILL
     /// finalize。回归见 `tests/mcp_change_notifications.rs` 的并发死锁守卫用例。
-    pub async fn restage_mcp_skills(&self, server_name: Option<&str>) -> Vec<String> {
+    pub async fn restage_mcp_skills(&self, bundle_id: Option<&str>) -> Vec<String> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return Vec::new();
         };
@@ -1384,7 +1406,7 @@ impl<S: Session> Computer<S> {
         };
         // #77：写锁不再跨 materialize 网络持有——stage_mcp_skills 内部按 SKILL 在 finalize 阶段短持写锁。
         // #106：物化 + `mcp:` 源孤儿对账抽为共享自由函数，与 [`McpChangeReactor`] 复用（见 restage_mcp_skills_into）。
-        restage_mcp_skills_into(manager, &self.skill_registry, &home, server_name).await
+        restage_mcp_skills_into(manager, &self.skill_registry, &home, bundle_id).await
     }
 
     /// 直接处理一条 MCP 运行期变化通知（#106）：刷新工具映射 / desktop 集合去抖 / MCP 源 skill 重挂，并触发
@@ -1841,9 +1863,10 @@ impl<S: Session> Computer<S> {
     ///
     /// # Preconditions
     /// 本方法**不执行** §10.6 名称冲突门（install/enable 流程经 [`McpInstallHooks::existing_server_names`] 预检属其职责）。
-    /// **绕过**标准安装/启用路径**直接**驱动本方法者，须自行确保 server 名不与已声明 server 冲突——否则运行期投影
-    /// （name-keyed）会**覆盖**同名条目（仅内存、不落盘、重启即复原，非持久边界击穿）。经 [`McpInstallHooks`] 标准
-    /// 路径挂载（installer 已做冲突门）无此顾虑。
+    /// **绕过**标准安装/启用路径**直接**驱动本方法者，须自行确保不与已声明 server 冲突——#127 起运行期投影按
+    /// **`bundle_id`** 建键，故**同名不再互相覆盖**（display 名可合法碰撞），但**同 `bundle_id`** 仍会覆盖既有条目
+    /// （仅内存、不落盘、重启即复原，非持久边界击穿）；同 `bundle_id` = 同一软件，manager 侧另有 no-double-open
+    /// 约束。经 [`McpInstallHooks`] 标准路径挂载（installer 已做冲突门）无此顾虑。
     ///
     /// # Errors
     /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；运行期物化失败（manager 错）。
@@ -1871,6 +1894,10 @@ impl<S: Session> Computer<S> {
             }
         }
 
+        // 投影键取 `validated` 的身份——`render_server_config` 已从 **raw** 派生并 stamp（#117），故它与
+        // manager 的 `resolve_key` 结果**按构造相同**；不在此重派生，避免 raw/rendered 连接身份漂移。
+        let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&validated);
+
         // 添加到管理器 / Add to manager
         {
             let manager = self.mcp_manager.read().await;
@@ -1879,10 +1906,10 @@ impl<S: Session> Computer<S> {
             }
         }
 
-        // 更新本地配置映射（存原始引用，与落盘一致）/ Update local configuration map
+        // 更新本地配置映射（键 = bundle_id，值存原始引用与落盘一致）/ Update local projection, keyed by bundle_id
         {
             let mut servers = self.mcp_servers.write().await;
-            servers.insert(raw.name().to_string(), raw);
+            servers.insert(bundle_id, raw);
         }
 
         // 工具投影变化 → capability revision +1（§12 R2）。
@@ -1904,35 +1931,53 @@ impl<S: Session> Computer<S> {
     ///
     /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期停摘不改持久 config）。
     ///
+    /// **消歧**：同名多 server 时取字典序最小的 `bundle_id`（确定但任意——`name` 非身份键；调用方需精确
+    /// 寻址应走 [`unmount_server_by_id`](Self::unmount_server_by_id)）。**先解析一次身份**再委托，使 manager
+    /// 与本地投影停摘**同一对象**（#127 前：manager 走 name→bundle_id 桥、投影按 name 直删，二者在同名场景下
+    /// 可能停摘不同的 server）。
+    ///
+    /// **boot 前亦可用**：manager 尚未建时（如 [`Computer::new`] 播种的声明集）回退到本地投影解析身份，与
+    /// [`mount_server`](Self::mount_server) 的 boot 前可挂载对称——否则 boot 前停摘会静默 no-op、`boot_up`
+    /// 照样把该 server 拉起。
+    ///
     /// # Errors
     /// 运行期停摘失败（manager 错）。
     pub async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
-        {
+        // 锁纪律：两把读锁**逐次取、至多同时持一把**（manager 的解析在其 guard 内做完即释放，再取
+        // `mcp_servers`）——不嵌套，避免给「持 `mcp_servers` 写锁再取 manager」的未来调用方留下 ABBA 环。
+        let resolved = {
             let manager = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager {
-                manager.remove_server(server_name).await?;
+            match manager.as_ref() {
+                Some(m) => Some(m.bundle_id_for_name(server_name).await),
+                None => None,
             }
-        }
-
-        // 从本地配置映射移除 / Remove from local configuration map
-        {
-            let mut servers = self.mcp_servers.write().await;
-            servers.remove(server_name);
-        }
-
-        // 工具投影变化 → capability revision +1（§12 R2）。
-        self.status.bump_capability();
-
-        // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
-        let _ = self.emit_update_config().await;
-
-        Ok(())
+        };
+        let bundle_id = match resolved {
+            Some(from_manager) => from_manager,
+            // manager 未建（boot 前）→ 从本地投影按 name 解析；同名取字典序最小，与 manager 的桥同规则。
+            None => {
+                let servers = self.mcp_servers.read().await;
+                let mut matches: Vec<&BundleId> = servers
+                    .iter()
+                    .filter(|(_, cfg)| cfg.name() == server_name)
+                    .map(|(bid, _)| bid)
+                    .collect();
+                matches.sort();
+                matches.first().map(|bid| (*bid).clone())
+            }
+        };
+        // 名称未注册 → 幂等 no-op，与 manager `remove_server` 的缺失键语义一致。
+        let Some(bundle_id) = bundle_id else {
+            return Ok(());
+        };
+        self.unmount_server_by_id(&bundle_id).await
     }
 
     /// 仅运行期停摘 server（**bundle_id 寻址**）/ unmount at runtime only, by bundle_id（#121 B）。
     ///
-    /// [`remove_server`](Self::remove_server) 的运行期臂：按软件唯一身份 `bundle_id` 从 manager（bundle_id-keyed）
-    /// 与本地投影（name-keyed，按 `resolve_bundle_id` 匹配删）双双停摘——无 name→bundle_id 桥的歧义。
+    /// [`remove_server`](Self::remove_server) 与 [`unmount_server`](Self::unmount_server) 的**共用运行期臂**：
+    /// 按软件唯一身份 `bundle_id` 从 manager 与本地投影（#127 起同为 bundle_id-keyed）双双停摘——两侧同键，
+    /// 无 name→bundle_id 桥的歧义。
     pub(crate) async fn unmount_server_by_id(&self, bundle_id: &str) -> ComputerResult<()> {
         {
             let manager = self.mcp_manager.read().await;
@@ -1941,14 +1986,10 @@ impl<S: Session> Computer<S> {
             }
         }
 
-        // 从本地投影移除：投影按 name 键（`mount_rendered` 一贯 name 键），按 `resolve_bundle_id` 匹配删所有命中项。
-        // 注：本地投影按 name 键，两个同名 + 显式不同 bundle_id 的 server 在此会**折叠**（后写覆盖先写）——属既有
-        // name-keying 局限、非本次引入；manager（bundle_id 键）为路由权威、始终正确。删单一身份此处逻辑正确。
+        // 从本地投影移除（键即 bundle_id，直删——无需按 name 扫描/匹配）。
         {
             let mut servers = self.mcp_servers.write().await;
-            servers.retain(|_name, cfg| {
-                crate::mcp_clients::bundle_id::resolve_bundle_id(cfg) != bundle_id
-            });
+            servers.remove(bundle_id);
         }
 
         // 工具投影变化 → capability revision +1（§12 R2）。
@@ -2003,26 +2044,33 @@ impl<S: Session> Computer<S> {
         let ctx = self.instance_config_context(&config_dir, &home, upsert_new_scope);
         let snapshot = load_config(&ctx);
 
-        // #126 归属门控（早于 render/落盘，快速失败）：名字被**启用中**插件占用、且用户在 config 中**无任何声明**
-        // （pure plugin-owned）→ 拒绝直接声明（用户应停用/卸载该 plugin，或经治理 mount 通道，不经此写用户 config）。
-        // 用户**已有**同名声明（origin=Some）则放行——writable 走下方 update_config 编辑其 origin scope、只读 origin
-        // 由 write_target 返回 `ReadOnlyOrigin`。归属集与 `list_mcp_servers_with_metadata`（managedBy）**同源**。
+        // #126 归属门控（早于 render/落盘，快速失败）：该**身份**被**启用中**插件占用、且用户在 config 中
+        // **无同名声明**（pure plugin-owned）→ 拒绝直接声明（用户应停用/卸载该 plugin，或经治理 mount 通道，
+        // 不经此写用户 config）。用户**已有**同名声明（origin=Some）则放行——writable 走下方 update_config
+        // 编辑其 origin scope、只读 origin 由 write_target 返回 `ReadOnlyOrigin`。归属集与
+        // `list_mcp_servers_with_metadata`（managedBy）**同源**。
+        //
+        // #127：占用判定的 join key 由 display 名改为 **`bundle_id`**，与 `remove_server`（#121 起即 bundle_id）
+        // **对称**。协议 §身份正交性：`name` 允许碰撞、非身份；bundled 配置 runtime-only 不落 `mcp.json`（#122）
+        // ⇒ 用户的 `foo`（bundle_id `foo`）与插件 bundled `foo`（显式 bundle_id `plugin-foo`）是**不同软件**、
+        // 可合法共存且无 name-key 冲突，旧的 name-join 拒绝前者属**假阳性**。
+        // 注：`declared_origin` 仍按 name 查——那是 **config-file 域**（`mcp.json` 按协议 §9.1 合法地 name-keyed）。
         let declared_origin = snapshot
             .provenance
             .get(&EntityKey::Mcp(name.clone()))
             .copied();
-        if declared_origin.is_none()
-            && self
-                .enabled_bundled_ownership()
-                .iter()
-                .any(|rec| rec.config.name() == name)
-        {
-            return Err(ComputerError::ConfigPersist(
-                WriteTargetError::Synthesized {
-                    entity: format!("mcp:{name}"),
-                }
-                .to_string(),
-            ));
+        if declared_origin.is_none() {
+            let incoming_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&server);
+            if let Some(rec) = self.enabled_bundled_ownership().into_iter().find(|rec| {
+                crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config) == incoming_id
+            }) {
+                return Err(ComputerError::ConfigPersist(
+                    WriteTargetError::Synthesized {
+                        entity: format!("mcp:{}", rec.config.name()),
+                    }
+                    .to_string(),
+                ));
+            }
         }
 
         // 先 render 校验：非法 config / 无法解析的 input 早失败，**不落盘**（**唯一一次** render，下方物化复用其结果，
@@ -2598,31 +2646,19 @@ impl<S: Session> Computer<S> {
         Ok(history.clone())
     }
 
-    /// 获取服务器状态列表 / Get server status list
-    pub async fn get_server_status(&self) -> Vec<(String, bool, String)> {
+    /// 获取服务器状态列表 `(bundle_id, name, is_active, state)` / Get server status list。
+    ///
+    /// 每行**自带身份键** `bundle_id`（#127）——`remove_server` 按 bundle_id 寻址（协议 §身份：`name` 非
+    /// 身份键），故 client / CLI 直接从本列表拿到寻址键，**无需**再按 name 去 join 另一张映射（旧的
+    /// `materialized_server_bundle_ids` 即为此 join 而设，其 name-keyed map 在同名场景下会折叠身份，
+    /// 令 CLI 给两行打印同一个 bundle_id → `server rm` 删错对象；该 API 随本次修复移除）。
+    pub async fn get_server_status(&self) -> Vec<(BundleId, ServerName, bool, String)> {
         let manager_guard = self.mcp_manager.read().await;
         if let Some(ref manager) = *manager_guard {
             manager.get_server_status().await
         } else {
             Vec::new()
         }
-    }
-
-    /// 运行期已物化 server 的 `name → bundle_id` 映射（#121 B）/ name→bundle_id for materialized servers。
-    ///
-    /// 供 client / CLI 展示软件唯一身份 `bundle_id`——`remove_server` 现按 bundle_id 寻址（协议 §身份，name 非
-    /// 身份键），此映射使调用方从人类可读名找到寻址键。从 raw config `resolve_bundle_id`，与 manager 注册期同键。
-    pub async fn materialized_server_bundle_ids(&self) -> HashMap<String, String> {
-        let servers = self.mcp_servers.read().await;
-        servers
-            .iter()
-            .map(|(name, cfg)| {
-                (
-                    name.clone(),
-                    crate::mcp_clients::bundle_id::resolve_bundle_id(cfg),
-                )
-            })
-            .collect()
     }
 
     // ── #114 S7：runtime status / observability 公开面 / runtime status surface ──────────
@@ -2648,7 +2684,7 @@ impl<S: Session> Computer<S> {
                     .get_server_status()
                     .await
                     .into_iter()
-                    .filter(|(_, active, _)| *active)
+                    .filter(|(_, _, active, _)| *active)
                     .count();
                 // 廉价：读已缓存 tool_mapping 长度，不发 tools/list RPC（🟡 修复：status 不因 MCP server 挂起而阻塞）。
                 let tools = manager.tool_count().await;
@@ -2713,12 +2749,19 @@ impl<S: Session> Computer<S> {
     /// #121 A：以**本实例** env（`config_env`）解析账本 + `enabledPlugins`，绝不混入宿主 ambient settings。**停用的
     /// plugin 不在结果内**（#126 D3：停用插件后同名 server 可自由增删——issue 记录的规避路径）。
     ///
-    /// **join key（#126 有意的非对称）**：`add_or_update_server` 按 **name** 判占用（config 落 `mcp.json` 的 name key、
-    /// 与 `list_mcp_servers_with_metadata` 的 name-join 归属一致，见其「归属 join key = name」限制）；`remove_server` 按
-    /// **bundle_id** 判占用（其公开入参即 bundle_id，#121）。二者仅在「用户声明与某启用插件 bundled server **同名但显式
-    /// 设了不同 `bundle_id`**」这一病态场景分歧——此时 `remove_server(用户自己的 bundle_id)` 放行删**用户自己的**声明
-    /// （更正确），而查询因 name-collision 标 `managedBy=plugin`。这不是 bug（默认 `bundle_id=normalize(name)`，需人为
-    /// 显式差异才触发），彻底 bundle_id 化归属属 #97/#117 的独立议题、不在 #126 范围。
+    /// **join key = `bundle_id`（#127 起对称）**：`add_or_update_server` / `remove_server` /
+    /// `list_mcp_servers_with_metadata` 三者**一律**按软件唯一身份 `bundle_id` 判占用。此前 add 按 name、
+    /// remove 按 bundle_id（#126 记为「有意的非对称」），在「用户声明与某启用插件 bundled server 同名但显式设了
+    /// 不同 `bundle_id`」时自相矛盾：查询标 `managedBy=plugin`（只读）、`remove_server` 却放行。协议 §身份正交性
+    /// 判定该场景下二者是**不同软件**（`name` 允许碰撞、非身份），故统一按 `bundle_id` 判——查询与增删同时正确。
+    ///
+    /// ## 已知限制：`declared_origin` 命中即跳过门控（非本次引入）
+    ///
+    /// `add_or_update_server` 的门控前置条件是「用户在 config 中**无同名声明**」（`declared_origin` 按 **name** 查
+    /// ——那是 config-file 域，`mcp.json` 按协议 §9.1 合法 name-keyed）。故用户**已拥有**名为 `N` 的声明时门控整体
+    /// 跳过，此时可把该声明的 `bundle_id` 改写成某启用插件 bundled server 的身份。该缝隙**旧实现同样放行**（非本次
+    /// 回归），且 bundled 配置 runtime-only、不落 `mcp.json`，冲突止于 manager 注册期的 no-double-open first-wins +
+    /// 本地配置诊断（协议 §config-diagnostics），不击穿持久边界。彻底封堵需让门控同时看「声明的身份变更」，属独立议题。
     fn enabled_bundled_ownership(&self) -> Vec<BundledServerRecord> {
         let home = self.skill_home();
         let env = self.config_env();
@@ -2741,23 +2784,27 @@ impl<S: Session> Computer<S> {
     /// v0.2.3 §4.8（归属 = boot 纯函数、每次可复现；enabled bundled server 进程未拉起也须可查询）。元数据类型
     /// 见 [`crate::inventory`]，**SDK-facing、不进** Agent-facing `client:*` wire。
     ///
-    /// 合并两个来源（去重按 server 名，运行期条目优先）：
+    /// 合并两个来源（去重按 **`bundle_id`**，运行期条目优先）：
     /// 1. 运行期已物化集 `self.mcp_servers`——用户配置 server，或 client 经 `reconcile_governance(hooks)` 物化
-    ///    的 plugin bundled server；名字命中 ledger 派生 bundled 集 → `managedBy=plugin`，否则 `managedBy=user`。
+    ///    的 plugin bundled server；`bundle_id` 命中 ledger 派生 bundled 集 → `managedBy=plugin`，否则 `user`。
     /// 2. ledger 派生的**已启用但尚未物化**的 plugin bundled server（boot `hooks=None` 后即此态）——补入
     ///    inventory 并标 `managedBy=plugin`，满足 §4.8「进程未拉起也可观测」（客户端据此物化或引导 Marketplace）。
     ///
-    /// 结果按 server 名排序（`self.mcp_servers` 为 `HashMap`，排序保证稳定可测输出）。**不**含运行期「进程是否
+    /// 结果按 `(name, bundle_id)` 双键排序（`self.mcp_servers` 为 `HashMap` 且 `name` 现可合法碰撞，故须以身份键
+    /// 兜底 tiebreak 才有稳定可测输出）。**不**含运行期「进程是否
     /// 已启动」状态——那由 [`get_server_status`](Self::get_server_status) 单独提供。
     ///
-    /// ## 归属 join key = server 名（限制与非目标）/ ownership join key = name
+    /// ## 归属 join key = `bundle_id`（#127）/ ownership join key = bundle_id
     ///
-    /// 归属以 **server 名**为唯一 join key：运行期条目名命中 ledger 派生 bundled 集即标 `plugin`。故**同名冲突**
-    /// 会退化——用户配置一个与某启用 plugin bundled server **同名**的 server 会被标 `plugin`（只读）；两个 plugin
-    /// 的同名 bundled server 经首见去重、后者身份不出现。这**符合协议「name = 能力身份」**语义，且**可靠的冲突
-    /// 拦截是安装期职责**（[`install_plugin`](Self::install_plugin) 经 hooks `existing_server_names` 的冲突门），
-    /// **非**本只读投影的职责。#96 pt5「同名返回明确错误」属安装期契约、不在 #97（inventory 查询）范围。调用方若
-    /// 需强冲突保证，应经带 hooks 的安装路径拦截，而非依赖本查询。
+    /// 归属以**软件唯一身份 `bundle_id`** 为 join key（协议 0.3.0 §身份正交性：`name` 是纯 display、允许碰撞、
+    /// **永不做键/寻址**）。故两个 display 名相同、`bundle_id` 不同的 server **各自保留身份**：用户声明的那条标
+    /// `user`（可从 MCP tab 编辑），插件的那条标 `plugin`（只读）——此前的 name-join 会把用户自己的声明误标
+    /// `plugin`（假阳性、只读），且两个 plugin 的同名 bundled server 经首见去重后者身份不出现。
+    ///
+    /// 与 [`add_or_update_server`](Self::add_or_update_server) / [`remove_server`](Self::remove_server) 的门控
+    /// **同源同键**（#126 验收#3）。**可靠的同名冲突拦截仍是安装期职责**（[`install_plugin`](Self::install_plugin)
+    /// 经 hooks `existing_server_names` 的冲突门）——#96 pt5「同名返回明确错误」属安装期契约、不在本只读投影范围；
+    /// 调用方若需强冲突保证，应经带 hooks 的安装路径拦截，而非依赖本查询。
     pub async fn list_mcp_servers_with_metadata(&self) -> Vec<McpServerWithMetadata> {
         // 由 [`BundledServerRecord`] 纯函数派生 `managedBy=plugin`（§4.8.3）。
         let plugin_ownership = |rec: &BundledServerRecord| McpOwnership::Plugin {
@@ -2767,29 +2814,33 @@ impl<S: Session> Computer<S> {
         };
 
         // ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图）。
-        let bundled: HashMap<String, BundledServerRecord> = self
+        // #127：按 **bundle_id** 建索引——归属 join 的键即身份键，与 add/remove 门控同源同键。
+        let bundled: HashMap<BundleId, BundledServerRecord> = self
             .enabled_bundled_ownership()
             .into_iter()
-            .map(|rec| (rec.config.name().to_string(), rec))
+            .map(|rec| {
+                (
+                    crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config),
+                    rec,
+                )
+            })
             .collect();
 
         let mut out: Vec<McpServerWithMetadata> = Vec::new();
-        let mut materialized: HashSet<String> = HashSet::new();
+        let mut materialized: HashSet<BundleId> = HashSet::new();
 
-        // 来源一：运行期已物化 server。命中 ledger bundled 集 → plugin，否则 user。
+        // 来源一：运行期已物化 server。`bundle_id` 命中 ledger bundled 集 → plugin，否则 user。
         {
             let servers = self.mcp_servers.read().await;
-            for (name, cfg) in servers.iter() {
-                materialized.insert(name.clone());
-                let managed_by = match bundled.get(name) {
+            for (bundle_id, cfg) in servers.iter() {
+                materialized.insert(bundle_id.clone());
+                let managed_by = match bundled.get(bundle_id) {
                     Some(rec) => plugin_ownership(rec),
                     None => McpOwnership::User,
                 };
-                // #121 B：暴露 bundle_id（管理/删除寻址键）；从 raw config 派生，与 manager 同键。
-                let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(cfg);
                 out.push(McpServerWithMetadata::new(
-                    name.clone(),
-                    bundle_id,
+                    cfg.name().to_string(),
+                    bundle_id.clone(),
                     cfg.disabled(),
                     managed_by,
                 ));
@@ -2797,19 +2848,24 @@ impl<S: Session> Computer<S> {
         }
 
         // 来源二：已启用但尚未物化的 bundled server（不在运行期集 → 补入，标 plugin；§4.8 可观测）。
-        for (name, rec) in &bundled {
-            if !materialized.contains(name) {
-                let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
+        for (bundle_id, rec) in &bundled {
+            if !materialized.contains(bundle_id) {
                 out.push(McpServerWithMetadata::new(
-                    name.clone(),
-                    bundle_id,
+                    rec.config.name().to_string(),
+                    bundle_id.clone(),
                     rec.config.disabled(),
                     plugin_ownership(rec),
                 ));
             }
         }
 
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        // 按 (name, bundle_id) 排序：`HashMap` 迭代序不定，且 `name` 现可合法碰撞（#127）——须以身份键
+        // 兜底 tiebreak，否则同名两条的相对次序不确定、输出不可测。
+        out.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.bundle_id.cmp(&b.bundle_id))
+        });
         out
     }
 
@@ -2835,8 +2891,17 @@ impl<S: Session> Computer<S> {
         for v in bundled_skills_by_plugin.values_mut() {
             v.sort();
         }
-        let materialized_mcp_servers: std::collections::BTreeSet<String> =
-            self.mcp_servers.read().await.keys().cloned().collect();
+        // 取**展示名**（非投影键 bundle_id）：本集合的唯一消费者是与 ledger `bundled_mcp_servers` 求交集
+        // （`governance::resolve_governance_snapshot`），而那是持久化的 plugin-manifest **名**字段——两侧须同域。
+        // 彻底 bundle_id 化需迁移 ledger 记录格式（跨 SDK 持久化契约），不在 #127 范围；此处仅治理展示、
+        // 不做寻址，故沿用名域。
+        let materialized_mcp_servers: std::collections::BTreeSet<String> = self
+            .mcp_servers
+            .read()
+            .await
+            .values()
+            .map(|cfg| cfg.name().to_string())
+            .collect();
         GovernanceRuntimeOverlay {
             bundled_skills_by_plugin,
             materialized_mcp_servers,
@@ -3344,17 +3409,16 @@ async fn restage_mcp_skills_into(
     manager: &MCPServerManager,
     skill_registry: &Arc<RwLock<SkillRegistry>>,
     home: &std::path::Path,
-    server_name: Option<&str>,
+    bundle_id: Option<&str>,
 ) -> Vec<String> {
-    let registered = match stage_mcp_skills(manager, skill_registry, home, server_name, None).await
-    {
+    let registered = match stage_mcp_skills(manager, skill_registry, home, bundle_id, None).await {
         Ok(names) => names,
         Err(e) => {
             error!(error = %e, "restage_mcp_skills failed (non-blocking)");
             return Vec::new();
         }
     };
-    if server_name.is_none() {
+    if bundle_id.is_none() {
         let present: HashSet<String> = registered.iter().cloned().collect();
         let mut reg = skill_registry.write().await;
         reconcile_orphans_in(&mut reg, &present, |s| s.starts_with("mcp:"));
@@ -3436,21 +3500,23 @@ impl McpChangeReactor {
         }
     }
 
-    async fn on_skills_changed(&self, server: Option<&str>) {
+    /// `bundle_id`（server 唯一身份，非 display 名——#127）给定则仅重挂该 server；None 则全量 + 孤儿对账。
+    async fn on_skills_changed(&self, bundle_id: Option<&str>) {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return;
         };
         if let Some(mgr_cell) = self.manager.upgrade() {
             let guard = mgr_cell.read().await;
             if let Some(mgr) = guard.as_ref() {
-                let _ = restage_mcp_skills_into(mgr, &self.skill_registry, &home, server).await;
+                let _ = restage_mcp_skills_into(mgr, &self.skill_registry, &home, bundle_id).await;
             }
         }
         // 去抖 emit_update_skills（与本地 watcher 路径合流；标脏 → 窗口合并 → 单次 emit）。
         self.skill_debouncer.mark_dirty();
     }
 
-    async fn on_resource_updated(&self, server: &str, uri: &str) {
+    /// `bundle_id` = 通知来源 server 的唯一身份（[`McpServerNotification::server`]，#127）。
+    async fn on_resource_updated(&self, bundle_id: &str, uri: &str) {
         if uri.starts_with("window://") {
             // 内容级更新：直接刷桌面（不比集合，降延迟）；同步刷新集合缓存避免后续集合比较误判。
             if let Some(windows) = self.collect_window_uris().await {
@@ -3458,7 +3524,7 @@ impl McpChangeReactor {
             }
             self.emit_desktop().await;
         } else if uri.starts_with("skill://") {
-            self.on_skills_changed(Some(server)).await;
+            self.on_skills_changed(Some(bundle_id)).await;
         } else {
             debug!(
                 uri,
@@ -4694,6 +4760,70 @@ mod tests {
         assert_eq!(comp.config_revision(), 1, "停用后 add 落盘 bump");
     }
 
+    /// #127 扫漏：归属 join key = **bundle_id**，非 display 名（订正 #126 自陈的「有意非对称」）。
+    ///
+    /// 用户声明一个与某启用插件 bundled server **同名、但显式 `bundle_id` 不同**的 server：二者是**不同软件**
+    /// （协议 §身份正交性：`name` 允许碰撞、`bundle_id` 才是身份），且 bundled 配置 runtime-only、不落
+    /// `mcp.json`（#122）→ 无 name-key 冲突，可合法共存。
+    ///
+    /// 旧的 name-join 把用户自己的声明误标 `managedBy=plugin`（只读）并拒其 `add_or_update_server`
+    /// （`Synthesized`）——**假阳性**；而 `remove_server` 自 #121 起已按 bundle_id 门控 ⇒ 同一场景下
+    /// 「查询说只读、删除却放行」自相矛盾。本测锁定两侧对称，并守护「真同一身份仍被拒」不被过度矫正。
+    #[tokio::test]
+    async fn ownership_gate_joins_by_bundle_id_127() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let env = instance_xdg_env_126(&tmp);
+        let proj = tmp.path().join("proj");
+        let comp = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_env(env.clone())
+            .with_config_dir(&proj);
+
+        seed_user_settings_126(
+            &env,
+            serde_json::json!({ "enabledPlugins": { "audit@acme": true } }),
+        );
+
+        // 前置守卫（不过度矫正）：用户**尚无**同名声明时，**同一身份**（缺省 bundle_id → 派生 == "audit-mcp"）
+        // 仍须被拒——证明门控没被本次改动整体放开。
+        let err = comp
+            .add_or_update_server(user_stdio_server97("audit-mcp"))
+            .await
+            .expect_err("同一 bundle_id = 同一软件，仍应拒");
+        assert!(matches!(err, ComputerError::ConfigPersist(_)));
+        assert_eq!(comp.config_revision(), 0, "拒绝应零落盘");
+
+        // 用户声明：display 名与插件 bundled server 相同，但显式 bundle_id 不同 → 不同软件 → 应放行。
+        let mut own = user_stdio_server97("audit-mcp");
+        if let MCPServerConfig::Stdio(ref mut c) = own {
+            c.bundle_id = Some("user-own-id".to_string());
+        }
+        comp.add_or_update_server(own).await.expect(
+            "同名但 bundle_id 不同 = 不同软件，用户应可声明（旧的 name-join 误拒为 Synthesized）",
+        );
+
+        // 查询侧与门控同源：用户自己的声明标 user（可编辑），插件的仍标 plugin（只读）。
+        let inv = comp.list_mcp_servers_with_metadata().await;
+        let mine = inv
+            .iter()
+            .find(|e| e.bundle_id == "user-own-id")
+            .expect("用户自己的声明应在 inventory 中");
+        assert!(
+            matches!(mine.managed_by, McpOwnership::User),
+            "同名但不同 bundle_id 的用户声明应 user-owned，实得 {:?}",
+            mine.managed_by
+        );
+        let theirs = inv
+            .iter()
+            .find(|e| e.bundle_id == "audit-mcp")
+            .expect("插件 bundled server 仍应可查询（§4.8）");
+        assert!(
+            matches!(theirs.managed_by, McpOwnership::Plugin { .. }),
+            "插件 bundled server 仍应 plugin-owned"
+        );
+    }
+
     /// v0.3.0：uninstall 从 `installedPlugins` 全局意图移除该 pid（改 `home` 内文件，hermetic，非 `~/.config`），
     /// 卸载后 inventory 不再出现其 bundled server。（installed_disabled server 本就不在 inventory；本测聚焦
     /// uninstall 对**安装意图**的移除——v0.3.0 权威 install-set。卸载从未 enable 的 plugin 不触碰 `~/.config`，
@@ -5915,6 +6045,139 @@ mod tests {
         assert!(matches!(err, ComputerError::InvalidState(_)));
     }
 
+    /// #127 扫漏（根因）：`Computer` 的运行期投影 `mcp_servers` 按 **bundle_id** 键，非 display 名。
+    ///
+    /// 两个 display 名相同、`bundle_id` 不同的合法共存 server（协议：`name` 允许碰撞）：旧的 name-keyed
+    /// 投影会**折叠**（后写覆盖先写）→ `list_mcp_servers` 少一条；且 `get_server_status`（Vec，两行都在）
+    /// 与 `materialized_server_bundle_ids`（name-keyed map，折叠）**按名 join** → CLI `status` 给两行打
+    /// 同一个 bundle_id，用户照 `server rm <bundle_id>` 提示操作会**删错 server**，另一个从 CLI 无从寻址。
+    #[tokio::test]
+    async fn runtime_projection_keys_by_bundle_id_127() {
+        use crate::mcp_clients::manager::test_support::stdio_cfg_with_bundle;
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        *computer.mcp_manager.write().await = Some(MCPServerManager::new());
+        computer
+            .mount_server(stdio_cfg_with_bundle("same-display-name", Some("id-a")))
+            .await
+            .unwrap();
+        computer
+            .mount_server(stdio_cfg_with_bundle("same-display-name", Some("id-b")))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            computer.list_mcp_servers().await.len(),
+            2,
+            "两个同名不同 bundle_id 的 server 均须在投影中（旧实现折叠成 1 条）"
+        );
+
+        let mut ids: Vec<String> = computer
+            .list_mcp_servers()
+            .await
+            .iter()
+            .map(crate::mcp_clients::bundle_id::resolve_bundle_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["id-a", "id-b"], "两条身份须各自可辨");
+
+        // status 每行自带身份键 —— CLI 无需再按 name join（那个 join 正是误删的根源）。
+        let mut status = computer.get_server_status().await;
+        status.sort_by(|a, b| a.0.cmp(&b.0));
+        let status_ids: Vec<&str> = status.iter().map(|(bid, ..)| bid.as_str()).collect();
+        assert_eq!(
+            status_ids,
+            vec!["id-a", "id-b"],
+            "status 两行须各自带可寻址的 bundle_id（旧实现两行同一个 id → server rm 删错人）"
+        );
+        for (_, name, ..) in &status {
+            assert_eq!(name, "same-display-name", "展示名保留（display 非身份）");
+        }
+    }
+
+    /// #127 隔离审查 🔴：`Computer::new` 的 `mcp_servers` 入参键**不被采信**，投影键由 config 自身派生。
+    ///
+    /// 外部 embedder 一贯从 name-keyed 的 `mcp.json`（协议 §9.1）播种。若原样搬入 bundle_id-keyed 投影，
+    /// 键 ≠ 真身份时（此处 display 名 `my.api` → 真 bundle_id `my_api`）会全面污染下游：inventory 出线
+    /// **错的** `bundle_id` → 用户拿它 `remove_server` 永不命中、删不掉；归属 join 亦 miss → plugin-owned
+    /// 被误标 `user`。`BundleId = String` 是类型别名 ⇒ 编译期零信号，只能靠本测试守。
+    #[tokio::test]
+    async fn new_rekeys_seeded_projection_by_bundle_id_127() {
+        use crate::mcp_clients::manager::test_support::stdio_cfg_with_bundle;
+
+        // 调用方按旧契约用 display 名作键；`my.api` 的真身份是 `my_api`（缺省生成规范化 `.`→`_`）。
+        let mut seeded = HashMap::new();
+        seeded.insert("my.api".to_string(), stdio_cfg_with_bundle("my.api", None));
+        // 另一条显式 bundle_id ≠ 其 display 名。
+        seeded.insert(
+            "display-name".to_string(),
+            stdio_cfg_with_bundle("display-name", Some("explicit-id")),
+        );
+
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("s"),
+            None,
+            Some(seeded),
+            false,
+            false,
+        );
+
+        let inv = computer.list_mcp_servers_with_metadata().await;
+        let mut ids: Vec<&str> = inv.iter().map(|e| e.bundle_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["explicit-id", "my_api"],
+            "投影键须由 config 派生（`my.api`→`my_api`），而非采信调用方给的 display 名键"
+        );
+        // 出线的 bundle_id 必须真能用于寻址（`remove_server` 按 bundle_id 比对 resolve_bundle_id）。
+        for e in &inv {
+            assert!(
+                computer
+                    .list_mcp_servers()
+                    .await
+                    .iter()
+                    .any(|c| crate::mcp_clients::bundle_id::resolve_bundle_id(c) == e.bundle_id),
+                "inventory 出线的 bundle_id {} 须可寻址到实际 config",
+                e.bundle_id
+            );
+        }
+    }
+
+    /// #127 隔离审查 🟡1：**boot 前** `unmount_server` 仍须真正停摘（manager 未建 → 回退按投影解析身份）。
+    ///
+    /// 与 `mount_server` 的 boot 前可挂载对称。若此路径静默 no-op，`boot_up` 会照样把已被显式停摘的
+    /// server 拉起来。
+    #[tokio::test]
+    async fn unmount_server_works_before_boot_127() {
+        use crate::mcp_clients::manager::test_support::stdio_cfg_with_bundle;
+
+        let mut seeded = HashMap::new();
+        seeded.insert("my.api".to_string(), stdio_cfg_with_bundle("my.api", None));
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("s"),
+            None,
+            Some(seeded),
+            false,
+            false,
+        );
+        // 前置：manager 尚未建（未 boot / 未挂载）。
+        assert!(!computer.is_mcp_manager_initialized().await);
+        assert_eq!(computer.list_mcp_servers().await.len(), 1);
+
+        // 按 display 名停摘（#122 plugin-hook 契约的公开面）→ 投影须真的少一条。
+        computer.unmount_server("my.api").await.unwrap();
+        assert!(
+            computer.list_mcp_servers().await.is_empty(),
+            "boot 前 unmount_server 须真正停摘（否则 boot_up 会把它重新拉起）"
+        );
+
+        // 未注册的名字 → 幂等 no-op，不 panic、不报错。
+        computer.unmount_server("never-declared").await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_restage_mcp_skills_no_home_empty() {
         // 未 boot（skill_home None / 无 manager）→ 空列表，不 panic。
@@ -6007,6 +6270,117 @@ mod tests {
         // 单 server 重物化（server_name=Some）：不做孤儿对账，仍返回该名。
         let again = computer.restage_mcp_skills(Some("tfrobot-tools")).await;
         assert_eq!(again, vec!["mcp:tfrobot-tools:real-name".to_string()]);
+    }
+
+    /// #127 验收：mcp SKILL 的 `name` / `source` / 磁盘落点的 `<server>` 段 = **`bundle_id` 原样**。
+    ///
+    /// 三个 server 覆盖协议 skill.md §1.6 的关键分支，且前两者**故意共用 display 名**（协议：`name`
+    /// 允许碰撞、永不做键）：显式 `bundle_id=acme-editor` / 显式 `bundle_id=id-b` / CJK display 名
+    /// （缺省生成走 `bundle_<16hex>` hash fallback）。三者暴露的 SKILL frontmatter `name` **全为
+    /// `real-name`**——故合成 name 是否碰撞**完全取决于 `<server>` 段取值**，这正是本测试要锁的。
+    ///
+    /// 旧实现取规范化 display 名：前两者撞出同一个 `mcp:same-display-name:real-name`，后到者被
+    /// `seen_this_run` 丢弃 → 一个**合法 SKILL 对 Agent 隐身**；CJK 名则退化成 `mcp:___:real-name`。
+    #[tokio::test]
+    async fn restage_mcp_skills_uses_bundle_id_segment_127() {
+        use crate::mcp_clients::bundle_id::derive_bundle_id;
+        use crate::mcp_clients::manager::test_support::{
+            inject, inject_config, skill_resource_mounted, stdio_cfg_with_bundle, MockSkillClient,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::write(
+            mount.join("SKILL.md"),
+            "---\nname: real-name\ndescription: mounted skill\n---\nbody",
+        )
+        .unwrap();
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        // CJK display 名 → normalize_name 结果为空 → 缺省生成走 sha256 fallback。
+        let cjk_cfg = stdio_cfg_with_bundle("服务器", None);
+        let cjk_bundle = derive_bundle_id(&cjk_cfg);
+        assert!(
+            cjk_bundle.starts_with("bundle_"),
+            "CJK display 名应触发 hash fallback，实得 {cjk_bundle}"
+        );
+
+        let mgr = MCPServerManager::new();
+        for (bundle_id, cfg) in [
+            (
+                "acme-editor".to_string(),
+                stdio_cfg_with_bundle("same-display-name", Some("acme-editor")),
+            ),
+            (
+                "id-b".to_string(),
+                stdio_cfg_with_bundle("same-display-name", Some("id-b")),
+            ),
+            (cjk_bundle.clone(), cjk_cfg),
+        ] {
+            inject_config(&mgr, &bundle_id, cfg).await;
+            inject(
+                &mgr,
+                &bundle_id,
+                MockSkillClient {
+                    pages: vec![vec![skill_resource_mounted(
+                        &format!("skill://h.example.com/{bundle_id}"),
+                        Some("mounted"),
+                        mount.to_str().unwrap(),
+                    )]],
+                    fail: false,
+                    cap_fail: false,
+                    read_text: String::new(),
+                },
+            )
+            .await;
+        }
+        *computer.mcp_manager.write().await = Some(mgr);
+
+        let mut registered = computer.restage_mcp_skills(None).await;
+        registered.sort();
+        assert_eq!(
+            registered,
+            vec![
+                "mcp:acme-editor:real-name".to_string(),
+                format!("mcp:{cjk_bundle}:real-name"),
+                "mcp:id-b:real-name".to_string(),
+            ],
+            "三个 server 的 SKILL 均须可见：`<server>` 段取 bundle_id 后构造上不碰撞"
+        );
+
+        // source 与磁盘落点同取 bundle_id：两个同名 server 的 staged 目录不再互相覆盖。
+        let skills = computer.get_skills().await;
+        for bundle_id in ["acme-editor", "id-b", cjk_bundle.as_str()] {
+            let name = format!("mcp:{bundle_id}:real-name");
+            let r = skills
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} 应对 Agent 可见"));
+            assert_eq!(r.source, format!("mcp:{bundle_id}"));
+            assert!(
+                r.path.ends_with(&format!("mcp/{bundle_id}/real-name")),
+                "磁盘落点应按 bundle_id 分组，实得 {}",
+                r.path
+            );
+        }
+
+        // 定向重挂按 bundle_id 寻址；display 名不再是寻址键。
+        assert_eq!(
+            computer.restage_mcp_skills(Some("acme-editor")).await,
+            vec!["mcp:acme-editor:real-name".to_string()]
+        );
+        assert!(
+            computer
+                .restage_mcp_skills(Some("same-display-name"))
+                .await
+                .is_empty(),
+            "display 名非寻址键，不应命中任何 server"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

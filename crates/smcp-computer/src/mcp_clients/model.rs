@@ -47,23 +47,27 @@ pub enum McpChangeKind {
     ResourceUpdated { uri: String },
 }
 
-/// 携带来源 server 名的 MCP 变化通知 / An MCP change notification tagged with its origin server。
+/// 携带来源 server 身份的 MCP 变化通知 / An MCP change notification tagged with its origin server。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerNotification {
-    /// 触发变化的 MCP Server 逻辑名（manager 映射的 key）/ logical server name。
-    pub server: ServerName,
+    /// 触发变化的 MCP Server 唯一身份 `bundle_id`（= manager 各映射的键）/ origin server's bundle_id。
+    ///
+    /// #127：改携 `bundle_id`（此前为 display 名，且注释误称其为「manager 映射的 key」——manager 的键
+    /// 一直是 `bundle_id`）。定向重挂（`resources/updated{skill://…}` → 单 server restage）据此寻址；
+    /// 用 display 名则同名 server 之间无从区分。
+    pub server: BundleId,
     /// 变化种类 / change kind。
     pub kind: McpChangeKind,
 }
 
 /// 注入给单个 MCP 客户端的通知上报接缝（#106）/ per-client notification-forwarding seam。
 ///
-/// `client_factory` 在创建客户端时注入：`server_name` 让客户端能给通知打上来源标签（客户端本身不知道自己
-/// 的逻辑名——见 [`super::utils::client_factory`]），`tx` 是喂给 Computer 单消费者任务的发送端。
+/// `client_factory` 在创建客户端时注入：`bundle_id` 让客户端能给通知打上来源标签（客户端本身不知道自己
+/// 的身份——见 [`super::utils::client_factory`]），`tx` 是喂给 Computer 单消费者任务的发送端。
 #[derive(Debug, Clone)]
 pub struct ClientNotifyCtx {
-    /// 该客户端对应的 MCP Server 逻辑名 / this client's logical server name。
-    pub server_name: ServerName,
+    /// 该客户端对应的 MCP Server 唯一身份 `bundle_id`（#127；非 display 名）/ this client's bundle_id。
+    pub bundle_id: BundleId,
     /// 变化通知发送端（Computer 侧持有接收端）/ change-notification sender。
     pub tx: mpsc::UnboundedSender<McpServerNotification>,
 }
@@ -72,7 +76,7 @@ impl ClientNotifyCtx {
     /// 构造一条 [`McpServerNotification`] 并非阻塞发送（channel 关闭时静默丢弃）/ build & send, drop on closed。
     pub fn notify(&self, kind: McpChangeKind) {
         let _ = self.tx.send(McpServerNotification {
-            server: self.server_name.clone(),
+            server: self.bundle_id.clone(),
             kind,
         });
     }

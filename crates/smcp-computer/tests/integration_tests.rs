@@ -94,18 +94,19 @@ async fn test_complete_workflow() {
     sleep(Duration::from_millis(200)).await;
 
     // 7. 检查运行状态 / Check running status
+    // #127：get_server_status 现出 (bundle_id, name, is_active, state)——`.1` 是展示名、`.2` 是活跃标志。
     let status = manager.get_server_status().await;
     let calc_status = status
         .iter()
-        .find(|(name, _, _)| name == "calculator_server")
+        .find(|(_, name, _, _)| name == "calculator_server")
         .unwrap();
-    assert!(calc_status.1); // calculator_server 应该已激活 / calculator_server should be active
+    assert!(calc_status.2); // calculator_server 应该已激活 / calculator_server should be active
 
     let http_status = status
         .iter()
-        .find(|(name, _, _)| name == "http_server")
+        .find(|(_, name, _, _)| name == "http_server")
         .unwrap();
-    assert!(!http_status.1); // http_server 应该未激活（被禁用）/ http_server should not be active (disabled)
+    assert!(!http_status.2); // http_server 应该未激活（被禁用）/ http_server should not be active (disabled)
 
     // 8. 停止所有服务器 / Stop all servers
     let result = manager.stop_all().await;
@@ -113,7 +114,7 @@ async fn test_complete_workflow() {
 
     // 9. 检查最终状态 / Check final status
     let status = manager.get_server_status().await;
-    for (_, active, _) in status {
+    for (_, _, active, _) in status {
         assert!(!active); // 所有服务器都应该未激活 / All servers should be inactive
     }
 

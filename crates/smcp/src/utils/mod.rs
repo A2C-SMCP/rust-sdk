@@ -1,7 +1,9 @@
 //! 基础设施工具 / Infrastructure utilities（治理层 SET/SKL 共用）。
 //!
 //! `{atomic_io,env,path}` 为纯 std（+ `uuid`）实现，无协议依赖：原子写、XDG 优先路径解析、
-//! 路径包含判定、环境变量真值判定。`mime` 为纯静态表（无依赖）：确定性扩展名→MIME + 文本性判据
+//! 路径包含判定、环境变量真值判定。`bundle_id` 为纯静态判据（无依赖）：BundleID 字符集/合法性
+//! **单一权威**（§BundleID，`smcp-computer` 注册边界与本 crate SKILL 命名共用）。
+//! `mime` 为纯静态表（无依赖）：确定性扩展名→MIME + 文本性判据
 //! （§6.4，Computer 铸造 / Agent drain 共用单一权威）。`handshake` 复用协议类型；`blob` 引入
 //! `base64` / `sha2` / `futures`（分块拉取 + 完整性自证 + 并发）。对标 Python 参考实现 /
 //! mirrors the Python reference: `a2c_smcp/utils/{atomic_io,env,path,mime,blob}.py`。
@@ -11,6 +13,7 @@
 
 pub mod atomic_io;
 pub mod blob;
+pub mod bundle_id;
 pub mod env;
 pub mod handshake;
 pub mod hash;
@@ -23,6 +26,7 @@ pub use blob::{
     drain_blob, drain_blob_sync, BlobChunkRequest, BlobErrorReason, BlobTransferError,
     DrainBlobOptions, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_RETRIES,
 };
+pub use bundle_id::{is_bundle_id_char, is_valid_bundle_id};
 pub use env::{env_truthy, env_truthy_in, env_truthy_or, is_truthy};
 pub use handshake::{
     apply_polling_first_guard, build_handshake_url, build_protocol_version_error,

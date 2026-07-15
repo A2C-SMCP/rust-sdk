@@ -86,14 +86,14 @@ impl ClientHandler for A2cClientHandler {
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         if let Some(n) = &self.notify {
-            debug!(server = %n.server_name, "MCP tools/list_changed received");
+            debug!(bundle_id = %n.bundle_id, "MCP tools/list_changed received");
             n.notify(McpChangeKind::ToolListChanged);
         }
     }
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
         if let Some(n) = &self.notify {
-            debug!(server = %n.server_name, "MCP resources/list_changed received");
+            debug!(bundle_id = %n.bundle_id, "MCP resources/list_changed received");
             n.notify(McpChangeKind::ResourceListChanged);
         }
     }
@@ -104,7 +104,7 @@ impl ClientHandler for A2cClientHandler {
         _context: NotificationContext<RoleClient>,
     ) {
         if let Some(n) = &self.notify {
-            debug!(server = %n.server_name, uri = %params.uri, "MCP resources/updated received");
+            debug!(bundle_id = %n.bundle_id, uri = %params.uri, "MCP resources/updated received");
             n.notify(McpChangeKind::ResourceUpdated { uri: params.uri });
         }
     }

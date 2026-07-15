@@ -449,6 +449,6 @@ async fn test_auto_reconnect_semantics() {
 
     // 验证配置已更新（通过get_server_status间接验证）
     let status = manager.get_server_status().await;
-    let test_server = status.iter().find(|(name, _, _)| name == "test");
+    let test_server = status.iter().find(|(_, name, _, _)| name == "test");
     assert!(test_server.is_some());
 }

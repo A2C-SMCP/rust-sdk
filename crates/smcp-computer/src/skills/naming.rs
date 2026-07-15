@@ -29,9 +29,9 @@
 // 协议级 lexer / 合成 / 错误类型——单点 re-export，Computer 子系统经此统一引入。
 // Protocol-level lexer / synthesis / error types — re-exported as the subsystem's single import face.
 pub use smcp::skill_name::{
-    is_valid_skill_name, normalize_mcp_server_segment, parse_skill_name,
-    synthesize_marketplace_name, synthesize_mcp_name, synthesize_user_name, ParsedSkillName,
-    SkillNameError, SkillNameKind, MAX_SEGMENT_LEN, MCP_SEGMENT, SEPARATOR,
+    is_valid_skill_name, parse_skill_name, synthesize_marketplace_name, synthesize_mcp_name,
+    synthesize_user_name, ParsedSkillName, SkillNameError, SkillNameKind, MAX_SEGMENT_LEN,
+    MCP_SEGMENT, SEPARATOR,
 };
 
 /// Computer 侧 source → name 合成输入 / Computer-side source spec for name synthesis。
@@ -53,10 +53,10 @@ pub enum SkillNameSpec<'a> {
         /// leaf skill 段（严格 kebab）。
         skill: &'a str,
     },
-    /// mcp 源：3 段 `mcp:<server>:<skill>`（`server` 合成前先经 [`normalize_mcp_server_segment`]）。
+    /// mcp 源：3 段 `mcp:<bundle_id>:<skill>`（skill.md §1.3：`<server>` 段 = `bundle_id` **原样**）。
     Mcp {
-        /// MCP server 段（合成时规范化为 `[A-Za-z0-9_-]`）。
-        server: &'a str,
+        /// MCP Server 的 `bundle_id`（唯一身份，**原样**进段、不规范化；**非** display 名）。
+        bundle_id: &'a str,
         /// leaf skill 段（严格 kebab）。
         skill: &'a str,
     },
@@ -80,13 +80,13 @@ impl SkillNameSpec<'_> {
 /// sources **MUST** 经此函数生成 name，而非手工拼接，以保证与协议 lexer 单一事实源对齐。
 ///
 /// # Errors
-/// 任一段不符协议字符集（严格 kebab；或 mcp `<server>` 规范化后为空 / 越界）时返回 [`SkillNameError`]
-/// （映射协议 `4016`）。
+/// 任一段不符协议字符集（严格 kebab；或 mcp `<server>` 段非合法 `bundle_id` 字符集 / 越界）时返回
+/// [`SkillNameError`]（映射协议 `4016`）。
 pub fn synthesize_name(spec: SkillNameSpec<'_>) -> Result<String, SkillNameError> {
     match spec {
         SkillNameSpec::User { skill } => synthesize_user_name(skill),
         SkillNameSpec::Marketplace { plugin, skill } => synthesize_marketplace_name(plugin, skill),
-        SkillNameSpec::Mcp { server, skill } => synthesize_mcp_name(server, skill),
+        SkillNameSpec::Mcp { bundle_id, skill } => synthesize_mcp_name(bundle_id, skill),
     }
 }
 
@@ -128,16 +128,28 @@ mod tests {
                 skill: "audit",
             },
             Case {
-                // server 含点/空格 → 规范化为下划线。
+                // mcp `<server>` 段 = bundle_id 原样（skill.md §1.6：display 名 `my.api` 的缺省生成结果）。
                 spec: SkillNameSpec::Mcp {
-                    server: "my.api server",
+                    bundle_id: "my_api",
                     skill: "csv-aggregator",
                 },
-                name: "mcp:my_api_server:csv-aggregator",
+                name: "mcp:my_api:csv-aggregator",
                 kind: SkillNameKind::Mcp,
                 plugin: None,
-                server: Some("my_api_server"),
+                server: Some("my_api"),
                 skill: "csv-aggregator",
+            },
+            Case {
+                // hash-fallback 情形（CJK display 名）：不透明 bundle_id 同样原样进段。
+                spec: SkillNameSpec::Mcp {
+                    bundle_id: "bundle_a1b2c3d4e5f60718",
+                    skill: "summarize",
+                },
+                name: "mcp:bundle_a1b2c3d4e5f60718:summarize",
+                kind: SkillNameKind::Mcp,
+                plugin: None,
+                server: Some("bundle_a1b2c3d4e5f60718"),
+                skill: "summarize",
             },
         ];
         for c in cases {
@@ -154,7 +166,7 @@ mod tests {
         }
     }
 
-    /// 非法段（严格 kebab 违例 / mcp server 规范化后越界）→ 合成失败并映射 4016。
+    /// 非法段（严格 kebab 违例 / mcp `<server>` 非合法 bundle_id 字符集）→ 合成失败并映射 4016。
     #[test]
     fn test_synthesize_name_rejects_invalid_segments_maps_4016() {
         let invalid = [
@@ -171,11 +183,15 @@ mod tests {
                 skill: "Audit",
             }, // skill 非 kebab
             SkillNameSpec::Mcp {
-                server: "",
+                bundle_id: "",
                 skill: "ok",
-            }, // server 规范化后为空
+            }, // `<server>` 段为空（合法 bundle_id 恒非空，故此仅挡调用方错误）
             SkillNameSpec::Mcp {
-                server: "srv",
+                bundle_id: "my.api",
+                skill: "ok",
+            }, // 传了 display 名而非 bundle_id（含 `.` → 越界，不再被静默规范化）
+            SkillNameSpec::Mcp {
+                bundle_id: "srv",
                 skill: "Bad",
             }, // skill 非 kebab
         ];

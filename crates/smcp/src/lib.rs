@@ -7,9 +7,8 @@ pub mod utils;
 /// SKILL name 解析与合成（段数消歧 lexer）/ SKILL name parse & synthesis (segment-count lexer)。
 pub mod skill_name;
 pub use skill_name::{
-    is_valid_skill_name, normalize_mcp_server_segment, parse_skill_name,
-    synthesize_marketplace_name, synthesize_mcp_name, synthesize_user_name, ParsedSkillName,
-    SkillNameError, SkillNameKind,
+    is_valid_skill_name, parse_skill_name, synthesize_marketplace_name, synthesize_mcp_name,
+    synthesize_user_name, ParsedSkillName, SkillNameError, SkillNameKind,
 };
 
 /// 协议版本解析与兼容性判定 / Protocol version parse & compatibility。

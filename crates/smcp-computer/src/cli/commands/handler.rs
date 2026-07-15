@@ -112,23 +112,22 @@ impl CommandHandler {
             let server_status = self.computer.get_server_status().await;
             let active_count = server_status
                 .iter()
-                .filter(|(_, active, _)| *active)
+                .filter(|(_, _, active, _)| *active)
                 .count();
 
             println!("  MCP Manager: 已初始化 / Initialized");
             println!("  Active Servers: {}", active_count);
 
-            // #121 B：一并展示 bundle_id（软件唯一身份）——`server rm` 现按 bundle_id 寻址。
-            let bundle_ids = self.computer.materialized_server_bundle_ids().await;
-
-            // 显示每个服务器的状态
-            for (name, active, state) in server_status {
+            // #121 B：一并展示 bundle_id（软件唯一身份）——`server rm` 按 bundle_id 寻址。
+            // #127：`bundle_id` 随 `get_server_status` 每行同源直出，**不再**按 name join 另一张映射——
+            // 那张映射是 name-keyed 的，同名 server 会折叠，导致两行打印同一个 bundle_id、用户按提示
+            // `server rm <bundle_id>` 删错对象且另一条从 CLI 完全无法寻址。
+            for (bundle_id, name, active, state) in server_status {
                 let status = if active {
                     "运行中 / Running"
                 } else {
                     "已停止 / Stopped"
                 };
-                let bundle_id = bundle_ids.get(&name).map(String::as_str).unwrap_or("-");
                 println!("    - {name} [bundle_id={bundle_id}]: {status} ({state})");
             }
 

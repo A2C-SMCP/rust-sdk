@@ -49,9 +49,14 @@ pub struct ExposedToolRoute {
 /// MCP服务器管理器 / MCP server manager
 ///
 /// **身份键 = `bundle_id`（协议 0.3.0，rust-sdk#117）**：`servers_config` / `active_clients` / `retry_counts`
-/// 均以 [`BundleId`] 为键（no-double-open 去重、同名跨源 server 共存）。公开生命周期方法仍以**人类可读名**
-/// 寻址（`bundle_id` 由 [`bundle_id`](super::bundle_id) 在管理器内**从所持 config 计算一次**——避免 raw/rendered
-/// 连接身份漂移致的 bundle_id 不一致），desktop `window://` / skill `skill://` 路径仍以 server 名对外（不受 #117 改动）。
+/// 均以 [`BundleId`] 为键（no-double-open 去重、同名跨源 server 共存）。公开生命周期方法（`start_client` /
+/// `stop_client` / `get_window_detail` 等）仍以**人类可读名**寻址、内部经 [`bundle_id_for_name`](Self::bundle_id_for_name)
+/// 解析（`bundle_id` 由 [`bundle_id`](super::bundle_id) 在管理器内**从所持 config 计算一次**——避免 raw/rendered
+/// 连接身份漂移致的 bundle_id 不一致）。
+///
+/// **对外标识一律 `bundle_id`**：desktop `window://` 分组（#118）与 skill `skill://` 枚举/物化（#127）均以
+/// `bundle_id` 标注——协议 §身份正交性规定 `name` 是纯 display、允许碰撞、永不做键。唯一仍与 `bundle_id`
+/// **正交**的是 `window://` / `skill://` URI 里的 **host** 段：它由 MCP Server 自选，A2C 透传不解释。
 pub struct MCPServerManager {
     /// 服务器配置映射（键 = `bundle_id`）/ Server configuration mapping keyed by bundle_id。
     servers_config: Arc<RwLock<HashMap<BundleId, MCPServerConfig>>>,
@@ -155,13 +160,15 @@ impl MCPServerManager {
     }
 
     /// 为指定 server 构造通知上报接缝（发送端已注入时）/ build a per-client notify seam if a sender is set。
-    async fn notify_ctx_for(&self, server_name: &str) -> Option<ClientNotifyCtx> {
+    ///
+    /// 以 `bundle_id`（server 唯一身份）打来源标签（#127）——消费侧的定向重挂据此寻址。
+    async fn notify_ctx_for(&self, bundle_id: &str) -> Option<ClientNotifyCtx> {
         self.change_tx
             .read()
             .await
             .as_ref()
             .map(|tx| ClientNotifyCtx {
-                server_name: server_name.to_string(),
+                bundle_id: bundle_id.to_string(),
                 tx: tx.clone(),
             })
     }
@@ -194,7 +201,7 @@ impl MCPServerManager {
     /// 最小**的 `bundle_id`——**跨运行确定**（此前 `HashMap.find` 迭代序不确定，协议 §身份「name 永不做键」告警的
     /// 正是此非确定性）；命中多个时 WARN 提示以唯一 `bundle_id` 消歧。销毁性操作（`remove_server`）应改走
     /// `remove_server_by_id` 直接按 `bundle_id` 寻址，不经本桥。
-    async fn bundle_id_for_name(&self, server_name: &str) -> Option<BundleId> {
+    pub(crate) async fn bundle_id_for_name(&self, server_name: &str) -> Option<BundleId> {
         let configs = self.servers_config.read().await;
         let mut matches: Vec<&BundleId> = configs
             .iter()
@@ -426,8 +433,8 @@ impl MCPServerManager {
             }
         }
 
-        // 创建客户端（注入通知上报接缝，用 server **名**打来源标签——desktop/skill 路径以名寻址，#106）。
-        let notify = self.notify_ctx_for(&server_name).await;
+        // 创建客户端（注入通知上报接缝，用 **bundle_id** 打来源标签——消费侧定向重挂按身份寻址，#106/#127）。
+        let notify = self.notify_ctx_for(bundle_id).await;
         let client = client_factory(config, notify);
 
         // 连接服务器 / Connect to server
@@ -909,11 +916,13 @@ impl MCPServerManager {
             .await
     }
 
-    /// 获取服务器状态列表 / Get server status list
+    /// 获取服务器状态列表 `(bundle_id, name, is_active, state)` / Get server status list。
     ///
-    /// 输出以**人类可读名**（`config.name()`）为对外标识（非身份键 `bundle_id`）——身份键仅用于内部按键索引
-    /// `active_clients`（协议 0.3.0，rust-sdk#117）。
-    pub async fn get_server_status(&self) -> Vec<(String, bool, String)> {
+    /// **每行自带身份键（#127）**：`.0` = `bundle_id`（唯一身份、寻址键），`.1` = display 名（人类可读、
+    /// 可碰撞、非身份）。此前只出 name，调用方（CLI `status`）须再按 name 去 join 一张 name-keyed 的
+    /// bundle_id 映射——同名 server 在那张映射里折叠，导致两行打印**同一个** `bundle_id`、用户按
+    /// `server rm <bundle_id>` 删错对象。同源直出即消除该 join。
+    pub async fn get_server_status(&self) -> Vec<(BundleId, ServerName, bool, String)> {
         let configs = self.servers_config.read().await;
         let clients = self.active_clients.read().await;
 
@@ -929,7 +938,12 @@ impl MCPServerManager {
                 } else {
                     "pending".to_string()
                 };
-                (config.name().to_string(), is_active, state)
+                (
+                    bundle_id.clone(),
+                    config.name().to_string(),
+                    is_active,
+                    state,
+                )
             })
             .collect()
     }
@@ -1112,10 +1126,10 @@ impl MCPServerManager {
         tools
     }
 
-    /// 活动客户端快照，附各 server **人类可读名**（active_clients 键为 `bundle_id`，desktop/skill 对外以名标识）。
-    /// Snapshot of active clients tagged with each server's human-readable name（active_clients keyed by bundle_id）。
+    /// 活动客户端快照，附各 server **人类可读名**（`active_clients` 键为 `bundle_id`）/ snapshot tagged with names。
     ///
-    /// desktop `window://` / skill `skill://` 资源标识用 server 名（不受 #117 改动）；本 helper 把身份键映射回名。
+    /// 仅供**需要展示名**的场合（如 `get_windows_details` 的 `.1`、诊断日志）——身份/分组/寻址一律用
+    /// `bundle_id`，**勿**用本 helper 的名做键（协议 §身份正交性：`name` 允许碰撞）。
     /// 极端情况下（config 已移除但 client 尚存）回退用 `bundle_id` 作名。
     async fn active_clients_by_name(&self) -> Vec<(ServerName, StdArc<dyn MCPClientProtocol>)> {
         let clients = self.active_clients.read().await;
@@ -1172,17 +1186,23 @@ impl MCPServerManager {
     /// Unlike `list_resources_page` (single-page, Agent-driven): Computer-driven SKILL materialization needs
     /// the full `skill://` set, so pages are exhausted here. Servers lacking `resources` or erroring are skipped.
     ///
-    /// `server_name` 给定则仅枚举该 server（用于 ResourceListChanged 单 server 重枚举）。
-    pub async fn list_skill_resources(
-        &self,
-        server_name: Option<&str>,
-    ) -> Vec<(ServerName, Resource)> {
-        // 以**人类可读名**过滤/标注（skill:// URI 用 server 名，不受 #117 改动）。
-        let clients: Vec<(String, StdArc<dyn MCPClientProtocol>)> = self
-            .active_clients_by_name()
+    /// `bundle_id` 给定则仅枚举该 server（用于 ResourceListChanged 单 server 重枚举）。
+    ///
+    /// **协议 0.3.0 §身份正交性（#127）**：标注与过滤均用 `bundle_id`（`active_clients` 键，server 唯一
+    /// 身份），**不经 name 解析**——mcp 形态 SKILL 的 name / `source` / 磁盘落点全部由它构成（skill.md
+    /// §1.3），退回 display 名会让两个同名 server 撞名、令其一的 SKILL 隐身。对齐 [`list_resources`] 的
+    /// bundle_id 直查先例。
+    ///
+    /// [`list_resources`]: Self::list_resources
+    pub async fn list_skill_resources(&self, bundle_id: Option<&str>) -> Vec<(BundleId, Resource)> {
+        // bundle_id 直查/过滤 active_clients（身份键 == 键，不经 name 解析）。
+        let clients: Vec<(BundleId, StdArc<dyn MCPClientProtocol>)> = self
+            .active_clients
+            .read()
             .await
-            .into_iter()
-            .filter(|(name, _)| server_name.is_none() || server_name == Some(name.as_str()))
+            .iter()
+            .filter(|(bid, _)| bundle_id.is_none() || bundle_id == Some(bid.as_str()))
+            .map(|(bid, client)| (bid.clone(), client.clone()))
             .collect();
 
         let mut results = Vec::new();
@@ -1315,28 +1335,41 @@ impl MCPServerManager {
         results
     }
 
-    /// 获取单个窗口资源的详情 / Get detail of a single window resource
-    /// 通过 server_name 定位客户端，委托调用 get_window_detail
-    /// Locates client by server_name and delegates to get_window_detail
-    pub async fn get_window_detail(
+    /// 读取指定 server 的单个资源（**`bundle_id` 直查**，通用 `resources/read`）/ read a resource by bundle_id。
+    ///
+    /// 身份键直查 `active_clients`、**不经 name 解析**——[`get_window_detail`](Self::get_window_detail)
+    /// （name 寻址公开面）与 [`SkillResourceManager::read_resource`]（#127 起 bundle_id 寻址）共用本实现，
+    /// 避免两条读路径分叉。
+    async fn read_resource_by_id(
         &self,
-        server_name: &str,
+        bundle_id: &str,
         resource: Resource,
     ) -> Result<ReadResourceResult, ComputerError> {
-        // 名称寻址：解析为身份键后取 client（window:// URI 用 server 名）。
         let client = {
-            let bundle_id = self.active_client_key(server_name).await.ok_or_else(|| {
-                ComputerError::InvalidState(format!("Server '{}' not connected", server_name))
-            })?;
             let clients = self.active_clients.read().await;
-            clients.get(&bundle_id).cloned().ok_or_else(|| {
-                ComputerError::InvalidState(format!("Server '{}' not connected", server_name))
+            clients.get(bundle_id).cloned().ok_or_else(|| {
+                ComputerError::InvalidState(format!("Server '{}' not connected", bundle_id))
             })?
         };
         client
             .get_window_detail(resource)
             .await
             .map_err(|e| ComputerError::ProtocolError(format!("Get window detail error: {}", e)))
+    }
+
+    /// 获取单个窗口资源的详情 / Get detail of a single window resource
+    ///
+    /// **名称寻址**公开面（`window://` 通道沿用 display 名寻址，内部解析为身份键后委托
+    /// [`read_resource_by_id`](Self::read_resource_by_id)）。
+    pub async fn get_window_detail(
+        &self,
+        server_name: &str,
+        resource: Resource,
+    ) -> Result<ReadResourceResult, ComputerError> {
+        let bundle_id = self.active_client_key(server_name).await.ok_or_else(|| {
+            ComputerError::InvalidState(format!("Server '{}' not connected", server_name))
+        })?;
+        self.read_resource_by_id(&bundle_id, resource).await
     }
 
     /// 合并工具元数据 / Merge tool metadata
@@ -1562,11 +1595,18 @@ impl MCPServerManager {
 
     /// 检查所有服务器的健康状态 / Check health of all servers
     ///
-    /// 返回 map 以**人类可读名**为键（非身份键 `bundle_id`），与 [`get_server_status`](Self::get_server_status) 一致。
-    pub async fn check_all_health(&self) -> HashMap<String, HealthCheckResult> {
+    /// 返回 map 以**身份键 `bundle_id`** 为键（#127；此前为 display 名——同名 server 会在 map 里折叠、
+    /// **丢一条**健康结果，令不健康者被同名健康者静默掩盖）。
+    pub async fn check_all_health(&self) -> HashMap<BundleId, HealthCheckResult> {
         let mut results = HashMap::new();
-        // 以 (name, client) 快照迭代——键用展示名而非 bundle_id。
-        let clients = self.active_clients_by_name().await;
+        // 以 (bundle_id, client) 快照迭代——键即身份键。
+        let clients: Vec<(BundleId, StdArc<dyn MCPClientProtocol>)> = self
+            .active_clients
+            .read()
+            .await
+            .iter()
+            .map(|(bid, client)| (bid.clone(), client.clone()))
+            .collect();
 
         let config = self.health_check_config.read().await.clone();
 
@@ -1594,7 +1634,11 @@ impl MCPServerManager {
     }
 
     /// 获取重试计数 / Get retry counts
-    pub async fn get_retry_counts(&self) -> HashMap<String, u32> {
+    ///
+    /// 键 = **`bundle_id`**（身份键），与 [`check_all_health`](Self::check_all_health) 一致（#127 起两者同键；
+    /// 此前本函数已是 bundle_id 键却无文档说明，与紧邻的 name 键 `check_all_health` 同为 `HashMap<String, _>`、
+    /// 类型上无从分辨）。
+    pub async fn get_retry_counts(&self) -> HashMap<BundleId, u32> {
         self.retry_counts.read().await.clone()
     }
 
@@ -1621,15 +1665,15 @@ impl MCPServerManager {
 impl SkillResourceManager for MCPServerManager {
     async fn list_skill_resources(
         &self,
-        server_name: Option<&str>,
+        bundle_id: Option<&str>,
     ) -> Result<Vec<(String, McpResource)>, SkillStagingError> {
-        let pairs = MCPServerManager::list_skill_resources(self, server_name).await;
+        let pairs = MCPServerManager::list_skill_resources(self, bundle_id).await;
         let mut out = Vec::with_capacity(pairs.len());
-        for (sname, resource) in pairs {
+        for (bid, resource) in pairs {
             // rmcp `Resource._meta`（`Option<Meta(JsonObject)>`）→ staging 的 `Map<String, Value>`。
             let meta = resource.meta.clone().map(|m| m.0).unwrap_or_default();
             out.push((
-                sname,
+                bid,
                 McpResource {
                     uri: resource.uri.clone(),
                     meta,
@@ -1639,15 +1683,20 @@ impl SkillResourceManager for MCPServerManager {
         Ok(out)
     }
 
-    async fn read_resource(&self, server: &str, uri: &str) -> Result<Vec<u8>, SkillStagingError> {
-        // 复用 manager 的通用 read（`get_window_detail` 实为通用 `resources/read`，命名沿用历史）。
-        // Reuse the manager's generic read (`get_window_detail` is a generic `resources/read`).
+    async fn read_resource(
+        &self,
+        bundle_id: &str,
+        uri: &str,
+    ) -> Result<Vec<u8>, SkillStagingError> {
+        // 复用 manager 的 bundle_id 直查通用 read（#127：身份寻址，不经 name 解析——`active_client_key`
+        // 的 name-first 回退会在「某 server 的 display 名恰等于另一 server 的 bundle_id」时路由到错的 server）。
+        // Reuse the manager's bundle_id-direct generic read (no name resolution).
         let resource = make_resource(uri, uri, None, None);
         let result = self
-            .get_window_detail(server, resource)
+            .read_resource_by_id(bundle_id, resource)
             .await
             .map_err(|e| {
-                SkillStagingError(format!("read_resource '{uri}' from '{server}': {e}"))
+                SkillStagingError(format!("read_resource '{uri}' from '{bundle_id}': {e}"))
             })?;
 
         // 拼接 content blocks → 字节：文本按 UTF-8，二进制按 base64（MCP 标准编码）解码。
@@ -1778,13 +1827,48 @@ pub(crate) mod test_support {
         raw.no_annotation()
     }
 
-    /// 把假 client 注入 manager 的 `active_clients` / inject a fake client into the manager。
-    pub(crate) async fn inject(manager: &MCPServerManager, name: &str, client: MockSkillClient) {
+    /// 把假 client 注入 manager 的 `active_clients`（键 = `bundle_id`）/ inject a fake client。
+    pub(crate) async fn inject(
+        manager: &MCPServerManager,
+        bundle_id: &str,
+        client: MockSkillClient,
+    ) {
         manager
             .active_clients
             .write()
             .await
-            .insert(name.to_string(), StdArc::new(client));
+            .insert(bundle_id.to_string(), StdArc::new(client));
+    }
+
+    /// 构造带**显式** bundle_id 的 stdio 配置（其余占位）/ a stdio config with an explicit bundle_id。
+    pub(crate) fn stdio_cfg_with_bundle(name: &str, bundle_id: Option<&str>) -> MCPServerConfig {
+        let mut c = StdioServerConfig::new(
+            name,
+            StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.bundle_id = bundle_id.map(String::from);
+        MCPServerConfig::Stdio(c)
+    }
+
+    /// 把一条 config 注入 `servers_config`（键 = `bundle_id`）/ inject a server config keyed by bundle_id。
+    ///
+    /// 供需要 **display 名 ≠ bundle_id**（含两个 server 共用 display 名）的测试构造身份/展示分离的场景——
+    /// 仅 [`inject`] 时 `servers_config` 为空，展示名会回退成 bundle_id，测不出两者分歧。
+    pub(crate) async fn inject_config(
+        manager: &MCPServerManager,
+        bundle_id: &str,
+        config: MCPServerConfig,
+    ) {
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bundle_id.to_string(), config);
     }
 
     // ── INT-02 #70：可取消调用的共享假 client（manager 三态 + computer 端到端共用）──────────
@@ -2113,6 +2197,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::stdio_cfg_with_bundle;
     use super::*;
     use std::collections::HashMap;
     use tokio::time::{sleep, Duration};
@@ -2266,18 +2351,18 @@ mod tests {
         let status = manager.get_server_status().await;
         assert_eq!(status.len(), 2);
 
-        // 验证状态 / Verify status
+        // 验证状态 / Verify status（#127：行形态 = (bundle_id, name, is_active, state)）
         let stdio_status = status
             .iter()
-            .find(|(name, _, _)| name == "test_stdio")
+            .find(|(_, name, _, _)| name == "test_stdio")
             .unwrap();
-        assert!(!stdio_status.1); // 未激活 / Not active
+        assert!(!stdio_status.2); // 未激活 / Not active
 
         let http_status = status
             .iter()
-            .find(|(name, _, _)| name == "test_http")
+            .find(|(_, name, _, _)| name == "test_http")
             .unwrap();
-        assert!(!http_status.1); // 未激活 / Not active
+        assert!(!http_status.2); // 未激活 / Not active
     }
 
     #[tokio::test]
@@ -2305,10 +2390,11 @@ mod tests {
         let result = manager.add_or_update_server(config).await;
         assert!(result.is_ok());
 
-        // 检查状态 / Check status
+        // 检查状态 / Check status（`.0` = bundle_id（此处缺省生成 == name）、`.1` = 展示名）
         let status = manager.get_server_status().await;
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].0, "test_server");
+        assert_eq!(status[0].1, "test_server");
     }
 
     #[tokio::test]
@@ -2342,21 +2428,6 @@ mod tests {
         // 检查状态 / Check status
         let status = manager.get_server_status().await;
         assert!(status.is_empty());
-    }
-
-    /// 构造带**显式** bundle_id 的 stdio 配置（其余占位）。
-    fn stdio_cfg_with_bundle(name: &str, bundle_id: Option<&str>) -> MCPServerConfig {
-        let mut c = StdioServerConfig::new(
-            name,
-            StdioServerParameters {
-                command: "echo".to_string(),
-                args: vec![],
-                env: HashMap::new(),
-                cwd: None,
-            },
-        );
-        c.bundle_id = bundle_id.map(String::from);
-        MCPServerConfig::Stdio(c)
     }
 
     /// no-double-open（加载期）：两个 config 解析出相同 bundle_id（同名缺省生成）→ 仅保留**配置顺序第一个**。
@@ -2577,6 +2648,104 @@ mod tests {
             resource.uri.as_str(),
             "window://a.mcp.com/w",
             "window://host 属 MCP 自选、原样保留（正交，不受 #118 改动）"
+        );
+    }
+
+    /// #127：`list_skill_resources` 的 `.0` = **bundle_id**（`active_clients` 键），非 display 名。
+    ///
+    /// SKILL 通道是最后一个仍以 display 名标注/寻址的通道（协议 skill.md §1.3 已废止该例外）。
+    /// 两个 display 名相同、`bundle_id` 不同的**合法共存** server：旧实现经 `active_clients_by_name()`
+    /// 把两者都标成同一个 display 名 → staging 合成同一个 `mcp:<name>:<skill>` → 后者被去重丢弃、
+    /// 其 SKILL 对 Agent **隐身**。
+    #[tokio::test]
+    async fn list_skill_resources_keys_by_bundle_id_127() {
+        use super::test_support::{inject, inject_config, skill_resource, MockSkillClient};
+        let manager = MCPServerManager::new();
+        // 两个 server 共用 display 名 "same-display-name"，bundle_id 各异（协议：name 允许碰撞）。
+        for bid in ["id_a", "id_b"] {
+            inject_config(
+                &manager,
+                bid,
+                stdio_cfg_with_bundle("same-display-name", Some(bid)),
+            )
+            .await;
+            inject(
+                &manager,
+                bid,
+                MockSkillClient {
+                    pages: vec![vec![skill_resource(
+                        &format!("skill://h.example.com/{bid}"),
+                        Some("mounted"),
+                    )]],
+                    fail: false,
+                    cap_fail: false,
+                    read_text: String::new(),
+                },
+            )
+            .await;
+        }
+
+        let mut keys: Vec<String> = manager
+            .list_skill_resources(None)
+            .await
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["id_a", "id_b"],
+            ".0 应为 bundle_id：两个同名 server 须各自可辨（旧实现两条都标 'same-display-name'）"
+        );
+
+        // 定向枚举按 bundle_id 寻址；display 名不再是寻址键。
+        let scoped = manager.list_skill_resources(Some("id_a")).await;
+        assert_eq!(scoped.len(), 1, "定向枚举应只命中 id_a");
+        assert_eq!(scoped[0].0, "id_a");
+        assert!(
+            manager
+                .list_skill_resources(Some("same-display-name"))
+                .await
+                .is_empty(),
+            "display 名非寻址键，不应命中任何 server"
+        );
+    }
+
+    /// #127 扫漏：`check_all_health` 的键 = **bundle_id**，非 display 名。
+    ///
+    /// 旧实现按 display 名建 map：两个同名 server 只剩**一条**健康结果——不健康的那个会被同名健康者
+    /// 静默掩盖（后写覆盖先写），使观测端点对「哪个软件挂了」给出错误答案。
+    #[tokio::test]
+    async fn check_all_health_keys_by_bundle_id_127() {
+        use super::test_support::{inject, inject_config, MockSkillClient};
+        let manager = MCPServerManager::new();
+        for bid in ["id_a", "id_b"] {
+            inject_config(
+                &manager,
+                bid,
+                stdio_cfg_with_bundle("same-display-name", Some(bid)),
+            )
+            .await;
+            inject(
+                &manager,
+                bid,
+                MockSkillClient {
+                    pages: vec![],
+                    fail: false,
+                    cap_fail: false,
+                    read_text: String::new(),
+                },
+            )
+            .await;
+        }
+
+        let health = manager.check_all_health().await;
+        let mut keys: Vec<&String> = health.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["id_a", "id_b"],
+            "键应为 bundle_id：两个同名 server 各须有独立健康结果（旧实现丢一条）"
         );
     }
 

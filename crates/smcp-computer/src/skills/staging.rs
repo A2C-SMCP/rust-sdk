@@ -20,7 +20,8 @@
 //! - **marketplace**：`git clone --depth 1` catalog → 读 `marketplace.json` → 解析 plugin source（5 类）
 //!   → 扫 `<plugin>/skills/<skill>/SKILL.md` → 注册（name = `<plugin>:<skill>`）。
 //! - **mcp**：经 [`SkillResourceManager`] 枚举 `skill://` 资源，按 mounted/archive/resources 物化到
-//!   `<home>/mcp/<server>/<skill>/`，name = `mcp:<server>:<frontmatter.name>`。
+//!   `<home>/mcp/<bundle_id>/<skill>/`，name = `mcp:<bundle_id>:<frontmatter.name>`（#127：`<server>`
+//!   段 = server 唯一身份 `bundle_id` 原样，**非** display 名——见 [`smcp::skill_name`] 模块文档）。
 //!
 //! 安全 / Security：tar.gz/zip 解包防 zip-slip（[`is_within`]）、拒符号/硬链接、解压累计 / 成员数 cap；
 //! git 经 `tokio::process` **显式 argv**（非 shell，杜绝注入）+ `GIT_TERMINAL_PROMPT=0` 非交互。
@@ -58,8 +59,7 @@ use crate::skills::manifest::{
     resolve_skill_override_dirs, PluginManifestError,
 };
 use crate::skills::naming::{
-    normalize_mcp_server_segment, synthesize_marketplace_name, synthesize_mcp_name,
-    synthesize_user_name,
+    synthesize_marketplace_name, synthesize_mcp_name, synthesize_user_name,
 };
 use crate::skills::registry::SkillRegistry;
 use crate::skills::sources::{
@@ -162,16 +162,23 @@ pub struct McpResource {
 }
 
 /// MCP manager 接缝（#74 注入真实实现）/ MCP manager seam (real impl injected by #74)。
+///
+/// **身份寻址（#127）**：本接缝以 server 唯一身份 `bundle_id` 标注与寻址，**不使用** display `name`
+/// （协议 §身份正交性：`name` 允许碰撞、永不做键）。mcp 形态 SKILL 的 name / `source` / 磁盘落点均由
+/// 此 `bundle_id` 构成，故此处若退回 display 名，两个同名 server 会撞名并令其一的 SKILL 隐身。
 #[async_trait::async_trait]
 pub trait SkillResourceManager: Send + Sync {
-    /// 完整消费 cursor 枚举 `(server, skill 资源)` / Enumerate `(server, skill resource)`。
+    /// 完整消费 cursor 枚举 `(bundle_id, skill 资源)` / Enumerate `(bundle_id, skill resource)`。
+    ///
+    /// `bundle_id` 给定则仅枚举该 server（**按身份寻址**，非 display 名）。
     async fn list_skill_resources(
         &self,
-        server_name: Option<&str>,
+        bundle_id: Option<&str>,
     ) -> Result<Vec<(String, McpResource)>, SkillStagingError>;
 
-    /// 读取单个资源的字节（content 块已拼接）/ Read a single resource's bytes。
-    async fn read_resource(&self, server: &str, uri: &str) -> Result<Vec<u8>, SkillStagingError>;
+    /// 读取单个资源的字节（content 块已拼接；**按 `bundle_id` 寻址**）/ Read a resource's bytes by bundle_id。
+    async fn read_resource(&self, bundle_id: &str, uri: &str)
+        -> Result<Vec<u8>, SkillStagingError>;
 }
 
 /// `known_marketplaces.json` 物化记录入参 / Inputs for recording a known marketplace。
@@ -1197,7 +1204,7 @@ async fn materialize_archive(
 /// resources：逐个读子资源，按相对路径安全写入 staging / resources materialization。
 async fn materialize_resources(
     manager: &dyn SkillResourceManager,
-    server: &str,
+    bundle_id: &str,
     root_uri: &str,
     sub_resources: &[McpResource],
     dest: &Path,
@@ -1216,7 +1223,7 @@ async fn materialize_resources(
             continue;
         }
         let target = resolved_member_target(dest, rel)?;
-        let bytes = manager.read_resource(server, &res.uri).await?;
+        let bytes = manager.read_resource(bundle_id, &res.uri).await?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
@@ -1232,10 +1239,11 @@ async fn materialize_resources(
 }
 
 /// 读 frontmatter → 真冲突拒绝 → 校正包根目录名 → register/update（失败 → `None`）/ Finalize one mcp SKILL。
-#[allow(clippy::too_many_arguments)]
+///
+/// `bundle_id` 同时构成合成 name 的 `<server>` 段、`source` 与磁盘落点的分组目录（#127：三者同源于
+/// server 唯一身份，此前是 raw display 名 + 其规范化结果**两个**标识并行）。
 fn finalize_and_register(
-    server_name: &str,
-    normalized_server: &str,
+    bundle_id: &str,
     meta: &Map<String, Value>,
     staged: &Path,
     root_uri: &str,
@@ -1264,7 +1272,7 @@ fn finalize_and_register(
         let _ = std::fs::remove_dir_all(staged);
         return None;
     };
-    let name = match synthesize_mcp_name(server_name, fm_name) {
+    let name = match synthesize_mcp_name(bundle_id, fm_name) {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(uri = root_uri, reason = %e.reason, "skill name synthesis failed, skipped");
@@ -1287,7 +1295,7 @@ fn finalize_and_register(
     // A 已 rename 落盘的内容（A 仍在 registry 但磁盘被毁）。seen_this_run 仅对合成 name 去重、不覆盖
     // staging↔final 路径。加固（如 rename 前探测 final_dir 是否为本 run 内其它落点）须协议/Python 先行，
     // 以维持跨 SDK 一致——不在 Rust 单侧修改。
-    let final_dir = mcp_skill_dir(home, normalized_server, fm_name);
+    let final_dir = mcp_skill_dir(home, bundle_id, fm_name);
     if final_dir != staged {
         if final_dir.exists() {
             let _ = std::fs::remove_dir_all(&final_dir);
@@ -1308,7 +1316,7 @@ fn finalize_and_register(
         .map(scalar_to_string);
     let skill_ref = build_ref(
         name.clone(),
-        format!("mcp:{normalized_server}"),
+        format!("mcp:{bundle_id}"),
         Some(root_uri.to_string()),
         &final_dir,
         description,
@@ -1320,8 +1328,14 @@ fn finalize_and_register(
 
 /// 枚举并物化 mcp 源 SKILL，注册进 Registry / Enumerate, materialize and register mcp-source SKILLs。
 ///
-/// `server_name` 给定则仅物化该 server。`fetcher` 为归档拉取替身（`None` → [`DefaultArchiveFetcher`]）。
-/// 返回成功注册（或刷新）的 SKILL name 列表。
+/// `bundle_id` 给定则仅物化该 server（**按身份寻址**，非 display 名）。`fetcher` 为归档拉取替身
+/// （`None` → [`DefaultArchiveFetcher`]）。返回成功注册（或刷新）的 SKILL name 列表。
+///
+/// **磁盘落点按 `bundle_id` 分组（#127）**：`<home>/mcp/<bundle_id>/<skill>/`。升级前若某 server 的
+/// display 名规范化结果 ≠ 其 `bundle_id`（含 CJK / 连续 `__` / 首尾 `_-` / 显式指定 `bundle_id` 等边角
+/// 情形），旧 `<home>/mcp/<旧段>/` 目录会**留在盘上**——全量重挂时其 name 经 registry 孤儿对账标 orphan、
+/// 对 Agent 不可见（`get_skills` / `get_skill` 不返回），仅占磁盘，可由用户手动清理。常见情形（display 名
+/// 本就是 ASCII kebab）缺省生成结果与旧规范化结果一致，落点不变、无残留。
 ///
 /// **两阶段持锁（#77 INT 硬化）**：写锁 **不再** 跨 `materialize_*` 的网络/FS await 持有——
 /// `registry` 改为 `&RwLock<SkillRegistry>`，按 SKILL 仅在 `finalize_and_register`（FS rename + 内存注册，
@@ -1339,22 +1353,21 @@ pub async fn stage_mcp_skills(
     manager: &dyn SkillResourceManager,
     registry: &RwLock<SkillRegistry>,
     home: &Path,
-    server_name: Option<&str>,
+    bundle_id: Option<&str>,
     fetcher: Option<&dyn ArchiveFetcher>,
 ) -> Result<Vec<String>, SkillStagingError> {
     let default_fetcher = DefaultArchiveFetcher;
     let fetch: &dyn ArchiveFetcher = fetcher.unwrap_or(&default_fetcher);
 
-    let pairs = manager.list_skill_resources(server_name).await?;
+    let pairs = manager.list_skill_resources(bundle_id).await?;
     let mut by_server: indexmap::IndexMap<String, Vec<McpResource>> = indexmap::IndexMap::new();
-    for (sname, res) in pairs {
-        by_server.entry(sname).or_default().push(res);
+    for (bid, res) in pairs {
+        by_server.entry(bid).or_default().push(res);
     }
 
     let mut registered = Vec::new();
     let mut seen_this_run: HashSet<String> = HashSet::new();
-    for (sname, resources) in &by_server {
-        let normalized_server = normalize_mcp_server_segment(sname);
+    for (bid, resources) in &by_server {
         for res in resources {
             let mode = res.meta.get("source").and_then(Value::as_str).unwrap_or("");
             if !MCP_SOURCE_MODES.contains(&mode) {
@@ -1369,7 +1382,7 @@ pub async fn stage_mcp_skills(
                 );
                 continue;
             }
-            let staged = mcp_skill_dir(home, &normalized_server, leaf);
+            let staged = mcp_skill_dir(home, bid, leaf);
             // phase 1（不持 Registry 锁）：物化到 staged——archive 网络下载 / resources MCP read_resource。
             let materialize = match mode {
                 "mounted" => materialize_mounted(&res.meta, &staged),
@@ -1380,7 +1393,7 @@ pub async fn stage_mcp_skills(
                         .filter(|r| r.uri.starts_with(&format!("{root_uri}/")))
                         .cloned()
                         .collect();
-                    materialize_resources(manager, sname, root_uri, &subs, &staged).await
+                    materialize_resources(manager, bid, root_uri, &subs, &staged).await
                 }
             };
             if let Err(e) = materialize {
@@ -1392,8 +1405,7 @@ pub async fn stage_mcp_skills(
             // 网络，并严格保持 per-SKILL materialize→finalize 交错（维持 rename 冲突的跨 SDK 边界）。
             let mut reg = registry.write().await;
             if let Some(name) = finalize_and_register(
-                sname,
-                &normalized_server,
+                bid,
                 &res.meta,
                 &staged,
                 root_uri,

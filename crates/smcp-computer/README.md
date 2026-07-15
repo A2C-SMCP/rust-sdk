@@ -383,9 +383,10 @@ use tracing_subscriber;
 tracing_subscriber::fmt::init();
 
 // 监控服务器状态 / Monitor server status
+// 每行 = (bundle_id, name, is_active, state)：bundle_id 是唯一身份/寻址键，name 仅供展示（可碰撞）。
 let status = manager.get_server_status().await;
-for (name, active, state) in status {
-    println!("Server {}: active={}, state={}", name, active, state);
+for (bundle_id, name, active, state) in status {
+    println!("Server {} [{}]: active={}, state={}", name, bundle_id, active, state);
 }
 
 // 检查工具映射 / Check tool mapping

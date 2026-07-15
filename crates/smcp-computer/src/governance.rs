@@ -299,7 +299,10 @@ impl ListPluginsOptions {
 pub(crate) struct GovernanceRuntimeOverlay {
     /// plugin_id → 活跃 bundled skill 名 / active bundled skill names by plugin id。
     pub bundled_skills_by_plugin: BTreeMap<String, Vec<String>>,
-    /// 当前已物化的 MCP server 名集 / currently materialized server names。
+    /// 当前已物化的 MCP server **展示名**集 / currently materialized server display names。
+    ///
+    /// 有意用**名**而非 `bundle_id`：唯一消费者是与 ledger `bundled_mcp_servers`（持久化的 plugin-manifest
+    /// 名字段）求交集，两侧须同域。仅治理展示、不做寻址。
     pub materialized_mcp_servers: BTreeSet<String>,
 }
 
