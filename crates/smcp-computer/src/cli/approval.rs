@@ -27,7 +27,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::commands::{msg_dim, msg_err, msg_ok, msg_warn, resolved_settings};
+use super::commands::{msg_dim, msg_err, msg_ok, msg_warn, resolved_settings_with_errors};
 use crate::computer::{Computer, Session};
 use crate::mcp_clients::model::MCPServerConfig;
 use crate::settings::mcp_config::{
@@ -105,7 +105,18 @@ pub async fn run_mcp_approval<S: Session>(
         return;
     }
 
-    let settings = resolved_settings(cwd.as_deref(), None, flag_config);
+    // #143：settings 的校验错误必须**呈现**——scope 越权（policy-only / 审批门 enable 方向判据）会**静默
+    // 丢弃字段**，若连错误也吞掉，用户只会看到「我的 settings 莫名不生效」。协议指南 §2.1/§3：响亮失败。
+    let resolved_st = resolved_settings_with_errors(cwd.as_deref(), None, flag_config);
+    for err in &resolved_st.errors {
+        msg_warn(&format!(
+            "⚠ settings.json[{}]: {} — {}",
+            err.scope.as_str(),
+            err.field,
+            err.reason
+        ));
+    }
+    let settings = resolved_st.settings;
     let statuses = gate_mcp_servers(&resolved, &settings);
 
     // mcp.json 定义的 input 入池（无前缀），供 server config 的裸 `${input:}` 解析。

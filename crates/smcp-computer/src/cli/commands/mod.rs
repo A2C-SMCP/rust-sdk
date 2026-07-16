@@ -32,6 +32,7 @@ use crate::settings::installer::{McpHookError, McpInstallHooks};
 use crate::settings::scope::EnvMap;
 use crate::settings::{
     resolve_policy_settings, resolve_settings, FileSkillGovernanceStore, ResolveSettingsArgs,
+    ResolvedSettings,
 };
 use crate::skills::manifest::{MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR};
 
@@ -143,6 +144,22 @@ pub fn resolved_settings(
     env: Option<&EnvMap>,
     flag_path: Option<&Path>,
 ) -> Map<String, Value> {
+    resolved_settings_with_errors(cwd, env, flag_path).settings
+}
+
+/// 同 [`resolved_settings`]，但**保留校验错误**（scope 越权 / 字段级判废）/ same, but keeps errors。
+///
+/// #143：scope 越权过滤（[`POLICY_ONLY_FIELDS`](crate::settings::POLICY_ONLY_FIELDS) /
+/// [`TRUSTED_SCOPE_ONLY_FIELDS`](crate::settings::TRUSTED_SCOPE_ONLY_FIELDS)）**静默丢弃字段**——若调用方
+/// 连错误也丢，用户就只能看到「我的 settings 莫名不生效」。协议指南 §2.1/§3 要求**响亮失败、不静默忽略**，
+/// 故需要本变体把 `errors` 交给能呈现的调用方（如 boot 批准流程）。
+///
+/// [`resolved_settings`] 保留为薄封装：多数调用方（`settings show` / plugin 视图等）只关心合并值。
+pub fn resolved_settings_with_errors(
+    cwd: Option<&Path>,
+    env: Option<&EnvMap>,
+    flag_path: Option<&Path>,
+) -> ResolvedSettings {
     let policy = resolve_policy_settings(env, None, None);
     resolve_settings(ResolveSettingsArgs {
         cwd,
@@ -150,7 +167,6 @@ pub fn resolved_settings(
         flag_settings_path: flag_path,
         policy_settings: Some(&policy),
     })
-    .settings
 }
 
 // ── MCP 注入回调装配（对标 build_mcp_callbacks / McpCallbacks）/ MCP hooks wiring ──
