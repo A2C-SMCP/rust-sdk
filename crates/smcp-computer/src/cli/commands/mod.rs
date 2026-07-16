@@ -169,6 +169,26 @@ pub fn resolved_settings_with_errors(
     })
 }
 
+/// 把 settings 校验错误格式化为人读警示行（**纯函数**，供 boot 批准流程与 `settings show` 共用）/ format.
+///
+/// #143：scope 越权过滤（policy-only / 审批门 enable 方向判据）**静默丢弃字段** —— 若连错误也不呈现，用户
+/// 只会看到「我的 settings 莫名不生效」。抽为纯函数以便**单测文案与 scope/field 拼装**，杜绝未来重构把「呈现」
+/// 半程静默回退成吞错误（呈现行为无法在 `run_mcp_approval` 这类 `Session`-泛型异步副作用函数里直接断言）。
+#[must_use]
+pub fn format_settings_errors(errors: &[crate::settings::SettingsValidationError]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|e| {
+            format!(
+                "⚠ settings.json[{}]: {} — {}",
+                e.scope.as_str(),
+                e.field,
+                e.reason
+            )
+        })
+        .collect()
+}
+
 // ── MCP 注入回调装配（对标 build_mcp_callbacks / McpCallbacks）/ MCP hooks wiring ──
 /// 从活跃 `Computer` 装配 installer / 卸载级联所需的 MCP 注入回调 / wire MCP hooks from a live Computer。
 ///
@@ -352,6 +372,44 @@ pub(crate) fn test_env(home: &Path) -> std::collections::HashMap<String, String>
 mod tests {
     use super::*;
     use crate::computer::{Computer, SilentSession};
+    use crate::settings::{SettingsScope, SettingsValidationError};
+
+    /// #143：`format_settings_errors` 的文案与 scope/field 拼装（呈现半程的可断言守护——`run_mcp_approval`
+    /// 是 `Session`-泛型异步副作用函数，无法直接断言其打印；抽纯函数即为此）。
+    #[test]
+    fn format_settings_errors_pins_scope_field_reason() {
+        let errors = vec![
+            SettingsValidationError {
+                scope: SettingsScope::Project,
+                field: "enableAllProjectMcpServers".to_string(),
+                reason: "approval-gate field not allowed in the project scope (filtered)"
+                    .to_string(),
+                source_path: None,
+            },
+            SettingsValidationError {
+                scope: SettingsScope::User,
+                field: "allowedMcpServers".to_string(),
+                reason: "policy-only field not allowed outside the policy scope (filtered)"
+                    .to_string(),
+                source_path: None,
+            },
+        ];
+        let lines = format_settings_errors(&errors);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("[project]"),
+            "须含 scope，实得 {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("enableAllProjectMcpServers"),
+            "须含 field"
+        );
+        assert!(lines[0].contains("project scope"), "须含 reason");
+        assert!(lines[1].contains("[user]") && lines[1].contains("allowedMcpServers"));
+        // 空输入 → 空输出（无噪音）。
+        assert!(format_settings_errors(&[]).is_empty());
+    }
 
     fn cli_computer() -> Computer<SilentSession> {
         Computer::new(

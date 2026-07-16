@@ -23,13 +23,15 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use super::{err_flat as err, ok_msg, print_json, resolved_settings, EXIT_OK, EXIT_USER_ERROR};
+use super::{
+    err_flat as err, ok_msg, print_json, resolved_settings_with_errors, EXIT_OK, EXIT_USER_ERROR,
+};
 use crate::settings::scope::{
     apply_write, load_settings_file, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
 };
 use crate::settings::store::{atomic_write_settings_json, with_settings_lock};
-use crate::settings::{resolve_policy_settings, SettingsScope};
+use crate::settings::{resolve_policy_settings, SettingsScope, SettingsValidationError};
 
 // 可读 scope（show/get）/ readable scopes；可写 scope（set/edit）/ writable scopes。
 const READABLE: [&str; 6] = ["user", "project", "local", "flag", "policy", "merged"];
@@ -83,9 +85,28 @@ fn read_scope(
     cwd: Option<&Path>,
     flag_path: Option<&Path>,
 ) -> Option<Map<String, Value>> {
+    read_scope_with_errors(scope, env, cwd, flag_path).map(|(m, _)| m)
+}
+
+/// 同 [`read_scope`]，但**保留校验错误**（scope 越权过滤 / 字段级判废）/ same, but keeps errors。
+///
+/// #143：`settings show <scope>` 是用户排查「我的 settings 莫名不生效」时**最先跑**的命令 —— scope 越权
+/// 会静默丢字段（policy-only / 审批门 enable 方向判据），若此处也吞错误则诊断回路断裂。协议 §3「响亮失败」。
+fn read_scope_with_errors(
+    scope: &str,
+    env: Option<&EnvMap>,
+    cwd: Option<&Path>,
+    flag_path: Option<&Path>,
+) -> Option<(Map<String, Value>, Vec<SettingsValidationError>)> {
     match scope {
-        "merged" => Some(resolved_settings(cwd, env, flag_path)),
-        "user" => Some(load_settings_file(&user_settings_path(env), SettingsScope::User).0),
+        "merged" => {
+            let rs = resolved_settings_with_errors(cwd, env, flag_path);
+            Some((rs.settings, rs.errors))
+        }
+        "user" => Some(load_settings_file(
+            &user_settings_path(env),
+            SettingsScope::User,
+        )),
         "project" | "local" => {
             let base = resolve_cwd(cwd);
             let (path, enum_) = if scope == "project" {
@@ -101,15 +122,15 @@ fn read_scope(
             };
             // cwd 不可读 → 空层（不 panic）。
             Some(match path {
-                Some(p) => load_settings_file(&p, enum_).0,
-                None => Map::new(),
+                Some(p) => load_settings_file(&p, enum_),
+                None => (Map::new(), Vec::new()),
             })
         }
         "flag" => match flag_path {
-            Some(fp) => Some(load_settings_file(fp, SettingsScope::Flag).0),
-            None => Some(Map::new()),
+            Some(fp) => Some(load_settings_file(fp, SettingsScope::Flag)),
+            None => Some((Map::new(), Vec::new())),
         },
-        "policy" => Some(resolve_policy_settings(env, None, None)),
+        "policy" => Some((resolve_policy_settings(env, None, None), Vec::new())),
         _ => None,
     }
 }
@@ -141,13 +162,17 @@ pub fn settings_show(
         );
     }
     // READABLE 预检后 read_scope 恒 Some；None 仅在未知 scope（防御）。
-    let Some(data) = read_scope(scope, env, cwd, flag_path) else {
+    let Some((data, errors)) = read_scope_with_errors(scope, env, cwd, flag_path) else {
         return err(
             &format!("unknown scope {scope:?}"),
             json_output,
             EXIT_USER_ERROR,
         );
     };
+    // #143：scope 越权被过滤的字段在此有解释（打 stderr，不污染 stdout 的 JSON）。
+    for line in super::format_settings_errors(&errors) {
+        eprintln!("{line}");
+    }
     print_json(&Value::Object(data));
     EXIT_OK
 }

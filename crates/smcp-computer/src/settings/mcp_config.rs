@@ -1133,6 +1133,76 @@ mod tests {
         }
     }
 
+    /// #143 守护（**过滤只打不受信层、不误伤同名受信层**）：同一次 `resolve_settings` 下 project 供给
+    /// `enabledMcpjsonServers:["evil"]`（**应被过滤**）**且** local 供给 `enabledMcpjsonServers:["good"]`
+    /// （**应保留**）→ merge 后仅剩 `["good"]`，gate 中 `good→Enabled`、`evil→Pending`。
+    ///
+    /// 这是「过滤点必须在 `validate_settings`（逐层握 scope）而非 merge 后」这条论证的**可执行钉子**——
+    /// merge 对数组是拼接去重，若在 merge 后过滤则**无从区分**两个同名元素的来源层，只能整字段一刀切（误伤
+    /// local 的 `good`）。当前逐层过滤保证了精确性。
+    #[test]
+    fn filter_targets_only_untrusted_layer_not_same_name_trusted_143() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let xdg = tmp.path().join("xdg");
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        ))
+        .collect();
+
+        // 两个 project server：evil 借 project settings 自我批准（应失败）、good 由 local 批准（应生效）。
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"servers": {
+                "evil": {"type":"stdio","server_parameters":{"command":"x"}},
+                "good": {"type":"stdio","server_parameters":{"command":"y"}}
+            }}"#,
+        );
+        // project（入 git）供给 evil 的批准 → MUST 被过滤。
+        write(
+            &crate::settings::scope::workdir_project_settings_path(&wd),
+            r#"{"enabledMcpjsonServers": ["evil"]}"#,
+        );
+        // local（不入 git，个人决定）供给 good 的批准 → MUST 保留。
+        write(
+            &crate::settings::scope::workdir_local_settings_path(&wd),
+            r#"{"enabledMcpjsonServers": ["good"]}"#,
+        );
+
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            ..Default::default()
+        });
+        let rs =
+            crate::settings::scope::resolve_settings(crate::settings::scope::ResolveSettingsArgs {
+                cwd: Some(&wd),
+                env: Some(&env),
+                ..Default::default()
+            });
+
+        // merge 后：只剩 good（local 保留），evil（project 供给）被逐层过滤掉、不因拼接去重而残留。
+        assert_eq!(
+            str_list(&rs.settings, FIELD_ENABLED_MCPJSON_SERVERS),
+            vec!["good"],
+            "过滤 MUST 精确打掉不受信层供给的元素、保留同字段受信层元素，实得 {:?}",
+            rs.settings.get(FIELD_ENABLED_MCPJSON_SERVERS)
+        );
+        let gated = gate_mcp_servers(&resolved, &rs.settings);
+        assert_eq!(
+            gated["good"],
+            McpApprovalStatus::Enabled,
+            "local 批准 MUST 生效"
+        );
+        assert_eq!(
+            gated["evil"],
+            McpApprovalStatus::Pending,
+            "project 自我批准 MUST 失效（不因与 good 同字段而搭便车）"
+        );
+    }
+
     /// #143 守护（**防过度矫正**）：`disabledMcpjsonServers` 是 **DENY** 方向 —— 协议 §2.1 表第 3 行明定
     /// **任意 scope（含 project）可供给**，理由是 fail-safe（仓库禁自己的 server 无安全影响，更严格永远安全）。
     ///
