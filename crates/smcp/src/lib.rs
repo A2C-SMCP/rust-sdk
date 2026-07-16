@@ -559,7 +559,9 @@ pub mod tool_meta {
     /// 结果级（MUST）：授权错误码 `4006`/`4007`（整数，[`ErrorCode::ToolAuthorizationRequired`] /
     /// [`ErrorCode::ToolAuthorizationFailed`]）。
     pub const AUTH_ERROR_CODE_KEY: &str = "error_code";
-    /// 结果级（MUST）：触发授权错误的 MCP Server 标识 / the MCP server that raised the auth error。
+    /// 结果级（MUST）：触发授权错误的 MCP Server 的 **bundle_id**（值 = bundle_id，协议 0.3.0 §身份正交性 #18；
+    /// 生产方发 `call_tool` 传入的 bundle_id 身份键，与 `get_config` 归属一致）/
+    /// the MCP server (bundle_id) that raised the auth error。
     pub const AUTH_MCP_SERVER_KEY: &str = "mcp_server";
     /// 结果级（SHOULD）：面向用户的**非敏感**授权提示对象（`action`/`message`，已脱敏）/
     /// non-sensitive user-facing auth hint object (sanitized per error-handling.md §454)。
@@ -837,7 +839,9 @@ pub struct GetResourcesReq {
     pub base: AgentCallData,
     /// 目标 Computer 名 / target Computer name。
     pub computer: String,
-    /// 必填：目标 MCP Server 名称 / required: target MCP Server name。
+    /// 必填：目标 MCP Server 的 **bundle_id**（**非** display 名；协议 0.3.0 §身份正交性 #18）。
+    /// Computer 侧按 bundle_id 直查 `active_clients`、不经 name 解析 ⇒ 传 display 名 → `4014`。
+    /// required: the target MCP server's **bundle_id** (NOT the display name; a display name → `4014`)。
     pub mcp_server: String,
     /// MCP 标准翻页游标（可选；缺省取首页）/ MCP-standard pagination cursor (optional)。
     #[serde(default, skip_serializing_if = "Option::is_none")]

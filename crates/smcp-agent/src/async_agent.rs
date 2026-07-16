@@ -357,6 +357,10 @@ impl AsyncSmcpAgent {
 
     /// 获取指定 Computer 上某 MCP Server 的资源列表（v0.2.0）/ Get a MCP Server's resource list。
     ///
+    /// `mcp_server`：目标 MCP Server 的 **bundle_id**（**非** display 名；协议 0.3.0 §身份正交性 #18）。
+    /// Computer 按 bundle_id 直查、不经 name 解析 ⇒ 传 display 名必得 `4014`。bundle_id 取自
+    /// `client:get_config` 响应的 `servers` map 键（typed 消费方法由 #136 补齐）。
+    ///
     /// 透明转发 MCP `resources/list`：SDK **不**自动翻页——`cursor` 由调用方控制，首次传 `None`，
     /// 响应含 `next_cursor` 时由调用方决定是否带该 cursor 继续请求（协议指南 §5.3 #3）。flat
     /// ErrorPayload（`4014` MCP Server 未注册 / `4015` 未声明 `resources` 能力）经 ack 透传为协议

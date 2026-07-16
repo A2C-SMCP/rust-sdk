@@ -74,6 +74,7 @@ impl SyncSmcpAgent {
 
     /// 获取指定 Computer 上某 MCP Server 的资源列表（v0.2.0，同步）/ Get a MCP Server's resources (sync)。
     ///
+    /// `mcp_server`：目标 MCP Server 的 **bundle_id**（**非** display 名；传 display 名 → `4014`）。
     /// 阻塞包装 [`AsyncSmcpAgent::get_resources`]：透明转发 MCP `resources/list`，`cursor` 调用方控制
     /// （首次 `None`），flat ErrorPayload（`4014`/`4015`）透传为协议错误。
     pub fn get_resources(

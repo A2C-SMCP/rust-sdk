@@ -70,6 +70,7 @@ pub fn build_get_tools_request(agent: &str, computer: &str) -> GetToolsReq {
 
 /// 创建获取资源请求（透明转发 MCP `resources/list`）/ Create a `client:get_resources` request。
 ///
+/// `mcp_server`：目标 MCP Server 的 **bundle_id**（**非** display 名；传 display 名 → `4014`）。
 /// `cursor`：MCP 标准翻页游标；首次传 `None`。
 pub fn build_get_resources_request(
     agent: &str,
