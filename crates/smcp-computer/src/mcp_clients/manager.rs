@@ -590,6 +590,23 @@ impl MCPServerManager {
             };
             let server_name = config.name().to_string();
 
+            // #134：`default_tool_meta.alias` 天生 per-tool、放 default 位无合理用例（无法把 N 个工具改成
+            // 同一名）。merged_tool_meta 已不再继承它；此处每 server 每次 refresh 打一次配置诊断，把「静默
+            // 忽略」变响亮（不静默丢 + 配置诊断姿态）。空串按未设处理，与 python 真值判定逐行同构。
+            if config
+                .default_tool_meta()
+                .and_then(|d| d.alias.as_deref())
+                .is_some_and(|a| !a.is_empty())
+            {
+                warn!(
+                    bundle_id = %bundle_id,
+                    server_name = %server_name,
+                    "default_tool_meta.alias is ignored (aliases are per-tool; a default alias would \
+                     collapse all tools of this server into one exposed name). Rename via per-tool \
+                     tool_meta.<tool>.alias instead (config diagnostic)"
+                );
+            }
+
             // 获取工具列表 / Get tool list
             match client.list_tools().await {
                 Ok(tools) => {
@@ -1396,6 +1413,12 @@ impl MCPServerManager {
     }
 
     /// 合并工具元数据 / Merge tool metadata
+    ///
+    /// #134：`alias` 天生 per-tool（把某个工具改名），故**只取自具体 `tool_meta[tool]`，绝不从
+    /// `default_tool_meta` 继承**——否则同 server 多工具会全塌成同一个 `{bundle_id}__{alias}`、first-wins
+    /// 静默丢弃其余。default 的其余字段（`auto_apply`/`tags`/`ret_object_mapper`）仍作默认值照常回落。
+    /// 被忽略的 `default_tool_meta.alias` 由 [`refresh_tool_routes`](Self::refresh_tool_routes) 每 server 打一次
+    /// 配置诊断 WARN（与 python-sdk #151 同方案）。
     fn merged_tool_meta(&self, config: &MCPServerConfig, tool_name: &str) -> Option<ToolMeta> {
         let specific = config.tool_meta().get(tool_name);
         let default = config.default_tool_meta();
@@ -1403,16 +1426,20 @@ impl MCPServerManager {
         match (specific, default) {
             (None, None) => None,
             (Some(s), None) => Some(s.clone()),
-            (None, Some(d)) => Some(d.clone()),
+            (None, Some(d)) => {
+                // default 位的 alias 绝不回落到任何工具。
+                let mut merged = d.clone();
+                merged.alias = None;
+                Some(merged)
+            }
             (Some(s), Some(d)) => {
                 // 浅合并，specific优先 / Shallow merge, specific takes priority
                 let mut merged = d.clone();
                 if s.auto_apply.is_some() {
                     merged.auto_apply = s.auto_apply;
                 }
-                if s.alias.is_some() {
-                    merged.alias = s.alias.clone();
-                }
+                // alias 仅源自 specific（含 None 语义）——绝不继承 default。
+                merged.alias = s.alias.clone();
                 if s.tags.is_some() {
                     merged.tags = s.tags.clone();
                 }
@@ -3002,7 +3029,7 @@ mod tests {
             tool_meta: HashMap::new(),
             default_tool_meta: Some(ToolMeta {
                 auto_apply: Some(false),
-                alias: None,
+                alias: Some("ignored_default_alias".to_string()),
                 tags: Some(vec!["default_tag".to_string()]),
                 ret_object_mapper: None,
             }),
@@ -3017,6 +3044,8 @@ mod tests {
         let meta = manager.merged_tool_meta(&config, "any_tool").unwrap();
         assert_eq!(meta.auto_apply, Some(false));
         assert_eq!(meta.tags, Some(vec!["default_tag".to_string()]));
+        // #134：default 位的 alias 绝不回落到任何工具（其余字段照常作默认值）。
+        assert_eq!(meta.alias, None);
 
         // Case 3: specific + default merge (specific wins)
         let config = MCPServerConfig::Stdio(StdioServerConfig {
@@ -3050,8 +3079,9 @@ mod tests {
         });
         let meta = manager.merged_tool_meta(&config, "tool_a").unwrap();
         assert_eq!(meta.auto_apply, Some(true)); // specific wins
-        assert_eq!(meta.alias, Some("default_alias".to_string())); // from default
-        assert_eq!(meta.tags, Some(vec!["default_tag".to_string()])); // from default
+                                                 // #134：alias 天生 per-tool，绝不从 default 继承——specific 无 alias ⇒ 结果为 None（旧行为曾误取 default_alias）。
+        assert_eq!(meta.alias, None);
+        assert_eq!(meta.tags, Some(vec!["default_tag".to_string()])); // 其余字段仍从 default 回落
 
         // Case 4: no config
         let config = MCPServerConfig::Stdio(StdioServerConfig {
@@ -3765,9 +3795,131 @@ mod tests {
         assert!(matches!(err, ComputerError::PermissionError(_)));
     }
 
-    /// `default_tool_meta` 提供的 alias 同样反映到暴露名（端到端经 refresh），并可被对原始名的 forbid 抑制。
+    /// 便捷：构造带 `default_tool_meta`（可含 per-tool `tool_meta`）的 Stdio 配置。
+    fn stdio_cfg_with_default_meta(
+        name: &str,
+        tool_meta: HashMap<String, ToolMeta>,
+        default_tool_meta: Option<ToolMeta>,
+    ) -> MCPServerConfig {
+        let mut c = StdioServerConfig::new(
+            name,
+            StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.tool_meta = tool_meta;
+        c.default_tool_meta = default_tool_meta;
+        MCPServerConfig::Stdio(c)
+    }
+
+    /// #134 复现（回归守护）：一 server 暴露 ≥2 工具 + `default_tool_meta.alias` → alias 天生 per-tool，
+    /// 绝不从 default 继承，故各工具按**原始名**暴露、无一塌名丢弃。旧行为下三者塌成同一个 `srv__custom`、
+    /// first-wins 静默丢 2/3（该测试在旧码红、修后绿）。
     #[tokio::test]
-    async fn test_default_tool_meta_alias_flows_through_exposure_and_forbid() {
+    async fn test_default_tool_meta_alias_no_collapse_all_tools_exposed() {
+        let manager = MCPServerManager::new();
+        let cfg = stdio_cfg_with_default_meta(
+            "srv",
+            HashMap::new(),
+            Some(ToolMeta {
+                alias: Some("custom".to_string()),
+                ..ToolMeta::new()
+            }),
+        );
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "srv",
+                vec![tool_named("alpha"), tool_named("beta"), tool_named("gamma")],
+                cfg,
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let names: Vec<String> = manager
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        // 三工具均按原始名暴露，无一塌名到 srv__custom。
+        for tool in ["alpha", "beta", "gamma"] {
+            assert!(
+                names.contains(&exposed("srv", tool)),
+                "工具 {tool} 应按原始名暴露: {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&exposed("srv", "custom")),
+            "default alias 不应产生 srv__custom: {names:?}"
+        );
+        assert_eq!(names.len(), 3, "恰好三个工具、无丢弃: {names:?}");
+
+        // 每个 exposed 名都能路由回各自 original（真·可调用，非仅出现在列表）。
+        for tool in ["alpha", "beta", "gamma"] {
+            let (b, _s, orig) = manager
+                .validate_tool_call(&exposed("srv", tool), &serde_json::json!({}))
+                .await
+                .unwrap();
+            assert_eq!((b.as_str(), orig.as_str()), ("srv", tool));
+        }
+    }
+
+    /// #134 边界：per-tool `tool_meta[alpha].alias` 仍优先生效，且不受「default alias 被忽略」牵连——
+    /// `alpha` 暴露 `srv__renamed`、`beta` 暴露原始名 `srv__beta`，无塌名、default alias 不出线。
+    /// 镜像 python `test_per_tool_alias_wins_over_default_alias_no_collapse`。
+    #[tokio::test]
+    async fn test_per_tool_alias_wins_over_ignored_default_alias() {
+        let manager = MCPServerManager::new();
+        let cfg = stdio_cfg_with_default_meta(
+            "srv",
+            meta_with_alias("alpha", "renamed"),
+            Some(ToolMeta {
+                alias: Some("custom".to_string()),
+                ..ToolMeta::new()
+            }),
+        );
+        setup_and_refresh(
+            &manager,
+            vec![("srv", vec![tool_named("alpha"), tool_named("beta")], cfg)],
+        )
+        .await
+        .expect("refresh ok");
+
+        let names: Vec<String> = manager
+            .list_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.contains(&exposed("srv", "renamed")),
+            "alpha 应用 per-tool alias: {names:?}"
+        );
+        assert!(
+            names.contains(&exposed("srv", "beta")),
+            "beta 应按原始名暴露: {names:?}"
+        );
+        assert!(
+            !names.contains(&exposed("srv", "custom")),
+            "default alias 应被忽略: {names:?}"
+        );
+        assert!(
+            !names.contains(&exposed("srv", "alpha")),
+            "alpha 原始名已被 per-tool alias 取代: {names:?}"
+        );
+        assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    /// #134：`default_tool_meta.alias` 被忽略（alias 天生 per-tool），工具按原始名暴露；forbid 原始名仍抑制。
+    /// （本测试原名 `..._flows_through_exposure_and_forbid` + 原断言恰是旧 bug 行为的活文档，随 #134 重写。）
+    #[tokio::test]
+    async fn test_default_tool_meta_alias_ignored_original_exposed_and_forbid() {
         let cfg_default = |forbidden: Vec<String>| {
             let mut c = StdioServerConfig::new(
                 "srv",
@@ -3786,7 +3938,7 @@ mod tests {
             MCPServerConfig::Stdio(c)
         };
 
-        // (a) default alias 作为暴露名（带 bundle_id 前缀）/ default alias surfaces as the exposed name
+        // (a) default alias 被忽略 → 工具按原始名暴露（带 bundle_id 前缀），def_alias 不出线。
         let mgr_a = MCPServerManager::new();
         inject_tools(&mgr_a, &bid("srv"), vec![tool_named("t")]).await;
         mgr_a
@@ -3802,11 +3954,11 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         assert!(
-            names.contains(&exposed("srv", "def_alias")) && !names.contains(&exposed("srv", "t")),
-            "default alias 应作为暴露名（带前缀）: {names:?}"
+            names.contains(&exposed("srv", "t")) && !names.contains(&exposed("srv", "def_alias")),
+            "default alias 应被忽略、工具按原始名暴露: {names:?}"
         );
 
-        // (b) 对原始名 forbid 时，default alias 也被抑制 / forbidding the original name suppresses it too
+        // (b) 对原始名 forbid 时该工具被抑制（default alias 既已忽略、暴露名即原始名）/ forbidding original suppresses it
         let mgr_b = MCPServerManager::new();
         inject_tools(&mgr_b, &bid("srv"), vec![tool_named("t")]).await;
         mgr_b
@@ -3824,7 +3976,7 @@ mod tests {
         assert!(
             !names2.contains(&exposed("srv", "def_alias"))
                 && !names2.contains(&exposed("srv", "t")),
-            "forbid 原始名应抑制 default alias: {names2:?}"
+            "forbid 原始名应抑制该工具（def_alias 本就忽略、不出线）: {names2:?}"
         );
     }
 
