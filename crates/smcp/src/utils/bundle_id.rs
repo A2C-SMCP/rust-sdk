@@ -30,6 +30,15 @@
 //!
 //! **刻意不实现 `Borrow<str>`**：否则 `HashMap<BundleId, _>::get(&str)` 仍编译，用 display 名查身份键表
 //! 这一**核心混用点**会继续静默通过——那正是本 newtype 要消灭的东西。代价是查表需显式转换，值得。
+//!
+//! # ⚠️ 本轮关掉的是**查表面**，不是全部（勿高估保证）
+//!
+//! [`PartialEq<&str>`] 仍在（见其实现处的理由：pub API 暂收 `&str`，rust-sdk#130 的"紧边界"）⇒
+//! **name-join 式比较**（`resolve_bundle_id(&cfg) == some_display_name`）**依然编译通过**。而 #126/#127 的
+//! 真实 bug 恰是 name-join 比较（`bundled.contains(name)`、按 display 名关联归属），不是 map 查表。
+//!
+//! 即：本轮令「用 name **查身份键表**」编译红；「用 name **与身份比较**」仍需人眼。后者随 **#141**（库层
+//! 公开 API 一律收 `BundleId`）移除 `PartialEq<&str>` 后收口。
 
 /// 判定字符是否属 BundleID 字符集 `[A-Za-z0-9_-]`（**显式 ASCII 类**，非 Unicode-aware `\w`）。
 ///

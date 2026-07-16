@@ -250,7 +250,11 @@ pub struct StdioServerConfig {
     /// 服务器名称（人类可读，非唯一身份）/ Server name (human-readable, not the unique identity)。
     pub name: ServerName,
     /// MCP Server 唯一标识（BundleID）。省略时由 `name` 经确定性算法缺省生成（[`super::bundle_id`]，
-    /// **derive-on-load、不回写 mcp.json**）。显式非法值（含 `.` / `__` / 越界）在注册边界报错。
+    /// **derive-on-load、不回写 mcp.json**）。
+    ///
+    /// #130：显式非法值（含 `.` / `__` / 空）在 **serde 反序列化的字段级**即判废（[`BundleId`] 构造即校验），
+    /// **不再**是"注册边界报错"——`resolve_key` 的校验分支已随之删除。**无长度上限**（协议 §BundleID 未设，
+    /// 由 `smcp` 的 `valid_bundle_id_has_no_length_cap` 专测守护），故不存在"越界"一说。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<BundleId>,
     /// 是否禁用 / Whether disabled

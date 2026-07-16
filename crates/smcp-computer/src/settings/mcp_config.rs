@@ -15,8 +15,13 @@
 //! `guides/mcp-approval-gate-alignment.md`（批准门控档位表、双 SDK 共同对齐锚点）/ `runtime-contract.md`
 //! §2.5（来源优先序）· §5 item 10（两套开关正交）。对标 Python `computer/settings/mcp_config.py`。
 //!
-//! ⚠️ 早前注释引用的 `§9.1` / `§9.2` 是**幽灵章节**（协议仓 `computer-management/` 无此章节，§9 是「兼容性」）——
-//! mcp.json 定义层与批准门控的权威已是上述 `guides/`。该幽灵引用曾真实误导过一次决策，勿再复活。
+//! ⚠️ 早前注释引用的 `§9.1` / `§9.2` 是**幽灵章节**：`computer-management/protocol.md` 的 §9 是「兼容性」、
+//! `runtime-contract.md` 压根只到 §8，两处都没有 mcp.json 定义层或批准门控的子节。mcp.json 与批准门控的权威
+//! 已是上述 `guides/`。该幽灵引用曾真实误导过一次决策，勿再复活。
+//!
+//! **引用规则**：协议引用 MUST 带**文件名**（如 `runtime-contract.md §5 item 10`），裸 `§X.Y` 无从校验、正是
+//! 幽灵滋生的温床。本文件内 `§5.5` / `§5.6` 等裸引用同属待清理项（经核实亦为幽灵，`runtime-contract.md` §5 是
+//! 扁平 1–10 条、无子节）—— 一并扫净归后续卫生批次（#132）。
 //!
 //! 本模块是 **MCP 定义/门控的纯逻辑层**（无 git / 无 MCP manager / 无网络）。职责三件：
 //! 1. **多 scope 加载合并** `mcp.json`——顺序 `policy > local > project > user > flag`，**无能力层并集**
@@ -519,6 +524,15 @@ fn str_list<'a>(settings: &'a Map<String, Value>, key: &str) -> Vec<&'a str> {
 ///
 /// 协议依据：[审批门对齐指南][guide] §2 档位表（SDK 非规范性共同对齐锚点，双 SDK MUST 行为一致）。
 ///
+/// # ⚠️ 与指南的两处**已知未对齐**（勿把"引用了 §2"误读为"已对齐 §2"）
+///
+/// 1. **键仍是 display 名，非 `bundle_id`**：指南 §1 定四个名单数组的元素、§2 定本函数入参**一律为
+///    `bundle_id`**；本实现收的 `name` 是 `gate_mcp_servers` 从 `mcp.json` map key 迭代出的 **display 名**
+///    （Python `mcp_config.py` 同为 name-keyed ⇒ **双端对称**，非单边分歧）。其后果正是指南 §1 所述的信任
+///    泄漏（同名两条 server 共用一份审批）。换键归 **#136–#141**；届时下方 `const _` 会显红，**那是预期**——
+///    连同本节一并更新。
+/// 2. **档④/⑤ 的判据可由不受信 scope 供给**：见 `gate_mcp_servers` 的安全注记。
+///
 /// 优先级（先到先决）：① `deniedMcpServers` → Disabled；② `allowedMcpServers` 非空且不在其中 → Disabled；
 /// ③ `disabledMcpjsonServers` → Disabled（disabled 优先 over enabled）；④ `trusted_origin`（user/flag/policy）
 /// → Enabled；⑤ `enabledMcpjsonServers` → Enabled；⑥ `enableAllProjectMcpServers == true` → Enabled；
@@ -571,6 +585,28 @@ pub fn mcp_server_status(
 const _: fn(&str, &Map<String, Value>, bool) -> McpApprovalStatus = mcp_server_status;
 
 /// 对全部已解析 server 套 [`mcp_server_status`] / Apply the gate to all resolved servers。
+///
+/// # ⚠️ 已知残留攻击面（**#143**，blocked-by [protocol#30]）：project scope settings.json 可自我批准
+///
+/// **非本函数引入，勿在此单边打补丁**（理由见下）。
+///
+/// `resolved_settings` 会加载 `<cwd>/.tfrobot/settings.json`（scope = `Project`，**入 git**），而
+/// [`schema::POLICY_ONLY_FIELDS`](crate::settings::schema::POLICY_ONLY_FIELDS) **只**过滤
+/// `allowedMcpServers` / `deniedMcpServers`。`enableAllProjectMcpServers`（BOOL_FIELDS）与
+/// `enabledMcpjsonServers`（STRING_ARRAY_FIELDS）**不在其列** ⇒ 被 clone 的仓库同时携带
+/// `.tfrobot/mcp.json`（恶意 server）+ `.tfrobot/settings.json`（`{"enableAllProjectMcpServers": true}`）
+/// 即命中档⑤/⑥ → `Enabled` → `cli/approval.rs` 免批准框直挂。
+///
+/// 这与 #131 删掉的档④ **同构且更易达成**（无需受害者装过任何插件、无需猜中 bundled 名）。
+///
+/// **为何不在此单边修**：① 协议 `guides/mcp-approval-gate-alignment.md` §2 档位表对档⑤/⑥ **未写任何 scope
+/// 约束** ⇒ 现状照文本实现属**合规**，缺口在协议文本（§2 danger 块只钉死了档④ 一个形状，未钉死「不受信
+/// scope 不得供给信任判据」这条通则）；② python-sdk **完全同构**（其 `schema.py` 同样只有 allowed/denied 是
+/// policy-only）⇒ 单边收紧即制造双端分歧。故须**协议先行**再双端同步落地。
+///
+/// 注：三个批准**写**助手（[`approve_mcp_server`] 等）本就只写 **local** scope —— 读写面不对称正是此洞的形状。
+///
+/// [protocol#30]: https://github.com/A2C-SMCP/a2c-smcp-protocol/issues/30
 #[must_use]
 pub fn gate_mcp_servers(
     resolved: &ResolvedMcpConfig,
@@ -903,6 +939,11 @@ mod tests {
 
     /// #131 P0 安全回归（借名绕过授权门）：**project scope（不受信）** 的 `mcp.json` 声明借用账本中某已装
     /// plugin 的 bundled **显示名** → MUST 落 [`McpApprovalStatus::Pending`]（弹批准框），MUST NOT 免批准直挂。
+    ///
+    /// **覆盖边界（勿高估）**：本测覆盖 `resolve_mcp_config` + `gate_mcp_servers` 两个纯函数（**门层**），
+    /// **不**覆盖真正做出挂载决定的 `cli::approval::run_mcp_approval`（该函数全仓无测试、缺 cwd/env 注入
+    /// 接缝）。故若有人把「进门后豁免」重新写进 `run_mcp_approval` 自身，本测与 `const _` 签名 pin **都抓不到**
+    /// —— 而那正是指南 §2 danger 块所禁的「以任何形状复活」。补该层 e2e 守护是后续项。
     ///
     /// 攻击链：clone 来的仓库带 `.tfrobot/mcp.json` 声明 `audit-mcp`（= 受害者装过的 `audit@acme` 插件的
     /// bundled 名，**公开信息**）→ 旧档④ `bundled.contains(name)` 命中 → `Enabled` → `cli/approval.rs` 无提示、

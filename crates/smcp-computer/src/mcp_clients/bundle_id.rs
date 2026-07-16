@@ -344,6 +344,12 @@ mod tests {
     /// 覆盖两条分支：normalize 非空（ASCII / 混合符号 / 连续下划线源）与 fallback（CJK / 全符号 / 空名）。
     #[test]
     fn derive_bundle_id_always_yields_valid_id_130() {
+        static LONG_NAME: &str = concat!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
         for name in [
             "My Server",
             "a__b",         // 源含保留分隔符 → 折叠后须合法
@@ -354,6 +360,9 @@ mod tests {
             "-lead-trail-", // 首尾连字符 → 裁剪
             "a.b.c",        // 含点 → 映射为 _
             "UPPER_lower-9",
+            // 长名：不变量与权威**耦合**——若协议未来给 `is_valid_bundle_id` 加长度上限，此条会让
+            // `derive_bundle_id` 的 `expect` 从"不可达"变成线上 panic，本例把该耦合显式钉住。
+            LONG_NAME,
         ] {
             let c = stdio(name, "npx", &["x"], &[]);
             // 不 panic 即证 expect 不可达；再正面断言权威判据。
