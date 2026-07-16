@@ -20,23 +20,24 @@ pub enum ComputerError {
     /// 输入项未找到 / Input not found
     InputNotFound { input_id: String },
 
-    #[error("Server {server_name} is not active")]
-    /// 服务器未激活 / Server not active
-    ServerNotActive { server_name: String },
+    #[error("Server {bundle_id} is not active")]
+    /// 服务器未激活 / Server not active。
+    /// 字段 `bundle_id`：目标 server 身份键（**非** display 名，协议 0.3.0 §身份正交性 #18）。
+    ServerNotActive { bundle_id: String },
 
     #[error("MCP server not found: {0}")]
     /// 目标 MCP Server 未注册（`get_resources` → 处理器映射 4014）/ target MCP server not registered
     /// (`get_resources` → handler maps 4014)。对标 Python `MCPServerNotFoundError`。
     McpServerNotFound(String),
 
-    #[error("MCP capability '{capability}' not supported by server '{server_name}'")]
+    #[error("MCP capability '{capability}' not supported by server '{bundle_id}'")]
     /// MCP Server 未声明所需 capability（`get_resources` → 处理器映射 4015）/ required capability not
     /// declared (`get_resources` → handler maps 4015)。对标 Python `MCPCapabilityNotSupportedError`。
-    /// 结构化分流字段：`server_name`（值 = **bundle_id**，协议 0.3.0 #18）+ `capability` 供 handler 直接平铺为
+    /// 结构化分流字段：`bundle_id`（server 身份键，协议 0.3.0 §身份正交性 #18）+ `capability` 供 handler 直接平铺为
     /// flat ErrorPayload 顶层 `mcp_server`/`capability`（`with_mcp_server`/`with_capability`），无需再解析字符串。
     McpCapabilityNotSupported {
         /// 目标 MCP Server 的 bundle_id（顶层 `mcp_server`）。
-        server_name: String,
+        bundle_id: String,
         /// 缺失的 capability 名（顶层 `capability`，如 `"resources"`）。
         capability: String,
     },

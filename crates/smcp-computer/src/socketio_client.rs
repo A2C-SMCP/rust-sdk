@@ -1105,18 +1105,18 @@ impl SmcpComputerClient {
             }
             // capability 不支持 → 4015 flat ErrorPayload。
             Err(ComputerError::McpCapabilityNotSupported {
-                server_name,
+                bundle_id,
                 capability,
             }) => {
                 warn!(
                     "client:get_resources MCP server '{}' does not support '{}' capability",
-                    server_name, capability
+                    bundle_id, capability
                 );
                 let payload = smcp::ErrorPayload::from_error_code(
                     smcp::ErrorCode::McpCapabilityNotSupported,
                     "MCP Server does not support the requested capability",
                 )
-                .with_mcp_server(server_name)
+                .with_mcp_server(bundle_id)
                 .with_capability(capability);
                 Ok((ack_id, serde_json::to_value(payload)?))
             }

@@ -704,11 +704,11 @@ impl MCPServerManager {
     ///
     /// 形参改收 `BundleId` 属 **#141**（库层 API 一律收 bundle_id）；在此之前，非法串**必然**不是活动键
     /// ⇒ 归入既有的「未激活」错误，**无新增失败模式、无行为变更**。
-    fn active_key(server_name: &str, tool_name: &str) -> Result<BundleId, ComputerError> {
-        BundleId::try_from(server_name).map_err(|_| {
+    fn active_key(bundle_id: &str, tool_name: &str) -> Result<BundleId, ComputerError> {
+        BundleId::try_from(bundle_id).map_err(|_| {
             ComputerError::InvalidConfiguration(format!(
                 "Server '{}' for tool '{}' is not active",
-                server_name, tool_name
+                bundle_id, tool_name
             ))
         })
     }
@@ -716,12 +716,12 @@ impl MCPServerManager {
     /// 调用工具 / Call tool
     pub async fn call_tool(
         &self,
-        server_name: &str,
+        bundle_id: &str,
         tool_name: &str,
         parameters: serde_json::Value,
         timeout: Option<std::time::Duration>,
     ) -> Result<CallToolResult, ComputerError> {
-        let key = Self::active_key(server_name, tool_name)?;
+        let key = Self::active_key(bundle_id, tool_name)?;
         // 获取客户端引用 / Get client reference
         let client = {
             let clients = self.active_clients.read().await;
@@ -730,7 +730,7 @@ impl MCPServerManager {
                 .ok_or_else(|| {
                     ComputerError::InvalidConfiguration(format!(
                         "Server '{}' for tool '{}' is not active",
-                        server_name, tool_name
+                        bundle_id, tool_name
                     ))
                 })?
                 .clone()
@@ -758,13 +758,13 @@ impl MCPServerManager {
     /// - 超时 → [`ComputerError::TimeoutError`]（`Computer` 写 `meta.a2c_timeout`）。
     pub async fn call_tool_cancellable(
         &self,
-        server_name: &str,
+        bundle_id: &str,
         tool_name: &str,
         parameters: serde_json::Value,
         timeout: Option<std::time::Duration>,
         cancel: CancellationToken,
     ) -> Result<CancellableCallOutcome, ComputerError> {
-        let key = Self::active_key(server_name, tool_name)?;
+        let key = Self::active_key(bundle_id, tool_name)?;
         // 获取客户端引用 / Get client reference
         let client = {
             let clients = self.active_clients.read().await;
@@ -773,7 +773,7 @@ impl MCPServerManager {
                 .ok_or_else(|| {
                     ComputerError::InvalidConfiguration(format!(
                         "Server '{}' for tool '{}' is not active",
-                        server_name, tool_name
+                        bundle_id, tool_name
                     ))
                 })?
                 .clone()
@@ -820,7 +820,7 @@ impl MCPServerManager {
     /// 成功结果：注入合并后的 `tool_meta` + 可选 VRL 转换。
     async fn finalize_tool_result(
         &self,
-        server_name: &BundleId,
+        bundle_id: &BundleId,
         tool_name: &str,
         result: Result<CallToolResult, MCPClientError>,
     ) -> Result<CallToolResult, ComputerError> {
@@ -833,10 +833,10 @@ impl MCPServerManager {
             Err(e) => match auth_error::classify_auth_error(&e) {
                 Some(code) => {
                     let hint = auth_error::build_default_auth_hint(code);
-                    // 协议 0.3.0 §身份正交性（#18）：授权错误 `meta.mcp_server` = **bundle_id**（形参 server_name
+                    // 协议 0.3.0 §身份正交性（#18）：授权错误 `meta.mcp_server` = **bundle_id**（形参 bundle_id
                     // 即 call_tool 传入的 bundle_id 身份键），与 `get_config` 归属一致，Agent 可 correlate 到具体 server。
                     return Ok(auth_error::build_auth_error_result(
-                        server_name.as_str(),
+                        bundle_id.as_str(),
                         code,
                         hint,
                     ));
@@ -853,7 +853,7 @@ impl MCPServerManager {
         // 添加工具元数据到结果 / Add tool metadata to result
         let config = {
             let configs = self.servers_config.read().await;
-            configs.get(server_name).cloned()
+            configs.get(bundle_id).cloned()
         };
 
         if let Some(config) = config {
@@ -1290,7 +1290,7 @@ impl MCPServerManager {
             Ok(pair) => Ok(pair),
             Err(MCPClientError::CapabilityNotSupported(cap)) => {
                 Err(ComputerError::McpCapabilityNotSupported {
-                    server_name: bundle_id.to_string(),
+                    bundle_id: bundle_id.to_string(),
                     capability: cap,
                 })
             }
@@ -1489,8 +1489,7 @@ impl MCPServerManager {
                 }
 
                 // 获取所有活动客户端 / Get all active clients
-                // 键 = bundle_id（`active_clients` 的身份键）。局部变量仍名 `server_name` 属「名叫 name、
-                // 值是 id」残留 → #132 卫生批次统一改名；本轮只落类型。
+                // 键 = bundle_id（`active_clients` 的身份键、非 display 名）——下方循环变量即以 `bundle_id` 命名。
                 let clients: Vec<(BundleId, StdArc<dyn MCPClientProtocol>)> = {
                     let clients_guard = active_clients.read().await;
                     clients_guard
@@ -1500,7 +1499,8 @@ impl MCPServerManager {
                 };
 
                 // 对每个客户端执行健康检查 / Perform health check on each client
-                for (server_name, client) in clients {
+                // 注：`clients` 键（`bundle_id`）源自 `active_clients`（`HashMap<BundleId,_>`），即 server 身份键、非 display 名。
+                for (bundle_id, client) in clients {
                     let check_result = tokio::time::timeout(
                         std::time::Duration::from_secs(config.timeout_secs),
                         client.health_check(),
@@ -1510,13 +1510,13 @@ impl MCPServerManager {
                     let is_healthy = match check_result {
                         Ok(result) => result.is_healthy,
                         Err(_) => {
-                            warn!("Health check timed out for server: {}", server_name);
+                            warn!(bundle_id = %bundle_id, "MCP server health check timed out");
                             false
                         }
                     };
 
                     if !is_healthy {
-                        warn!("Server {} is unhealthy", server_name);
+                        warn!(bundle_id = %bundle_id, "MCP server is unhealthy");
 
                         // 检查是否启用自动重连 / Check if auto-reconnect is enabled
                         let should_reconnect = *auto_reconnect.read().await;
@@ -1526,52 +1526,54 @@ impl MCPServerManager {
 
                         let policy = reconnect_policy.read().await.clone();
                         let mut retries = retry_counts.write().await;
-                        let retry_count = retries.entry(server_name.clone()).or_insert(0);
+                        let retry_count = retries.entry(bundle_id.clone()).or_insert(0);
 
                         if policy.should_retry(*retry_count) {
                             let delay = policy.calculate_delay(*retry_count);
+                            let max_retries_label = if policy.max_retries == 0 {
+                                "∞".to_string()
+                            } else {
+                                policy.max_retries.to_string()
+                            };
                             info!(
-                                "Attempting to reconnect {} (retry {}/{}), delay {:?}",
-                                server_name,
-                                *retry_count + 1,
-                                if policy.max_retries == 0 {
-                                    "∞".to_string()
-                                } else {
-                                    policy.max_retries.to_string()
-                                },
-                                delay
+                                bundle_id = %bundle_id,
+                                retry = *retry_count + 1,
+                                max_retries = %max_retries_label,
+                                ?delay,
+                                "Attempting to reconnect MCP server"
                             );
 
                             tokio::time::sleep(delay).await;
 
                             // 尝试断开并重新连接 / Try disconnect and reconnect
                             if let Err(e) = client.disconnect().await {
-                                warn!("Failed to disconnect {}: {}", server_name, e);
+                                warn!(bundle_id = %bundle_id, error = %e, "Failed to disconnect MCP server");
                             }
 
                             match client.connect().await {
                                 Ok(_) => {
-                                    info!("Successfully reconnected to {}", server_name);
+                                    info!(bundle_id = %bundle_id, "Successfully reconnected to MCP server");
                                     // 重置重试计数 / Reset retry count
                                     *retry_count = 0;
                                 }
                                 Err(e) => {
-                                    error!("Failed to reconnect to {}: {}", server_name, e);
+                                    error!(bundle_id = %bundle_id, error = %e, "Failed to reconnect to MCP server");
                                     *retry_count += 1;
                                 }
                             }
                         } else {
                             error!(
-                                "Max retries ({}) reached for server {}. Giving up.",
-                                policy.max_retries, server_name
+                                bundle_id = %bundle_id,
+                                max_retries = policy.max_retries,
+                                "Max retries reached for MCP server, giving up"
                             );
                             // 可以考虑从活动客户端中移除 / Consider removing from active clients
                         }
                     } else {
                         // 健康检查通过，重置重试计数 / Health check passed, reset retry count
                         let mut retries = retry_counts.write().await;
-                        retries.remove(&server_name);
-                        debug!("Server {} is healthy", server_name);
+                        retries.remove(&bundle_id);
+                        debug!(bundle_id = %bundle_id, "MCP server is healthy");
                     }
                 }
 
@@ -1635,7 +1637,7 @@ impl MCPServerManager {
 
         let config = self.health_check_config.read().await.clone();
 
-        for (server_name, client) in clients {
+        for (bundle_id, client) in clients {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(config.timeout_secs),
                 client.health_check(),
@@ -1652,7 +1654,7 @@ impl MCPServerManager {
                 },
             };
 
-            results.insert(server_name, health_result);
+            results.insert(bundle_id, health_result);
         }
 
         results
@@ -3233,8 +3235,8 @@ mod tests {
         assert_eq!(err.error_code(), 4015);
         assert!(matches!(
             err,
-            ComputerError::McpCapabilityNotSupported { server_name, capability }
-            if server_name == "srv" && capability == "resources"
+            ComputerError::McpCapabilityNotSupported { bundle_id, capability }
+            if bundle_id == "srv" && capability == "resources"
         ));
     }
 

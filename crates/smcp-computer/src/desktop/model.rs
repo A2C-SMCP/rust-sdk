@@ -21,7 +21,7 @@ pub type ServerName = String;
 pub struct ToolCallRecord {
     /// 服务器身份键（`bundle_id`）——desktop 分组/最近排序按此关联（协议 0.3.0 §身份正交性 #18）。
     /// Server identity key (bundle_id); desktop grouping/recency correlates on this。
-    pub bundle_id: ServerName,
+    pub bundle_id: String,
     /// 服务器展示名（display，非身份）/ Server display name (not identity)。
     pub server: ServerName,
     /// 工具名称 / Tool name
@@ -38,7 +38,7 @@ pub struct ToolCallRecord {
 pub struct WindowInfo {
     /// 服务器身份键（`bundle_id`）——desktop **分组键**（协议 0.3.0 §身份正交性 #18：避免同名 server 窗口误并）。
     /// Server identity key (bundle_id); the desktop **grouping key**。
-    pub bundle_id: ServerName,
+    pub bundle_id: String,
     /// 服务器展示名（display，非身份、非分组键）/ Server display name (not identity/grouping key)。
     pub server_name: ServerName,
     /// 资源 / Resource
@@ -50,7 +50,7 @@ pub struct WindowInfo {
 impl WindowInfo {
     /// 创建新的窗口信息 / Create new window info
     pub fn new(
-        bundle_id: ServerName,
+        bundle_id: String,
         server_name: ServerName,
         resource: Resource,
         read_result: ReadResourceResult,

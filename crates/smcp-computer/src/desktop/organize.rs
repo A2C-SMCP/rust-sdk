@@ -8,7 +8,7 @@
 * 描述: 桌面组织策略实现 / Desktop organizing strategy implementation
 */
 use super::metadata::{check_audience, cmp_priority_desc, read_fullscreen, read_priority};
-use super::model::{ServerName, ToolCallRecord, WindowInfo};
+use super::model::{ToolCallRecord, WindowInfo};
 use super::window_uri::{is_window_uri, WindowURI};
 use super::Desktop;
 use crate::mcp_clients::model::{resource_contents_as_text, ReadResourceResult, Resource};
@@ -61,9 +61,9 @@ pub fn organize_desktop(
         }
     }
 
-    // 1) 构建服务器 -> 窗口 列表映射，并解析 priority、fullscreen，保留原始序号以确定"第一个 fullscreen"
-    //    同时过滤无内容的资源（contents 为空时跳过）。为后续渲染，保留 detail。
-    let mut grouped: HashMap<ServerName, Vec<WindowItem>> = HashMap::new();
+    // 1) 构建 **bundle_id → 窗口列表** 映射（键为 server 身份键、非 display 名），并解析 priority、fullscreen，
+    //    保留原始序号以确定"第一个 fullscreen"；同时过滤无内容的资源（contents 为空时跳过）。为后续渲染，保留 detail。
+    let mut grouped: HashMap<String, Vec<WindowItem>> = HashMap::new();
 
     for (idx, window) in windows.into_iter().enumerate() {
         // 过滤无内容的窗口 / Filter windows without content
@@ -96,8 +96,8 @@ pub fn organize_desktop(
     }
 
     // 2) 服务器优先级：根据最近工具调用历史，倒序去重（按 bundle_id 关联，与分组键一致）
-    let mut recent_servers: Vec<ServerName> = Vec::new();
-    let mut seen: HashSet<ServerName> = HashSet::new();
+    let mut recent_servers: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for rec in history.iter().rev() {
         if grouped.contains_key(&rec.bundle_id) && !seen.contains(&rec.bundle_id) {
@@ -106,15 +106,15 @@ pub fn organize_desktop(
         }
     }
 
-    // 其余服务器（未在历史中出现）按名称稳定排序追加
-    let mut remaining: Vec<ServerName> = grouped
+    // 其余服务器（未在历史中出现）按 bundle_id 字典序稳定排序追加
+    let mut remaining: Vec<String> = grouped
         .keys()
         .filter(|s| !seen.contains(*s))
         .cloned()
         .collect();
     remaining.sort();
 
-    let server_order: Vec<ServerName> = recent_servers.into_iter().chain(remaining).collect();
+    let server_order: Vec<String> = recent_servers.into_iter().chain(remaining).collect();
 
     // 3) 每个服务器内按 priority 降序排序（共享比较器，单源化 f32 NaN→Equal 语义）。
     for items in grouped.values_mut() {
@@ -176,10 +176,10 @@ pub fn organize_desktop(
 /// Pure detector: returns hosts exposed by ≥2 distinct MCP servers (distinctness by `bundle_id`; sorted,
 /// stable). Callers emit a non-blocking lint WARN; desktop organizing groups by `bundle_id` and does not
 /// depend on host uniqueness. No reverse host index exists (mirrors the Python reference).
-pub(crate) fn detect_host_collisions(windows: &[WindowInfo]) -> Vec<(String, Vec<ServerName>)> {
+pub(crate) fn detect_host_collisions(windows: &[WindowInfo]) -> Vec<(String, Vec<String>)> {
     use std::collections::BTreeMap;
 
-    let mut by_host: BTreeMap<String, Vec<ServerName>> = BTreeMap::new();
+    let mut by_host: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for w in windows {
         // 仅 window:// 资源参与 host 唯一性检查；非法/非 window URI 跳过（与 organize 守卫一致）。
         if !is_window_uri(&w.resource.uri) {
