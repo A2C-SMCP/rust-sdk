@@ -162,13 +162,13 @@ impl MCPServerManager {
     /// 为指定 server 构造通知上报接缝（发送端已注入时）/ build a per-client notify seam if a sender is set。
     ///
     /// 以 `bundle_id`（server 唯一身份）打来源标签（#127）——消费侧的定向重挂据此寻址。
-    async fn notify_ctx_for(&self, bundle_id: &str) -> Option<ClientNotifyCtx> {
+    async fn notify_ctx_for(&self, bundle_id: &BundleId) -> Option<ClientNotifyCtx> {
         self.change_tx
             .read()
             .await
             .as_ref()
             .map(|tx| ClientNotifyCtx {
-                bundle_id: bundle_id.to_string(),
+                bundle_id: bundle_id.clone(),
                 tx: tx.clone(),
             })
     }
@@ -178,20 +178,14 @@ impl MCPServerManager {
         let _ = self.state_notifier.send(state);
     }
 
-    /// 校验显式 `bundle_id`（若有）后解析出恒有值的 `bundle_id`；显式非法值 → 拒绝（协议 0.3.0，rust-sdk#117）。
+    /// 解析出恒有值的 `bundle_id`：显式配置值优先，否则缺省生成。**在管理器内从所持 config 计算**，避免
+    /// raw/rendered 漂移。
     ///
-    /// 显式含 `.` / `__` / 字符集越界 → [`ComputerError::InvalidConfiguration`]（对应验收「显式非法值拒绝」）；
-    /// 省略 `bundle_id` → 缺省生成（不算错误）。**在管理器内从所持 config 计算**，避免 raw/rendered 漂移。
-    fn resolve_key(config: &MCPServerConfig) -> Result<BundleId, ComputerError> {
-        if let Some(explicit) = config.bundle_id() {
-            bundle_id::validate_bundle_id(explicit).map_err(|e| {
-                ComputerError::InvalidConfiguration(format!(
-                    "invalid bundle_id for server '{}': {e}",
-                    config.name()
-                ))
-            })?;
-        }
-        Ok(bundle_id::resolve_bundle_id(config))
+    /// #130：**不再校验显式值**——[`BundleId`] 构造即校验（`mcp.json` 里的畸形 `bundleId` 在 serde 反序列化的
+    /// **字段级**即判废，由 `settings::mcp_config::validate_server` 逐-server 降级；程序化构造亦拿不到非法
+    /// `BundleId`）⇒ 本函数**无从**收到非法值，故由 `Result` 收敛为**不可失败**。
+    fn resolve_key(config: &MCPServerConfig) -> BundleId {
+        bundle_id::resolve_bundle_id(config)
     }
 
     /// 名称 → `bundle_id` 解析（扫描 `servers_config` 取同名匹配）/ resolve a server name to its bundle_id。
@@ -227,17 +221,21 @@ impl MCPServerManager {
         if let Some(bid) = self.bundle_id_for_name(server_name).await {
             return Some(bid);
         }
+        // 回退：把入参当身份键直取。非法 bundle_id 串**必然**不是已注册键 → None（与"未命中"同义）。
+        let candidate = BundleId::try_from(server_name).ok()?;
         let clients = self.active_clients.read().await;
-        clients
-            .contains_key(server_name)
-            .then(|| server_name.to_string())
+        clients.contains_key(&candidate).then_some(candidate)
     }
 
     /// 初始化管理器 / Initialize manager
     ///
     /// **no-double-open（加载期 first-wins）**：按传入顺序解析每个 server 的 `bundle_id`，重复 `bundle_id`
     /// （无论 connection config 是否相同）仅保留**第一个**，其余作 **Computer 本地配置诊断**（结构化 WARN，
-    /// **非协议错误码**，协议 §config-diagnostics）。显式非法 `bundle_id` 亦作诊断跳过（不硬失败整批 boot）。
+    /// **非协议错误码**，协议 §config-diagnostics）。
+    ///
+    /// #130：「显式非法 `bundle_id` 作诊断跳过」的分支**已前移**——非法值在 `mcp.json` 反序列化的字段级即被
+    /// [`BundleId`] 判废，由 `settings::mcp_config::validate_server` 逐-server drop + 记错（整份文件仍不 abort），
+    /// 故到不了这里。「不硬失败整批 boot」的语义不变，只是判废点更早、更响亮。
     pub async fn initialize(&self, servers: Vec<MCPServerConfig>) -> Result<(), ComputerError> {
         // 停止所有现有客户端 / Stop all existing clients
         self.stop_all().await?;
@@ -249,18 +247,7 @@ impl MCPServerManager {
         {
             let mut configs = self.servers_config.write().await;
             for server in servers {
-                let bid = match Self::resolve_key(&server) {
-                    Ok(bid) => bid,
-                    Err(e) => {
-                        // 显式非法 bundle_id：本地配置诊断，跳过该 server（不中断其余）。
-                        warn!(
-                            server = %server.name(),
-                            error = %e,
-                            "skipping server with invalid explicit bundle_id (config diagnostic)"
-                        );
-                        continue;
-                    }
-                };
+                let bid = Self::resolve_key(&server);
                 match configs.entry(bid.clone()) {
                     std::collections::hash_map::Entry::Occupied(existing) => {
                         // no-double-open：重复 bundle_id，保留 config 顺序第一个（本地配置诊断，非协议错误码）。
@@ -291,9 +278,11 @@ impl MCPServerManager {
     /// 添加或更新服务器配置 / Add or update server configuration
     ///
     /// **no-double-open（运行期 update-in-place）**：按解析出的 `bundle_id` **原地更新**（`name` 可变、
-    /// `bundle_id` 稳定），传入已存在的 `bundle_id` 不算冲突。显式非法 `bundle_id` → 拒绝（返回 Err）。
+    /// `bundle_id` 稳定），传入已存在的 `bundle_id` 不算冲突。
+    ///
+    /// #130：显式非法 `bundle_id` 已无从抵达（[`BundleId`] 构造即校验），故此处不再有该拒绝分支。
     pub async fn add_or_update_server(&self, config: MCPServerConfig) -> Result<(), ComputerError> {
-        let bundle_id = Self::resolve_key(&config)?;
+        let bundle_id = Self::resolve_key(&config);
 
         // 检查是否已激活（按 bundle_id）/ Check if already active (by bundle_id)
         let is_active = {
@@ -344,14 +333,26 @@ impl MCPServerManager {
             self.refresh_tool_routes().await?;
             return Ok(());
         };
-        self.remove_server_by_id(&bundle_id).await
+        self.remove_server_by_key(&bundle_id).await
     }
 
     /// 移除服务器配置（**bundle_id 寻址**，协议 §身份 MUST 用 bundle_id）/ Remove by bundle_id (identity key)。
     ///
     /// 直接按身份键操作，**无** name→bundle_id 桥的歧义（对齐 Python `aremove_server(bundle_id)`）。未注册 →
     /// 幂等 no-op（仍刷新路由保持一致）。
+    ///
+    /// #130：形参暂留 `&str`（库层 API 一律收 `BundleId` 属 #141）。**非法** `bundle_id` 串必然不是已注册键
+    /// ⇒ 归入既有的「未注册 → 幂等 no-op」分支，无新增失败模式。
     pub async fn remove_server_by_id(&self, bundle_id: &str) -> Result<(), ComputerError> {
+        let Ok(bundle_id) = BundleId::try_from(bundle_id) else {
+            self.refresh_tool_routes().await?;
+            return Ok(());
+        };
+        self.remove_server_by_key(&bundle_id).await
+    }
+
+    /// 按身份键移除（内部；已持 [`BundleId`] 的调用方直接走此路，免 `&str` 往返）/ remove by key。
+    async fn remove_server_by_key(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
         let exists = { self.servers_config.read().await.contains_key(bundle_id) };
         if !exists {
             self.refresh_tool_routes().await?;
@@ -405,7 +406,7 @@ impl MCPServerManager {
     }
 
     /// 启动单个客户端（身份键寻址）/ Start single client (bundle_id-addressed, internal)。
-    async fn start_client_by_id(&self, bundle_id: &str) -> Result<(), ComputerError> {
+    async fn start_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
         // 获取配置 / Get configuration
         let config = {
             let configs = self.servers_config.read().await;
@@ -445,7 +446,7 @@ impl MCPServerManager {
         // 添加到活动客户端（按 bundle_id）/ Add to active clients (by bundle_id)
         {
             let mut clients = self.active_clients.write().await;
-            clients.insert(bundle_id.to_string(), client);
+            clients.insert(bundle_id.clone(), client);
         }
 
         // 刷新工具路由 / Refresh tool routes
@@ -469,7 +470,7 @@ impl MCPServerManager {
     }
 
     /// 停止单个客户端（身份键寻址）/ Stop single client (bundle_id-addressed, internal)。
-    async fn stop_client_by_id(&self, bundle_id: &str) -> Result<(), ComputerError> {
+    async fn stop_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
         // 移除客户端 / Remove client
         let mut client = {
             let mut clients = self.active_clients.write().await;
@@ -494,7 +495,7 @@ impl MCPServerManager {
     }
 
     /// 重启服务器（身份键寻址）/ Restart server (bundle_id-addressed, internal)。
-    async fn restart_client_by_id(&self, bundle_id: &str) -> Result<(), ComputerError> {
+    async fn restart_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
         self.stop_client_by_id(bundle_id).await?;
 
         // 检查是否启用 / Check if enabled
@@ -699,6 +700,19 @@ impl MCPServerManager {
         ))
     }
 
+    /// 把 pub API 收到的 `&str` 身份键转为 [`BundleId`]（#130 过渡垫片）/ parse a pub-API id param。
+    ///
+    /// 形参改收 `BundleId` 属 **#141**（库层 API 一律收 bundle_id）；在此之前，非法串**必然**不是活动键
+    /// ⇒ 归入既有的「未激活」错误，**无新增失败模式、无行为变更**。
+    fn active_key(server_name: &str, tool_name: &str) -> Result<BundleId, ComputerError> {
+        BundleId::try_from(server_name).map_err(|_| {
+            ComputerError::InvalidConfiguration(format!(
+                "Server '{}' for tool '{}' is not active",
+                server_name, tool_name
+            ))
+        })
+    }
+
     /// 调用工具 / Call tool
     pub async fn call_tool(
         &self,
@@ -707,11 +721,12 @@ impl MCPServerManager {
         parameters: serde_json::Value,
         timeout: Option<std::time::Duration>,
     ) -> Result<CallToolResult, ComputerError> {
+        let key = Self::active_key(server_name, tool_name)?;
         // 获取客户端引用 / Get client reference
         let client = {
             let clients = self.active_clients.read().await;
             clients
-                .get(server_name)
+                .get(&key)
                 .ok_or_else(|| {
                     ComputerError::InvalidConfiguration(format!(
                         "Server '{}' for tool '{}' is not active",
@@ -730,8 +745,7 @@ impl MCPServerManager {
             client.call_tool(tool_name, parameters).await
         };
 
-        self.finalize_tool_result(server_name, tool_name, result)
-            .await
+        self.finalize_tool_result(&key, tool_name, result).await
     }
 
     /// 可取消工具调用（INT-02 #70 取消最后一公里）/ Cancellable tool call.
@@ -750,11 +764,12 @@ impl MCPServerManager {
         timeout: Option<std::time::Duration>,
         cancel: CancellationToken,
     ) -> Result<CancellableCallOutcome, ComputerError> {
+        let key = Self::active_key(server_name, tool_name)?;
         // 获取客户端引用 / Get client reference
         let client = {
             let clients = self.active_clients.read().await;
             clients
-                .get(server_name)
+                .get(&key)
                 .ok_or_else(|| {
                     ComputerError::InvalidConfiguration(format!(
                         "Server '{}' for tool '{}' is not active",
@@ -788,12 +803,12 @@ impl MCPServerManager {
             Ok(CancellableCallOutcome::Cancelled) => Ok(CancellableCallOutcome::Cancelled),
             // 完成：跑与 call_tool 一致的收尾（授权分流可能把 4006/4007 转成协议形状授权结果）。
             Ok(CancellableCallOutcome::Completed(r)) => self
-                .finalize_tool_result(server_name, tool_name, Ok(r))
+                .finalize_tool_result(&key, tool_name, Ok(r))
                 .await
                 .map(CancellableCallOutcome::Completed),
             // 上游错误：交由 finalize 的授权分流（Err 路径）；非授权类仍上抛 ProtocolError。
             Err(e) => self
-                .finalize_tool_result(server_name, tool_name, Err(e))
+                .finalize_tool_result(&key, tool_name, Err(e))
                 .await
                 .map(CancellableCallOutcome::Completed),
         }
@@ -805,7 +820,7 @@ impl MCPServerManager {
     /// 成功结果：注入合并后的 `tool_meta` + 可选 VRL 转换。
     async fn finalize_tool_result(
         &self,
-        server_name: &str,
+        server_name: &BundleId,
         tool_name: &str,
         result: Result<CallToolResult, MCPClientError>,
     ) -> Result<CallToolResult, ComputerError> {
@@ -820,7 +835,11 @@ impl MCPServerManager {
                     let hint = auth_error::build_default_auth_hint(code);
                     // 协议 0.3.0 §身份正交性（#18）：授权错误 `meta.mcp_server` = **bundle_id**（形参 server_name
                     // 即 call_tool 传入的 bundle_id 身份键），与 `get_config` 归属一致，Agent 可 correlate 到具体 server。
-                    return Ok(auth_error::build_auth_error_result(server_name, code, hint));
+                    return Ok(auth_error::build_auth_error_result(
+                        server_name.as_str(),
+                        code,
+                        hint,
+                    ));
                 }
                 None => {
                     return Err(ComputerError::ProtocolError(format!(
@@ -912,7 +931,7 @@ impl MCPServerManager {
     ) -> Result<CallToolResult, ComputerError> {
         let (bundle_id, _server_name, original_tool_name) =
             self.validate_tool_call(tool_name, &parameters).await?;
-        self.call_tool(&bundle_id, &original_tool_name, parameters, timeout)
+        self.call_tool(bundle_id.as_str(), &original_tool_name, parameters, timeout)
             .await
     }
 
@@ -1050,7 +1069,10 @@ impl MCPServerManager {
             }
 
             // key = bundle_id（server 唯一身份，协议 0.3.0 #18）；name 已作为 value 字段暴露。
-            result.insert(bundle_id.clone(), serde_json::Value::Object(server_info));
+            result.insert(
+                bundle_id.to_string(),
+                serde_json::Value::Object(server_info),
+            );
         }
 
         serde_json::Value::Object(result)
@@ -1140,7 +1162,7 @@ impl MCPServerManager {
                 let name = configs
                     .get(bundle_id)
                     .map(|cfg| cfg.name().to_string())
-                    .unwrap_or_else(|| bundle_id.clone());
+                    .unwrap_or_else(|| bundle_id.to_string());
                 (name, client.clone())
             })
             .collect()
@@ -1256,9 +1278,10 @@ impl MCPServerManager {
         cursor: Option<String>,
     ) -> Result<(Vec<Resource>, Option<String>), ComputerError> {
         // bundle_id 寻址：直查 active_clients（身份键 == 键，不经 name 解析）。未命中 → 4014 携 bundle_id。
-        let client = {
-            let clients = self.active_clients.read().await;
-            clients.get(bundle_id).cloned()
+        // #130：形参暂留 `&str`（→ #141）；非法串必然不是活动键 ⇒ 归入既有的「未命中 → 4014」。
+        let client = match BundleId::try_from(bundle_id) {
+            Ok(key) => self.active_clients.read().await.get(&key).cloned(),
+            Err(_) => None,
         };
         let client =
             client.ok_or_else(|| ComputerError::McpServerNotFound(bundle_id.to_string()))?;
@@ -1296,7 +1319,7 @@ impl MCPServerManager {
                     let name = configs
                         .get(bundle_id)
                         .map(|c| c.name().to_string())
-                        .unwrap_or_else(|| bundle_id.clone());
+                        .unwrap_or_else(|| bundle_id.to_string());
                     (bundle_id.clone(), name, client.clone())
                 })
                 .collect()
@@ -1342,7 +1365,7 @@ impl MCPServerManager {
     /// 避免两条读路径分叉。
     async fn read_resource_by_id(
         &self,
-        bundle_id: &str,
+        bundle_id: &BundleId,
         resource: Resource,
     ) -> Result<ReadResourceResult, ComputerError> {
         let client = {
@@ -1466,7 +1489,9 @@ impl MCPServerManager {
                 }
 
                 // 获取所有活动客户端 / Get all active clients
-                let clients: Vec<(String, StdArc<dyn MCPClientProtocol>)> = {
+                // 键 = bundle_id（`active_clients` 的身份键）。局部变量仍名 `server_name` 属「名叫 name、
+                // 值是 id」残留 → #132 卫生批次统一改名；本轮只落类型。
+                let clients: Vec<(BundleId, StdArc<dyn MCPClientProtocol>)> = {
                     let clients_guard = active_clients.read().await;
                     clients_guard
                         .iter()
@@ -1644,10 +1669,14 @@ impl MCPServerManager {
 
     /// 重置特定服务器的重试计数（名称寻址，内部解析为身份键；未匹配名则按原样当键）/ Reset retry count。
     pub async fn reset_retry_count(&self, server_name: &str) {
-        let key = self
-            .bundle_id_for_name(server_name)
-            .await
-            .unwrap_or_else(|| server_name.to_string());
+        // 名未注册 → 回退把入参当身份键（非法串则无键可删，直接返回）。
+        let key = match self.bundle_id_for_name(server_name).await {
+            Some(k) => k,
+            None => match BundleId::try_from(server_name) {
+                Ok(k) => k,
+                Err(_) => return,
+            },
+        };
         self.retry_counts.write().await.remove(&key);
     }
 
@@ -1673,7 +1702,8 @@ impl SkillResourceManager for MCPServerManager {
             // rmcp `Resource._meta`（`Option<Meta(JsonObject)>`）→ staging 的 `Map<String, Value>`。
             let meta = resource.meta.clone().map(|m| m.0).unwrap_or_default();
             out.push((
-                bid,
+                // trait 边界仍收 `String`（`SkillResourceManager` 定义在 skills 模块）→ #132/#141 统一改型。
+                bid.into_string(),
                 McpResource {
                     uri: resource.uri.clone(),
                     meta,
@@ -1692,8 +1722,12 @@ impl SkillResourceManager for MCPServerManager {
         // 的 name-first 回退会在「某 server 的 display 名恰等于另一 server 的 bundle_id」时路由到错的 server）。
         // Reuse the manager's bundle_id-direct generic read (no name resolution).
         let resource = make_resource(uri, uri, None, None);
+        // trait 边界仍收 `&str`（→ #132/#141）；非法 bundle_id 串必然不是活动键 → 与「未连接」同义。
+        let key = BundleId::try_from(bundle_id).map_err(|e| {
+            SkillStagingError(format!("read_resource '{uri}' from '{bundle_id}': {e}"))
+        })?;
         let result = self
-            .read_resource_by_id(bundle_id, resource)
+            .read_resource_by_id(&key, resource)
             .await
             .map_err(|e| {
                 SkillStagingError(format!("read_resource '{uri}' from '{bundle_id}': {e}"))
@@ -1731,6 +1765,13 @@ impl Default for MCPServerManager {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    /// 测试夹具：构造合法 [`BundleId`]（非法字面量在此 panic —— 夹具写错须立刻暴露，而非静默成 `String`）。
+    ///
+    /// #130：夹具此前直写 `String`；改型后身份键须经构造校验，这也顺带守护「夹具取值必须是合法 bundle_id」。
+    pub(crate) fn bid(s: &str) -> BundleId {
+        BundleId::try_from(s).expect("测试夹具的 bundle_id 字面量必须合法")
+    }
 
     /// 受控分页的假 MCP client：按 cursor 顺序返回各页，可注入翻页失败 / 能力缺失 / read 文本。
     /// Controllable fake MCP client paginating canned pages, with injectable failure/cap-fail/read text.
@@ -1830,14 +1871,14 @@ pub(crate) mod test_support {
     /// 把假 client 注入 manager 的 `active_clients`（键 = `bundle_id`）/ inject a fake client。
     pub(crate) async fn inject(
         manager: &MCPServerManager,
-        bundle_id: &str,
+        bundle_id: &BundleId,
         client: MockSkillClient,
     ) {
         manager
             .active_clients
             .write()
             .await
-            .insert(bundle_id.to_string(), StdArc::new(client));
+            .insert(bundle_id.clone(), StdArc::new(client));
     }
 
     /// 构造带**显式** bundle_id 的 stdio 配置（其余占位）/ a stdio config with an explicit bundle_id。
@@ -1851,7 +1892,7 @@ pub(crate) mod test_support {
                 cwd: None,
             },
         );
-        c.bundle_id = bundle_id.map(String::from);
+        c.bundle_id = bundle_id.map(bid);
         MCPServerConfig::Stdio(c)
     }
 
@@ -1861,14 +1902,14 @@ pub(crate) mod test_support {
     /// 仅 [`inject`] 时 `servers_config` 为空，展示名会回退成 bundle_id，测不出两者分歧。
     pub(crate) async fn inject_config(
         manager: &MCPServerManager,
-        bundle_id: &str,
+        bundle_id: &BundleId,
         config: MCPServerConfig,
     ) {
         manager
             .servers_config
             .write()
             .await
-            .insert(bundle_id.to_string(), config);
+            .insert(bundle_id.clone(), config);
     }
 
     // ── INT-02 #70：可取消调用的共享假 client（manager 三态 + computer 端到端共用）──────────
@@ -1952,14 +1993,15 @@ pub(crate) mod test_support {
         tool: &str,
         behavior: CancelBehavior,
     ) {
-        manager.active_clients.write().await.insert(
-            server.to_string(),
-            StdArc::new(CancelMockClient { behavior }),
-        );
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bid(server), StdArc::new(CancelMockClient { behavior }));
         manager.tool_routes.write().await.insert(
             tool.to_string(),
             ExposedToolRoute {
-                bundle_id: server.to_string(),
+                bundle_id: bid(server),
                 server_name: server.to_string(),
                 original_tool_name: tool.to_string(),
                 alias: None,
@@ -2069,12 +2111,16 @@ pub(crate) mod test_support {
 
     /// 用给定工具集构造 [`MockToolsClient`] 并注入 `active_clients`；配套 `ServerConfig` 由调用方写入
     /// `servers_config`（`refresh_tool_mapping` 同时读两者）。Inject a `MockToolsClient` into `active_clients`.
-    pub(crate) async fn inject_tools(manager: &MCPServerManager, name: &str, tools: Vec<Tool>) {
+    pub(crate) async fn inject_tools(
+        manager: &MCPServerManager,
+        bundle_id: &BundleId,
+        tools: Vec<Tool>,
+    ) {
         manager
             .active_clients
             .write()
             .await
-            .insert(name.to_string(), StdArc::new(MockToolsClient { tools }));
+            .insert(bundle_id.clone(), StdArc::new(MockToolsClient { tools }));
     }
 
     /// 计数版 [`MockToolsClient`]：`list_tools` 每次调用 `calls += 1`，供 #91「每 server 仅拉一次
@@ -2185,7 +2231,7 @@ pub(crate) mod test_support {
     ) -> StdArc<std::sync::atomic::AtomicUsize> {
         let calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
         manager.active_clients.write().await.insert(
-            name.to_string(),
+            bid(name),
             StdArc::new(CountingToolsClient {
                 tools,
                 calls: calls.clone(),
@@ -2197,7 +2243,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::stdio_cfg_with_bundle;
+    use super::test_support::{bid, stdio_cfg_with_bundle};
     use super::*;
     use std::collections::HashMap;
     use tokio::time::{sleep, Duration};
@@ -2255,7 +2301,7 @@ mod tests {
     /// 注入 `AuthErrClient` 到 `active_clients`（auth 分支在 `servers_config` 读取前早返回，仅需此）。
     async fn inject_auth_err(manager: &MCPServerManager, name: &str, msg: &str) {
         manager.active_clients.write().await.insert(
-            name.to_string(),
+            bid(name),
             StdArc::new(AuthErrClient {
                 msg: msg.to_string(),
             }),
@@ -2449,7 +2495,7 @@ mod tests {
         let status = manager.get_server_status().await;
         assert_eq!(status.len(), 1, "重复 bundle_id 应只留一条: {status:?}");
         let configs = manager.servers_config.read().await;
-        let kept = configs.get("dup").expect("bundle_id=dup 应存在");
+        let kept = configs.get(&bid("dup")).expect("bundle_id=dup 应存在");
         match kept {
             MCPServerConfig::Stdio(c) => {
                 assert_eq!(
@@ -2472,12 +2518,15 @@ mod tests {
 
         let configs = manager.servers_config.read().await;
         assert_eq!(configs.len(), 2, "不同 bundle_id 的同名 server 应共存");
-        assert!(configs.contains_key("playwright"));
-        assert!(configs.contains_key("playwright_isolated"));
+        assert!(configs.contains_key(&bid("playwright")));
+        assert!(configs.contains_key(&bid("playwright_isolated")));
         // 两者 name 相同、身份不同。
-        assert_eq!(configs.get("playwright").unwrap().name(), "playwright");
         assert_eq!(
-            configs.get("playwright_isolated").unwrap().name(),
+            configs.get(&bid("playwright")).unwrap().name(),
+            "playwright"
+        );
+        assert_eq!(
+            configs.get(&bid("playwright_isolated")).unwrap().name(),
             "playwright"
         );
     }
@@ -2501,7 +2550,7 @@ mod tests {
 
         let configs = manager.servers_config.read().await;
         assert_eq!(configs.len(), 1, "同 bundle_id 应原地更新，不新增");
-        let updated = configs.get("fixed_id").expect("bundle_id 稳定");
+        let updated = configs.get(&bid("fixed_id")).expect("bundle_id 稳定");
         assert_eq!(updated.name(), "srv-renamed", "name 可变");
         match updated {
             MCPServerConfig::Stdio(c) => {
@@ -2511,34 +2560,27 @@ mod tests {
         }
     }
 
-    /// 显式非法 bundle_id：运行期 add → 拒绝（Err）；加载期 initialize → 跳过该条 + 保留合法条（本地诊断）。
-    #[tokio::test]
-    async fn invalid_explicit_bundle_id_rejected_or_skipped() {
-        let manager = MCPServerManager::new();
-        // 运行期：含 "__" 非法 → Err。
-        let bad = stdio_cfg_with_bundle("x", Some("a__b"));
-        assert!(
-            manager.add_or_update_server(bad).await.is_err(),
-            "显式含 __ 应拒绝"
-        );
-        // 含 "." 非法 → Err。
-        let bad_dot = stdio_cfg_with_bundle("y", Some("a.b"));
-        assert!(
-            manager.add_or_update_server(bad_dot).await.is_err(),
-            "显式含 . 应拒绝"
-        );
-
-        // 加载期：一条非法 + 一条合法 → 跳过非法、保留合法（不硬失败整批）。
-        let mgr2 = MCPServerManager::new();
-        mgr2.initialize(vec![
-            stdio_cfg_with_bundle("bad", Some("has__sep")),
-            stdio_cfg_with_bundle("good", Some("good_id")),
-        ])
-        .await
-        .unwrap();
-        let configs = mgr2.servers_config.read().await;
-        assert_eq!(configs.len(), 1, "非法条应跳过、合法条保留");
-        assert!(configs.contains_key("good_id"));
+    /// #130：「显式非法 bundle_id 抵达 manager」这一失效模式已被**类型**消灭。
+    ///
+    /// 原测断言「运行期 add → Err；加载期 initialize → 跳过该条」。[`BundleId`] 构造即校验后，非法值**根本
+    /// 构造不出来** ⇒ manager 无从收到它，那两个分支不再可达（已随 `resolve_key` 的 `Result` 一并移除）。
+    ///
+    /// **保证没有消失，只是前移且更响亮**，由两处接管——本测钉死①，②见
+    /// `settings::mcp_config::tests::malformed_bundle_id_degrades_per_server_130`：
+    /// 1. **构造边界**：非法值 → `Err`，编译期就不存在"带着非法 id 的 config"这种值；
+    /// 2. **parse 边界**：`mcp.json` 的畸形 `bundleId` → 该 server **单条**判废 + 记错，**整份文件照常解析**
+    ///    （即原「不硬失败整批 boot」语义的新家）。
+    #[test]
+    fn invalid_explicit_bundle_id_is_unconstructible_130() {
+        // 含 `__` / `.` / 空 —— 原测覆盖的三类非法值，现在连值都造不出来。
+        for bad in ["a__b", "has__sep", "a.b", ""] {
+            assert!(
+                BundleId::try_from(bad).is_err(),
+                "{bad:?} 是非法 bundle_id，MUST 构造失败"
+            );
+        }
+        // 不过度矫正：合法值仍可构造。
+        assert!(BundleId::try_from("good_id").is_ok());
     }
 
     /// 空名 stdio → fallback 缺省生成（`bundle_` + 16 hex），仍可作身份键注册。
@@ -2553,8 +2595,11 @@ mod tests {
         let configs = manager.servers_config.read().await;
         assert_eq!(configs.len(), 1);
         let key = configs.keys().next().unwrap();
-        assert!(key.starts_with("bundle_"), "空规范化应触发 fallback: {key}");
-        assert_eq!(key.len(), "bundle_".len() + 16);
+        assert!(
+            key.as_str().starts_with("bundle_"),
+            "空规范化应触发 fallback: {key}"
+        );
+        assert_eq!(key.as_str().len(), "bundle_".len() + 16);
     }
 
     /// name != bundle_id（显式 bundle_id）时，name-addressed 的 reset_retry_count 应解析到 bundle_id 键。
@@ -2567,18 +2612,14 @@ mod tests {
             .servers_config
             .write()
             .await
-            .insert("bid".to_string(), stdio_cfg_with_bundle("srv", Some("bid")));
+            .insert(bid("bid"), stdio_cfg_with_bundle("srv", Some("bid")));
         // retry_counts 以 bundle_id 为键。
-        manager
-            .retry_counts
-            .write()
-            .await
-            .insert("bid".to_string(), 3);
+        manager.retry_counts.write().await.insert(bid("bid"), 3);
 
         // 按**名**重置 → 内部解析到 bundle_id 键并移除。
         manager.reset_retry_count("srv").await;
         assert!(
-            !manager.get_retry_counts().await.contains_key("bid"),
+            !manager.get_retry_counts().await.contains_key(&bid("bid")),
             "按名重置应解析到 bundle_id 键并清除"
         );
     }
@@ -2589,7 +2630,7 @@ mod tests {
         let manager = MCPServerManager::new();
         // 展示名 "display-name" ≠ 显式 bundle_id "id_x"，以区分 key/name。
         manager.servers_config.write().await.insert(
-            "id_x".to_string(),
+            bid("id_x"),
             stdio_cfg_with_bundle("display-name", Some("id_x")),
         );
 
@@ -2629,11 +2670,11 @@ mod tests {
         let manager = MCPServerManager::new();
         // bundle_id "id_x" ≠ 展示名 "display-name"。
         manager.servers_config.write().await.insert(
-            "id_x".to_string(),
+            bid("id_x"),
             stdio_cfg_with_bundle("display-name", Some("id_x")),
         );
         manager.active_clients.write().await.insert(
-            "id_x".to_string(),
+            bid("id_x"),
             StdArc::new(WindowMockClient {
                 uri: "window://a.mcp.com/w".to_string(),
             }),
@@ -2662,19 +2703,19 @@ mod tests {
         use super::test_support::{inject, inject_config, skill_resource, MockSkillClient};
         let manager = MCPServerManager::new();
         // 两个 server 共用 display 名 "same-display-name"，bundle_id 各异（协议：name 允许碰撞）。
-        for bid in ["id_a", "id_b"] {
+        for id in ["id_a", "id_b"] {
             inject_config(
                 &manager,
-                bid,
-                stdio_cfg_with_bundle("same-display-name", Some(bid)),
+                &bid(id),
+                stdio_cfg_with_bundle("same-display-name", Some(id)),
             )
             .await;
             inject(
                 &manager,
-                bid,
+                &bid(id),
                 MockSkillClient {
                     pages: vec![vec![skill_resource(
-                        &format!("skill://h.example.com/{bid}"),
+                        &format!("skill://h.example.com/{id}"),
                         Some("mounted"),
                     )]],
                     fail: false,
@@ -2685,7 +2726,7 @@ mod tests {
             .await;
         }
 
-        let mut keys: Vec<String> = manager
+        let mut keys: Vec<BundleId> = manager
             .list_skill_resources(None)
             .await
             .into_iter()
@@ -2694,7 +2735,7 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec!["id_a", "id_b"],
+            vec![bid("id_a"), bid("id_b")],
             ".0 应为 bundle_id：两个同名 server 须各自可辨（旧实现两条都标 'same-display-name'）"
         );
 
@@ -2719,16 +2760,16 @@ mod tests {
     async fn check_all_health_keys_by_bundle_id_127() {
         use super::test_support::{inject, inject_config, MockSkillClient};
         let manager = MCPServerManager::new();
-        for bid in ["id_a", "id_b"] {
+        for id in ["id_a", "id_b"] {
             inject_config(
                 &manager,
-                bid,
-                stdio_cfg_with_bundle("same-display-name", Some(bid)),
+                &bid(id),
+                stdio_cfg_with_bundle("same-display-name", Some(id)),
             )
             .await;
             inject(
                 &manager,
-                bid,
+                &bid(id),
                 MockSkillClient {
                     pages: vec![],
                     fail: false,
@@ -2740,11 +2781,11 @@ mod tests {
         }
 
         let health = manager.check_all_health().await;
-        let mut keys: Vec<&String> = health.keys().collect();
+        let mut keys: Vec<BundleId> = health.keys().cloned().collect();
         keys.sort();
         assert_eq!(
             keys,
-            vec!["id_a", "id_b"],
+            vec![bid("id_a"), bid("id_b")],
             "键应为 bundle_id：两个同名 server 各须有独立健康结果（旧实现丢一条）"
         );
     }
@@ -2869,27 +2910,19 @@ mod tests {
 
         // 通过内部操作添加重试计数 / Add retry counts through internal operation
         {
-            manager
-                .retry_counts
-                .write()
-                .await
-                .insert("server1".to_string(), 3);
-            manager
-                .retry_counts
-                .write()
-                .await
-                .insert("server2".to_string(), 5);
+            manager.retry_counts.write().await.insert(bid("server1"), 3);
+            manager.retry_counts.write().await.insert(bid("server2"), 5);
         }
 
         let counts = manager.get_retry_counts().await;
-        assert_eq!(counts.get("server1"), Some(&3));
-        assert_eq!(counts.get("server2"), Some(&5));
+        assert_eq!(counts.get(&bid("server1")), Some(&3));
+        assert_eq!(counts.get(&bid("server2")), Some(&5));
 
         // 重置单个服务器 / Reset single server
         manager.reset_retry_count("server1").await;
         let counts = manager.get_retry_counts().await;
-        assert!(!counts.contains_key("server1"));
-        assert_eq!(counts.get("server2"), Some(&5));
+        assert!(!counts.contains_key(&bid("server1")));
+        assert_eq!(counts.get(&bid("server2")), Some(&5));
 
         // 重置所有 / Reset all
         manager.reset_all_retry_counts().await;
@@ -3081,7 +3114,7 @@ mod tests {
         ];
         inject(
             &manager,
-            "srv",
+            &bid("srv"),
             MockSkillClient {
                 pages,
                 fail: false,
@@ -3103,7 +3136,7 @@ mod tests {
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "srv",
+            &bid("srv"),
             MockSkillClient {
                 pages: vec![vec![skill_resource("skill://srv/a", Some("mounted"))]],
                 fail: false,
@@ -3138,7 +3171,7 @@ mod tests {
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "bad",
+            &bid("bad"),
             MockSkillClient {
                 pages: vec![],
                 fail: true,
@@ -3149,7 +3182,7 @@ mod tests {
         .await;
         inject(
             &manager,
-            "good",
+            &bid("good"),
             MockSkillClient {
                 pages: vec![vec![skill_resource("skill://good/a", Some("mounted"))]],
                 fail: false,
@@ -3187,7 +3220,7 @@ mod tests {
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "srv",
+            &bid("srv"),
             MockSkillClient {
                 pages: vec![],
                 fail: false,
@@ -3210,7 +3243,7 @@ mod tests {
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "srv",
+            &bid("srv"),
             MockSkillClient {
                 pages: vec![
                     vec![make_resource("res://a", "a", None, None)],
@@ -3424,7 +3457,7 @@ mod tests {
             .servers_config
             .write()
             .await
-            .insert("srv".to_string(), stdio_cfg("srv", vec![], HashMap::new()));
+            .insert(bid("srv"), stdio_cfg("srv", vec![], HashMap::new()));
         manager.refresh_tool_mapping().await.expect("refresh ok");
 
         // 归零，隔离 refresh_tool_mapping 自身那次 list_tools —— 仅测 list_available_tools。
@@ -3450,14 +3483,8 @@ mod tests {
             inject_counting_tools(&manager, "srvB", vec![tool_named("b1"), tool_named("b2")]).await;
         {
             let mut cfgs = manager.servers_config.write().await;
-            cfgs.insert(
-                "srvA".to_string(),
-                stdio_cfg("srvA", vec![], HashMap::new()),
-            );
-            cfgs.insert(
-                "srvB".to_string(),
-                stdio_cfg("srvB", vec![], HashMap::new()),
-            );
+            cfgs.insert(bid("srvA"), stdio_cfg("srvA", vec![], HashMap::new()));
+            cfgs.insert(bid("srvB"), stdio_cfg("srvB", vec![], HashMap::new()));
         }
         manager.refresh_tool_mapping().await.expect("refresh ok");
 
@@ -3499,16 +3526,16 @@ mod tests {
             .active_clients
             .write()
             .await
-            .insert("srv".to_string(), StdArc::new(ErrToolsClient));
+            .insert(bid("srv"), StdArc::new(ErrToolsClient));
         manager
             .servers_config
             .write()
             .await
-            .insert("srv".to_string(), stdio_cfg("srv", vec![], HashMap::new()));
+            .insert(bid("srv"), stdio_cfg("srv", vec![], HashMap::new()));
         manager.tool_routes.write().await.insert(
             exposed("srv", "t"),
             ExposedToolRoute {
-                bundle_id: "srv".to_string(),
+                bundle_id: bid("srv"),
                 server_name: "srv".to_string(),
                 original_tool_name: "t".to_string(),
                 alias: None,
@@ -3759,12 +3786,12 @@ mod tests {
 
         // (a) default alias 作为暴露名（带 bundle_id 前缀）/ default alias surfaces as the exposed name
         let mgr_a = MCPServerManager::new();
-        inject_tools(&mgr_a, "srv", vec![tool_named("t")]).await;
+        inject_tools(&mgr_a, &bid("srv"), vec![tool_named("t")]).await;
         mgr_a
             .servers_config
             .write()
             .await
-            .insert("srv".to_string(), cfg_default(vec![]));
+            .insert(bid("srv"), cfg_default(vec![]));
         mgr_a.refresh_tool_routes().await.expect("refresh ok");
         let names: Vec<String> = mgr_a
             .list_available_tools()
@@ -3779,12 +3806,12 @@ mod tests {
 
         // (b) 对原始名 forbid 时，default alias 也被抑制 / forbidding the original name suppresses it too
         let mgr_b = MCPServerManager::new();
-        inject_tools(&mgr_b, "srv", vec![tool_named("t")]).await;
+        inject_tools(&mgr_b, &bid("srv"), vec![tool_named("t")]).await;
         mgr_b
             .servers_config
             .write()
             .await
-            .insert("srv".to_string(), cfg_default(vec!["t".to_string()]));
+            .insert(bid("srv"), cfg_default(vec!["t".to_string()]));
         mgr_b.refresh_tool_routes().await.expect("refresh ok");
         let names2: Vec<String> = mgr_b
             .list_available_tools()

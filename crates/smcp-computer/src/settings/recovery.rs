@@ -64,7 +64,7 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value};
 
 use crate::mcp_clients::bundle_id::resolve_bundle_id;
-use crate::mcp_clients::model::MCPServerConfig;
+use crate::mcp_clients::model::{BundleId, MCPServerConfig};
 use crate::settings::installer::materialize_plugin_record;
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
@@ -265,7 +265,7 @@ pub fn collect_enabled_bundled_servers(
     // 权威 install-set = `installedPlugins` 意图；账本仅供 installPath / bundled 细节。
     let intent = load_installed_plugins_intent(Some(home), env).account;
     let installed = load_installed_plugins(Some(home), env).account;
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<BundleId> = HashSet::new();
     let mut out: Vec<BundledServerRecord> = Vec::new();
 
     for (pid, records) in &installed.plugins {

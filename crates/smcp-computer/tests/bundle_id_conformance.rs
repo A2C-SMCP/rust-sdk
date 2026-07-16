@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use smcp_computer::mcp_clients::bundle_id::resolve_bundle_id;
+use smcp_computer::mcp_clients::bundle_id::{resolve_bundle_id, BundleId};
 use smcp_computer::mcp_clients::model::{
     HttpServerConfig, HttpServerParameters, MCPServerConfig, SseServerConfig, SseServerParameters,
     StdioServerConfig, StdioServerParameters,
@@ -38,10 +38,12 @@ fn json_string_list(v: &serde_json::Value) -> Vec<String> {
 /// 从扁平向量形式构造 `MCPServerConfig`（经公开构造器；显式 `bundle_id` 直填字段）。
 fn build_config(name: &str, cfg: &serde_json::Value) -> MCPServerConfig {
     let ty = cfg["type"].as_str().expect("type");
+    // #130：向量里的显式 bundle_id 经 `BundleId` 构造校验——夹具取值非法即在此 panic（跨 SDK 向量
+    // 本就只应含合法值；若未来新增"非法值"向量，须改走 `try_from` 的 Err 分支断言，而非静默成 String）。
     let explicit_bundle_id = cfg
         .get("bundle_id")
         .and_then(|v| v.as_str())
-        .map(String::from);
+        .map(|v| BundleId::try_from(v).expect("向量中的显式 bundle_id 必须合法"));
 
     match ty {
         "stdio" => {

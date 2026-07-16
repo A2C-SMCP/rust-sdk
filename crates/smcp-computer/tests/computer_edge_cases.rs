@@ -1,8 +1,8 @@
 use smcp_computer::{
     computer::{Computer, SilentSession},
     mcp_clients::model::{
-        MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification, PromptStringInput,
-        StdioServerConfig, StdioServerParameters,
+        BundleId, MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification,
+        PromptStringInput, StdioServerConfig, StdioServerParameters,
     },
 };
 /**
@@ -304,21 +304,21 @@ async fn test_computer_handle_mcp_notification_no_deps() {
 
     computer
         .handle_mcp_notification(McpServerNotification {
-            server: "srv".to_string(),
+            server: BundleId::try_from("srv").expect("夹具 bundle_id 须合法"),
             kind: McpChangeKind::ToolListChanged,
         })
         .await;
 
     computer
         .handle_mcp_notification(McpServerNotification {
-            server: "srv".to_string(),
+            server: BundleId::try_from("srv").expect("夹具 bundle_id 须合法"),
             kind: McpChangeKind::ResourceListChanged,
         })
         .await;
 
     computer
         .handle_mcp_notification(McpServerNotification {
-            server: "srv".to_string(),
+            server: BundleId::try_from("srv").expect("夹具 bundle_id 须合法"),
             kind: McpChangeKind::ResourceUpdated {
                 uri: "window://1".to_string(),
             },

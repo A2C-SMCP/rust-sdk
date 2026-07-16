@@ -25,12 +25,23 @@ pub const A2C_TOOL_META: &str = "a2c_tool_meta";
 pub const A2C_VRL_TRANSFORMED: &str = "a2c_vrl_transformed";
 
 // 类型别名 / Type aliases
+/// MCP Server 的 **display 名**（给人看、允许碰撞、**非身份**）/ display name (may collide; NOT identity)。
+///
+/// #130：**有意**保持 `String`——display 名混用无害，不值得付 newtype 的 `.0` / `.as_str()` 噪声。
+/// 身份请用 [`BundleId`]（**不同型**，混用即编译红）。
 pub type ServerName = String;
 pub type ToolName = String;
-/// MCP Server 唯一标识（BundleID）/ MCP Server unique identity (BundleID)。见 [`super::bundle_id`]。
-pub type BundleId = String;
 /// 聚合后暴露给 LLM 的工具名 `{bundle_id}__{alias ?? 原始名}` / aggregated exposed tool name。
+///
+/// #130：同 [`ServerName`]，本轮**有意**保持 `String`。
 pub type ExposedToolName = String;
+
+/// MCP Server 唯一标识（BundleID，**构造即校验**）/ MCP Server unique identity (valid by construction)。
+///
+/// #130：由 `pub type BundleId = String`（与 [`ServerName`] 对编译器**完全同型**）改为协议 crate 的
+/// **newtype**——权威定义与合法性判据同处 [`smcp::utils::bundle_id`]，使 wire / SKILL / computer / agent
+/// 共用同一类型与同一权威。缺省生成算法仍在 [`super::bundle_id`]。
+pub use smcp::utils::bundle_id::BundleId;
 
 /// MCP Server 运行期变化通知的种类（#106）/ Kind of a runtime MCP server change notification。
 ///
@@ -150,11 +161,14 @@ impl MCPServerConfig {
     /// 返回 `None` 表示未显式配置——此时**唯一身份**须经 [`super::bundle_id::resolve_bundle_id`]（或
     /// [`derive_bundle_id`](super::bundle_id::derive_bundle_id)）从 `name` 缺省生成。**恒有值的身份**用
     /// [`resolve_bundle_id`](super::bundle_id::resolve_bundle_id)，本访问器只暴露原始显式字段（如用于落盘保真）。
-    pub fn bundle_id(&self) -> Option<&str> {
+    ///
+    /// #130：返回 [`BundleId`] 而非 `&str`——身份不在此处退化为字符串（退化即混用的起点）。
+    #[must_use]
+    pub fn bundle_id(&self) -> Option<&BundleId> {
         match self {
-            MCPServerConfig::Stdio(config) => config.bundle_id.as_deref(),
-            MCPServerConfig::Sse(config) => config.bundle_id.as_deref(),
-            MCPServerConfig::Http(config) => config.bundle_id.as_deref(),
+            MCPServerConfig::Stdio(config) => config.bundle_id.as_ref(),
+            MCPServerConfig::Sse(config) => config.bundle_id.as_ref(),
+            MCPServerConfig::Http(config) => config.bundle_id.as_ref(),
         }
     }
 

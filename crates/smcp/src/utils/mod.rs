@@ -26,7 +26,9 @@ pub use blob::{
     drain_blob, drain_blob_sync, BlobChunkRequest, BlobErrorReason, BlobTransferError,
     DrainBlobOptions, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_RETRIES,
 };
-pub use bundle_id::{is_bundle_id_char, is_valid_bundle_id};
+pub use bundle_id::{
+    is_bundle_id_char, is_valid_bundle_id, validate_bundle_id, BundleId, BundleIdError,
+};
 pub use env::{env_truthy, env_truthy_in, env_truthy_or, is_truthy};
 pub use handshake::{
     apply_polling_first_guard, build_handshake_url, build_protocol_version_error,

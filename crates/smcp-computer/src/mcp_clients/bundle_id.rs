@@ -42,33 +42,14 @@ use super::model::MCPServerConfig;
 use smcp::utils::hash::sha256_hex;
 use std::collections::HashMap;
 
-/// `bundle_id` 校验错误（仅用于**显式**配置值；缺省生成结果恒合法）/ explicit bundle_id validation error。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum BundleIdError {
-    /// 显式 `bundle_id` 为空 / explicit bundle_id is empty。
-    #[error("bundle_id must not be empty")]
-    Empty,
-    /// 含保留分隔符 `__`（BundleID 与工具名的分隔符，禁出现于 BundleID 内）/ contains reserved `__`。
-    #[error("bundle_id '{0}' must not contain the reserved separator '__'")]
-    ReservedSeparator(String),
-    /// 含字符集 `[A-Za-z0-9_-]` 之外的字符（含 `.`）/ contains a char outside `[A-Za-z0-9_-]`。
-    #[error(
-        "bundle_id '{value}' contains illegal character '{ch}' (allowed charset: [A-Za-z0-9_-])"
-    )]
-    IllegalChar {
-        /// 违规的完整值 / the offending value。
-        value: String,
-        /// 首个违规字符 / first offending character。
-        ch: char,
-    },
-}
-
-/// BundleID 字符集判据——**单一权威**在协议 crate（[`smcp::utils::bundle_id`]），本模块只 re-use。
-///
-/// 不在此另写等价谓词：SKILL 的 mcp `<server>` 段**就是** `bundle_id`（skill.md §1.3），其判据由
-/// `smcp::skill_name` 消费；两处若各写一份，一旦漂移即令合法 `bundle_id` 的 SKILL 对 Agent 隐身
-/// （rust-sdk#127 / python-sdk#142 要消灭的失效模式）。
 use smcp::utils::bundle_id::is_bundle_id_char;
+/// BundleID 的**类型 / 判据 / 错误分类**——**单一权威**在协议 crate（[`smcp::utils::bundle_id`]），本模块只
+/// re-export（#130）。**本模块的职责仅剩「缺省生成算法」**。
+///
+/// 不在此另写等价谓词或另一个 newtype：SKILL 的 mcp `<server>` 段**就是** `bundle_id`（skill.md §1.3），其
+/// 判据由 `smcp::skill_name` 消费；两处若各写一份，一旦漂移即令合法 `bundle_id` 的 SKILL 对 Agent 隐身
+/// （rust-sdk#127 / python-sdk#142 要消灭的失效模式）。
+pub use smcp::utils::bundle_id::{validate_bundle_id, BundleId, BundleIdError};
 
 /// Step 1：规范化 `name` → 候选 `bundle_id`（可能为空，空时走 [`derive_bundle_id`] 的 fallback）。
 ///
@@ -157,50 +138,39 @@ pub fn connection_identity_bytes(config: &MCPServerConfig) -> Vec<u8> {
 /// **缺省生成**：从 `name` 派生 `bundle_id`（忽略配置里可能存在的显式 `bundle_id`）。
 ///
 /// `normalize_name(name)` 非空 → 即为结果；为空 → `bundle_` + `sha256(TLV)[:8]` 小写 hex（16 hex 字符）。
-pub fn derive_bundle_id(config: &MCPServerConfig) -> String {
+///
+/// # 产出恒合法（不变量）
+///
+/// 两条分支的产出都**可证**满足 [`smcp::utils::bundle_id::is_valid_bundle_id`]：
+/// - `normalize_name` 已把非字符集码点映射为 `_`、折叠连续 `_`（故无 `__`）、裁首尾——非空分支即合法；
+/// - fallback `bundle_` + 16 位小写 hex：字符集内、单个 `_`、非空——亦合法。
+///
+/// 故此处 `expect` **不可达**；由 `derive_bundle_id_always_yields_valid_id_130` 覆盖（含 CJK / 全符号 /
+/// 空名等会走 fallback 的输入）。
+#[must_use]
+pub fn derive_bundle_id(config: &MCPServerConfig) -> BundleId {
     let normalized = normalize_name(config.name());
-    if !normalized.is_empty() {
-        return normalized;
-    }
-    // fallback：确定性摘要（禁随机 UUID / 内建 hash / base32·64）。sha256_hex 为 64 位小写 hex，取前 16 = 前 8 字节。
-    let digest = sha256_hex(&connection_identity_bytes(config));
-    format!("bundle_{}", &digest[..16])
+    let raw = if normalized.is_empty() {
+        // fallback：确定性摘要（禁随机 UUID / 内建 hash / base32·64）。sha256_hex 为 64 位小写 hex，取前 16 = 前 8 字节。
+        let digest = sha256_hex(&connection_identity_bytes(config));
+        format!("bundle_{}", &digest[..16])
+    } else {
+        normalized
+    };
+    BundleId::try_from(raw).expect("derive_bundle_id 产出恒合法（见函数文档的不变量论证）")
 }
 
 /// 解析出**恒有值**的 `bundle_id`：显式配置值优先，否则 [`derive_bundle_id`] 缺省生成。
 ///
-/// 显式值的合法性由注册边界经 [`validate_bundle_id`] 校验（非法值在此之前即报错）；本函数只做「取显式或派生」。
-pub fn resolve_bundle_id(config: &MCPServerConfig) -> String {
+/// #130：显式值的合法性**由构造保证**（[`BundleId`] 存在即合法——`mcp.json` 里的畸形 `bundleId` 在 serde
+/// 反序列化的**字段级**即判废，由 `settings::mcp_config::validate_server` 逐-server 降级），故本函数与注册
+/// 边界都**无需**再校验一遍。
+#[must_use]
+pub fn resolve_bundle_id(config: &MCPServerConfig) -> BundleId {
     match config.bundle_id() {
-        Some(explicit) => explicit.to_string(),
+        Some(explicit) => explicit.clone(),
         None => derive_bundle_id(config),
     }
-}
-
-/// 校验**显式** `bundle_id`：非空、无 `__`、字符集 `[A-Za-z0-9_-]`（含 `.` 判为 [`BundleIdError::IllegalChar`]）。
-///
-/// **判决完全委托** [`smcp::utils::bundle_id::is_valid_bundle_id`]（单一权威），本函数**只在已知非法时**
-/// 做结构化**分类**——accept/reject 的边界因此**由构造保证**与 SKILL 侧（`smcp::skill_name` 的 mcp
-/// `<server>` 段）一致，而非靠人同步维护两份规则集。
-///
-/// 曾经的写法是在此重写一遍「非空 + 字符集 + 无 `__`」：彼时与权威等价纯属巧合，协议一旦新增规则（如
-/// 「MUST NOT 以 `-` 开头」）而只改权威，本函数就会在注册边界**放行**、SKILL 层却**判废** → 合法
-/// `bundle_id` 的 SKILL 对 Agent 隐身，即 rust-sdk#127 / python-sdk#142 的失效模式上移一层复发。
-pub fn validate_bundle_id(value: &str) -> Result<(), BundleIdError> {
-    if smcp::utils::bundle_id::is_valid_bundle_id(value) {
-        return Ok(());
-    }
-    // 已知非法 → 仅做结构化分类（分类顺序不影响 accept/reject 判决，判决已由上方权威给出）。
-    if value.is_empty() {
-        return Err(BundleIdError::Empty);
-    }
-    if let Some(ch) = value.chars().find(|c| !is_bundle_id_char(*c)) {
-        return Err(BundleIdError::IllegalChar {
-            value: value.to_string(),
-            ch,
-        });
-    }
-    Err(BundleIdError::ReservedSeparator(value.to_string()))
 }
 
 /// `exposed_tool_name = bundle_id + "__" + (alias ?? original_tool_name)`。
@@ -208,8 +178,16 @@ pub fn validate_bundle_id(value: &str) -> Result<(), BundleIdError> {
 /// `alias` 仅替换**工具名部分**，仍带 `{bundle_id}__` 前缀。因 `bundle_id` 禁 `__`，第一个 `__` 之前恒为
 /// `bundle_id` → 对 `(bundle_id, tool)` **单射**；路由 MUST 查 [`ExposedToolMapping`] 整键、**不** split 反解。
 ///
+/// #130：前缀形参收 [`BundleId`]（而非 `&str`）——「第一个 `__` 之前恒为 `bundle_id`」这条单射性前提，
+/// 由**类型**保证（`BundleId` 存在即合法 ⇒ 恒不含 `__`），而非靠调用方自觉传对东西。
+///
 /// [`ExposedToolMapping`]: super::manager::ExposedToolRoute
-pub fn exposed_tool_name(bundle_id: &str, alias: Option<&str>, original_tool_name: &str) -> String {
+#[must_use]
+pub fn exposed_tool_name(
+    bundle_id: &BundleId,
+    alias: Option<&str>,
+    original_tool_name: &str,
+) -> String {
     format!("{bundle_id}__{}", alias.unwrap_or(original_tool_name))
 }
 
@@ -220,6 +198,11 @@ mod tests {
         HttpServerConfig, HttpServerParameters, MCPServerConfig, SseServerConfig,
         SseServerParameters, StdioServerConfig, StdioServerParameters,
     };
+
+    /// 测试夹具：构造合法 [`BundleId`]（非法字面量在此 panic —— 夹具写错须立刻暴露）。
+    fn bid(s: &str) -> BundleId {
+        BundleId::try_from(s).expect("测试夹具的 bundle_id 字面量必须合法")
+    }
 
     fn stdio(name: &str, command: &str, args: &[&str], env: &[(&str, &str)]) -> MCPServerConfig {
         let mut c = StdioServerConfig::new(
@@ -348,11 +331,38 @@ mod tests {
     fn derive_falls_back_to_digest_for_empty_name() {
         let c = stdio("你好", "npx", &["-y", "everything"], &[]);
         let id = derive_bundle_id(&c);
+        let id = id.as_str();
         assert!(id.starts_with("bundle_"), "got {id}");
         assert_eq!(id.len(), "bundle_".len() + 16); // bundle_ + 16 hex
         assert!(id["bundle_".len()..]
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    }
+
+    /// #130 不变量：[`derive_bundle_id`] 的产出**恒合法**（故其内部 `expect` 不可达）。
+    ///
+    /// 覆盖两条分支：normalize 非空（ASCII / 混合符号 / 连续下划线源）与 fallback（CJK / 全符号 / 空名）。
+    #[test]
+    fn derive_bundle_id_always_yields_valid_id_130() {
+        for name in [
+            "My Server",
+            "a__b",         // 源含保留分隔符 → 折叠后须合法
+            "___",          // 全下划线 → 裁空 → 走 fallback
+            "你好",         // CJK → 走 fallback
+            "!!!",          // 全符号 → 走 fallback
+            "",             // 空名 → 走 fallback
+            "-lead-trail-", // 首尾连字符 → 裁剪
+            "a.b.c",        // 含点 → 映射为 _
+            "UPPER_lower-9",
+        ] {
+            let c = stdio(name, "npx", &["x"], &[]);
+            // 不 panic 即证 expect 不可达；再正面断言权威判据。
+            let id = derive_bundle_id(&c);
+            assert!(
+                smcp::utils::bundle_id::is_valid_bundle_id(id.as_str()),
+                "derive_bundle_id({name:?}) 产出 {id:?} 不合法——不变量被破坏"
+            );
+        }
     }
 
     #[test]
@@ -439,10 +449,11 @@ mod tests {
 
     #[test]
     fn exposed_prefixes_bundle_id() {
-        assert_eq!(exposed_tool_name("b", None, "foo"), "b__foo");
-        assert_eq!(exposed_tool_name("b", Some("bar"), "foo"), "b__bar");
+        let b = bid("b");
+        assert_eq!(exposed_tool_name(&b, None, "foo"), "b__foo");
+        assert_eq!(exposed_tool_name(&b, Some("bar"), "foo"), "b__bar");
         // 原始工具名内含 __ 无害：单射，第一个 __ 前恒为 bundle_id。
-        assert_eq!(exposed_tool_name("b", None, "foo__bar"), "b__foo__bar");
+        assert_eq!(exposed_tool_name(&b, None, "foo__bar"), "b__foo__bar");
     }
 
     #[test]
@@ -456,7 +467,7 @@ mod tests {
                 cwd: None,
             },
         );
-        c.bundle_id = Some("custom_id".to_string());
+        c.bundle_id = Some(bid("custom_id"));
         let cfg = MCPServerConfig::Stdio(c);
         assert_eq!(resolve_bundle_id(&cfg), "custom_id");
     }

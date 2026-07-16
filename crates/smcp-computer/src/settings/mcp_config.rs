@@ -967,6 +967,52 @@ mod tests {
         );
     }
 
+    /// #130：畸形 `bundleId` **逐-server 降级**——单条判废 + 记错，**整份 `mcp.json` 照常解析**。
+    ///
+    /// 这是 [`BundleId`](crate::mcp_clients::model::BundleId) 改型后「不硬失败整批 boot」语义的**新家**：
+    /// 判废点由 manager 注册期（`resolve_key` 的显式校验）**前移**到 serde 反序列化的**字段级**，由本层既有的
+    /// 容错通道（`validate_server` 的 `from_value` 分支）照常降级。守护「前移 ≠ 变严苛到炸掉整份配置」。
+    ///
+    /// 配套：`mcp_clients::manager::tests::invalid_explicit_bundle_id_is_unconstructible_130`。
+    #[test]
+    fn malformed_bundle_id_degrades_per_server_130() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        // 一条畸形 bundleId（含 `.`）+ 一条合法 —— 混在同一份文件里。
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"servers": {
+                "bad":  {"type":"stdio","bundle_id":"a.b","server_parameters":{"command":"x"}},
+                "good": {"type":"stdio","bundle_id":"good_id","server_parameters":{"command":"y"}}
+            }}"#,
+        );
+
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            ..Default::default()
+        });
+
+        // 合法条保留（整份未 abort —— 这正是「不硬失败整批 boot」）。
+        assert!(
+            resolved.servers.contains_key("good"),
+            "合法 server MUST 不受同文件畸形条牵连"
+        );
+        // 畸形条单条判废 + 记错（响亮失败，不静默）。
+        assert!(
+            !resolved.servers.contains_key("bad"),
+            "畸形 bundleId 的 server MUST 判废"
+        );
+        assert!(
+            resolved
+                .errors
+                .iter()
+                .any(|e| format!("{e:?}").contains("servers.bad")),
+            "畸形条 MUST 进 errors 供诊断，实得 {:?}",
+            resolved.errors
+        );
+    }
+
     // ---- bundled_mcp_server_names ------------------------------------------
     #[test]
     fn bundled_names_from_ledger() {

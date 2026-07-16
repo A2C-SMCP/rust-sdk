@@ -730,9 +730,10 @@ async fn issue121_add_or_update_targets_injected_user_scope_not_ambient() {
         .iter()
         .find(|e| e.name == probe)
         .expect("探针应出现在 inventory");
+    // `McpServerEntry.bundle_id` 仍是 `String`（wire 投影，改型归 #132）→ 与 `BundleId` 比较取 `.as_str()`。
     assert_eq!(
-        entry.bundle_id,
-        resolve_bundle_id(&stdio_cmd(probe, "after")),
+        entry.bundle_id.as_str(),
+        resolve_bundle_id(&stdio_cmd(probe, "after")).as_str(),
         "inventory 须暴露 bundle_id（= raw config 派生，与 manager 同键）"
     );
 }
@@ -761,7 +762,7 @@ async fn issue121_remove_by_bundle_id_targets_injected_user_scope() {
     computer.boot_up().await.unwrap();
 
     let bid = resolve_bundle_id(&stdio_cmd(probe, "x"));
-    computer.remove_server(&bid).await.unwrap();
+    computer.remove_server(bid.as_str()).await.unwrap();
 
     let disk = read_json(&user_mcp);
     assert!(
@@ -804,7 +805,7 @@ async fn issue121_remove_addresses_by_bundle_id_not_name() {
     );
 
     // 按 bundle_id（身份键）删 → 真删。
-    computer.remove_server(&bid).await.unwrap();
+    computer.remove_server(bid.as_str()).await.unwrap();
     assert!(
         !load_config(&ConfigContext::new(&cd))
             .mcp

@@ -1017,7 +1017,9 @@ impl SmcpComputerClient {
                 let windows: Vec<WindowInfo> = raw_windows
                     .into_iter()
                     .map(|(bundle_id, server_name, resource, read_result)| {
-                        WindowInfo::new(bundle_id, server_name, resource, read_result)
+                        // `WindowInfo.bundle_id` 仍标 `ServerName`（desktop/model.rs 的既有误标）——
+                        // newtype 一上来就照出了它；改型归 #132 卫生批次，此处先按边界转换。
+                        WindowInfo::new(bundle_id.into_string(), server_name, resource, read_result)
                     })
                     .collect();
                 organize_desktop(windows, req.desktop_size.map(|s| s as usize), &[])
@@ -1870,13 +1872,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resources_single_page_passthrough() {
-        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::manager::{
+            test_support::{bid, inject},
+            MCPServerManager,
+        };
         use crate::mcp_clients::model::make_resource;
 
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "srv-1",
+            &bid("srv-1"),
             mock(
                 vec![vec![
                     make_resource("window://app/w1", "W1", None, None),
@@ -1907,13 +1912,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resources_cursor_passthrough() {
-        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::manager::{
+            test_support::{bid, inject},
+            MCPServerManager,
+        };
         use crate::mcp_clients::model::make_resource;
 
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "srv-1",
+            &bid("srv-1"),
             mock(
                 vec![
                     vec![make_resource("res://0", "r0", None, None)],
@@ -1974,10 +1982,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resources_capability_not_supported_4015() {
-        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::manager::{
+            test_support::{bid, inject},
+            MCPServerManager,
+        };
 
         let manager = MCPServerManager::new();
-        inject(&manager, "srv-1", mock(vec![], true)).await;
+        inject(&manager, &bid("srv-1"), mock(vec![], true)).await;
         let manager = Arc::new(RwLock::new(Some(manager)));
 
         let (_, value) = SmcpComputerClient::handle_get_resources_with_ack(

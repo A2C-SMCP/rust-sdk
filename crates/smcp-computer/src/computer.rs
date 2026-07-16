@@ -1970,7 +1970,7 @@ impl<S: Session> Computer<S> {
         let Some(bundle_id) = bundle_id else {
             return Ok(());
         };
-        self.unmount_server_by_id(&bundle_id).await
+        self.unmount_server_by_id(bundle_id.as_str()).await
     }
 
     /// 仅运行期停摘 server（**bundle_id 寻址**）/ unmount at runtime only, by bundle_id（#121 B）。
@@ -1987,9 +1987,10 @@ impl<S: Session> Computer<S> {
         }
 
         // 从本地投影移除（键即 bundle_id，直删——无需按 name 扫描/匹配）。
-        {
+        // #130：投影键已是 [`BundleId`]；非法串必然不是已挂键 → 无匹配、no-op。
+        if let Ok(key) = BundleId::try_from(bundle_id) {
             let mut servers = self.mcp_servers.write().await;
-            servers.remove(bundle_id);
+            servers.remove(&key);
         }
 
         // 工具投影变化 → capability revision +1（§12 R2）。
@@ -2348,7 +2349,7 @@ impl<S: Session> Computer<S> {
     pub async fn get_windows_details(
         &self,
         window_uri: Option<&str>,
-    ) -> ComputerResult<Vec<(String, String, Resource, ReadResourceResult)>> {
+    ) -> ComputerResult<Vec<(BundleId, ServerName, Resource, ReadResourceResult)>> {
         let manager = self.mcp_manager.read().await;
         if let Some(ref manager) = *manager {
             Ok(manager.get_windows_details(window_uri).await)
@@ -2410,7 +2411,7 @@ impl<S: Session> Computer<S> {
                         let timeout_duration = timeout.map(std::time::Duration::from_secs_f64);
                         result = manager
                             .call_tool(
-                                &bundle_id,
+                                bundle_id.as_str(),
                                 &tool_name,
                                 parameters_for_call,
                                 timeout_duration,
@@ -2432,7 +2433,7 @@ impl<S: Session> Computer<S> {
                 let timeout_duration = timeout.map(std::time::Duration::from_secs_f64);
                 result = manager
                     .call_tool(
-                        &bundle_id,
+                        bundle_id.as_str(),
                         &tool_name,
                         parameters_for_call,
                         timeout_duration,
@@ -2528,7 +2529,7 @@ impl<S: Session> Computer<S> {
 
         let outcome = manager
             .call_tool_cancellable(
-                &bundle_id,
+                bundle_id.as_str(),
                 &resolved_tool,
                 parameters.clone(),
                 timeout_duration,
@@ -3441,7 +3442,7 @@ impl McpChangeReactor {
                 self.on_skills_changed(None).await;
             }
             McpChangeKind::ResourceUpdated { uri } => {
-                self.on_resource_updated(&notif.server, &uri).await
+                self.on_resource_updated(notif.server.as_str(), &uri).await
             }
         }
     }
@@ -3548,6 +3549,7 @@ impl McpChangeReactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_clients::manager::test_support::bid;
     use crate::mcp_clients::model::{
         CommandInput, MCPServerConfig, MCPServerInput, PickStringInput, PromptStringInput,
         StdioServerConfig, StdioServerParameters,
@@ -4678,7 +4680,7 @@ mod tests {
 
         // 删除用户声明（按 bundle_id）→ 应成功，落盘 bump。
         let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&updated);
-        comp.remove_server(&bundle_id)
+        comp.remove_server(bundle_id.as_str())
             .await
             .expect("用户自己声明的同名 server 应可删除");
         assert_eq!(comp.config_revision(), 3, "删除同名用户声明应落盘 bump");
@@ -4770,7 +4772,7 @@ mod tests {
         // 用户声明：display 名与插件 bundled server 相同，但显式 bundle_id 不同 → 不同软件 → 应放行。
         let mut own = user_stdio_server97("audit-mcp");
         if let MCPServerConfig::Stdio(ref mut c) = own {
-            c.bundle_id = Some("user-own-id".to_string());
+            c.bundle_id = Some(bid("user-own-id"));
         }
         comp.add_or_update_server(own).await.expect(
             "同名但 bundle_id 不同 = 不同软件，用户应可声明（旧的 name-join 误拒为 Synthesized）",
@@ -5742,7 +5744,7 @@ mod tests {
         let validated = computer.render_server_config(&raw).await.unwrap();
         // stamped bundle_id 来自 raw 占位字面（raw 决策），而非渲染后值。
         assert_eq!(
-            validated.bundle_id(),
+            validated.bundle_id().map(BundleId::as_str),
             Some("bundle_68ae00fea9122c01"),
             "无名 server 应 stamp raw 派生 bundle_id（占位字面），非渲染后值"
         );
@@ -6045,14 +6047,14 @@ mod tests {
             "两个同名不同 bundle_id 的 server 均须在投影中（旧实现折叠成 1 条）"
         );
 
-        let mut ids: Vec<String> = computer
+        let mut ids: Vec<BundleId> = computer
             .list_mcp_servers()
             .await
             .iter()
             .map(crate::mcp_clients::bundle_id::resolve_bundle_id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec!["id-a", "id-b"], "两条身份须各自可辨");
+        assert_eq!(ids, vec![bid("id-a"), bid("id-b")], "两条身份须各自可辨");
 
         // status 每行自带身份键 —— CLI 无需再按 name join（那个 join 正是误删的根源）。
         let mut status = computer.get_server_status().await;
@@ -6111,7 +6113,7 @@ mod tests {
                     .list_mcp_servers()
                     .await
                     .iter()
-                    .any(|c| crate::mcp_clients::bundle_id::resolve_bundle_id(c) == e.bundle_id),
+                    .any(|c| crate::mcp_clients::bundle_id::resolve_bundle_id(c) == *e.bundle_id),
                 "inventory 出线的 bundle_id {} 须可寻址到实际 config",
                 e.bundle_id
             );
@@ -6167,7 +6169,7 @@ mod tests {
         let mgr = MCPServerManager::new();
         inject(
             &mgr,
-            "srv",
+            &bid("srv"),
             MockSkillClient {
                 pages: vec![vec![make_resource("res://a", "a", None, None)]],
                 fail: false,
@@ -6215,7 +6217,7 @@ mod tests {
         let mgr = MCPServerManager::new();
         inject(
             &mgr,
-            "tfrobot-tools",
+            &bid("tfrobot-tools"),
             MockSkillClient {
                 pages: vec![vec![skill_resource_mounted(
                     "skill://tfrobot-tools/raw-leaf",
@@ -6279,18 +6281,18 @@ mod tests {
         let cjk_cfg = stdio_cfg_with_bundle("服务器", None);
         let cjk_bundle = derive_bundle_id(&cjk_cfg);
         assert!(
-            cjk_bundle.starts_with("bundle_"),
+            cjk_bundle.as_str().starts_with("bundle_"),
             "CJK display 名应触发 hash fallback，实得 {cjk_bundle}"
         );
 
         let mgr = MCPServerManager::new();
         for (bundle_id, cfg) in [
             (
-                "acme-editor".to_string(),
+                bid("acme-editor"),
                 stdio_cfg_with_bundle("same-display-name", Some("acme-editor")),
             ),
             (
-                "id-b".to_string(),
+                bid("id-b"),
                 stdio_cfg_with_bundle("same-display-name", Some("id-b")),
             ),
             (cjk_bundle.clone(), cjk_cfg),
@@ -6383,7 +6385,7 @@ mod tests {
         let mgr = MCPServerManager::new();
         inject(
             &mgr,
-            "tfrobot-tools",
+            &bid("tfrobot-tools"),
             MockSkillClient {
                 pages: vec![vec![skill_resource_mounted(
                     "skill://tfrobot-tools/leaf",
@@ -6432,7 +6434,7 @@ mod tests {
             let b = tokio::spawn(async move {
                 // reactor 侧：`mcp_manager.read` → `skill_registry.write`（经 on_skills_changed(None)）。
                 cb.handle_mcp_notification(McpServerNotification {
-                    server: "tfrobot-tools".to_string(),
+                    server: bid("tfrobot-tools"),
                     kind: McpChangeKind::ResourceListChanged,
                 })
                 .await;
