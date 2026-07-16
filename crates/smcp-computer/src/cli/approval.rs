@@ -9,9 +9,14 @@
 *
 * 对标 Python `a2c_smcp/computer/cli/commands/plugin.py::run_mcp_approval`：启动期解析 `.tfrobot/mcp.json`
 * 定义层 + 套门控 + 挂载 ENABLED server。
-* - bundled / user-flag-policy origin → 门控判 ENABLED → 直挂（免批准框）；
+* - user-flag-policy origin → 门控判 ENABLED → 直挂（免批准框）；
 * - DISABLED（企业拒绝/不在白名单/显式 disabled）→ 跳过；
 * - PENDING（工作区共享未决）→ TTY 弹 y/a/n 写 local scope；非 TTY → skip+WARN，`--approve-all-mcp` 全批（仅本次不落盘）。
+*
+* #131（P0 授权门绕过）：本路径**不再**读 bundled 名集。此前 `bundled_mcp_server_names` 的账本名集喂门控档④，
+* 令任何 project/local 声明只要**显示名**撞上账本里任一插件的 bundled 名即免批准框直挂——而真 bundled server
+* 走 enable→mount、**从不进** `resolve_mcp_config` ⇒ 该档唯一可达路径 100% 是借名绕过。plugin 声明依赖的
+* server MUST 不进入本门迭代（协议 `runtime-contract.md` §5 item 10 + `guides/mcp-approval-gate-alignment.md` §2）。
 *
 * flag 层 schema 区分（fix-review #1）：`flag_config` 是 **settings.json** flag 层（喂 `resolved_settings` 的
 * `flag_path`），**不是 mcp.json**，故不喂 `resolve_mcp_config(flag_config_path=)`。
@@ -26,9 +31,8 @@ use super::commands::{msg_dim, msg_err, msg_ok, msg_warn, resolved_settings};
 use crate::computer::{Computer, Session};
 use crate::mcp_clients::model::MCPServerConfig;
 use crate::settings::mcp_config::{
-    approve_all_project_mcp, approve_mcp_server, bundled_mcp_server_names, deny_mcp_server,
-    gate_mcp_servers, resolve_mcp_config, McpApprovalStatus, ResolveMcpConfigArgs,
-    ResolvedMcpServer,
+    approve_all_project_mcp, approve_mcp_server, deny_mcp_server, gate_mcp_servers,
+    resolve_mcp_config, McpApprovalStatus, ResolveMcpConfigArgs, ResolvedMcpServer,
 };
 
 /// 合并 resolved server 的 `config`（含占位符）+ `ext`（剥离的 envFile 等）为挂载用 config。
@@ -102,9 +106,7 @@ pub async fn run_mcp_approval<S: Session>(
     }
 
     let settings = resolved_settings(cwd.as_deref(), None, flag_config);
-    let home = comp.skill_home();
-    let bundled = bundled_mcp_server_names(Some(&home), None);
-    let statuses = gate_mcp_servers(&resolved, &settings, &bundled);
+    let statuses = gate_mcp_servers(&resolved, &settings);
 
     // mcp.json 定义的 input 入池（无前缀），供 server config 的裸 `${input:}` 解析。
     for inp in resolved.inputs.iter().cloned() {

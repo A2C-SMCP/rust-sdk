@@ -37,8 +37,8 @@ use crate::governance::{
 };
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::settings::config::{
-    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent, EntityKey,
-    WriteScope, WriteTargetError, WriteTargetOptions,
+    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent, WriteScope,
+    WriteTargetError, WriteTargetOptions,
 };
 use crate::settings::installer::{
     DisableOptions, EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError,
@@ -2009,15 +2009,17 @@ impl<S: Session> Computer<S> {
     ///   团队共享 → 用 [`add_or_update_server_in_scope`](Self::add_or_update_server_in_scope) 显式选 `Project`/`User`。
     /// - **D1 安全**：落盘的是**原始** `server`（保留 `${input:*}`/`${env:*}` 引用），**绝不**落渲染后的明文值/secret。
     /// - **改已有 server** → 恒落其 **origin scope**（`upsert_new_scope` 只作用于新声明）。
-    /// - **#126 归属门控**：名字被**启用中**插件占用、且用户在 config 中**无任何同名声明**（pure plugin-owned）→
-    ///   拒（[`WriteTargetError::Synthesized`]，用户应停用/卸载 plugin）。用户**自己声明的**同名 server（含撞
-    ///   bundled 名者）可正常更新——**停用该 plugin 后**该名亦可自由新增（归属 enabled-gated，与 managedBy 查询同源）。
+    /// - **#131 F3(a)：撞 plugin 基线不拒写**。用户声明与某启用中插件的 bundled server 同 `bundle_id` → **照常
+    ///   写入**并覆盖之。协议 `runtime-contract.md` §2.5 定 `plugin 声明 < user < project < local < flag < policy`，
+    ///   plugin 声明是**最低基线层**、被任何用户侧 scope 覆盖（用户主权）；`guides/mcp-approval-gate-alignment.md`
+    ///   §5 明定 upsert **MUST NOT** 因「同 bundle_id 已由 plugin 提供」拒写。此前 #126 的 `Synthesized` 拒写门控
+    ///   据此**移除**。（`remove_server` 侧门控仍在——有意非对称，其 origin 判据改造属 F3(b) / #138。）
     /// - **§12 R2**：落盘成功后 bump **config** revision；随后运行期物化 bump **capability**。
     /// - 治理物化（bundled 重挂）**不**走此路径（走 [`mount_server`]），避免 ledger 意图重复写入 mcp.json。
     ///
     /// # Errors
     /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；落盘失败
-    /// （[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期物化失败（manager 错）。
+    /// （[`ComputerError::ConfigPersist`]，含只读 origin / I/O）；运行期物化失败（manager 错）。
     pub async fn add_or_update_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
         // #123（协议#19 加固）：默认 `Local`（不入 git、机器本地、重启存活）。
         self.add_or_update_server_in_scope(server, WriteScope::Local)
@@ -2044,34 +2046,13 @@ impl<S: Session> Computer<S> {
         let ctx = self.instance_config_context(&config_dir, &home, upsert_new_scope);
         let snapshot = load_config(&ctx);
 
-        // #126 归属门控（早于 render/落盘，快速失败）：该**身份**被**启用中**插件占用、且用户在 config 中
-        // **无同名声明**（pure plugin-owned）→ 拒绝直接声明（用户应停用/卸载该 plugin，或经治理 mount 通道，
-        // 不经此写用户 config）。用户**已有**同名声明（origin=Some）则放行——writable 走下方 update_config
-        // 编辑其 origin scope、只读 origin 由 write_target 返回 `ReadOnlyOrigin`。归属集与
-        // `list_mcp_servers_with_metadata`（managedBy）**同源**。
+        // #131 F3(a)：**不设**「同 bundle_id 已由 plugin 提供 → 拒写」门控。协议
+        // `guides/mcp-approval-gate-alignment.md` §5 + `runtime-contract.md` §2.5：用户在自己的 scope 声明同
+        // `bundle_id` **正是来源优先序赋予的覆盖权**（`plugin 声明 < user < project < local < flag < policy`，
+        // plugin 声明是**最低基线层**）——upsert **MUST NOT** 因此拒写。#126 引入的 `Synthesized` 拒写短路据此
+        // 移除（提示「你的声明将覆盖 plugin 基线」为 MAY，本轮不做）。
         //
-        // #127：占用判定的 join key 由 display 名改为 **`bundle_id`**，与 `remove_server`（#121 起即 bundle_id）
-        // **对称**。协议 §身份正交性：`name` 允许碰撞、非身份；bundled 配置 runtime-only 不落 `mcp.json`（#122）
-        // ⇒ 用户的 `foo`（bundle_id `foo`）与插件 bundled `foo`（显式 bundle_id `plugin-foo`）是**不同软件**、
-        // 可合法共存且无 name-key 冲突，旧的 name-join 拒绝前者属**假阳性**。
-        // 注：`declared_origin` 仍按 name 查——那是 **config-file 域**（`mcp.json` 按协议 §9.1 合法地 name-keyed）。
-        let declared_origin = snapshot
-            .provenance
-            .get(&EntityKey::Mcp(name.clone()))
-            .copied();
-        if declared_origin.is_none() {
-            let incoming_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&server);
-            if let Some(rec) = self.enabled_bundled_ownership().into_iter().find(|rec| {
-                crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config) == incoming_id
-            }) {
-                return Err(ComputerError::ConfigPersist(
-                    WriteTargetError::Synthesized {
-                        entity: format!("mcp:{}", rec.config.name()),
-                    }
-                    .to_string(),
-                ));
-            }
-        }
+        // 注：`remove_server` 的归属门控仍在（有意非对称）——删除面的 origin 判据改造属 F3(b)，见 #138。
 
         // 先 render 校验：非法 config / 无法解析的 input 早失败，**不落盘**（**唯一一次** render，下方物化复用其结果，
         // 避免重复触发 resolver 副作用）/ validate before persist; single render reused by mount_rendered below。
@@ -4703,11 +4684,17 @@ mod tests {
         assert_eq!(comp.config_revision(), 3, "删除同名用户声明应落盘 bump");
     }
 
-    /// #126 验收#2（守护，不过度矫正）：名字被**启用中**插件占用、用户**无**同名声明（pure plugin-owned）→ 直接
-    /// `add_or_update_server` / `remove_server` 拒（`Synthesized`）；**停用**插件后同名 add 放行（issue 记录的规避
-    /// 路径 / enabled-gating）。归属集与 `list_mcp_servers_with_metadata`（managedBy）同源，守护验收#3 一致性。
+    /// #131 F3(a)：撞 plugin 基线的用户声明**不再拒写**（推翻 #126 写侧）；`remove` 侧门控**仍在**（F3(b) → #138）。
+    ///
+    /// 协议 `runtime-contract.md` §2.5 定来源优先序 `plugin 声明 < user < project < local < flag < policy`——plugin
+    /// 声明是**最低基线层**，被任何用户侧 scope 覆盖（用户主权）；`guides/mcp-approval-gate-alignment.md` §5 明定
+    /// upsert **MUST NOT** 因「同 bundle_id 已由 plugin 提供」拒写。
+    ///
+    /// 本测同时守护**有意的非对称**：`remove` 在「用户无自有声明 ∧ 该 bundle_id 属启用中插件」时仍拒（导向
+    /// `plugin uninstall`），其 origin 判据改造归 #138 —— 故 remove 断言须**先于** add 执行（add 之后用户就有声明了，
+    /// remove 会合法放行、测不到该门）。
     #[tokio::test]
-    async fn pure_plugin_owned_name_rejects_crud_but_disabled_allows() {
+    async fn plugin_baseline_add_allowed_remove_still_gated_131() {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = cold_start_setup95(&tmp).await;
         let env = instance_xdg_env_126(&tmp);
@@ -4723,41 +4710,32 @@ mod tests {
             serde_json::json!({ "enabledPlugins": { "audit@acme": true } }),
         );
 
-        // add 同名 → 拒（pure plugin-owned），零落盘。
+        // remove 侧（F3(b) 未改造，仍拒）——必须在 add 之前测，理由见 doc。
+        let inv = comp.list_mcp_servers_with_metadata().await;
+        let plugin_srv = inv
+            .iter()
+            .find(|e| e.name == "audit-mcp")
+            .expect("enabled bundled server 应可查询（§4.8）");
         let err = comp
-            .add_or_update_server(user_stdio_server97("audit-mcp"))
+            .remove_server(&plugin_srv.bundle_id)
             .await
-            .expect_err("pure plugin-owned 名字直接 add 应拒");
+            .expect_err("用户无自有声明时，删 plugin bundled bundle_id 仍应拒（F3(b) → #138）");
         assert!(matches!(
             err,
             crate::errors::ComputerError::ConfigPersist(_)
         ));
         assert_eq!(comp.config_revision(), 0, "拒绝应零落盘");
 
-        // remove 插件 bundled server 的 bundle_id → 拒。
-        let inv = comp.list_mcp_servers_with_metadata().await;
-        let plugin_srv = inv
-            .iter()
-            .find(|e| e.name == "audit-mcp")
-            .expect("enabled bundled server 应可查询（§4.8）");
-        let err2 = comp
-            .remove_server(&plugin_srv.bundle_id)
-            .await
-            .expect_err("pure plugin-owned bundle_id 直接 remove 应拒");
-        assert!(matches!(
-            err2,
-            crate::errors::ComputerError::ConfigPersist(_)
-        ));
-
-        // 停用 audit@acme → 归属集空 → 同名 add 放行（规避路径 / D3）。
-        seed_user_settings_126(
-            &env,
-            serde_json::json!({ "enabledPlugins": { "audit@acme": false } }),
-        );
+        // F3(a)：同 bundle_id 撞 plugin 基线 → **放行**（此前 #126 拒 `Synthesized`），落盘 bump。
         comp.add_or_update_server(user_stdio_server97("audit-mcp"))
             .await
-            .expect("停用插件后同名 server 应可添加");
-        assert_eq!(comp.config_revision(), 1, "停用后 add 落盘 bump");
+            .expect("撞 plugin 基线的用户声明 MUST NOT 被拒写（#131 F3(a)·指南 §5）");
+        assert_eq!(comp.config_revision(), 1, "放行后应落盘 bump");
+
+        // 用户声明既已存在 → 覆盖 plugin 基线；此时 remove 删的是用户自己那条，放行。
+        comp.remove_server(&plugin_srv.bundle_id)
+            .await
+            .expect("用户自有声明存在 → remove 删自己那条，放行");
     }
 
     /// #127 扫漏：归属 join key = **bundle_id**，非 display 名（订正 #126 自陈的「有意非对称」）。
@@ -4768,7 +4746,11 @@ mod tests {
     ///
     /// 旧的 name-join 把用户自己的声明误标 `managedBy=plugin`（只读）并拒其 `add_or_update_server`
     /// （`Synthesized`）——**假阳性**；而 `remove_server` 自 #121 起已按 bundle_id 门控 ⇒ 同一场景下
-    /// 「查询说只读、删除却放行」自相矛盾。本测锁定两侧对称，并守护「真同一身份仍被拒」不被过度矫正。
+    /// 「查询说只读、删除却放行」自相矛盾。本测锁定 **inventory 归属仍按 bundle_id 分辨**（#127 的核心不变量）。
+    ///
+    /// #131 F3(a)：原「同一 bundle_id 仍应拒 add」前置守卫**已移除**——协议指南 §5 定 upsert MUST NOT 拒写，
+    /// 无论 bundle_id 是否撞 plugin 基线（用户主权覆盖）。写侧「同一身份仍拒」的守护由
+    /// [`plugin_baseline_add_allowed_remove_still_gated_131`] 在 **remove 侧**接管。
     #[tokio::test]
     async fn ownership_gate_joins_by_bundle_id_127() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4784,15 +4766,6 @@ mod tests {
             &env,
             serde_json::json!({ "enabledPlugins": { "audit@acme": true } }),
         );
-
-        // 前置守卫（不过度矫正）：用户**尚无**同名声明时，**同一身份**（缺省 bundle_id → 派生 == "audit-mcp"）
-        // 仍须被拒——证明门控没被本次改动整体放开。
-        let err = comp
-            .add_or_update_server(user_stdio_server97("audit-mcp"))
-            .await
-            .expect_err("同一 bundle_id = 同一软件，仍应拒");
-        assert!(matches!(err, ComputerError::ConfigPersist(_)));
-        assert_eq!(comp.config_revision(), 0, "拒绝应零落盘");
 
         // 用户声明：display 名与插件 bundled server 相同，但显式 bundle_id 不同 → 不同软件 → 应放行。
         let mut own = user_stdio_server97("audit-mcp");
