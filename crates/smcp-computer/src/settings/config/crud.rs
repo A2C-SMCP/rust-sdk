@@ -37,6 +37,7 @@ use super::write_target::{
     resolve_write_target, ConfigEntity, EditIntent, ScopeAnchors, WriteTargetError,
     WriteTargetOptions,
 };
+use crate::mcp_clients::model::MCPServerConfig;
 
 // ===========================================================================
 // 上下文 / Context
@@ -64,6 +65,8 @@ pub struct ConfigContext<'a> {
     pub platform: Option<&'a str>,
     /// policy settings 原始视图 / raw policy settings。
     pub policy_settings: Option<&'a Map<String, Value>>,
+    /// 宿主构造入参 embed 层（`Computer::new(mcp_servers=…)`）——供 remove 守卫按 origin 判定覆盖 embed（#147）。
+    pub embed_servers: &'a [MCPServerConfig],
     /// 写目标消解选项（upsert/disable scope）/ write-target options。
     pub opts: WriteTargetOptions,
 }
@@ -80,6 +83,7 @@ impl<'a> ConfigContext<'a> {
             managed_mcp_path: None,
             platform: None,
             policy_settings: None,
+            embed_servers: &[],
             opts: WriteTargetOptions::default(),
         }
     }
@@ -95,6 +99,7 @@ impl<'a> ConfigContext<'a> {
             managed_mcp_path: self.managed_mcp_path,
             platform: self.platform,
             policy_settings: self.policy_settings,
+            embed_servers: self.embed_servers,
         }
     }
 

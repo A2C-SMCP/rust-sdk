@@ -103,6 +103,8 @@ pub async fn run_mcp_approval<S: Session>(
         flag_config_path: flag_mcp_config,
         managed_mcp_path: None,
         platform: None,
+        // #147：宿主构造入参 embed 层（CLI 空集构造下恒空；嵌入宿主非空 ⇒ embed server 亦入审批门声明面）。
+        embed_servers: comp.embed_servers(),
     });
 
     // 被 drop 的畸形 server/input 必须呈现（mcp_config 容错不静默）。

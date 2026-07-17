@@ -308,6 +308,15 @@ pub struct Computer<S: Session> {
     /// 删错对象。存 **raw** config（保留 `${input:*}` 引用，与落盘一致）；键取 `render_server_config`
     /// 已 stamp 的值（从 raw 派生，#117：不在此重派生，避免 raw/rendered 连接身份漂移）。
     mcp_servers: RwLock<HashMap<BundleId, MCPServerConfig>>,
+    /// #147/S14：宿主构造入参 `Computer::new(mcp_servers=…)` 的 **frozen 声明快照**（embed 层）。
+    ///
+    /// 与 `mcp_servers`（运行期可变物化集，随 mount/unmount/add 变动）**分离**——本字段构造后**不可变**、
+    /// 每次 resolve 作 embed 层重投影、**不落盘**（协议 §2.5-5「origin 可从当次 boot 输入重建、MUST NOT
+    /// 落盘为快照」）。**消费方 = 回收判据(#139) + remove 守卫**：二者经 `resolve_snapshot(embed_servers=…)`
+    /// 读 `origin=embed`（#139 过滤 `origin != Plugin` 永不连坐 embed；remove 见只读 embed 声明 →
+    /// `ReadOnlyOrigin`）。注：`managedBy`(F1) 走 `self.mcp_servers`+账本、**不经**本层（embed 现归
+    /// `managedBy=User`）。CLI 空集构造下恒空（协议 §2.5-4）。
+    embed_servers: Vec<MCPServerConfig>,
     /// 输入处理器 / Input handler
     input_handler: Arc<RwLock<InputHandler>>,
     /// 自动连接标志 / Auto connect flag
@@ -657,9 +666,14 @@ impl<S: Session> Computer<S> {
     ) -> Self {
         let name = name.into();
         let inputs = inputs.unwrap_or_default();
+        let raw_mcp_servers = mcp_servers.unwrap_or_default();
+        // #147/S14：frozen embed 声明快照 = 构造入参**原样**（存储层不折叠，保留同 display 名异显式 bundle_id
+        // 的多条）。注意 resolve 的 embed 层是 **name-keyed** 投影（`raw_servers.insert(cfg.name())`，last-wins，
+        // 与 python `_embed_layer` dict 及所有文件层同构）⇒ 同名多条在**声明面**按 name 归一。构造后不可变，
+        // 与下方运行期可变物化集分离。
+        let embed_servers: Vec<MCPServerConfig> = raw_mcp_servers.values().cloned().collect();
         // 按 bundle_id 重建键（丢弃调用方键，见上方 rustdoc）。
-        let mcp_servers: HashMap<BundleId, MCPServerConfig> = mcp_servers
-            .unwrap_or_default()
+        let mcp_servers: HashMap<BundleId, MCPServerConfig> = raw_mcp_servers
             .into_values()
             .map(|cfg| (crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg), cfg))
             .collect();
@@ -683,6 +697,7 @@ impl<S: Session> Computer<S> {
             mcp_manager: Arc::new(RwLock::new(None)),
             inputs: Arc::new(RwLock::new(inputs)),
             mcp_servers: RwLock::new(mcp_servers),
+            embed_servers,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
             auto_reconnect,
@@ -778,6 +793,14 @@ impl<S: Session> Computer<S> {
     /// #123（协议#19 加固）：`upsert_new_scope` 决定**新** server 声明的落盘 scope——公开 CRUD 默认 `Local`
     /// （`mcp.local.json`，不入 git；仍 boot 读取→重启存活），避免 API/UI 加的 server 静默污染团队共享层；
     /// `remove` 不 upsert，此参数对其无影响。
+    /// 宿主构造入参的 frozen embed 声明快照（#147）——供 CLI boot 审批的 resolve embed 层投影。
+    /// CLI 空集构造下恒空；SDK 嵌入宿主传 `Computer::new(mcp_servers=…)` 时非空。非 CLI 路径直接读
+    /// `self.embed_servers`（如 #139 回收判据），故本访问器随其唯一用户 `cli` feature 门控。
+    #[cfg(feature = "cli")]
+    pub(crate) fn embed_servers(&self) -> &[MCPServerConfig] {
+        &self.embed_servers
+    }
+
     fn instance_config_context<'a>(
         &'a self,
         config_dir: &'a std::path::Path,
@@ -787,6 +810,9 @@ impl<S: Session> Computer<S> {
         ConfigContext {
             env: self.config_env(),
             home: Some(home),
+            // #147：remove 守卫按 origin 判定须能看见 embed 声明（否则宿主构造 server 被判「无声明的纯运行期
+            // 投影」误拒/误判）。frozen 快照，与 mcp.json/durable 同入声明面。
+            embed_servers: &self.embed_servers,
             opts: WriteTargetOptions {
                 upsert_new_scope,
                 ..WriteTargetOptions::default()
@@ -3050,6 +3076,9 @@ impl<S: Session> Computer<S> {
             mcp_manager: Arc::clone(&self.mcp_manager),
             inputs: Arc::new(RwLock::new(HashMap::new())), // 运行时态不复制（同 Clone 语义）。
             mcp_servers: RwLock::new(HashMap::new()),
+            // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
+            // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。
+            embed_servers: self.embed_servers.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -3258,6 +3287,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
             mcp_manager: Arc::clone(&self.mcp_manager),
             inputs: Arc::new(RwLock::new(HashMap::new())), // Note: 不复制运行时状态 / Don't copy runtime state
             mcp_servers: RwLock::new(HashMap::new()),
+            // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
+            // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。
+            embed_servers: self.embed_servers.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -3594,6 +3626,34 @@ mod tests {
         assert_eq!(snap.capability_revision, 0);
         assert!(snap.last_error.is_none());
         assert!(snap.degraded_reason.is_none());
+    }
+
+    /// #147/#139：`Clone` / `clone_for_handlers` MUST 保留 frozen embed 声明快照——否则克隆出的 Computer 上
+    /// 跑回收判据时 embed 面静默消失、重开「误回收 embed」缺口（隔离复审 🟡1）。embed 是不可变构造入参、
+    /// 非运行期状态，随 clone 存续（同 `name`）。
+    #[test]
+    fn clone_preserves_frozen_embed_declaration_147() {
+        let cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "host-srv", "server_parameters": {"command": "e"}
+        }))
+        .unwrap();
+        let mut servers = HashMap::new();
+        servers.insert("host-srv".to_string(), cfg);
+        let comp = Computer::new(
+            "c",
+            SilentSession::new("s"),
+            None,
+            Some(servers),
+            false,
+            false,
+        );
+        assert_eq!(comp.embed_servers.len(), 1, "构造入参入 frozen embed 快照");
+        let cloned = comp.clone();
+        assert_eq!(
+            cloned.embed_servers.len(),
+            1,
+            "clone MUST 保留 embed 声明面（#147 连坐防线随 clone 存续）"
+        );
     }
 
     #[tokio::test]

@@ -34,11 +34,17 @@ use serde_json::Value;
 
 /// settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high).
 ///
-/// 五级 = Claude Code 完整对齐（user/project/local/flag/policy）。#98：能力发现层 `Capability`
-/// 已随 workdir 概念瘦身移除（对齐 protocol#10 / python-sdk#116）——project/local 现锚定进程 cwd，
-/// `enabledPlugins` / `extraKnownMarketplaces` 经常规 project/local 层进入，无需专门的能力并集层。
+/// 与 Claude Code 对齐（user/project/local/flag/policy）。`Embed` 为 A2C 特有的**宿主构造挂载层**
+/// （`Computer::new(mcp_servers=…)`），**仅存在于 mcp.json 轴**——settings.json 无此来源（#147/S14）。
+/// #98：能力发现层 `Capability` 已随 workdir 概念瘦身移除（对齐 protocol#10 / python-sdk#116）——
+/// project/local 现锚定进程 cwd，`enabledPlugins` / `extraKnownMarketplaces` 经常规 project/local 层进入，
+/// 无需专门的能力并集层。
 ///
-/// 序列化为小写字符串，与 Python `StrEnum` 字面一致（`user` / `project` / `local` / `flag` /
+/// **顺序权威在 [`ProvenanceScope::priority`](super::config::ProvenanceScope::priority)**（协议
+/// `runtime-contract.md` §2.5 第3条 `plugin < user < project < local < embed < flag < policy`），
+/// **不在本枚举的成员声明序**——成员序恰好一致，勿依赖。
+///
+/// 序列化为小写字符串，与 Python `StrEnum` 字面一致（`user` / `project` / `local` / `embed` / `flag` /
 /// `policy`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,6 +52,8 @@ pub enum SettingsScope {
     User,
     Project,
     Local,
+    /// 宿主构造挂载（`Computer::new(mcp_servers=…)`）；仅 mcp.json 轴（#147）/ embedded-constructor, mcp.json axis only。
+    Embed,
     Flag,
     /// 企业策略层（最高）/ enterprise policy (highest)。
     Policy,
@@ -58,6 +66,7 @@ impl SettingsScope {
             SettingsScope::User => "user",
             SettingsScope::Project => "project",
             SettingsScope::Local => "local",
+            SettingsScope::Embed => "embed",
             SettingsScope::Flag => "flag",
             SettingsScope::Policy => "policy",
         }

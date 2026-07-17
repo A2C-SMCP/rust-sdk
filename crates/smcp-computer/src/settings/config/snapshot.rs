@@ -136,6 +136,7 @@ impl From<SettingsScope> for ProvenanceScope {
             SettingsScope::User => ProvenanceScope::User,
             SettingsScope::Project => ProvenanceScope::Project,
             SettingsScope::Local => ProvenanceScope::Local,
+            SettingsScope::Embed => ProvenanceScope::Embed,
             SettingsScope::Flag => ProvenanceScope::Flag,
             SettingsScope::Policy => ProvenanceScope::Policy,
         }
@@ -343,6 +344,10 @@ pub struct SnapshotArgs<'a> {
     pub platform: Option<&'a str>,
     /// policy scope settings 原始视图（first-source-wins 结果）/ raw policy settings。
     pub policy_settings: Option<&'a Map<String, Value>>,
+    /// 宿主构造入参 `Computer::new(mcp_servers=…)` 的 **embed 层**（origin=embed，local<embed<flag；#147/S14）。
+    /// 透传给 [`resolve_mcp_config`]；非-plugin 路径全投影，供**回收判据(#139)**（过滤 `origin != Plugin`）与
+    /// **remove 守卫**（只读 embed → `ReadOnlyOrigin`）消费。
+    pub embed_servers: &'a [MCPServerConfig],
 }
 
 /// 解析统一 `ComputerConfig` 快照 = 多 scope reconcile 投影（读，无写）/ resolve the unified snapshot.
@@ -361,6 +366,7 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
         managed_mcp_path,
         platform,
         policy_settings,
+        embed_servers,
     } = args;
 
     let mut provenance: BTreeMap<EntityKey, ProvenanceScope> = BTreeMap::new();
@@ -372,6 +378,7 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
         flag_config_path: flag_mcp_config_path,
         managed_mcp_path,
         platform,
+        embed_servers,
     });
     let mut servers: Vec<McpServerView> = Vec::with_capacity(mcp_resolved.servers.len());
     // 文件 scope 已占用的 `bundle_id`（身份键，#117）——用于 plugin 投影去重（user > plugin）。

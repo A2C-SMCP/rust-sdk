@@ -571,6 +571,40 @@ mod tests {
         );
     }
 
+    /// #147/S14：remove 守卫覆盖 embed —— 宿主构造入参（origin=embed，只读 scope）声明的 server durable
+    /// 删除 → `ReadOnlyOrigin`（不静默假成功 + 下次 boot 复活；对齐 python `remove_mcp_server` 档3）。
+    #[test]
+    fn mcp_remove_readonly_embed_origin_errors_147() {
+        let fx = Fixture::new();
+        let embed: Vec<crate::mcp_clients::model::MCPServerConfig> = vec![serde_json::from_value(
+            json!({"type":"stdio","name":"srv-embed","server_parameters":{"command":"e"}}),
+        )
+        .unwrap()];
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&fx.wd),
+            env: Some(&fx.env),
+            home: Some(&fx.home),
+            managed_mcp_path: Some(&fx._tmp.path().join("no-managed.json")),
+            embed_servers: &embed,
+            ..Default::default()
+        });
+        let err = resolve_write_target(
+            &ConfigEntity::McpServer("srv-embed".into()),
+            &EditIntent::Remove,
+            &snap,
+            &fx.anchors(),
+            &OPTS,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            WriteTargetError::ReadOnlyOrigin {
+                entity: "mcp:srv-embed".into(),
+                origin: ProvenanceScope::Embed,
+            }
+        );
+    }
+
     #[test]
     fn mcp_remove_writable_origin_deletes_all_writable_scopes() {
         let fx = Fixture::new();

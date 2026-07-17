@@ -185,6 +185,10 @@ pub struct ResolveMcpConfigArgs<'a> {
     pub managed_mcp_path: Option<&'a Path>,
     /// 平台标识（缺省 `std::env::consts::OS`；接受 `darwin`/`win32`/`linux` 或 `macos`/`windows`）/ platform。
     pub platform: Option<&'a str>,
+    /// 宿主构造入参 `Computer::new(mcp_servers=…)` 的 **embed 层**（插在 local 与 flag 之间，§2.5-3；#147/S14）。
+    /// 每条 config 以 `cfg.name()` 为 map 键投影成 mcp.json 形状的一层，origin=embed、预信任（`is_trusted_origin`）。
+    /// 与 flag/durable 同为**当次 boot 声明式输入**，每次 resolve 重算、**不落盘**（§2.5-5）。
+    pub embed_servers: &'a [MCPServerConfig],
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +431,19 @@ pub(crate) fn validate_input(
 // ---------------------------------------------------------------------------
 // 多 scope 解析 / Multi-scope resolution
 // ---------------------------------------------------------------------------
+
+/// embed 层 source 标识（诊断 / origin 溯源，非文件路径）/ embed-layer source marker (not a file path)。
+/// 对齐 python `mcp_config.py::_EMBED_SOURCE`。
+const EMBED_SOURCE: &str = "<embed:Computer(mcp_servers=...)>";
+
+/// resolve 的一层来源：磁盘文件（5 个 scope）或内存 embed 层（宿主构造入参，#147）/ one resolve layer source。
+enum McpLayer<'a> {
+    /// 磁盘 mcp.json 文件层（user/project/local/flag/policy）/ on-disk mcp.json file layer。
+    File(SettingsScope, PathBuf),
+    /// 内存 embed 层：`Computer::new(mcp_servers=…)` 的构造入参（origin=embed）/ in-memory embed layer。
+    Embed(&'a [MCPServerConfig]),
+}
+
 /// 多 scope 加载合并 `.tfrobot/mcp.json` + 字段级校验 / Multi-scope load + merge + validate mcp.json。
 ///
 /// 合并顺序 low → high = `[user, project, local, flag, policy]`（优先级
@@ -442,22 +459,36 @@ pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| managed_mcp_config_path(args.platform));
 
-    // (scope, path) 层，低优先级在前 / layers, lowest priority first。
+    // 层，低优先级在前 / layers, lowest priority first。
     // 序 = 协议 `runtime-contract.md §2.5` 完整序 `user < project < local < embed < flag < policy`
-    // （F6：flag **次高**，仅低于 policy；embed 层归 #147）。settings.json 与 mcp.json 两套来源 MUST 同序。
-    let mut layers: Vec<(SettingsScope, PathBuf)> = Vec::new();
-    layers.push((SettingsScope::User, user_mcp_config_path(args.env)));
+    // （F6：flag **次高**，仅低于 policy；#147：embed 层插在 local 与 flag 之间）。settings.json 与 mcp.json
+    // 两套来源 MUST 同序。embed 是**内存层**（宿主构造入参），非文件路径 ⇒ 用 `McpLayer` 枚举承载。
+    let mut layers: Vec<McpLayer<'_>> = Vec::new();
+    layers.push(McpLayer::File(
+        SettingsScope::User,
+        user_mcp_config_path(args.env),
+    ));
     // project/local：无条件锚定进程 cwd（cwd 不可读 → 跳过该两层）。
     if let Some(base) = resolve_cwd(args.cwd) {
-        layers.push((SettingsScope::Project, workdir_mcp_config_path(&base)));
-        layers.push((SettingsScope::Local, workdir_mcp_local_config_path(&base)));
+        layers.push(McpLayer::File(
+            SettingsScope::Project,
+            workdir_mcp_config_path(&base),
+        ));
+        layers.push(McpLayer::File(
+            SettingsScope::Local,
+            workdir_mcp_local_config_path(&base),
+        ));
+    }
+    // embed（`Computer::new(mcp_servers=…)`）：local 与 flag 之间（§2.5-3；#147/S14）。空集不贡献。
+    if !args.embed_servers.is_empty() {
+        layers.push(McpLayer::Embed(args.embed_servers));
     }
     // flag（`--mcp-config`）：次高——CLI 显式传入覆盖用户默认配置（F6，协议 §2.5）。历史实现把它排最低
     // （`--config` 老接口遗留），令用户默认反覆盖 CLI 显式传入、违反直觉 —— 已废止。
     if let Some(fc) = args.flag_config_path {
-        layers.push((SettingsScope::Flag, fc.to_path_buf()));
+        layers.push(McpLayer::File(SettingsScope::Flag, fc.to_path_buf()));
     }
-    layers.push((SettingsScope::Policy, managed_path));
+    layers.push(McpLayer::File(SettingsScope::Policy, managed_path));
 
     let mut errors: Vec<SettingsValidationError> = Vec::new();
     // 累积原始定义（低→高，后者覆盖前者）；IndexMap 保插入序、同 key 覆盖值不挪位（对齐 Python dict）。
@@ -465,24 +496,52 @@ pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
     let mut raw_inputs: IndexMap<String, (Value, SettingsScope, String)> = IndexMap::new();
     let mut noid: usize = 0;
 
-    for (scope, path) in &layers {
-        let (file, errs) = load_mcp_config_file(path, *scope);
-        errors.extend(errs);
-        let src = path.to_string_lossy().into_owned();
-        for (srv_name, sdef) in file.servers {
-            raw_servers.insert(srv_name, (sdef, *scope, src.clone()));
-        }
-        for idef in file.inputs {
-            let iid = idef.get("id").and_then(Value::as_str).map(String::from);
-            let key = match &iid {
-                Some(s) => s.clone(),
-                None => {
-                    let k = format!("<noid-{noid}>");
-                    noid += 1;
-                    k
+    for layer in &layers {
+        match layer {
+            McpLayer::File(scope, path) => {
+                let (file, errs) = load_mcp_config_file(path, *scope);
+                errors.extend(errs);
+                let src = path.to_string_lossy().into_owned();
+                for (srv_name, sdef) in file.servers {
+                    raw_servers.insert(srv_name, (sdef, *scope, src.clone()));
                 }
-            };
-            raw_inputs.insert(key, (idef, *scope, src.clone()));
+                for idef in file.inputs {
+                    let iid = idef.get("id").and_then(Value::as_str).map(String::from);
+                    let key = match &iid {
+                        Some(s) => s.clone(),
+                        None => {
+                            let k = format!("<noid-{noid}>");
+                            noid += 1;
+                            k
+                        }
+                    };
+                    raw_inputs.insert(key, (idef, *scope, src.clone()));
+                }
+            }
+            // embed 层：宿主构造入参投影成 mcp.json 形状（map 键 = `cfg.name()`，与文件层身份承载一致）。
+            // origin=embed 由 `validate_server(scope=Embed)` 落定；trusted 经 `is_trusted_origin`。**无 inputs**
+            // （构造入参 `inputs=` 是另一条通路，不经本层）。config 已是校验后的 A2C 模型 ⇒ `to_value` 回落 raw、
+            // 交同一 `validate_server` 往返（`name` 字段与 map 键一致，不触发身份冲突判废）。
+            McpLayer::Embed(cfgs) => {
+                for cfg in *cfgs {
+                    let name = cfg.name().to_string();
+                    match serde_json::to_value(cfg) {
+                        Ok(sdef) => {
+                            raw_servers.insert(
+                                name,
+                                (sdef, SettingsScope::Embed, EMBED_SOURCE.to_string()),
+                            );
+                        }
+                        // 校验后的模型序列化几乎不可能失败；真失败则记诊断、不阻断其余层。
+                        Err(e) => errors.push(err(
+                            SettingsScope::Embed,
+                            &format!("servers.{name}"),
+                            &format!("embed server config failed to serialize: {e}"),
+                            Some(EMBED_SOURCE),
+                        )),
+                    }
+                }
+            }
         }
     }
 
@@ -905,6 +964,144 @@ mod tests {
             _ => panic!("expected stdio server"),
         };
         assert_eq!(command, "flag", "胜出的 command 应来自 flag 层");
+    }
+
+    /// 构造一个 stdio embed server config（`name` = 身份 map 键）/ build one stdio embed config。
+    #[cfg(test)]
+    fn embed_stdio(name: &str, command: &str) -> MCPServerConfig {
+        serde_json::from_value(json!({
+            "type": "stdio",
+            "name": name,
+            "server_parameters": {"command": command},
+        }))
+        .unwrap()
+    }
+
+    /// 隔离 env/cwd（避免读到真实 user/project mcp.json）/ isolated env + empty cwd。
+    #[cfg(test)]
+    fn isolated_env(xdg: &Path) -> EnvMap {
+        std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        ))
+        .collect()
+    }
+
+    /// #147/S14：宿主构造入参（embed 层）→ resolve 输出携 `origin=Embed`、预信任（`is_trusted_origin`）。
+    /// embed 是 §2.5-3 完整序里 local 与 flag 之间的一层；每次 resolve 从声明式入参重投影、不落盘。
+    #[test]
+    fn embed_layer_projects_origin_embed_trusted_147() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd"); // 空目录：无 .tfrobot/mcp.json。
+        let env = isolated_env(&tmp.path().join("xdg"));
+        let embed = vec![embed_stdio("host-srv", "embed")];
+
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            embed_servers: &embed,
+            ..Default::default()
+        });
+
+        let s = resolved
+            .servers
+            .get("host-srv")
+            .expect("embed server MUST appear in the resolve authoritative set (#147)");
+        assert_eq!(s.origin, SettingsScope::Embed, "宿主构造入参 origin=embed");
+        assert!(s.trusted_origin, "embed ∈ 受信集（审批门档④）");
+    }
+
+    /// #147：碰撞优先序——embed 覆盖 local（`local < embed`），flag 覆盖 embed（`embed < flag`）。
+    /// 协议 `runtime-contract.md` §2.5-3 完整序 `... local < embed < flag < policy`。
+    #[test]
+    fn embed_priority_between_local_and_flag_147() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = isolated_env(&tmp.path().join("xdg"));
+        // local 声明 srv=local。
+        write(
+            &workdir_mcp_local_config_path(&wd),
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"local"}}}}"#,
+        );
+        let embed = vec![embed_stdio("srv", "embed")];
+
+        // (a) local + embed → embed 胜。
+        let r1 = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            embed_servers: &embed,
+            ..Default::default()
+        });
+        let cmd1 = match &r1.servers["srv"].config {
+            MCPServerConfig::Stdio(c) => c.server_parameters.command.as_str(),
+            _ => panic!("stdio"),
+        };
+        assert_eq!(
+            r1.servers["srv"].origin,
+            SettingsScope::Embed,
+            "embed > local"
+        );
+        assert_eq!(cmd1, "embed");
+
+        // (b) + flag 声明 srv=flag → flag 胜（embed < flag）。
+        let flag_file = tmp.path().join("flag-mcp.json");
+        write(
+            &flag_file,
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"flag"}}}}"#,
+        );
+        let r2 = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            flag_config_path: Some(&flag_file),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            embed_servers: &embed,
+            ..Default::default()
+        });
+        let cmd2 = match &r2.servers["srv"].config {
+            MCPServerConfig::Stdio(c) => c.server_parameters.command.as_str(),
+            _ => panic!("stdio"),
+        };
+        assert_eq!(
+            r2.servers["srv"].origin,
+            SettingsScope::Flag,
+            "flag > embed"
+        );
+        assert_eq!(cmd2, "flag");
+    }
+
+    /// #147：通用禁用开关（`deniedMcpServers`，档①）对 embed **适用**——用户/管理员保留最终关停权
+    /// （embed 无 plugin 那样的整体 enable/disable 兜底，不可豁免）。embed 预信任 ⇒ 无名单时默认 Enabled
+    /// （档④），但 deniedMcpServers 先于档④ 生效。档⑤⑥ 的 project 信任门因档④短路而对 embed 不可达。
+    #[test]
+    fn embed_honors_denied_general_disable_147() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = isolated_env(&tmp.path().join("xdg"));
+        let embed = vec![embed_stdio("host-srv", "embed")];
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            embed_servers: &embed,
+            ..Default::default()
+        });
+        // 无名单 → embed 预信任 → Enabled（档④）。
+        let empty = Map::new();
+        assert_eq!(
+            gate_mcp_servers(&resolved, &empty)["host-srv"],
+            McpApprovalStatus::Enabled,
+            "embed 预信任默认 Enabled"
+        );
+        // deniedMcpServers=[host-srv] → Disabled（档① 先于档④）。
+        let mut denied = Map::new();
+        denied.insert(FIELD_DENIED_MCP_SERVERS.to_string(), json!(["host-srv"]));
+        assert_eq!(
+            gate_mcp_servers(&resolved, &denied)["host-srv"],
+            McpApprovalStatus::Disabled,
+            "deniedMcpServers 对 embed 适用（用户保留关停权）"
+        );
     }
 
     // ---- mcp_server_status 7 档优先级（协议 guides/mcp-approval-gate-alignment.md §2 档位表）-----
