@@ -18,8 +18,9 @@
 * 走 enable→mount、**从不进** `resolve_mcp_config` ⇒ 该档唯一可达路径 100% 是借名绕过。plugin 声明依赖的
 * server MUST 不进入本门迭代（协议 `runtime-contract.md` §5 item 10 + `guides/mcp-approval-gate-alignment.md` §2）。
 *
-* flag 层 schema 区分（fix-review #1）：`flag_config` 是 **settings.json** flag 层（喂 `resolved_settings` 的
-* `flag_path`），**不是 mcp.json**，故不喂 `resolve_mcp_config(flag_config_path=)`。
+* flag 层两文件（#137 起两者都接线）：`flag_settings`=`--settings`（**settings.json** flag 层，喂 `resolved_settings`
+* 的 `flag_path`）；`flag_mcp_config`=`--mcp-config`（**mcp.json** flag 层，**次高**，喂 `resolve_mcp_config` 的
+* `flag_config_path`）。二者是 flag scope 的 settings.json + mcp.json 文件对（协议 §2.5，与其他 scope 双文件对称）。
 */
 
 use std::io::Write;
@@ -83,18 +84,23 @@ async fn mount<S: Session>(comp: &Computer<S>, srv: &ResolvedMcpServer) {
 }
 
 /// 启动期解析 `.tfrobot/mcp.json` 定义层 + 批准门控 + 挂载 ENABLED server / boot-time MCP approval + mount。
+///
+/// 两个 flag 文件（分属不同 scope 家族的两文件形态，见模块头）：`flag_settings` = `--settings`（settings.json
+/// flag 层，喂 [`resolved_settings_with_errors`]）；`flag_mcp_config` = `--mcp-config`（mcp.json flag 层，**次高**，
+/// 喂 [`resolve_mcp_config`]）。#137：后者接线到位——flag 层受信（`is_trusted_origin`）⇒ 门判 Enabled 直挂、
+/// 覆盖 user/project/local 同 `bundle_id`，本次运行**不落盘**；文件 `inputs` 段亦经该解析入池（替代旧 `--inputs`）。
 pub async fn run_mcp_approval<S: Session>(
     comp: &Computer<S>,
     approve_all: bool,
-    flag_config: Option<&Path>,
+    flag_settings: Option<&Path>,
+    flag_mcp_config: Option<&Path>,
 ) {
     // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
     let cwd = std::env::current_dir().ok();
-    // flag_config 是 settings.json（见模块文档）→ resolve_mcp_config 不收（避免当 mcp.json 误读）。
     let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
         cwd: cwd.as_deref(),
         env: None,
-        flag_config_path: None,
+        flag_config_path: flag_mcp_config,
         managed_mcp_path: None,
         platform: None,
     });
@@ -109,7 +115,7 @@ pub async fn run_mcp_approval<S: Session>(
 
     // #143：settings 的校验错误必须**呈现**——scope 越权（policy-only / 审批门 enable 方向判据）会**静默
     // 丢弃字段**，若连错误也吞掉，用户只会看到「我的 settings 莫名不生效」。协议指南 §2.1/§3：响亮失败。
-    let resolved_st = resolved_settings_with_errors(cwd.as_deref(), None, flag_config);
+    let resolved_st = resolved_settings_with_errors(cwd.as_deref(), None, flag_settings);
     for line in format_settings_errors(&resolved_st.errors) {
         msg_warn(&line);
     }

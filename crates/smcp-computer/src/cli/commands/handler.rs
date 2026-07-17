@@ -353,7 +353,13 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// 加载服务器配置
+    /// 从文件批量导入 server/input 声明并**持久化**（经 `add_or_update_server` 写 local scope）/ bulk-import + persist。
+    ///
+    /// ⚠️ **无 CLI 入口**（#137 起）：旧 `run --config` 启动参数已退役为 `--mcp-config`——后者是 **flag scope
+    /// 覆盖层**（次高、受信、**不落盘**，经 `run_mcp_approval` → `resolve_mcp_config`），与本方法**语义不同**
+    /// （本方法落盘持久化）。且本方法读的是 **legacy 数组形态** `{"servers": [ … ]}`，
+    /// 与 mcp.json 的**对象形态** `{"servers": {name: def}}`（协议 §9.1）**不一致**。仅作宿主/程序化的批量导入
+    /// seam（当前唯 REPL 外调用方 = 测试）；勿把它误当作 mcp.json 加载器。
     pub async fn load_config(&mut self, path: &Path) -> Result<(), CommandError> {
         let content = std::fs::read_to_string(path)?;
         let config: Value = serde_json::from_str(&content)?;

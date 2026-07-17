@@ -79,7 +79,7 @@ pub struct Args {
     #[arg(long)]
     pub no_color: bool,
 
-    /// flag scope settings.json 路径（最低优先级，§5.5）/ flag-scope settings.json file
+    /// flag scope settings.json 路径（次高，仅低于 policy；F6，协议 §2.5）/ flag-scope settings.json file
     #[arg(long)]
     pub settings: Option<PathBuf>,
 
@@ -95,12 +95,10 @@ pub struct Args {
 pub enum Commands {
     /// 启动计算机并进入持续运行模式（REPL）
     Run {
-        /// 在启动时从文件加载 MCP Servers 配置
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-        /// 在启动时从文件加载 Inputs 定义
-        #[arg(short, long)]
-        inputs: Option<PathBuf>,
+        /// flag 层 mcp.json 文件（次高，仅低于 policy；覆盖 user/project/local 同 bundle_id）。文件含 servers
+        /// 与 inputs 段，本次运行受信直挂、不落盘。-c 短参保留（与 Claude Code 同名）。
+        #[arg(short = 'c', long = "mcp-config")]
+        mcp_config: Option<PathBuf>,
     },
     /// SKILL marketplace 管理（git 源）/ SKILL marketplaces
     Marketplace {
@@ -298,12 +296,12 @@ async fn dispatch(mut args: Args) -> i32 {
         Some(Commands::Plugin { action }) => dispatch_plugin(action, &root).await,
         Some(Commands::Settings { action }) => dispatch_settings(action, &root),
         Some(Commands::Skill { action }) => dispatch_skill(action).await,
-        Some(Commands::Run { config, inputs }) => {
-            run_repl(&args, &root, config, inputs).await;
+        Some(Commands::Run { mcp_config }) => {
+            run_repl(&args, &root, mcp_config).await;
             0
         }
         None => {
-            run_repl(&args, &root, None, None).await;
+            run_repl(&args, &root, None).await;
             0
         }
     }
@@ -495,7 +493,7 @@ async fn dispatch_skill(action: SkillCmd) -> i32 {
 }
 
 // ── REPL 运行模式 / REPL run mode ─────────────────────────────────────────────
-async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs: Option<PathBuf>) {
+async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
     let session = SilentSession::new("cli-session");
     let computer = Computer::new(
         "friday_hands",
@@ -513,9 +511,10 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
         headers: args.headers.clone(),
     };
 
-    // 启动前缀（inputs/config 加载 → boot_up 子系统装配 → socket.io 连接）抽出为可测 helper。
-    let handler =
-        prepare_handler(computer, cli_config, config, inputs, root.flag_path.clone()).await;
+    // 启动前缀（boot_up 子系统装配 → 治理重挂 → socket.io 连接）抽出为可测 helper。
+    // #137：`--mcp-config` 不再走此处（旧 `--config` 的持久化加载已退役）——改为 flag 层喂启动期批准框
+    // （见下方 `run_mcp_approval`），flag scope 次高、受信直挂、不落盘。
+    let handler = prepare_handler(computer, cli_config, root.flag_path.clone()).await;
 
     // 启动 banner（版本 / 协议版本 / home）。
     let home = handler.computer.skill_home();
@@ -528,11 +527,13 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
         smcp::PROTOCOL_VERSION,
     );
 
-    // 启动期 MCP 批准框（--approve-all-mcp / 逐项 y-a-n）。
+    // 启动期 MCP 批准框（--approve-all-mcp / 逐项 y-a-n）。#137：`--mcp-config` 作 flag 层 mcp.json 喂入
+    // ——flag scope 次高、受信（`is_trusted_origin`）⇒ 门判 Enabled 直挂（非持久）；文件 `inputs` 段一并消费。
     approval::run_mcp_approval(
         &handler.computer,
         root.approve_all_mcp,
         root.flag_path.as_deref(),
+        mcp_config.as_deref(),
     )
     .await;
 
@@ -551,8 +552,6 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
 async fn prepare_handler(
     computer: Computer<SilentSession>,
     cli_config: commands::CliConfig,
-    config: Option<PathBuf>,
-    inputs: Option<PathBuf>,
     flag_path: Option<PathBuf>,
 ) -> CommandHandler {
     let url = cli_config.url.clone();
@@ -561,16 +560,9 @@ async fn prepare_handler(
     let headers = cli_config.headers.clone();
     let mut handler = CommandHandler::new(computer, cli_config);
 
-    if let Some(inputs_path) = inputs {
-        if let Err(e) = handler.load_inputs(&inputs_path).await {
-            eprintln!("加载 inputs 失败: {e}");
-        }
-    }
-    if let Some(config_path) = config {
-        if let Err(e) = handler.load_config(&config_path).await {
-            eprintln!("加载 config 失败: {e}");
-        }
-    }
+    // #137：旧 `--config`/`--inputs` 的持久化加载（`add_or_update_server` 写 local + `update_inputs`）已退役。
+    // 启动期 mcp.json 定义（含 flag 层 `--mcp-config`）改由 `run_mcp_approval` 经 `resolve_mcp_config` 统一解析
+    // + 门控 + 运行期挂载（非持久）；`inputs` 段亦经该解析入池。
 
     // #83 修复：装配 SKILL/blob/watcher 子系统（对齐 Python `a2c-computer run`）。
     // 必须在 connect_socketio 之前完成——Computer 一旦在线，Agent 可立即 get_skills/get_skill/mint blob。
@@ -624,11 +616,42 @@ mod tests {
             auth: None,
             headers: None,
         };
-        let handler = prepare_handler(computer, cli_config, None, None, None).await;
+        let handler = prepare_handler(computer, cli_config, None).await;
 
         // 修复后：prepare_handler 内 boot_up 已发现 user 源 SKILL。
         assert_eq!(handler.computer.get_skills().await.len(), 1);
         handler.computer.shutdown().await.unwrap();
+    }
+
+    /// #137 A6：`run --mcp-config`（`-c`）解析成功；旧 `--config` / `--inputs` 已删除 → 解析失败。
+    #[test]
+    fn run_accepts_mcp_config_and_rejects_legacy_flags_137() {
+        use clap::Parser;
+        // 长参 --mcp-config。
+        let a = Args::try_parse_from(["smcp-computer", "run", "--mcp-config", "f.json"]).unwrap();
+        assert!(matches!(
+            a.command,
+            Some(Commands::Run {
+                mcp_config: Some(ref p),
+            }) if p == std::path::Path::new("f.json")
+        ));
+        // 短参 -c 保留。
+        let b = Args::try_parse_from(["smcp-computer", "run", "-c", "g.json"]).unwrap();
+        assert!(matches!(
+            b.command,
+            Some(Commands::Run {
+                mcp_config: Some(_)
+            })
+        ));
+        // 旧 --config / --inputs 已删除。
+        assert!(
+            Args::try_parse_from(["smcp-computer", "run", "--config", "f.json"]).is_err(),
+            "--config 应已删除（更名 --mcp-config）"
+        );
+        assert!(
+            Args::try_parse_from(["smcp-computer", "run", "--inputs", "i.json"]).is_err(),
+            "--inputs 应已删除（并入 --mcp-config 文件 inputs 段）"
+        );
     }
 
     #[test]

@@ -95,10 +95,11 @@ pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIE
 /// 档⑤/⑥，被 clone 的仓库携一份 `{"enableAllProjectMcpServers": true}` 即可让其 `mcp.json` 里的任意
 /// server 启动期免批准框直挂 —— 与 #131 删掉的档④ **同构且更易达成**（无需装任何插件、无需猜任何名字）。
 ///
-/// # 为何**只拒 `Project`**（而非复用 [`crate::settings::mcp_config`] 的 `TRUSTED_ORIGINS`）
+/// # 为何**只拒 `Project`**（而非复用 mcp.json 声明面的预信任集 `is_trusted_origin`）
 ///
 /// 受信供给方 = `user` / `local` / `flag` / `policy`（协议 §2.1 表）——**含 `Local`**。这与 mcp.json
-/// **声明面**的 `TRUSTED_ORIGINS`（`[User, Flag, Policy]`，**不含 Local**）**有意不同**，勿混用：
+/// **声明面**的预信任集（`ProvenanceScope::is_trusted_origin` = `{user, embed, flag, policy}`，文件 scope
+/// 落到即 `{user, flag, policy}`，**不含 Local**）**有意不同**，勿混用：
 /// 三个批准写助手（`approve_mcp_server` / `deny_mcp_server` / `approve_all_project_mcp`）**只写 local
 /// scope**（个人决定不污染共享层）。若把 `Local` 也判为不受信，**每次批准都会在读回时被自己过滤掉、
 /// 批准永远不生效**。读面与写面 MUST 对称。
@@ -768,8 +769,8 @@ mod tests {
         );
     }
 
-    /// **含 `Local`**——这条是 `TRUSTED_ORIGINS`（不含 Local）的反面守护：三个批准写助手只写 local
-    /// scope，若 local 被判不受信，则「批准 → 写 local → 读回」链断裂、批准永不生效。
+    /// **含 `Local`**——这条是 mcp.json 声明面预信任集（`is_trusted_origin`，不含 Local）的反面守护：三个
+    /// 批准写助手只写 local scope，若 local 被判不受信，则「批准 → 写 local → 读回」链断裂、批准永不生效。
     #[test]
     fn test_trusted_scope_only_fields_kept_in_user_local_flag_policy() {
         for scope in [

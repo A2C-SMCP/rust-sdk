@@ -37,8 +37,8 @@ use crate::governance::{
 };
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::settings::config::{
-    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent, WriteScope,
-    WriteTargetError, WriteTargetOptions,
+    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent,
+    ProvenanceScope, WriteScope, WriteTargetError, WriteTargetOptions,
 };
 use crate::settings::installer::{
     DisableOptions, EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError,
@@ -2097,13 +2097,17 @@ impl<S: Session> Computer<S> {
         let home = self.skill_home();
         let ctx = self.instance_config_context(&config_dir, &home, WriteScope::Local);
 
-        // bundle_id → 声明名（去重）。快照 `McpServerView.config` 为 raw，`resolve_bundle_id` 与 manager 注册期同键。
+        // bundle_id → **用户声明名**（去重）。快照 `McpServerView.config` 为 raw，`resolve_bundle_id` 与 manager
+        // 注册期同键。**F3(b) origin 判据**（#138，与 A4 plugin 投影耦合）：`origin == Plugin` 的条目是 plugin
+        // 基线的**读侧投影**、非用户声明（runtime-only、不落 mcp.json、不可 Remove）——MUST 排除，否则「用户无自有
+        // 声明、bundle_id 属启用插件」会误判为「有声明」而绕过归属门（回归 #131/#126）。
         let snap = load_config(&ctx);
         let mut seen = HashSet::new();
         let names: Vec<String> = snap
             .mcp
             .servers
             .iter()
+            .filter(|v| v.origin != ProvenanceScope::Plugin)
             .filter(|v| crate::mcp_clients::bundle_id::resolve_bundle_id(&v.config) == bundle_id)
             .map(|v| v.name.clone())
             .filter(|n| seen.insert(n.clone()))

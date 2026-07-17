@@ -24,9 +24,9 @@
 //! 扁平 1–10 条、无子节）—— 一并扫净归后续卫生批次（#132）。
 //!
 //! 本模块是 **MCP 定义/门控的纯逻辑层**（无 git / 无 MCP manager / 无网络）。职责三件：
-//! 1. **多 scope 加载合并** `mcp.json`——顺序 `policy > local > project > user > flag`，**无能力层并集**
-//!    （敏感面隔离，区别于 settings.json）；server 按 name **整体替换**（配置是原子单元、非深合并），记录最高
-//!    定义 scope 为 `origin`。
+//! 1. **多 scope 加载合并** `mcp.json`——顺序 `policy > flag > local > project > user`（协议 `runtime-contract.md`
+//!    §2.5 完整序，F6：flag 次高、与 settings.json 同序），**无能力层并集**（敏感面隔离，区别于 settings.json）；
+//!    server 按 name **整体替换**（配置是原子单元、非深合并），记录最高定义 scope 为 `origin`。
 //! 2. **批准门控判定**（[`mcp_server_status`]）——**只**据 resolved settings（MCP 门控字段）+ 声明 `origin` 算
 //!    `enabled/disabled/pending`。**不读账本 / bundled 名集**（#131：读账本即授权门绕过，见该函数文档）。
 //! 3. **批准写助手**——批准/拒绝写 **local scope**（`settings.local.json`，个人决定不污染共享层），
@@ -61,6 +61,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
+use crate::settings::config::snapshot::ProvenanceScope;
 use crate::settings::policy::{LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR};
 use crate::settings::schema::{
     SettingsScope, SettingsValidationError, FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS,
@@ -85,12 +86,9 @@ pub const MANAGED_MCP_FILENAME: &str = "managed-mcp.json";
 /// server 定义里的 VS Code 风格扩展键：非 A2C `MCPServerConfig` 字段，校验前剥离、原样交渲染层 / ext keys。
 const VSCODE_EXT_KEYS: &[&str] = &["envFile"];
 
-/// 预信任 origin scope（user/flag/policy 自加 server，不弹批准框；审批门对齐指南 §2 档④）；project/local 受门控。
-const TRUSTED_ORIGINS: &[SettingsScope] = &[
-    SettingsScope::User,
-    SettingsScope::Flag,
-    SettingsScope::Policy,
-];
+// 预信任 origin 集（免批准门控）现集中于 [`ProvenanceScope::is_trusted_origin`]（`config::snapshot`）——
+// `{user, embed, flag, policy}`（#137 受信集扩位 embed）。文件 scope 经 `From<SettingsScope>` 落该集，
+// 结果对 mcp.json 声明面等价于旧 `[user, flag, policy]`（embed 非文件 scope、其运行期接线归 #147）。
 
 // ---------------------------------------------------------------------------
 // 错误 / Errors
@@ -181,7 +179,7 @@ pub struct ResolveMcpConfigArgs<'a> {
     pub cwd: Option<&'a Path>,
     /// 环境映射（解析 user config dir），`None` → 进程环境 / env map。
     pub env: Option<&'a EnvMap>,
-    /// `--config @file` 老接口文件（最低优先级，§5.5）/ legacy flag config path。
+    /// `--mcp-config` flag 层 mcp.json 文件（**次高**，仅低于 policy；F6，协议 §2.5）/ flag-scope mcp config path。
     pub flag_config_path: Option<&'a Path>,
     /// policy scope `managed-mcp.json` 覆盖路径（缺省按平台推导）/ managed path override。
     pub managed_mcp_path: Option<&'a Path>,
@@ -394,7 +392,7 @@ pub(crate) fn validate_server(
         config: cfg,
         ext,
         origin: scope,
-        trusted_origin: TRUSTED_ORIGINS.contains(&scope),
+        trusted_origin: ProvenanceScope::from(scope).is_trusted_origin(),
     };
     (Some(server), Vec::new())
 }
@@ -431,8 +429,9 @@ pub(crate) fn validate_input(
 // ---------------------------------------------------------------------------
 /// 多 scope 加载合并 `.tfrobot/mcp.json` + 字段级校验 / Multi-scope load + merge + validate mcp.json。
 ///
-/// 合并顺序 low → high = `[flag, user, project, local, policy]`（优先级
-/// `policy > local > project > user > flag`，`runtime-contract.md` §2.5）；**无能力层并集**。#98：project/local **无条件**锚定
+/// 合并顺序 low → high = `[user, project, local, flag, policy]`（优先级
+/// `policy > flag > local > project > user`，`runtime-contract.md` §2.5；F6：flag 次高、与 settings.json 同序）；
+/// **无能力层并集**。#98：project/local **无条件**锚定
 /// 进程 cwd（`cwd` 注入接缝，`None` → `std::env::current_dir()`；cwd 不可读则该两层缺省）。server 按 name
 /// **整体替换**（`origin` = 最高定义 scope）；inputs 按 `id` 去重高 scope 胜（缺 `id` 的条目各自保留以逐条报错）。
 /// 单 server / input 畸形 → drop + 错误，**不 abort**（§5.6）。
@@ -444,15 +443,19 @@ pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
         .unwrap_or_else(|| managed_mcp_config_path(args.platform));
 
     // (scope, path) 层，低优先级在前 / layers, lowest priority first。
+    // 序 = 协议 `runtime-contract.md §2.5` 完整序 `user < project < local < embed < flag < policy`
+    // （F6：flag **次高**，仅低于 policy；embed 层归 #147）。settings.json 与 mcp.json 两套来源 MUST 同序。
     let mut layers: Vec<(SettingsScope, PathBuf)> = Vec::new();
-    if let Some(fc) = args.flag_config_path {
-        layers.push((SettingsScope::Flag, fc.to_path_buf()));
-    }
     layers.push((SettingsScope::User, user_mcp_config_path(args.env)));
     // project/local：无条件锚定进程 cwd（cwd 不可读 → 跳过该两层）。
     if let Some(base) = resolve_cwd(args.cwd) {
         layers.push((SettingsScope::Project, workdir_mcp_config_path(&base)));
         layers.push((SettingsScope::Local, workdir_mcp_local_config_path(&base)));
+    }
+    // flag（`--mcp-config`）：次高——CLI 显式传入覆盖用户默认配置（F6，协议 §2.5）。历史实现把它排最低
+    // （`--config` 老接口遗留），令用户默认反覆盖 CLI 显式传入、违反直觉 —— 已废止。
+    if let Some(fc) = args.flag_config_path {
+        layers.push((SettingsScope::Flag, fc.to_path_buf()));
     }
     layers.push((SettingsScope::Policy, managed_path));
 
@@ -861,6 +864,65 @@ mod tests {
         assert_eq!(resolved.inputs.len(), 1);
         assert_eq!(resolved.inputs[0].id(), "tok");
         assert!(resolved.errors.is_empty());
+    }
+
+    /// #137 F6：flag scope（`--mcp-config`）**次高**——覆盖 user/project/local 同名声明（协议 §2.5 第3条
+    /// `... local < embed < flag < policy`）。历史实现把 mcp.json 的 flag 排最低（`--config` 老接口遗留），
+    /// 导致用户默认配置反覆盖 CLI 显式传入，违反直觉——本测钉死修正后的次高序。
+    #[test]
+    fn flag_scope_overrides_user_project_local_137() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let xdg = tmp.path().join("xdg");
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        ))
+        .collect();
+
+        // user + project + local 各声明 srv（低于 flag）。
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"user"}}}}"#,
+        );
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"project"}}}}"#,
+        );
+        write(
+            &workdir_mcp_local_config_path(&wd),
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"local"}}}}"#,
+        );
+        // flag（--mcp-config）声明 srv（MUST 次高胜出）。
+        let flag_file = tmp.path().join("flag-mcp.json");
+        write(
+            &flag_file,
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"flag"}}}}"#,
+        );
+
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            flag_config_path: Some(&flag_file),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            ..Default::default()
+        });
+
+        let srv = &resolved.servers["srv"];
+        // flag 次高胜出：origin=Flag、command=flag、trusted（flag ∈ 受信集）。
+        assert_eq!(
+            srv.origin,
+            SettingsScope::Flag,
+            "flag scope MUST 次高覆盖 user/project/local（协议 §2.5）"
+        );
+        assert!(srv.trusted_origin, "flag origin 预信任（审批门档④）");
+        let command = match &srv.config {
+            crate::mcp_clients::model::MCPServerConfig::Stdio(c) => {
+                c.server_parameters.command.as_str()
+            }
+            _ => panic!("expected stdio server"),
+        };
+        assert_eq!(command, "flag", "胜出的 command 应来自 flag 层");
     }
 
     // ---- mcp_server_status 7 档优先级（协议 guides/mcp-approval-gate-alignment.md §2 档位表）-----

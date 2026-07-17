@@ -358,13 +358,20 @@ fn resolve_plugin(
 // 内部辅助 / Helpers
 // ===========================================================================
 
-/// 只读判定：Flag/Policy/Intent → `None`（不可写）；User/Project/Local → 对应 `WriteScope`。
+/// 只读判定：User/Project/Local → 对应 `WriteScope`；其余 → `None`（不可写）。
+///
+/// 不可写包含：Flag/Policy（只读 scope）、Intent（reconcile 写、非手编）、Plugin（bundled server runtime-only、
+/// 不落 mcp.json，走 installer）、Embed（宿主构造入参、非持久文件；#137 骨架，运行期接线归 #147）。
 fn writable_scope(origin: ProvenanceScope) -> Option<WriteScope> {
     match origin {
         ProvenanceScope::User => Some(WriteScope::User),
         ProvenanceScope::Project => Some(WriteScope::Project),
         ProvenanceScope::Local => Some(WriteScope::Local),
-        ProvenanceScope::Flag | ProvenanceScope::Policy | ProvenanceScope::Intent => None,
+        ProvenanceScope::Plugin
+        | ProvenanceScope::Embed
+        | ProvenanceScope::Flag
+        | ProvenanceScope::Policy
+        | ProvenanceScope::Intent => None,
     }
 }
 
