@@ -56,7 +56,7 @@ impl Subscription {
 /// 负责管理资源订阅的本地状态，提供线程安全的订阅管理接口。
 #[derive(Debug, Clone)]
 pub struct SubscriptionManager {
-    /// 订阅列表（使用 Arc<RwLock> 保证线程安全）
+    /// 订阅列表（使用 `Arc<RwLock>` 保证线程安全）
     subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 

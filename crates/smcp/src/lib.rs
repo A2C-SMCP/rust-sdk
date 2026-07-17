@@ -556,8 +556,8 @@ pub mod tool_meta {
     // 不走 flat ErrorPayload，而内嵌 CallToolResult(isError=true) + 下列三键，使 Agent 区分「工具坏了」
     // 与「需授权」。Protocol-literal keys (NOT a2c-prefixed) for the upstream-auth CallToolResult.meta.
 
-    /// 结果级（MUST）：授权错误码 `4006`/`4007`（整数，[`ErrorCode::ToolAuthorizationRequired`] /
-    /// [`ErrorCode::ToolAuthorizationFailed`]）。
+    /// 结果级（MUST）：授权错误码 `4006`/`4007`（整数，[`crate::ErrorCode::ToolAuthorizationRequired`] /
+    /// [`crate::ErrorCode::ToolAuthorizationFailed`]）。
     pub const AUTH_ERROR_CODE_KEY: &str = "error_code";
     /// 结果级（MUST）：触发授权错误的 MCP Server 的 **bundle_id**（值 = bundle_id，协议 0.3.0 §身份正交性 #18；
     /// 生产方发 `call_tool` 传入的 bundle_id 身份键，与 `get_config` 归属一致）/

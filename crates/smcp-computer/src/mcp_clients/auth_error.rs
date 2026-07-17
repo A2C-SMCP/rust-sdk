@@ -14,11 +14,11 @@
 //! wire `_meta`），使 Agent 区分「工具坏了」与「需用户授权」——**不**走路由级 flat ErrorPayload。
 //!
 //! 本模块为**纯函数**（无 I/O，可独立单测）：
-//! - [`classify_auth_error`]：按 §423 决策表把上游错误（现仅字符串化于 [`MCPClientError`]）尽力归类为
+//! - [`classify_auth_error`](crate::mcp_clients::auth_error::classify_auth_error)：按 §423 决策表把上游错误（现仅字符串化于 [`MCPClientError`]）尽力归类为
 //!   `4006`（需授权）/ `4007`（授权失败）/ `None`（非授权，保持通用错误路径）。仅 transport 级 `Err`，
 //!   不解析 `Ok(CallToolResult{isError:true})` 的 content 文本（best-effort 边界）。
-//! - [`sanitize_auth_hint`]：按 §454「auth_hint 安全边界」MUST NOT 清单脱敏（删敏感键 + URL 去 query/fragment）。
-//! - [`build_default_auth_hint`] / [`build_auth_error_result`]：构造协议形状的授权错误结果。
+//! - [`sanitize_auth_hint`](crate::mcp_clients::auth_error::sanitize_auth_hint)：按 §454「auth_hint 安全边界」MUST NOT 清单脱敏（删敏感键 + URL 去 query/fragment）。
+//! - [`build_default_auth_hint`](crate::mcp_clients::auth_error::build_default_auth_hint) / [`build_auth_error_result`](crate::mcp_clients::auth_error::build_auth_error_result)：构造协议形状的授权错误结果。
 //!
 //! Python 参考实现**不存在**（仅有 `ErrorCode` 枚举），Rust 领先实现，依据为协议决策表。
 

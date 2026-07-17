@@ -37,7 +37,7 @@ use super::validate::{validate_config, ValidationReport};
 /// 脱敏哨兵：抹去 secret 字面值后的占位记号（显式、非明文、提示导入方补值）/ redaction sentinel。
 ///
 /// 形如占位符但 token 不匹配 `input:`/`env:` → 渲染层原样保留（明显「需替换」），且不含任何 secret。
-/// 自身含 `${` 且不可识别 → 再次导出时被当作字面段抹回同一哨兵（幂等，见 [`redact_value_string`]）。
+/// 自身含 `${` 且不可识别 → 再次导出时被当作字面段抹回同一哨兵（幂等，见 `redact_value_string`）。
 pub const REDACTED_PLACEHOLDER: &str = "${REDACTED}";
 
 /// `${...}` 占位符正则（与 [`crate::inputs::render`] 渲染层同 grammar：要求闭合 `}`、token 非空）。

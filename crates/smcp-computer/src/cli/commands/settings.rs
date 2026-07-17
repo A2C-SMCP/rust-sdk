@@ -8,7 +8,7 @@
 * 描述: `settings` 命令 handler（show / get / set / edit）
 *       Settings command handlers.
 *
-* 对标 Python `a2c_smcp/computer/cli/commands/settings.py`：读经 [`resolved_settings`]（merged，含 policy
+* 对标 Python `a2c_smcp/computer/cli/commands/settings.py`：读经 [`super::resolved_settings`]（merged，含 policy
 * first-source-wins）或单层 [`load_settings_file`]；写经 [`apply_write`]（**数组整体替换**；删键仅经 DELETE
 * 哨兵，`null` 写 JSON null，§5.4）+ store 持锁原子写。
 *

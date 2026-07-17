@@ -50,8 +50,8 @@ pub struct ExposedToolRoute {
 ///
 /// **身份键 = `bundle_id`（协议 0.3.0，rust-sdk#117）**：`servers_config` / `active_clients` / `retry_counts`
 /// 均以 [`BundleId`] 为键（no-double-open 去重、同名跨源 server 共存）。公开生命周期方法（`start_client` /
-/// `stop_client` / `get_window_detail` 等）仍以**人类可读名**寻址、内部经 [`bundle_id_for_name`](Self::bundle_id_for_name)
-/// 解析（`bundle_id` 由 [`bundle_id`](super::bundle_id) 在管理器内**从所持 config 计算一次**——避免 raw/rendered
+/// `stop_client` / `get_window_detail` 等）仍以**人类可读名**寻址、内部经 `bundle_id_for_name`
+/// 解析（`bundle_id` 由 [`bundle_id`] 在管理器内**从所持 config 计算一次**——避免 raw/rendered
 /// 连接身份漂移致的 bundle_id 不一致）。
 ///
 /// **对外标识一律 `bundle_id`**：desktop `window://` 分组（#118）与 skill `skill://` 枚举/物化（#127）均以
@@ -325,7 +325,7 @@ impl MCPServerManager {
     /// 移除服务器配置（**名称寻址**，内部解析为 `bundle_id`）/ Remove server configuration (name-addressed)。
     ///
     /// 保留供治理级联（plugin disable/uninstall 停摘 bundled server，按名）与既有内部调用；名→bundle_id 经
-    /// [`bundle_id_for_name`](Self::bundle_id_for_name)（已确定性消歧）。**用户 CRUD 删除**应走
+    /// `bundle_id_for_name`（已确定性消歧）。**用户 CRUD 删除**应走
     /// [`remove_server_by_id`](Self::remove_server_by_id) 直接按身份寻址（协议 §身份 MUST 用 bundle_id）。
     pub async fn remove_server(&self, server_name: &str) -> Result<(), ComputerError> {
         let Some(bundle_id) = self.bundle_id_for_name(server_name).await else {
@@ -559,7 +559,7 @@ impl MCPServerManager {
         Ok(())
     }
 
-    /// 兼容别名：重建工具路由（旧名 `refresh_tool_mapping`）/ compat alias for [`refresh_tool_routes`]。
+    /// 兼容别名：重建工具路由（旧名 `refresh_tool_mapping`）/ compat alias for [`Self::refresh_tool_routes`]。
     ///
     /// #106 消费者任务经此在 `emit_update_tool_list` **之前**重建路由。保留旧名以免破坏既有调用点。
     pub async fn refresh_tool_mapping(&self) -> Result<(), ComputerError> {
@@ -683,7 +683,7 @@ impl MCPServerManager {
     /// 验证工具调用并路由 / Validate a tool call and route it（协议 0.3.0 BundleID 模型）。
     ///
     /// 入参 `exposed_tool_name` = `client:tool_call` 的 `tool_name`（`{bundle_id}__{alias ?? 原始名}`）。经**共享**
-    /// [`tool_routes`](Self::tool_routes) **整键查表**（**不** split 反解）路由，返回 `(bundle_id, server_name,
+    /// `tool_routes` **整键查表**（**不** split 反解）路由，返回 `(bundle_id, server_name,
     /// original_tool_name)`：`bundle_id` 是 `active_clients` 的键（供 [`call_tool`](Self::call_tool)），`server_name`
     /// 为诊断/历史用人类可读名，`original_tool_name` 是调上游 MCP 的原始名。映射未命中 →
     /// [`ComputerError::InvalidConfiguration`]（Computer 层映射协议 `4001 Tool Not Found`）。被 `forbidden_tools`
@@ -768,7 +768,7 @@ impl MCPServerManager {
     /// 可取消工具调用（INT-02 #70 取消最后一公里）/ Cancellable tool call.
     ///
     /// 与 [`Self::call_tool`] 同：套用 manager 级 `timeout`，并对**完成**结果跑相同收尾
-    /// （授权分流 / `tool_meta` / VRL，见 [`Self::finalize_tool_result`]）。差异仅在改调
+    /// （授权分流 / `tool_meta` / VRL，见 `Self::finalize_tool_result`）。差异仅在改调
     /// [`MCPClientProtocol::call_tool_cancellable`] 并透传 `cancel`：
     /// - [`CancellableCallOutcome::Cancelled`]（取消胜出）→ 原样上抛，由 `Computer` 写结果级 `meta.a2c_cancelled`；
     /// - 完成 / 上游错误 → 经 `finalize_tool_result` 收尾后包回 [`CancellableCallOutcome::Completed`]；
@@ -1097,7 +1097,7 @@ impl MCPServerManager {
 
     /// 获取可用工具列表 / Get available tools list
     ///
-    /// 与 [`validate_tool_call`](Self::validate_tool_call) **共享同一份** [`tool_routes`](Self::tool_routes)：每项
+    /// 与 [`validate_tool_call`](Self::validate_tool_call) **共享同一份** `tool_routes`：每项
     /// 产出 `SMCPTool.name = exposed_tool_name`（`{bundle_id}__{alias ?? 原始名}`）。原始工具名只从 `route`
     /// 读取（永不从 exposed 名 split 反解，协议 0.3.0 单射性）。
     pub async fn list_available_tools(&self) -> Vec<Tool> {
@@ -1400,7 +1400,7 @@ impl MCPServerManager {
     /// 获取单个窗口资源的详情 / Get detail of a single window resource
     ///
     /// **名称寻址**公开面（`window://` 通道沿用 display 名寻址，内部解析为身份键后委托
-    /// [`read_resource_by_id`](Self::read_resource_by_id)）。
+    /// `read_resource_by_id`）。
     pub async fn get_window_detail(
         &self,
         server_name: &str,

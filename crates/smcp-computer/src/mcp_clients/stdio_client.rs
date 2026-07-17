@@ -152,7 +152,7 @@ impl StdioMCPClient {
     /// 注入运行期变化通知上报接缝（#106）/ attach the runtime change-notification seam。
     ///
     /// 由 [`client_factory`](super::utils::client_factory) 在 manager 启动客户端时调用；须在 `connect` 前设置
-    /// （`connect` 据此构造 [`A2cClientHandler`] 传给 `.serve()`）。
+    /// （`connect` 据此构造 `A2cClientHandler` 传给 `.serve()`）。
     pub fn with_notify(mut self, notify: Option<ClientNotifyCtx>) -> Self {
         self.notify = notify;
         self

@@ -161,6 +161,9 @@ pub enum MarketplaceCmd {
         json: bool,
     },
     /// marketplace set <name> auto-update=<bool>
+    // clap 逐字消费此 doc 作 `--help` about 文案；尖括号是 CLI metavar（与 repl.rs / help.rs 的
+    // usage 串一致），rustdoc 的 invalid_html_tags 在此属误报——窄作用域 allow 以保 help 输出字节不变。
+    #[allow(rustdoc::invalid_html_tags)]
     Set {
         name: String,
         assignment: String,

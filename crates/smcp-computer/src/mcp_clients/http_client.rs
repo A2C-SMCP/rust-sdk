@@ -34,7 +34,7 @@ const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// HTTP MCP客户端 / HTTP MCP client
 ///
 /// #106：改用 rmcp 官方 [`StreamableHttpClientTransport`] + [`RunningService`]，与 stdio 客户端共享同一
-/// [`A2cClientHandler`] 通知接缝。方法体退化为 `peer` 委托（同 stdio），删去了手写的 JSON-RPC POST /
+/// `A2cClientHandler` 通知接缝。方法体退化为 `peer` 委托（同 stdio），删去了手写的 JSON-RPC POST /
 /// 会话管理 / SSE 解析——rmcp 传输负责 Streamable HTTP 的会话（Mcp-Session-Id）、SSE 响应流、GET 通知流与重连。
 /// A2C 业务语义（auth 4006/4007 分流、VRL、tool_meta、window://、skill://）仍在 manager 层，不受影响。
 pub struct HttpMCPClient {
@@ -75,7 +75,7 @@ impl HttpMCPClient {
     /// 注入运行期变化通知上报接缝（#106）/ attach the runtime change-notification seam。
     ///
     /// 由 [`client_factory`](super::utils::client_factory) 在 manager 启动客户端时调用；须在 `connect` 前设置
-    /// （`connect` 据此构造 [`A2cClientHandler`] 传给 `.serve()`）。
+    /// （`connect` 据此构造 `A2cClientHandler` 传给 `.serve()`）。
     pub fn with_notify(mut self, notify: Option<ClientNotifyCtx>) -> Self {
         self.notify = notify;
         self

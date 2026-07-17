@@ -32,7 +32,7 @@
 //! 写保护：物化文件顶端写一行 JSONC 注释 [`WRITE_PROTECTION_HEADER`]；读时容错剥离前导 `//` 行再解析。
 //! 发现手编痕迹（version 不符 / 未知顶层键）→ WARN + 用 in-memory 解析、下次 save 重写覆盖。
 //!
-//! DRY：账本记录类型（[`KnownMarketplaceEntry`] / [`KnownMarketplaces`] / [`InstalledPluginRecord`] /
+//! DRY：账本记录类型（[`KnownMarketplaceEntry`] / [`KnownMarketplaces`] / [`InstalledPluginRecord`](crate::settings::reconciler::InstalledPluginRecord) /
 //! [`InstalledPlugins`]）复用 [`reconciler`] 已定义者（`#[serde(flatten)] extra` 已对全部字段保真 round-trip）；
 //! 本模块仅新增带 `version` 的 `*File` 信封 + 持久化 I/O。
 //!
@@ -73,7 +73,7 @@ use crate::skills::staging::{KnownMarketplaceRecord, KnownMarketplaceRecorder};
 // ===========================================================================
 // 常量 / Constants
 // ===========================================================================
-/// 物化文件顶端写保护注释（JSONC 单行；读时被 [`strip_jsonc_header`] 剥离）/ Write-protection header line。
+/// 物化文件顶端写保护注释（JSONC 单行；读时被 `strip_jsonc_header` 剥离）/ Write-protection header line。
 pub const WRITE_PROTECTION_HEADER: &str =
     "// Maintained automatically by a2c-computer. DO NOT EDIT.";
 
@@ -566,7 +566,7 @@ pub fn load_installed_plugins_intent(
 
 /// 加锁 + 原子写 `known_marketplaces.json`（带写保护头 + `version`）/ Locked atomic write。
 ///
-/// ⚠️ **不可**在已持有 [`with_file_lock`] 的上下文内调用；读-改-写请改用 [`update_known_marketplaces`]。
+/// ⚠️ **不可**在已持有 `with_file_lock` 的上下文内调用；读-改-写请改用 [`update_known_marketplaces`]。
 pub fn save_known_marketplaces(
     file: &KnownMarketplacesFile,
     home: Option<&Path>,
@@ -586,7 +586,7 @@ pub fn save_known_marketplaces(
 
 /// 加锁 + 原子写 `installed_plugins.json`（带写保护头 + `version`）/ Locked atomic write。
 ///
-/// ⚠️ **不可**在已持有 [`with_file_lock`] 的上下文内调用；读-改-写请改用 [`update_installed_plugins`]。
+/// ⚠️ **不可**在已持有 `with_file_lock` 的上下文内调用；读-改-写请改用 [`update_installed_plugins`]。
 pub fn save_installed_plugins(
     file: &InstalledPluginsFile,
     home: Option<&Path>,

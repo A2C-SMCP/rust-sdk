@@ -445,7 +445,7 @@ impl AsyncSmcpAgent {
     /// - 二进制或过大文本 → `blob_handle` **原样返回**，由调用方经 `client:get_blob` 自取字节。
     ///
     /// 文本 MIME 的 `blob_handle` 自动经 `drain_blob` 拉回并 UTF-8 解码回填 `body`，对调用方透明；
-    /// 文本性判定经单一权威 [`mime_is_textual`]（协议 §6.4(2)）。对标 Python
+    /// 文本性判定经单一权威 `mime_is_textual`（协议 §6.4(2)）。对标 Python
     /// `a2c_smcp/agent/client.py::get_skill`。
     pub async fn get_skill(
         &self,
@@ -509,7 +509,7 @@ impl AsyncSmcpAgent {
     /// 直接对应协议 `client:get_blob`：按 `chunk_offset`（资源字节绝对偏移，缺省 0）+ `max_chunk_bytes`
     /// （客户建议单块上限，Computer clamp 至 `BlobThresholds.chunk_max_bytes`）取一块，返回 [`GetBlobRet`]
     /// （含 `total_size`/`sha256`/`eof`/base64 `blob`）。flat ErrorPayload（`4018` invalid_handle/
-    /// forbidden/gone/range）经 ack 透传为协议错误。多块重组/校验/重试请用 [`Self::drain_blob_bytes`]。
+    /// forbidden/gone/range）经 ack 透传为协议错误。多块重组/校验/重试请用 `Self::drain_blob_bytes`。
     /// 对标 Python `a2c_smcp/agent/client.py::get_blob`。
     pub async fn get_blob(
         &self,
@@ -748,7 +748,7 @@ impl AsyncSmcpAgent {
     /// 协议合规预期，**MUST NOT** 当作失败。
     ///
     /// 取消是否真正中断由 Computer 侧协作式处理（INT-02 #70）；Agent 随后从原 `client:tool_call` 的 ack
-    /// 拿到取消态 `CallToolResult`（结果级 `a2c_cancelled=true`），用 [`classify_tool_call_outcome`]
+    /// 拿到取消态 `CallToolResult`（结果级 `a2c_cancelled=true`），用 [`crate::response::classify_tool_call_outcome`]
     /// 区分取消 / 超时 / 失败。
     ///
     /// 注：取消载体 `AgentCallData` 仅 `{agent, req_id}`，**不含** reason 字段——取消原因

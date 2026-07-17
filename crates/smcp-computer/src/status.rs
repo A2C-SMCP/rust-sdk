@@ -238,7 +238,7 @@ impl RuntimeStatus {
     /// 用 CAS 而非「load 闸门 + store」：后者在并发下有 TOCTOU——`transition` 读闸门=false 后被抢占、
     /// `enter_shutdown` 落 `Shutdown`、`transition` 恢复即用 `store` 把终态**回写**为非终态。CAS 循环保证一旦
     /// 状态为 `Shutdown` 就拒绝迁移；且与 `enter_shutdown` 的 `store(Shutdown)` 交错时，被抢占的 CAS 会因期望值
-    /// 失配而重试→读到 `Shutdown`→返回。事件仍经 [`emit`](Self::emit) 的闸门抑制（`Shutdown` 恒为最后事件）。
+    /// 失配而重试→读到 `Shutdown`→返回。事件仍经 `emit` 的闸门抑制（`Shutdown` 恒为最后事件）。
     pub fn transition(&self, next: LifecycleState) {
         let mut cur = self.state.load(Ordering::Acquire);
         loop {

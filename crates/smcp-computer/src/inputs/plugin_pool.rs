@@ -5,7 +5,7 @@
 * 最后修改日期: 2026/06/04
 * 版权: 2023 JQQ. All rights reserved.
 * 依赖: serde_json, mcp_clients::model::MCPServerInput
-* 描述: plugin inputs 入池消歧（<plugin>@<marketplace>/<id> 前缀）。
+* 描述: plugin inputs 入池消歧（`<plugin>@<marketplace>/<id>` 前缀）。
 *       Plugin inputs pool disambiguation (prefixed pool ids).
 */
 

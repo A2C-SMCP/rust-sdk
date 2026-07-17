@@ -16,7 +16,7 @@
 *     而非 N→N+1 版本迁移。唯一带 `version` 的 ambient home 物化文件已有自迁移、且在 config-CRUD 边界外。
 *
 * 复用既有校验器（避免与运行期漂移）/ reuses the runtime validators (no drift):
-*   settings → [`schema::validate_settings`]；mcp server/input → [`mcp_config::validate_server`/`validate_input`]。
+*   settings → `schema::validate_settings`；mcp server/input → `mcp_config::validate_server`/`validate_input`。
 *   validate 产出的错误集**基本上**就是运行期加载会逐条过滤掉的那些——故不误报可运行配置。**唯一刻意更严**的一处：
 *   同文件内**重复 input id**（loader 静默去重、不报错，但 §8 要求「ID 唯一」）→ validate 逐条检出。此额外严格性
 *   是 schema 层面的合法诊断（重复 id 是编辑意图不清的信号），非环境探测。

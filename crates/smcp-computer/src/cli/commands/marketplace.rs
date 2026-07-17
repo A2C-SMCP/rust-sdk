@@ -160,7 +160,7 @@ pub struct MarketplaceAddOptions<'a> {
 /// 添加新 marketplace（首次 trust y/N，默认 eager clone）/ add a marketplace。
 ///
 /// **薄封装**：信任门（user-scope，§10.5/§11）属 CLI 表现层，其余 stage/no-clone 编排委托非 CLI 的
-/// [`register_or_stage_marketplace`]；本 handler 仅做信任决策 + 结构化结果 → 退出码映射。
+/// `register_or_stage_marketplace`；本 handler 仅做信任决策 + 结构化结果 → 退出码映射。
 pub async fn marketplace_add(
     registry: &mut SkillRegistry,
     home: &Path,

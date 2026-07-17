@@ -19,7 +19,7 @@
 //! **结构化缺失**：input 未解析且无默认值 → [`InputResolutionError::Missing`]（**非仅日志**），由 client 决定补录
 //! UI，绝不静默用空串。
 //!
-//! **keyring 降级为 resolver 实现**：[`SecretStore`](super::secret_store::SecretStore)（OS keyring）在 D1 下不再属
+//! **keyring 降级为 resolver 实现**：[`SecretStore`]（OS keyring）在 D1 下不再属
 //! SDK-owned config，而是 [`SecretValueResolver`] 的一种 **opt-in** 实现（[`KeyringSecretResolver`]）。明文 value
 //! store 已于 S5 **硬退役**——SDK 不再落盘任何 input 明文值。
 

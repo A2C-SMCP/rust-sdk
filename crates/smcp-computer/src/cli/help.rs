@@ -8,7 +8,7 @@
 * 描述: 分组 help 渲染 + 命令分类法（REPL help / completer 共用单一事实源）/ grouped help + command taxonomy.
 *
 * 对标 Python `a2c_smcp/computer/cli/help.py`：`render_help` 默认列 namespace（折叠），`help <ns>` 列该
-* namespace 命令。分类法（[`NAMESPACES`] / [`namespace_commands`] / [`subcommands`] / [`flags_for`] / [`ROOT_WORDS`]）
+* namespace 命令。分类法（[`NAMESPACES`] / `namespace_commands` / [`subcommands`] / [`flags_for`] / [`ROOT_WORDS`]）
 * 是 REPL help 与 [`super::completer`] 的单一事实源。
 */
 

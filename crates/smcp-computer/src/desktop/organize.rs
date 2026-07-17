@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 /// Rules from /desktop workflow:
 ///   1) 若指定 window_uri，Manager 层已完成过滤；此处按一般规则组织即可。
 ///   2) 按最近工具调用历史对应的 MCP Server 倒序优先（最近使用的服务器优先）。
-///   3) 同一 MCP Server 内，按 `Resource.annotations.priority`（f32[0,1]，缺省 0.0）降序推入；
+///   3) 同一 MCP Server 内，按 `Resource.annotations.priority`（`f32[0,1]`，缺省 0.0）降序推入；
 ///      URI query 不再承载排序信息（v0.2 元数据下沉）。
 ///   4) 若 `Resource._meta.fullscreen=true` 的窗口，则该 MCP 仅推入这一个；若 size 仍有剩余，则进入下一个 MCP。
 ///   5) 全局按 size 截断（None 表示不限；size<=0 则返回空）。

@@ -602,7 +602,7 @@ fn write_ledger_record(
 ///
 /// v0.3.0 conformance §63（账本删除无损）：账本 `installed_plugins.json` 被外部删除/损坏后，boot / reconcile
 /// 据 `installedPlugins` 意图重建其派生缓存，使 enabled plugin 的 bundled server 与归属重现。复用
-/// [`materialize_plugin`]（`refresh=false` 离线复用既有 clone）+ [`write_ledger_record`]，故重建的 `installPath`
+/// `materialize_plugin`（`refresh=false` 离线复用既有 clone）+ `write_ledger_record`，故重建的 `installPath`
 /// / bundled 名集与 install 当初一致。
 ///
 /// **只写账本**：不写 `installedPlugins` 意图（本就是重建依据）、不写 `enabledPlugins`、不 stage skills（phase 1
@@ -616,7 +616,7 @@ fn write_ledger_record(
 /// `refresh=false` 复用同一 manifest，重建期不重复门控（避免 catalog 漂移令恢复误失败）。
 ///
 /// # Errors
-/// 见 [`materialize_plugin`] / [`write_ledger_record`]（源不可达 / manifest 畸形 / 账本写失败）。调用方（boot
+/// 见 `materialize_plugin` / `write_ledger_record`（源不可达 / manifest 畸形 / 账本写失败）。调用方（boot
 /// 恢复 [`rematerialize_missing_ledger_records`](crate::settings::recovery::rematerialize_missing_ledger_records)）
 /// 遇 `Err` 应降级记录、不阻断其余恢复。
 pub async fn materialize_plugin_record(
@@ -638,7 +638,7 @@ pub async fn materialize_plugin_record(
 /// `orphan`（不进 `get_skills`），bundled MCP server **不**挂、inputs **不**注入、**不**写 `enabledPlugins`
 /// （absent = 未启用 → `installed_disabled`）。激活全部交给 [`enable_plugin`]。
 ///
-/// 顺序：① 解析 id + mp source；② 要求 catalog 已 clone、读 marketplace.json 定位 entry；③ [`locate_plugin_root`]
+/// 顺序：① 解析 id + mp source；② 要求 catalog 已 clone、读 marketplace.json 定位 entry；③ `locate_plugin_root`
 /// 定位 plugin 根（必要时 clone）；④ strict 冲突检测 + [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**
 /// （外来 MCP 同名硬抛、零变更——满足「install 拒绝 foreign name conflict」，虽本步不挂载）；⑥ stage skills →
 /// 立即 `mark_orphan`（不投影）；⑦ **config-first 写 `installedPlugins` 全局安装意图**（权威）→ ⑧ 写账本
@@ -725,7 +725,7 @@ pub async fn install_plugin(
 /// `scope=None` 删该 id 全部记录；指定 scope 仅删该 scope 记录。未安装 / 无匹配 → `false`（no-op）。
 ///
 /// ⚠️ **相对源 plugin 的删除范围**：source 为相对路径时，其 `installPath` 位于**共享 catalog clone 内**
-/// （`<home>/marketplace/<mp>/.../<plugin>`），[`safe_rmtree`] 删的是该 marketplace 共享 git 工作树的子目录
+/// （`<home>/marketplace/<mp>/.../<plugin>`），`safe_rmtree` 删的是该 marketplace 共享 git 工作树的子目录
 /// （与兄弟 `gc_plugins` 同一 `safe_rmtree` 语义，非本函数新引入）；后续 `marketplace refresh` 遇脏树会 fallback
 /// 全量重 clone 干净恢复。即「删 plugin 子树」可能动到共享 catalog——勿误判为仅删独立 `.plugins/` 外部树。
 ///

@@ -442,7 +442,7 @@ pub fn list_orphan_marketplaces(
 /// 清理孤儿 marketplace（clone 树 + 外部 plugin 树 + known_marketplaces 条目 + Registry SKILL）/ Prune。
 ///
 /// y/N 确认交 CLI 层（#68）；本函数只**执行**清理（`names` 应为 [`list_orphan_marketplaces`] 的子集，
-/// 经用户确认后传入）。非法名跳过；删除越界守卫见 [`safe_rmtree`]。**不**触碰 `installed_plugins.json`
+/// 经用户确认后传入）。非法名跳过；删除越界守卫见 `safe_rmtree`。**不**触碰 `installed_plugins.json`
 /// （plugin 账本归 [`gc_plugins`]）。返回实际清理的 marketplace 名列表。
 pub fn prune_marketplaces(
     names: &[String],
@@ -494,7 +494,7 @@ pub fn list_orphan_plugins(
 /// 清理孤儿 plugin（installPath 树 + installed_plugins 条目 + Registry SKILL + bundled MCP）/ GC plugins。
 ///
 /// y/N 确认交 CLI 层（#68）；`plugin_ids` 应为 [`list_orphan_plugins`] 的子集（用户确认后传入）。每条记录的
-/// `installPath` 仅在词法位于 SKILL Home 内才删（[`safe_rmtree`]）；`bundledMcpServers` 汇总后经 `mcp_teardown`
+/// `installPath` 仅在词法位于 SKILL Home 内才删（`safe_rmtree`）；`bundledMcpServers` 汇总后经 `mcp_teardown`
 /// 回调停/摘（真正接线由 computer.py 集成承担，本模块只触发回调）。返回实际清理的 plugin id 列表。
 pub async fn gc_plugins(
     plugin_ids: &[String],

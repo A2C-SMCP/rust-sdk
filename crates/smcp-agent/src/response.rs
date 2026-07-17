@@ -12,7 +12,7 @@
 //!
 //! 当前承载 `client:*` ack 的 `req_id` 回显校验——`get_tools` / `get_desktop` / `list_room` /
 //! SKILL 消费（`skill_consume`）均经此单点收敛，避免「错误处理逻辑重复」（DRY）——以及
-//! `get_resources` 响应解析（[`parse_get_resources_response`]，与 `skill_consume` 同款纯函数约定）。
+//! `get_resources` 响应解析（`parse_get_resources_response`，与 `skill_consume` 同款纯函数约定）。
 
 use serde_json::Value;
 use smcp::{GetBlobRet, GetResourcesRet};

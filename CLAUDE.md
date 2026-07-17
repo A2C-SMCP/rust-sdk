@@ -27,6 +27,9 @@ cargo test -- --nocapture
 cargo fmt-all           # 格式化所有代码
 cargo clippy-workspace  # 严格 clippy 检查
 cargo clippy-loose      # 宽松 clippy 检查
+
+# rustdoc 零警告门禁（#146，与 CI 一致）
+RUSTDOCFLAGS="-D warnings" cargo doc-check
 ```
 
 ### 构建

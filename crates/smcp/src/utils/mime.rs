@@ -88,7 +88,7 @@ fn ext_of(filename: &str) -> Option<String> {
 
 /// 按文件名扩展名推断 MIME（§6.4(1) 确定性：**绝不**调用宿主系统库）/ Deterministic MIME by extension。
 ///
-/// 纯查表：命中 [`EXT_TO_MIME`] → 规范 MIME；未命中（含无扩展名）→ [`FALLBACK_MIME`]。结果只取决于扩展名
+/// 纯查表：命中 `EXT_TO_MIME` → 规范 MIME；未命中（含无扩展名）→ [`FALLBACK_MIME`]。结果只取决于扩展名
 /// （大小写不敏感），跨 OS / 跨 SDK 一致——这正是 python-sdk #105 的根因修复点（`mimetypes.guess_type` /
 /// `mime_guess` 内置表对 `.yaml` / `.toml` / `.rst` 等返回与协议基线不一致的值）。对标 Python `guess_mime`。
 ///
@@ -109,7 +109,7 @@ pub fn guess_mime(filename: &str) -> &'static str {
 ///
 /// - top-level type 为 `text`（RFC 2046 §4.1）；或
 /// - structured syntax suffix ∈ {`+json`, `+xml`, `+yaml`}（RFC 6839 / RFC 9512）；或
-/// - essence ∈ [`TEXT_MIME_ESSENCES`]（`application/json|xml|yaml|toml|javascript`）。
+/// - essence ∈ `TEXT_MIME_ESSENCES`（`application/json|xml|yaml|toml|javascript`）。
 ///
 /// 与 WHATWG MIME Sniffing 对「JSON / XML MIME type」的定义同构（后缀 ∨ essence 白名单）。不满足任一
 /// → 二进制（铸 `blob_handle`）。供 Computer inline 路由与 Agent `get_skill` 自动 drain 门**共用**，

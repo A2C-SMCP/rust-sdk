@@ -146,7 +146,7 @@ static AVAILABILITY: AtomicU8 = AtomicU8::new(0);
 /// 探测 OS keyring 是否可用（结果缓存，`force_recheck` 可重探）/ Probe keyring availability (cached)。
 ///
 /// 判定：本 target 编译了 keyring 后端 **且** 运行期后端非 fail（容器 / 无 Secret Service 时不可用）。结果缓存于
-/// [`AVAILABILITY`]，供 [`SecretStore`] 每次 get/set/delete 廉价复用（[`OsKeyring::available`] 即读此缓存）。
+/// `AVAILABILITY`，供 [`SecretStore`] 每次 get/set/delete 廉价复用（[`OsKeyring::available`] 即读此缓存）。
 pub fn keyring_available(force_recheck: bool) -> bool {
     if !KEYRING_COMPILED {
         return false;

@@ -113,7 +113,7 @@ pub struct ConnectOptions {
     /// Socket.IO CONNECT `auth` 字段负载（连接面鉴权唯一信道）；auth-agnostic，整个 JSON 由调用方决定。
     /// Socket.IO CONNECT `auth` payload (the sole connection-auth channel; caller owns the JSON).
     pub auth_payload: Option<serde_json::Value>,
-    /// 路由 HTTP upgrade headers，`"k:v,foo:bar"` 串（沿用 [`parse_headers_string`]；**非鉴权**）。
+    /// 路由 HTTP upgrade headers，`"k:v,foo:bar"` 串（沿用 `parse_headers_string`；**非鉴权**）。
     /// Routing HTTP upgrade headers as a `"k:v,foo:bar"` string (NOT for auth).
     pub headers: Option<String>,
     /// 应用层 namespace；[`Default`] 为 [`smcp::SMCP_NAMESPACE`] (`/smcp`)。
@@ -234,7 +234,7 @@ pub trait Session: Send + Sync {
 
 /// 默认的静默Session实现 / Default silent session implementation
 ///
-/// `Clone`：socketio 接线（#72）的 [`Computer::clone_for_handlers`] 需克隆 Session 以构造
+/// `Clone`：socketio 接线（#72）的 `Computer::clone_for_handlers` 需克隆 Session 以构造
 /// socketio-detached 句柄；`SilentSession` 仅持 `id`，克隆无副作用。自定义 Session 若要接 socketio
 /// blob/skill/cancel handler，亦须可 `Clone`（handler 路径**不**触碰 session，克隆体仅占位）。
 #[derive(Clone)]
@@ -1002,12 +1002,10 @@ impl<S: Session> Computer<S> {
 
     /// 启用单个 plugin（廉价复原：复活 skills + 重挂 server；hook 失败原子回滚）/ enable a plugin。
     ///
-    /// **scope（#113 S6）**：`options.scope` 缺省时从 ledger 安装记录**消解**（[`resolve_plugin_install_scope`]，
+    /// **scope（#113 S6）**：`options.scope` 缺省时从 ledger 安装记录**消解**（`resolve_plugin_install_scope`，
     /// **非恒定 user**，守「与安装 scope 一致」契约）；显式传入则原样尊重。**仅当 `enabledPlugins` 内容真变**时
     /// bump **config** revision + `emit_update_config`（#115 R1：installer 据实际写盘返回 `changed`，幂等 re-enable
-    /// 不虚假 bump / 不惊动 robot）；bundled server 若翻活经 hooks 走 [`mount_server`] 另 bump capability（§12 R2 正交）。
-    ///
-    /// [`resolve_plugin_install_scope`]: Self::resolve_plugin_install_scope
+    /// 不虚假 bump / 不惊动 robot）；bundled server 若翻活经 hooks 走 [`Self::mount_server`] 另 bump capability（§12 R2 正交）。
     ///
     /// # Errors
     /// 见 [`PluginInstallError`]（未安装 / 冲突 / manifest / settings 写 / 注入）。
@@ -1057,7 +1055,7 @@ impl<S: Session> Computer<S> {
         }
     }
 
-    /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；可经 [`enable_plugin`] 复原）/ disable。
+    /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；可经 [`Self::enable_plugin`] 复原）/ disable。
     ///
     /// **scope（#113 S6）**：同 [`enable_plugin`](Self::enable_plugin)——缺省时按安装记录消解；**仅当 `enabledPlugins`
     /// 内容真变**时 bump config revision + `emit_update_config`（#115 R1：重复 disable 不虚假 bump）。
@@ -1388,7 +1386,7 @@ impl<S: Session> Computer<S> {
     /// `stage_mcp_skills` 内部按 SKILL 仅在 `finalize`（FS rename + 内存注册，同步无 await）**短持写锁**，
     /// `archive` 网络下载 / `resources` MCP `read_resource` 期间**不持任何 Registry 锁**。慢/卡 fetch 不再阻塞
     /// `get_skills` / `get_skill_ref` 读（修复 Python 单事件循环掩盖、Rust 暴露的尾延迟竞争）。孤儿对账亦短持写锁。
-    /// **锁序（#106 并发接线后）**：本路径（含 [`McpChangeReactor`] 消费者，运行期由 MCP
+    /// **锁序（#106 并发接线后）**：本路径（含 `McpChangeReactor` 消费者，运行期由 MCP
     /// `ResourceListChanged`/`ResourceUpdated` 通知驱动，**已可达**）取 `mcp_manager.read` → `skill_registry.write`；
     /// CLI REPL 的 governance 路径（`cli::repl`）取 `skill_registry.write` → 经 `CliMcpHooks` 调
     /// `add_or_update_server`/`remove_server` 取 `mcp_manager` 锁。为消除相反序 ABBA，已把
@@ -1410,7 +1408,7 @@ impl<S: Session> Computer<S> {
     }
 
     /// 直接处理一条 MCP 运行期变化通知（#106）：刷新工具映射 / desktop 集合去抖 / MCP 源 skill 重挂，并触发
-    /// 对应 `server:update_*` emit。供**测试直调**与**消费者任务**共用（消费者持 [`McpChangeReactor`]，
+    /// 对应 `server:update_*` emit。供**测试直调**与**消费者任务**共用（消费者持 `McpChangeReactor`，
     /// 此方法即时构建等价 reactor）。无 socketio / 未入房间 → emit 均为 no-op。
     pub async fn handle_mcp_notification(&self, notif: McpServerNotification) {
         self.mcp_change_reactor().handle(notif).await;
@@ -1932,7 +1930,7 @@ impl<S: Session> Computer<S> {
     /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期停摘不改持久 config）。
     ///
     /// **消歧**：同名多 server 时取字典序最小的 `bundle_id`（确定但任意——`name` 非身份键；调用方需精确
-    /// 寻址应走 [`unmount_server_by_id`](Self::unmount_server_by_id)）。**先解析一次身份**再委托，使 manager
+    /// 寻址应走 `unmount_server_by_id`）。**先解析一次身份**再委托，使 manager
     /// 与本地投影停摘**同一对象**（#127 前：manager 走 name→bundle_id 桥、投影按 name 直删，二者在同名场景下
     /// 可能停摘不同的 server）。
     ///
@@ -2016,7 +2014,7 @@ impl<S: Session> Computer<S> {
     ///   §5 明定 upsert **MUST NOT** 因「同 bundle_id 已由 plugin 提供」拒写。此前 #126 的 `Synthesized` 拒写门控
     ///   据此**移除**。（`remove_server` 侧门控仍在——有意非对称，其 origin 判据改造属 F3(b) / #138。）
     /// - **§12 R2**：落盘成功后 bump **config** revision；随后运行期物化 bump **capability**。
-    /// - 治理物化（bundled 重挂）**不**走此路径（走 [`mount_server`]），避免 ledger 意图重复写入 mcp.json。
+    /// - 治理物化（bundled 重挂）**不**走此路径（走 [`Self::mount_server`]），避免 ledger 意图重复写入 mcp.json。
     ///
     /// # Errors
     /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；落盘失败
@@ -2027,14 +2025,14 @@ impl<S: Session> Computer<S> {
             .await
     }
 
-    /// 同 [`add_or_update_server`]，但**显式指定新 server 的落盘 scope**（opt-in 团队共享 `Project` / 用户全局 `User`）。
+    /// 同 [`Self::add_or_update_server`]，但**显式指定新 server 的落盘 scope**（opt-in 团队共享 `Project` / 用户全局 `User`）。
     ///
     /// #123（协议#19 加固）：`upsert_new_scope` **只作用于新声明**——更新已有 server 恒落其 origin scope，与本参数无关。
     /// `Local` = `<cwd>/.tfrobot/mcp.local.json`（不入 git）；`Project` = `<cwd>/.tfrobot/mcp.json`（入 git、团队共享）；
     /// `User` = `~/.config/a2c/mcp.json`（用户全局）。
     ///
     /// # Errors
-    /// 同 [`add_or_update_server`]。
+    /// 同 [`Self::add_or_update_server`]。
     pub async fn add_or_update_server_in_scope(
         &self,
         server: MCPServerConfig,
@@ -2489,7 +2487,7 @@ impl<S: Session> Computer<S> {
     /// - **显式取消**（`acancel_tool` fire 令牌）→ [`CancellableCallOutcome::Cancelled`] → 取消态结果；
     /// - **超时**（manager 级 timeout）→ [`ComputerError::TimeoutError`] → 超时态结果；
     /// - **外层断连/teardown**（本 future 被 drop）→ 不产生任何结果（future 消失，无 ack 可投），
-    ///   RAII [`InflightCancelGuard`] 注销注册表，**绝不**被误判为取消态（tokio drop 语义天然满足）。
+    ///   RAII `InflightCancelGuard` 注销注册表，**绝不**被误判为取消态（tokio drop 语义天然满足）。
     ///
     /// 注：跳过了 [`Self::execute_tool`] 的二次确认回调——取消语义聚焦在途中断；二次确认在 socketio 接线
     /// （#72）汇入时按需补接。当前 auto_apply 路径直达可取消调用。
@@ -2603,7 +2601,7 @@ impl<S: Session> Computer<S> {
     /// （就地中断 + rmcp 传输 best-effort 补发 MCP `notifications/cancelled`）。
     ///
     /// 返回 `true`：已对一个在途任务请求取消；`false`：`req_id` 未知或已完成（**幂等 no-op**，对齐
-    /// Python `acancel_tool`——完成即由 [`InflightCancelGuard`] 注销注册表，再次取消落空回 `false`）。
+    /// Python `acancel_tool`——完成即由 `InflightCancelGuard` 注销注册表，再次取消落空回 `false`）。
     /// MCP 取消为**协作式**——远端是否真正停止**不保证**。
     pub async fn acancel_tool(&self, req_id: &str) -> bool {
         let token = {

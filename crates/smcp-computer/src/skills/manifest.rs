@@ -5,7 +5,7 @@
 * 最后修改日期: 2026/06/03
 * 版权: 2023 JQQ. All rights reserved.
 * 依赖: serde_json, smcp (utils::path), crate::mcp_clients::model, crate::skills::sources
-* 描述: Plugin manifest 文件式解析（marketplace.json + plugin.json + mcp-servers/<n>.json）
+* 描述: Plugin manifest 文件式解析（marketplace.json + plugin.json + `mcp-servers/<n>.json`）
 *       对标 Python computer/skills/manifest.py / Plugin manifest file parsing.
 */
 
