@@ -52,7 +52,7 @@
 //! 对此类未知键在 Rust **不触发**（该 server 被容受、不入 `errors`），故 CLI 启动 WARN 接线**不应**假定与 Python
 //! 逐条对等；真正畸形（缺必填 / `type` 非法 / name-key 冲突）仍 drop+error，与 Python 一致。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -71,7 +71,7 @@ use crate::settings::scope::{
     apply_write, load_settings_file, resolve_cwd, resolve_user_config_dir,
     workdir_local_settings_path, workdir_settings_dir, EnvMap, WriteValue,
 };
-use crate::settings::store::{self, load_installed_plugins, SettingsStoreError};
+use crate::settings::store::{self, SettingsStoreError};
 
 // ---------------------------------------------------------------------------
 // 常量 / Constants
@@ -621,29 +621,11 @@ pub fn gate_mcp_servers(
         .collect()
 }
 
-/// 已安装 plugin 携带的 bundled MCP server name 并集（账本接缝）/ Union of installed plugins' bundled servers。
-///
-/// 读 `installed_plugins.json` 全记录的 `bundledMcpServers`。
-///
-/// ⚠️ **不是授权判据**。#131 起唯一消费者是 [`config::snapshot`](crate::settings::config) 的
-/// `McpServerView.bundled` **信息位**（仅供客户端提示「名字与某已装插件 bundled server 撞名」）。审批门
-/// （[`mcp_server_status`]）与 CRUD 归属门**均不得**读它：
-/// - 本函数**只读派生账本**（`installed_plugins.json`），**不看** `installedPlugins` 安装意图、**不看**
-///   `enabledPlugins` 启用态 ⇒ 已停用、乃至已 uninstall 待 gc 的陈旧记录，名字照样在集合里；
-/// - 且按 **display name** 关联——而 name 允许碰撞、非身份（协议 §身份正交性）。
-///
-/// 归属判定请用 `settings::recovery::collect_enabled_bundled_servers`（intent ∧ `enabledPlugins` ∧ `bundle_id`
-/// 关联）。本函数整体删除（F8 判据②）待 `snapshot.bundled` 改 `origin == plugin` 推导后执行 —— 见 #138。
-#[must_use]
-pub fn bundled_mcp_server_names(home: Option<&Path>, env: Option<&EnvMap>) -> HashSet<String> {
-    let mut out: HashSet<String> = HashSet::new();
-    for records in load_installed_plugins(home, env).account.plugins.values() {
-        for record in records {
-            out.extend(record.bundled_mcp_servers.iter().cloned());
-        }
-    }
-    out
-}
+// #138（F8 判据②）：`bundled_mcp_server_names()`（name-join、不分启用态的账本并集）**已整体删除**——
+// 它是 #126 假阳性的根源（撞任一已装插件 bundled 名即标记，无视 enable/intent），且按 display name 关联
+// （name 允许碰撞、非身份）。唯一消费者 `McpServerView.bundled` 已改 `origin == Plugin` 纯推导（见
+// `config::snapshot`）；归属判定用 `settings::recovery::collect_enabled_bundled_servers`
+// （intent ∧ `enabledPlugins` ∧ `bundle_id`）。审批门与 CRUD 归属门均不读账本名集（F8 判据①，签名 const pin）。
 
 // ---------------------------------------------------------------------------
 // 批准写助手（写 local scope = settings.local.json）/ Approval write helpers
@@ -1053,7 +1035,16 @@ mod tests {
         assert_eq!(resolved.servers["audit-mcp"].origin, SettingsScope::Project);
         assert!(!resolved.servers["audit-mcp"].trusted_origin);
         // 账本确实含该名——否则红灯来自夹具失效而非档④ 本身（此断言即「借名」前提，勿删）。
-        assert!(bundled_mcp_server_names(Some(&home), Some(&env)).contains("audit-mcp"));
+        // #138：`bundled_mcp_server_names` 已删，改直读派生账本验证同一前提。
+        assert!(
+            store::load_installed_plugins(Some(&home), Some(&env))
+                .account
+                .plugins
+                .values()
+                .flatten()
+                .any(|r| r.bundled_mcp_servers.iter().any(|n| n == "audit-mcp")),
+            "账本应含 bundled 名 audit-mcp（借名前提）"
+        );
 
         // 门控**收不到**账本名集（F8 判据①：签名不含 `bundled` 入参）⇒ 借名无从生效。
         let gated = gate_mcp_servers(&resolved, &Map::new());
@@ -1315,33 +1306,8 @@ mod tests {
         );
     }
 
-    // ---- bundled_mcp_server_names ------------------------------------------
-    #[test]
-    fn bundled_names_from_ledger() {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path();
-        let env = EnvMap::new();
-        // 空账本 → 空。
-        assert!(bundled_mcp_server_names(Some(home), Some(&env)).is_empty());
-        // 写一条记录。
-        crate::settings::store::update_installed_plugins(
-            |file| {
-                file.account.plugins.insert(
-                    "audit@acme".to_string(),
-                    vec![crate::settings::reconciler::InstalledPluginRecord {
-                        install_path: Some("/x".to_string()),
-                        bundled_mcp_servers: vec!["audit-mcp".to_string()],
-                        extra: Map::new(),
-                    }],
-                );
-            },
-            Some(home),
-            Some(&env),
-        )
-        .unwrap();
-        let names = bundled_mcp_server_names(Some(home), Some(&env));
-        assert!(names.contains("audit-mcp"));
-    }
+    // #138：`bundled_mcp_server_names` 已删除（F8 判据②），其单测一并移除；`snapshot.bundled=origin==Plugin`
+    // 的行为由 `config::snapshot` 的 `snapshot_bundled_is_origin_plugin_not_name_join_138` 等覆盖。
 
     // ---- 批准写助手（#98：锚定 cwd，无 fail-fast）----------------------------
     #[test]

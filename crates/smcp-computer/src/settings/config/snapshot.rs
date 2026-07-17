@@ -40,9 +40,7 @@ use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig, MCPServerInput};
 use crate::skills::home::resolve_skill_home;
 
-use super::super::mcp_config::{
-    bundled_mcp_server_names, resolve_mcp_config, ResolveMcpConfigArgs,
-};
+use super::super::mcp_config::{resolve_mcp_config, ResolveMcpConfigArgs};
 use super::super::recovery::collect_enabled_bundled_servers;
 use super::super::schema::{validate_settings, SettingsScope};
 use super::super::scope::{
@@ -200,12 +198,12 @@ pub struct McpServerView {
     pub origin: ProvenanceScope,
     /// origin ∈ {user, embed, flag, policy} → 免批准门控 / pre-trusted（见 [`ProvenanceScope::is_trusted_origin`]）。
     pub trusted_origin: bool,
-    /// **信息位**：该 server 名命中某已装插件的 bundled 名集（`bundled_mcp_server_names`，**不分启用态**）。
+    /// 该条目的权威 origin 是否为 plugin（`origin == Plugin`，#138 纯推导）/ is this entry plugin-origin。
     ///
-    /// ⚠️ #126：这**不是** CRUD 权威——凡进 config 快照的 server 必有可编辑声明文件（bundled 配置来自插件安装目录、
-    /// runtime-only 挂载、从不落 `mcp.json`，#122），故名冲突**不代表**"无可编辑文件"。"插件占用同名"的归属门控
-    /// （`Synthesized`）已上移 **Computer 层**（`add_or_update_server`/`remove_server`，**enabled-gated**、与
-    /// `managedBy` 查询同源）；`write_target` 不再读此位。此位仅供客户端提示"名字与某已装插件 bundled server 撞名"。
+    /// #138：语义由旧「name 命中已装插件 bundled 名集」（`bundled_mcp_server_names`，name-join、**不分启用态**、
+    /// #126 假阳性）翻转为 `origin == ProvenanceScope::Plugin` —— 与 F1 `managedBy` 同式。文件 scope 声明
+    /// （user/project/local/flag/policy，含撞名者）恒 `false`；唯**已启用 plugin 的读侧投影条目**为 `true`。
+    /// 未启用 / 待 gc 的插件不投影 ⇒ 不再造成假阳性。
     pub bundled: bool,
     /// 校验后的 A2C 配置（**含占位符、未渲染**——不解析 `${input:*}`/`${env:*}`、不读 store）/ placeholders unrendered.
     ///
@@ -375,7 +373,6 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
         managed_mcp_path,
         platform,
     });
-    let bundled_names = bundled_mcp_server_names(home, env);
     let mut servers: Vec<McpServerView> = Vec::with_capacity(mcp_resolved.servers.len());
     // 文件 scope 已占用的 `bundle_id`（身份键，#117）——用于 plugin 投影去重（user > plugin）。
     let mut claimed_bundle_ids: HashSet<BundleId> = HashSet::new();
@@ -387,7 +384,9 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
             name: name.clone(),
             origin,
             trusted_origin: server.trusted_origin,
-            bundled: bundled_names.contains(name),
+            // #138：`origin == Plugin` 纯推导（文件 scope 声明 origin != Plugin ⇒ false）。旧 name-join
+            // 账本（`bundled_mcp_server_names`，不分启用态）会把撞名的用户声明误标 true（#126 假阳性）——已删。
+            bundled: origin == ProvenanceScope::Plugin,
             config: server.config.clone(),
         });
     }
@@ -423,7 +422,7 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
                 origin: ProvenanceScope::Plugin,
                 // plugin 非预信任（install∧enable 门保证、不走 settings 信任面；MUST 不进审批门迭代）。
                 trusted_origin: false,
-                // 投影条目恒为 plugin bundled server（#138 将全表统一为 `origin == Plugin` 推导）。
+                // origin == Plugin ⇒ bundled=true（#138 全表 `origin == Plugin` 推导，此条恒真）。
                 bundled: true,
                 config: rec.config,
             });
@@ -1125,6 +1124,10 @@ mod tests {
             "投影条目 origin=plugin"
         );
         assert!(
+            srv.bundled,
+            "plugin 投影条目 origin==Plugin ⇒ bundled=true（#138）"
+        );
+        assert!(
             !srv.trusted_origin,
             "plugin origin 非预信任（install∧enable 门保证、不走 settings 信任面）"
         );
@@ -1187,9 +1190,13 @@ mod tests {
         );
     }
 
+    /// #138：`McpServerView.bundled` = `origin == Plugin` 纯推导，**非** name-join 账本（#126 假阳性根治）。
+    ///
+    /// 场景：用户 mcp.json 声明 `bundled-srv`，且账本里有一个**未启用**（无 intent / 无 `enabledPlugins`）的
+    /// plugin 恰好 bundle 同名 `bundled-srv`。旧实现 `bundled_names.contains(name)`（不分启用态）会把用户自己的
+    /// 声明误标 `bundled=true`（#126 假阳性）；新实现按 `origin`——该 server origin=User ⇒ `bundled=false`。
     #[test]
-    fn snapshot_marks_plugin_bundled_mcp_server() {
-        // 账本记录 bundledMcpServers=["bundled-srv"]，同名 mcp server → McpServerView.bundled=true（S2 地基）。
+    fn snapshot_bundled_is_origin_plugin_not_name_join_138() {
         let tmp = TempDir::new().unwrap();
         let env = xdg_env(&tmp);
         let home = tmp.path().join("home");
@@ -1201,6 +1208,7 @@ mod tests {
                 "plain-srv": {"type":"stdio","server_parameters":{"command":"p"}}
             }}"#,
         );
+        // 未启用（install_path=None、无 intent、无 enabledPlugins）的 plugin 恰 bundle 同名。
         update_installed_plugins(
             |file| {
                 file.account.plugins.insert(
@@ -1213,7 +1221,7 @@ mod tests {
                 );
             },
             Some(&home),
-            None,
+            Some(&env),
         )
         .unwrap();
 
@@ -1231,7 +1239,11 @@ mod tests {
             .iter()
             .find(|s| s.name == "bundled-srv")
             .unwrap();
-        assert!(bundled.bundled, "账本 bundled server 应标记 bundled=true");
+        assert_eq!(bundled.origin, ProvenanceScope::User, "该条是用户声明");
+        assert!(
+            !bundled.bundled,
+            "撞未启用 plugin bundled 名的用户声明 MUST NOT 标 bundled（#126 假阳性根治）"
+        );
         let plain = snap
             .mcp
             .servers
