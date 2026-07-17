@@ -56,6 +56,7 @@ fn test_protocol_serialization_compatibility() {
     // 5. 测试SMCPTool结构（确保与Python TypedDict匹配）
     let tool = SMCPTool {
         name: "echo".to_string(),
+        bundle_id: "echo_bundle".to_string(),
         description: "Echo tool".to_string(),
         params_schema: serde_json::json!({
             "type": "object",

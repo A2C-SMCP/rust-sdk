@@ -1100,7 +1100,24 @@ impl MCPServerManager {
     /// 与 [`validate_tool_call`](Self::validate_tool_call) **共享同一份** `tool_routes`：每项
     /// 产出 `SMCPTool.name = exposed_tool_name`（`{bundle_id}__{alias ?? 原始名}`）。原始工具名只从 `route`
     /// 读取（永不从 exposed 名 split 反解，协议 0.3.0 单射性）。
+    ///
+    /// 本方法丢弃每项的 `bundle_id`；wire 产出需要 [`SMCPTool`](smcp::SMCPTool) 的 `bundle_id`（协议 0.3.0
+    /// D1 / #136）时改用 `list_available_tools_with_bundle_id`（本 crate 内部）。
     pub async fn list_available_tools(&self) -> Vec<Tool> {
+        self.list_available_tools_with_bundle_id()
+            .await
+            .into_iter()
+            .map(|(_, tool)| tool)
+            .collect()
+    }
+
+    /// 同 [`list_available_tools`](Self::list_available_tools)，但每项额外携带其**解析后** `bundle_id`
+    /// （= `route.bundle_id`，恒非空）。
+    ///
+    /// 供 wire 产出 [`SMCPTool.bundle_id`](smcp::SMCPTool) 用（协议 0.3.0 D1 / #136）：Agent 据此把工具
+    /// 归属回具体 server，**MUST NOT** 切分 exposed name 的 `__` 前缀反推——故 bundle_id 只从 `route` 取，
+    /// 与 `name`（exposed 名）在同一循环内配对，无二次解析。
+    pub(crate) async fn list_available_tools_with_bundle_id(&self) -> Vec<(BundleId, Tool)> {
         let mut tools = Vec::new();
         let routes = self.tool_routes.read().await;
 
@@ -1158,7 +1175,7 @@ impl MCPServerManager {
                     }
                 }
 
-                tools.push(display_tool);
+                tools.push((bundle_id.clone(), display_tool));
             }
         }
 
@@ -3501,6 +3518,74 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "list_available_tools 应每 server 仅调用 list_tools 一次（#91）"
+        );
+    }
+
+    /// #136 D1（**防假绿**·Epic #129 关键坑）：`list_available_tools_with_bundle_id` 每项携带的
+    /// bundle_id 是**解析后** bundle_id（= `servers_config`/`active_clients` 键 = `route.bundle_id`），
+    /// **非**从 display 名派生。用**显式 bundle_id ≠ `normalize_name(display 名)`** 令任何名派生实现显红。
+    ///
+    /// 缺省路径下 `bundle_id == normalize_name(name)` 会盖住裂缝（四轮扫漏之源），故此处显式令二者分叉。
+    #[tokio::test]
+    async fn list_available_tools_carries_resolved_bundle_id_not_name_derived() {
+        let manager = MCPServerManager::new();
+        // 展示名 "Display Name"（normalize → "display_name"）≠ 显式 bundle_id "id_x"，令名派生实现暴露。
+        inject_counting_tools(&manager, "id_x", vec![tool_named("real_tool")]).await;
+        manager.servers_config.write().await.insert(
+            bid("id_x"),
+            stdio_cfg_with_bundle("Display Name", Some("id_x")),
+        );
+        manager.refresh_tool_mapping().await.expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        assert_eq!(out.len(), 1, "应暴露一个工具");
+        let (bundle_id, tool) = &out[0];
+        assert_eq!(
+            bundle_id.as_str(),
+            "id_x",
+            "bundle_id 应为解析后值（servers_config 键 / route.bundle_id），\
+             非从 display 名 'Display Name' 派生的 'display_name'"
+        );
+        assert_eq!(
+            tool.name.as_ref(),
+            exposed("id_x", "real_tool"),
+            "exposed 名 = {{bundle_id}}__{{tool}}"
+        );
+    }
+
+    /// #136 F2：`get_server_configs`（`get_config.servers` 数据源）读**运行期活跃集**——经**运行期
+    /// 公开入口** `add_or_update_server` 注入一个 server 后即以其 bundle_id 为 key 反映（非空、非构造期
+    /// 死快照，对齐 python#149 的修复方向）。走公开入口而非直写 `servers_config`，同时守护「运行期变更
+    /// 入口 ↔ get_config 所读 map」之间的接线（`auto_connect` 默认关，不触发真实连接）。
+    #[tokio::test]
+    async fn get_server_configs_reflects_runtime_active_set() {
+        let manager = MCPServerManager::new();
+        // 构造后初始为空（无死快照残留）。
+        assert!(
+            manager
+                .get_server_configs()
+                .await
+                .as_object()
+                .expect("object")
+                .is_empty(),
+            "初始应为空"
+        );
+
+        // 经运行期公开入口注入 → 立即以 bundle_id 键反映。
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("Display Name", Some("id_x")))
+            .await
+            .expect("add_or_update_server ok");
+        let cfg = manager.get_server_configs().await;
+        let obj = cfg.as_object().expect("object");
+        assert!(
+            obj.contains_key("id_x"),
+            "运行期新增 server 应即以 bundle_id 为 key 出现（活跃集，非死快照）: {obj:?}"
+        );
+        assert_eq!(
+            obj["id_x"]["name"],
+            serde_json::json!("Display Name"),
+            "value 带 display 名（key = bundle_id 非 name）"
         );
     }
 

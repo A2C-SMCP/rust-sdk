@@ -16,8 +16,8 @@
 //! 对应 Python 的 `agent_config["agent"]`；本 crate 的 `SmcpAgentConfig` 仅承载超时/重试配置）。
 
 use smcp::{
-    AgentCallData, GetBlobReq, GetDesktopReq, GetResourcesReq, GetSkillReq, GetSkillsReq,
-    GetToolsReq, ReqId, ToolCallReq,
+    AgentCallData, GetBlobReq, GetComputerConfigReq, GetDesktopReq, GetResourcesReq, GetSkillReq,
+    GetSkillsReq, GetToolsReq, ReqId, ToolCallReq,
 };
 
 use crate::error::{Result, SmcpAgentError};
@@ -63,6 +63,18 @@ pub fn build_tool_call_cancel(agent: &str, req_id: &str) -> AgentCallData {
 /// 创建获取工具列表请求 / Create a `client:get_tools` request。
 pub fn build_get_tools_request(agent: &str, computer: &str) -> GetToolsReq {
     GetToolsReq {
+        base: base(agent),
+        computer: computer.to_string(),
+    }
+}
+
+/// 创建获取 Computer 配置请求 / Create a `client:get_config` request（#136 / D#23 B-1）。
+///
+/// 用于取 Computer 的**运行期活跃** MCP Server 集（`GetComputerConfigRet.servers`，key = `bundle_id`）
+/// 与 `inputs` 定义——纯资源型 server（无工具、只出 `window://`）的 `bundle_id` 只能经此拿到，
+/// 供后续 `get_resources(mcp_server=<bundle_id>)`。对标 Python `_request_builders`。
+pub fn build_get_config_request(agent: &str, computer: &str) -> GetComputerConfigReq {
+    GetComputerConfigReq {
         base: base(agent),
         computer: computer.to_string(),
     }
@@ -210,6 +222,20 @@ mod tests {
         assert_eq!(v["agent"], "agent1");
         assert_eq!(v["computer"], "c1");
         assert!(v.get("tool_name").is_none());
+    }
+
+    #[test]
+    fn test_get_config_request_shape() {
+        // #136：形态恰为 {agent, req_id, computer}（base 经 flatten 平铺）。
+        let v = to_val(&build_get_config_request("agent1", "c1"));
+        assert_eq!(v["agent"], "agent1");
+        assert_eq!(v["computer"], "c1");
+        assert!(v["req_id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(3),
+            "get_config 请求在线形态应恰为 {{agent, req_id, computer}}"
+        );
     }
 
     #[test]

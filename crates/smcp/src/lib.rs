@@ -697,9 +697,20 @@ pub struct GetToolsReq {
 }
 
 /// SMCP工具定义
+///
+/// **协议 0.3.0 D1（#136）**：`bundle_id` 为**必填** wire 字段（snake_case），承载该工具所属 MCP
+/// Server 的**解析后** `bundle_id`（`resolve_bundle_id` 产物，恒非空；非配置显式声明值，缺省下二者可能不同）。
+/// 它与 [`GetComputerConfigRet.servers`] 的字典 key、错误码 `meta.mcp_server` 属**同一身份空间**——Agent
+/// 据此把工具归属回具体 server（分组展示、关联配置与资源）。`name` 是聚合后的 `exposed_tool_name`
+/// （`{bundle_id}__{alias ?? 原始名}`），对 Agent **不透明**：**MUST NOT** 通过切分 `__` 前缀反推归属，
+/// 本字段即归属的唯一正解。
+///
+/// [`GetComputerConfigRet.servers`]: GetComputerConfigRet
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SMCPTool {
     pub name: String,
+    /// 所属 MCP Server 的**解析后** `bundle_id`（server 唯一身份，非 display 名）。
+    pub bundle_id: String,
     pub description: String,
     pub params_schema: serde_json::Value,
     pub return_schema: Option<serde_json::Value>,

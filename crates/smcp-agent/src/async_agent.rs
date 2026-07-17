@@ -15,17 +15,21 @@ use crate::{
     events::AsyncAgentEventHandler,
     protocol_error::raise_for_error_payload,
     request_builders::{
-        build_get_blob_request, build_get_desktop_request, build_get_resources_request,
-        build_get_skill_request, build_get_skills_request, build_get_tools_request,
-        build_tool_call_cancel, build_tool_call_request,
+        build_get_blob_request, build_get_config_request, build_get_desktop_request,
+        build_get_resources_request, build_get_skill_request, build_get_skills_request,
+        build_get_tools_request, build_tool_call_cancel, build_tool_call_request,
     },
-    response::{ensure_req_id, parse_get_blob_response, parse_get_resources_response},
+    response::{
+        ensure_req_id, parse_get_blob_response, parse_get_config_response,
+        parse_get_resources_response,
+    },
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
-    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetResourcesRet,
-    GetSkillRet, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
+    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetComputerConfigRet,
+    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo,
+    SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -314,6 +318,41 @@ impl AsyncSmcpAgent {
 
         info!("Received {} tools from computer: {}", tools.len(), computer);
         Ok(tools)
+    }
+
+    /// 获取指定 Computer 的配置（`client:get_config`，#136 / D#23 B-1）/ Get a Computer's config。
+    ///
+    /// 返回 [`GetComputerConfigRet`]：`servers` = Computer 的**运行期活跃** MCP Server 集（字典
+    /// key = **`bundle_id`**，server 唯一身份；F2/PROTO-2：读运行期权威配置集、非构造期快照），`inputs`
+    /// = input 定义列表。**唯一途径**取纯资源型 server（无工具、只出 `window://`）的 `bundle_id`，供
+    /// 后续 [`get_resources`](Self::get_resources)（其 `mcp_server` 参即此处 `servers` 的 key）。
+    ///
+    /// flat ErrorPayload 经 ack 透传为协议错误、不吞错。`GetComputerConfigRet` 无 `req_id` 字段 ⇒
+    /// 不做回显校验（见 `response::parse_get_config_response`）。对标 Python
+    /// `a2c_smcp/agent/client.py::get_config`（SDK 方法名各按语言惯例，D#23 R5：无需跨端对拍）。
+    pub async fn get_computer_config(&self, computer: &str) -> Result<GetComputerConfigRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_config_request(&agent_config.agent, computer);
+
+        debug!("Getting config from computer: {}", computer);
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_CONFIG, data, self.config.get_timeout)
+            .await?;
+
+        // flat ErrorPayload 透传 + 整包解析单点收敛于纯函数（无 req_id 回显校验，见 parse_get_config_response）。
+        let ret = parse_get_config_response(&response)?;
+        info!(
+            "Received config from computer {} ({} servers)",
+            computer,
+            ret.servers.as_object().map(|m| m.len()).unwrap_or(0)
+        );
+        Ok(ret)
     }
 
     /// 获取指定Computer的桌面信息

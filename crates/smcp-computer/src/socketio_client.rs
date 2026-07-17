@@ -895,10 +895,14 @@ impl SmcpComputerClient {
                 Some(mgr) => {
                     // 转换Tool为SMCPTool
                     // Convert Tool to SMCPTool
-                    let tool_list = mgr.list_available_tools().await;
+                    // 携 bundle_id 拉取（协议 0.3.0 D1 / #136）：每个 SMCPTool 必带其所属 server 的
+                    // 解析后 bundle_id，供 Agent 归属工具（禁切 exposed `__` 前缀反推）。
+                    let tool_list = mgr.list_available_tools_with_bundle_id().await;
                     tool_list
                         .into_iter()
-                        .map(convert_tool_to_smcp_tool)
+                        .map(|(bundle_id, tool)| {
+                            convert_tool_to_smcp_tool(tool, bundle_id.as_str())
+                        })
                         .collect()
                 }
                 None => {
@@ -1458,9 +1462,15 @@ pub(crate) fn to_a2c_resource(resource: &crate::mcp_clients::model::Resource) ->
     }
 }
 
-/// 将内部 Tool 转换为协议类型 SMCPTool
-/// Convert internal Tool to protocol type SMCPTool
-pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -> smcp::SMCPTool {
+/// 将内部 `Tool`（rmcp 模型）转成协议类型 `SMCPTool` / Convert internal Tool to protocol SMCPTool。
+///
+/// `bundle_id`：该工具所属 MCP Server 的**解析后** `bundle_id`（协议 0.3.0 D1 / #136），由调用方从
+/// [`list_available_tools_with_bundle_id`](crate::mcp_clients::manager::MCPServerManager::list_available_tools_with_bundle_id)
+/// 与 `tool` 配对传入——**绝不**从 `tool.name`（exposed 名）切 `__` 前缀反推。
+pub(crate) fn convert_tool_to_smcp_tool(
+    tool: crate::mcp_clients::model::Tool,
+    bundle_id: &str,
+) -> smcp::SMCPTool {
     let mut meta_map = serde_json::Map::new();
 
     // 传递 tool.meta 中的所有键值（如 a2c_tool_meta）
@@ -1496,6 +1506,7 @@ pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -
     let params_schema = tool.schema_as_json_value();
     smcp::SMCPTool {
         name: tool.name.to_string(),
+        bundle_id: bundle_id.to_string(),
         description,
         params_schema,
         return_schema: None,
@@ -1701,8 +1712,11 @@ mod tests {
             idempotent_hint: None,
             open_world_hint: Some(false),
         };
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)));
+        let smcp_tool =
+            convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)), "fs-bundle");
 
+        // 协议 0.3.0 D1 / #136：bundle_id 由调用方传入，原样填 wire 字段（不受 meta/annotations 影响）。
+        assert_eq!(smcp_tool.bundle_id, "fs-bundle");
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();
         assert!(meta_map.contains_key("a2c_tool_meta"));
@@ -1716,7 +1730,7 @@ mod tests {
     fn test_tool_to_smcp_tool_only_meta() {
         let mut meta = serde_json::Map::new();
         meta.insert("a2c_tool_meta".to_string(), json!({"tags": ["fs"]}));
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None));
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None), "test_bundle");
 
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();
@@ -1733,7 +1747,8 @@ mod tests {
             idempotent_hint: None,
             open_world_hint: Some(false),
         };
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, Some(annotations)));
+        let smcp_tool =
+            convert_tool_to_smcp_tool(make_tool(None, Some(annotations)), "test_bundle");
 
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();
@@ -1743,7 +1758,8 @@ mod tests {
 
     #[test]
     fn test_tool_to_smcp_tool_no_meta_no_annotations() {
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, None));
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, None), "test_bundle");
+        assert_eq!(smcp_tool.bundle_id, "test_bundle");
         assert!(smcp_tool.meta.is_none());
     }
 
@@ -1754,7 +1770,7 @@ mod tests {
             "simple_key".to_string(),
             serde_json::Value::String("already_a_string".to_string()),
         );
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None));
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None), "test_bundle");
 
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();

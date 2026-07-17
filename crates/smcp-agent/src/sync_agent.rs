@@ -14,7 +14,10 @@ use crate::{
     error::{Result, SmcpAgentError},
     AsyncSmcpAgent,
 };
-use smcp::{A2CSkillRef, GetBlobRet, GetResourcesRet, GetSkillRet, SMCPTool, SessionInfo};
+use smcp::{
+    A2CSkillRef, GetBlobRet, GetComputerConfigRet, GetResourcesRet, GetSkillRet, SMCPTool,
+    SessionInfo,
+};
 use tokio::runtime::Runtime;
 
 /// 同步SMCP Agent
@@ -59,6 +62,15 @@ impl SyncSmcpAgent {
     /// 获取指定Computer的工具列表
     pub fn get_tools(&self, computer: &str) -> Result<Vec<SMCPTool>> {
         self.runtime.block_on(self.async_agent.get_tools(computer))
+    }
+
+    /// 获取指定 Computer 的配置（同步，#136）/ Get a Computer's config (sync)。
+    ///
+    /// 阻塞包装 [`AsyncSmcpAgent::get_computer_config`](crate::AsyncSmcpAgent::get_computer_config)：
+    /// `servers` = 运行期活跃集（key = `bundle_id`），`inputs` = input 定义列表。
+    pub fn get_computer_config(&self, computer: &str) -> Result<GetComputerConfigRet> {
+        self.runtime
+            .block_on(self.async_agent.get_computer_config(computer))
     }
 
     /// 获取指定Computer的桌面信息
