@@ -317,6 +317,13 @@ pub struct Computer<S: Session> {
     /// `ReadOnlyOrigin`）。注：`managedBy`(F1) 走 `self.mcp_servers`+账本、**不经**本层（embed 现归
     /// `managedBy=User`）。CLI 空集构造下恒空（协议 §2.5-4）。
     embed_servers: Vec<MCPServerConfig>,
+    /// #139：`--mcp-config <file>` 的 **flag 层** mcp.json 路径（当次 boot 的声明式输入，与 `embed_servers` 同族）。
+    ///
+    /// 协议 §2.5-5 要求 origin 集「可从当次 boot 的声明式输入重建」——Computer 即该 boot 对象，故 flag 与 embed
+    /// 同住于此，经 [`non_plugin_declared_bundle_ids`](Self::non_plugin_declared_bundle_ids) 一并投影。
+    /// **回收判据 MUST 含本层**：漏传会让经 `--mcp-config` 声明的用户 server 退回「非用户声明」而被连坐停摘
+    /// （#153 遗留缺口形状）。镜像 python `Computer(mcp_flag_config=)`。
+    mcp_flag_config: Option<PathBuf>,
     /// 输入处理器 / Input handler
     input_handler: Arc<RwLock<InputHandler>>,
     /// 自动连接标志 / Auto connect flag
@@ -698,6 +705,7 @@ impl<S: Session> Computer<S> {
             inputs: Arc::new(RwLock::new(inputs)),
             mcp_servers: RwLock::new(mcp_servers),
             embed_servers,
+            mcp_flag_config: None,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
             auto_reconnect,
@@ -793,6 +801,17 @@ impl<S: Session> Computer<S> {
     /// #123（协议#19 加固）：`upsert_new_scope` 决定**新** server 声明的落盘 scope——公开 CRUD 默认 `Local`
     /// （`mcp.local.json`，不入 git；仍 boot 读取→重启存活），避免 API/UI 加的 server 静默污染团队共享层；
     /// `remove` 不 upsert，此参数对其无影响。
+    /// 注入 `--mcp-config <file>` 的 flag 层路径（#139）/ inject the `--mcp-config` flag-layer path。
+    ///
+    /// 与 `Computer::new(mcp_servers=…)`（embed 层）同属**当次 boot 的声明式输入**（§2.5-5）：二者共同构成
+    /// 回收判据的「非用户声明」数据源。CLI `--mcp-config` 与嵌入宿主均应注入，否则该层声明的用户 server 会在
+    /// plugin uninstall/disable/gc 时被**连坐**停摘。镜像 python `Computer(mcp_flag_config=)`。
+    #[must_use]
+    pub fn with_mcp_flag_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.mcp_flag_config = Some(path.into());
+        self
+    }
+
     /// 宿主构造入参的 frozen embed 声明快照（#147）——供 CLI boot 审批的 resolve embed 层投影。
     /// CLI 空集构造下恒空；SDK 嵌入宿主传 `Computer::new(mcp_servers=…)` 时非空。非 CLI 路径直接读
     /// `self.embed_servers`（如 #139 回收判据），故本访问器随其唯一用户 `cli` feature 门控。
@@ -967,10 +986,20 @@ impl<S: Session> Computer<S> {
         params: RemoveMarketplaceParams<'_>,
     ) -> Result<MarketplaceRemoveOutcome, GovernanceError> {
         let home = self.skill_home();
+        // #139：全集回收判据数据源（durable + flag + embed + 实例 config_dir/config_env）——marketplace 级联
+        // 卸载 MUST 用全集，否则连坐用户/宿主自有 server（同 uninstall/disable）。
+        let non_plugin = self.non_plugin_declared_bundle_ids(&home, self.config_env());
         let res = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::lifecycle::remove_marketplace(&mut reg, &home, None, name, params)
-                .await
+            crate::settings::lifecycle::remove_marketplace(
+                &mut reg,
+                &home,
+                None,
+                name,
+                params,
+                &non_plugin,
+            )
+            .await
         };
         if res.is_ok() {
             self.mark_skills_dirty();
@@ -1081,6 +1110,41 @@ impl<S: Session> Computer<S> {
         }
     }
 
+    /// #139/§4.9.1-2 回收判据「X 非用户声明」项的数据源：**带 origin 的运行期权威配置集中 `origin != plugin`
+    /// 的 bundle_id 集**（durable scopes + flag `--mcp-config` + embed 构造入参）。每次重算、零持久态（§2.5-5）。
+    ///
+    /// 传给 disable/uninstall/gc 的回收判据（`reclaimable_mcp_deps`）——**MUST 传全集**：退回只读 mcp.json
+    /// 声明面会让经 flag/embed 挂载的用户/宿主 server 被误判「非用户声明」而连坐停摘（#153 缺口形状）。
+    /// 经 [`resolve_snapshot`] 消费 [#147](Self::embed_servers) 投影的 `origin=embed`。
+    pub(crate) fn non_plugin_declared_bundle_ids(
+        &self,
+        home: &std::path::Path,
+        env: Option<&EnvMap>,
+    ) -> std::collections::HashSet<BundleId> {
+        use crate::settings::config::snapshot::{resolve_snapshot, SnapshotArgs};
+        use crate::settings::config::ProvenanceScope;
+        // project/local 锚点 MUST 用**实例** `config_dir`（与 `governance_snapshot` 同源）——漏传则退回进程 cwd，
+        // 嵌入宿主 `with_config_dir(/proj)` 下解析不到 `/proj/.tfrobot/mcp[.local].json` 声明的用户 server，
+        // 其 durable(project/local) 声明会被误判「非用户声明」而连坐停摘（#139「永不连坐」覆盖 durable scope）。
+        let config_dir = self.config_dir();
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&config_dir),
+            env,
+            home: Some(home),
+            // 当次 boot 的两条声明式输入 MUST 全传（§2.5-5）：漏 flag ⇒ 经 `--mcp-config` 声明的用户 server
+            // 被误判「非用户声明」而连坐；漏 embed ⇒ 宿主构造 server 同理（#147）。
+            flag_mcp_config_path: self.mcp_flag_config.as_deref(),
+            embed_servers: &self.embed_servers,
+            ..Default::default()
+        });
+        snap.mcp
+            .servers
+            .iter()
+            .filter(|s| s.origin != ProvenanceScope::Plugin)
+            .map(|s| crate::mcp_clients::bundle_id::resolve_bundle_id(&s.config))
+            .collect()
+    }
+
     /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；可经 [`Self::enable_plugin`] 复原）/ disable。
     ///
     /// **scope（#113 S6）**：同 [`enable_plugin`](Self::enable_plugin)——缺省时按安装记录消解；**仅当 `enabledPlugins`
@@ -1108,10 +1172,18 @@ impl<S: Session> Computer<S> {
             project_path: options.project_path,
             env,
         };
+        let non_plugin = self.non_plugin_declared_bundle_ids(&home, env);
         let res = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::installer::disable_plugin(plugin_id, &mut reg, &home, effective, hooks)
-                .await
+            crate::settings::installer::disable_plugin(
+                plugin_id,
+                &mut reg,
+                &home,
+                effective,
+                &non_plugin,
+                hooks,
+            )
+            .await
         };
         match res {
             Ok(changed) => {
@@ -1143,10 +1215,19 @@ impl<S: Session> Computer<S> {
         hooks: Option<&dyn McpInstallHooks>,
     ) -> Result<bool, PluginInstallError> {
         let home = self.skill_home();
+        let non_plugin =
+            self.non_plugin_declared_bundle_ids(&home, options.env.or_else(|| self.config_env()));
         let res = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::installer::uninstall_plugin(plugin_id, &mut reg, &home, options, hooks)
-                .await
+            crate::settings::installer::uninstall_plugin(
+                plugin_id,
+                &mut reg,
+                &home,
+                options,
+                &non_plugin,
+                hooks,
+            )
+            .await
         };
         if matches!(res, Ok(true)) {
             self.mark_skills_dirty();
@@ -1249,15 +1330,18 @@ impl<S: Session> Computer<S> {
         //    install/enable 流一致）；注入失败 → **隔离该 server**（不 register、不阻断其余）；
         // ③ 成功后把名字并入 `existing`，使同名 bundled server（跨 plugin）后见者亦被跳过（首见胜）。
         if let Some(h) = hooks {
-            let mut existing = h.existing_server_names();
+            // #139：去重按 **bundle_id**（身份键）——name 允许碰撞、非身份。同名不同 bundle_id 的合法 server
+            // 不再互相隐身；同 bundle_id 已存在 → 既有/用户配置胜（首见胜，additive-only）。
+            let mut existing: HashSet<BundleId> = h.existing_servers().into_keys().collect();
             let mut injected_roots: HashSet<PathBuf> = HashSet::new();
             for rec in
                 crate::settings::recovery::collect_enabled_bundled_servers(&home, env, declared)
             {
                 let name = rec.config.name().to_string();
-                if existing.contains(&name) {
-                    warn!(server = %name, plugin = %rec.plugin_id,
-                        "reconcile_governance: remount skipped (name conflicts with an existing server, existing wins)");
+                let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
+                if existing.contains(&bid) {
+                    warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id,
+                        "reconcile_governance: remount skipped (bundle_id conflicts with an existing server, existing wins)");
                     continue;
                 }
                 // 每 plugin 根注入一次 inputs；注入失败 → 隔离该 server（roots 不入集，同根后续 server 会重试）。
@@ -1271,11 +1355,11 @@ impl<S: Session> Computer<S> {
                 }
                 match h.register_server(rec.config).await {
                     Ok(()) => {
-                        existing.insert(name.clone());
+                        existing.insert(bid);
                         report.remounted_servers.push(name);
                     }
                     Err(e) => {
-                        warn!(server = %name, plugin = %rec.plugin_id, error = %e,
+                        warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id, error = %e,
                             "reconcile_governance: remount register_server failed (non-blocking)");
                     }
                 }
@@ -1667,6 +1751,18 @@ impl<S: Session> Computer<S> {
         ) {
             warn!(error = %e, "governance boot: v0.3.0 ledger→intent migration failed (non-blocking)");
         }
+        // #139：丢弃旧格式 `bundledMcpServers`（display-name 数组）——每条发 WARN、不做 name→id 映射；依赖集
+        // 由紧随其后的 `reconcile_governance` 从 installedPlugins 意图重建。非幂等风险：无（无旧键 → 0 且不写盘）。
+        let discarded = crate::settings::installer::discard_legacy_bundled_mcp_servers(
+            &self.skill_home(),
+            self.config_env(),
+        );
+        if discarded > 0 {
+            info!(
+                records = discarded,
+                "governance boot: discarded legacy 'bundledMcpServers' ledger fields (#139); rebuilding from intent"
+            );
+        }
         let recovery = self.reconcile_governance(None, None).await;
         if !recovery.restored_plugins.is_empty() || !recovery.failed_marketplaces.is_empty() {
             info!(
@@ -1886,7 +1982,7 @@ impl<S: Session> Computer<S> {
     /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期物化不改持久 config）。
     ///
     /// # Preconditions
-    /// 本方法**不执行** §10.6 名称冲突门（install/enable 流程经 [`McpInstallHooks::existing_server_names`] 预检属其职责）。
+    /// 本方法**不执行** §10.6 冲突门（install/enable 流程经 [`McpInstallHooks::existing_servers`] 依赖预检属其职责）。
     /// **绕过**标准安装/启用路径**直接**驱动本方法者，须自行确保不与已声明 server 冲突——#127 起运行期投影按
     /// **`bundle_id`** 建键，故**同名不再互相覆盖**（display 名可合法碰撞），但**同 `bundle_id`** 仍会覆盖既有条目
     /// （仅内存、不落盘、重启即复原，非持久边界击穿）；同 `bundle_id` = 同一软件，manager 侧另有 no-double-open
@@ -2901,16 +2997,15 @@ impl<S: Session> Computer<S> {
         for v in bundled_skills_by_plugin.values_mut() {
             v.sort();
         }
-        // 取**展示名**（非投影键 bundle_id）：本集合的唯一消费者是与 ledger `bundled_mcp_servers` 求交集
-        // （`governance::resolve_governance_snapshot`），而那是持久化的 plugin-manifest **名**字段——两侧须同域。
-        // 彻底 bundle_id 化需迁移 ledger 记录格式（跨 SDK 持久化契约），不在 #127 范围；此处仅治理展示、
-        // 不做寻址，故沿用名域。
+        // #139：取 **bundle_id**（身份键）——ledger 已迁 bundle_id 数组（`mcpServers`），本集合唯一消费者是
+        // 与之求交集（`governance::resolve_governance_snapshot`），两侧须同 bundle_id 域。`self.mcp_servers`
+        // 已按 bundle_id 建键，直接取 keys。仅治理展示、不做寻址。
         let materialized_mcp_servers: std::collections::BTreeSet<String> = self
             .mcp_servers
             .read()
             .await
-            .values()
-            .map(|cfg| cfg.name().to_string())
+            .keys()
+            .map(|b| b.as_str().to_string())
             .collect();
         GovernanceRuntimeOverlay {
             bundled_skills_by_plugin,
@@ -3077,8 +3172,9 @@ impl<S: Session> Computer<S> {
             inputs: Arc::new(RwLock::new(HashMap::new())), // 运行时态不复制（同 Clone 语义）。
             mcp_servers: RwLock::new(HashMap::new()),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
-            // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。
+            // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
+            mcp_flag_config: self.mcp_flag_config.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -3288,8 +3384,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
             inputs: Arc::new(RwLock::new(HashMap::new())), // Note: 不复制运行时状态 / Don't copy runtime state
             mcp_servers: RwLock::new(HashMap::new()),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
-            // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。
+            // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
+            mcp_flag_config: self.mcp_flag_config.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -3653,6 +3750,45 @@ mod tests {
             cloned.embed_servers.len(),
             1,
             "clone MUST 保留 embed 声明面（#147 连坐防线随 clone 存续）"
+        );
+    }
+
+    /// #139 回归（隔离复审 🔴#2）：`non_plugin_declared_bundle_ids` MUST 以**实例 config_dir** 锚定 project/local
+    /// （非进程 cwd）——否则 `with_config_dir` 嵌入宿主在 `<config_dir>/.tfrobot/mcp.json` 声明的用户 server 看不见，
+    /// 其 durable(project) 声明会在 plugin uninstall/disable 时被误判「非用户声明」而连坐停摘（「永不连坐」）。
+    #[test]
+    fn non_plugin_declared_anchors_project_at_config_dir_139() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // 在 config_dir 的 project mcp.json 声明用户 server。
+        let mcp = crate::settings::mcp_config::workdir_mcp_config_path(&proj);
+        std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mcp,
+            r#"{"servers":{"user-owned":{"type":"stdio","server_parameters":{"command":"u"}}}}"#,
+        )
+        .unwrap();
+
+        let comp = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj);
+        // 隔离 user scope（XDG → 空临时目录，防读到真实 ~/.config）。
+        let mut env = EnvMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("xdg").to_string_lossy().into_owned(),
+        );
+        let set = comp.non_plugin_declared_bundle_ids(&home, Some(&env));
+        let want = crate::mcp_clients::bundle_id::resolve_bundle_id(
+            &serde_json::from_value(serde_json::json!({
+                "type":"stdio","name":"user-owned","server_parameters":{"command":"u"}
+            }))
+            .unwrap(),
+        );
+        assert!(
+            set.contains(&want),
+            "config_dir 的 project 声明用户 server MUST 入非-plugin 集（永不连坐）；实际: {set:?}"
         );
     }
 
@@ -4282,8 +4418,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl McpInstallHooks for RecordingRemountHooks {
-        fn existing_server_names(&self) -> std::collections::HashSet<String> {
-            self.existing.clone()
+        fn existing_servers(&self) -> std::collections::HashMap<BundleId, ServerName> {
+            self.existing
+                .iter()
+                .filter_map(|n| BundleId::try_from(n.clone()).ok().map(|b| (b, n.clone())))
+                .collect()
         }
         async fn register_server(
             &self,
@@ -4300,7 +4439,7 @@ mod tests {
         }
         async fn remove_server(
             &self,
-            _name: &str,
+            _id: &BundleId,
         ) -> Result<(), crate::settings::installer::McpHookError> {
             Ok(())
         }
@@ -4513,7 +4652,7 @@ mod tests {
             rebuilt
                 .iter()
                 .any(|r| r.install_path.as_deref().is_some_and(|s| !s.is_empty())
-                    && r.bundled_mcp_servers.iter().any(|n| n == "audit-mcp")),
+                    && r.mcp_servers.iter().any(|n| n.as_str() == "audit-mcp")),
             "重建记录含非空 installPath + bundled server 名"
         );
 

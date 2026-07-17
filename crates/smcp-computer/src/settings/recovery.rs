@@ -339,7 +339,8 @@ pub fn collect_enabled_bundled_servers(
 pub async fn rematerialize_missing_ledger_records(
     home: &Path,
     env: Option<&EnvMap>,
-    declared: &Map<String, Value>,
+    // #139：**不再** gate on `enabledPlugins`（保留形参仅为签名稳定，故 `_`）——见下方循环内注释。
+    _declared: &Map<String, Value>,
     report: &mut GovernanceRecoveryReport,
 ) {
     // 权威 install-set = `installedPlugins` 意图；单次账本快照供「已有记录」判定（逐 pid 只写自身、pid 唯一 →
@@ -352,10 +353,12 @@ pub async fn rematerialize_missing_ledger_records(
         if pid.split_once('@').is_none() {
             continue;
         }
-        // 惰性 installed_disabled 不重建（活跃集 = 已安装 ∧ 启用）。
-        if !plugin_enabled(declared, pid) {
-            continue;
-        }
+        // #139：**不** gate on enabled——`installed_disabled` 也重建账本**派生缓存**（物化 ≠ 激活：
+        // `materialize_plugin_record` 只 clone + 读 manifest + 写账本，**不** stage skills、**不** mount server；
+        // 激活仍由后续 enabled 门控的 skills/mount 路径负责）。对齐 python `recover_marketplace_skills`
+        // （`needs_materialize` 按账本完好度、非 enabled 判定）+ 协议 §4.9「账本删除无损」（对 disabled 亦无损）。
+        // ⚠️ 旧 gate 在 #139 whole-record-drop 迁移下会让「disabled + 旧格式 + bundled」插件账本永失、
+        // `plugin enable` 谎报「未安装」不可复原（隔离复审逮到的回归）。
         // 账本已有非空 installPath 记录 → 派生缓存健在，无需重建（幂等）。
         let has_usable_record = installed.plugins.get(pid).is_some_and(|recs| {
             recs.iter()
@@ -683,9 +686,11 @@ mod tests {
         assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
     }
 
-    // ---- §63：disabled plugin 账本删也不重建（惰性 installed_disabled，#104）-----------
+    // ---- §63/#139：disabled plugin 账本删后**也重建派生缓存**（物化 ≠ 激活，对齐 python）--------------
+    // 推翻旧 `rematerialize_skips_disabled_plugin`（#104 惰性 gate 与 python 分叉；#139 whole-record-drop
+    // 迁移下该 gate 会让 disabled 旧格式插件账本永失、`plugin enable` 谎报「未安装」）。
     #[tokio::test]
-    async fn rematerialize_skips_disabled_plugin() {
+    async fn rematerialize_rebuilds_disabled_plugin_ledger_but_not_active_139() {
         let tmp = TempDir::new().unwrap();
         let (home, _src) = setup_installed(&tmp).await;
         fs::remove_file(crate::settings::store::installed_plugins_path(
@@ -699,12 +704,23 @@ mod tests {
         let mut report = GovernanceRecoveryReport::default();
         rematerialize_missing_ledger_records(&home, None, &declared, &mut report).await;
 
-        assert!(
-            report.rematerialized_plugins.is_empty(),
-            "禁用 plugin 不重建"
+        // 账本派生缓存**重建**（installed_disabled 也重建，§4.9 删除无损）——记录回来、可查询、可 enable。
+        assert_eq!(
+            report.rematerialized_plugins,
+            vec!["audit@acme".to_string()],
+            "disabled plugin 的账本记录 MUST 重建（物化 ≠ 激活）"
         );
         assert!(report.failed_rematerialize.is_empty());
-        assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
+        let installed = load_installed_plugins(Some(&home), None).account;
+        assert!(
+            installed.plugins.contains_key("audit@acme"),
+            "重建后账本含该 pid（可查询/可 enable）"
+        );
+        // 但**未激活**：collect_enabled_bundled_servers 仍空（激活由 enabled 门控，rematerialize 不 stage/mount）。
+        assert!(
+            collect_enabled_bundled_servers(&home, None, &declared).is_empty(),
+            "物化 ≠ 激活：disabled plugin 的 bundled server 不进活跃集"
+        );
     }
 
     // ---- §63：重建幂等（已有非空 installPath 记录则跳过，#104）------------------------
@@ -859,7 +875,7 @@ mod tests {
                     pid_owned,
                     vec![crate::settings::reconciler::InstalledPluginRecord {
                         install_path: ip,
-                        bundled_mcp_servers: Vec::new(),
+                        mcp_servers: Vec::new(),
                         extra: Map::new(),
                     }],
                 );

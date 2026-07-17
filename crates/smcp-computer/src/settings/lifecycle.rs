@@ -432,6 +432,7 @@ pub async fn remove_marketplace(
     env: Option<&EnvMap>,
     name: &str,
     params: RemoveMarketplaceParams<'_>,
+    non_plugin_bundle_ids: &std::collections::HashSet<crate::mcp_clients::model::BundleId>,
 ) -> Result<MarketplaceRemoveOutcome, GovernanceError> {
     if !marketplace_name_taken(home, env, name) {
         return Err(GovernanceError::UnknownMarketplace(name.to_string()));
@@ -447,6 +448,10 @@ pub async fn remove_marketplace(
             .filter(|pid| pid.ends_with(&suffix))
             .cloned()
             .collect();
+        // #139 回收判据数据源由调用方（`Computer::remove_marketplace`）经
+        // `non_plugin_declared_bundle_ids` 供给**全集**（durable + flag + embed + 实例 config_dir/config_env）——
+        // 本自由函数无 Computer 实例，MUST NOT 自行以残缺声明面重算（漏 embed/flag/config_dir ⇒ 连坐用户/
+        // 宿主自有 server，#139「永不连坐」）。
         for pid in &victims {
             let res = uninstall_plugin(
                 pid,
@@ -457,6 +462,7 @@ pub async fn remove_marketplace(
                     keep_servers: false,
                     env,
                 },
+                non_plugin_bundle_ids,
                 params.hooks,
             )
             .await;
@@ -579,7 +585,8 @@ mod tests {
                 home,
                 None,
                 "ghost",
-                RemoveMarketplaceParams::default()
+                RemoveMarketplaceParams::default(),
+                &std::collections::HashSet::new(),
             )
             .await,
             Err(GovernanceError::UnknownMarketplace(n)) if n == "ghost"
@@ -614,6 +621,7 @@ mod tests {
                 keep_plugins: true,
                 hooks: None,
             },
+            &std::collections::HashSet::new(),
         )
         .await
         .unwrap();
@@ -681,8 +689,13 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl McpInstallHooks for RecordingHooks {
-        fn existing_server_names(&self) -> std::collections::HashSet<String> {
-            std::collections::HashSet::new()
+        fn existing_servers(
+            &self,
+        ) -> std::collections::HashMap<
+            crate::mcp_clients::model::BundleId,
+            crate::mcp_clients::model::ServerName,
+        > {
+            std::collections::HashMap::new()
         }
         async fn register_server(
             &self,
@@ -692,9 +705,9 @@ mod tests {
         }
         async fn remove_server(
             &self,
-            name: &str,
+            id: &crate::mcp_clients::model::BundleId,
         ) -> Result<(), crate::settings::installer::McpHookError> {
-            self.removed.lock().unwrap().push(name.to_string());
+            self.removed.lock().unwrap().push(id.as_str().to_string());
             Ok(())
         }
     }
@@ -702,14 +715,17 @@ mod tests {
     /// 直接向 `installed_plugins.json` 写一条记录（绕过 install，专测 remove 级联）/ seed an install record。
     fn seed_installed(home: &Path, pid: &str, bundled: &[&str]) {
         let pid = pid.to_string();
-        let bundled: Vec<String> = bundled.iter().map(|s| s.to_string()).collect();
+        let bundled: Vec<crate::mcp_clients::model::BundleId> = bundled
+            .iter()
+            .map(|s| crate::mcp_clients::model::BundleId::try_from(s.to_string()).unwrap())
+            .collect();
         crate::settings::store::update_installed_plugins(
             move |file| {
                 file.account.plugins.insert(
                     pid,
                     vec![crate::settings::reconciler::InstalledPluginRecord {
                         install_path: None,
-                        bundled_mcp_servers: bundled,
+                        mcp_servers: bundled,
                         extra: Map::new(),
                     }],
                 );
@@ -759,6 +775,7 @@ mod tests {
                 keep_plugins: false,
                 hooks: Some(&hooks),
             },
+            &std::collections::HashSet::new(),
         )
         .await
         .unwrap();

@@ -11,6 +11,7 @@ use serde_json::{json, Map, Value};
 use tempfile::TempDir;
 
 use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::mcp_clients::model::BundleId;
 use smcp_computer::settings::scope::{workdir_local_settings_path, EnvMap};
 use smcp_computer::settings::store::{
     update_installed_plugins, update_installed_plugins_intent, update_known_marketplaces,
@@ -74,7 +75,10 @@ fn ledger_record(
     extra.insert("scope".to_string(), json!("user"));
     InstalledPluginRecord {
         install_path: install_path.map(|p| p.to_string_lossy().into_owned()),
-        bundled_mcp_servers: bundled.iter().map(|s| s.to_string()).collect(),
+        mcp_servers: bundled
+            .iter()
+            .map(|s| BundleId::try_from(s.to_string()).unwrap())
+            .collect(),
         extra,
     }
 }

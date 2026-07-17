@@ -407,12 +407,16 @@ pub struct MarketplaceRemoveOptions<'a> {
 ///
 /// **薄封装**：未知校验 + confirm 闸门 + trust 撤销（user-scope）属 CLI 表现层，级联卸载 + prune 编排委托非
 /// CLI 的 [`remove_marketplace`]；本 handler 仅做结构化结果 → 退出码映射。
+/// `non_plugin_bundle_ids`：#139 回收判据「非用户声明」数据源（`origin != plugin` 全集）——MUST 由持有
+/// `Computer` 的调用方经 `Computer::non_plugin_declared_bundle_ids` 供给；空集会连坐用户/宿主自有 server。
+/// `opts.hooks == None` 的路径不停摘，该集未被读取。
 pub async fn marketplace_remove(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
     name: &str,
     opts: MarketplaceRemoveOptions<'_>,
+    non_plugin_bundle_ids: &std::collections::HashSet<crate::mcp_clients::model::BundleId>,
 ) -> i32 {
     let json_output = opts.json_output;
     // 未知校验先于 confirm（保留既有时序：未知直接拒、不弹 confirm）。
@@ -438,6 +442,7 @@ pub async fn marketplace_remove(
             keep_plugins: opts.keep_plugins,
             hooks: opts.hooks,
         },
+        non_plugin_bundle_ids,
     )
     .await
     {
@@ -713,6 +718,7 @@ mod tests {
                 json_output: true,
                 ..Default::default()
             },
+            &std::collections::HashSet::new(),
         )
         .await;
         assert_eq!(code, EXIT_USER_ERROR);
@@ -750,6 +756,7 @@ mod tests {
                 json_output: true,
                 ..Default::default()
             },
+            &std::collections::HashSet::new(),
         )
         .await;
         assert_eq!(code, EXIT_OK);

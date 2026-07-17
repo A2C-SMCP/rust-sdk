@@ -619,7 +619,7 @@ mod tests {
                     "plug@mp".into(),
                     vec![InstalledPluginRecord {
                         install_path: Some("/abs/install/path".into()),
-                        bundled_mcp_servers: vec![],
+                        mcp_servers: vec![],
                         extra: Map::new(),
                     }],
                 );

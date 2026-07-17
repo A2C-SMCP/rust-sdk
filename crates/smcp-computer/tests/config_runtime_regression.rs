@@ -17,7 +17,7 @@
 //! 10. lifecycle 不变量（boot/shutdown 终态 + 未连接 gate）
 //! 11. 跨-SDK 快照 fixture round-trip **桩**（python 未实现，守护 schema 漂移）
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use tempfile::TempDir;
@@ -26,8 +26,8 @@ use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::errors::ComputerError;
 use smcp_computer::mcp_clients::bundle_id::resolve_bundle_id;
 use smcp_computer::mcp_clients::model::{
-    HttpServerConfig, HttpServerParameters, MCPServerConfig, StdioServerConfig,
-    StdioServerParameters,
+    BundleId, HttpServerConfig, HttpServerParameters, MCPServerConfig, ServerName,
+    StdioServerConfig, StdioServerParameters,
 };
 use smcp_computer::settings::config::{
     export_config, import_config, load_config, migrate_config, update_config, validate_config,
@@ -843,9 +843,9 @@ struct ExternalGovernanceHooks<'a> {
 
 #[async_trait::async_trait]
 impl McpInstallHooks for ExternalGovernanceHooks<'_> {
-    fn existing_server_names(&self) -> HashSet<String> {
+    fn existing_servers(&self) -> HashMap<BundleId, ServerName> {
         // 冲突门控非本测试关注点（#122 只验运行期通道的对外可达 + 不落盘契约）。
-        HashSet::new()
+        HashMap::new()
     }
 
     async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError> {
@@ -856,13 +856,15 @@ impl McpInstallHooks for ExternalGovernanceHooks<'_> {
             .map_err(|e| McpHookError(e.to_string()))
     }
 
-    async fn remove_server(&self, name: &str) -> Result<(), McpHookError> {
+    async fn remove_server(&self, id: &BundleId) -> Result<(), McpHookError> {
         if self.fail_teardown {
             return Err(McpHookError("injected teardown failure".into()));
         }
-        // #122 关键行：治理级联停摘走**运行期通道**（不删 config 声明）。修复前无法编译（unmount_server 私有）。
+        // #122 关键行：治理级联停摘走**运行期通道**（不删 config 声明）。#139：本 double 是**集成测试**（独立
+        // crate），够不着 `pub(crate)` 的 `unmount_server_by_id`，故用 `pub` 的 name 寻址 `unmount_server`；本
+        // fixture 的 name==bundle_id 故等价。#141 把 `unmount_server` 本身改 `&BundleId` 后此处自然收敛。
         self.comp
-            .unmount_server(name)
+            .unmount_server(id.as_str())
             .await
             .map_err(|e| McpHookError(e.to_string()))
     }
@@ -918,7 +920,10 @@ async fn issue122_external_hook_runtime_mount_does_not_persist() {
     );
 
     // remove（= plugin disable 级联摘）→ 运行期消失、仍无盘上痕迹、config revision 全程恒 0。
-    hooks.remove_server("audit-mcp").await.unwrap();
+    hooks
+        .remove_server(&BundleId::try_from("audit-mcp".to_string()).unwrap())
+        .await
+        .unwrap();
     assert!(
         !computer
             .list_mcp_servers()
@@ -977,7 +982,10 @@ async fn issue122_teardown_failure_then_rebuild_has_no_resurrection() {
 
         // 模拟 disable 的 MCP teardown 阶段失败（issue 复现步骤 4）：remove hook 返错、server 未摘。
         assert!(
-            hooks.remove_server("audit-mcp").await.is_err(),
+            hooks
+                .remove_server(&BundleId::try_from("audit-mcp".to_string()).unwrap())
+                .await
+                .is_err(),
             "注入 teardown 失败"
         );
 

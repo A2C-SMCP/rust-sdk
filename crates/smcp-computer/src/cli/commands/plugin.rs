@@ -22,9 +22,12 @@
 * 启动期 MCP 批准框（`run_mcp_approval`）属 REPL/boot 范畴，由 CLI-03（#54）实现。
 */
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
+
+use crate::mcp_clients::model::BundleId;
 
 use super::{
     file_store, msg_dim, msg_err, ok_msg, print_json, resolved_settings, Confirm, EXIT_OK,
@@ -174,7 +177,7 @@ pub async fn plugin_install(
         Err(e) => return plugin_err(&e.to_string(), json_output, EXIT_USER_ERROR, None),
     };
 
-    let servers = record.bundled_mcp_servers.clone();
+    let servers = record.mcp_servers.clone();
     if json_output {
         print_json(&json!({
             "installed": plugin_id,
@@ -192,12 +195,19 @@ pub async fn plugin_install(
 }
 
 /// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联停摘 bundled server + 删账本）/ uninstall a plugin。
+///
+/// `non_plugin_bundle_ids` = 回收判据「非用户声明」数据源（`origin != plugin` 的 bundle_id 全集，含
+/// durable/flag/embed）。**MUST 由持有 `Computer` 的调用方经
+/// `Computer::non_plugin_declared_bundle_ids` 供给**——传空集会让用户/宿主自有 server 被连坐停摘（#139）。
+/// `hooks == None` 的路径不发生停摘，该集未被读取。
+#[allow(clippy::too_many_arguments)]
 pub async fn plugin_uninstall(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
     plugin_id: &str,
     keep_servers: bool,
+    non_plugin_bundle_ids: &HashSet<BundleId>,
     hooks: Option<&dyn McpInstallHooks>,
     json_output: bool,
 ) -> i32 {
@@ -210,6 +220,7 @@ pub async fn plugin_uninstall(
             keep_servers,
             env,
         },
+        non_plugin_bundle_ids,
         hooks,
     )
     .await
@@ -300,11 +311,14 @@ pub async fn plugin_enable(
 }
 
 /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；物化层保留可一键复原）/ disable a plugin。
+/// `non_plugin_bundle_ids`：同 [`plugin_uninstall`]——回收判据「非用户声明」数据源，MUST 由持有 `Computer`
+/// 的调用方供给；传空集会连坐用户/宿主自有 server（#139）。
 pub async fn plugin_disable(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
     plugin_id: &str,
+    non_plugin_bundle_ids: &HashSet<BundleId>,
     hooks: Option<&dyn McpInstallHooks>,
     json_output: bool,
 ) -> i32 {
@@ -328,6 +342,7 @@ pub async fn plugin_disable(
                 project_path: rec.extra.get("projectPath").and_then(Value::as_str),
                 env,
             },
+            non_plugin_bundle_ids,
             hooks,
         )
         .await
@@ -373,7 +388,7 @@ pub fn plugin_list(
         scopes.dedup();
         let mut bundled: Vec<String> = records
             .iter()
-            .flat_map(|r| r.bundled_mcp_servers.iter().cloned())
+            .flat_map(|r| r.mcp_servers.iter().map(|b| b.as_str().to_string()))
             .collect();
         bundled.sort();
         bundled.dedup();
@@ -454,10 +469,14 @@ pub fn plugin_info(
         if let Some(ip) = &rec.install_path {
             println!("  {prefix}installPath: {ip}");
         }
-        if !rec.bundled_mcp_servers.is_empty() {
+        if !rec.mcp_servers.is_empty() {
             println!(
                 "  {prefix}bundledMcpServers: {}",
-                rec.bundled_mcp_servers.join(", ")
+                rec.mcp_servers
+                    .iter()
+                    .map(|b| b.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         for key in ["scope", "version", "commitSha", "installedAt"] {
@@ -472,12 +491,16 @@ pub fn plugin_info(
 /// 清理孤儿 plugin（账本有记录、但 pid 不在 `installedPlugins` 安装意图 = 陈旧派生缓存）/ GC orphan plugins。
 ///
 /// v0.3.0：孤儿判定基于**安装意图**（非 `enabledPlugins`）——`installed_disabled` 仍是合法安装、绝不 gc。
+///
+/// `non_plugin_bundle_ids`：同 [`plugin_uninstall`]——回收判据「非用户声明」数据源，MUST 由持有 `Computer`
+/// 的调用方供给；传空集会连坐用户/宿主自有 server（#139）。`teardown == None` 的路径不发生停摘。
 #[allow(clippy::too_many_arguments)]
 pub async fn plugin_gc(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
     _cwd: Option<&Path>,
+    non_plugin_bundle_ids: &HashSet<BundleId>,
     teardown: Option<&dyn McpTeardown>,
     confirm: Option<&dyn Confirm>,
     json_output: bool,
@@ -514,7 +537,15 @@ pub async fn plugin_gc(
             return plugin_err("aborted by user", json_output, EXIT_USER_ERROR, None);
         }
     }
-    let removed = gc_plugins(&orphans, registry, home, &store, teardown).await;
+    let removed = gc_plugins(
+        &orphans,
+        registry,
+        home,
+        &store,
+        non_plugin_bundle_ids,
+        teardown,
+    )
+    .await;
     if json_output {
         print_json(&json!({ "removed": removed }));
         return EXIT_OK;
@@ -555,7 +586,10 @@ mod tests {
                     pid.to_string(),
                     vec![InstalledPluginRecord {
                         install_path: Some(home.join("x").to_string_lossy().into_owned()),
-                        bundled_mcp_servers: vec!["figma-mcp".to_string()],
+                        mcp_servers: vec![crate::mcp_clients::model::BundleId::try_from(
+                            "figma-mcp".to_string(),
+                        )
+                        .unwrap()],
                         extra: Map::from_iter([("scope".to_string(), json!(scope))]),
                     }],
                 );
@@ -605,6 +639,7 @@ mod tests {
                 Some(&env),
                 "x@y",
                 false,
+                &HashSet::new(),
                 None,
                 true
             )
@@ -616,7 +651,16 @@ mod tests {
             EXIT_USER_ERROR
         );
         assert_eq!(
-            plugin_disable(&mut registry, dir.path(), Some(&env), "x@y", None, true).await,
+            plugin_disable(
+                &mut registry,
+                dir.path(),
+                Some(&env),
+                "x@y",
+                &HashSet::new(),
+                None,
+                true
+            )
+            .await,
             EXIT_USER_ERROR
         );
     }
@@ -661,6 +705,7 @@ mod tests {
             dir.path(),
             Some(&env),
             Some(dir.path()),
+            &HashSet::new(),
             None,
             None,
             true,
@@ -683,7 +728,7 @@ mod tests {
                         pid.to_string(),
                         vec![InstalledPluginRecord {
                             install_path: Some(home.join(pid).to_string_lossy().into_owned()),
-                            bundled_mcp_servers: vec![],
+                            mcp_servers: vec![],
                             extra: Map::from_iter([("scope".to_string(), json!("user"))]),
                         }],
                     );
@@ -711,6 +756,7 @@ mod tests {
             home,
             Some(&env),
             Some(home),
+            &HashSet::new(),
             None,
             None,
             true,
@@ -739,7 +785,7 @@ mod tests {
                     pid.to_string(),
                     vec![InstalledPluginRecord {
                         install_path: Some(install_path.to_string_lossy().into_owned()),
-                        bundled_mcp_servers: vec![],
+                        mcp_servers: vec![],
                         extra: Map::from_iter([("scope".to_string(), json!("user"))]),
                     }],
                 );
@@ -768,6 +814,7 @@ mod tests {
             home,
             Some(&env),
             Some(home),
+            &HashSet::new(),
             None,
             None,
             true,
@@ -799,6 +846,7 @@ mod tests {
             home,
             Some(&env),
             Some(home),
+            &HashSet::new(),
             None,
             None,
             true,

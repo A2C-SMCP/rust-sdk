@@ -1051,7 +1051,10 @@ mod tests {
             "figma@acme".to_string(),
             vec![InstalledPluginRecord {
                 install_path: Some("/home/.plugins/figma".to_string()),
-                bundled_mcp_servers: vec!["figma-mcp".to_string()],
+                mcp_servers: vec![crate::mcp_clients::model::BundleId::try_from(
+                    "figma-mcp".to_string(),
+                )
+                .unwrap()],
                 extra: {
                     let mut m = Map::new();
                     m.insert("scope".into(), json!("user"));
@@ -1068,7 +1071,10 @@ mod tests {
             recs[0].install_path.as_deref(),
             Some("/home/.plugins/figma")
         );
-        assert_eq!(recs[0].bundled_mcp_servers, vec!["figma-mcp".to_string()]);
+        assert_eq!(
+            recs[0].mcp_servers,
+            vec![crate::mcp_clients::model::BundleId::try_from("figma-mcp".to_string()).unwrap()]
+        );
         assert_eq!(recs[0].extra.get("scope"), Some(&json!("user")));
     }
 

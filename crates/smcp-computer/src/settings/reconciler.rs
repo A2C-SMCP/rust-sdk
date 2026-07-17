@@ -44,6 +44,7 @@ use serde_json::{Map, Value};
 
 use smcp::utils::path::{is_within, normalize_lexical};
 
+use crate::mcp_clients::model::BundleId;
 use crate::settings::schema::{is_valid_enabled_plugin_key, is_valid_marketplace_name};
 use crate::settings::scope::EnvMap;
 use crate::skills::home::{marketplace_skill_dir, SOURCE_MARKETPLACE};
@@ -88,13 +89,15 @@ pub struct InstalledPluginRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub install_path: Option<String>,
-    /// 随附 bundled MCP server 名（gc 时经 teardown 停摘）/ bundled MCP server names。
-    #[serde(
-        default,
-        rename = "bundledMcpServers",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub bundled_mcp_servers: Vec<String>,
+    /// plugin 声明依赖的 MCP server **bundle_id**（纯数组，无 name/provenance）/ declared MCP dependency bundle_ids。
+    ///
+    /// #139/D3：语义 = 「plugin 声明的 MCP 依赖」（依赖关系，非所有关系）。**不存 name**——防 drift（显式
+    /// `bundleId` 的 server 改名后账本名即过期）；display 名从 `installPath` 实时解析。**不存 provenance**——
+    /// 「字段降级但消费者没跟上」正是档④ 成因模式，删除才是可靠护栏。gc/uninstall 停摘名单经**回收判据**
+    /// （无其他 plugin 依赖 ∧ 非用户声明）过滤后才 teardown。旧格式 `bundledMcpServers: ["<name>"]` 检测即
+    /// 丢弃 + 从 `installedPlugins` 意图重建（见 [`rematerialize_missing_ledger_records`](super::recovery::rematerialize_missing_ledger_records)），**无 name→id 映射**。
+    #[serde(default, rename = "mcpServers", skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<BundleId>,
     /// 其余字段透传（store 拥有）/ passthrough fields owned by the store。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -153,8 +156,10 @@ pub trait SkillGovernanceStore: KnownMarketplaceRecorder {
 /// bundled MCP server 停摘回调接缝（真正接线由 computer.py 集成承担，本模块只触发）/ MCP teardown seam。
 #[async_trait::async_trait]
 pub trait McpTeardown: Send + Sync {
-    /// 停止 / 摘除给定 bundled MCP server / Tear down the given bundled MCP servers。
-    async fn teardown(&self, servers: Vec<String>);
+    /// 停止 / 摘除给定 bundled MCP server（按 **bundle_id** 寻址）/ Tear down by bundle_id。
+    ///
+    /// #139/R4：由 `Vec<String>`（name）改 `Vec<BundleId>`——第二条 name 停摘链收口；同名两 server 精确停摘。
+    async fn teardown(&self, servers: Vec<BundleId>);
 }
 
 // ===========================================================================
@@ -491,6 +496,49 @@ pub fn list_orphan_plugins(
         .collect()
 }
 
+/// §4.9.1-2 回收判据「无其他 plugin 依赖 X」项：除 `exclude_pid` 外全部 plugin 声明依赖的并集 /
+/// union of every OTHER plugin's declared MCP deps。纯函数、只读账本自身字段（停摘自足）。
+#[must_use]
+pub fn other_plugin_mcp_deps(installed: &InstalledPlugins, exclude_pid: &str) -> HashSet<BundleId> {
+    let mut out: HashSet<BundleId> = HashSet::new();
+    for (pid, records) in &installed.plugins {
+        if pid == exclude_pid {
+            continue;
+        }
+        for rec in records {
+            out.extend(rec.mcp_servers.iter().cloned());
+        }
+    }
+    out
+}
+
+/// §4.9.1-2 回收判据（纯函数、零落盘状态）：**回收 X ⟺ 无其他 plugin 依赖 X ∧ X 非用户声明** /
+/// recycle X ⟺ (no other plugin declares X) ∧ (X is not user-declared)。
+///
+/// D5 措辞（正式重写）：~~「只收回自己带入且无其他 plugin 仍依赖」~~ → 「只收回**无人再依赖 ∧ 非用户声明**」——
+/// 原措辞把时点快照写进长期判据、是泄漏来源。
+///
+/// - `deps`：本次 disable/uninstall/gc 的 plugin 所声明的依赖（`ledger_mcp_deps_of` 产出）。
+/// - `other_deps`：[`other_plugin_mcp_deps`] 产出。
+/// - `non_plugin_declared`：**带 `origin` 的运行期权威配置集中 `origin != plugin` 的 bundle_id 集**
+///   （durable scopes + flag `--mcp-config` + embed 构造入参）——Discussion #32 裁决。**MUST 传全集**：
+///   退回只读 mcp.json 声明面会让经 flag/embed 挂载的用户/宿主 server 被误判「非用户声明」而**连坐**停摘
+///   （#153 遗留缺口形状）。**MUST NOT** 用裸活跃集（无 origin ⇒ 三挂载路径同形）或「活跃集 ∖ 全 plugin
+///   声明集」差集（对回收候选恒空 = 死代码，python 已实测证伪）。
+///
+/// 返回可回收的 bundle_id（保 `deps` 迭代序）。
+#[must_use]
+pub fn reclaimable_mcp_deps(
+    deps: &[BundleId],
+    other_deps: &HashSet<BundleId>,
+    non_plugin_declared: &HashSet<BundleId>,
+) -> Vec<BundleId> {
+    deps.iter()
+        .filter(|d| !other_deps.contains(*d) && !non_plugin_declared.contains(*d))
+        .cloned()
+        .collect()
+}
+
 /// 清理孤儿 plugin（installPath 树 + installed_plugins 条目 + Registry SKILL + bundled MCP）/ GC plugins。
 ///
 /// y/N 确认交 CLI 层（#68）；`plugin_ids` 应为 [`list_orphan_plugins`] 的子集（用户确认后传入）。每条记录的
@@ -501,6 +549,7 @@ pub async fn gc_plugins(
     registry: &mut SkillRegistry,
     home: &Path,
     store: &dyn SkillGovernanceStore,
+    non_plugin_bundle_ids: &HashSet<BundleId>,
     mcp_teardown: Option<&dyn McpTeardown>,
 ) -> Vec<String> {
     let installed = store.load_installed_plugins();
@@ -509,13 +558,22 @@ pub async fn gc_plugins(
         let Some(records) = installed.plugins.get(pid) else {
             continue;
         };
-        let mut bundled: Vec<String> = Vec::new();
+        // 停摘自足：依赖名单在账本记录移除**之前**取得，且仅依赖账本自身字段（installPath 树此刻已删）。
+        let mut deps: Vec<BundleId> = Vec::new();
         for rec in records {
             if let Some(install_path) = rec.install_path.as_deref().filter(|s| !s.is_empty()) {
                 safe_rmtree(Path::new(install_path), home);
             }
-            bundled.extend(rec.bundled_mcp_servers.iter().cloned());
+            for id in &rec.mcp_servers {
+                if !deps.contains(id) {
+                    deps.push(id.clone());
+                }
+            }
         }
+        // #139/§4.9.1-2 回收判据：无其他 plugin 依赖 ∧ 非用户声明（`non_plugin_bundle_ids` 已含 durable/
+        // flag/embed 全非-plugin 路径）。用户/宿主自有 server 永不连坐。
+        let other = other_plugin_mcp_deps(&installed, pid);
+        let reclaim = reclaimable_mcp_deps(&deps, &other, non_plugin_bundle_ids);
 
         // pid = "<plugin>@<mp>"；无 '@' → marketplace 空（不注销）。
         let (plugin, marketplace) = pid.split_once('@').unwrap_or((pid.as_str(), ""));
@@ -524,8 +582,8 @@ pub async fn gc_plugins(
         }
 
         if let Some(teardown) = mcp_teardown {
-            if !bundled.is_empty() {
-                teardown.teardown(bundled.clone()).await;
+            if !reclaim.is_empty() {
+                teardown.teardown(reclaim.clone()).await;
             }
         }
 
@@ -534,9 +592,139 @@ pub async fn gc_plugins(
             data.plugins.shift_remove(&drop_pid);
         });
         removed.push(pid.clone());
-        tracing::info!(plugin = %pid, bundled = ?bundled, "gc: removed orphan plugin");
+        tracing::info!(plugin = %pid, deps = ?deps, reclaimed = ?reclaim, "gc: removed orphan plugin");
     }
     removed
+}
+
+#[cfg(test)]
+mod recycle_criterion_tests_139 {
+    use super::*;
+
+    fn bid(s: &str) -> BundleId {
+        BundleId::try_from(s.to_string()).unwrap()
+    }
+    fn rec_with(ids: &[&str]) -> InstalledPluginRecord {
+        InstalledPluginRecord {
+            install_path: Some("/p".to_string()),
+            mcp_servers: ids.iter().map(|s| bid(s)).collect(),
+            extra: Map::new(),
+        }
+    }
+
+    /// **F1 判据形状**：ledger 序列化为**纯 bundle_id 数组**——无 provenance、无 name、字段名 `mcpServers`。
+    /// 与 python-sdk 磁盘格式逐字节一致。
+    #[test]
+    fn ledger_serializes_mcp_servers_as_pure_bundle_id_array_139() {
+        let rec = rec_with(&["acme-audit", "shared-fs"]);
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(
+            v["mcpServers"],
+            serde_json::json!(["acme-audit", "shared-fs"]),
+            "F1：纯 bundle_id 数组"
+        );
+        assert!(
+            v.get("bundledMcpServers").is_none(),
+            "旧字段名 MUST NOT 出现（检测即丢弃，无 name→id 映射）"
+        );
+        // 无 provenance / 无 name：数组元素是裸字符串，不是对象。
+        assert!(v["mcpServers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(Value::is_string));
+    }
+
+    /// **§4.9.1-2 四景**（Discussion #32）：回收 X ⟺ 无其他 plugin 依赖 X ∧ X 非用户声明。
+    /// ① 无人依赖 ∧ 非用户声明 → 回收；② 其他 plugin 仍依赖 → 保留；③④ 用户/宿主声明（durable/flag/embed，
+    /// 含碰撞景：同 bundle_id 既被 plugin 声明又被非-plugin 路径声明）→ **永不连坐**。
+    #[test]
+    fn reclaimable_criterion_four_scenarios_139() {
+        let (x, y, z) = (bid("x"), bid("y"), bid("z"));
+        let deps = vec![x.clone(), y.clone(), z.clone()];
+        let other: HashSet<BundleId> = [y].into_iter().collect(); // ② B 仍依赖 y
+        let non_plugin: HashSet<BundleId> = [z].into_iter().collect(); // ③④ 用户/宿主声明 z
+        assert_eq!(
+            reclaimable_mcp_deps(&deps, &other, &non_plugin),
+            vec![x],
+            "只回收「无其他 plugin 依赖 ∧ 非用户声明」者"
+        );
+    }
+
+    /// **回归（#139 验收）**：A 引入 X → B 依赖 X → 卸载 A（**X 保留**）→ 卸载 B（**X 回收，不泄漏**）。
+    #[test]
+    fn ab_handoff_keeps_then_reclaims_shared_dep_139() {
+        let x = bid("x");
+        let mut installed = InstalledPlugins::default();
+        installed
+            .plugins
+            .insert("a@mp".into(), vec![rec_with(&["x"])]);
+        installed
+            .plugins
+            .insert("b@mp".into(), vec![rec_with(&["x"])]);
+
+        // 卸载 A：B 仍声明依赖 X ⇒ 不回收（X 保留，B 不被打断）。
+        let other_a = other_plugin_mcp_deps(&installed, "a@mp");
+        assert!(other_a.contains(&x));
+        assert!(
+            reclaimable_mcp_deps(std::slice::from_ref(&x), &other_a, &HashSet::new()).is_empty(),
+            "卸载 A 时 X MUST 保留（B 仍依赖）"
+        );
+
+        // A 记录移除后卸载 B：无人再依赖 ⇒ 回收（不泄漏成僵尸）。
+        installed.plugins.shift_remove("a@mp");
+        let other_b = other_plugin_mcp_deps(&installed, "b@mp");
+        assert_eq!(
+            reclaimable_mcp_deps(std::slice::from_ref(&x), &other_b, &HashSet::new()),
+            vec![x],
+            "卸载 B 时 X MUST 被回收（无人再依赖，不泄漏）"
+        );
+    }
+
+    /// **永不连坐**：X 被 plugin 声明，同时经**非-plugin 路径**（user/project/local durable、flag `--mcp-config`、
+    /// embed 宿主构造入参 —— 三者在 resolve 输出中皆 `origin != plugin`）声明 ⇒ 卸载该 plugin 时 X **不回收**。
+    /// 这是 Discussion #32 裁决「判据锚 origin 权威集」的核心可观测后果（#147 让 embed 进入该集）。
+    #[test]
+    fn non_plugin_declared_never_collateral_including_embed_139() {
+        let x = bid("x");
+        // resolve 输出中 origin != plugin 的 bundle_id 集（durable / flag / embed 同源同域）。
+        let non_plugin: HashSet<BundleId> = [x.clone()].into_iter().collect();
+        assert!(
+            reclaimable_mcp_deps(&[x], &HashSet::new(), &non_plugin).is_empty(),
+            "碰撞景：origin != plugin ⇒ MUST NOT 回收（用户/宿主自有 server 永不连坐）"
+        );
+    }
+
+    /// **旧格式检测即丢弃**：磁盘上的 `bundledMcpServers`（name 数组）反序列化后 **MUST NOT** 进入
+    /// `mcp_servers`（无 name→id 映射）；它落进 `extra`，由 `discard_legacy_bundled_mcp_servers` 显式丢弃。
+    #[test]
+    fn legacy_bundled_name_array_is_not_mapped_into_mcp_servers_139() {
+        let legacy = serde_json::json!({
+            "installPath": "/p",
+            "bundledMcpServers": ["Legacy.Name", "another"],
+            "scope": "user"
+        });
+        let rec: InstalledPluginRecord = serde_json::from_value(legacy).unwrap();
+        assert!(
+            rec.mcp_servers.is_empty(),
+            "旧 name 数组 MUST NOT 被映射成 bundle_id（丢弃 + 从意图重建）"
+        );
+        // 旧键落进 extra（故需 `discard_legacy_bundled_mcp_servers` 显式清理，否则会原样回写）。
+        assert!(rec.extra.contains_key("bundledMcpServers"));
+    }
+
+    /// `other_plugin_mcp_deps` MUST 排除自身（否则自己的声明会让自己永不可回收 = 泄漏）。
+    #[test]
+    fn other_plugin_deps_excludes_self_139() {
+        let mut installed = InstalledPlugins::default();
+        installed
+            .plugins
+            .insert("a@mp".into(), vec![rec_with(&["only-mine"])]);
+        assert!(
+            other_plugin_mcp_deps(&installed, "a@mp").is_empty(),
+            "排除自身 ⇒ 独占依赖可回收"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -613,8 +801,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl McpTeardown for RecordingTeardown {
-        async fn teardown(&self, servers: Vec<String>) {
-            self.torn.lock().unwrap().extend(servers);
+        async fn teardown(&self, servers: Vec<BundleId>) {
+            self.torn
+                .lock()
+                .unwrap()
+                .extend(servers.iter().map(|b| b.as_str().to_string()));
         }
     }
 
@@ -771,7 +962,7 @@ mod tests {
                 "audit@acme".to_string(),
                 vec![InstalledPluginRecord {
                     install_path: Some(install_path.to_string_lossy().into_owned()),
-                    bundled_mcp_servers: vec!["audit-mcp".to_string()],
+                    mcp_servers: vec![BundleId::try_from("audit-mcp".to_string()).unwrap()],
                     extra: Map::new(),
                 }],
             );
@@ -803,6 +994,7 @@ mod tests {
             &mut reg,
             &home,
             &store,
+            &HashSet::new(),
             Some(&teardown),
         )
         .await;
@@ -1045,13 +1237,21 @@ mod tests {
                 "audit@acme".to_string(),
                 vec![InstalledPluginRecord {
                     install_path: Some(install_path.to_string_lossy().into_owned()),
-                    bundled_mcp_servers: vec!["audit-mcp".to_string()],
+                    mcp_servers: vec![BundleId::try_from("audit-mcp".to_string()).unwrap()],
                     extra: Map::new(),
                 }],
             );
         });
         let mut reg = SkillRegistry::new();
-        let removed = gc_plugins(&["audit@acme".to_string()], &mut reg, &home, &store, None).await;
+        let removed = gc_plugins(
+            &["audit@acme".to_string()],
+            &mut reg,
+            &home,
+            &store,
+            &HashSet::new(),
+            None,
+        )
+        .await;
         assert_eq!(removed, vec!["audit@acme".to_string()]);
         assert!(!install_path.exists());
         assert!(!store
@@ -1073,6 +1273,7 @@ mod tests {
             &mut reg,
             &home,
             &store,
+            &HashSet::new(),
             None,
         )
         .await;
@@ -1094,7 +1295,15 @@ mod tests {
             );
         });
         let mut reg = SkillRegistry::new();
-        let removed = gc_plugins(&["local-only".to_string()], &mut reg, &home, &store, None).await;
+        let removed = gc_plugins(
+            &["local-only".to_string()],
+            &mut reg,
+            &home,
+            &store,
+            &HashSet::new(),
+            None,
+        )
+        .await;
         assert_eq!(removed, vec!["local-only".to_string()]);
         assert!(!store
             .load_installed_plugins()

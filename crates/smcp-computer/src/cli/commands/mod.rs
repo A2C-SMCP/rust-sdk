@@ -18,7 +18,7 @@
 *   - `flag_value` / `resolved_settings`：REPL 行解析与六层合并视图。
 */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -27,7 +27,8 @@ use serde_json::{Map, Value};
 
 use crate::computer::{Computer, Session};
 use crate::inputs::load_plugin_inputs;
-use crate::mcp_clients::model::MCPServerConfig;
+use crate::mcp_clients::bundle_id::resolve_bundle_id;
+use crate::mcp_clients::model::{BundleId, MCPServerConfig, ServerName};
 use crate::settings::installer::{McpHookError, McpInstallHooks};
 use crate::settings::scope::EnvMap;
 use crate::settings::{
@@ -208,7 +209,8 @@ pub fn format_settings_errors(errors: &[crate::settings::SettingsValidationError
 /// plugin 场景 `roots` 为空、回退到构造期绑定的 `plugin`/`marketplace`。
 pub struct CliMcpHooks<'a, S: Session> {
     comp: &'a Computer<S>,
-    existing: HashSet<String>,
+    /// 构造期 server 快照：`bundle_id → display 名`（依赖预检输入；#139 由 name 集改 bundle_id 键）。
+    existing: HashMap<BundleId, ServerName>,
     plugin: Option<String>,
     marketplace: Option<String>,
     /// 重挂归属索引：`install_path → (plugin, marketplace)`（单 plugin 场景为空）/ remount ownership index。
@@ -226,7 +228,7 @@ impl<'a, S: Session> CliMcpHooks<'a, S> {
             .list_mcp_servers()
             .await
             .iter()
-            .map(|cfg| cfg.name().to_string())
+            .map(|cfg| (resolve_bundle_id(cfg), cfg.name().to_string()))
             .collect();
         CliMcpHooks {
             comp,
@@ -258,7 +260,7 @@ impl<'a, S: Session> CliMcpHooks<'a, S> {
             .list_mcp_servers()
             .await
             .iter()
-            .map(|cfg| cfg.name().to_string())
+            .map(|cfg| (resolve_bundle_id(cfg), cfg.name().to_string()))
             .collect();
         CliMcpHooks {
             comp,
@@ -272,7 +274,7 @@ impl<'a, S: Session> CliMcpHooks<'a, S> {
 
 #[async_trait]
 impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
-    fn existing_server_names(&self) -> HashSet<String> {
+    fn existing_servers(&self) -> HashMap<BundleId, ServerName> {
         self.existing.clone()
     }
 
@@ -288,10 +290,12 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
             .map_err(|e| McpHookError(e.to_string()))
     }
 
-    async fn remove_server(&self, name: &str) -> Result<(), McpHookError> {
+    async fn remove_server(&self, id: &BundleId) -> Result<(), McpHookError> {
         // #113 S6：治理级联停摘走**运行期卸载**（不删 config 声明）——bundled server 本不在用户 config 层。
+        // #139：按 bundle_id 精确停摘，经 `unmount_server_by_id`（pub(crate)、同 crate 可达）——#141 会把它并入
+        // `unmount_server`；届时此处随之收敛。
         self.comp
-            .unmount_server(name)
+            .unmount_server_by_id(id.as_str())
             .await
             .map_err(|e| McpHookError(e.to_string()))
     }
@@ -440,7 +444,7 @@ mod tests {
         // 回调装配：空 Computer → 快照为空；占位上下文不触发注入。
         let comp = cli_computer();
         let hooks = CliMcpHooks::new(&comp, Some("figma".into()), Some("acme".into())).await;
-        assert!(hooks.existing_server_names().is_empty());
+        assert!(hooks.existing_servers().is_empty());
         // inject 无 inputs.json → no-op（不 panic）。
         let tmp = std::env::temp_dir();
         assert!(hooks.inject_inputs(&tmp).await.is_ok());
@@ -479,7 +483,7 @@ mod tests {
                     "remounttest@acme".to_string(),
                     vec![InstalledPluginRecord {
                         install_path: Some(install_path.to_string_lossy().into_owned()),
-                        bundled_mcp_servers: vec!["a-mcp".to_string()],
+                        mcp_servers: vec![BundleId::try_from("a-mcp".to_string()).unwrap()],
                         extra: Map::from_iter([("scope".to_string(), json!("user"))]),
                     }],
                 );
@@ -561,7 +565,7 @@ mod tests {
                     "alpha@m1".to_string(),
                     vec![InstalledPluginRecord {
                         install_path: Some(alpha_root.to_string_lossy().into_owned()),
-                        bundled_mcp_servers: vec!["alpha-mcp".to_string()],
+                        mcp_servers: vec![BundleId::try_from("alpha-mcp".to_string()).unwrap()],
                         extra: Map::from_iter([("scope".to_string(), json!("user"))]),
                     }],
                 );
@@ -569,7 +573,7 @@ mod tests {
                     "beta@m2".to_string(),
                     vec![InstalledPluginRecord {
                         install_path: Some(beta_root.to_string_lossy().into_owned()),
-                        bundled_mcp_servers: vec!["beta-mcp".to_string()],
+                        mcp_servers: vec![BundleId::try_from("beta-mcp".to_string()).unwrap()],
                         extra: Map::from_iter([("scope".to_string(), json!("user"))]),
                     }],
                 );

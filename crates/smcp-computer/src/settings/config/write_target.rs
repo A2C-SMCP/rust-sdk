@@ -721,7 +721,10 @@ mod tests {
                     "plug@mp".into(),
                     vec![InstalledPluginRecord {
                         install_path: None,
-                        bundled_mcp_servers: vec!["bundled-srv".into()],
+                        mcp_servers: vec![crate::mcp_clients::model::BundleId::try_from(
+                            "bundled-srv".to_string(),
+                        )
+                        .unwrap()],
                         extra: Map::new(),
                     }],
                 );
@@ -766,7 +769,10 @@ mod tests {
                     "plug@mp".into(),
                     vec![InstalledPluginRecord {
                         install_path: None,
-                        bundled_mcp_servers: vec!["audit-mcp".into()],
+                        mcp_servers: vec![crate::mcp_clients::model::BundleId::try_from(
+                            "audit-mcp".to_string(),
+                        )
+                        .unwrap()],
                         extra: Map::new(),
                     }],
                 );
@@ -827,7 +833,10 @@ mod tests {
                     "plug@mp".into(),
                     vec![InstalledPluginRecord {
                         install_path: None,
-                        bundled_mcp_servers: vec!["audit-mcp".into()],
+                        mcp_servers: vec![crate::mcp_clients::model::BundleId::try_from(
+                            "audit-mcp".to_string(),
+                        )
+                        .unwrap()],
                         extra: Map::new(),
                     }],
                 );

@@ -1073,7 +1073,7 @@ mod tests {
                     "audit@acme".to_string(),
                     vec![InstalledPluginRecord {
                         install_path: Some(install.to_string_lossy().into_owned()),
-                        bundled_mcp_servers: vec![srv_name.to_string()],
+                        mcp_servers: vec![BundleId::try_from(srv_name.to_string()).unwrap()],
                         extra: Map::new(),
                     }],
                 );
@@ -1222,7 +1222,7 @@ mod tests {
                     "plug@mp".to_string(),
                     vec![InstalledPluginRecord {
                         install_path: None,
-                        bundled_mcp_servers: vec!["bundled-srv".to_string()],
+                        mcp_servers: vec![BundleId::try_from("bundled-srv".to_string()).unwrap()],
                         extra: Map::new(),
                     }],
                 );

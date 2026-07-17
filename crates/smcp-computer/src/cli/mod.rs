@@ -15,6 +15,7 @@
 */
 
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::computer::{Computer, SilentSession};
@@ -365,6 +366,8 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
                     hooks: None, // ledger-only：MCP 摘除延到下次 REPL boot。
                     json_output: json,
                 },
+                // hooks=None ⇒ 无停摘发生，回收判据集不被读取，空集安全（同 plugin 一次性子命令路径）。
+                &HashSet::new(),
             )
             .await
         }
@@ -426,23 +429,48 @@ async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
             )
             .await
         }
+        // #139：本组**一次性子命令**路径 `hooks`/`teardown` 恒为 `None`（无活跃 Computer ⇒ 无运行期 server 可
+        // 停摘），回收判据的「非用户声明」集**不会被读取**，故传空集安全。真正会停摘的是 REPL 路径
+        // （`cli::repl::dispatch_plugin`），那里经 `Computer::non_plugin_declared_bundle_ids` 供给全集。
         PluginCmd::Uninstall {
             id,
             keep_servers,
             json,
-        } => plugin_uninstall(&mut registry, &home, None, &id, keep_servers, None, json).await,
+        } => {
+            plugin_uninstall(
+                &mut registry,
+                &home,
+                None,
+                &id,
+                keep_servers,
+                &HashSet::new(),
+                None,
+                json,
+            )
+            .await
+        }
         PluginCmd::Enable { id, json } => {
             plugin_enable(&mut registry, &home, None, &id, None, json).await
         }
         PluginCmd::Disable { id, json } => {
-            plugin_disable(&mut registry, &home, None, &id, None, json).await
+            plugin_disable(&mut registry, &home, None, &id, &HashSet::new(), None, json).await
         }
         PluginCmd::List { available, json } => {
             plugin_list(&home, None, cwd.as_deref(), available, json)
         }
         PluginCmd::Info { id, json } => plugin_info(&home, None, &id, cwd.as_deref(), json),
         PluginCmd::Gc { json } => {
-            plugin_gc(&mut registry, &home, None, cwd.as_deref(), None, None, json).await
+            plugin_gc(
+                &mut registry,
+                &home,
+                None,
+                cwd.as_deref(),
+                &HashSet::new(),
+                None,
+                None,
+                json,
+            )
+            .await
         }
     }
 }
@@ -495,7 +523,7 @@ async fn dispatch_skill(action: SkillCmd) -> i32 {
 // ── REPL 运行模式 / REPL run mode ─────────────────────────────────────────────
 async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
     let session = SilentSession::new("cli-session");
-    let computer = Computer::new(
+    let mut computer = Computer::new(
         "friday_hands",
         session,
         None,
@@ -503,6 +531,13 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
         args.auto_connect,
         args.auto_reconnect,
     );
+    // #139：把 `--mcp-config`（flag 层）作为**当次 boot 的声明式输入**绑到 Computer 上——回收判据的
+    // 「非用户声明」集据此包含 flag 层声明，否则经 `--mcp-config` 声明的用户 server 会在 plugin
+    // uninstall/disable/gc 时被连坐停摘（§2.5-5 / #153 缺口形状）。
+    if let Some(ref p) = mcp_config {
+        computer = computer.with_mcp_flag_config(p.clone());
+    }
+    let computer = computer;
 
     let cli_config = commands::CliConfig {
         url: args.url.clone(),

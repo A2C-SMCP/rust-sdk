@@ -71,10 +71,14 @@ struct ReplTeardown<'a, S: Session> {
 
 #[async_trait]
 impl<S: Session> McpTeardown for ReplTeardown<'_, S> {
-    async fn teardown(&self, servers: Vec<String>) {
-        for name in servers {
+    async fn teardown(&self, servers: Vec<crate::mcp_clients::model::BundleId>) {
+        for id in servers {
             // #113 S6：gc 停摘 bundled server 走**运行期卸载**（不删 config 声明）——bundled 归属 ledger、非用户 config。
-            let _ = self.comp.unmount_server(&name).await;
+            // #139：按 **bundle_id** 精确停摘——MUST 走 `unmount_server_by_id`（`unmount_server` 是 name 寻址，
+            // 把 bundle_id 当名传会命中错的 server 或静默 no-op）。#141 会把二者合并，届时此处随之收敛。
+            if let Err(e) = self.comp.unmount_server_by_id(id.as_str()).await {
+                tracing::warn!(bundle_id = %id.as_str(), error = %e, "gc teardown: unmount failed");
+            }
         }
     }
 }
@@ -154,6 +158,8 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
                 return;
             };
             let hooks = CliMcpHooks::new(comp, None, None).await;
+            // #139：marketplace 级联卸载的回收判据数据源（全集）——传空集会连坐用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
             let code = marketplace_remove(
                 &mut registry,
@@ -166,6 +172,7 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
                     hooks: Some(&hooks),
                     json_output: json,
                 },
+                &non_plugin,
             )
             .await;
             drop(registry);
@@ -253,6 +260,9 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, None, None).await;
+            // #139：回收判据数据源（durable + flag + embed 的 `origin != plugin` 全集）——传空集会连坐
+            // 用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
             let code = plugin_uninstall(
                 &mut registry,
@@ -260,6 +270,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 None,
                 id,
                 has_flag(&args, "--keep-servers"),
+                &non_plugin,
                 Some(&hooks),
                 json,
             )
@@ -292,8 +303,19 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, None, None).await;
+            // #139：回收判据数据源（同 uninstall）——传空集会连坐用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
-            let code = plugin_disable(&mut registry, &home, None, id, Some(&hooks), json).await;
+            let code = plugin_disable(
+                &mut registry,
+                &home,
+                None,
+                id,
+                &non_plugin,
+                Some(&hooks),
+                json,
+            )
+            .await;
             drop(registry);
             if code == EXIT_OK {
                 comp.mark_skills_dirty();
@@ -318,12 +340,15 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
         "gc" => {
             let confirm = ReplConfirm;
             let teardown = ReplTeardown { comp };
+            // #139：回收判据数据源（同 uninstall）——传空集会连坐用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
             let code = plugin_gc(
                 &mut registry,
                 &home,
                 None,
                 cwd.as_deref(),
+                &non_plugin,
                 Some(&teardown),
                 Some(&confirm),
                 json,

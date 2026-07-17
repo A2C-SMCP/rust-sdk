@@ -39,7 +39,7 @@
 //!   uninstall 仅注销**活跃** SKILL；先 disable（orphan）再 uninstall 会残留内存孤儿条目，进程重启即清。
 //! - **非原子的 disable**：先写 settings 再摘 server / orphan skill；`remove_server` 抛错留半态——靠 reconcile 兜底。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,7 +47,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
-use crate::mcp_clients::model::MCPServerConfig;
+use crate::mcp_clients::bundle_id::resolve_bundle_id;
+use crate::mcp_clients::model::{BundleId, MCPServerConfig, ServerName};
 use crate::settings::reconciler::{safe_rmtree, InstalledPluginRecord};
 use crate::settings::schema::{is_valid_enabled_plugin_key, SettingsScope};
 use crate::settings::scope::{
@@ -125,18 +126,24 @@ pub enum PluginInstallError {
 /// **结构性成对**，杜绝 §10.6 冲突闸门静默旁路。`hooks = None` ⇒ ledger-only（见模块文档）。
 #[async_trait]
 pub trait McpInstallHooks: Send + Sync {
-    /// 当前已注册 server 名集合（冲突闸门输入）/ currently-registered server names。
-    fn existing_server_names(&self) -> HashSet<String>;
+    /// 当前已注册 server：`bundle_id → display 名`（冲突闸门/依赖预检输入）/ registered servers by bundle_id。
+    ///
+    /// #139/R4：由 `existing_server_names() -> HashSet<String>` 改按 **bundle_id 寻址**（display 名仅供
+    /// 「依赖已满足」诊断呈现，非身份键）。`register_server` 与本方法结构性成对，杜绝 §10.6 静默旁路。
+    fn existing_servers(&self) -> HashMap<BundleId, ServerName>;
     /// 注册 / 更新一个 server（含 `${input:}` 渲染）/ register or update a server。
     ///
     /// # Errors
     /// 注册失败 → [`McpHookError`]（触发 install 补偿回滚）。
     async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError>;
-    /// 停止并摘除一个 server / stop & remove a server。
+    /// 停止并摘除一个 server（按 **bundle_id** 寻址）/ stop & remove a server by bundle_id。
+    ///
+    /// #139/R4：由 `name: &str` 改 `id: &BundleId`——非对称合理（register 需完整 cfg 才能挂；remove 只需身份
+    /// 就能摘）。同名两 server（显式异 bundle_id）从此可精确停摘，不再字典序最小误摘。
     ///
     /// # Errors
     /// 摘除失败 → [`McpHookError`]（uninstall/disable 上抛；install 回滚中仅 WARN）。
-    async fn remove_server(&self, name: &str) -> Result<(), McpHookError>;
+    async fn remove_server(&self, id: &BundleId) -> Result<(), McpHookError>;
     /// 注入 plugin-scoped inputs 入池（在 register 之前，使裸 id 经 D2 前缀回退命中，§9.3）/ inject inputs。
     ///
     /// 默认 no-op（`inputs.json` 缺失 / 无需注入时）/ defaults to no-op。
@@ -369,13 +376,13 @@ fn plugin_skill_names(registry: &SkillRegistry, marketplace: &str, plugin: &str)
         .collect()
 }
 
-/// 该 plugin 物化记录里全部 `bundledMcpServers` 名（跨 scope 记录并集）/ All recorded bundled server names。
-fn bundled_servers_of(home: &Path, plugin_id: &str, env: Option<&EnvMap>) -> HashSet<String> {
+/// 该 plugin 物化记录里全部声明依赖 **bundle_id**（跨 scope 记录并集）/ All declared dependency bundle_ids。
+fn bundled_servers_of(home: &Path, plugin_id: &str, env: Option<&EnvMap>) -> HashSet<BundleId> {
     let installed = load_installed_plugins(Some(home), env);
-    let mut out: HashSet<String> = HashSet::new();
+    let mut out: HashSet<BundleId> = HashSet::new();
     if let Some(records) = installed.account.plugins.get(plugin_id) {
         for rec in records {
-            out.extend(rec.bundled_mcp_servers.iter().cloned());
+            out.extend(rec.mcp_servers.iter().cloned());
         }
     }
     out
@@ -406,23 +413,36 @@ fn resolve_marketplace_source(
     Ok((record.source.clone(), commit_sha))
 }
 
-/// bundled server 同名冲突预检（§7.2/§10.6）/ Bundled-server name-conflict precheck。
+/// bundled server 依赖模型预检（#139/D3，§7.2/§10.6）/ Bundled-server dependency-model precheck。
 ///
-/// 外来同名（`name in existing` 且 `not in owned`）→ [`McpServerNameConflictError`]（硬抛、零变更）；
-/// plugin 自有（命中 `owned`）→ 幂等放行。
+/// **心智转变（D3）**：plugin ↔ MCP server 是**依赖关系**（以 bundle_id 声明），非所有关系。故：
+/// - **硬错误 fail-fast**：同一 plugin manifest 内两 server 归一**同 bundle_id**（身份坍缩，不可自动消歧
+///   ——须显式设不同 `bundleId`）。这是唯一保留的硬门（协议 §身份正交性）。
+/// - **不再阻止**：声明的 bundle_id 本地已有（`existing` 命中）= **依赖已满足** → 仅诊断提示、交 reconcile，
+///   **不**抛错、**不**阻止安装（推翻旧「外来同名硬抛」——name 允许碰撞、永不做键）。
 fn conflict_check(
     servers: &[MCPServerConfig],
-    existing: &HashSet<String>,
-    owned: &HashSet<String>,
+    existing: &HashMap<BundleId, ServerName>,
+    plugin_id: &str,
 ) -> Result<(), McpServerNameConflictError> {
+    let mut seen: HashSet<BundleId> = HashSet::new();
     for cfg in servers {
-        let name = cfg.name();
-        if existing.contains(name) && !owned.contains(name) {
+        let bid = resolve_bundle_id(cfg);
+        if !seen.insert(bid.clone()) {
             return Err(McpServerNameConflictError(format!(
-                "{name:?} already exists and is not owned by this plugin. Resolve by 'server rm' the \
-                 existing server, or rename it in the plugin's own manifest (no --rename / \
-                 --force-override escape hatch: name is identity)."
+                "two servers in plugin {plugin_id:?} resolve to the same bundle_id {:?} (identity \
+                 collapse); set an explicit distinct bundleId to disambiguate.",
+                bid.as_str()
             )));
+        }
+        // D3：同 bundle_id 本地已有 = 依赖已满足，非冲突——仅提示（不阻止、交 reconcile）。
+        if let Some(existing_name) = existing.get(&bid) {
+            tracing::info!(
+                plugin = plugin_id,
+                bundle_id = %bid.as_str(),
+                existing = %existing_name,
+                "#139/D3: declared MCP dependency already satisfied by an existing server; not remounting"
+            );
         }
     }
     Ok(())
@@ -544,7 +564,8 @@ fn write_ledger_record(
     m: &MaterializedPlugin,
     env: Option<&EnvMap>,
 ) -> Result<InstalledPluginRecord, PluginInstallError> {
-    let bundled_names: Vec<String> = m.servers.iter().map(|c| c.name().to_string()).collect();
+    // #139：账本存 bundle_id（身份键），非 display 名——防 drift（显式 bundleId 的 server 改名后账本不过期）。
+    let bundled: Vec<BundleId> = m.servers.iter().map(resolve_bundle_id).collect();
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let mut extra: Map<String, Value> = Map::new();
@@ -566,7 +587,7 @@ fn write_ledger_record(
 
     let record = InstalledPluginRecord {
         install_path: Some(m.plugin_root.to_string_lossy().into_owned()),
-        bundled_mcp_servers: bundled_names,
+        mcp_servers: bundled,
         extra,
     };
 
@@ -670,12 +691,11 @@ pub async fn install_plugin(
     )
     .await?;
 
-    // ⑤：★冲突闸门（零变更）。owned = 自有同名白名单（上次记录的 bundledMcpServers）。
-    let owned = bundled_servers_of(home, plugin_id, env);
+    // ⑤：★依赖预检（零变更，#139/D3）。existing = 现注册 `bundle_id → display 名`（仅供「依赖已满足」诊断）。
     let existing = hooks
-        .map(McpInstallHooks::existing_server_names)
+        .map(McpInstallHooks::existing_servers)
         .unwrap_or_default();
-    conflict_check(&m.servers, &existing, &owned)?;
+    conflict_check(&m.servers, &existing, plugin_id)?;
 
     // —— 过闸：物化但**不激活**（v0.3.0，协议 §2.4：install 落 `installed_disabled`）——
     // 不挂 server、不注入 inputs（延到 [`enable_plugin`]）；skills 注册后立即 orphan（不进 `get_skills`）。
@@ -736,6 +756,7 @@ pub async fn uninstall_plugin(
     registry: &mut SkillRegistry,
     home: &Path,
     options: UninstallOptions<'_>,
+    non_plugin_bundle_ids: &HashSet<BundleId>,
     hooks: Option<&dyn McpInstallHooks>,
 ) -> Result<bool, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
@@ -786,12 +807,17 @@ pub async fn uninstall_plugin(
         return Ok(false);
     }
 
-    let mut bundled: Vec<String> = Vec::new();
+    // 停摘自足：依赖名单在账本记录移除**之前**取得，且仅依赖账本自身字段（`safe_rmtree` 已删 installPath 树）。
+    let mut deps: Vec<BundleId> = Vec::new();
     for rec in &targeted {
         if let Some(ip) = rec.install_path.as_deref().filter(|s| !s.is_empty()) {
             safe_rmtree(Path::new(ip), home);
         }
-        bundled.extend(rec.bundled_mcp_servers.iter().cloned());
+        for id in &rec.mcp_servers {
+            if !deps.contains(id) {
+                deps.push(id.clone());
+            }
+        }
     }
 
     for name in plugin_skill_names(registry, &marketplace, &plugin) {
@@ -800,8 +826,17 @@ pub async fn uninstall_plugin(
 
     if !options.keep_servers {
         if let Some(h) = hooks {
-            for sname in &bundled {
-                h.remove_server(sname).await?;
+            // #139/§4.9.1-2 回收判据：无其他 plugin 依赖 ∧ 非用户声明。用户/宿主自有 server 永不连坐。
+            let other =
+                crate::settings::reconciler::other_plugin_mcp_deps(&installed.account, plugin_id);
+            let mut reclaim = crate::settings::reconciler::reclaimable_mcp_deps(
+                &deps,
+                &other,
+                non_plugin_bundle_ids,
+            );
+            reclaim.sort();
+            for id in &reclaim {
+                h.remove_server(id).await?;
             }
         }
     }
@@ -902,6 +937,7 @@ pub async fn disable_plugin(
     registry: &mut SkillRegistry,
     home: &Path,
     options: DisableOptions<'_>,
+    non_plugin_bundle_ids: &HashSet<BundleId>,
     hooks: Option<&dyn McpInstallHooks>,
 ) -> Result<bool, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
@@ -910,12 +946,18 @@ pub async fn disable_plugin(
     // skill orphan 幂等、仍无条件执行（不因 no-op 而漏兜底），仅**配置内容**变化由 `changed` 表达上抛。
     let changed = write_enabled_plugin(plugin_id, false, scope, options.project_path, options.env)?;
     if let Some(h) = hooks {
-        let mut names: Vec<String> = bundled_servers_of(home, plugin_id, options.env)
+        // #139/§4.9.1-2 回收判据：只停摘无其他 plugin 依赖 ∧ 非用户声明者（用户/宿主自有 server 永不连坐）。
+        let deps: Vec<BundleId> = bundled_servers_of(home, plugin_id, options.env)
             .into_iter()
             .collect();
-        names.sort();
-        for sname in names {
-            h.remove_server(&sname).await?;
+        let installed = load_installed_plugins(Some(home), options.env);
+        let other =
+            crate::settings::reconciler::other_plugin_mcp_deps(&installed.account, plugin_id);
+        let mut reclaim =
+            crate::settings::reconciler::reclaimable_mcp_deps(&deps, &other, non_plugin_bundle_ids);
+        reclaim.sort();
+        for id in &reclaim {
+            h.remove_server(id).await?;
         }
     }
     for name in plugin_skill_names(registry, &marketplace, &plugin) {
@@ -970,11 +1012,10 @@ pub async fn enable_plugin(
             servers.extend(load_bundled_servers(Path::new(ip))?);
         }
     }
-    let owned = bundled_servers_of(home, plugin_id, env);
     let existing = hooks
-        .map(McpInstallHooks::existing_server_names)
+        .map(McpInstallHooks::existing_servers)
         .unwrap_or_default();
-    conflict_check(&servers, &existing, &owned)?;
+    conflict_check(&servers, &existing, plugin_id)?;
 
     // ② 写 enabledPlugins[id]=true（冲突预检通过后）。`changed`＝真的从非-true→true（#115 R1）；
     //    幂等 re-enable（已 true）→ false。skill 复活 / server 重挂幂等、仍无条件跑（半态修复），仅
@@ -1004,13 +1045,15 @@ pub async fn enable_plugin(
     //    半态——Sub-B 的 boot 恢复会据此复活半装 plugin。失败 → 摘除本次已挂 server + 重新 orphan 本 plugin
     //    skills + 回写 `enabledPlugins=false`（确定性禁用末态，优于精确还原前值：无论前值如何，失败即落定禁用）。
     if let Some(h) = hooks {
-        let mut remounted: Vec<String> = Vec::new();
+        // #139：回滚按 **bundle_id** 寻址——挂前取身份（cfg 随后 move 入 register_server）。同 plugin 内两个
+        // 同名、显式异 bundle_id 的 server，回滚时精确摘本次已挂那条，不再字典序最小误摘（消解回滚破原子性）。
+        let mut remounted: Vec<BundleId> = Vec::new();
         for cfg in servers {
-            let sname = cfg.name().to_string();
+            let bid = resolve_bundle_id(&cfg);
             if let Err(e) = h.register_server(cfg).await {
                 for done in &remounted {
                     if let Err(re) = h.remove_server(done).await {
-                        tracing::warn!(server = %done, error = %re, "enable rollback: remove_server failed");
+                        tracing::warn!(bundle_id = %done.as_str(), error = %re, "enable rollback: remove_server failed");
                     }
                 }
                 for name in plugin_skill_names(registry, &marketplace, &plugin) {
@@ -1027,7 +1070,7 @@ pub async fn enable_plugin(
                 }
                 return Err(e.into());
             }
-            remounted.push(sname);
+            remounted.push(bid);
         }
     }
     tracing::info!(
@@ -1051,6 +1094,62 @@ pub async fn enable_plugin(
 /// # Errors
 /// 意图 / settings 写失败（锁 / I/O）→ [`PluginInstallError`]。逐记录的 enabledPlugins 写为 best-effort（非法
 /// scope 等仅 WARN 跳过、不中断整体迁移）。
+/// #139 迁移：检测并**丢弃**旧格式 `bundledMcpServers`（display-name 数组）/ discard the legacy name array。
+///
+/// 账本字段 `bundledMcpServers`（`Vec<String>` 名）已换为 `mcpServers`（`Vec<BundleId>`，F1 纯 bundle_id 数组）。
+/// 旧键会被 [`InstalledPluginRecord`] 的 `#[serde(flatten)] extra` **静默吸收、并在下次写盘时原样回写**——本函数
+/// 显式丢弃之，避免过期的 name 数组永久寄生。
+///
+/// **MUST NOT 写 name→bundle_id 映射**（那正是本 Epic 在拆的 name-join；依据协议 §4.9「删除它无损」）：丢弃后由
+/// [`rematerialize_missing_ledger_records`](super::recovery::rematerialize_missing_ledger_records) 从
+/// `installedPlugins` **意图**重建。旧名可能根本不是合法 `BundleId`（含 `.`/CJK/`__`），映射亦不可能可靠。
+///
+/// 每条被丢弃的记录发一条 WARN（静默丢弃盘上数据会让人措手不及）。返回被丢弃的记录数（幂等：再跑返回 0）。
+///
+/// **协议 §4.9.1-4：检测到旧格式 MUST 整条丢弃**（**非**仅剥 `bundledMcpServers` 键）。若只剥键、保留
+/// `installPath`，[`rematerialize_missing_ledger_records`](super::recovery::rematerialize_missing_ledger_records)
+/// 会因「派生缓存健在」（installPath 非空）**跳过**该记录，`mcpServers` 永空 ⇒ 此后 uninstall/disable/gc 的
+/// teardown reclaim 恒空、已挂 bundled server **永不停摘（泄漏至进程重启）**。整条丢弃后，reconcile 对启用
+/// plugin 从 `installedPlugins` 意图重物化派生缓存（含正确的 `mcpServers` bundle_id）。与 python
+/// `store.py::_drop_legacy_mcp_dep_records` 逐字同构（判据取「**含** `bundledMcpServers` 键」）。
+pub fn discard_legacy_bundled_mcp_servers(home: &Path, env: Option<&EnvMap>) -> usize {
+    const LEGACY_KEY: &str = "bundledMcpServers";
+    let installed = load_installed_plugins(Some(home), env);
+    let stale: Vec<(String, Value)> = installed
+        .account
+        .plugins
+        .iter()
+        .flat_map(|(pid, recs)| {
+            recs.iter()
+                .filter_map(move |r| r.extra.get(LEGACY_KEY).map(|v| (pid.clone(), v.clone())))
+        })
+        .collect();
+    if stale.is_empty() {
+        return 0;
+    }
+    for (pid, v) in &stale {
+        tracing::warn!(
+            plugin = %pid, discarded = %v,
+            "#139 migration: discarding legacy 'bundledMcpServers' ledger record (display-name array); the ledger \
+             now stores 'mcpServers' as bundle_ids. No name→bundle_id mapping is performed by design — the whole \
+             record is dropped and rebuilt from the installedPlugins intent (§4.9.1-4)."
+        );
+    }
+    let n = stale.len();
+    let _ = update_installed_plugins(
+        move |data: &mut InstalledPluginsFile| {
+            // 整条丢弃含旧键的记录；丢空的 pid 整个移除 ⇒ rematerialize 判「账本缺记录」→ 从意图重建。
+            data.account.plugins.retain(|_pid, recs| {
+                recs.retain(|r| !r.extra.contains_key(LEGACY_KEY));
+                !recs.is_empty()
+            });
+        },
+        Some(home),
+        env,
+    );
+    n
+}
+
 pub fn migrate_ledger_to_intent_once(
     home: &Path,
     env: Option<&EnvMap>,
@@ -1147,14 +1246,18 @@ mod tests {
             }))
             .unwrap(),
         ];
-        let existing: HashSet<String> = std::iter::once("dup".to_string()).collect();
-        // 外来同名 → 硬抛。
-        assert!(conflict_check(&servers, &existing, &HashSet::new()).is_err());
-        // 自有同名 → 幂等放行。
-        let owned: HashSet<String> = std::iter::once("dup".to_string()).collect();
-        assert!(conflict_check(&servers, &existing, &owned).is_ok());
-        // 不存在 → 放行。
-        assert!(conflict_check(&servers, &HashSet::new(), &HashSet::new()).is_ok());
+        // #139：conflict_check 契约变更——`existing` 命中不再是冲突，而是「依赖已满足」（仅诊断、放行）；
+        // 唯一保留的硬门 = 同一 plugin manifest 内两 server 塌成同一 bundle_id（身份坍缩）。
+        let bid = resolve_bundle_id(&servers[0]);
+        // 本地已有同 bundle_id（依赖已满足）→ 放行（推翻旧「外来同名硬抛」）。
+        let existing: HashMap<BundleId, ServerName> =
+            std::iter::once((bid.clone(), "dup".to_string())).collect();
+        assert!(conflict_check(&servers, &existing, "audit@acme").is_ok());
+        // 本地无该 bundle_id → 放行。
+        assert!(conflict_check(&servers, &HashMap::new(), "audit@acme").is_ok());
+        // 同一 manifest 内两 server 塌成同一 bundle_id → 硬抛（唯一保留硬门）。
+        let collided = vec![servers[0].clone(), servers[0].clone()];
+        assert!(conflict_check(&collided, &HashMap::new(), "audit@acme").is_err());
     }
 
     // ---- 集成：fake catalog 构造 / integration fixtures ---------------------
@@ -1296,8 +1399,11 @@ mod tests {
     }
     #[async_trait]
     impl McpInstallHooks for RecordingHooks {
-        fn existing_server_names(&self) -> HashSet<String> {
-            self.existing.clone()
+        fn existing_servers(&self) -> HashMap<BundleId, ServerName> {
+            self.existing
+                .iter()
+                .filter_map(|n| BundleId::try_from(n.clone()).ok().map(|b| (b, n.clone())))
+                .collect()
         }
         async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError> {
             if self.fail_register.as_deref() == Some(cfg.name()) {
@@ -1306,8 +1412,8 @@ mod tests {
             self.registered.lock().unwrap().push(cfg.name().to_string());
             Ok(())
         }
-        async fn remove_server(&self, name: &str) -> Result<(), McpHookError> {
-            self.removed.lock().unwrap().push(name.to_string());
+        async fn remove_server(&self, id: &BundleId) -> Result<(), McpHookError> {
+            self.removed.lock().unwrap().push(id.as_str().to_string());
             Ok(())
         }
     }
@@ -1370,7 +1476,10 @@ mod tests {
             "install config-first 写 installedPlugins 意图"
         );
         // 账本记录（派生缓存）：scope/installPath/bundledMcpServers/installedAt。
-        assert_eq!(record.bundled_mcp_servers, vec!["audit-mcp".to_string()]);
+        assert_eq!(
+            record.mcp_servers,
+            vec![BundleId::try_from("audit-mcp".to_string()).unwrap()]
+        );
         assert!(record.install_path.is_some());
         assert_eq!(
             record.extra.get("scope").and_then(Value::as_str),
@@ -1437,14 +1546,19 @@ mod tests {
         assert_eq!(enabled_flag(&env, "audit@acme"), Some(true));
     }
 
+    /// #139/D3 **心智转变**（推翻旧「外来同名硬抛」）：plugin ↔ MCP server 是**依赖关系**、非所有关系。
+    /// 同 `bundle_id` 本地已有 =「**依赖已满足**」⇒ **不阻止安装**、仅诊断提示、交 reconcile。
+    /// 依据：协议 §身份正交性——name 允许碰撞、永不做键；旧硬门把「撞名」误判为「冲突」。
+    ///
+    /// （原测 `install_foreign_name_conflict_is_hard_fail_zero_change` 断言的正是被本 Issue 废止的契约。）
     #[tokio::test]
-    async fn install_foreign_name_conflict_is_hard_fail_zero_change() {
+    async fn install_with_existing_same_bundle_id_is_dependency_satisfied_139() {
         let tmp = TempDir::new().unwrap();
         let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
         let mut reg = SkillRegistry::new();
-        // existing 含 audit-mcp 且非自有 → 冲突硬抛。
+        // existing 已有同 bundle_id 的 audit-mcp（非本 plugin 带入）→ 依赖已满足，**不再**硬抛。
         let hooks = RecordingHooks::new().with_existing(&["audit-mcp"]);
-        let err = install_plugin(
+        let res = install_plugin(
             "audit@acme",
             &mut reg,
             &home,
@@ -1454,13 +1568,96 @@ mod tests {
             },
             Some(&hooks),
         )
-        .await
+        .await;
+        assert!(
+            res.is_ok(),
+            "同 bundle_id 本地已有 = 依赖已满足，MUST NOT 阻止安装（D3）：{res:?}"
+        );
+        // 装成即落账本（v0.3.0：install 物化但不激活——不挂 server、不注入 inputs）。
+        assert!(!ledger_records(&home, &env, "audit@acme").is_empty());
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "install 不激活：不挂 server（延到 enable）"
+        );
+    }
+
+    /// #139：**唯一保留的硬门**——同一 plugin manifest 内两 server 归一**同 bundle_id**（身份坍缩，
+    /// 不可自动消歧，须显式设不同 `bundleId`）。与「同 bundle_id 本地已有 → 放行」正交。
+    #[test]
+    fn conflict_check_hard_fails_on_intra_manifest_bundle_id_collapse_139() {
+        let mk = |name: &str, bid: &str| -> MCPServerConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "stdio",
+                "name": name,
+                "bundle_id": bid,
+                "server_parameters": {"command": "c"},
+            }))
+            .unwrap()
+        };
+        // 两条显式同 bundle_id → 身份坍缩 → fail-fast。
+        let err = conflict_check(
+            &[mk("alpha", "same"), mk("beta", "same")],
+            &HashMap::new(),
+            "p@mp",
+        )
         .unwrap_err();
-        assert!(matches!(err, PluginInstallError::Conflict(_)));
-        // 零变更：未注册 server、未注册 skill、未写账本。
-        assert!(hooks.registered.lock().unwrap().is_empty());
-        assert!(reg.resolve("audit:code-review").is_none());
-        assert!(ledger_records(&home, &env, "audit@acme").is_empty());
+        assert!(
+            err.0.contains("same bundle_id"),
+            "身份坍缩 MUST fail-fast，实际: {}",
+            err.0
+        );
+        // 反面：同 display 名、**异** bundle_id → 合法共存（name 非身份），MUST NOT 报错。
+        assert!(
+            conflict_check(
+                &[mk("dup", "id-a"), mk("dup", "id-b")],
+                &HashMap::new(),
+                "p@mp"
+            )
+            .is_ok(),
+            "同名异 bundle_id 是合法共存，不得误判冲突"
+        );
+    }
+
+    /// #139/§4.9.1-4 迁移：旧格式记录（含 `bundledMcpServers` 键 + 非空 installPath）MUST **整条丢弃**
+    /// （非仅剥键）——否则 `rematerialize_missing_ledger_records` 因「派生缓存健在」跳过、`mcpServers` 永空、
+    /// teardown reclaim 永久失效。整条丢弃后 rematerialize 判「账本缺记录」→ 从意图重建。幂等。
+    #[tokio::test]
+    async fn discard_legacy_drops_whole_record_not_just_key_139() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let env = EnvMap::new();
+        // seed 旧格式记录：installPath 非空 + extra 含 bundledMcpServers（name 数组）。
+        update_installed_plugins(
+            |data| {
+                let mut extra = Map::new();
+                extra.insert("scope".into(), serde_json::json!("user"));
+                extra.insert(
+                    "bundledMcpServers".into(),
+                    serde_json::json!(["Legacy.Name", "another"]),
+                );
+                data.account.plugins.insert(
+                    "audit@acme".into(),
+                    vec![InstalledPluginRecord {
+                        install_path: Some("/p".into()),
+                        mcp_servers: vec![],
+                        extra,
+                    }],
+                );
+            },
+            Some(home),
+            Some(&env),
+        )
+        .unwrap();
+
+        let n = discard_legacy_bundled_mcp_servers(home, Some(&env));
+        assert_eq!(n, 1, "命中一条旧格式记录");
+        let after = load_installed_plugins(Some(home), Some(&env)).account;
+        assert!(
+            after.plugins.get("audit@acme").is_none(),
+            "含旧键的记录 MUST 整条丢弃（pid 移除）——仅剥键会让 rematerialize 跳过、mcpServers 永空"
+        );
+        // 幂等：无旧键 → 0。
+        assert_eq!(discard_legacy_bundled_mcp_servers(home, Some(&env)), 0);
     }
 
     // 注：v0.3.0 起 install **不**挂 server（延到 enable），故原 `install_rollback_on_register_failure` 已移除；
@@ -1516,6 +1713,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             Some(&hooks),
         )
         .await
@@ -1548,6 +1746,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             None,
         )
         .await
@@ -1582,6 +1781,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             Some(&hooks),
         )
         .await
@@ -1646,6 +1846,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             Some(&hooks),
         )
         .await
@@ -1741,6 +1942,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             Some(&hooks),
         )
         .await
@@ -1805,6 +2007,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             Some(&hooks),
         )
         .await
@@ -1866,7 +2069,7 @@ mod tests {
                     pid,
                     vec![InstalledPluginRecord {
                         install_path: None,
-                        bundled_mcp_servers: Vec::new(),
+                        mcp_servers: Vec::new(),
                         extra,
                     }],
                 );
@@ -1989,6 +2192,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             None,
         )
         .await
@@ -2010,6 +2214,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
+            &HashSet::new(),
             None,
         )
         .await

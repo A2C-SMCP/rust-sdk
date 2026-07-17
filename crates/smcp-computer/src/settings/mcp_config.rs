@@ -1204,7 +1204,10 @@ mod tests {
                     "audit@acme".to_string(),
                     vec![crate::settings::reconciler::InstalledPluginRecord {
                         install_path: Some("/x".to_string()),
-                        bundled_mcp_servers: vec!["audit-mcp".to_string()],
+                        mcp_servers: vec![crate::mcp_clients::model::BundleId::try_from(
+                            "audit-mcp".to_string(),
+                        )
+                        .unwrap()],
                         extra: Map::new(),
                     }],
                 );
@@ -1239,7 +1242,7 @@ mod tests {
                 .plugins
                 .values()
                 .flatten()
-                .any(|r| r.bundled_mcp_servers.iter().any(|n| n == "audit-mcp")),
+                .any(|r| r.mcp_servers.iter().any(|n| n.as_str() == "audit-mcp")),
             "账本应含 bundled 名 audit-mcp（借名前提）"
         );
 

@@ -492,8 +492,15 @@ pub(crate) fn resolve_governance_snapshot(
         let mut degraded = false;
 
         let install_path = record.and_then(|r| r.install_path.clone());
+        // #139：ledger 现存 bundle_id（身份键）。governance 展示面沿用 `Vec<String>` 承载 bundle_id 字面量，
+        // 与下方 `materialized_mcp_servers` overlay（亦 bundle_id 域）求交集。
         let bundled_mcp_servers = record
-            .map(|r| r.bundled_mcp_servers.clone())
+            .map(|r| {
+                r.mcp_servers
+                    .iter()
+                    .map(|b| b.as_str().to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let install_scope = record.and_then(|r| extra_str(&r.extra, "scope"));
         let version = resolve_installed_version(record, install_path.as_deref());
@@ -922,7 +929,7 @@ mod tests {
         extra.insert("version".to_string(), json!(version));
         InstalledPluginRecord {
             install_path: install.map(|p| p.to_string_lossy().into_owned()),
-            bundled_mcp_servers: vec![],
+            mcp_servers: vec![],
             extra,
         }
     }
