@@ -888,12 +888,26 @@ mod tests {
 
     /// 造一个含单个 bundled server 文件的 plugin 根 / a plugin root with one bundled server file。
     fn plugin_root_with_server(root: &Path, server_name: &str) -> PathBuf {
+        plugin_root_with_server_bid(root, server_name, None)
+    }
+
+    /// 同上，但可注入**显式** `bundle_id`（#142 / R5②）——令 display 名与身份**可控地分叉**。
+    ///
+    /// 缺省（`None`）走 `derive_bundle_id` ⇒ `bundle_id == normalize_name(name)`：同 display 名必同 id，
+    /// 于是「按 name 去重」与「按 bundle_id 去重」两种实现在该夹具下**双双通过**（零鉴别力）。要让去重键
+    /// 的语义真正可被断言分辨，必须至少一方**显式声明** `bundle_id`（conformance §2.0-2）。
+    fn plugin_root_with_server_bid(
+        root: &Path,
+        server_name: &str,
+        bundle_id: Option<&str>,
+    ) -> PathBuf {
         let sd = root.join("mcp-servers");
         fs::create_dir_all(&sd).unwrap();
+        let bid_field = bundle_id.map_or_else(String::new, |b| format!(r#","bundle_id":"{b}""#));
         fs::write(
             sd.join(format!("{server_name}.json")),
             format!(
-                r#"{{"type":"stdio","name":"{server_name}","server_parameters":{{"command":"node"}}}}"#
+                r#"{{"type":"stdio","name":"{server_name}"{bid_field},"server_parameters":{{"command":"node"}}}}"#
             ),
         )
         .unwrap();
@@ -1008,9 +1022,15 @@ mod tests {
         );
     }
 
-    // ---- 🟡8e：跨 plugin 同名 bundled server 去重（首见保留）------------------------
+    // ---- 🟡8e：跨 plugin **同 bundle_id** 的 bundled server 去重（首见保留）------------------------
+    /// 两 plugin 声明同 display 名且**均走缺省派生** ⇒ 同 `bundle_id` ⇒ no-double-open 去重为一条。
+    ///
+    /// **#142 命名订正**：原名 `collect_dedups_same_named_servers_across_plugins` 描述的是 **name-keyed**
+    /// 语义，与生产实现（`seen: HashSet<BundleId>` + `resolve_bundle_id`）正好相反。此夹具下 name 与
+    /// bundle_id 恰好重合，两种键法都过——它守的其实是「同 **id** ⇒ 去重」，故按 id 更名。真正能分辨去重键
+    /// 的用例是下面的 `collect_keeps_same_name_distinct_bundle_id`。
     #[tokio::test]
-    async fn collect_dedups_same_named_servers_across_plugins() {
+    async fn collect_dedups_same_bundle_id_servers_across_plugins() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -1022,7 +1042,57 @@ mod tests {
         let servers =
             collect_enabled_bundled_servers(&home, None, &declared_enabled(&["a@acme", "b@acme"]));
         let names: Vec<&str> = servers.iter().map(|r| r.config.name()).collect();
-        assert_eq!(names, vec!["shared-mcp"], "同名 server 跨 plugin 去重");
+        assert_eq!(
+            names,
+            vec!["shared-mcp"],
+            "同 bundle_id server 跨 plugin 去重"
+        );
+    }
+
+    // ---- #142 / R5②：跨 plugin 同 display 名 + **显式异 bundle_id** → 两条各自保留 --------------
+    /// 去重键是 **bundle_id（身份）而非 display name**：同 display 名但显式异 `bundle_id` 是两个**不同身份**
+    /// 的 server，MUST 各自保留（协议 data-structures.md §BundleID no-double-open 同键）。
+    ///
+    /// English: same display name but explicitly distinct bundle_id ⇒ both kept (dedup key is bundle_id, not name).
+    ///
+    /// **本用例是「假绿」修复的核心**：上面那条同名用例走缺省派生 ⇒ 同名必同 id ⇒ 无论按 name 还是按
+    /// bundle_id 去重都通过，对真实契约零覆盖。此处显式注入异 `bundle_id` 令两识别空间分叉，去重键一旦
+    /// 退回 `config.name()` 本用例即红（变异验证已实测）。
+    ///
+    /// 双端对拍：python-sdk `test_collect_keeps_same_name_distinct_bundle_id`（`2fc8428`）逐条同构。
+    /// 注：python 侧此用例曾是**真红灯**（其 `collect_enabled_bundled_servers` 当时按 `config.name` 去重，
+    /// 随该提交一并根治）；rust 侧生产实现自 #117 起即按 `resolve_bundle_id` 去重，故本用例是**回归栅栏**。
+    #[tokio::test]
+    async fn collect_keeps_same_name_distinct_bundle_id() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        // 同 display 名 "shared"，两 plugin 根不同 ⇒ 文件名不碰撞；显式异 bundle_id ⇒ 两个不同身份的 server。
+        let a = plugin_root_with_server_bid(&tmp.path().join("a"), "shared", Some("shared-a"));
+        let b = plugin_root_with_server_bid(&tmp.path().join("b"), "shared", Some("shared-b"));
+        seed_install_record(&home, "a@acme", Some(&a));
+        seed_install_record(&home, "b@acme", Some(&b));
+
+        let servers =
+            collect_enabled_bundled_servers(&home, None, &declared_enabled(&["a@acme", "b@acme"]));
+
+        assert_eq!(
+            servers.len(),
+            2,
+            "同 display 名 + 异 bundle_id MUST 各自保留（去重键 = 身份，非 name）"
+        );
+        let bids: HashSet<String> = servers
+            .iter()
+            .map(|r| resolve_bundle_id(&r.config).into_string())
+            .collect();
+        assert_eq!(
+            bids,
+            ["shared-a".to_string(), "shared-b".to_string()]
+                .into_iter()
+                .collect::<HashSet<String>>()
+        );
+        // display 名碰撞合法、非身份——两条的 name 本就该相同。
+        assert!(servers.iter().all(|r| r.config.name() == "shared"));
     }
 
     // ---- 🟡8f：单 marketplace 下多 plugin 分组恢复 --------------------------------

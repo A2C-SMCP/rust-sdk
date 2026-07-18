@@ -411,18 +411,31 @@ async fn test_inputs_type_compatibility() {
     assert!(matches!(request.input_type, InputType::String { .. }));
 }
 
+/// auto_reconnect 语义与 Python 一致（配置热更新）。
+///
+/// **#142 / R5① 夹具取值分叉**：display 名取 `"auto.reconnect (display)"`，其 `normalize_name` 派生的
+/// bundle_id 为 `auto_reconnect_display` —— 二者**取值分叉**（conformance §2.0-1）。原夹具名 `"test"` 规范化后
+/// 逐字等于自身 bundle_id，name 与身份恰好重合，把身份裂缝整个盖住。
+///
+/// **#142 修假绿**：原断言 `status.iter().find(|(_, name, _, _)| name == "test")` 把 `.0`（bundle_id、唯一身份键）
+/// 丢进 `_`，只按 display 名断言存在性 —— **bundle_id 全线错乱此测试照样绿**，且重新引入了 #127 已铲除的
+/// 「按 name 去 join 身份」形态（同名 server 在那张映射里折叠 ⇒ 用户 `server rm <bundle_id>` 删错对象）。
+/// 现改为断言落在 **bundle_id 维度**，并同时钉住 display 名不被身份键顶替（两识别空间分账）。
 #[tokio::test]
 async fn test_auto_reconnect_semantics() {
-    // 测试auto_reconnect语义与Python一致（配置热更新）
     use smcp_computer::mcp_clients::{
         MCPServerConfig, MCPServerManager, StdioServerConfig, StdioServerParameters,
     };
+
+    // R5①：display 名 ≠ bundle_id（`.`/空格/括号 → `_`，折叠连续 `_`，裁首尾）。
+    const DISPLAY_NAME: &str = "auto.reconnect (display)";
+    const EXPECTED_BID: &str = "auto_reconnect_display";
 
     let manager = MCPServerManager::new();
 
     // 创建初始配置
     let config1 = StdioServerConfig::new(
-        "test",
+        DISPLAY_NAME,
         StdioServerParameters {
             command: "echo".to_string(),
             args: vec!["v1".to_string()],
@@ -447,8 +460,45 @@ async fn test_auto_reconnect_semantics() {
         .await;
     assert!(result.is_ok());
 
-    // 验证配置已更新（通过get_server_status间接验证）
+    // 验证配置已更新（通过 get_server_status 间接验证）。
     let status = manager.get_server_status().await;
-    let test_server = status.iter().find(|(_, name, _, _)| name == "test");
-    assert!(test_server.is_some());
+
+    // ① 热更新是**替换**而非新增：注册表恒只此一条（若 add_or_update 误按另一键插入，此处为 2）。
+    //    `args` 本身不在任何公开 API 的投影面上（`get_server_configs` 只出 name/type/status/is_active/
+    //    disabled），故以「不重复」钉住 update-in-place 语义。
+    //
+    //    ⚠️ **诚实标注遗留缺口**（不在 #142 范围内，另行跟踪）：本测试名为 `auto_reconnect_semantics`，但
+    //    `auto_reconnect` 分支（`manager.rs:263-275`）在此**从未被执行**——`MCPServerManager::new()` 默认
+    //    `auto_connect=false`（`manager.rs:121`）、`initialize` 也不启动客户端 ⇒ `add_or_update_server` 里
+    //    `is_active` 恒 false，热更新走的是「未激活直接改配置」那条路。要真正覆盖需先 `start_all()` 起真实
+    //    客户端再更新，并补 `auto_reconnect=false` 的负例。#142 只负责修「身份维度被丢弃」这处假绿，
+    //    不顺手扩这条测试的主题范围。
+    assert_eq!(
+        status.len(),
+        1,
+        "热更新 MUST 替换同一 bundle_id 的既有条目，而非新增一条"
+    );
+
+    // ② 身份维度断言（#142 修假绿的核心）：按 **bundle_id** 寻址，不再按 display 名 join。
+    let (bundle_id, name, _, _) = &status[0];
+    assert_eq!(
+        bundle_id.as_str(),
+        EXPECTED_BID,
+        "身份键 MUST 是派生 bundle_id（`.0`），非 display 名"
+    );
+
+    // ③ 两识别空间分账：display 名原样保留、MUST NOT 被身份键顶替（python#166 在其 REPL 上正是此病）。
+    assert_eq!(
+        name, DISPLAY_NAME,
+        "display 名 MUST 原样保留（人看的那一半）"
+    );
+    // 夹具分叉自检：钉到**真实派生函数**（比较两个运行期取回的值本身不足以守住派生算法漂移）。
+    assert_eq!(
+        smcp_computer::mcp_clients::bundle_id::derive_bundle_id(&MCPServerConfig::Stdio(
+            config2.clone()
+        ))
+        .as_str(),
+        EXPECTED_BID,
+        "EXPECTED_BID 须是 DISPLAY_NAME 的真实派生值（conformance §2.0-1 取值分叉由此自动蕴含）"
+    );
 }

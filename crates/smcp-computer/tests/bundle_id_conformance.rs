@@ -88,11 +88,32 @@ fn build_config(name: &str, cfg: &serde_json::Value) -> MCPServerConfig {
 #[test]
 fn bundle_id_conformance_vectors_pass() {
     let doc: serde_json::Value = serde_json::from_str(VECTORS).expect("valid vectors JSON");
+
+    // ---- 夹具完整性门禁（#142）-------------------------------------------------------------
+    // 本文件的 `VECTORS` 是协议仓 `docs/specification/fixtures/bundle_id_conformance_vectors.json` 的
+    // **vendored 逐字节副本**（`include_str!` 编译期嵌入），同步靠人手 `git show` —— 没有任何构建期校验。
+    // 原先只有一句宽松的 `>= 16`、且从不读 `algorithm` 块 ⇒ **副本被截断或漂移在 rust 侧无人察觉**
+    // （少几条向量照样绿）。姊妹文件 `env_segment_conformance.rs` 早已有这层门禁，此处照其形态补齐。
+    let algo = &doc["algorithm"];
+    for key in [
+        "normalize",
+        "fallback",
+        "input_state",
+        "connection_identity_tlv",
+        "explicit",
+    ] {
+        assert!(
+            algo.get(key).and_then(serde_json::Value::as_str).is_some(),
+            "algorithm.{key} 须在（vendored 副本疑被截断/漂移，请从协议仓重新同步）"
+        );
+    }
+
     let vectors = doc["vectors"].as_array().expect("vectors array");
-    assert!(
-        vectors.len() >= 16,
-        "向量应覆盖全部分叉点（含 raw 占位 2 条），实得 {}",
-        vectors.len()
+    // 精确条数（非 `>=`）：协议仓新增向量时此处 MUST 同步失败，逼出一次显式的重新同步。
+    assert_eq!(
+        vectors.len(),
+        16,
+        "16 条向量（PR #16 首 14 条 + #17 raw 决策 2 条 `${{input:*}}`）；条数变化即副本与协议仓漂移"
     );
 
     let mut checked = 0usize;
