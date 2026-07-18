@@ -31,14 +31,19 @@
 //! **刻意不实现 `Borrow<str>`**：否则 `HashMap<BundleId, _>::get(&str)` 仍编译，用 display 名查身份键表
 //! 这一**核心混用点**会继续静默通过——那正是本 newtype 要消灭的东西。代价是查表需显式转换，值得。
 //!
-//! # ⚠️ 本轮关掉的是**查表面**，不是全部（勿高估保证）
+//! # 收口进度（#130 → #141）
 //!
-//! [`PartialEq<&str>`] 仍在（见其实现处的理由：pub API 暂收 `&str`，rust-sdk#130 的"紧边界"）⇒
-//! **name-join 式比较**（`resolve_bundle_id(&cfg) == some_display_name`）**依然编译通过**。而 #126/#127 的
-//! 真实 bug 恰是 name-join 比较（`bundled.contains(name)`、按 display 名关联归属），不是 map 查表。
+//! #130 先关掉**查表面**（无 `Borrow<str>`），但当时保留了 `PartialEq<str>`/`PartialEq<&str>`——因为公开 API
+//! 尚收 `&str`（那一轮的"紧边界"）⇒ **name-join 式比较**（`resolve_bundle_id(&cfg) == some_display_name`）
+//! 仍编译通过，而 #126/#127 的真实 bug 恰是 name-join 比较，不是 map 查表。
 //!
-//! 即：本轮令「用 name **查身份键表**」编译红；「用 name **与身份比较**」仍需人眼。后者随 **#141**（库层
-//! 公开 API 一律收 `BundleId`）移除 `PartialEq<&str>` 后收口。
+//! **#141 已收口**：库层公开 API 一律收 [`BundleId`]，两个 `PartialEq` 实现随之**删除**。现在「用 name 查
+//! 身份键表」与「用 name 与身份比较」**都是编译红**；需与字符串比较请显式 `.as_str() == s` 或
+//! `BundleId::try_from(s)? == id`，令意图在类型层显形。
+//!
+//! ⚠️ 仍**不**保证的：display 名与 bundle_id 的**取值空间大面积重叠**（缺省派生下 `bundle_id ==
+//! normalize_name(name)`），故「用户敲的字符串该当 name 还是 id」是**运行期**判别问题，类型层拦不住——
+//! 那条缝由人机面的 `resolve_target`（协议 §5.1 步骤序）而非本 newtype 负责。
 
 /// 判定字符是否属 BundleID 字符集 `[A-Za-z0-9_-]`（**显式 ASCII 类**，非 Unicode-aware `\w`）。
 ///
@@ -213,18 +218,9 @@ impl std::fmt::Display for BundleId {
     }
 }
 
-/// 与 `&str` 直接比较（免 `.as_str()` 噪声；**只**放开比较，不放开查表）/ compare against `&str`。
-impl PartialEq<str> for BundleId {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl PartialEq<&str> for BundleId {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
+// #141/R4：`PartialEq<str>` / `PartialEq<&str>` **已移除**——库层公开 API 一律收 `BundleId`，name-join 的
+// "紧边界"（rust-sdk#130）收口。需与字符串比较请显式 `.as_str() == s` 或 `BundleId::try_from(s)? == id`，
+// 令「拿字符串当身份键」在类型层显形、不再隐式。
 
 #[cfg(test)]
 mod tests {
@@ -335,7 +331,8 @@ mod tests {
             serde_json::from_str::<Holder>(r#"{"bundle_id":"ok_1"}"#)
                 .unwrap()
                 .bundle_id
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "ok_1"
         );
     }

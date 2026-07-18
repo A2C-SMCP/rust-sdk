@@ -2,7 +2,7 @@ use smcp_computer::{
     computer::{Computer, Session, SilentSession},
     errors::ComputerError,
     mcp_clients::model::{
-        MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
+        BundleId, MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
         StdioServerParameters,
     },
 };
@@ -313,7 +313,10 @@ async fn test_computer_multiple_servers() {
         .unwrap();
 
     // 移除一个服务器 / Remove one server
-    computer.remove_server("server2").await.unwrap();
+    computer
+        .remove_server(&BundleId::try_from("server2".to_string()).unwrap())
+        .await
+        .unwrap();
 
     computer.shutdown().await.unwrap();
 }
@@ -339,7 +342,9 @@ async fn test_computer_error_handling() {
     computer.boot_up().await.unwrap();
 
     // 尝试移除不存在的服务器 / Try to remove non-existent server
-    let result = computer.remove_server("non_existent").await;
+    let result = computer
+        .remove_server(&BundleId::try_from("non_existent".to_string()).unwrap())
+        .await;
     // 应该成功，即使服务器不存在
     // Should succeed even if server doesn't exist
     assert!(result.is_ok());

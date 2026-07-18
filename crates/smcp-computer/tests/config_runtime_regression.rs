@@ -762,7 +762,7 @@ async fn issue121_remove_by_bundle_id_targets_injected_user_scope() {
     computer.boot_up().await.unwrap();
 
     let bid = resolve_bundle_id(&stdio_cmd(probe, "x"));
-    computer.remove_server(bid.as_str()).await.unwrap();
+    computer.remove_server(&bid).await.unwrap();
 
     let disk = read_json(&user_mcp);
     assert!(
@@ -773,8 +773,14 @@ async fn issue121_remove_by_bundle_id_targets_injected_user_scope() {
 
 /// #121 B：CRUD 按 **bundle_id（软件唯一身份）** 寻址，非 name（协议 §身份 MUST 用 bundle_id）。
 ///
-/// 用 name ≠ bundle_id 的 server（`my__server` 折叠 `__` → bundle_id `my_server`）验证：按 name 删是 no-op、
-/// 按 bundle_id 删才真删——消除此前 name 寻址在同名 + 显式 bundle_id 时的非确定性。
+/// 用 name ≠ bundle_id 的 server（`my__server` 折叠 `__` → bundle_id `my_server`）验证：按 bundle_id 删才真删，
+/// 消除此前 name 寻址在同名 + 显式 bundle_id 时的非确定性。
+///
+/// #141：`remove_server` 收 `&BundleId` 后，误传 display 名是**编译红**（类型不符）。本例的 `my__server`
+/// 更进一步——含保留分隔符 `__`，连 `BundleId` 字面量都构造不出。
+///
+/// ⚠️ **勿据此推广**：多数 display 名（如 `everything`）**是**合法 `BundleId` 字面量，类型层拦不住「拼错的
+/// 名字被当 id 用」。那条缝按 R4 有意保留、由**真实回执**兜底（见 `stop_receipt`/`remove_receipt`）。
 #[tokio::test]
 async fn issue121_remove_addresses_by_bundle_id_not_name() {
     let td = TempDir::new().unwrap();
@@ -791,21 +797,29 @@ async fn issue121_remove_addresses_by_bundle_id_not_name() {
         .await
         .unwrap();
     let bid = resolve_bundle_id(&stdio_cmd(name, "echo"));
-    assert_ne!(bid, name, "该名规范化后 bundle_id ≠ name（折叠连续 `_`）");
+    assert_ne!(
+        bid.as_str(),
+        name,
+        "该名规范化后 bundle_id ≠ name（折叠连续 `_`）"
+    );
 
-    // 按 name（非身份键）删 → no-op：声明仍在。
-    computer.remove_server(name).await.unwrap();
+    // 按 name（非身份键）删 → #141 起在**类型层**即不可表达：display 名 `my__server` 含保留分隔符
+    // `__`，连 BundleId 都构造不出 ⇒ 比改型前「运行期 no-op」更强的静态保证（误传 name 是编译红）。
+    assert!(
+        BundleId::try_from(name.to_string()).is_err(),
+        "display 名 MUST NOT 能当身份键用（含保留分隔符 `__`）"
+    );
     assert!(
         load_config(&ConfigContext::new(&cd))
             .mcp
             .servers
             .iter()
             .any(|s| s.name == name),
-        "按 name（非身份键）删应 no-op"
+        "尚未按身份键删 → 声明仍在"
     );
 
     // 按 bundle_id（身份键）删 → 真删。
-    computer.remove_server(bid.as_str()).await.unwrap();
+    computer.remove_server(&bid).await.unwrap();
     assert!(
         !load_config(&ConfigContext::new(&cd))
             .mcp
@@ -860,12 +874,12 @@ impl McpInstallHooks for ExternalGovernanceHooks<'_> {
         if self.fail_teardown {
             return Err(McpHookError("injected teardown failure".into()));
         }
-        // #122 关键行：治理级联停摘走**运行期通道**（不删 config 声明）。#139：本 double 是**集成测试**（独立
-        // crate），够不着 `pub(crate)` 的 `unmount_server_by_id`，故用 `pub` 的 name 寻址 `unmount_server`；本
-        // fixture 的 name==bundle_id 故等价。#141 把 `unmount_server` 本身改 `&BundleId` 后此处自然收敛。
+        // #122 关键行：治理级联停摘走**运行期通道**（不删 config 声明）。#141：`unmount_server` 已合并为
+        // bundle_id 寻址的 `pub` API，直接精确停摘。
         self.comp
-            .unmount_server(id.as_str())
+            .unmount_server(id)
             .await
+            .map(|_| ())
             .map_err(|e| McpHookError(e.to_string()))
     }
 }

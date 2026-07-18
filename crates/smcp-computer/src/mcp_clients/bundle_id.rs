@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn derive_uses_normalized_name_when_nonempty() {
         let c = stdio("My Server", "npx", &["everything"], &[]);
-        assert_eq!(derive_bundle_id(&c), "My_Server");
+        assert_eq!(derive_bundle_id(&c).as_str(), "My_Server");
     }
 
     #[test]
@@ -478,6 +478,6 @@ mod tests {
         );
         c.bundle_id = Some(bid("custom_id"));
         let cfg = MCPServerConfig::Stdio(c);
-        assert_eq!(resolve_bundle_id(&cfg), "custom_id");
+        assert_eq!(resolve_bundle_id(&cfg).as_str(), "custom_id");
     }
 }

@@ -292,11 +292,12 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
 
     async fn remove_server(&self, id: &BundleId) -> Result<(), McpHookError> {
         // #113 S6：治理级联停摘走**运行期卸载**（不删 config 声明）——bundled server 本不在用户 config 层。
-        // #139：按 bundle_id 精确停摘，经 `unmount_server_by_id`（pub(crate)、同 crate 可达）——#141 会把它并入
-        // `unmount_server`；届时此处随之收敛。
+        // #139/#141：按 bundle_id 精确停摘，经合并后的 `unmount_server(&BundleId)`（R4：库层收 bundle_id）。
+        // 治理级联本就幂等（账本条目可能早已不活跃）——`false`（本无实例）不是错误，忽略回执即可。
         self.comp
-            .unmount_server_by_id(id.as_str())
+            .unmount_server(id)
             .await
+            .map(|_| ())
             .map_err(|e| McpHookError(e.to_string()))
     }
 

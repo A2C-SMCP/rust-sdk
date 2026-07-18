@@ -152,7 +152,7 @@ async fn tool_list_update_full_chain_add_rename_remove() {
     );
     computer.boot_up().await.expect("boot");
     computer
-        .start_mcp_client("all")
+        .start_all_mcp_clients()
         .await
         .expect("start mcp client");
     computer

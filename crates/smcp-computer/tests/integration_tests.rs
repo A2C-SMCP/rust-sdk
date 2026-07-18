@@ -12,6 +12,11 @@ use smcp_computer::mcp_clients::*;
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 
+/// 测试夹具：构造合法 [`BundleId`]（#141：库层 API 由 display 名改按身份键寻址）。
+fn bid(s: &str) -> BundleId {
+    BundleId::try_from(s.to_string()).expect("测试夹具的 bundle_id 字面量必须合法")
+}
+
 /// 测试完整的MCP服务器管理工作流 / Test complete MCP server management workflow
 #[tokio::test]
 async fn test_complete_workflow() {
@@ -177,18 +182,24 @@ async fn test_error_handling() {
     let manager = MCPServerManager::new();
 
     // 尝试启动不存在的服务器 / Try to start non-existent server
-    let result = manager.start_client("non_existent").await;
+    let result = manager.start_client_by_id(&bid("non_existent")).await;
     assert!(result.is_err());
 
-    // 尝试停止不存在的服务器 - 应该成功（幂等操作）
-    // Try to stop non-existent server - should succeed (idempotent operation)
-    let result = manager.stop_client("non_existent").await;
-    assert!(result.is_ok());
+    // 停止不存在的服务器：幂等 `Ok` —— 但 #141 起回执必须**如实**说「什么都没停」（`false`），
+    // 否则 CLI 会把拼错的 target 打成 ✅。
+    // Stopping a non-existent server stays idempotent-Ok, but must honestly report `false`.
+    let stopped = manager
+        .stop_client_by_id(&bid("non_existent"))
+        .await
+        .expect("幂等：不存在的 bundle_id 不报错");
+    assert!(!stopped, "本无活跃客户端 ⇒ 回执 MUST 为 false（禁假成功）");
 
-    // 尝试移除不存在的服务器 - 应该成功（幂等操作）
-    // Try to remove non-existent server - should succeed (idempotent operation)
-    let result = manager.remove_server("non_existent").await;
-    assert!(result.is_ok());
+    // 移除不存在的服务器同理。/ Same for remove.
+    let removed = manager
+        .remove_server_by_id(&bid("non_existent"))
+        .await
+        .expect("幂等：不存在的 bundle_id 不报错");
+    assert!(!removed, "本无该声明 ⇒ 回执 MUST 为 false（禁假成功）");
 }
 
 /// 测试并发操作 / Test concurrent operations
@@ -259,7 +270,8 @@ async fn test_concurrent_operations() {
     for i in 0..5 {
         let manager_clone = manager.clone();
         let server_name = format!("calculator_{}", i);
-        let handle = tokio::spawn(async move { manager_clone.start_client(&server_name).await });
+        let handle =
+            tokio::spawn(async move { manager_clone.start_client_by_id(&bid(&server_name)).await });
 
         handles.push(handle);
     }

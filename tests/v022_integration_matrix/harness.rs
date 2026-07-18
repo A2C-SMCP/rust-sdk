@@ -221,7 +221,7 @@ pub async fn spawn_computer(
     // boot_up 仅注册配置（manager auto_connect 默认 false），需显式启动 stdio MCP 子进程，
     // 否则 get_resources/tool_call 命中未连接服务 → 4014。
     computer
-        .start_mcp_client("all")
+        .start_all_mcp_clients()
         .await
         .expect("start MCP servers");
     computer

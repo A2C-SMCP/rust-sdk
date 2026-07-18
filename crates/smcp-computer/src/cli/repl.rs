@@ -74,9 +74,8 @@ impl<S: Session> McpTeardown for ReplTeardown<'_, S> {
     async fn teardown(&self, servers: Vec<crate::mcp_clients::model::BundleId>) {
         for id in servers {
             // #113 S6：gc 停摘 bundled server 走**运行期卸载**（不删 config 声明）——bundled 归属 ledger、非用户 config。
-            // #139：按 **bundle_id** 精确停摘——MUST 走 `unmount_server_by_id`（`unmount_server` 是 name 寻址，
-            // 把 bundle_id 当名传会命中错的 server 或静默 no-op）。#141 会把二者合并，届时此处随之收敛。
-            if let Err(e) = self.comp.unmount_server_by_id(id.as_str()).await {
+            // #139/#141：按 **bundle_id** 精确停摘——经合并后的 `unmount_server(&BundleId)`（R4）。
+            if let Err(e) = self.comp.unmount_server(&id).await {
                 tracing::warn!(bundle_id = %id.as_str(), error = %e, "gc teardown: unmount failed");
             }
         }

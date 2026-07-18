@@ -867,6 +867,19 @@ impl<S: Session> Computer<S> {
     }
 
     // ── INT-01 #68：SKILL Home 解析 / SKILL Home resolution ──────────────────
+    /// 读**已解析**的 SKILL Home，不触发解析/建目录 / read the cached SKILL Home without side effects。
+    ///
+    /// 与 [`ensure_skill_home`](Self::ensure_skill_home) 的区别是**无副作用**：后者会解析并落缓存（且下游
+    /// `skill_home()` 会建目录）。只读路径（如 #141 的 CLI 候选表）用本方法——boot 后恒已解析，boot 前
+    /// 返回 `None` 而不是凭空造出一个 home。对齐 python `collect_candidates` 读裸 `_skill_home` 的约定。
+    fn skill_home_opt(&self) -> Option<PathBuf> {
+        self.skill_home
+            .read()
+            .expect("skill_home poisoned")
+            .clone()
+            .or_else(|| self.skill_home_override.clone())
+    }
+
     /// 解析并缓存 SKILL Home（override > env 链）/ Resolve & cache the SKILL Home root。
     fn ensure_skill_home(&self) -> PathBuf {
         {
@@ -1169,6 +1182,28 @@ impl<S: Session> Computer<S> {
             .filter(|s| s.origin != ProvenanceScope::Plugin)
             .map(|s| crate::mcp_clients::bundle_id::resolve_bundle_id(&s.config))
             .collect()
+    }
+
+    /// **声明面**：当次 boot 权威配置集里的 server 声明（durable scopes + flag + embed），供 CLI 寻址补全。
+    ///
+    /// #141：`list_mcp_servers_with_metadata` 的查找空间是「运行期投影 ∪ ledger」，**不含**已落盘但未挂载的
+    /// 声明（如卡在审批门外的 pending server）。[`remove_server`](Self::remove_server) 读磁盘快照、本来删得掉
+    /// 它们，若 CLI 候选表看不见就会误报「未找到」⇒ display 名不是合法 bundle_id 字面量者从 CLI 无路可删。
+    /// 故 CLI 的候选表取二者并集（python `collect_candidates` 决策 1：查找空间 = 运行期活跃集 ∪ 声明面）。
+    ///
+    /// 与 [`non_plugin_declared_bundle_ids`](Self::non_plugin_declared_bundle_ids) 同源同参（同一次
+    /// `resolve_snapshot`、同样必须传全 flag/embed 输入），差别只在此处返回 config、那处返回 bundle_id 集。
+    pub(crate) fn declared_mcp_servers(&self) -> Vec<crate::mcp_clients::model::MCPServerConfig> {
+        use crate::settings::config::snapshot::{resolve_snapshot, SnapshotArgs};
+        let config_dir = self.config_dir();
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&config_dir),
+            home: self.skill_home_opt().as_deref(),
+            flag_mcp_config_path: self.mcp_flag_config.as_deref(),
+            embed_servers: &self.embed_servers,
+            ..Default::default()
+        });
+        snap.mcp.servers.iter().map(|s| s.config.clone()).collect()
     }
 
     /// 禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；可经 [`Self::enable_plugin`] 复原）/ disable。
@@ -2081,85 +2116,47 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
-    /// **运行期停摘** MCP server（**名称寻址**；manager + 内存投影 + capability bump + emit），**不落盘** /
-    /// unmount an MCP server at runtime only, by name (no persistence)。
+    /// **运行期停摘** MCP server（**bundle_id 寻址**；manager + 内存投影 + capability bump + emit），**不落盘** /
+    /// unmount an MCP server at runtime only, by bundle_id (no persistence)。
     ///
     /// #122：[`mount_server`](Self::mount_server) 的对侧——供 **plugin / 治理 Hook**（[`McpInstallHooks`] 的
-    /// `remove_server` 实现，含 **SDK 外部** client）按 bundled server 名停摘运行期实例，**不删** project `mcp.json`
-    /// 声明（bundled server 本不在用户 config 层，其增减由 plugin enablement 意图驱动）。**用户删除**声明走
-    /// [`remove_server`](Self::remove_server)（bundle_id 寻址：落盘删声明后经运行期臂 `unmount_server_by_id` 停摘）。
+    /// `remove_server` 实现，含 **SDK 外部** client）按身份停摘运行期实例，**不删** project `mcp.json` 声明
+    /// （bundled server 本不在用户 config 层，其增减由 plugin enablement 意图驱动）。**用户删除**声明走
+    /// [`remove_server`](Self::remove_server)（落盘删声明后经本运行期臂停摘）。
     ///
     /// - `§12 R2`：工具投影变化 → bump **capability** revision（**不** bump config——运行期停摘不改持久 config）。
     ///
-    /// **消歧**：同名多 server 时取字典序最小的 `bundle_id`（确定但任意——`name` 非身份键；调用方需精确
-    /// 寻址应走 `unmount_server_by_id`）。**先解析一次身份**再委托，使 manager
-    /// 与本地投影停摘**同一对象**（#127 前：manager 走 name→bundle_id 桥、投影按 name 直删，二者在同名场景下
-    /// 可能停摘不同的 server）。
+    /// #141/R4：由「name 寻址 `unmount_server` + `pub(crate)` `unmount_server_by_id`」**合并**为单一
+    /// bundle_id-addressed 公开 API。旧实现按 name 解析、同名多 server 取**字典序最小**（确定但任意，会误摘）
+    /// 且 boot 前回退到本地投影按 name 解析——**两者均已删除**。同名两 server（显式异 bundle_id）从此**精确**停摘。
     ///
-    /// **boot 前亦可用**：manager 尚未建时（如 [`Computer::new`] 播种的声明集）回退到本地投影解析身份，与
-    /// [`mount_server`](Self::mount_server) 的 boot 前可挂载对称——否则 boot 前停摘会静默 no-op、`boot_up`
-    /// 照样把该 server 拉起。
+    /// 返回**是否真的摘到东西**（`true` = manager 或本地投影确有该身份键并已移除）——未挂载的 bundle_id 是
+    /// 幂等 no-op，但如实上报 `false`，供调用方打真实回执（勿一律报成功，见 [`stop_mcp_client`](Self::stop_mcp_client)）。
     ///
     /// # Errors
     /// 运行期停摘失败（manager 错）。
-    pub async fn unmount_server(&self, server_name: &str) -> ComputerResult<()> {
-        // 锁纪律：两把读锁**逐次取、至多同时持一把**（manager 的解析在其 guard 内做完即释放，再取
-        // `mcp_servers`）——不嵌套，避免给「持 `mcp_servers` 写锁再取 manager」的未来调用方留下 ABBA 环。
-        let resolved = {
-            let manager = self.mcp_manager.read().await;
-            match manager.as_ref() {
-                Some(m) => Some(m.bundle_id_for_name(server_name).await),
-                None => None,
-            }
-        };
-        let bundle_id = match resolved {
-            Some(from_manager) => from_manager,
-            // manager 未建（boot 前）→ 从本地投影按 name 解析；同名取字典序最小，与 manager 的桥同规则。
-            None => {
-                let servers = self.mcp_servers.read().await;
-                let mut matches: Vec<&BundleId> = servers
-                    .iter()
-                    .filter(|(_, cfg)| cfg.name() == server_name)
-                    .map(|(bid, _)| bid)
-                    .collect();
-                matches.sort();
-                matches.first().map(|bid| (*bid).clone())
-            }
-        };
-        // 名称未注册 → 幂等 no-op，与 manager `remove_server` 的缺失键语义一致。
-        let Some(bundle_id) = bundle_id else {
-            return Ok(());
-        };
-        self.unmount_server_by_id(bundle_id.as_str()).await
-    }
-
-    /// 仅运行期停摘 server（**bundle_id 寻址**）/ unmount at runtime only, by bundle_id（#121 B）。
-    ///
-    /// [`remove_server`](Self::remove_server) 与 [`unmount_server`](Self::unmount_server) 的**共用运行期臂**：
-    /// 按软件唯一身份 `bundle_id` 从 manager 与本地投影（#127 起同为 bundle_id-keyed）双双停摘——两侧同键，
-    /// 无 name→bundle_id 桥的歧义。
-    pub(crate) async fn unmount_server_by_id(&self, bundle_id: &str) -> ComputerResult<()> {
+    pub async fn unmount_server(&self, id: &BundleId) -> ComputerResult<bool> {
+        let mut removed = false;
         {
             let manager = self.mcp_manager.read().await;
             if let Some(ref manager) = *manager {
-                manager.remove_server_by_id(bundle_id).await?;
+                removed |= manager.remove_server_by_id(id).await?;
             }
         }
 
-        // 从本地投影移除（键即 bundle_id，直删——无需按 name 扫描/匹配）。
-        // #130：投影键已是 [`BundleId`]；非法串必然不是已挂键 → 无匹配、no-op。
-        if let Ok(key) = BundleId::try_from(bundle_id) {
+        // 从本地投影移除（键即 bundle_id，直删）。未挂载键 → 无匹配、no-op。
+        {
             let mut servers = self.mcp_servers.write().await;
-            servers.remove(&key);
+            removed |= servers.remove(id).is_some();
         }
 
-        // 工具投影变化 → capability revision +1（§12 R2）。
-        self.status.bump_capability();
+        // 仅**真摘到**才是工具投影变化 → 才 bump capability + 通知（§12 R2；no-op 不是能力变化）。
+        if removed {
+            self.status.bump_capability();
+            let _ = self.emit_update_config().await;
+        }
 
-        // 如果 Socket.IO 已连接，自动发送配置更新通知 / Auto emit update config if Socket.IO connected
-        let _ = self.emit_update_config().await;
-
-        Ok(())
+        Ok(removed)
     }
 
     /// 动态添加或更新服务器配置（**落盘 + 运行期物化**）/ Add or update a server config (persist + mount)。
@@ -2252,7 +2249,7 @@ impl<S: Session> Computer<S> {
     ///
     /// # Errors
     /// 落盘失败（[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期停摘失败（manager 错）。
-    pub async fn remove_server(&self, bundle_id: &str) -> ComputerResult<()> {
+    pub async fn remove_server(&self, bundle_id: &BundleId) -> ComputerResult<bool> {
         // #121 A：以本实例上下文（含 User env + Skill Home）解析 config，绝不误读/误删宿主 User config。
         // remove 不 upsert（删所有可写 scope，S2 R1），`upsert_new_scope` 对其无影响，占位传 `Local`。
         let config_dir = self.config_dir();
@@ -2270,7 +2267,7 @@ impl<S: Session> Computer<S> {
             .servers
             .iter()
             .filter(|v| v.origin != ProvenanceScope::Plugin)
-            .filter(|v| crate::mcp_clients::bundle_id::resolve_bundle_id(&v.config) == bundle_id)
+            .filter(|v| crate::mcp_clients::bundle_id::resolve_bundle_id(&v.config) == *bundle_id)
             .map(|v| v.name.clone())
             .filter(|n| seen.insert(n.clone()))
             .collect();
@@ -2282,7 +2279,7 @@ impl<S: Session> Computer<S> {
         // 归属集与 `list_mcp_servers_with_metadata`（managedBy）**同源**（#126 验收#3）；停用插件后不占名（D3）。
         if names.is_empty() {
             if let Some(rec) = self.enabled_bundled_ownership().into_iter().find(|rec| {
-                crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config) == bundle_id
+                crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config) == *bundle_id
             }) {
                 return Err(ComputerError::ConfigPersist(
                     WriteTargetError::Synthesized {
@@ -2294,6 +2291,11 @@ impl<S: Session> Computer<S> {
         }
 
         // 落盘删声明（每个匹配名一条 Remove）。无匹配（纯运行期实例、非 plugin-owned）→ 空计划、不落盘。
+        //
+        // 🔴 回执信号取 **revision 真变**、而非 `!names.is_empty()`：`names` 来自合并快照（只滤掉
+        // `origin==Plugin`），`origin==Embed`（#147 宿主构造入参投影）**不落盘**⇒ names 非空但 `update_config`
+        // 无事可做，据 names 打「已移除」会谎报，而该声明下次 boot 原样回来。
+        let mut removed_declaration = false;
         if !names.is_empty() {
             let edits: Vec<ConfigEdit> = names
                 .into_iter()
@@ -2301,14 +2303,18 @@ impl<S: Session> Computer<S> {
                 .collect();
             let after = update_config(&ctx, &edits)
                 .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
+            removed_declaration = after.revision != before_rev;
             // 落盘且内容真变 → config revision +1（§12 R2）。
-            if after.revision != before_rev {
+            if removed_declaration {
                 self.bump_config_revision();
             }
         }
 
         // 运行期停摘（按 bundle_id；manager + 内存投影 + capability bump + emit）。
-        self.unmount_server_by_id(bundle_id).await
+        let unmounted = self.unmount_server(bundle_id).await?;
+        // #141：如实上报「有没有删到东西」——既无声明也无活跃实例时返回 `false`，供 CLI 打真实回执
+        // （否则拼错的 target 恰是合法 bundle_id 字面量时会谎报「已移除」）。
+        Ok(removed_declaration || unmounted)
     }
 
     /// 更新inputs定义 / Update inputs definition
@@ -2527,12 +2533,12 @@ impl<S: Session> Computer<S> {
     /// 获取单个窗口资源的详情 / Get detail of a single window resource
     pub async fn get_window_detail(
         &self,
-        server_name: &str,
+        id: &BundleId,
         resource: Resource,
     ) -> ComputerResult<ReadResourceResult> {
         let manager = self.mcp_manager.read().await;
         if let Some(ref manager) = *manager {
-            manager.get_window_detail(server_name, resource).await
+            manager.get_window_detail(id, resource).await
         } else {
             Err(ComputerError::InvalidState(
                 "Computer not initialized".to_string(),
@@ -3128,49 +3134,89 @@ impl<S: Session> Computer<S> {
     }
 
     /// 启动 MCP 客户端 / Start MCP client
-    pub async fn start_mcp_client(&self, server_name: &str) -> ComputerResult<()> {
+    pub async fn start_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
         let result = {
-            let manager_guard = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager_guard {
-                if server_name == "all" {
-                    manager.start_all().await
-                } else {
-                    manager.start_client(server_name).await
-                }
-            } else {
-                Err(ComputerError::InvalidState(
-                    "MCP Manager not initialized".to_string(),
-                ))
+            let mgr = self.mcp_manager.read().await;
+            match mgr.as_ref() {
+                Some(m) => m.start_client_by_id(id).await,
+                None => Err(Self::manager_uninit()),
             }
         };
-        // #114 S7：MCP 起停改变 Agent-facing 工具投影 → 成功时 bump capability revision（§12 R2）。
-        if result.is_ok() {
+        self.bump_capability_if_ok(&result);
+        result
+    }
+
+    /// 停止单个 MCP 客户端（**bundle_id 寻址**）；返回**是否真的停了** / Stop by bundle_id; returns whether it stopped。
+    ///
+    /// #141/R4：由 name 寻址改 `&BundleId`——同名两 server 精确起停。
+    ///
+    /// 🔴 **根治 `stop` 假回执**：旧 `manager.stop_client(name)` 名解析未命中即 `refresh + Ok(())` 谎报成功。
+    /// 仅把寻址改成身份键**不足以**根治——CLI 的 `resolve_target` 按 R4 必须放行「0 命中但语法合法的 bundle_id」
+    /// （拼错的 server 名几乎总是合法字面量），那条 token 会一路走到这里、对缺席键幂等返回。故本方法**如实上报**
+    /// `Ok(true)=确有活跃客户端被停` / `Ok(false)=无活跃客户端、未做任何事`，由调用方（CLI）据此打真实回执。
+    pub async fn stop_mcp_client(&self, id: &BundleId) -> ComputerResult<bool> {
+        let result = {
+            let mgr = self.mcp_manager.read().await;
+            match mgr.as_ref() {
+                Some(m) => m.stop_client_by_id(id).await,
+                None => Err(Self::manager_uninit()),
+            }
+        };
+        // 只有**真停了**才改变工具投影 → 仅此时 bump capability（未停到不是能力变化）。
+        if matches!(result, Ok(true)) {
             self.status.bump_capability();
         }
         result
     }
 
-    /// 停止 MCP 客户端 / Stop MCP client
-    pub async fn stop_mcp_client(&self, server_name: &str) -> ComputerResult<()> {
+    /// 重启单个 MCP 客户端（**bundle_id 寻址**）/ Restart one MCP client by bundle_id（#141 新增公开 restart）。
+    pub async fn restart_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
         let result = {
-            let manager_guard = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager_guard {
-                if server_name == "all" {
-                    manager.stop_all().await
-                } else {
-                    manager.stop_client(server_name).await
-                }
-            } else {
-                Err(ComputerError::InvalidState(
-                    "MCP Manager not initialized".to_string(),
-                ))
+            let mgr = self.mcp_manager.read().await;
+            match mgr.as_ref() {
+                Some(m) => m.restart_client_by_id(id).await,
+                None => Err(Self::manager_uninit()),
             }
         };
-        // #114 S7：同 start——停 MCP 亦改变工具投影，成功时 bump capability revision。
+        self.bump_capability_if_ok(&result);
+        result
+    }
+
+    /// 启动全部 MCP 客户端（CLI `start all`）/ Start all MCP clients。
+    pub async fn start_all_mcp_clients(&self) -> ComputerResult<()> {
+        let result = {
+            let mgr = self.mcp_manager.read().await;
+            match mgr.as_ref() {
+                Some(m) => m.start_all().await,
+                None => Err(Self::manager_uninit()),
+            }
+        };
+        self.bump_capability_if_ok(&result);
+        result
+    }
+
+    /// 停止全部 MCP 客户端（CLI `stop all`）/ Stop all MCP clients。
+    pub async fn stop_all_mcp_clients(&self) -> ComputerResult<()> {
+        let result = {
+            let mgr = self.mcp_manager.read().await;
+            match mgr.as_ref() {
+                Some(m) => m.stop_all().await,
+                None => Err(Self::manager_uninit()),
+            }
+        };
+        self.bump_capability_if_ok(&result);
+        result
+    }
+
+    fn manager_uninit() -> ComputerError {
+        ComputerError::InvalidState("MCP Manager not initialized".to_string())
+    }
+
+    /// MCP 起停成功 → bump capability revision（§12 R2：改变 Agent-facing 工具投影）/ bump on Ok。
+    fn bump_capability_if_ok(&self, result: &ComputerResult<()>) {
         if result.is_ok() {
             self.status.bump_capability();
         }
-        result
     }
 
     /// 检查 MCP Manager 是否已初始化 / Check if MCP Manager is initialized
@@ -3969,7 +4015,11 @@ mod tests {
             .iter()
             .any(|s| s.name == "gone"));
 
-        computer.remove_server("gone").await.unwrap();
+        let removed = computer
+            .remove_server(&BundleId::try_from("gone".to_string()).unwrap())
+            .await
+            .unwrap();
+        assert!(removed, "确有声明被删 ⇒ 回执 MUST 为 true（#141）");
         assert_eq!(
             computer.config_revision(),
             2,
@@ -4149,15 +4199,27 @@ mod tests {
         );
 
         // 删不存在的 server：空计划零落盘 → config **不** bump。
-        computer.remove_server("never-existed").await.unwrap();
+        // #141：回执亦须如实为 `false`——CLI 据此打 ℹ️ 而非 ✅（拼错的 target 往往是合法 bundle_id 字面量）。
+        let removed = computer
+            .remove_server(&BundleId::try_from("never-existed".to_string()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !removed,
+            "既无声明也无实例 ⇒ 回执 MUST 为 false（禁假成功）"
+        );
         assert_eq!(
             computer.config_revision(),
             1,
             "no-op remove 不虚假 bump config"
         );
 
-        // 真删已存在 → config +1。
-        computer.remove_server("x").await.unwrap();
+        // 真删已存在 → config +1，且回执为 `true`。
+        let removed = computer
+            .remove_server(&BundleId::try_from("x".to_string()).unwrap())
+            .await
+            .unwrap();
+        assert!(removed, "确有声明被删 ⇒ 回执 MUST 为 true");
         assert_eq!(computer.config_revision(), 2);
     }
 
@@ -4238,10 +4300,10 @@ mod tests {
 
         // start/stop MCP（空配置 → Ok）改变工具投影 → 各 bump 一次 capability（单调）。
         let cap_after_boot = computer.capability_revision();
-        computer.start_mcp_client("all").await.unwrap();
+        computer.start_all_mcp_clients().await.unwrap();
         let cap_after_start = computer.capability_revision();
         assert!(cap_after_start > cap_after_boot, "start 应 bump capability");
-        computer.stop_mcp_client("all").await.unwrap();
+        computer.stop_all_mcp_clients().await.unwrap();
         assert!(
             computer.capability_revision() > cap_after_start,
             "stop 应 bump capability"
@@ -4921,7 +4983,7 @@ mod tests {
 
         // 删除用户声明（按 bundle_id）→ 应成功，落盘 bump。
         let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&updated);
-        comp.remove_server(bundle_id.as_str())
+        comp.remove_server(&bundle_id)
             .await
             .expect("用户自己声明的同名 server 应可删除");
         assert_eq!(comp.config_revision(), 3, "删除同名用户声明应落盘 bump");
@@ -4960,7 +5022,7 @@ mod tests {
             .find(|e| e.name == "audit-mcp")
             .expect("enabled bundled server 应可查询（§4.8）");
         let err = comp
-            .remove_server(&plugin_srv.bundle_id)
+            .remove_server(&BundleId::try_from(plugin_srv.bundle_id.clone()).unwrap())
             .await
             .expect_err("用户无自有声明时，删 plugin bundled bundle_id 仍应拒（F3(b) → #138）");
         assert!(matches!(
@@ -4976,7 +5038,7 @@ mod tests {
         assert_eq!(comp.config_revision(), 1, "放行后应落盘 bump");
 
         // 用户声明既已存在 → 覆盖 plugin 基线；此时 remove 删的是用户自己那条，放行。
-        comp.remove_server(&plugin_srv.bundle_id)
+        comp.remove_server(&BundleId::try_from(plugin_srv.bundle_id.clone()).unwrap())
             .await
             .expect("用户自有声明存在 → remove 删自己那条，放行");
     }
@@ -5439,7 +5501,10 @@ mod tests {
         computer.add_or_update_server(updated_config).await.unwrap();
 
         // 移除服务器 / Remove server
-        computer.remove_server("test_server").await.unwrap();
+        computer
+            .remove_server(&BundleId::try_from("test_server".to_string()).unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -6374,11 +6439,10 @@ mod tests {
         // 出线的 bundle_id 必须真能用于寻址（`remove_server` 按 bundle_id 比对 resolve_bundle_id）。
         for e in &inv {
             assert!(
-                computer
-                    .list_mcp_servers()
-                    .await
-                    .iter()
-                    .any(|c| crate::mcp_clients::bundle_id::resolve_bundle_id(c) == *e.bundle_id),
+                computer.list_mcp_servers().await.iter().any(|c| {
+                    crate::mcp_clients::bundle_id::resolve_bundle_id(c).as_str()
+                        == e.bundle_id.as_str()
+                }),
                 "inventory 出线的 bundle_id {} 须可寻址到实际 config",
                 e.bundle_id
             );
@@ -6393,8 +6457,11 @@ mod tests {
     async fn unmount_server_works_before_boot_127() {
         use crate::mcp_clients::manager::test_support::stdio_cfg_with_bundle;
 
+        let cfg = stdio_cfg_with_bundle("my.api", None);
+        // display 名含 `.` ⇒ 不是合法 bundle_id 字面量；身份键须由同一份 config 派生（#141）。
+        let cfg_bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg);
         let mut seeded = HashMap::new();
-        seeded.insert("my.api".to_string(), stdio_cfg_with_bundle("my.api", None));
+        seeded.insert("my.api".to_string(), cfg);
         let computer = Computer::new(
             "c",
             SilentSession::new("s"),
@@ -6407,15 +6474,18 @@ mod tests {
         assert!(!computer.is_mcp_manager_initialized().await);
         assert_eq!(computer.list_mcp_servers().await.len(), 1);
 
-        // 按 display 名停摘（#122 plugin-hook 契约的公开面）→ 投影须真的少一条。
-        computer.unmount_server("my.api").await.unwrap();
+        // 按 bundle_id 停摘（#122 plugin-hook 契约的公开面；#141 由 display 名改身份键）→ 投影须真的少一条。
+        computer.unmount_server(&cfg_bundle_id).await.unwrap();
         assert!(
             computer.list_mcp_servers().await.is_empty(),
             "boot 前 unmount_server 须真正停摘（否则 boot_up 会把它重新拉起）"
         );
 
         // 未注册的名字 → 幂等 no-op，不 panic、不报错。
-        computer.unmount_server("never-declared").await.unwrap();
+        computer
+            .unmount_server(&BundleId::try_from("never-declared".to_string()).unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

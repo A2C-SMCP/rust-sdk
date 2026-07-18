@@ -10,7 +10,8 @@
 
 use crate::computer::{Computer, ConnectOptions, SilentSession};
 use crate::errors::ComputerError;
-use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
+use crate::inventory::{McpOwnership, McpServerWithMetadata};
+use crate::mcp_clients::model::{BundleId, MCPServerConfig, MCPServerInput};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -60,9 +61,16 @@ impl CommandHandler {
         println!("  tools                     列出可用工具 / list tools");
         println!("  mcp                       显示当前 MCP 配置 / show current MCP config");
         println!("  server add <json|@file>   添加或更新 MCP 配置 / add or update config");
-        println!("  server rm <bundle_id>     移除 MCP 配置（按 bundle_id）/ remove config (by bundle_id)");
-        println!("  start <name>|all          启动客户端 / start client(s)");
-        println!("  stop <name>|all           停止客户端 / stop client(s)");
+        println!("  server rm <target>        移除 MCP 配置（target = 唯一 name 或 bundle_id）/ remove config");
+        println!(
+            "  start <target>|all        启动客户端（target = name 或 bundle_id）/ start client(s)"
+        );
+        println!(
+            "  stop <target>|all         停止客户端（target = name 或 bundle_id）/ stop client(s)"
+        );
+        println!(
+            "  restart <target>          重启客户端（target = name 或 bundle_id）/ restart client"
+        );
         println!("  inputs load <@file>       从文件加载 inputs 定义 / load inputs");
         println!("  inputs add <json|@file>   添加 input 定义 / add input definition");
         println!("  inputs update <json|@file> 更新 input 定义 / update input definition");
@@ -236,50 +244,189 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// 移除服务器配置（**按 bundle_id 寻址**，协议 §身份；bundle_id 可经 `status` 查看）/ remove by bundle_id。
-    pub async fn remove_server(&mut self, bundle_id: &str) -> Result<(), CommandError> {
-        // 按软件唯一身份 bundle_id 移除（#121 B：name 是 human display、非身份键）。
-        self.computer.remove_server(bundle_id).await?;
-        println!("已移除服务器配置 (bundle_id={bundle_id}) / Removed server config");
+    /// #141/R4：人机面 `token`（name 或 bundle_id）→ `BundleId` 解析（**只在人机面**，库层永不 name 寻址）。
+    ///
+    /// **步骤序严格按协议 §5.1（`sdk-api-guidance.md` 行 127-145），与 python `cli/resolve.py:183-192` 逐行
+    /// 同构——顺序有意义，勿重排**：
+    ///
+    /// 1. token 按 **display name** 反查，**唯一命中** → 其 bundle_id；
+    /// 2. **多命中** → 报错并列出候选（bundle_id + name + 归属），要求改用 bundle_id 重试；
+    /// 3. **0 命中** ∧ token 是**合法且已注册**的 bundle_id → token 本身；
+    /// 4. 其余 → 报错「未找到」。
+    ///
+    /// 🔴 两条曾被写反、经隔离复审在真二进制上复现（本 doc 即订正记录）：
+    ///
+    /// - **name 必须先于 bundle_id 查**。反过来会让 `server rm foo` 在「A(name=foo, id=foo_1) + B(name=bar,
+    ///   id=foo)」时删掉 **B**——用户敲的是自己看得见的名字，回执里的 bundle_id 他分辨不出是别人的。
+    /// - **语法合法 ≠ 存在**。放行未注册的合法 id 会让拼错的 token 一路走到底层幂等 no-op ⇒ 假成功复活
+    ///   （协议步骤 2 明文「仍无 → 报错「未找到」」、步骤 5「未命中 MUST 报错，MUST NOT 静默成功」）。
+    ///   此前注释宣称「R4 必须放行」——**协议、issue 正文、python 三处均无此说，系凭空杜撰**。
+    async fn resolve_target(&self, token: &str) -> Result<BundleId, CommandError> {
+        let servers = self.candidates().await;
+        let name_hits: Vec<&McpServerWithMetadata> =
+            servers.iter().filter(|s| s.name == token).collect();
+
+        // ① 唯一 name 命中 → 其 bundle_id。
+        if let [one] = name_hits.as_slice() {
+            return BundleId::try_from(one.bundle_id.clone()).map_err(|e| {
+                CommandError::InvalidCommand(format!("invalid bundle_id {:?}: {e}", one.bundle_id))
+            });
+        }
+
+        // ② 多命中 → 列候选报错（禁字典序最小：把不确定的错变成确定的错）。
+        if name_hits.len() > 1 {
+            let candidates = name_hits
+                .iter()
+                .map(|s| {
+                    let owner = match &s.managed_by {
+                        McpOwnership::User => "user".to_string(),
+                        McpOwnership::Plugin { plugin_id, .. } => format!("plugin:{plugin_id}"),
+                    };
+                    format!("   {} [bundle_id={}] ({owner})", s.name, s.bundle_id)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(CommandError::InvalidCommand(format!(
+                "有 {} 个 server 叫 {token:?}:\n{candidates}\n请用 bundle_id 重试 / retry with bundle_id",
+                name_hits.len()
+            )));
+        }
+
+        // ③ 0 命中 ∧ 合法**且已注册**的 bundle_id → token 本身。
+        if let Ok(id) = BundleId::try_from(token.to_string()) {
+            if servers.iter().any(|s| s.bundle_id == token) {
+                return Ok(id);
+            }
+        }
+
+        // ④ 其余 → 未找到。
+        Err(CommandError::InvalidCommand(format!(
+            "未找到服务器 {token:?} / server not found（请经 status 核对 name 或 bundle_id）"
+        )))
+    }
+
+    /// `resolve_target` 的查找空间：**运行期活跃集 ∪ 声明面**（python `collect_candidates`，#143 决策 1）。
+    ///
+    /// 🔴 只取运行期会漏掉「已落盘声明但未挂载」的 server（如待审批 pending 声明）：`Computer::remove_server`
+    /// 读的是磁盘快照、**本来删得掉**，但 CLI 候选表看不见它 ⇒ 凡 display 名不是合法 bundle_id 字面量者
+    /// （含 `.`、空格、中文…）**从 CLI 无路可删**。隔离复审已在真二进制上复现。
+    async fn candidates(&self) -> Vec<McpServerWithMetadata> {
+        // 运行期 + ledger 归属（携 `managed_by`，供歧义候选列表标注「谁的」）。
+        let mut out = self.computer.list_mcp_servers_with_metadata().await;
+        let known: std::collections::HashSet<String> =
+            out.iter().map(|s| s.bundle_id.clone()).collect();
+        // 声明面兜底：补上未挂载的已声明 server。归属按 origin 推导——`resolve` 的声明面结构性不含
+        // origin==plugin（plugin bundled 走 transient 挂载、由上面的 ledger 源覆盖），故一律记 User。
+        for cfg in self.computer.declared_mcp_servers() {
+            let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg);
+            if !known.contains(bundle_id.as_str()) {
+                out.push(McpServerWithMetadata::new(
+                    cfg.name(),
+                    bundle_id.into_string(),
+                    cfg.disabled(),
+                    McpOwnership::User,
+                ));
+            }
+        }
+        out
+    }
+
+    /// 移除服务器配置（`bundle_id` 可经 `status` 查看；亦接受唯一 name）/ remove（#141：经 `resolve_target`）。
+    ///
+    /// **真实回执**：仅当确有声明被删或实例被停摘才报「已移除」；否则报「未做任何操作」。
+    pub async fn remove_server(&mut self, target: &str) -> Result<(), CommandError> {
+        let line = self.remove_server_line(target).await?;
+        println!("{line}");
         Ok(())
     }
 
-    /// 启动客户端
+    /// [`remove_server`](Self::remove_server) 的**可断言内核**：返回回执行而非直接 `println!`。
+    ///
+    /// 🔴 存在的理由：`println!` 无法被单测检查，于是「回执是否诚实」——本 issue 的**交付物本身**——就没有
+    /// 任何测试守得住。隔离复审实测：把回执硬编成成功态，920 条测试仍全绿。故把 sink 抽出来，让测试断言
+    /// **真实调用链**的输出，而不是只断言纯函数映射。
+    pub(crate) async fn remove_server_line(&self, target: &str) -> Result<String, CommandError> {
+        let id = self.resolve_target(target).await?;
+        let removed = self.computer.remove_server(&id).await?;
+        Ok(remove_receipt(&id, removed))
+    }
+
+    /// 启动客户端（`<target>|all`，target = name 或 bundle_id）/ start（#141：经 `resolve_target`）。
     pub async fn start_client(&self, target: &str) -> Result<(), CommandError> {
-        match self.computer.start_mcp_client(target).await {
-            Ok(()) => {
-                if target == "all" {
+        if target == "all" {
+            return match self.computer.start_all_mcp_clients().await {
+                Ok(()) => {
                     println!("✅ 所有服务器启动完成 / All servers started");
-                } else {
-                    println!(
-                        "✅ 服务器 '{}' 启动完成 / Server '{}' started",
-                        target, target
-                    );
+                    Ok(())
                 }
-            }
-            Err(e) => {
-                println!("❌ 启动服务器失败: {} / Failed to start server: {}", e, e);
-            }
+                Err(e) => {
+                    println!("❌ 启动服务器失败: {e}");
+                    Ok(())
+                }
+            };
+        }
+        let id = self.resolve_target(target).await?;
+        match self.computer.start_mcp_client(&id).await {
+            Ok(()) => println!("✅ 服务器 [bundle_id={id}] 启动完成 / Server started"),
+            Err(e) => println!("❌ 启动服务器失败: {e}"),
         }
         Ok(())
     }
 
-    /// 停止客户端
+    /// 停止客户端（`<target>|all`，target = name 或 bundle_id）/ stop（#141：根治假成功）。
+    ///
+    /// 旧实现：`stop_mcp_client(name)` 名未命中即静默 `Ok(())` → CLI 照打「✅ 停止完成」而 server 仍在跑。
+    ///
+    /// **两道防线**（缺一不可，隔离复审两轮各钉一道）：
+    ///
+    /// 1. `resolve_target` 按协议 §5.1 对**未注册**的 token 报「未找到」——拼错的
+    ///    名字止步于此，根本不进 stop；
+    /// 2. `stop_mcp_client` 回报 `bool`——**已注册但未挂载**这类真·no-op 打 ℹ️ 而非 ✅。这道防线还兼管
+    ///    库层被非 CLI 宿主直调的路径（python `manager.py:245-249` 明文承认自己没堵这个洞）。
     pub async fn stop_client(&self, target: &str) -> Result<(), CommandError> {
-        match self.computer.stop_mcp_client(target).await {
-            Ok(()) => {
-                if target == "all" {
+        if target == "all" {
+            return match self.computer.stop_all_mcp_clients().await {
+                Ok(()) => {
                     println!("✅ 所有服务器停止完成 / All servers stopped");
-                } else {
-                    println!(
-                        "✅ 服务器 '{}' 停止完成 / Server '{}' stopped",
-                        target, target
-                    );
+                    Ok(())
                 }
-            }
-            Err(e) => {
-                println!("❌ 停止服务器失败: {} / Failed to stop server: {}", e, e);
-            }
+                Err(e) => {
+                    println!("❌ 停止服务器失败: {e}");
+                    Ok(())
+                }
+            };
+        }
+        match self.stop_client_line(target).await? {
+            Ok(line) => println!("{line}"),
+            Err(e) => println!("❌ 停止服务器失败: {e}"),
+        }
+        Ok(())
+    }
+
+    /// [`stop_client`](Self::stop_client) 的**可断言内核**（非 `all` 分支）：返回回执行而非直接 `println!`。
+    ///
+    /// 见 [`remove_server_line`](Self::remove_server_line) 里同一条理由。外层 `Result` = resolve 失败（未找到
+    /// /歧义），内层 = 库层停止失败；二者呈现不同，故不压平。
+    pub(crate) async fn stop_client_line(
+        &self,
+        target: &str,
+    ) -> Result<Result<String, ComputerError>, CommandError> {
+        let id = self.resolve_target(target).await?;
+        Ok(self
+            .computer
+            .stop_mcp_client(&id)
+            .await
+            .map(|stopped| stop_receipt(&id, stopped)))
+    }
+
+    /// 重启客户端（`<target>`，target = name 或 bundle_id；不收 `all`）/ restart（#141）。
+    ///
+    /// 兑现 [`Computer::restart_mcp_client`] 的公开面——此前该 API 无任何调用点、doc 却已声称供 CLI 使用。
+    pub async fn restart_client(&self, target: &str) -> Result<(), CommandError> {
+        let id = self.resolve_target(target).await?;
+        match self.computer.restart_mcp_client(&id).await {
+            Ok(()) => println!("✅ 服务器 [bundle_id={id}] 重启完成 / Server restarted"),
+            Err(e) => println!("❌ 重启服务器失败: {e}"),
         }
         Ok(())
     }
@@ -674,6 +821,38 @@ impl CommandHandler {
     }
 }
 
+/// `stop <target>` 的用户可见回执 / user-facing receipt for `stop`。
+///
+/// 🔴 **假回执的第二道防线**（#141）。`stop_client_by_id` 对缺席键幂等返回 `Ok`，据 `Ok` 打 ✅ 就是谎报
+/// 「已停止」而 server 仍在跑。故回执**只认 `stopped` 布尔**，不认 `Ok`。
+///
+/// 第一道防线是 [`resolve_target`](CommandHandler::resolve_target)（未注册 token → 报「未找到」，拼错的名字
+/// 止步于此）。二者分工：走到这里的 `false` 只可能是**已注册但未挂载**——故文案说「尚未挂载」而**不**再提
+/// 「是否拼写正确」（那会对拼写完全正确、status 里看得见的 server 发出误导提示）。
+///
+/// 抽成纯函数是为了**可断言**：`println!` 无法被单测检查，而回执文案正是本 issue 的交付物本身。
+fn stop_receipt(id: &BundleId, stopped: bool) -> String {
+    if stopped {
+        format!("✅ 服务器 [bundle_id={id}] 停止完成 / Server stopped")
+    } else {
+        format!("ℹ️ 服务器 [bundle_id={id}] 尚未挂载，无需停止 / not mounted, nothing to stop")
+    }
+}
+
+/// `server rm <target>` 的用户可见回执 / user-facing receipt for `server rm`。
+///
+/// 同 [`stop_receipt`]：`removed=false` 表示**既无声明落盘可删、也无运行期实例可停摘**——必须如实说
+/// 「未做任何操作」，否则用户以为删掉了、而它下次 boot 原样回来。
+fn remove_receipt(id: &BundleId, removed: bool) -> String {
+    if removed {
+        format!("已移除服务器配置 (bundle_id={id}) / Removed server config")
+    } else {
+        format!(
+            "ℹ️ 服务器 [bundle_id={id}] 无可删声明、亦无活跃实例，未做任何操作 / nothing to remove"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +887,201 @@ mod tests {
             headers: None,
         };
         CommandHandler::new(computer, cli_config)
+    }
+
+    /// 挂一个 stdio server（display 名与显式 bundle_id 分离，用于钉「按名还是按 id」）。
+    async fn mount(computer: &Computer<SilentSession>, name: &str, bundle_id: Option<&str>) {
+        let mut v = serde_json::json!({
+            "type": "stdio",
+            "name": name,
+            "server_parameters": {"command": "echo"},
+        });
+        if let Some(b) = bundle_id {
+            v["bundle_id"] = serde_json::json!(b);
+        }
+        computer
+            .mount_server(serde_json::from_value(v).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// #141 🔴1（隔离复审在**真二进制**上复现的破坏性误删）：**display name 必须先于 bundle_id 查**。
+    ///
+    /// 复现原文（修复前）：`A(name=foo, id=foo_1)` + `B(name=bar, id=foo)` 共存时
+    /// ```text
+    /// a2c> server rm foo
+    /// 已移除服务器配置 (bundle_id=foo) / Removed server config   ← 删掉的是 bar！
+    /// ```
+    /// 用户敲的是自己**看得见的名字**，回执里的 bundle_id 他分辨不出是别人的。这比原先的「假成功」更危险。
+    ///
+    /// 权威：协议 §5.1（`sdk-api-guidance.md:127-145`）步骤序 **1=display name → 2=bundle_id**；
+    /// python `cli/resolve.py:183-192` 逐行同构并注明「顺序有意义，勿重排」。
+    #[tokio::test]
+    async fn resolve_target_checks_name_before_bundle_id_141() {
+        let computer = create_test_computer().await;
+        mount(&computer, "foo", Some("foo_1")).await;
+        // B 的 **bundle_id** 恰好等于 A 的 **display name**——这正是步骤序会露馅的配置。
+        mount(&computer, "bar", Some("foo")).await;
+        let handler = create_test_handler(computer);
+
+        assert_eq!(
+            handler.resolve_target("foo").await.unwrap().as_str(),
+            "foo_1",
+            "MUST 命中 display 名为 foo 的那条（A），而非 bundle_id 恰为 foo 的 B"
+        );
+        // 反向：按 B 自己的名字查仍得 B。
+        assert_eq!(handler.resolve_target("bar").await.unwrap().as_str(), "foo");
+    }
+
+    /// #141 🔴2：**语法合法 ≠ 存在**——未注册的合法 bundle_id MUST 报「未找到」，不得放行到底层幂等 no-op。
+    ///
+    /// 协议 §5.1 步骤 2 明文「仍无 → 报错「未找到」」、步骤 5「未命中 MUST 报错，MUST NOT 静默成功」；
+    /// python `resolve.py:165-166` 同构并写明理由「否则 `stop <合法但不存在的 id>` 会一路走到底层的静默
+    /// no-op ⇒ 假成功复活」。
+    ///
+    /// 此前本仓注释宣称「R4 **必须**放行 0 命中但语法合法的 bundle_id」——**协议、issue 正文、python 三处
+    /// 均无此说，系凭空杜撰**，且正是那条假回执得以复活的入口。
+    #[tokio::test]
+    async fn resolve_target_rejects_unregistered_valid_bundle_id_141() {
+        let computer = create_test_computer().await;
+        mount(&computer, "everything", None).await;
+        let handler = create_test_handler(computer);
+
+        // `everthing`（拼错一个字母）是**合法** bundle_id 字面量——字符集 `[A-Za-z0-9_-]` 决定了绝大多数
+        // 拼写错误都合法。正因如此，「语法合法就放行」等于对一切拼写错误假成功。
+        assert!(BundleId::try_from("everthing".to_string()).is_ok());
+        for unknown in ["everthing", "no-such-server", "a__b", "my.api", ""] {
+            let err = handler
+                .resolve_target(unknown)
+                .await
+                .expect_err("未注册的 target MUST 报「未找到」（禁静默成功）");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("未找到") || msg.contains("not found"),
+                "错误须自解释「未找到」，实际: {msg}"
+            );
+        }
+        // 已注册的 bundle_id 仍照常命中（别把收紧做成「一律拒绝」）。
+        assert_eq!(
+            handler.resolve_target("everything").await.unwrap().as_str(),
+            "everything"
+        );
+    }
+
+    /// #141 🔴3：候选空间 = **运行期活跃集 ∪ 声明面**——已落盘但未挂载的声明按 display 名必须可寻址。
+    ///
+    /// 复现（修复前）：`my.api` 落盘到 project mcp.json 但卡在审批门外未挂载 ⇒ `server rm my.api` 报
+    /// 「未知目标」，而 `Computer::remove_server` 读磁盘快照**本来删得掉**它。凡 display 名不是合法
+    /// bundle_id 字面量者（含 `.`、空格、中文…），用户从 CLI **无路可删**。
+    ///
+    /// python `collect_candidates`（`resolve.py:81-156` 决策 1）逐字命中该缺陷：「若只取运行期，『手改
+    /// mcp.json 但未重载』的声明会被本解析器判为『未找到』，而 `aremove_server` 本可删掉它 ⇒ 回归」。
+    #[tokio::test]
+    async fn resolve_target_covers_declared_but_unmounted_141() {
+        let computer = create_test_computer().await;
+        // 只落盘声明、**不**挂载（`add_or_update_server` 写 project mcp.json + 内存投影；这里靠 CLI 候选表
+        // 的声明面分支来寻址它）。名字含 `.` ⇒ 不是合法 bundle_id 字面量，只能按 name 找到。
+        computer
+            .add_or_update_server(
+                serde_json::from_value(serde_json::json!({
+                    "type": "stdio",
+                    "name": "my.api",
+                    "server_parameters": {"command": "echo"},
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let handler = create_test_handler(computer);
+
+        let id = handler
+            .resolve_target("my.api")
+            .await
+            .expect("已声明的 server 按 display 名 MUST 可寻址（即便未挂载）");
+        assert_eq!(id.as_str(), "my_api", "解析到其派生 bundle_id");
+    }
+
+    /// #141 🔴4：**回执的真实调用链**必须被测到——不是只测纯函数映射。
+    ///
+    /// 隔离复审的判别性检验：把回执硬编成成功态，920 条测试仍全绿（因为没有一条覆盖 `stop_client` /
+    /// `remove_server` 的非 `all` 分支）。本测走 `*_line` 内核，断言用户真正看到的那行字。
+    #[tokio::test]
+    async fn cli_receipts_are_honest_through_real_call_chain_141() {
+        let computer = create_test_computer().await;
+        mount(&computer, "everything", None).await;
+        let handler = create_test_handler(computer);
+
+        // ① 拼错的 target：止步于 resolve，**根本打不出回执**（第一道防线）。
+        let err = handler
+            .stop_client_line("everthing")
+            .await
+            .expect_err("拼错的 target MUST 在 resolve 阶段报错");
+        assert!(format!("{err}").contains("未找到"));
+
+        // ② 已注册但**未挂载**：走完真实调用链，回执 MUST 无 ✅（第二道防线）。
+        let line = handler
+            .stop_client_line("everything")
+            .await
+            .expect("已注册 ⇒ resolve 通过")
+            .expect("库层不报错");
+        assert!(
+            !line.contains('✅') && !line.contains("停止完成"),
+            "未挂载却打了成功回执: {line}"
+        );
+        assert!(line.contains("尚未挂载"), "回执须自解释: {line}");
+
+        // ③ 别把根治做成「一律不报成功」：`true` 分支仍是 ✅。（真活跃客户端的 `true` 由
+        // `tests/integration_tests.rs` 的 manager 级用例覆盖，此处钉回执映射。）
+        let id = handler.resolve_target("everything").await.unwrap();
+        assert!(stop_receipt(&id, true).contains('✅'));
+
+        // ④ `server rm` 同链路：真删到 → 「已移除」。
+        let line = handler.remove_server_line("everything").await.unwrap();
+        assert!(
+            line.contains("已移除"),
+            "确有实例可停摘 ⇒ 应报已移除: {line}"
+        );
+        // 再删一次：此时既无声明也无实例 ⇒ MUST 报「未做任何操作」，且该 target 已不可寻址。
+        assert!(handler.remove_server_line("everything").await.is_err());
+    }
+
+    /// #141/R4：同名多 server → **列候选（bundle_id + name + 归属）报错，禁字典序最小**。
+    #[tokio::test]
+    async fn resolve_target_ambiguous_lists_candidates_141() {
+        let computer = create_test_computer().await;
+        // 两条**同 display 名、显式异 bundle_id** 的合法共存 server（协议：name 允许碰撞、非身份）。
+        let mk = |bid: &str| -> MCPServerConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "stdio",
+                "name": "dup",
+                "bundle_id": bid,
+                "server_parameters": {"command": "echo"},
+            }))
+            .unwrap()
+        };
+        computer.mount_server(mk("dup-a")).await.unwrap();
+        computer.mount_server(mk("dup-b")).await.unwrap();
+        let handler = create_test_handler(computer);
+
+        let err = handler
+            .resolve_target("dup")
+            .await
+            .expect_err("同名多命中 MUST 报歧义、禁字典序最小");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dup-a") && msg.contains("dup-b"),
+            "须列全部候选 bundle_id: {msg}"
+        );
+        assert!(msg.contains("bundle_id="), "候选须带 bundle_id 标注: {msg}");
+        // 精确按 bundle_id 寻址 → 各自命中（同名不再互相隐身）。
+        assert_eq!(
+            handler.resolve_target("dup-a").await.unwrap().as_str(),
+            "dup-a"
+        );
+        assert_eq!(
+            handler.resolve_target("dup-b").await.unwrap().as_str(),
+            "dup-b"
+        );
     }
 
     #[tokio::test]
@@ -805,28 +1179,36 @@ mod tests {
         Ok(())
     }
 
+    /// #141：删不存在的 target → **报「未找到」**。
+    ///
+    /// 旧断言是 `assert!(result.is_ok())`，注释写「即使不存在也应该成功」——那正是本 issue 要根治的假成功，
+    /// 且 `remove_server` 当时任何情况下都返回 `Ok` ⇒ 该断言恒真、零判别力（隔离复审 🔴4）。
     #[tokio::test]
     async fn test_remove_server() {
         let computer = create_test_computer().await;
         let mut handler = create_test_handler(computer);
 
-        // 测试移除服务器（即使不存在也应该成功） / Test removing server
-        let result = handler.remove_server("non_existent").await;
-        assert!(result.is_ok());
+        let err = handler
+            .remove_server("non_existent")
+            .await
+            .expect_err("不存在的 target MUST 报错（协议 §5.1-5：MUST NOT 静默成功）");
+        assert!(format!("{err}").contains("未找到"));
     }
 
+    /// #141：未初始化（无任何 server）时 `start <未知>` → 报「未找到」；`stop all` 仍是无害 no-op。
     #[tokio::test]
     async fn test_start_stop_client_uninitialized() {
         let computer = create_test_computer().await;
         let handler = create_test_handler(computer);
 
-        // 测试未初始化时启动客户端 / Test starting client when uninitialized
-        let result = handler.start_client("test").await;
-        assert!(result.is_ok());
+        let err = handler
+            .start_client("test")
+            .await
+            .expect_err("未注册的 target MUST 报「未找到」");
+        assert!(format!("{err}").contains("未找到"));
 
-        // 测试停止所有客户端 / Test stopping all clients
-        let result = handler.stop_client("all").await;
-        assert!(result.is_ok());
+        // `all` 是 CLI 侧哨兵、不过 resolve——空集停全部是合法 no-op。
+        handler.stop_client("all").await.expect("stop all 应无害");
     }
 
     #[tokio::test]

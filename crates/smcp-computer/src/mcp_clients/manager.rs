@@ -49,10 +49,15 @@ pub struct ExposedToolRoute {
 /// MCP服务器管理器 / MCP server manager
 ///
 /// **身份键 = `bundle_id`（协议 0.3.0，rust-sdk#117）**：`servers_config` / `active_clients` / `retry_counts`
-/// 均以 [`BundleId`] 为键（no-double-open 去重、同名跨源 server 共存）。公开生命周期方法（`start_client` /
-/// `stop_client` / `get_window_detail` 等）仍以**人类可读名**寻址、内部经 `bundle_id_for_name`
-/// 解析（`bundle_id` 由 [`bundle_id`] 在管理器内**从所持 config 计算一次**——避免 raw/rendered
-/// 连接身份漂移致的 bundle_id 不一致）。
+/// 均以 [`BundleId`] 为键（no-double-open 去重、同名跨源 server 共存）。**#141/R4：公开生命周期方法
+/// （`start_client_by_id` / `stop_client_by_id` / `remove_server_by_id` / `get_window_detail` 等）一律收
+/// `&BundleId`**——管理器内**不再做名解析**（旧 `bundle_id_for_name` 的名未命中→静默 `Ok` 正是
+/// `stop` 假回执的来源）。人类可读名→bundle_id 的启发式只存在于 CLI 的 `resolve_target`，库层不参与。
+/// `bundle_id` 由 [`bundle_id`] 在管理器内**从所持 config 计算一次**——避免 raw/rendered 连接身份漂移
+/// 致的 bundle_id 不一致。
+///
+/// 幂等方法（`stop_client_by_id` / `remove_server_by_id`）返回 `bool` 而非 `()`：缺席键不报错，但**必须
+/// 如实回报「什么都没做」**，否则调用方（CLI）会把拼错的 target 打成 ✅。
 ///
 /// **对外标识一律 `bundle_id`**：desktop `window://` 分组（#118）与 skill `skill://` 枚举/物化（#127）均以
 /// `bundle_id` 标注——协议 §身份正交性规定 `name` 是纯 display、允许碰撞、永不做键。唯一仍与 `bundle_id`
@@ -153,7 +158,7 @@ impl MCPServerManager {
 
     /// 注入 MCP 运行期变化通知发送端（#106）/ inject the runtime MCP change-notification sender。
     ///
-    /// 必须在 [`start_client`](Self::start_client) / [`start_all`](Self::start_all) **之前**调用，才能让随后
+    /// 必须在 [`start_client_by_id`](Self::start_client_by_id) / [`start_all`](Self::start_all) **之前**调用，才能让随后
     /// 创建的客户端携带 [`ClientNotifyCtx`]。已激活客户端不追溯注入（对齐"启动前接线"约定）。
     pub async fn set_change_sender(&self, tx: mpsc::UnboundedSender<McpServerNotification>) {
         *self.change_tx.write().await = Some(tx);
@@ -188,44 +193,9 @@ impl MCPServerManager {
         bundle_id::resolve_bundle_id(config)
     }
 
-    /// 名称 → `bundle_id` 解析（扫描 `servers_config` 取同名匹配）/ resolve a server name to its bundle_id。
-    ///
-    /// 内部桥：`window://` / `skill://` URI、CLI start/stop 等仍以**人类可读名**寻址，经此映射到身份键。
-    /// **消歧（#121）**：两个不同 `bundle_id` 的同名 server 共存时（仅显式指定不同 `bundle_id` 可致），取**字典序
-    /// 最小**的 `bundle_id`——**跨运行确定**（此前 `HashMap.find` 迭代序不确定，协议 §身份「name 永不做键」告警的
-    /// 正是此非确定性）；命中多个时 WARN 提示以唯一 `bundle_id` 消歧。销毁性操作（`remove_server`）应改走
-    /// `remove_server_by_id` 直接按 `bundle_id` 寻址，不经本桥。
-    pub(crate) async fn bundle_id_for_name(&self, server_name: &str) -> Option<BundleId> {
-        let configs = self.servers_config.read().await;
-        let mut matches: Vec<&BundleId> = configs
-            .iter()
-            .filter(|(_, c)| c.name() == server_name)
-            .map(|(bid, _)| bid)
-            .collect();
-        matches.sort(); // 字典序 → 跨运行确定（消除 HashMap 迭代序非确定性）。
-        if matches.len() > 1 {
-            warn!(
-                name = %server_name,
-                candidates = ?matches,
-                "name maps to multiple bundle_ids; picking lexicographically-smallest deterministically \
-                 (disambiguate by bundle_id — protocol: name MUST NOT be used as identity)"
-            );
-        }
-        matches.first().map(|bid| (*bid).clone())
-    }
-
-    /// 定位一个活动客户端的键（`bundle_id`）：先按 server **名**解析（生产路径，`window://` / `skill://` 用名），
-    /// 再**回退**把入参当作 `active_clients` 键（`bundle_id`）直取。回退容忍「直接传 bundle_id」，也覆盖测试里注入
-    /// client 未附 config 的场景。名匹配优先于回退（名寻址语义）。返回 `None` = 既非任一 server 名、也非活动键。
-    async fn active_client_key(&self, server_name: &str) -> Option<BundleId> {
-        if let Some(bid) = self.bundle_id_for_name(server_name).await {
-            return Some(bid);
-        }
-        // 回退：把入参当身份键直取。非法 bundle_id 串**必然**不是已注册键 → None（与"未命中"同义）。
-        let candidate = BundleId::try_from(server_name).ok()?;
-        let clients = self.active_clients.read().await;
-        clients.contains_key(&candidate).then_some(candidate)
-    }
+    // #141/R4：name→bundle_id 的桥 `bundle_id_for_name` / `active_client_key` **已删除**——库层公开 API 一律收
+    // `bundle_id`（消歧的字典序最小 + 碰撞路由是同名歧义的根源）。人机面 name→身份的解析归 CLI `resolve_target`
+    // （源 `list_mcp_servers_with_metadata`，多命中列候选、0 命中且合法 id 当 id、否则报错），不再进库层。
 
     /// 初始化管理器 / Initialize manager
     ///
@@ -322,41 +292,18 @@ impl MCPServerManager {
         Ok(())
     }
 
-    /// 移除服务器配置（**名称寻址**，内部解析为 `bundle_id`）/ Remove server configuration (name-addressed)。
+    /// 移除服务器配置（**bundle_id 寻址**，协议 §身份 MUST 用 bundle_id）；返回**是否真的移除** / remove by identity。
     ///
-    /// 保留供治理级联（plugin disable/uninstall 停摘 bundled server，按名）与既有内部调用；名→bundle_id 经
-    /// `bundle_id_for_name`（已确定性消歧）。**用户 CRUD 删除**应走
-    /// [`remove_server_by_id`](Self::remove_server_by_id) 直接按身份寻址（协议 §身份 MUST 用 bundle_id）。
-    pub async fn remove_server(&self, server_name: &str) -> Result<(), ComputerError> {
-        let Some(bundle_id) = self.bundle_id_for_name(server_name).await else {
-            // 名称未注册：与 HashMap.remove 缺失键一致，视为幂等 no-op（仍刷新路由保持一致）。
-            self.refresh_tool_routes().await?;
-            return Ok(());
-        };
-        self.remove_server_by_key(&bundle_id).await
-    }
-
-    /// 移除服务器配置（**bundle_id 寻址**，协议 §身份 MUST 用 bundle_id）/ Remove by bundle_id (identity key)。
+    /// 直接按身份键操作，**无** name→bundle_id 桥的歧义（对齐 Python `aremove_server(bundle_id)`）。
     ///
-    /// 直接按身份键操作，**无** name→bundle_id 桥的歧义（对齐 Python `aremove_server(bundle_id)`）。未注册 →
-    /// 幂等 no-op（仍刷新路由保持一致）。
-    ///
-    /// #130：形参暂留 `&str`（库层 API 一律收 `BundleId` 属 #141）。**非法** `bundle_id` 串必然不是已注册键
-    /// ⇒ 归入既有的「未注册 → 幂等 no-op」分支，无新增失败模式。
-    pub async fn remove_server_by_id(&self, bundle_id: &str) -> Result<(), ComputerError> {
-        let Ok(bundle_id) = BundleId::try_from(bundle_id) else {
-            self.refresh_tool_routes().await?;
-            return Ok(());
-        };
-        self.remove_server_by_key(&bundle_id).await
-    }
-
-    /// 按身份键移除（内部；已持 [`BundleId`] 的调用方直接走此路，免 `&str` 往返）/ remove by key。
-    async fn remove_server_by_key(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
+    /// #141/R4：形参由 `&str` 收敛为 `&BundleId`（库层公开 API 一律收身份），顺带消灭「非法串 → `refresh + Ok(())`
+    /// 静默成功」这一与本 Issue 同形的假回执残留（非法值现在**构造不出** `BundleId`，在类型层即被拦）。
+    /// 未注册的合法身份键 → 幂等 no-op 但如实返回 `false`（供调用方打真实回执）。
+    pub async fn remove_server_by_id(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         let exists = { self.servers_config.read().await.contains_key(bundle_id) };
         if !exists {
             self.refresh_tool_routes().await?;
-            return Ok(());
+            return Ok(false);
         }
 
         // 停止客户端（按 bundle_id）/ Stop client (by bundle_id)
@@ -371,7 +318,7 @@ impl MCPServerManager {
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
 
-        Ok(())
+        Ok(true)
     }
 
     /// 启动所有启用的服务器 / Start all enabled servers
@@ -397,16 +344,11 @@ impl MCPServerManager {
         Ok(())
     }
 
-    /// 启动单个客户端（名称寻址，内部解析为 `bundle_id`）/ Start single client (name-addressed)。
-    pub async fn start_client(&self, server_name: &str) -> Result<(), ComputerError> {
-        let bundle_id = self.bundle_id_for_name(server_name).await.ok_or_else(|| {
-            ComputerError::InvalidConfiguration(format!("Unknown server: {}", server_name))
-        })?;
-        self.start_client_by_id(&bundle_id).await
-    }
-
-    /// 启动单个客户端（身份键寻址）/ Start single client (bundle_id-addressed, internal)。
-    async fn start_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
+    /// 启动单个客户端（**身份键寻址**）/ Start single client (bundle_id-addressed)。
+    ///
+    /// #141/R4：删除 name 寻址的 `start_client`——库层公开 API 一律收 `bundle_id`；name→身份的解析归 CLI
+    /// `resolve_target`（未知即报错，不再 `Unknown server` 混淆同名歧义）。
+    pub async fn start_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
         // 获取配置 / Get configuration
         let config = {
             let configs = self.servers_config.read().await;
@@ -459,23 +401,21 @@ impl MCPServerManager {
         Ok(())
     }
 
-    /// 停止单个客户端（名称寻址，内部解析为 `bundle_id`）/ Stop single client (name-addressed)。
-    pub async fn stop_client(&self, server_name: &str) -> Result<(), ComputerError> {
-        let Some(bundle_id) = self.bundle_id_for_name(server_name).await else {
-            // 名称未注册：幂等 no-op（仍刷新路由）。
-            self.refresh_tool_routes().await?;
-            return Ok(());
-        };
-        self.stop_client_by_id(&bundle_id).await
-    }
-
-    /// 停止单个客户端（身份键寻址）/ Stop single client (bundle_id-addressed, internal)。
-    async fn stop_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
+    /// 停止单个客户端（**身份键寻址**）；返回**是否真的停了**/ Stop by bundle_id; returns whether it actually stopped。
+    ///
+    /// #141/R4：删除 name 寻址的 `stop_client`（它在 name 未命中时 `refresh + Ok(())` 谎报成功）。
+    ///
+    /// 🔴 **返回 `bool` 是假回执的根治点**：库层对缺席键保持**幂等**（无可停、非错误），但把「有没有停到东西」
+    /// **如实上报**给调用方——否则 CLI 无从分辨「真停了」与「压根没这个活跃客户端」，只能一律打 ✅，那正是
+    /// 本 Issue 要消灭的谎报（拼错的 server 名恰好是合法 bundle_id 字面量时尤甚）。
+    /// `Ok(true)` = 确有活跃客户端被摘除并断连；`Ok(false)` = 该身份键无活跃客户端，未做任何事。
+    pub async fn stop_client_by_id(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         // 移除客户端 / Remove client
         let mut client = {
             let mut clients = self.active_clients.write().await;
             clients.remove(bundle_id)
         };
+        let was_active = client.is_some();
 
         // 断开连接 / Disconnect
         if let Some(ref mut c) = client {
@@ -487,25 +427,37 @@ impl MCPServerManager {
             })?;
         }
 
-        // 刷新工具路由 / Refresh tool routes
+        // 刷新工具路由（幂等，无论是否停到都保持路由一致）/ Refresh tool routes
         self.refresh_tool_routes().await?;
 
-        info!("Client (bundle_id={}) stopped successfully", bundle_id);
-        Ok(())
+        if was_active {
+            info!("Client (bundle_id={}) stopped successfully", bundle_id);
+        } else {
+            debug!(
+                "No active client for bundle_id={} — nothing to stop (idempotent)",
+                bundle_id
+            );
+        }
+        Ok(was_active)
     }
 
-    /// 重启服务器（身份键寻址）/ Restart server (bundle_id-addressed, internal)。
-    async fn restart_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
-        self.stop_client_by_id(bundle_id).await?;
-
-        // 检查是否启用 / Check if enabled
+    /// 重启服务器（**身份键寻址**）/ Restart server (bundle_id-addressed)。#141：公开供 CLI `restart`。
+    pub async fn restart_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
+        // #141：**先查声明再动手**。此前用 `unwrap_or(false)` 兜底，未知 bundle_id 走成
+        // 「stop 幂等 no-op + enabled=false 不 start」⇒ 静默 `Ok(())` ——与被根治的 `stop` 假回执同形。
+        // restart 语义蕴含「事后应在跑」，故对不存在的声明必须报错（与 `start_client_by_id` 一致）；
+        // 声明存在但 `disabled` 则停而不起，仍是 `Ok`（尊重停用意图，非假成功）。
         let enabled = {
             let configs = self.servers_config.read().await;
-            configs
-                .get(bundle_id)
-                .map(|c| !c.disabled())
-                .unwrap_or(false)
+            let config = configs.get(bundle_id).ok_or_else(|| {
+                ComputerError::InvalidConfiguration(format!(
+                    "Unknown server bundle_id: {bundle_id}"
+                ))
+            })?;
+            !config.disabled()
         };
+
+        self.stop_client_by_id(bundle_id).await?;
 
         if enabled {
             self.start_client_by_id(bundle_id).await?;
@@ -1312,7 +1264,13 @@ impl MCPServerManager {
         cursor: Option<String>,
     ) -> Result<(Vec<Resource>, Option<String>), ComputerError> {
         // bundle_id 寻址：直查 active_clients（身份键 == 键，不经 name 解析）。未命中 → 4014 携 bundle_id。
-        // #130：形参暂留 `&str`（→ #141）；非法串必然不是活动键 ⇒ 归入既有的「未命中 → 4014」。
+        // #141 裁决：形参**保留** `&str`，不改 `&BundleId`。本方法是 **wire 入口**（`mcp_server` 由
+        // `client:*` 载荷直送，见 `socketio_client.rs`），正确形状是「边界处解析、失败即协议错」——这里
+        // 已经 `try_from` + 非法串归入既有的「未命中 → 4014」。改收 `&BundleId` 只会把解析与 4014 映射
+        // 推给每个调用方（含 socketio handler），反而分散。R4 约束的是**做 name 启发式**的治理/生命周期
+        // API，本方法零启发式、直接按身份键查表 ⇒ 不在其射程内。
+        //
+        // 同理适用：`list_skill_resources`、`SkillResourceManager` trait 边界。
         let client = match BundleId::try_from(bundle_id) {
             Ok(key) => self.active_clients.read().await.get(&key).cloned(),
             Err(_) => None,
@@ -1420,13 +1378,19 @@ impl MCPServerManager {
     /// `read_resource_by_id`）。
     pub async fn get_window_detail(
         &self,
-        server_name: &str,
+        bundle_id: &BundleId,
         resource: Resource,
     ) -> Result<ReadResourceResult, ComputerError> {
-        let bundle_id = self.active_client_key(server_name).await.ok_or_else(|| {
-            ComputerError::InvalidState(format!("Server '{}' not connected", server_name))
-        })?;
-        self.read_resource_by_id(&bundle_id, resource).await
+        // #141/R4：按身份寻址，删 `active_client_key` name 桥（同名歧义 + 文档化的碰撞路由）。
+        {
+            let clients = self.active_clients.read().await;
+            if !clients.contains_key(bundle_id) {
+                return Err(ComputerError::InvalidState(format!(
+                    "Server (bundle_id={bundle_id}) not connected"
+                )));
+            }
+        }
+        self.read_resource_by_id(bundle_id, resource).await
     }
 
     /// 合并工具元数据 / Merge tool metadata
@@ -1638,11 +1602,10 @@ impl MCPServerManager {
         }
     }
 
-    /// 检查单个服务器的健康状态（名称寻址，内部解析为身份键）/ Check health of a single server。
-    pub async fn check_server_health(&self, server_name: &str) -> Option<HealthCheckResult> {
-        let key = self.active_client_key(server_name).await?;
+    /// 检查单个服务器的健康状态（**bundle_id 寻址**）/ Check health of a single server by bundle_id（#141/R4）。
+    pub async fn check_server_health(&self, bundle_id: &BundleId) -> Option<HealthCheckResult> {
         let clients = self.active_clients.read().await;
-        if let Some(client) = clients.get(&key) {
+        if let Some(client) = clients.get(bundle_id) {
             let config = self.health_check_config.read().await;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(config.timeout_secs),
@@ -1713,17 +1676,9 @@ impl MCPServerManager {
         self.retry_counts.read().await.clone()
     }
 
-    /// 重置特定服务器的重试计数（名称寻址，内部解析为身份键；未匹配名则按原样当键）/ Reset retry count。
-    pub async fn reset_retry_count(&self, server_name: &str) {
-        // 名未注册 → 回退把入参当身份键（非法串则无键可删，直接返回）。
-        let key = match self.bundle_id_for_name(server_name).await {
-            Some(k) => k,
-            None => match BundleId::try_from(server_name) {
-                Ok(k) => k,
-                Err(_) => return,
-            },
-        };
-        self.retry_counts.write().await.remove(&key);
+    /// 重置特定服务器的重试计数（**bundle_id 寻址**）/ Reset retry count by bundle_id（#141/R4）。
+    pub async fn reset_retry_count(&self, bundle_id: &BundleId) {
+        self.retry_counts.write().await.remove(bundle_id);
     }
 
     /// 重置所有重试计数 / Reset all retry counts
@@ -1748,7 +1703,8 @@ impl SkillResourceManager for MCPServerManager {
             // rmcp `Resource._meta`（`Option<Meta(JsonObject)>`）→ staging 的 `Map<String, Value>`。
             let meta = resource.meta.clone().map(|m| m.0).unwrap_or_default();
             out.push((
-                // trait 边界仍收 `String`（`SkillResourceManager` 定义在 skills 模块）→ #132/#141 统一改型。
+                // trait 边界收 `String`（`SkillResourceManager` 定义在 skills 模块）。#141 裁决：**保留**
+                // ——见 `list_resources` 处的同一理由（值已是身份键、零 name 启发式，改型只搬运不消错）。
                 bid.into_string(),
                 McpResource {
                     uri: resource.uri.clone(),
@@ -2485,8 +2441,53 @@ mod tests {
         // 检查状态 / Check status（`.0` = bundle_id（此处缺省生成 == name）、`.1` = 展示名）
         let status = manager.get_server_status().await;
         assert_eq!(status.len(), 1);
-        assert_eq!(status[0].0, "test_server");
+        assert_eq!(status[0].0.as_str(), "test_server");
         assert_eq!(status[0].1, "test_server");
+    }
+
+    /// #141：`restart_client_by_id` 对**未声明**的 bundle_id 必须报错，不得静默 `Ok`。
+    ///
+    /// 修复前的形状与被根治的 `stop` 假回执同源：stop 幂等 no-op → `configs.get(id)` 落空 →
+    /// `unwrap_or(false)` 判为「未启用」→ 不 start → `Ok(())`。调用方据此以为「已重启」，实则什么都没发生。
+    #[tokio::test]
+    async fn restart_unknown_bundle_id_is_error_not_silent_ok_141() {
+        let manager = MCPServerManager::new();
+        let err = manager
+            .restart_client_by_id(&BundleId::try_from("never-declared").unwrap())
+            .await
+            .expect_err("未声明的 bundle_id MUST NOT 静默 Ok");
+        assert!(
+            format!("{err}").contains("never-declared"),
+            "错误须点名该 bundle_id，实际: {err}"
+        );
+    }
+
+    /// #141：声明存在但 `disabled` → 停而不起，仍是 `Ok`（尊重停用意图，与「未知 id」区分开）。
+    #[tokio::test]
+    async fn restart_disabled_but_declared_is_ok_141() {
+        let manager = MCPServerManager::new();
+        let config = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
+            bundle_id: None,
+            name: "disabled_server".to_string(),
+            disabled: true,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        manager.add_or_update_server(config).await.unwrap();
+
+        manager
+            .restart_client_by_id(&BundleId::try_from("disabled_server").unwrap())
+            .await
+            .expect("已声明但停用 → 停而不起，非错误");
     }
 
     #[tokio::test]
@@ -2514,8 +2515,11 @@ mod tests {
         manager.add_or_update_server(config).await.unwrap();
 
         // 移除服务器 / Remove server
-        let result = manager.remove_server("test_server").await;
-        assert!(result.is_ok());
+        let removed = manager
+            .remove_server_by_id(&BundleId::try_from("test_server").unwrap())
+            .await
+            .unwrap();
+        assert!(removed, "确有该声明 ⇒ 回执 MUST 为 true");
 
         // 检查状态 / Check status
         let status = manager.get_server_status().await;
@@ -2648,25 +2652,16 @@ mod tests {
         assert_eq!(key.as_str().len(), "bundle_".len() + 16);
     }
 
-    /// name != bundle_id（显式 bundle_id）时，name-addressed 的 reset_retry_count 应解析到 bundle_id 键。
-    /// 回归 re-key 后 public 健康/重试 API 未解析名→键的隐患（Step7 🟡-3）。
+    /// #141/R4：`reset_retry_count` 按 **bundle_id 寻址**（推翻旧 name→bundle_id 解析——name 桥
+    /// `bundle_id_for_name` 已删，库层不再 name 寻址）。
     #[tokio::test]
-    async fn reset_retry_count_resolves_name_to_bundle_id() {
+    async fn reset_retry_count_by_bundle_id_141() {
         let manager = MCPServerManager::new();
-        // server 名 "srv"，显式 bundle_id "bid" ≠ name。
-        manager
-            .servers_config
-            .write()
-            .await
-            .insert(bid("bid"), stdio_cfg_with_bundle("srv", Some("bid")));
-        // retry_counts 以 bundle_id 为键。
         manager.retry_counts.write().await.insert(bid("bid"), 3);
-
-        // 按**名**重置 → 内部解析到 bundle_id 键并移除。
-        manager.reset_retry_count("srv").await;
+        manager.reset_retry_count(&bid("bid")).await;
         assert!(
             !manager.get_retry_counts().await.contains_key(&bid("bid")),
-            "按名重置应解析到 bundle_id 键并清除"
+            "按 bundle_id 清除重试计数"
         );
     }
 
@@ -2729,7 +2724,11 @@ mod tests {
         let details = manager.get_windows_details(None).await;
         assert_eq!(details.len(), 1, "应返回一个 window 详情");
         let (bundle_id, name, resource, _detail) = &details[0];
-        assert_eq!(bundle_id, "id_x", ".0 应为 bundle_id（active_clients 键）");
+        assert_eq!(
+            bundle_id.as_str(),
+            "id_x",
+            ".0 应为 bundle_id（active_clients 键）"
+        );
         assert_eq!(name, "display-name", ".1 应为展示名（servers_config）");
         assert_eq!(
             resource.uri.as_str(),
@@ -2788,7 +2787,7 @@ mod tests {
         // 定向枚举按 bundle_id 寻址；display 名不再是寻址键。
         let scoped = manager.list_skill_resources(Some("id_a")).await;
         assert_eq!(scoped.len(), 1, "定向枚举应只命中 id_a");
-        assert_eq!(scoped[0].0, "id_a");
+        assert_eq!(scoped[0].0.as_str(), "id_a");
         assert!(
             manager
                 .list_skill_resources(Some("same-display-name"))
@@ -2965,7 +2964,7 @@ mod tests {
         assert_eq!(counts.get(&bid("server2")), Some(&5));
 
         // 重置单个服务器 / Reset single server
-        manager.reset_retry_count("server1").await;
+        manager.reset_retry_count(&bid("server1")).await;
         let counts = manager.get_retry_counts().await;
         assert!(!counts.contains_key(&bid("server1")));
         assert_eq!(counts.get(&bid("server2")), Some(&5));
@@ -3137,7 +3136,9 @@ mod tests {
             None,
             Some("text/plain".into()),
         );
-        let result = manager.get_window_detail("unknown_server", resource).await;
+        let result = manager
+            .get_window_detail(&bid("unknown_server"), resource)
+            .await;
         assert!(result.is_err());
         match result {
             Err(ComputerError::InvalidState(msg)) => {
@@ -3177,7 +3178,7 @@ mod tests {
         let uris: Vec<&str> = got.iter().map(|(_, r)| r.uri.as_str()).collect();
         // window:// 被过滤；两页都被消费 / window:// filtered out; both pages consumed.
         assert_eq!(uris, vec!["skill://srv/a", "skill://srv/b"]);
-        assert!(got.iter().all(|(s, _)| s == "srv"));
+        assert!(got.iter().all(|(s, _)| s.as_str() == "srv"));
     }
 
     #[tokio::test]
@@ -3244,7 +3245,7 @@ mod tests {
         // 出错 server 跳过，good 的结果仍在 / erroring server skipped, good's result remains.
         let got = manager.list_skill_resources(None).await;
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, "good");
+        assert_eq!(got[0].0.as_str(), "good");
         assert_eq!(got[0].1.uri, "skill://good/a");
 
         // server_name 过滤：只枚举指定 server / server_name filter narrows enumeration.
@@ -3691,7 +3692,7 @@ mod tests {
         let route = routes
             .get(&exposed("server2", "tool1"))
             .expect("server2 路由存在");
-        assert_eq!(route.bundle_id, "server2");
+        assert_eq!(route.bundle_id.as_str(), "server2");
         assert_eq!(route.original_tool_name, "tool1");
         assert!(
             !routes.contains_key(&exposed("server1", "tool1")),

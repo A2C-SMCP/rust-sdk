@@ -102,7 +102,8 @@ fn bundle_id_conformance_vectors_pass() {
         let desc = v.get("desc").and_then(|d| d.as_str()).unwrap_or("");
         let config = build_config(name, &v["config"]);
 
-        let got = resolve_bundle_id(&config);
+        let got_id = resolve_bundle_id(&config);
+        let got = got_id.as_str();
         assert_eq!(
             got, expected,
             "conformance 向量失配 [{desc}] name={name:?}: 期望 {expected}, 实得 {got}"

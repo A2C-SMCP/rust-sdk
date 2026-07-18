@@ -1,5 +1,6 @@
 use smcp_computer::{
     computer::{Computer, SilentSession},
+    mcp_clients::bundle_id::resolve_bundle_id,
     mcp_clients::model::{
         BundleId, MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification,
         PromptStringInput, StdioServerConfig, StdioServerParameters,
@@ -181,8 +182,10 @@ async fn test_computer_edge_case_servers() {
         },
     ));
 
+    // #141：remove 按身份键寻址；display 名未必是合法 bundle_id 字面量 → 由同一份 config 派生。
+    let long_bundle_id = resolve_bundle_id(&long_server);
     computer.add_or_update_server(long_server).await.unwrap();
-    computer.remove_server(&long_name).await.unwrap();
+    computer.remove_server(&long_bundle_id).await.unwrap();
 
     // 测试特殊字符服务器名称 / Test special character server name
     let special_name = "!@#$%^&*()".to_string();
@@ -196,8 +199,10 @@ async fn test_computer_edge_case_servers() {
         },
     ));
 
+    // 全特殊字符名 normalize 后为空 → bundle_id 走确定性摘要 fallback，故必须派生而非字面量。
+    let special_bundle_id = resolve_bundle_id(&special_server);
     computer.add_or_update_server(special_server).await.unwrap();
-    computer.remove_server(&special_name).await.unwrap();
+    computer.remove_server(&special_bundle_id).await.unwrap();
 
     computer.shutdown().await.unwrap();
 }

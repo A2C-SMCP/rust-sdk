@@ -6,7 +6,8 @@
 //! ```
 
 use smcp_computer::mcp_clients::model::{
-    make_resource, MCPServerConfig, ResourceContents, StdioServerConfig, StdioServerParameters,
+    make_resource, BundleId, MCPServerConfig, ResourceContents, StdioServerConfig,
+    StdioServerParameters,
 };
 use smcp_computer::mcp_clients::MCPServerManager;
 use std::collections::HashMap;
@@ -132,8 +133,17 @@ async fn test_manager_get_window_detail_single() {
     assert!(!windows.is_empty());
 
     let (server_name, resource) = &windows[0];
+    // #141：list_all_windows 出的是 display 名，get_window_detail 按身份键寻址
+    // → 经 status 表把 display 名映射回 bundle_id（不假设二者同值）。
+    let bundle_id = manager
+        .get_server_status()
+        .await
+        .into_iter()
+        .find(|(_, name, _, _)| name == server_name)
+        .map(|(id, _, _, _)| id)
+        .expect("列出 window 的 server 必在 status 表中");
     let detail = manager
-        .get_window_detail(server_name, resource.clone())
+        .get_window_detail(&bundle_id, resource.clone())
         .await
         .expect("get_window_detail failed");
     assert!(!detail.contents.is_empty(), "expected non-empty contents");
@@ -154,7 +164,10 @@ async fn test_manager_get_window_detail_unknown_server() {
     );
 
     let result = manager
-        .get_window_detail("nonexistent-server", resource)
+        .get_window_detail(
+            &BundleId::try_from("nonexistent-server".to_string()).expect("夹具 bundle_id 须合法"),
+            resource,
+        )
         .await;
     assert!(result.is_err(), "expected error for unknown server");
 

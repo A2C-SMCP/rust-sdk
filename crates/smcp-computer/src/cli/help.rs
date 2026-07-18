@@ -126,11 +126,21 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
                 "添加或更新 MCP 配置 / add or update config",
             ),
             (
-                "server rm <bundle_id>",
-                "移除 MCP 配置（按 bundle_id，可经 status 查看）/ remove config (by bundle_id)",
+                "server rm <target>",
+                "移除 MCP 配置（target = 唯一 name 或 bundle_id，可经 status 查看）/ remove config",
             ),
-            ("start <name>|all", "启动客户端 / start client(s)"),
-            ("stop <name>|all", "停止客户端 / stop client(s)"),
+            (
+                "start <target>|all",
+                "启动客户端（target = name 或 bundle_id）/ start client(s)",
+            ),
+            (
+                "stop <target>|all",
+                "停止客户端（target = name 或 bundle_id）/ stop client(s)",
+            ),
+            (
+                "restart <target>",
+                "重启客户端（target = name 或 bundle_id）/ restart client",
+            ),
         ],
         "inputs" => &[
             (
