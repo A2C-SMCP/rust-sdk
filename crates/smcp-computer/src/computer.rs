@@ -583,6 +583,32 @@ pub enum BlobMintError {
 }
 
 /// 默认 blob 缓存根 `~/.a2c`（`.blobspool/` 挂其下）/ default blob cache root (`~/.a2c`)。
+/// #140 迁移诊断：若已废止的旧 env 名 `A2C_INPUT_<UPPER>` 在环境中存在而新名不存在 → WARN 教改名。
+///
+/// **仅检测存在性（`var_os`），绝不用旧值解析**——F5 硬切、无双读、无过渡期，旧名恒被忽略。旧名派生
+/// 复刻 0.3.0 前的 `A2C_INPUT_` + `to_uppercase()` + 非 `[A-Z0-9]`→`_`（仅供匹配盘上残留，非新契约）。
+fn warn_if_legacy_env_var_present(input_id: &str, current_var: &str) {
+    let legacy: String = input_id
+        .to_uppercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let legacy = format!("A2C_INPUT_{legacy}");
+    if std::env::var_os(&legacy).is_some() && std::env::var_os(current_var).is_none() {
+        warn!(
+            legacy = %legacy, current = %current_var,
+            "#140: legacy input env var is set but retired (A2C_INPUT_ → A2C_SMCP_, case-preserved); \
+             it is IGNORED — set {current_var:?} instead (no dual-read, F5)"
+        );
+    }
+}
+
 fn default_blob_cache_root() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -1643,6 +1669,16 @@ impl<S: Session> Computer<S> {
     /// 启动Computer / Boot up the computer
     pub async fn boot_up(&self) -> ComputerResult<()> {
         info!("Starting Computer: {}", self.name);
+        // #140：注册期 env 名坍缩 fail-fast——两 input id 经 ENV_SEGMENT 归一同一完整 env 名（如 `a-b`/`a_b`）
+        // 会静默串味（后写的赢，含 `password:true` 密钥）。live 解析只用裸 id ⇒ 检 `self.inputs` 键集即全部活跃
+        // env 名（对齐 python `raise_on_env_name_collisions`，接线 server/tool 段时须扩形）。
+        {
+            let inputs = self.inputs.read().await;
+            // 迭代 `values().id()`（value 的权威 id）而非 map key——live resolve 亦用 `input.id()`，二者对齐；
+            // 畸形调用方令 key ≠ value.id() 时不致检查落到错误 keyspace。
+            smcp::utils::env_segment::raise_on_env_name_collisions(inputs.values().map(|v| v.id()))
+                .map_err(|e| ComputerError::InvalidConfiguration(e.to_string()))?;
+        }
         // #114 S7：进入 Starting（加载 config / 解析本地状态 / 启动 MCP 资源，契约 §3）。
         self.status.transition(LifecycleState::Starting);
 
@@ -1799,7 +1835,7 @@ impl<S: Session> Computer<S> {
 
     /// D1（#112 S5）运行期解析单个 input：SDK 不落盘明文值/secret，缺失且无默认值 → 结构化错误（**非仅日志**）。
     ///
-    /// 解析序：**client resolver**（`secret_resolver` / `input_resolver`，D1 权威源）→ **env** `A2C_INPUT_<ID>`
+    /// 解析序：**client resolver**（`secret_resolver` / `input_resolver`，D1 权威源）→ **env** `A2C_SMCP_<ENV_SEGMENT(id)>`
     /// （编排注入）→ **session**（自定义交互 Session 给真值 / `SilentSession` 给 default-or-empty；Command 经此执行）
     /// → **定义默认值** → [`InputResolutionError::Missing`]。仅当既无 resolver/env/session 命中**且**无默认值时硬错
     /// （有默认值仍回退默认，保后向兼容）。value store 明文已硬退役——本路径不落盘任何明文。
@@ -1830,10 +1866,14 @@ impl<S: Session> Computer<S> {
             }
         }
 
-        // 2. 环境变量 A2C_INPUT_<ID>（编排层注入）。
-        if let Ok(env_val) = std::env::var(env_var_name(input.id())) {
+        // 2. 环境变量 A2C_SMCP_<ENV_SEGMENT(id)>（编排层注入）。
+        let var = env_var_name(input.id());
+        if let Ok(env_val) = std::env::var(&var) {
             return Ok(serde_json::Value::String(env_val));
         }
+        // #140 迁移诊断（UX-gate）：新名未命中但旧 `A2C_INPUT_<UPPER>` 仍在环境 ⇒ WARN 教改名。
+        // **仅检测存在性、绝不读旧值**（F5 无双读、无过渡期，旧名恒被忽略）。
+        warn_if_legacy_env_var_present(input.id(), &var);
 
         // 3. session（自定义交互 Session 可给真值；SilentSession 给 default-or-empty）。
         //    - Ok(空串) 仅在「有默认值」时算有意义（显式空默认），否则视作未命中继续回退——区分「无默认值缺失」与「解析到空」。
@@ -6079,11 +6119,35 @@ mod tests {
         );
     }
 
+    /// #140：注册期 env 名坍缩 fail-fast——`a-b` 与 `a_b` 经 ENV_SEGMENT 归一到同一 `A2C_SMCP_a_b`
+    /// ⇒ boot 硬错（否则静默串味、后写的赢，含密钥）。检查在 boot_up 首步、早于任何 FS 副作用。
+    #[tokio::test]
+    async fn boot_fails_on_env_name_collision_140() {
+        let mut inputs = HashMap::new();
+        inputs.insert("a-b".to_string(), prompt_def("a-b", None, false));
+        inputs.insert("a_b".to_string(), prompt_def("a_b", None, false));
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs),
+            None,
+            false,
+            false,
+        );
+        let res = computer.boot_up().await;
+        let err = res.expect_err("两 input id 坍缩同一 env 名 MUST boot fail-fast");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("A2C_SMCP_a_b") && msg.to_lowercase().contains("collide"),
+            "错误须指明坍缩到同一 env 名：{msg}"
+        );
+    }
+
     #[tokio::test]
     async fn render_resolves_input_via_env_fallback() {
-        // env `A2C_INPUT_<ID>` 回退（= 豁免无损迁移后用户重新提供值的迁移路径）。用唯一 id 避免跨测污染。
+        // env `A2C_SMCP_<ENV_SEGMENT(id)>` 回退（= 豁免无损迁移后用户重新提供值的迁移路径）。用唯一 id 避免跨测污染。
         let id = "s5_env_hit_uid";
-        let var = env_var_name(id); // A2C_INPUT_S5_ENV_HIT_UID
+        let var = env_var_name(id); // A2C_SMCP_s5_env_hit_uid（#140：保留大小写）
         std::env::set_var(&var, "from-env-fallback");
         let mut inputs = HashMap::new();
         inputs.insert(id.to_string(), prompt_def(id, None, false));

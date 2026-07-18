@@ -15,6 +15,7 @@ pub mod atomic_io;
 pub mod blob;
 pub mod bundle_id;
 pub mod env;
+pub mod env_segment;
 pub mod handshake;
 pub mod hash;
 pub mod mime;
@@ -30,6 +31,10 @@ pub use bundle_id::{
     is_bundle_id_char, is_valid_bundle_id, validate_bundle_id, BundleId, BundleIdError,
 };
 pub use env::{env_truthy, env_truthy_in, env_truthy_or, is_truthy};
+pub use env_segment::{
+    detect_env_name_collisions, env_segment, env_var_name, raise_on_env_name_collisions,
+    EnvNameCollisionError, A2C_ENV_PREFIX,
+};
 pub use handshake::{
     apply_polling_first_guard, build_handshake_url, build_protocol_version_error,
     enforce_polling_first, extract_4008_payload, A2C_VERSION_QUERY_KEY,

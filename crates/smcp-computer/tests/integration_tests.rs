@@ -140,8 +140,9 @@ async fn test_input_system_integration() {
     let provider = EnvironmentInputProvider::new().with_prefix("TEST_".to_string());
 
     // 设置测试环境变量 / Set test environment variables
-    // 环境变量名格式: TEST_ + request.id + server_name + tool_name
-    std::env::set_var("TEST_TEST_INPUT_TEST_SERVER_TEST_TOOL", "test_value");
+    // #140：环境变量名 = prefix + ENV_SEGMENT(id) + '_' + ENV_SEGMENT(server) + '_' + ENV_SEGMENT(tool)
+    // 保留大小写（不再 upper()）：TEST_ + test_input + _test_server + _test_tool。
+    std::env::set_var("TEST_test_input_test_server_test_tool", "test_value");
 
     // 创建输入请求 / Create input request
     let request = InputRequest {
@@ -166,8 +167,8 @@ async fn test_input_system_integration() {
     // 环境变量提供者应该返回环境变量的值
     // The environment provider should return the environment variable value
 
-    // 清理环境变量 / Clean up environment variables
-    std::env::remove_var("TEST_TEST_INPUT_TEST_SERVER_TEST_TOOL");
+    // 清理环境变量 / Clean up environment variables（#140：须与上方 set 的**新名**一致，否则残留污染同进程后续测试）
+    std::env::remove_var("TEST_test_input_test_server_test_tool");
 }
 
 /// 测试错误处理 / Test error handling

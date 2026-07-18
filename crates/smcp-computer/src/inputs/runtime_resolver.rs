@@ -61,7 +61,7 @@ pub enum InputResolutionError {
         id: String,
         /// 种类（value / secret）/ kind。
         kind: InputKind,
-        /// 环境变量补录名（`A2C_INPUT_<ID>`）/ env fallback var name。
+        /// 环境变量补录名（`A2C_SMCP_<ENV_SEGMENT(id)>`）/ env fallback var name。
         env_hint: String,
     },
     /// client resolver 侧硬失败（区别于"未提供"的 `Ok(None)`）/ client resolver hard failure。
@@ -75,7 +75,7 @@ pub enum InputResolutionError {
 }
 
 impl InputResolutionError {
-    /// 构造 [`InputResolutionError::Missing`]（自动派生 `A2C_INPUT_<ID>` 补录名）/ build a Missing error。
+    /// 构造 [`InputResolutionError::Missing`]（自动派生 `A2C_SMCP_<ENV_SEGMENT(id)>` 补录名）/ build a Missing error。
     pub fn missing(id: impl Into<String>, kind: InputKind) -> Self {
         let id = id.into();
         let env_hint = env_var_name(&id);
@@ -221,7 +221,7 @@ mod tests {
             InputResolutionError::Missing { id, kind, env_hint } => {
                 assert_eq!(id, "figma_token");
                 assert_eq!(*kind, InputKind::Secret);
-                assert_eq!(env_hint, "A2C_INPUT_FIGMA_TOKEN");
+                assert_eq!(env_hint, "A2C_SMCP_figma_token");
             }
             other => panic!("expected Missing, got {other:?}"),
         }
@@ -229,7 +229,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("figma_token"));
         assert!(msg.contains("secret"));
-        assert!(msg.contains("A2C_INPUT_FIGMA_TOKEN"));
+        assert!(msg.contains("A2C_SMCP_figma_token"));
     }
 
     #[tokio::test]

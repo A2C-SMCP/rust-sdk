@@ -17,7 +17,7 @@
 //! 解析链（命中即返回、并按解析后池 id 进程内缓存）：
 //! 1. **定位定义**：裸 id 未命中且给了 plugin 上下文 → 回退查带前缀池条目（`<plugin>@<mp>/<id>`，§9.3 D2）。
 //! 2. **进程内 cache**（按解析后池 id，避免不同 plugin 同裸 id 串味）。
-//! 3. **环境变量** `A2C_INPUT_<ID>`（编排层注入）。
+//! 3. **环境变量** `A2C_SMCP_<ENV_SEGMENT(id)>`（编排层注入）。
 //! 4. **OS keyring**（仅 `password:true`）。
 //! 5. **交互 prompt**——password 在 headless（无 env + 无 keyring + 无 TTY）下**硬错误**，绝不落明文。
 //!
@@ -38,23 +38,15 @@ use crate::settings::scope::EnvMap;
 use super::plugin_pool::prefix_input_id;
 use super::secret_store::SecretStore;
 
-/// 把 input id 映射为环境变量名 `A2C_INPUT_<ID_UPPER>`（非 `[A-Z0-9]` → `_`）/ map id to env var name。
+/// 把 input id 映射为环境变量名 `A2C_SMCP_<ENV_SEGMENT(id)>`（#140/F4-F5）/ map id to env var name。
 ///
+/// #140：0.3.0 硬切——历史 `A2C_INPUT_<ID_UPPER>` 前缀 + `upper()` 废止（无双读、无过渡期，F5）。
+/// 单一权威在 [`env_var_name`](smcp::utils::env_segment::env_var_name)（双端逐字节一致、conformance 向量锁定）：**保留大小写**、
+/// 非 `[A-Za-z0-9_]` 码点 → `_`、不折叠不裁首尾。live 解析路径只传裸 id（server/tool 段预防性，#155 决策 1）。
 /// 含前缀 plugin id（`<plugin>@<mp>/<id>`）一并归一，如 `frontend@team/figma_token` →
-/// `A2C_INPUT_FRONTEND_TEAM_FIGMA_TOKEN`。
+/// `A2C_SMCP_frontend_team_figma_token`。
 pub fn env_var_name(input_id: &str) -> String {
-    let mapped: String = input_id
-        .to_uppercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_uppercase() || c.is_ascii_digit() {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("A2C_INPUT_{mapped}")
+    smcp::utils::env_segment::env_var_name(input_id, None, None)
 }
 
 /// inputs 解析错误 / input resolution errors。
@@ -181,7 +173,7 @@ impl InputResolver {
         let is_password =
             matches!(&cfg, MCPServerInput::PromptString(p) if p.password.unwrap_or(false));
 
-        // 3. 环境变量 A2C_INPUT_<ID>（编排层注入）
+        // 3. 环境变量 A2C_SMCP_<ENV_SEGMENT(id)>（编排层注入）
         if let Some(env_val) = self.env.get(&env_var_name(&resolved_id)) {
             let v = Value::String(env_val.clone());
             self.cache.lock().unwrap().insert(resolved_id, v.clone());
@@ -383,10 +375,11 @@ mod tests {
     // ---- env_var_name -------------------------------------------------------
     #[test]
     fn env_var_name_normalizes() {
-        assert_eq!(env_var_name("figma_token"), "A2C_INPUT_FIGMA_TOKEN");
+        // #140：A2C_SMCP_ 前缀 + ENV_SEGMENT（保留大小写、`@`/`/`→`_`，不 upper()）。
+        assert_eq!(env_var_name("figma_token"), "A2C_SMCP_figma_token");
         assert_eq!(
             env_var_name("frontend@team/figma_token"),
-            "A2C_INPUT_FRONTEND_TEAM_FIGMA_TOKEN"
+            "A2C_SMCP_frontend_team_figma_token"
         );
     }
 
@@ -394,7 +387,7 @@ mod tests {
     #[test]
     fn env_beats_keyring() {
         let mut env = EnvMap::new();
-        env.insert("A2C_INPUT_TOK".to_string(), "from-env".to_string());
+        env.insert("A2C_SMCP_tok".to_string(), "from-env".to_string());
         let ks = secret_store(true);
         ks.set("tok", "from-keyring"); // keyring 也有，但 env 优先
         let resolver = InputResolver::new(
@@ -436,7 +429,7 @@ mod tests {
         match resolver.resolve_by_id("secret", None, None) {
             Err(InputResolveError::Secret(id, var)) => {
                 assert_eq!(id, "secret");
-                assert_eq!(var, "A2C_INPUT_SECRET");
+                assert_eq!(var, "A2C_SMCP_secret");
             }
             other => panic!("expected Secret error, got {other:?}"),
         }
@@ -519,7 +512,7 @@ mod tests {
             password: Some(false),
         });
         let mut env = EnvMap::new();
-        env.insert("A2C_INPUT_FIGMA_ACME_TOKEN".to_string(), "v".to_string());
+        env.insert("A2C_SMCP_figma_acme_token".to_string(), "v".to_string());
         let resolver = InputResolver::new(
             [prefixed],
             Box::new(NonInteractivePrompter),
