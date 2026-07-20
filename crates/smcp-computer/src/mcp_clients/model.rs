@@ -839,6 +839,15 @@ pub enum MCPClientError {
     /// MCP Server did not declare the required capability (e.g. `resources`) → mapped to 4015 upstream.
     #[error("Capability not supported: {0}")]
     CapabilityNotSupported(String),
+    /// 上游工具调用错误（**保型**，供 AUTH-01 结构化分类）/ Upstream tool-call error, type preserved.
+    ///
+    /// 与 `ProtocolError(String)` 的区别：保留 rmcp [`rmcp::ServiceError`] 原始类型，使
+    /// [`classify_auth_error`](crate::mcp_clients::auth_error::classify_auth_error) 能对
+    /// `ServiceError::TransportSend` 做结构化 downcast（如 `StreamableHttpError::AuthRequired` → 4006），
+    /// 不再依赖 rmcp `Display` 字面量——后者对最规范的 401+`WWW-Authenticate` 仅产出无状态码的
+    /// `"Auth required"`，导致字符串分类器漏报（#150）。
+    #[error("Call tool error: {0}")]
+    ToolCallError(rmcp::ServiceError),
     /// IO错误 / IO error
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),

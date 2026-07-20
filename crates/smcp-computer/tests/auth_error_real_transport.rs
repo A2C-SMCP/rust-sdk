@@ -139,9 +139,15 @@ async fn spawn_auth_reject_mock(reject_status: StatusCode, with_www_authenticate
     port
 }
 
-/// 驱动一次真实 401/403 tool_call，返回 `call_tool` 的错误字符串。
+/// 驱动一次真实 401/403 tool_call，返回 `call_tool` 的**保型** `MCPClientError`。
 /// time-box 区分「返回 Err」与「挂起」——python 侧正是挂在这里。
-async fn call_and_capture_err(reject_status: StatusCode, with_www_authenticate: bool) -> String {
+///
+/// 直接返回类型化错误（而非 flatten 成 Display 串再重包 `ProtocolError(msg)`），让分类器走**真实构造
+/// 路径**——#150 反假绿：测过滤器（字符串 marker）≠ 测数据源（rmcp 保型错误）。
+async fn call_and_capture_err(
+    reject_status: StatusCode,
+    with_www_authenticate: bool,
+) -> MCPClientError {
     let port = spawn_auth_reject_mock(reject_status, with_www_authenticate).await;
     let client = HttpMCPClient::new(HttpServerParameters {
         url: format!("http://127.0.0.1:{}", port),
@@ -161,14 +167,15 @@ async fn call_and_capture_err(reject_status: StatusCode, with_www_authenticate: 
             reject_status
         ),
         Ok(Ok(r)) => panic!("unexpected Ok result on {}: {:?}", reject_status, r),
-        Ok(Err(e)) => e.to_string(),
+        Ok(Err(e)) => e,
     }
 }
 
 /// 403 → Display 携 `403 Forbidden` → 分类 4007。真实传输下**可达**。
 #[tokio::test]
 async fn test_http_real_403_reaches_4007() {
-    let msg = call_and_capture_err(StatusCode::FORBIDDEN, false).await;
+    let e = call_and_capture_err(StatusCode::FORBIDDEN, false).await;
+    let msg = e.to_string();
     println!("[HTTP 403] {}", msg);
 
     let lower = msg.to_lowercase();
@@ -178,7 +185,7 @@ async fn test_http_real_403_reaches_4007() {
         msg
     );
     assert_eq!(
-        classify_auth_error(&MCPClientError::ProtocolError(msg.clone())),
+        classify_auth_error(&e),
         Some(ErrorCode::ToolAuthorizationFailed),
         "403 must classify as 4007, got none for: {}",
         msg
@@ -188,7 +195,8 @@ async fn test_http_real_403_reaches_4007() {
 /// 裸 401（无 `WWW-Authenticate`）→ 走 `error_for_status` → Display 携 `401 Unauthorized` → 4006 可达。
 #[tokio::test]
 async fn test_http_real_401_without_www_authenticate_reaches_4006() {
-    let msg = call_and_capture_err(StatusCode::UNAUTHORIZED, false).await;
+    let e = call_and_capture_err(StatusCode::UNAUTHORIZED, false).await;
+    let msg = e.to_string();
     println!("[HTTP 401 no-WWW-Authenticate] {}", msg);
 
     let lower = msg.to_lowercase();
@@ -198,25 +206,27 @@ async fn test_http_real_401_without_www_authenticate_reaches_4006() {
         msg
     );
     assert_eq!(
-        classify_auth_error(&MCPClientError::ProtocolError(msg.clone())),
+        classify_auth_error(&e),
         Some(ErrorCode::ToolAuthorizationRequired),
         "bare 401 must classify as 4006, got none for: {}",
         msg
     );
 }
 
-/// **回归缺口**：401 + `WWW-Authenticate`（RFC 6750/9728 要求的标准形态）→ rmcp 短路成
-/// `AuthRequired`，Display 仅 `"Auth required"`，不含状态码 → 当前分类器漏报 4006。
+/// 401 + `WWW-Authenticate`（RFC 6750/9728 要求的标准形态）→ rmcp 短路成
+/// `AuthRequired`，Display 仅 `"Auth required"`，不含状态码。
 ///
-/// 本测试**如实锁定当前（有缺陷的）行为**，作为 Discussion #34 的可复现判据；修复后应改为断言
-/// `Some(ToolAuthorizationRequired)`（详见随附 issue）。
+/// #150 修复后：分类器对保型 `ToolCallError(ServiceError::TransportSend(..))` 做结构化 downcast
+/// 命中 `AuthRequired` → 4006 可达（与裸 401 一致）。Display 见证（事实①②）保留为"为何字符串匹配失效"
+/// 的文档——即令 fallback 字符串表永不命中此形态，结构化路径仍兜住。
 #[tokio::test]
-async fn test_http_real_401_with_www_authenticate_is_currently_misclassified() {
-    let msg = call_and_capture_err(StatusCode::UNAUTHORIZED, true).await;
+async fn test_http_real_401_with_www_authenticate_reaches_4006() {
+    let e = call_and_capture_err(StatusCode::UNAUTHORIZED, true).await;
+    let msg = e.to_string();
     println!("[HTTP 401 +WWW-Authenticate] {}", msg);
 
     // 事实①：不挂起——rmcp 把 transport 错误同步回灌调用方（与 python 挂起形成对比）。
-    // 事实②：Display 为 rmcp 字面量 "Auth required"，**不含** 401/unauthorized。
+    // 事实②：Display 为 rmcp 字面量 "Auth required"，**不含** 401/unauthorized（故字符串 fallback 永不命中）。
     assert!(
         msg.contains("Auth required"),
         "expected rmcp AuthRequired short-circuit, got: {}",
@@ -229,11 +239,12 @@ async fn test_http_real_401_with_www_authenticate_is_currently_misclassified() {
         msg
     );
 
-    // 事实③：故当前分类器漏报——4006 在最标准的 OAuth 形态下**不可达**。
+    // 事实③（#150 修复后）：结构化 downcast 命中 AuthRequired → 4006 可达。
     assert_eq!(
-        classify_auth_error(&MCPClientError::ProtocolError(msg.clone())),
-        None,
-        "documented gap (Discussion #34): rmcp 'Auth required' carries no classifiable marker"
+        classify_auth_error(&e),
+        Some(ErrorCode::ToolAuthorizationRequired),
+        "401 + WWW-Authenticate must classify as 4006 via structured downcast, got: {}",
+        msg
     );
 }
 
@@ -348,7 +359,7 @@ async fn spawn_sse_auth_mock(reject_status: StatusCode) -> u16 {
     port
 }
 
-async fn sse_call_and_capture_err(reject_status: StatusCode) -> String {
+async fn sse_call_and_capture_err(reject_status: StatusCode) -> MCPClientError {
     let port = spawn_sse_auth_mock(reject_status).await;
     let client = SseMCPClient::new(SseServerParameters {
         url: format!("http://127.0.0.1:{}/sse", port),
@@ -365,7 +376,7 @@ async fn sse_call_and_capture_err(reject_status: StatusCode) -> String {
     match outcome {
         Err(_) => panic!("HANG: SSE call_tool did not resolve on upstream {}", reject_status),
         Ok(Ok(r)) => panic!("unexpected Ok on {}: {:?}", reject_status, r),
-        Ok(Err(e)) => e.to_string(),
+        Ok(Err(e)) => e,
     }
 }
 
@@ -373,11 +384,12 @@ async fn sse_call_and_capture_err(reject_status: StatusCode) -> String {
 /// 与 HTTP 传输的 rmcp 短路形成对照——同一部署形态下两传输**分类结果不一致**。
 #[tokio::test]
 async fn test_sse_real_401_reaches_4006() {
-    let msg = sse_call_and_capture_err(StatusCode::UNAUTHORIZED).await;
+    let e = sse_call_and_capture_err(StatusCode::UNAUTHORIZED).await;
+    let msg = e.to_string();
     println!("[SSE 401 +WWW-Authenticate] {}", msg);
 
     assert_eq!(
-        classify_auth_error(&MCPClientError::ProtocolError(msg.clone())),
+        classify_auth_error(&e),
         Some(ErrorCode::ToolAuthorizationRequired),
         "SSE 401 must classify as 4006, got none for: {}",
         msg
@@ -387,11 +399,12 @@ async fn test_sse_real_401_reaches_4006() {
 /// SSE：403 → 4007 可达。
 #[tokio::test]
 async fn test_sse_real_403_reaches_4007() {
-    let msg = sse_call_and_capture_err(StatusCode::FORBIDDEN).await;
+    let e = sse_call_and_capture_err(StatusCode::FORBIDDEN).await;
+    let msg = e.to_string();
     println!("[SSE 403 +WWW-Authenticate] {}", msg);
 
     assert_eq!(
-        classify_auth_error(&MCPClientError::ProtocolError(msg.clone())),
+        classify_auth_error(&e),
         Some(ErrorCode::ToolAuthorizationFailed),
         "SSE 403 must classify as 4007, got none for: {}",
         msg

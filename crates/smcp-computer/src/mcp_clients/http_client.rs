@@ -271,7 +271,7 @@ impl MCPClientProtocol for HttpMCPClient {
                 arguments: params.as_object().cloned(),
             })
             .await
-            .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+            .map_err(MCPClientError::ToolCallError)?;
 
         Ok(result)
     }
@@ -304,7 +304,7 @@ impl MCPClientProtocol for HttpMCPClient {
             .unwrap()
             .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
-            .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+            .map_err(MCPClientError::ToolCallError)?;
         drop(guard);
         let request_id = handle.id.clone();
         let RequestHandle { rx, peer, .. } = handle;
@@ -316,7 +316,7 @@ impl MCPClientProtocol for HttpMCPClient {
                 Ok(Ok(_)) => Err(MCPClientError::ProtocolError(
                     "Unexpected response variant for tools/call".to_string(),
                 )),
-                Ok(Err(e)) => Err(MCPClientError::ProtocolError(format!("Call tool error: {}", e))),
+                Ok(Err(e)) => Err(MCPClientError::ToolCallError(e)),
                 Err(_) => Err(MCPClientError::ConnectionError("MCP transport closed".to_string())),
             },
             _ = cancel.cancelled() => {

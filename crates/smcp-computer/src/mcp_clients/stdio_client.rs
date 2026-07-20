@@ -368,7 +368,7 @@ impl MCPClientProtocol for StdioMCPClient {
                 arguments: params.as_object().cloned(),
             })
             .await
-            .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+            .map_err(MCPClientError::ToolCallError)?;
 
         Ok(result)
     }
@@ -411,7 +411,7 @@ impl MCPClientProtocol for StdioMCPClient {
             .unwrap()
             .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
-            .map_err(|e| MCPClientError::ProtocolError(format!("Call tool error: {}", e)))?;
+            .map_err(MCPClientError::ToolCallError)?;
         // handle 已 owned（id/rx/peer 均独立于 service）→ 立即释放 RunningService 互斥锁，放开同一 stdio
         // server 上的并发在途调用/取消（可取消调用可长/无界，绝不应在 select! 全程持锁）。RunningService
         // 由 self.running_service 的 Arc<Mutex> 保活，drop guard 仅释放锁、不析构 service，peer 仍可用。
@@ -427,7 +427,7 @@ impl MCPClientProtocol for StdioMCPClient {
                 Ok(Ok(_)) => Err(MCPClientError::ProtocolError(
                     "Unexpected response variant for tools/call".to_string(),
                 )),
-                Ok(Err(e)) => Err(MCPClientError::ProtocolError(format!("Call tool error: {}", e))),
+                Ok(Err(e)) => Err(MCPClientError::ToolCallError(e)),
                 Err(_) => Err(MCPClientError::ConnectionError("MCP transport closed".to_string())),
             },
             _ = cancel.cancelled() => {
