@@ -3142,7 +3142,16 @@ impl<S: Session> Computer<S> {
                 None => Err(Self::manager_uninit()),
             }
         };
-        self.bump_capability_if_ok(&result);
+        // #148：成功后 bump capability + joined 时自动广播 server:update_tool_list
+        // （manager 层 start_client_by_id 已 refresh_tool_routes，本地 tool mapping 已最新）。
+        //
+        // 注：start 类（含 restart/all）在**任何** Ok 都广播——与 stop 的 `Ok(true)` gate 不对称：manager 层
+        // `start_client_by_id` 对「已启动再 start」早返 Ok(())（manager.rs 无 bool 返回），故「无实际变更」的
+        // 幂等 start 也会触发一次广播。这与既有 capability_revision 在同路径的 spurious bump 同形；Agent 侧
+        // 回拉幂等（一次额外 tools/list，结果不变），无正确性影响。精确化（manager 返回 bool）为后续 follow-up。
+        if result.is_ok() {
+            self.on_capability_changed().await;
+        }
         result
     }
 
@@ -3162,9 +3171,9 @@ impl<S: Session> Computer<S> {
                 None => Err(Self::manager_uninit()),
             }
         };
-        // 只有**真停了**才改变工具投影 → 仅此时 bump capability（未停到不是能力变化）。
+        // 只有**真停了**才改变工具投影 → 仅此时同步能力（未停到不是能力变化，不广播）。
         if matches!(result, Ok(true)) {
-            self.status.bump_capability();
+            self.on_capability_changed().await;
         }
         result
     }
@@ -3178,7 +3187,9 @@ impl<S: Session> Computer<S> {
                 None => Err(Self::manager_uninit()),
             }
         };
-        self.bump_capability_if_ok(&result);
+        if result.is_ok() {
+            self.on_capability_changed().await;
+        }
         result
     }
 
@@ -3191,7 +3202,9 @@ impl<S: Session> Computer<S> {
                 None => Err(Self::manager_uninit()),
             }
         };
-        self.bump_capability_if_ok(&result);
+        if result.is_ok() {
+            self.on_capability_changed().await;
+        }
         result
     }
 
@@ -3204,7 +3217,9 @@ impl<S: Session> Computer<S> {
                 None => Err(Self::manager_uninit()),
             }
         };
-        self.bump_capability_if_ok(&result);
+        if result.is_ok() {
+            self.on_capability_changed().await;
+        }
         result
     }
 
@@ -3212,11 +3227,12 @@ impl<S: Session> Computer<S> {
         ComputerError::InvalidState("MCP Manager not initialized".to_string())
     }
 
-    /// MCP 起停成功 → bump capability revision（§12 R2：改变 Agent-facing 工具投影）/ bump on Ok。
-    fn bump_capability_if_ok(&self, result: &ComputerResult<()>) {
-        if result.is_ok() {
-            self.status.bump_capability();
-        }
+    /// #148：MCP 起停**真有变更**后：bump capability revision（§12 R2：改变 Agent-facing 工具投影）
+    /// 并（joined 时）向 Office 广播 `server:update_tool_list`（events.md §server:update_tool_list）。
+    /// 与 [`McpChangeReactor`] 的 `tools/list_changed` 路径合流——二者皆由 [`broadcast_tool_list_update`] 收口。
+    async fn on_capability_changed(&self) {
+        self.status.bump_capability();
+        broadcast_tool_list_update(&self.socketio_client).await;
     }
 
     /// 检查 MCP Manager 是否已初始化 / Check if MCP Manager is initialized
@@ -3365,10 +3381,29 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
+    /// #148：底层 transport 断开 + 清空 `socketio_client` 槽（`disconnect_socketio` / `shutdown` 共用，
+    /// 同根 bug 统一收口）。
+    ///
+    /// 取写锁；若槽内有 client，先调底层 transport disconnect（发 Socket.IO DISCONNECT 包并关 transport；
+    /// 持写锁跨 await，与 `join_office`/`leave_office` 持读锁跨 await 同构——`tf-rust-socketio` 的 `Client`
+    /// 背后 reader 后台任务持克隆，仅 Drop 用户句柄**不会**关 transport，必须显式 `disconnect()`），
+    /// 成功后再置 `None`。幂等：槽已空 → no-op。
+    ///
+    /// 失败上抛 Err、**不**清槽、**不**迁移 lifecycle——槽内 client 保留可重试（契约：`Ok` ⟹ 旧 transport
+    /// 已结束，而非仅表示 SDK 丢弃本地引用）。
+    async fn close_socketio_transport(&self) -> ComputerResult<()> {
+        let mut socketio_ref = self.socketio_client.write().await;
+        if let Some(client) = socketio_ref.as_ref() {
+            client.disconnect().await?;
+        }
+        *socketio_ref = None;
+        Ok(())
+    }
+
     /// 断开Socket.IO连接 / Disconnect Socket.IO
     pub async fn disconnect_socketio(&self) -> ComputerResult<()> {
-        let mut socketio_ref = self.socketio_client.write().await;
-        *socketio_ref = None;
+        // #148：自身完成底层 transport disconnect（不再仅置 None）。失败上抛 Err、不迁移 lifecycle。
+        self.close_socketio_transport().await?;
         // #114 S7：断开 Socket.IO 后本地 runtime 仍存活 → 回 Started（契约 §4.5：断开后不再向旧 Office 发
         // `server:update_*`——由 client=None 天然保证；本地管理操作可继续）。已 shutdown 则 transition 为 no-op。
         self.status.transition(LifecycleState::Started);
@@ -3445,15 +3480,17 @@ impl<S: Session> Computer<S> {
         }
         self.skill_debouncer.aclose().await;
 
+        // #148：先关底层 transport（与 disconnect_socketio 同根 bug 收口），再停 MCP——二者独立、锁不冲突
+        // （socketio_client vs mcp_manager；close_socketio_transport 返回前已释放其 W 锁）。**先**关 transport
+        // 保证下方 `manager.stop_all().await?` 失败早返时 transport 不泄漏到进程退出（原序置 None 在 stop_all
+        // 之后，失败即漏）。notify 消费者已在上方停掉，期间无 reactor emit。
+        if let Err(e) = self.close_socketio_transport().await {
+            warn!(error = %e, "transport disconnect during shutdown failed, skipped");
+        }
+
         let mut manager_guard = self.mcp_manager.write().await;
         if let Some(manager) = manager_guard.take() {
             manager.stop_all().await?;
-        }
-
-        // 清除Socket.IO客户端引用 / Clear Socket.IO client reference
-        {
-            let mut socketio_ref = self.socketio_client.write().await;
-            *socketio_ref = None;
         }
 
         info!("Computer {} shutdown successfully", self.name);
@@ -3625,6 +3662,21 @@ async fn restage_mcp_skills_into(
     registered
 }
 
+/// #148：joined 时向 Office 广播 `server:update_tool_list`（events.md §server:update_tool_list）。
+///
+/// Computer 的显式 MCP start/stop/restart/all（经 [`Computer::on_capability_changed`]）与
+/// [`McpChangeReactor`] 的 `tools/list_changed` 路径合流于此——单一广播出口，消除重复。`slot` 为 Computer
+/// 与 reactor 共享的 socketio 客户端槽。未连接/未加入 → [`SmcpComputerClient::emit_update_tool_list`]
+/// 内部 `office_id` guard 静默 no-op（不发旧 Office 消息）；emit 失败仅 `debug` 日志、不上抛（本地能力变更
+/// 已成功，协议重试归 SDK 观测层，业务 client 不承担）。
+async fn broadcast_tool_list_update(slot: &Arc<RwLock<Option<Arc<SmcpComputerClient>>>>) {
+    if let Some(client) = slot.read().await.clone() {
+        if let Err(e) = client.emit_update_tool_list().await {
+            debug!(error = %e, "emit_update_tool_list failed, skipped");
+        }
+    }
+}
+
 /// MCP 运行期变化的单一反应器（#106）：把一条 [`McpServerNotification`] 转成对应的刷新/emit 动作。
 ///
 /// **持锁/断环设计**：持 `Weak` 管理器 cell —— 变化通知的 sender 存于 `MCPServerManager.change_tx`，消费任务
@@ -3747,11 +3799,8 @@ impl McpChangeReactor {
     }
 
     async fn emit_tool_list(&self) {
-        if let Some(client) = self.socketio_client.read().await.clone() {
-            if let Err(e) = client.emit_update_tool_list().await {
-                debug!(error = %e, "emit_update_tool_list failed, skipped");
-            }
-        }
+        // #148：与 Computer 显式 start/stop 路径合流于同一广播函数（DRY）。
+        broadcast_tool_list_update(&self.socketio_client).await;
     }
 
     async fn emit_desktop(&self) {

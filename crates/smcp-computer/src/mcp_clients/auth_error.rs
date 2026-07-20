@@ -90,7 +90,7 @@ const SENSITIVE_HINT_KEY_MARKERS: &[&str] = &[
 /// 把上游 MCP 工具调用错误尽力归类为协议授权错误码 / Best-effort classify an upstream tool-call
 /// error into a protocol authorization code。
 ///
-/// 判别顺序：先 [`classify_structured`]（保型 downcast，覆盖最规范的 `401 + WWW-Authenticate`，
+/// 判别顺序：先 `classify_structured`（保型 downcast，覆盖最规范的 `401 + WWW-Authenticate`，
 /// #150），再退化到 `Display` 小写子串 marker 表（覆盖 SSE 自建错误串 / `McpError` 等非保型路径）。
 /// `Some(4006/4007)` → 调用方应改以授权 `CallToolResult` 透传；`None` → 非授权（5xx / 网络 / 其它，
 /// §435），保持通用错误路径。

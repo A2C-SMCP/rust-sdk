@@ -1382,9 +1382,15 @@ impl SmcpComputerClient {
         }
     }
 
-    /// 断开连接
-    /// Disconnect from server
-    pub async fn disconnect(self) -> ComputerResult<()> {
+    /// 断开连接（发 Socket.IO DISCONNECT 包并关 transport）。
+    ///
+    /// #148：取 `&self`（底层 [`tf_rust_socketio::asynchronous::Client::disconnect`] 本就 `&self`），
+    /// 解除「`disconnect(self)` 按值取参被 `Arc` 挡住」的约束——使 `Computer::disconnect_socketio` /
+    /// `Computer::shutdown`（见 `computer` 模块）能直接对槽内 `Arc<SmcpComputerClient>` 调用，无需
+    /// 调用方 `try_unwrap` 取出内部句柄（这正是 tfrobot-client TFRC-65 要消除的封装边界缺口）。
+    ///
+    /// Disconnect from server (sends the Socket.IO DISCONNECT packet and closes the transport).
+    pub async fn disconnect(&self) -> ComputerResult<()> {
         debug!("Disconnecting from server");
         self.client
             .disconnect()
