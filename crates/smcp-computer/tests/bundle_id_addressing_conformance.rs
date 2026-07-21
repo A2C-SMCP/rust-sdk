@@ -24,15 +24,12 @@
 //! 具体变异点逐条记在各测试的 `变异验证：` 行。
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+// #149：共享 Streamable HTTP mock（非 cli 门控，`test-ws` 无 cli 下亦可编译）。
+#[path = "common/streamable_mock.rs"]
+mod streamable_mock;
+use streamable_mock::{spawn_streamable_mock, MockOpts};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -86,113 +83,17 @@ fn stdio_cfg(name: &str, command: &str, explicit_bid: Option<&str>) -> MCPServer
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Mock MCP Server（Streamable HTTP）：握手/列表放行，仅 tools/call 返 403
+// Mock MCP Server：经共享 [`streamable_mock`] 起一台握手/列表/resources 放行、仅 tools/call 返 403 的 mock。
 // ═══════════════════════════════════════════════════════════════════════════════
-
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
-
-fn full_body(s: impl Into<Bytes>) -> BoxBody {
-    Full::new(s.into()).map_err(|never| match never {}).boxed()
-}
-
-fn empty_body() -> BoxBody {
-    full_body(Bytes::new())
-}
-
-/// 握手 + `tools/list` + `resources/list` 放行；`tools/call` 返 **403**。
-///
-/// 用 403（而非 401）是刻意的：rmcp 在 401 带 `WWW-Authenticate` 时会短路成 `AuthRequired`，其 Display 为
-/// 字面量 `"Auth required"`、**不含**任何状态码判别子串 ⇒ `classify_auth_error` 返 `None`（该缺陷另线跟踪，
-/// 见 protocol Discussion #34）。本文件要锁的是 **bundle_id 身份传递**，不应被那条正交缺陷挡住。
-async fn mock_handler(
-    req: Request<hyper::body::Incoming>,
-) -> Result<Response<BoxBody>, Infallible> {
-    if req.method() != Method::POST {
-        return Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(empty_body())
-            .unwrap());
-    }
-
-    let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value =
-        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({}));
-    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
-
-    if method.starts_with("notifications/") {
-        return Ok(Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .body(empty_body())
-            .unwrap());
-    }
-
-    // 仅 tools/call 被拒 —— 复现「已连接但调用需授权」的生产形态。
-    if method == "tools/call" {
-        return Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header("Content-Type", "text/plain")
-            .body(full_body("Forbidden"))
-            .unwrap());
-    }
-
-    let result = match method {
-        "initialize" => serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "serverInfo": { "name": "addressing-mock", "version": "0.1.0" },
-            "capabilities": { "tools": {}, "resources": {} }
-        }),
-        "tools/list" => serde_json::json!({
-            "tools": [{
-                "name": "protected",
-                "description": "Requires upstream auth",
-                "inputSchema": { "type": "object" }
-            }]
-        }),
-        "resources/list" => serde_json::json!({
-            "resources": [{
-                "uri": "window://addressing-mock/main",
-                "name": "main window",
-                "mimeType": "text/plain"
-            }]
-        }),
-        _ => serde_json::json!({}),
-    };
-
-    let resp_json = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/json");
-    if method == "initialize" {
-        builder = builder.header("mcp-session-id", "addressing-session-001");
-    }
-    Ok(builder
-        .body(full_body(serde_json::to_vec(&resp_json).unwrap()))
-        .unwrap())
-}
-
-async fn spawn_mock() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let io = TokioIo::new(stream);
-            tokio::spawn(async move {
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service_fn(mock_handler))
-                    .await;
-            });
-        }
-    });
-    port
-}
+//
+// 用 403（而非 401）是刻意的：rmcp 在 401 带 `WWW-Authenticate` 时会短路成 `AuthRequired`，其 Display 为
+// 字面量 `"Auth required"`、**不含**任何状态码判别子串 ⇒ `classify_auth_error` 返 `None`（该缺陷另线跟踪，
+// 见 protocol Discussion #34）。本文件要锁的是 **bundle_id 身份传递**，不应被那条正交缺陷挡住。
+// `MockOpts::default()` 逐字复现原 `mock_handler`（403 / 无 WWW-Authenticate / 有 resources/list）。
 
 /// 起一台连上 mock 的 manager，server display 名为 [`AUTH_NAME`]（缺省派生 ⇒ bundle_id = [`AUTH_BID`]）。
 async fn manager_on_mock() -> MCPServerManager {
-    let port = spawn_mock().await;
+    let port = spawn_streamable_mock(MockOpts::default()).await;
     let cfg = MCPServerConfig::Http(HttpServerConfig::new(
         AUTH_NAME,
         HttpServerParameters {
@@ -205,10 +106,11 @@ async fn manager_on_mock() -> MCPServerManager {
     // time-box：驱动真实 socket 的路径 MUST 有超时保护，否则 rmcp 行为回归时 CI 会**无限挂**而非报错
     // （姊妹文件 `auth_error_real_transport.rs` 同款约定）。
     //
-    // 阈值取 60s 而非几秒：本握手实测耗时约 20–50s——`HttpMCPClient` 的 `CONNECT_TIMEOUT_SECS = 30`
-    // （`http_client.rs:32`）会与 mock 对非-POST（rmcp 打开 GET SSE 流）直接返 405 的行为相互作用，
-    // 走满一次内部超时。这是**既有性能特征、非本批引入**（`auth_error_real_transport.rs` 同一形态、
-    // 同样慢），故此处只守「无限挂」这条底线，不在 #142 里顺手调 HTTP 客户端。
+    // 阈值取 60s 仅为「无限挂」底线保护——实测握手在亚秒级完成（本套件 7 测试含多次 start_all，总用时 <1s）。
+    // 此前注释称「握手实测 20–50s、GET 405 × `CONNECT_TIMEOUT_SECS=30` 走满超时」系**误归因**（#149 第 3 项已查）：
+    // rmcp 0.11.0 在 GET 返 405 时映射为 `ServerDoesNotSupportSse`
+    // （`transport/common/reqwest/streamable_http_client.rs:45-46`），worker 捕获后**立即降级**跳过 GET 流
+    // （`transport/streamable_http_client.rs:429`），不消耗任何超时——故 GET 405 非延迟来源。
     tokio::time::timeout(Duration::from_secs(60), manager.start_all())
         .await
         .expect("HANG: start_all 未在 60s 内完成（握手挂起，非仅仅慢）")

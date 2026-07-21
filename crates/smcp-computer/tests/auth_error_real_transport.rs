@@ -20,15 +20,20 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
+// #149：共享 Streamable HTTP mock（非 cli 门控）。HTTP 段改用它；SSE 段沿用其 `full_body`/`empty_body`/`BoxBody`。
+#[path = "common/streamable_mock.rs"]
+mod streamable_mock;
+use streamable_mock::{empty_body, full_body, spawn_streamable_mock, BoxBody, MockOpts};
+
+use http_body_util::BodyExt;
+use http_body_util::StreamBody;
 use hyper::body::Bytes;
+use hyper::body::Frame;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use http_body_util::StreamBody;
-use hyper::body::Frame;
 use smcp::ErrorCode;
 use smcp_computer::mcp_clients::auth_error::classify_auth_error;
 use smcp_computer::mcp_clients::http_client::HttpMCPClient;
@@ -37,107 +42,9 @@ use smcp_computer::mcp_clients::sse_client::SseMCPClient;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
-
-fn full_body(s: impl Into<Bytes>) -> BoxBody {
-    Full::new(s.into()).map_err(|never| match never {}).boxed()
-}
-
-fn empty_body() -> BoxBody {
-    full_body(Bytes::new())
-}
-
-/// 握手放行、仅 `tools/call` 返指定状态码的 Streamable HTTP mock。
-/// `with_www_authenticate` 控制是否带 `WWW-Authenticate`（rmcp 401 短路的触发条件）。
-async fn auth_reject_handler(
-    req: Request<hyper::body::Incoming>,
-    reject_status: StatusCode,
-    with_www_authenticate: bool,
-) -> Result<Response<BoxBody>, Infallible> {
-    if req.method() != Method::POST {
-        return Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(empty_body())
-            .unwrap());
-    }
-
-    let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value =
-        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({}));
-    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
-
-    if method.starts_with("notifications/") {
-        return Ok(Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .body(empty_body())
-            .unwrap());
-    }
-
-    // 关键：仅 tools/call 被拒，握手/列表全放行 —— 复现「已连接但调用需授权」的生产形态。
-    if method == "tools/call" {
-        let mut builder = Response::builder()
-            .status(reject_status)
-            .header("Content-Type", "text/plain");
-        if with_www_authenticate {
-            builder = builder.header("WWW-Authenticate", "Bearer realm=\"mcp\"");
-        }
-        return Ok(builder
-            .body(full_body(
-                reject_status.canonical_reason().unwrap_or("denied"),
-            ))
-            .unwrap());
-    }
-
-    let result = match method {
-        "initialize" => serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "serverInfo": { "name": "auth-mock", "version": "0.1.0" },
-            "capabilities": { "tools": {} }
-        }),
-        "tools/list" => serde_json::json!({
-            "tools": [{
-                "name": "protected",
-                "description": "Requires upstream auth",
-                "inputSchema": { "type": "object" }
-            }]
-        }),
-        _ => serde_json::json!({}),
-    };
-
-    let resp_json = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/json");
-    if method == "initialize" {
-        builder = builder.header("mcp-session-id", "auth-session-001");
-    }
-    Ok(builder
-        .body(full_body(serde_json::to_vec(&resp_json).unwrap()))
-        .unwrap())
-}
-
-async fn spawn_auth_reject_mock(reject_status: StatusCode, with_www_authenticate: bool) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let io = TokioIo::new(stream);
-            tokio::spawn(async move {
-                let service = service_fn(move |req| async move {
-                    auth_reject_handler(req, reject_status, with_www_authenticate).await
-                });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
-            });
-        }
-    });
-    port
-}
+// HTTP 段的 mock 已抽到共享 [`streamable_mock`]（#149）：`spawn_streamable_mock(MockOpts { reject_status,
+// with_www_authenticate, expose_resources: false })`。**MUST 保留** `with_www_authenticate` 开关——本文件
+// 的结论依赖「401 + `WWW-Authenticate` 时 rmcp 短路成 `AuthRequired`」这一形态。
 
 /// 驱动一次真实 401/403 tool_call，返回 `call_tool` 的**保型** `MCPClientError`。
 /// time-box 区分「返回 Err」与「挂起」——python 侧正是挂在这里。
@@ -148,7 +55,12 @@ async fn call_and_capture_err(
     reject_status: StatusCode,
     with_www_authenticate: bool,
 ) -> MCPClientError {
-    let port = spawn_auth_reject_mock(reject_status, with_www_authenticate).await;
+    let port = spawn_streamable_mock(MockOpts {
+        reject_status,
+        with_www_authenticate,
+        expose_resources: false,
+    })
+    .await;
     let client = HttpMCPClient::new(HttpServerParameters {
         url: format!("http://127.0.0.1:{}", port),
         headers: HashMap::new(),
