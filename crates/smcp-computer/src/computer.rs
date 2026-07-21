@@ -1702,6 +1702,11 @@ impl<S: Session> Computer<S> {
     }
 
     /// 启动Computer / Boot up the computer
+    ///
+    /// # Errors
+    /// 渲染阶段对已定义但 resolver/env/default 均无法提供的 input/secret 上抛
+    /// [`ComputerError::InputResolution`]（#144，对齐 [`Self::mount_server`]，**非仅日志**）；client 据此驱动补录
+    /// UI 并在保存后重试。失败落 `Error` 状态、不残留 manager/task/transport，可安全重试。管理器初始化失败（manager 错）。
     pub async fn boot_up(&self) -> ComputerResult<()> {
         info!("Starting Computer: {}", self.name);
         // #140：注册期 env 名坍缩 fail-fast——两 input id 经 ENV_SEGMENT 归一同一完整 env 名（如 `a-b`/`a_b`）
@@ -1733,6 +1738,19 @@ impl<S: Session> Computer<S> {
             match self.render_server_config(server_config).await {
                 Ok(validated) => validated_servers.push(validated),
                 Err(e) => {
+                    // #144：D1 结构化 input 解析错误（Missing/ResolverFailed）须上抛供 client 驱动补录（非仅日志，
+                    // 对齐 mount_server）。此处位于 commit/spawn/watcher 之前 ⇒ 无残留 manager/task/transport，boot 可
+                    // 安全重试。落 `Error` + last_error（同下方 initialize 失败路径）使观测面反映失败、不卡 `Starting`；
+                    // 诊断仅用 error_code + 名（不含渲染细节/secret，契约 §3）。其余渲染错误维持「保留原配置」容错。
+                    if matches!(e, ComputerError::InputResolution(_)) {
+                        self.status.set_last_error(Some(format!(
+                            "boot failed to render server config '{}' (code {})",
+                            server_config.name(),
+                            e.error_code()
+                        )));
+                        self.status.transition(LifecycleState::Error);
+                        return Err(e);
+                    }
                     error!(
                         "Failed to render server config {}: {}",
                         server_config.name(),
@@ -1745,9 +1763,9 @@ impl<S: Session> Computer<S> {
         }
 
         // 初始化管理器 / Initialize manager
-        // #114 S7：boot 的唯一硬失败点。失败 → 落 `Error` 状态 + 公开诊断（不含 secret，仅错误类别串），使观测面
-        // 反映「boot 失败」而非卡在 `Starting`（契约 §3 `error` 语义）。诊断用 `error_code` + 简述，避免透传可能
-        // 含渲染细节的 Display 全文。
+        // #114 S7：boot 的硬失败点之一（另一为上方 #144 render 阶段的 InputResolution）。失败 → 落 `Error` 状态 +
+        // 公开诊断（不含 secret，仅错误类别串），使观测面反映「boot 失败」而非卡在 `Starting`（契约 §3 `error` 语义）。
+        // 诊断用 `error_code` + 简述，避免透传可能含渲染细节的 Display 全文。
         if let Err(e) = manager.initialize(validated_servers).await {
             self.status.set_last_error(Some(format!(
                 "boot failed to initialize MCP manager (code {})",
@@ -6255,6 +6273,196 @@ mod tests {
             msg.contains("A2C_SMCP_a_b") && msg.to_lowercase().contains("collide"),
             "错误须指明坍缩到同一 env 名：{msg}"
         );
+    }
+
+    // ── #144：boot_up 须把 D1 结构化 InputResolution 上抛（非仅日志），对齐 mount_server ──────────
+
+    /// 构造单个引用 `${input:<id>}` 的 stdio server 的 mcp_servers 映射（boot_up 读 self.mcp_servers 渲染）。
+    fn one_server_referencing(arg: &str) -> HashMap<String, MCPServerConfig> {
+        HashMap::from([("s".to_string(), stdio_with_arg(arg))])
+    }
+
+    #[tokio::test]
+    async fn boot_up_propagates_missing_value_input() {
+        // #144：已定义、无默认值、无 resolver/env 的 value input → boot_up 上抛 InputResolution::Missing（非 Ok+日志）。
+        let mut inputs = HashMap::new();
+        inputs.insert("b144_val".to_string(), prompt_def("b144_val", None, false));
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs),
+            Some(one_server_referencing("${input:b144_val}")),
+            false,
+            false,
+        );
+        let err = computer
+            .boot_up()
+            .await
+            .expect_err("boot_up MUST propagate missing-value InputResolution");
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::Missing { id, kind, .. }) => {
+                assert_eq!(id, "b144_val");
+                assert_eq!(*kind, InputKind::Value);
+            }
+            other => panic!("expected InputResolution::Missing, got {other:?}"),
+        }
+        assert_eq!(err.error_code(), 400);
+    }
+
+    #[tokio::test]
+    async fn boot_up_propagates_missing_secret_input() {
+        // #144：password:true secret 缺失 → Missing{kind:Secret}。Missing 结构体无值字段 ⇒ 安全验收：错误天然不含明文。
+        let mut inputs = HashMap::new();
+        inputs.insert("b144_sec".to_string(), prompt_def("b144_sec", None, true));
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs),
+            Some(one_server_referencing("${input:b144_sec}")),
+            false,
+            false,
+        );
+        let err = computer
+            .boot_up()
+            .await
+            .expect_err("boot_up MUST propagate missing-secret InputResolution");
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::Missing {
+                id,
+                kind,
+                env_hint,
+            }) => {
+                assert_eq!(id, "b144_sec");
+                assert_eq!(*kind, InputKind::Secret);
+                // env_hint 为补录变量名（非 secret 明文）。
+                assert_eq!(env_hint, &env_var_name("b144_sec"));
+            }
+            other => panic!("expected Missing(Secret), got {other:?}"),
+        }
+        // 错误文案不得含任何疑似明文（此处 secret 本就缺失，确保无泄漏路径）。
+        assert!(!format!("{err}").contains("password"));
+        assert_eq!(err.error_code(), 400);
+    }
+
+    #[tokio::test]
+    async fn boot_up_propagates_resolver_hard_failure() {
+        // #144：client resolver 硬失败（Err）→ boot_up 上抛 ResolverFailed（区别于 Ok(None) 的 Missing 回退）。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "b144_fail".to_string(),
+            prompt_def("b144_fail", None, false),
+        );
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs),
+            Some(one_server_referencing("${input:b144_fail}")),
+            false,
+            false,
+        )
+        .with_input_resolver(Arc::new(FailingInputResolver));
+        let err = computer
+            .boot_up()
+            .await
+            .expect_err("boot_up MUST propagate resolver hard-failure");
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::ResolverFailed { id, reason }) => {
+                assert_eq!(id, "b144_fail");
+                assert!(reason.contains("boom"), "reason 须透传：{reason}");
+            }
+            other => panic!("expected ResolverFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_up_input_resolution_sets_error_status() {
+        // #144：失败须落 Error 状态 + last_error（对齐 manager.initialize 失败路径）——boot 可安全重试、观测面反映失败，
+        // 而非卡在 Starting。失败发生在 render 循环（commit/spawn/watcher 之前）⇒ 无残留 manager/task/transport。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "b144_state".to_string(),
+            prompt_def("b144_state", None, false),
+        );
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs),
+            Some(one_server_referencing("${input:b144_state}")),
+            false,
+            false,
+        );
+        assert!(
+            computer.boot_up().await.is_err(),
+            "boot MUST fail on missing input"
+        );
+        let snap = computer.status().await;
+        assert_eq!(
+            snap.lifecycle,
+            LifecycleState::Error,
+            "失败后状态须为 Error（非卡 Starting）"
+        );
+        assert!(
+            snap.last_error.is_some(),
+            "last_error 须落诊断（仅错误类别串、不含 secret）"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_up_retry_succeeds_after_resolver_provides_value() {
+        // #144：boot 失败后生命周期可安全重试——同一 Computer 在值可得后再次 boot 成功（无残留状态阻塞）。
+        // Error→Starting 迁移被允许（仅 Shutdown 终态拒绝），故首轮失败后可直挂重试。
+        let id = "b144_retry";
+        let var = env_var_name(id); // A2C_SMCP_b144_retry（#140 保留大小写）
+        std::env::remove_var(&var); // 确保首轮缺失
+        let mut inputs = HashMap::new();
+        inputs.insert(id.to_string(), prompt_def(id, None, false));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs),
+            Some(one_server_referencing(&format!("${{input:{id}}}"))),
+            false,
+            false,
+        )
+        .with_skill_home(tmp.path().join("skills"))
+        .with_blob_cache_root(tmp.path().join("blob"))
+        .with_config_dir(tmp.path().join("config"));
+
+        // 首轮：值缺失 → boot 失败（InputResolution），状态落 Error。
+        assert!(
+            computer.boot_up().await.is_err(),
+            "首轮 boot 须因 missing input 失败"
+        );
+        assert_eq!(computer.status().await.lifecycle, LifecycleState::Error);
+
+        // 提供值（env 回退路径）→ 同一 Computer 重试成功（证明无残留 manager/task/transport 阻塞重试）。
+        std::env::set_var(&var, "provided");
+        let second = computer.boot_up().await;
+        std::env::remove_var(&var);
+        second.expect("重试 boot 须在值可得后成功（无残留状态阻塞）");
+    }
+
+    #[tokio::test]
+    async fn boot_up_tolerates_undefined_placeholder() {
+        // #144：未定义占位符（不在 inputs 池）≠ 已定义但解析失败。前者保留字面、不上抛（VS Code parity），
+        // 仅后者（InputResolution）上抛。本测试守护「不连坐误伤」：无 input 定义时 boot 不应失败。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None, // 无 inputs 定义 → b144_undef 为未定义占位符
+            Some(one_server_referencing("${input:b144_undef}")),
+            false,
+            false,
+        )
+        .with_skill_home(tmp.path().join("skills"))
+        .with_blob_cache_root(tmp.path().join("blob"))
+        .with_config_dir(tmp.path().join("config"));
+        computer
+            .boot_up()
+            .await
+            .expect("undefined placeholder MUST NOT fail boot（字面保留）");
     }
 
     #[tokio::test]
