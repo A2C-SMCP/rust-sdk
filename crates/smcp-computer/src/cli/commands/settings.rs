@@ -76,22 +76,14 @@ fn writable_path(
     }
 }
 
-/// 读单 scope（或 merged）settings dict；进程 cwd 不可读时 project/local → 空层 / read one scope。
+/// 读单 scope（或 merged）settings dict **连同校验错误**；进程 cwd 不可读时 project/local → 空层 / read one scope。
 ///
 /// #98：project/local 锚定 `cwd`（`None` → 进程 cwd）。
-fn read_scope(
-    scope: &str,
-    env: Option<&EnvMap>,
-    cwd: Option<&Path>,
-    flag_path: Option<&Path>,
-) -> Option<Map<String, Value>> {
-    read_scope_with_errors(scope, env, cwd, flag_path).map(|(m, _)| m)
-}
-
-/// 同 [`read_scope`]，但**保留校验错误**（scope 越权过滤 / 字段级判废）/ same, but keeps errors。
 ///
-/// #143：`settings show <scope>` 是用户排查「我的 settings 莫名不生效」时**最先跑**的命令 —— scope 越权
-/// 会静默丢字段（policy-only / 审批门 enable 方向判据），若此处也吞错误则诊断回路断裂。协议 §3「响亮失败」。
+/// #143/#145：**恒带出 errors**（无吞错误包装）—— scope 越权会静默丢字段（policy-only / 审批门 enable 方向
+/// 判据），`settings show`/`get` 是用户排查「我的 settings 莫名不生效」时**最先跑**的命令，若吞错误则诊断回路
+/// 断裂、`get` 还会答「not set in scope」主动误导。呈现由调用方统一走 stderr（`format_settings_errors`）。
+/// 协议 §3「响亮失败」。对拍 python `_read_scope_with_errors`（python#157 已删吞错误包装，rust 同构）。
 fn read_scope_with_errors(
     scope: &str,
     env: Option<&EnvMap>,
@@ -161,7 +153,7 @@ pub fn settings_show(
             EXIT_USER_ERROR,
         );
     }
-    // READABLE 预检后 read_scope 恒 Some；None 仅在未知 scope（防御）。
+    // READABLE 预检后 read_scope_with_errors 恒 Some；None 仅在未知 scope（防御）。
     let Some((data, errors)) = read_scope_with_errors(scope, env, cwd, flag_path) else {
         return err(
             &format!("unknown scope {scope:?}"),
@@ -193,14 +185,20 @@ pub fn settings_get(
             EXIT_USER_ERROR,
         );
     }
-    // READABLE 预检后 read_scope 恒 Some；None 仅在未知 scope（防御）。
-    let Some(data) = read_scope(scope, env, cwd, flag_path) else {
+    // READABLE 预检后 read_scope_with_errors 恒 Some；None 仅在未知 scope（防御）。
+    let Some((data, errors)) = read_scope_with_errors(scope, env, cwd, flag_path) else {
         return err(
             &format!("unknown scope {scope:?}"),
             json_output,
             EXIT_USER_ERROR,
         );
     };
+    // #145：越权字段会被过滤出 data —— 若不呈现，下面的 "not set in scope" 会**主动误导**
+    // （文件里明明写了，却被安全策略过滤谎报成「你没配」）。故在判 key 命中之前先经 stderr 解释。
+    // 对齐 settings_show 与 python-sdk#157（emit 置于 key 判空之前）；stdout JSON 契约不变。
+    for line in super::format_settings_errors(&errors) {
+        eprintln!("{line}");
+    }
     let Some(value) = data.get(key) else {
         return err(
             &format!("key {key:?} not set in scope {scope:?}"),
@@ -385,7 +383,9 @@ mod tests {
             settings_set(Some(&env), "k", "1", "project", Some(&wd), true),
             EXIT_OK
         );
-        let data = read_scope("project", Some(&env), Some(&wd), None).unwrap();
+        let data = read_scope_with_errors("project", Some(&env), Some(&wd), None)
+            .unwrap()
+            .0;
         assert_eq!(data.get("k"), Some(&json!(1)));
         assert!(workdir_project_settings_path(&wd).exists());
     }
@@ -400,7 +400,9 @@ mod tests {
             EXIT_OK
         );
         // 直读 user scope 验证落盘。
-        let data = read_scope("user", Some(&env), None, None).unwrap();
+        let data = read_scope_with_errors("user", Some(&env), None, None)
+            .unwrap()
+            .0;
         assert_eq!(data.get("maxConcurrency"), Some(&json!(7)));
         // get 命中 → 0；缺失 key → 1。
         assert_eq!(
@@ -419,8 +421,9 @@ mod tests {
         let env = test_env(dir.path());
         settings_set(Some(&env), "foo", "\"bar\"", "user", None, true);
         assert_eq!(
-            read_scope("user", Some(&env), None, None)
+            read_scope_with_errors("user", Some(&env), None, None)
                 .unwrap()
+                .0
                 .get("foo"),
             Some(&json!("bar"))
         );
@@ -430,8 +433,9 @@ mod tests {
             EXIT_OK
         );
         assert_eq!(
-            read_scope("user", Some(&env), None, None)
+            read_scope_with_errors("user", Some(&env), None, None)
                 .unwrap()
+                .0
                 .get("foo"),
             Some(&Value::Null)
         );
@@ -445,8 +449,9 @@ mod tests {
         // 数组整体替换（非拼接）。
         settings_set(Some(&env), "list", "[9]", "user", None, true);
         assert_eq!(
-            read_scope("user", Some(&env), None, None)
+            read_scope_with_errors("user", Some(&env), None, None)
                 .unwrap()
+                .0
                 .get("list"),
             Some(&json!([9]))
         );
@@ -456,7 +461,9 @@ mod tests {
     fn flag_scope_without_path_is_empty() {
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
-        let data = read_scope("flag", Some(&env), None, None).unwrap();
+        let data = read_scope_with_errors("flag", Some(&env), None, None)
+            .unwrap()
+            .0;
         assert!(data.is_empty());
     }
 
