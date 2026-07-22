@@ -1364,6 +1364,54 @@ mod tests {
         );
     }
 
+    /// #151 Part 1（端到端）：被 precedence 遮蔽的非法声明经 #128 管线穿出 `snapshot.diagnostics`。
+    /// User 非法 `shadowed`(carrier-pigeon) 被 Local 同名合法 stdio 遮蔽 → Local 合法进 servers、
+    /// User 非法声明进 diagnostics（下游无需自行重解析即可区分「遮蔽非法」与「未声明」）。
+    #[test]
+    fn snapshot_diagnostics_includes_shadowed_illegal_declaration_151() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        // user：非法 `shadowed`（可解析 JSON 内的非法实体，区别于 #128 的损坏 JSON）。
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"servers": {"shadowed": {"type":"carrier-pigeon","server_parameters":{"command":"u"}}}}"#,
+        );
+        // local：同名合法 stdio（更高优先级 → 获胜）。
+        write(
+            &workdir_mcp_local_config_path(&wd),
+            r#"{"servers": {"shadowed": {"type":"stdio","server_parameters":{"command":"local"}}}}"#,
+        );
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+
+        // 获胜者投影：Local 合法 stdio。
+        assert_eq!(snap.mcp.servers.len(), 1);
+        assert_eq!(snap.mcp.servers[0].name, "shadowed");
+        assert_eq!(snap.mcp.servers[0].origin, ProvenanceScope::Local);
+        // 诊断：被遮蔽的 User 非法声明穿出 snapshot 公共契约。
+        let shadowed_diag = snap
+            .diagnostics
+            .iter()
+            .find(|d| d.scope == SettingsScope::User && d.field == "servers.shadowed")
+            .expect("被遮蔽的 User 非法声明 MUST 经 snapshot.diagnostics 暴露（#151 Part 1）");
+        assert!(
+            shadowed_diag
+                .source_path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("mcp.json")),
+            "诊断须带 source_path 指向 user mcp.json（实得 {:?}）",
+            shadowed_diag.source_path
+        );
+    }
+
     /// #128：部分失败——合法 srv-a 保留、畸形 srv-b 丢弃 **且** 诊断暴露丢弃项（field=servers.srv-b）。
     #[test]
     fn snapshot_partial_failure_keeps_valid_and_diagnoses_malformed_sibling_128() {

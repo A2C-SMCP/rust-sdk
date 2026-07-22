@@ -503,7 +503,19 @@ pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
                 errors.extend(errs);
                 let src = path.to_string_lossy().into_owned();
                 for (srv_name, sdef) in file.servers {
-                    raw_servers.insert(srv_name, (sdef, *scope, src.clone()));
+                    // #151 Part 1：被更高优先级层遮蔽（insert 覆盖）的定义在此即丢失——MUST 先校验它，
+                    // 否则「可解析 JSON 内被 precedence 遮蔽的非法实体」诊断静默丢失（获胜者由合并后循环校验）。
+                    if let Some((shadowed_def, shadowed_scope, shadowed_src)) =
+                        raw_servers.insert(srv_name.clone(), (sdef, *scope, src.clone()))
+                    {
+                        let (_, errs) = validate_server(
+                            &srv_name,
+                            &shadowed_def,
+                            shadowed_scope,
+                            Some(&shadowed_src),
+                        );
+                        errors.extend(errs);
+                    }
                 }
                 for idef in file.inputs {
                     let iid = idef.get("id").and_then(Value::as_str).map(String::from);
@@ -515,7 +527,14 @@ pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
                             k
                         }
                     };
-                    raw_inputs.insert(key, (idef, *scope, src.clone()));
+                    // #151 Part 1：被遮蔽的 input 定义同样先校验（id 键遮蔽）。
+                    if let Some((shadowed_def, shadowed_scope, shadowed_src)) =
+                        raw_inputs.insert(key, (idef, *scope, src.clone()))
+                    {
+                        let (_, errs) =
+                            validate_input(&shadowed_def, shadowed_scope, Some(&shadowed_src));
+                        errors.extend(errs);
+                    }
                 }
             }
             // embed 层：宿主构造入参投影成 mcp.json 形状（map 键 = `cfg.name()`，与文件层身份承载一致）。
@@ -527,10 +546,21 @@ pub fn resolve_mcp_config(args: ResolveMcpConfigArgs<'_>) -> ResolvedMcpConfig {
                     let name = cfg.name().to_string();
                     match serde_json::to_value(cfg) {
                         Ok(sdef) => {
-                            raw_servers.insert(
-                                name,
-                                (sdef, SettingsScope::Embed, EMBED_SOURCE.to_string()),
-                            );
+                            // #151 Part 1：embed 覆盖文件层同名声明时，先校验被遮蔽者。
+                            if let Some((shadowed_def, shadowed_scope, shadowed_src)) = raw_servers
+                                .insert(
+                                    name.clone(),
+                                    (sdef, SettingsScope::Embed, EMBED_SOURCE.to_string()),
+                                )
+                            {
+                                let (_, errs) = validate_server(
+                                    &name,
+                                    &shadowed_def,
+                                    shadowed_scope,
+                                    Some(&shadowed_src),
+                                );
+                                errors.extend(errs);
+                            }
                         }
                         // 校验后的模型序列化几乎不可能失败；真失败则记诊断、不阻断其余层。
                         Err(e) => errors.push(err(
@@ -1069,6 +1099,137 @@ mod tests {
             "flag > embed"
         );
         assert_eq!(cmd2, "flag");
+    }
+
+    // ==== #151 Part 1：跨 scope 遮蔽的非法声明须被独立校验、诊断穿出（获胜配置不变）=========
+
+    /// #151：User 非法 `shadowed`(type=carrier-pigeon) 被 Local 同名合法 stdio 遮蔽 → Local 合法获胜、
+    /// `errors` 仍含被遮蔽 User 声明的结构化 schema 诊断（scope/source_path/field/reason）。
+    #[test]
+    fn shadowed_illegal_lower_scope_diagnosed_winning_unchanged_151() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = isolated_env(&tmp.path().join("xdg"));
+        // user：非法 `shadowed`（unknown type，可解析 JSON 内的非法实体，区别于 #128 的损坏 JSON）。
+        let user_path = user_mcp_config_path(Some(&env));
+        write(
+            &user_path,
+            r#"{"servers": {"shadowed": {"type":"carrier-pigeon","server_parameters":{"command":"u"}}}}"#,
+        );
+        // local：同名合法 stdio（更高优先级 → 获胜）。
+        write(
+            &workdir_mcp_local_config_path(&wd),
+            r#"{"servers": {"shadowed": {"type":"stdio","server_parameters":{"command":"local"}}}}"#,
+        );
+
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            ..Default::default()
+        });
+
+        // 获胜不变：Local 合法 stdio、origin=Local。
+        let winner = &resolved.servers["shadowed"];
+        assert_eq!(winner.origin, SettingsScope::Local);
+        let cmd = match &winner.config {
+            MCPServerConfig::Stdio(c) => c.server_parameters.command.as_str(),
+            _ => panic!("stdio"),
+        };
+        assert_eq!(cmd, "local");
+
+        // 诊断：被遮蔽的 User 非法声明仍报——scope=User、field=servers.shadowed、source_path 指 user mcp.json。
+        let expected_src = user_path.to_string_lossy().into_owned();
+        let errs: Vec<_> = resolved
+            .errors
+            .iter()
+            .filter(|e| e.scope == SettingsScope::User && e.field == "servers.shadowed")
+            .collect();
+        assert_eq!(errs.len(), 1, "被遮蔽的 User 非法声明 MUST 产出结构化诊断");
+        assert_eq!(errs[0].source_path.as_deref(), Some(expected_src.as_str()));
+    }
+
+    /// #151：仅低 scope 非法、无更高 scope 覆盖 → 仍是获胜者，drop + error（不回归 #128 既有行为）。
+    #[test]
+    fn shadowed_illegal_with_no_override_still_diagnosed_151() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = isolated_env(&tmp.path().join("xdg"));
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"servers": {"shadowed": {"type":"carrier-pigeon","server_parameters":{"command":"u"}}}}"#,
+        );
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            ..Default::default()
+        });
+        assert!(
+            !resolved.servers.contains_key("shadowed"),
+            "非法获胜者 MUST drop"
+        );
+        assert_eq!(resolved.errors.len(), 1);
+        assert_eq!(resolved.errors[0].scope, SettingsScope::User);
+        assert_eq!(resolved.errors[0].field, "servers.shadowed");
+    }
+
+    /// #151：合法声明被合法声明遮蔽 → 不报噪音（errors 空）。
+    #[test]
+    fn shadowed_legal_declaration_produces_no_error_151() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = isolated_env(&tmp.path().join("xdg"));
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"u"}}}}"#,
+        );
+        write(
+            &workdir_mcp_local_config_path(&wd),
+            r#"{"servers": {"srv": {"type":"stdio","server_parameters":{"command":"local"}}}}"#,
+        );
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            ..Default::default()
+        });
+        assert_eq!(resolved.servers["srv"].origin, SettingsScope::Local);
+        assert!(resolved.errors.is_empty(), "合法遮蔽合法 MUST 不报噪音");
+    }
+
+    /// #151：inputs 侧同构——被遮蔽的非法 input 声明（id 键遮蔽）仍报诊断。
+    #[test]
+    fn shadowed_illegal_input_diagnosed_151() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = isolated_env(&tmp.path().join("xdg"));
+        // user：非法 input `tok`（unknown type variant）。
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"inputs": [{"id":"tok","type":"NotARealInputType"}]}"#,
+        );
+        // local：合法 input `tok`（遮蔽）。
+        write(
+            &workdir_mcp_local_config_path(&wd),
+            r#"{"inputs": [{"type":"PromptString","id":"tok","description":"d"}]}"#,
+        );
+        let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            managed_mcp_path: Some(&tmp.path().join("no-managed.json")),
+            ..Default::default()
+        });
+        // 获胜=Local 合法 input。
+        assert_eq!(resolved.inputs.len(), 1);
+        assert_eq!(resolved.inputs[0].id(), "tok");
+        // 被遮蔽的 User 非法 input 报错。
+        let errs: Vec<_> = resolved
+            .errors
+            .iter()
+            .filter(|e| e.scope == SettingsScope::User && e.field == "inputs.tok")
+            .collect();
+        assert_eq!(errs.len(), 1, "被遮蔽的 User 非法 input MUST 诊断");
     }
 
     /// #147：通用禁用开关（`deniedMcpServers`，档①）对 embed **适用**——用户/管理员保留最终关停权
