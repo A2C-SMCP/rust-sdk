@@ -104,7 +104,7 @@ impl<'a> ConfigContext<'a> {
     }
 
     /// 组装 S2 写目标锚点（env-resolved 路径拼接）/ build the S2 write-target anchors。
-    fn anchors(&self) -> ScopeAnchors {
+    pub(crate) fn anchors(&self) -> ScopeAnchors {
         ScopeAnchors::new(self.config_dir, self.env.cloned().unwrap_or_default())
     }
 }

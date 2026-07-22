@@ -139,7 +139,7 @@ fn execute_one(plan: &WritePlan) -> Result<(), ExecutorError> {
 }
 
 /// 读**原始** JSON object（无校验）：缺失/空 → 空 map；损坏/非 object → `CorruptTarget`（不覆盖）。
-fn read_raw_object(path: &Path) -> Result<Map<String, Value>, ExecutorError> {
+pub(crate) fn read_raw_object(path: &Path) -> Result<Map<String, Value>, ExecutorError> {
     if !path.exists() {
         return Ok(Map::new());
     }

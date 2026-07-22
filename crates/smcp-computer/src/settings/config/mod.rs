@@ -12,6 +12,7 @@
 
 pub mod crud;
 pub mod executor;
+pub mod import;
 pub mod portability;
 pub mod snapshot;
 pub mod validate;
@@ -22,6 +23,9 @@ pub use crud::{
     save_config, update_config, ConfigContext, ConfigCrudError, ConfigEdit, ProjectConfigDoc,
 };
 pub use executor::{execute_write_plans, ExecutorError};
+pub use import::{
+    import_mcp_servers, preflight_mcp_import, ImportError, PlannedServer, PreflightReport,
+};
 pub use portability::{export_config, import_config, REDACTED_PLACEHOLDER};
 pub use snapshot::{
     resolve_snapshot, ComputerConfigSnapshot, ConfigRevision, EntityKey, InputDefsView,

@@ -37,7 +37,8 @@ use crate::governance::{
 };
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::settings::config::{
-    load_config, update_config, ConfigContext, ConfigEdit, ConfigEntity, EditIntent,
+    import_mcp_servers as import_mcp_servers_cfg, load_config, preflight_mcp_import, update_config,
+    ConfigContext, ConfigEdit, ConfigEntity, EditIntent, PlannedServer, PreflightReport,
     ProvenanceScope, WriteScope, WriteTargetError, WriteTargetOptions,
 };
 use crate::settings::installer::{
@@ -48,6 +49,7 @@ use crate::settings::lifecycle::{
     AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceRefreshRow,
     MarketplaceRemoveOutcome, RemoveMarketplaceParams,
 };
+use crate::settings::mcp_config::canonicalize_persist_body;
 use crate::settings::policy::resolve_policy_settings;
 use crate::settings::reconciler::InstalledPluginRecord;
 use crate::settings::recovery::{BundledServerRecord, GovernanceRecoveryReport};
@@ -168,36 +170,6 @@ fn json_to_input_value(value: serde_json::Value) -> ComputerResult<InputValue> {
             "Unsupported value type".to_string(),
         )),
     }
-}
-
-/// 落盘前把类型化 `MCPServerConfig` 的序列化体归一化为 `mcp.json` 规范形（#113 S6）/ canonicalize the persist body。
-///
-/// 两处订正，保**跨 SDK（Python）可读** + Rust 自身重启回读：
-/// 1. 剥内嵌 `name`——map key 即身份（见 [`crate::settings::mcp_config`]，内嵌 `name` 与 key 冲突则判废）。
-/// 2. `type` 判别符归一化为协议 §9.1 规范**小写**：Rust enum 变体名序列化为 `Stdio`/`Sse`/`Http`，改写为
-///    `stdio`/`sse`/`streamable`（Python `Literal` **大小写敏感**；`streamable` 对齐 `StreamableHttpServerConfig`）。
-///    Rust 读端经 `alias` 接受该规范形（见 [`crate::mcp_clients::model::MCPServerConfig`]），故往返无损。
-fn canonicalize_persist_body(mut body: serde_json::Value) -> serde_json::Value {
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("name");
-        let canonical = obj
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .map(|t| {
-                match t {
-                    "Stdio" => "stdio",
-                    "Sse" => "sse",
-                    "Http" => "streamable",
-                    // 已是规范小写（防御：body 本就规范则原样）/ already canonical.
-                    other => other,
-                }
-                .to_string()
-            });
-        if let Some(t) = canonical {
-            obj.insert("type".to_string(), serde_json::Value::String(t));
-        }
-    }
-    body
 }
 
 /// 工具调用历史记录 / Tool call history record
@@ -2249,6 +2221,36 @@ impl<S: Session> Computer<S> {
 
         // 运行期物化（复用上面已 render 的 validated，不重复 render）+ 内存投影 + capability bump + emit。
         self.mount_rendered(server, validated).await
+    }
+
+    /// #151 Part 2：typed MCP **零写 preflight**——对一批 server 做确定性 + 引用语法可达校验，预测落盘清单。
+    ///
+    /// 不取真实值、不写盘（守 #107：不接管 client-owned inputs/profile/secrets）。供下游在事务提交前暴露只读来源
+    /// / 损坏目标 / schema / `${input:}` 不可达等确定性错误。新声明默认落 `Local`（与 [`Self::add_or_update_server`] 一致）。
+    pub fn preflight_mcp_servers(
+        &self,
+        servers: &[MCPServerConfig],
+    ) -> ComputerResult<PreflightReport> {
+        let config_dir = self.config_dir();
+        let home = self.skill_home();
+        let ctx = self.instance_config_context(&config_dir, &home, WriteScope::Local);
+        Ok(preflight_mcp_import(&ctx, servers))
+    }
+
+    /// #151 Part 2：typed MCP **import（全有或全无）**——preflight 干净后两阶段原子落盘。
+    ///
+    /// SDK 决定序列化（canonicalize）/ provenance / write-target；任一实体确定性失败 → 整批零写
+    /// （`ImportError::Preflight`）。**不 mount / 不 render 取值**（运行期物化归 [`Self::mount_server`] /
+    /// [`Self::add_or_update_server`]）。新声明默认落 `Local`。
+    pub fn import_mcp_servers(
+        &self,
+        servers: &[MCPServerConfig],
+    ) -> ComputerResult<Vec<PlannedServer>> {
+        let config_dir = self.config_dir();
+        let home = self.skill_home();
+        let ctx = self.instance_config_context(&config_dir, &home, WriteScope::Local);
+        import_mcp_servers_cfg(&ctx, servers)
+            .map_err(|e| ComputerError::ConfigPersist(e.to_string()))
     }
 
     /// 移除服务器配置（**bundle_id 寻址**；落盘删声明 + 运行期停摘）/ Remove a server config by bundle_id (persist + unmount)。

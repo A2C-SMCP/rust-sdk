@@ -429,6 +429,40 @@ pub(crate) fn validate_input(
 }
 
 // ---------------------------------------------------------------------------
+// 写侧归一化 / Write-side canonicalization
+// ---------------------------------------------------------------------------
+/// 落盘前把类型化 `MCPServerConfig` 的序列化体归一化为 `mcp.json` 规范形 / canonicalize the persist body.
+///
+/// [`validate_server`] 是读侧校验单元；本函数是**写侧**归一化单元（读写对称、同居本模块）。两处订正，
+/// 保跨 SDK（Python）可读 + Rust 自身重启回读：
+/// 1. 剥内嵌 `name`——map key 即身份（内嵌 `name` 与 key 冲突则判废）。
+/// 2. `type` 判别符归一化为协议规范小写：Rust enum 变体名序列化为 `Stdio`/`Sse`/`Http`，改写为
+///    `stdio`/`sse`/`streamable`（Python `Literal` 大小写敏感；`streamable` 对齐 `StreamableHttpServerConfig`）。
+///    Rust 读端经 `alias` 接受该规范形，故往返无损。
+///
+/// `pub(crate)`：复用于 `Computer::add_or_update_server_in_scope`（落盘）与 typed MCP import/preflight
+/// （`settings::config::import`）。纯函数、无 I/O。
+pub(crate) fn canonicalize_persist_body(mut body: Value) -> Value {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("name");
+        let canonical = obj.get("type").and_then(Value::as_str).map(|t| {
+            match t {
+                "Stdio" => "stdio",
+                "Sse" => "sse",
+                "Http" => "streamable",
+                // 已是规范小写（防御：body 本就规范则原样）/ already canonical.
+                other => other,
+            }
+            .to_string()
+        });
+        if let Some(t) = canonical {
+            obj.insert("type".to_string(), Value::String(t));
+        }
+    }
+    body
+}
+
+// ---------------------------------------------------------------------------
 // 多 scope 解析 / Multi-scope resolution
 // ---------------------------------------------------------------------------
 
