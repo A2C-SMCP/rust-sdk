@@ -438,6 +438,7 @@ mod tests {
             plugins: PluginConfigView::default(),
             runtime: RuntimeDefaults::default(),
             provenance,
+            diagnostics: Vec::new(),
         }
     }
 

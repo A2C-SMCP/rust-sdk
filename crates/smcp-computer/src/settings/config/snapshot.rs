@@ -42,7 +42,7 @@ use crate::skills::home::resolve_skill_home;
 
 use super::super::mcp_config::{resolve_mcp_config, ResolveMcpConfigArgs};
 use super::super::recovery::collect_enabled_bundled_servers;
-use super::super::schema::{validate_settings, SettingsScope};
+use super::super::schema::{validate_settings, SettingsScope, SettingsValidationError};
 use super::super::scope::{
     load_settings_file, merge_layers, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap,
@@ -323,6 +323,16 @@ pub struct ComputerConfigSnapshot {
     pub runtime: RuntimeDefaults,
     /// 每实体 origin scope（写目标消解输入）/ per-entity origin (write-target input)。
     pub provenance: BTreeMap<EntityKey, ProvenanceScope>,
+    /// 配置加载期间收集的字段级诊断（损坏/非法实体，不阻断加载）/ field-level load diagnostics (non-blocking).
+    ///
+    /// 汇总 MCP（`resolve_mcp_config.errors`）与 settings（`load_settings_file`）两套来源在 reconcile 投影
+    /// 期间**本会被丢弃**的字级校验错误（损坏 JSON / 根非对象 / 字段类型错 / 单 server 畸形等）。每条携
+    /// `scope/source_path/field/reason`，供下游区分「损坏配置」与「未配置」，避免静默投影为空/部分快照（#128）。
+    ///
+    /// **不进 `revision`**：revision 反映配置内容、本字段反映加载健康度（#128 决策）。
+    /// `skip_serializing_if = "Vec::is_empty"`：干净配置序列化无此键，保既有消费者字节不变（向后兼容）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<SettingsValidationError>,
 }
 
 /// [`resolve_snapshot`] 入参（镜像各 resolver 的注入接缝）/ inputs (mirrors resolver seams)。
@@ -401,8 +411,14 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
         inputs: mcp_resolved.inputs.clone(),
     };
 
+    // --- #128：MCP 层诊断（损坏 JSON / 畸形 server 等，本会被丢弃）穿出 snapshot 公共契约 ---
+    let mut diagnostics: Vec<SettingsValidationError> = mcp_resolved.errors;
+
     // --- settings 五层（cleaned，high→low）→ merged + 逐键 provenance ---
-    let layers = scoped_settings_layers(cwd, env, flag_settings_path, policy_settings);
+    let (layers, settings_errors) =
+        scoped_settings_layers(cwd, env, flag_settings_path, policy_settings);
+    // #128：settings 层同类吞错一并收口（损坏 settings.json / 字段类型错等）。
+    diagnostics.extend(settings_errors);
     let low_to_high: Vec<Map<String, Value>> =
         layers.iter().rev().map(|(_, m)| m.clone()).collect();
     let merged = merge_layers(&low_to_high);
@@ -513,6 +529,7 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
         plugins,
         runtime,
         provenance,
+        diagnostics,
     }
 }
 
@@ -520,53 +537,61 @@ pub fn resolve_snapshot(args: SnapshotArgs<'_>) -> ComputerConfigSnapshot {
 // 内部辅助 / Internal helpers
 // ===========================================================================
 
+/// 一层 settings（scope 标签 + cleaned map）/ one settings layer: scope tag + cleaned map.
+type ScopedLayer = (ProvenanceScope, Map<String, Value>);
+
 /// 加载五层 settings（cleaned，**high → low** 优先级）供逐键 provenance 判定 / scoped layers, high→low。
 ///
 /// 与 `resolve_settings` 同源（`user < project < local < flag < policy`），但保留每层 scope 标签
 /// （合并会丢失）。各层经 `load_settings_file` / `validate_settings` 清洗，故层内出现即该 scope 合法定义。
+///
+/// 返回 `(layers, errors)`：`errors` 为各层字段级校验错误（#128 起穿出，供 snapshot 诊断，原被 `(_, _)` 丢弃）。
 fn scoped_settings_layers(
     cwd: Option<&Path>,
     env: Option<&EnvMap>,
     flag_settings_path: Option<&Path>,
     policy_settings: Option<&Map<String, Value>>,
-) -> Vec<(ProvenanceScope, Map<String, Value>)> {
-    let mut layers: Vec<(ProvenanceScope, Map<String, Value>)> = Vec::new();
+) -> (Vec<ScopedLayer>, Vec<SettingsValidationError>) {
+    let mut layers: Vec<ScopedLayer> = Vec::new();
+    // #128：各层字段级校验错误聚合（损坏 JSON / 字段类型错等），原被 `(_, _)` 丢弃——现穿出供 snapshot 诊断。
+    let mut errors: Vec<SettingsValidationError> = Vec::new();
 
     // policy（最高）— 按 policy scope 校验，镜像 resolve_settings。
     if let Some(raw) = policy_settings {
-        let (clean, _) =
+        let (clean, errs) =
             validate_settings(&Value::Object(raw.clone()), SettingsScope::Policy, None);
+        errors.extend(errs);
         layers.push((ProvenanceScope::Policy, clean));
     }
     // flag。
     if let Some(path) = flag_settings_path {
-        let (clean, _) = load_settings_file(path, SettingsScope::Flag);
+        let (clean, errs) = load_settings_file(path, SettingsScope::Flag);
+        errors.extend(errs);
         layers.push((ProvenanceScope::Flag, clean));
     }
     // local + project（锚定 cwd；cwd 不可读 → 两层缺席）。
     if let Some(base) = resolve_cwd(cwd) {
-        let (local, _) =
+        let (local, errs) =
             load_settings_file(&workdir_local_settings_path(&base), SettingsScope::Local);
+        errors.extend(errs);
         layers.push((ProvenanceScope::Local, local));
-        let (project, _) = load_settings_file(
+        let (project, errs) = load_settings_file(
             &workdir_project_settings_path(&base),
             SettingsScope::Project,
         );
+        errors.extend(errs);
         layers.push((ProvenanceScope::Project, project));
     }
     // user（最低）。
-    let (user, _) = load_settings_file(&user_settings_path(env), SettingsScope::User);
+    let (user, errs) = load_settings_file(&user_settings_path(env), SettingsScope::User);
+    errors.extend(errs);
     layers.push((ProvenanceScope::User, user));
 
-    layers
+    (layers, errors)
 }
 
 /// 逐键 `enabledPlugins` 的胜出 scope：high→low 首个"值等于合并值"的层；退化取首个含该键的层。
-fn enabled_plugin_scope(
-    layers: &[(ProvenanceScope, Map<String, Value>)],
-    id: &str,
-    merged_value: &Value,
-) -> ProvenanceScope {
+fn enabled_plugin_scope(layers: &[ScopedLayer], id: &str, merged_value: &Value) -> ProvenanceScope {
     for (scope, layer) in layers {
         if let Some(entry) = layer
             .get("enabledPlugins")
@@ -694,8 +719,13 @@ mod tests {
         tmp.path().join("no-managed.json")
     }
 
-    use super::super::super::mcp_config::{user_mcp_config_path, workdir_mcp_config_path};
-    use super::super::super::scope::{user_settings_path, workdir_local_settings_path};
+    use super::super::super::mcp_config::{
+        user_mcp_config_path, workdir_mcp_config_path, workdir_mcp_local_config_path,
+    };
+    use super::super::super::schema::SettingsScope;
+    use super::super::super::scope::{
+        user_settings_path, workdir_local_settings_path, workdir_project_settings_path,
+    };
 
     /// #137 A1：`ProvenanceScope` 优先序骨架 = 协议 §2.5 第3条完整序（含 embed 扩位）。
     #[test]
@@ -1258,5 +1288,255 @@ mod tests {
             .find(|s| s.name == "plain-srv")
             .unwrap();
         assert!(!plain.bundled, "独立 server 不标 bundled");
+    }
+
+    // ===========================================================================
+    // #128：损坏/非法配置的诊断必须穿过 snapshot 公共契约（不再静默投影为空/部分快照）
+    // ===========================================================================
+
+    /// #128：损坏的 project `mcp.json`（JSON 解析失败）→ 空 servers **且** 诊断恰 1 条（scope/source_path/field）。
+    #[test]
+    fn snapshot_exposes_diagnostics_for_corrupt_project_mcp_128() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        write(&workdir_mcp_config_path(&wd), "{not valid json");
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+
+        assert!(
+            snap.mcp.servers.is_empty(),
+            "损坏 mcp.json 不应投影出任何 server"
+        );
+        assert_eq!(
+            snap.diagnostics.len(),
+            1,
+            "损坏文件须产恰好 1 条诊断（实得 {:?}）",
+            snap.diagnostics
+        );
+        let d = &snap.diagnostics[0];
+        assert_eq!(d.scope, SettingsScope::Project);
+        assert_eq!(d.field, "<file>");
+        assert!(
+            d.source_path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("mcp.json")),
+            "诊断须带 source_path 指向损坏文件（实得 {:?}）",
+            d.source_path
+        );
+    }
+
+    /// #128：损坏的 local `mcp.local.json` → 诊断 scope=Local、source_path 指向 local 文件。
+    #[test]
+    fn snapshot_exposes_diagnostics_for_corrupt_local_mcp_128() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        write(&workdir_mcp_local_config_path(&wd), "{{{broken");
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+
+        assert!(snap.mcp.servers.is_empty());
+        assert_eq!(snap.diagnostics.len(), 1, "实得 {:?}", snap.diagnostics);
+        let d = &snap.diagnostics[0];
+        assert_eq!(d.scope, SettingsScope::Local);
+        assert_eq!(d.field, "<file>");
+        assert!(
+            d.source_path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("mcp.local.json")),
+            "实得 {:?}",
+            d.source_path
+        );
+    }
+
+    /// #128：部分失败——合法 srv-a 保留、畸形 srv-b 丢弃 **且** 诊断暴露丢弃项（field=servers.srv-b）。
+    #[test]
+    fn snapshot_partial_failure_keeps_valid_and_diagnoses_malformed_sibling_128() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        // 同一 project mcp.json：合法 srv-a + 畸形 srv-b（值非对象）。
+        write(
+            &workdir_mcp_config_path(&wd),
+            r#"{"servers": {
+                "srv-a": {"type":"stdio","server_parameters":{"command":"a"}},
+                "srv-b": "not-an-object"
+            }}"#,
+        );
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+
+        let names: Vec<&str> = snap.mcp.servers.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"srv-a"),
+            "合法 srv-a 须保留（实得 {names:?}）"
+        );
+        assert!(
+            !names.contains(&"srv-b"),
+            "畸形 srv-b 须丢弃（实得 {names:?}）"
+        );
+        let bad = snap
+            .diagnostics
+            .iter()
+            .find(|d| d.field == "servers.srv-b")
+            .expect("畸形 srv-b 须产 field=servers.srv-b 诊断");
+        assert_eq!(bad.scope, SettingsScope::Project);
+        assert!(bad.source_path.is_some(), "须带 source_path");
+    }
+
+    /// #128：损坏的 project `settings.json` → 诊断穿过 settings 层（同函数同类吞错一并收口）。
+    #[test]
+    fn snapshot_exposes_diagnostics_for_corrupt_settings_128() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        write(&workdir_project_settings_path(&wd), "<<<not json>>>");
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+
+        let d = snap
+            .diagnostics
+            .iter()
+            .find(|e| e.field == "<file>")
+            .expect("损坏 settings.json 须产 <file> 诊断");
+        assert_eq!(d.scope, SettingsScope::Project);
+        assert!(
+            d.source_path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("settings.json")),
+            "实得 {:?}",
+            d.source_path
+        );
+    }
+
+    /// #128：干净配置 → 诊断恒空 **且** 序列化无 `"diagnostics"` 键（skip-if-empty 向后兼容守护）。
+    #[test]
+    fn snapshot_clean_config_has_empty_diagnostics_128() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        write(
+            &user_mcp_config_path(Some(&env)),
+            r#"{"servers": {"srv-u": {"type":"stdio","server_parameters":{"command":"u"}}}}"#,
+        );
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+
+        assert!(
+            snap.diagnostics.is_empty(),
+            "干净配置诊断须恒空（实得 {:?}）",
+            snap.diagnostics
+        );
+        // skip-if-empty 守护：空诊断不得序列化出 diagnostics 键（保既有消费者字节不变）。
+        let serialized = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !serialized.contains("\"diagnostics\""),
+            "空诊断不应序列化出 diagnostics 键（实得 {serialized}）"
+        );
+        // 且合法 server 正常投影（非空快照，区别于「损坏→空」）。
+        assert!(snap.mcp.servers.iter().any(|s| s.name == "srv-u"));
+    }
+
+    /// #128：损坏的 flag scope mcp.json（`--mcp-config`）→ 诊断 scope=Flag（与 project/local 同构路径守护）。
+    #[test]
+    fn snapshot_exposes_diagnostics_for_corrupt_flag_mcp_128() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        let flag_mcp = tmp.path().join("flag-mcp.json");
+        write(&flag_mcp, "{ corrupt");
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            flag_mcp_config_path: Some(&flag_mcp),
+            managed_mcp_path: Some(&no_managed(&tmp)),
+            ..Default::default()
+        });
+
+        let d = snap
+            .diagnostics
+            .iter()
+            .find(|e| e.scope == SettingsScope::Flag)
+            .expect("损坏 flag mcp.json 须产 scope=Flag 诊断");
+        assert_eq!(d.field, "<file>");
+        assert!(
+            d.source_path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("flag-mcp.json")),
+            "实得 {:?}",
+            d.source_path
+        );
+    }
+
+    /// #128：损坏的 policy managed-mcp.json → 诊断 scope=Policy（与 project/local 同构路径守护）。
+    #[test]
+    fn snapshot_exposes_diagnostics_for_corrupt_managed_mcp_128() {
+        let tmp = TempDir::new().unwrap();
+        let env = xdg_env(&tmp);
+        let home = tmp.path().join("home");
+        let wd = tmp.path().join("wd");
+        let managed = tmp.path().join("managed-mcp.json");
+        write(&managed, "{{corrupt");
+
+        let snap = resolve_snapshot(SnapshotArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            home: Some(&home),
+            managed_mcp_path: Some(&managed),
+            ..Default::default()
+        });
+
+        let d = snap
+            .diagnostics
+            .iter()
+            .find(|e| e.scope == SettingsScope::Policy)
+            .expect("损坏 managed-mcp.json 须产 scope=Policy 诊断");
+        assert_eq!(d.field, "<file>");
+        assert!(
+            d.source_path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("managed-mcp.json")),
+            "实得 {:?}",
+            d.source_path
+        );
     }
 }
