@@ -29,6 +29,36 @@ pub enum RenderError {
     InvalidPlaceholder,
 }
 
+/// `${input:<id>}` 占位符文法（单一权威：renderer 替换 + preflight/resolve 收集共用此 pattern）/
+/// the `${input:<id>}` placeholder grammar (single source for renderer substitution + collector extraction).
+pub(crate) const INPUT_PLACEHOLDER_PATTERN: &str = r"\$\{input:([^}]+)}";
+
+/// 收集配置 JSON 树里所有 `${input:<id>}` 引用的 input id（递归；纯语法扫描、**不取真实值**）/
+/// collect all `${input:<id>}` referenced ids from a config JSON tree (pure syntax scan, no value resolution).
+///
+/// **单一收集器**（#151 收口）：`Computer::render_server_config` 的「只解析被引用 input」判定与 typed-import
+/// preflight（`settings::config::import` 的引用可达校验）共用，避免 `${input:}` 文法分叉。
+pub(crate) fn collect_input_placeholder_ids(value: &Value) -> Vec<String> {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(INPUT_PLACEHOLDER_PATTERN).expect("input-placeholder regex")
+    });
+    fn walk(v: &Value, re: &Regex, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for cap in re.captures_iter(s) {
+                    out.push(cap[1].to_string());
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, re, out)),
+            Value::Object(m) => m.values().for_each(|x| walk(x, re, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &RE, &mut out);
+    out
+}
+
 /// 配置渲染器，用于处理 ${input:xxx} 占位符
 pub struct ConfigRender {
     placeholder_regex: Regex,
@@ -39,7 +69,7 @@ impl ConfigRender {
     /// 创建新的配置渲染器
     pub fn new(max_depth: usize) -> Self {
         Self {
-            placeholder_regex: Regex::new(r"\$\{input:([^}]+)}").unwrap(),
+            placeholder_regex: Regex::new(INPUT_PLACEHOLDER_PATTERN).unwrap(),
             max_depth,
         }
     }

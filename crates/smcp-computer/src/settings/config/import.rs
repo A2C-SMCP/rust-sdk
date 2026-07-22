@@ -191,6 +191,10 @@ pub fn preflight_mcp_import(ctx: &ConfigContext, servers: &[MCPServerConfig]) ->
 /// 干净则构造 edits 经 [`update_config`] 两阶段原子落盘（任一实体消解失败 → 整批零写，对齐既有 abort-on-error）。
 /// SDK 决定序列化（`canonicalize_persist_body`）、provenance 与 write-target（`opts.upsert_new_scope`）。
 ///
+/// **原子性边界**：上述「全有或全无」对**确定性**失败成立（preflight 已挡 schema / write-target / 目标可读 /
+/// 引用可达，`update_config` phase 1 挡消解期错）；**非确定性执行期 I/O 失败**（磁盘满 / 权限 / 与外部写者竞态）
+/// 发生时，executor 顺序写**不回滚**前序已落盘条目（FS 固有限制、非事务性），此时可能留下部分写 + `Err(Persist)`。
+///
 /// **不 mount / 不 render 取值**（运行期物化归 `Computer::mount_server`，本 API 守 #107 config 边界）。
 pub fn import_mcp_servers(
     ctx: &ConfigContext,
@@ -244,63 +248,24 @@ fn write_target_diag(
     diag(default_scope, &format!("servers.{name}"), reason)
 }
 
-/// `${input:<id>}` 引用扫描 → 不可达诊断（不取真实值）/ scan refs, flag undeclared.
+/// `${input:<id>}` 引用扫描 → 不可达诊断（不取真实值；文法权威 `mcp_clients::render`）/ flag undeclared refs.
 fn input_ref_diags(
     name: &str,
     body: &Value,
     declared: &HashSet<String>,
     scope: SettingsScope,
 ) -> Vec<SettingsValidationError> {
-    let mut refs = Vec::new();
-    collect_input_refs(body, &mut refs);
-    let mut out = Vec::new();
-    for id in refs {
-        if id.is_empty() {
-            out.push(diag(
-                scope,
-                &format!("servers.{name}"),
-                "malformed ${input:} reference (unclosed)",
-            ));
-        } else if !declared.contains(&id) {
-            out.push(diag(
+    crate::mcp_clients::render::collect_input_placeholder_ids(body)
+        .into_iter()
+        .filter(|id| !declared.contains(id))
+        .map(|id| {
+            diag(
                 scope,
                 &format!("servers.{name}"),
                 format!("references undeclared input '{id}' (declare it in mcp.json inputs first)"),
-            ));
-        }
-    }
-    out
-}
-
-/// 递归收集串值里所有 `${input:<id>}` 的 id / collect ${input:id} ids from all string values.
-fn collect_input_refs(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::String(s) => out.extend(extract_input_ids(s)),
-        Value::Array(a) => a.iter().for_each(|v| collect_input_refs(v, out)),
-        Value::Object(o) => o.values().for_each(|v| collect_input_refs(v, out)),
-        _ => {}
-    }
-}
-
-/// 从单个串提取 `${input:<id>}` 的 id（值渲染前的纯语法扫描）/ extract ids from one string.
-fn extract_input_ids(s: &str) -> Vec<String> {
-    const MARKER: &str = "${input:";
-    let mut out = Vec::new();
-    let mut rest = s;
-    while let Some(i) = rest.find(MARKER) {
-        rest = &rest[i + MARKER.len()..];
-        match rest.find('}') {
-            Some(end) => {
-                out.push(rest[..end].to_string());
-                rest = &rest[end + 1..];
-            }
-            None => {
-                out.push(String::new()); // 未闭合 → 语法错占位
-                break;
-            }
-        }
-    }
-    out
+            )
+        })
+        .collect()
 }
 
 /// SettingsScope → WriteScope（writable 三者；其余退回 default）/ convert.

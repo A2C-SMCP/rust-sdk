@@ -406,26 +406,11 @@ fn reconcile_orphans_in(
 /// [`render_server_config`](Computer::render_server_config) **只解析被引用的 input**——未被引用者不 resolve，从而不触发
 /// 其 resolver / keyring / command 副作用，也天然容忍其缺失。占位符替换不递归到替换值内，故单次扫描原始配置即完整。
 fn collect_referenced_input_ids(config: &serde_json::Value) -> HashSet<String> {
-    // 与 `mcp_clients::render::ConfigRender` 同一占位符文法；hoist 为 static 避免每次渲染重新编译。
-    static INPUT_PLACEHOLDER_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"\$\{input:([^}]+)}").expect("static input-placeholder regex")
-        });
-    fn walk(v: &serde_json::Value, re: &regex::Regex, out: &mut HashSet<String>) {
-        match v {
-            serde_json::Value::String(s) => {
-                for cap in re.captures_iter(s) {
-                    out.insert(cap[1].to_string());
-                }
-            }
-            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, re, out)),
-            serde_json::Value::Object(m) => m.values().for_each(|x| walk(x, re, out)),
-            _ => {}
-        }
-    }
-    let mut out = HashSet::new();
-    walk(config, &INPUT_PLACEHOLDER_RE, &mut out);
-    out
+    // 文法权威已收口至 `mcp_clients::render::collect_input_placeholder_ids`（#151：renderer/resolve/preflight
+    // 共用单一 `${input:}` 文法，避免分叉）。这里塑形为 HashSet（去重，供只解析被引用 input）。
+    crate::mcp_clients::render::collect_input_placeholder_ids(config)
+        .into_iter()
+        .collect()
 }
 
 /// 合并 VS Code 风格 `envFile` 的 `KEY=VALUE` 进 stdio `server_parameters.env`（显式 env 胜，§9.1）/
@@ -2239,9 +2224,11 @@ impl<S: Session> Computer<S> {
 
     /// #151 Part 2：typed MCP **import（全有或全无）**——preflight 干净后两阶段原子落盘。
     ///
-    /// SDK 决定序列化（canonicalize）/ provenance / write-target；任一实体确定性失败 → 整批零写
-    /// （`ImportError::Preflight`）。**不 mount / 不 render 取值**（运行期物化归 [`Self::mount_server`] /
-    /// [`Self::add_or_update_server`]）。新声明默认落 `Local`。
+    /// SDK 决定序列化（canonicalize）/ provenance / write-target；**确定性**失败（preflight 拦截）→ 整批零写
+    /// （`ImportError::Preflight`）；非确定性执行期 I/O 失败可能留下部分写（FS 非事务性，详见 config 层
+    /// `import_mcp_servers` 文档）。**不 mount / 不 render 取值**（运行期物化归 [`Self::mount_server`] /
+    /// [`Self::add_or_update_server`]）。新声明默认落 `Local`。内容真变才 bump `config_revision`（§12 R2，与
+    /// [`Self::add_or_update_server`] 一致）。
     pub fn import_mcp_servers(
         &self,
         servers: &[MCPServerConfig],
@@ -2249,8 +2236,14 @@ impl<S: Session> Computer<S> {
         let config_dir = self.config_dir();
         let home = self.skill_home();
         let ctx = self.instance_config_context(&config_dir, &home, WriteScope::Local);
-        import_mcp_servers_cfg(&ctx, servers)
-            .map_err(|e| ComputerError::ConfigPersist(e.to_string()))
+        // §12 R2：仅当真落盘（内容变）才 bump config，避免 no-op/幂等 mutate 虚假 bump。
+        let before_rev = load_config(&ctx).revision;
+        let planned = import_mcp_servers_cfg(&ctx, servers)
+            .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
+        if load_config(&ctx).revision != before_rev {
+            self.bump_config_revision();
+        }
+        Ok(planned)
     }
 
     /// 移除服务器配置（**bundle_id 寻址**；落盘删声明 + 运行期停摘）/ Remove a server config by bundle_id (persist + unmount)。
@@ -3944,6 +3937,68 @@ mod tests {
         assert!(
             set.contains(&want),
             "config_dir 的 project 声明用户 server MUST 入非-plugin 集（永不连坐）；实际: {set:?}"
+        );
+    }
+
+    /// #151 Part 2：Computer facade `preflight_mcp_servers`（零写）+ `import_mcp_servers`（落 `Local`）。
+    /// 守 facade 的 `WriteScope::Local` 硬编不被误改（config 层测试不因 facade 改默认 scope 而红）+ 内容变 bump。
+    #[test]
+    fn computer_facade_preflight_and_import_lands_local_151() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut env = EnvMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("xdg").to_string_lossy().into_owned(),
+        );
+        let comp = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env)
+            .with_skill_home(&home);
+
+        let srv: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "facade-srv", "server_parameters": {"command": "x"}
+        }))
+        .unwrap();
+
+        // preflight facade：零写、预测 planned（Local）、干净。
+        let tfrobot = proj.join(".tfrobot");
+        let pre = comp
+            .preflight_mcp_servers(std::slice::from_ref(&srv))
+            .unwrap();
+        assert!(!tfrobot.exists(), "preflight facade MUST 零写");
+        assert!(
+            pre.is_clean(),
+            "合法 server preflight 应干净（实得 {:?}）",
+            pre.diagnostics
+        );
+        assert!(pre
+            .planned
+            .iter()
+            .any(|p| p.name == "facade-srv" && p.scope == WriteScope::Local));
+
+        // import facade：落 Local（mcp.local.json 非 mcp.json）+ 内容变 bump config_revision。
+        let rev_before = comp.config_revision();
+        let planned = comp
+            .import_mcp_servers(std::slice::from_ref(&srv))
+            .expect("facade import ok");
+        assert!(
+            planned.iter().all(|p| p.scope == WriteScope::Local),
+            "facade import MUST 落 Local（实得 {:?}）",
+            planned
+        );
+        assert!(
+            comp.config_revision() > rev_before,
+            "内容变 MUST bump config_revision"
+        );
+        let local = crate::settings::mcp_config::workdir_mcp_local_config_path(&proj);
+        let local_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        assert!(
+            local_disk["servers"]["facade-srv"].is_object(),
+            "facade import MUST 落 mcp.local.json（实得 {local_disk}）"
         );
     }
 
