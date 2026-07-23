@@ -296,7 +296,10 @@ impl RuntimeStatus {
 
     /// 记 / 清最近公开错误（`None` 清除）/ set-or-clear the last public error。
     pub fn set_last_error(&self, err: Option<String>) {
-        self.diagnostics.write().expect("diagnostics poisoned").last_error = err;
+        self.diagnostics
+            .write()
+            .expect("diagnostics poisoned")
+            .last_error = err;
     }
 
     /// 记 / 清 degraded 原因（`None` 清除）/ set-or-clear the degraded reason。
@@ -335,7 +338,11 @@ impl RuntimeStatus {
         tools: usize,
         skills: usize,
     ) -> ComputerStatusSnapshot {
-        let diag = self.diagnostics.read().expect("diagnostics poisoned").clone();
+        let diag = self
+            .diagnostics
+            .read()
+            .expect("diagnostics poisoned")
+            .clone();
         ComputerStatusSnapshot {
             lifecycle: self.state(),
             config_revision: self.config_revision(),
@@ -471,7 +478,10 @@ mod tests {
         assert_eq!(snap.active_mcp_servers, 1);
         assert_eq!(snap.tools, 7);
         assert_eq!(snap.skills, 2);
-        assert_eq!(snap.degraded_reason.as_deref(), Some("marketplace X unreachable"));
+        assert_eq!(
+            snap.degraded_reason.as_deref(),
+            Some("marketplace X unreachable")
+        );
         assert_eq!(snap.last_error.as_deref(), Some("boot recovery partial"));
         // 清除 → 快照 None。
         s.set_degraded_reason(None);

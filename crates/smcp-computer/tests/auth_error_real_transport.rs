@@ -181,7 +181,9 @@ async fn sse_auth_handler(
 
     if method == Method::GET && path == "/sse" {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, Infallible>>();
-        let _ = tx.send(Ok(Frame::data(Bytes::from("event: endpoint\ndata: /messages\n\n"))));
+        let _ = tx.send(Ok(Frame::data(Bytes::from(
+            "event: endpoint\ndata: /messages\n\n",
+        ))));
         *state.sse_tx.lock().await = Some(tx);
         let stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -286,7 +288,10 @@ async fn sse_call_and_capture_err(reject_status: StatusCode) -> MCPClientError {
     .await;
 
     match outcome {
-        Err(_) => panic!("HANG: SSE call_tool did not resolve on upstream {}", reject_status),
+        Err(_) => panic!(
+            "HANG: SSE call_tool did not resolve on upstream {}",
+            reject_status
+        ),
         Ok(Ok(r)) => panic!("unexpected Ok on {}: {:?}", reject_status, r),
         Ok(Err(e)) => e,
     }

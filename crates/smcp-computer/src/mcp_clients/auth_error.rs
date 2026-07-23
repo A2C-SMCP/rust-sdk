@@ -32,8 +32,11 @@ use super::model::MCPClientError;
 
 /// §423「授权失败 / 权限不足 / 凭证失效」→ `4007` 的判别子串（小写比较）。
 /// 403 / scope 不足 / token 过期+刷新失败 / revoked / invalid_grant 等「曾授权但当前不可用」。
+///
+/// **不含裸 `403`**：错误 Display 常携 URL（如 `http://127.0.0.1:40397/`），裸状态码子串会误命中
+/// 端口号；标准 rmcp/reqwest 的 `error_for_status` Display 形如 `(403 Forbidden)`，原因短语
+/// `forbidden` 已覆盖标准形态，故裸 `403` 既冗余又有害（曾令 AUTH-01 真实传输测试间歇性误判）。
 const FAILED_MARKERS: &[&str] = &[
-    "403",
     "forbidden",
     "insufficient scope",
     "insufficient_scope",
@@ -49,8 +52,10 @@ const FAILED_MARKERS: &[&str] = &[
 
 /// §423「需要授权 / 未认证」→ `4006` 的判别子串（小写比较）。
 /// 401 / 无凭证 / 未登录等「从未授权或需重新授权」。
+///
+/// **不含裸 `401`**：同 FAILED_MARKERS——裸状态码子串误命中 URL 中的端口号（如 `:40123`）；
+/// 原因短语 `unauthorized` 已覆盖标准 `(401 Unauthorized)` 形态。
 const REQUIRED_MARKERS: &[&str] = &[
-    "401",
     "unauthorized",
     "unauthenticated",
     "not authenticated",
@@ -368,9 +373,10 @@ mod tests {
         let she = StreamableHttpError::AuthRequired(AuthRequiredError {
             www_authenticate_header: "Bearer realm=\"mcp\"".to_string(),
         });
-        let dte = DynamicTransportError::new::<StreamableHttpClientTransport<reqwest::Client>, RoleClient>(
-            she,
-        );
+        let dte = DynamicTransportError::new::<
+            StreamableHttpClientTransport<reqwest::Client>,
+            RoleClient,
+        >(she);
         let err = MCPClientError::ToolCallError(rmcp::ServiceError::TransportSend(dte));
         assert_eq!(
             classify_auth_error(&err),
@@ -388,9 +394,10 @@ mod tests {
         use rmcp::RoleClient;
 
         let she = StreamableHttpError::<reqwest::Error>::ServerDoesNotSupportSse;
-        let dte = DynamicTransportError::new::<StreamableHttpClientTransport<reqwest::Client>, RoleClient>(
-            she,
-        );
+        let dte = DynamicTransportError::new::<
+            StreamableHttpClientTransport<reqwest::Client>,
+            RoleClient,
+        >(she);
         let err = MCPClientError::ToolCallError(rmcp::ServiceError::TransportSend(dte));
         assert_eq!(
             classify_auth_error(&err),
