@@ -16,6 +16,7 @@ pub mod mcp_config;
 pub mod policy;
 pub mod reconciler;
 pub mod recovery;
+pub(crate) mod redaction;
 pub mod schema;
 pub mod scope;
 pub mod store;

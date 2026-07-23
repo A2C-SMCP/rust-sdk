@@ -29,11 +29,15 @@
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
+use url::Url;
 
 use crate::settings::installer::{
     uninstall_plugin, McpInstallHooks, PluginInstallError, UninstallOptions,
 };
 use crate::settings::reconciler::{prune_marketplaces, SkillGovernanceStore};
+use crate::settings::redaction::{
+    git_source_for_error, redact_git_urls_in_text, untrusted_name_for_display,
+};
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
     load_installed_plugins, load_known_marketplaces, update_known_marketplaces,
@@ -51,14 +55,15 @@ use crate::skills::{
 /// marketplace/plugin 生命周期编排失败（**结构化、非退出码**）/ Structured governance lifecycle failure。
 ///
 /// CLI handler 据各变体映射退出码（`CloneFailed` → 网络错 2，其余 → 用户错 1）+ 拼装用户面文案；GUI/Tauri
-/// client 直接消费结构化变体。携带的数据（git_url / name）足以让消费方自定义文案。
+/// client 直接消费结构化变体。所有字符串载荷均可安全进入公开 `Debug` / `Display`：URL 型输入先脱敏，
+/// 名称错误只携名称，clone 错误只携 marketplace 名。
 #[derive(Debug, thiserror::Error)]
 pub enum GovernanceError {
     /// 既非合法 git URL 也非 `owner/repo` 简写 / not a well-formed git URL or `owner/repo` shorthand。
     #[error("not a well-formed git url or owner/repo shorthand: {0:?}")]
     InvalidUrl(String),
-    /// 无法从 URL 派生合法 marketplace 名（须显式指定）/ cannot derive a valid marketplace name。
-    #[error("cannot derive a valid marketplace name from {0:?}")]
+    /// 非法 marketplace 名；空串表示未提供显式名且 URL 无法派生合法名 / invalid marketplace name。
+    #[error("invalid marketplace name: {0:?}")]
     InvalidName(String),
     /// marketplace 名已存在（add 拒绝覆盖）/ marketplace name already exists。
     #[error("marketplace name conflict: {0:?} already exists")]
@@ -66,8 +71,8 @@ pub enum GovernanceError {
     /// 未知 marketplace（refresh/remove 目标不存在）/ unknown marketplace。
     #[error("unknown marketplace: {0:?}")]
     UnknownMarketplace(String),
-    /// clone/refresh 失败（stage 降级未落 `known_marketplaces`）/ clone or refresh failed。
-    #[error("clone/refresh failed for {0:?} (see logs)")]
+    /// clone/refresh 失败，载荷为 marketplace 名（stage 降级未落 `known_marketplaces`）/ clone failed。
+    #[error("clone/refresh failed for marketplace {0:?} (see logs)")]
     CloneFailed(String),
     /// plugin 卸载级联失败（remove marketplace 级联期）/ plugin uninstall cascade failed。
     #[error(transparent)]
@@ -179,9 +184,27 @@ pub fn normalize_marketplace_url(raw: &str) -> Option<String> {
 /// 从 git URL 末段派生严格-kebab marketplace 名（去 `.git`、非字母数字折叠为 `-`）/ derive a kebab name。
 #[must_use]
 pub fn default_marketplace_name(url: &str) -> Option<String> {
-    let tail = url.trim_end_matches('/');
-    let seg = tail.rsplit(['/', ':']).next().unwrap_or(tail);
-    let seg = seg.strip_suffix(".git").unwrap_or(seg);
+    let raw = url.trim();
+    let segment = if raw.contains("://") {
+        let parsed = Url::parse(raw).ok()?;
+        if !matches!(parsed.scheme(), "ssh" | "git" | "http" | "https" | "file") {
+            return None;
+        }
+        parsed
+            .path_segments()?
+            .rfind(|part| !part.is_empty())?
+            .to_string()
+    } else {
+        let (_, path) = raw.rsplit_once(':')?;
+        path.split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .rsplit('/')
+            .find(|part| !part.is_empty())?
+            .to_string()
+    };
+    let seg = segment.strip_suffix(".git").unwrap_or(&segment);
 
     // `re.sub(r"[^a-z0-9]+", "-", seg.lower()).strip("-")`：小写后非 [a-z0-9] 连续段折叠为单 `-`。
     let mut slug = String::new();
@@ -213,18 +236,20 @@ pub struct MarketplaceIdentity {
 /// **纯函数**（不触盘）：CLI 信任门与 [`Computer`](crate::computer::Computer) 级 API 共用，确保两路同一身份语义。
 ///
 /// # Errors
-/// URL 非法 → [`GovernanceError::InvalidUrl`]；无法派生/非法名 → [`GovernanceError::InvalidName`]。
+/// URL 非法 → [`GovernanceError::InvalidUrl`]（安全展示值）；无法派生/非法名 →
+/// [`GovernanceError::InvalidName`]（显式名安全展示值；无显式名时为空串）。
 pub fn resolve_marketplace_identity(
     git_url: &str,
     explicit_name: Option<&str>,
 ) -> Result<MarketplaceIdentity, GovernanceError> {
     let url = normalize_marketplace_url(git_url)
-        .ok_or_else(|| GovernanceError::InvalidUrl(git_url.to_string()))?;
-    let name = explicit_name
-        .map(str::to_string)
-        .or_else(|| default_marketplace_name(&url))
-        .filter(|n| is_valid_marketplace_name(n))
-        .ok_or_else(|| GovernanceError::InvalidName(git_url.to_string()))?;
+        .ok_or_else(|| GovernanceError::InvalidUrl(git_source_for_error(git_url)))?;
+    let name = match explicit_name {
+        Some(name) if is_valid_marketplace_name(name) => name.to_string(),
+        Some(name) => return Err(GovernanceError::InvalidName(redact_git_urls_in_text(name))),
+        None => default_marketplace_name(&url)
+            .ok_or_else(|| GovernanceError::InvalidName(String::new()))?,
+    };
     Ok(MarketplaceIdentity { name, url })
 }
 
@@ -320,7 +345,7 @@ pub(crate) async fn register_or_stage_marketplace(
 
     // 成功判定：stage 失败降级（不抛、返回空 + 不写 known_marketplaces）；据物化记录是否落盘判定。
     if !marketplace_name_taken(home, env, name) {
-        return Err(GovernanceError::CloneFailed(url.clone()));
+        return Err(GovernanceError::CloneFailed(name.clone()));
     }
     Ok(MarketplaceAddOutcome {
         name: name.clone(),
@@ -371,7 +396,7 @@ pub async fn refresh_marketplaces(
     for nm in &names {
         let Some(rec) = mps.marketplaces.get(nm) else {
             rows.push(MarketplaceRefreshRow {
-                name: nm.clone(),
+                name: untrusted_name_for_display(nm),
                 status: RefreshStatus::Missing,
                 skills: 0,
             });
@@ -411,7 +436,7 @@ pub async fn refresh_marketplaces(
             RefreshStatus::Unchanged
         };
         rows.push(MarketplaceRefreshRow {
-            name: nm.clone(),
+            name: untrusted_name_for_display(nm),
             status,
             skills: registered.len(),
         });
@@ -435,11 +460,14 @@ pub async fn remove_marketplace(
     non_plugin_bundle_ids: &std::collections::HashSet<crate::mcp_clients::model::BundleId>,
 ) -> Result<MarketplaceRemoveOutcome, GovernanceError> {
     if !marketplace_name_taken(home, env, name) {
-        return Err(GovernanceError::UnknownMarketplace(name.to_string()));
+        return Err(GovernanceError::UnknownMarketplace(
+            untrusted_name_for_display(name),
+        ));
     }
 
+    let valid_name = is_valid_marketplace_name(name);
     let mut uninstalled: Vec<String> = Vec::new();
-    if !params.keep_plugins {
+    if !params.keep_plugins && valid_name {
         let suffix = format!("@{name}");
         let installed = load_installed_plugins(Some(home), env).account;
         let victims: Vec<String> = installed
@@ -473,12 +501,22 @@ pub async fn remove_marketplace(
     }
 
     let store = make_store(home, env);
-    let pruned = prune_marketplaces(&[name.to_string()], registry, home, &store);
+    let pruned = if valid_name {
+        prune_marketplaces(&[name.to_string()], registry, home, &store)
+    } else {
+        // 手编账本可能含非法 key。它不能安全映射为文件系统路径，也不能原样传入 reconciler tracing；
+        // 仅按精确原始 key 删除账本记录，公开 outcome 使用脱敏展示值，plugin 记录留待显式 GC。
+        let drop_name = name.to_string();
+        store.update_known_marketplaces(&mut |data| {
+            data.marketplaces.shift_remove(&drop_name);
+        });
+        vec![untrusted_name_for_display(name)]
+    };
     Ok(MarketplaceRemoveOutcome {
-        name: name.to_string(),
+        name: untrusted_name_for_display(name),
         pruned,
         uninstalled_plugins: uninstalled,
-        kept_plugins: params.keep_plugins,
+        kept_plugins: params.keep_plugins || !valid_name,
     })
 }
 
@@ -488,7 +526,37 @@ mod tests {
     // `cargo test-ws`（默认特性、无 cli）将无法编译——而这恰会反噬本特性"GUI 无需 cli feature"的目标。
     // marketplace 账本（known_marketplaces.json）落在 `home`（skill_home）内，故 `env = None` 即完全 hermetic。
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn normalize_url_passthrough_and_shorthand() {
@@ -513,6 +581,16 @@ mod tests {
             default_marketplace_name("git@github.com:acme/cool-repo.git"),
             Some("cool-repo".to_string())
         );
+        assert_eq!(
+            default_marketplace_name(
+                "https://user:PW_SECRET@example.com/acme/repo.git?token=QUERY#FRAGMENT"
+            ),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            default_marketplace_name("https://user:PW_SECRET@example.com?token=QUERY#FRAGMENT"),
+            None
+        );
     }
 
     #[test]
@@ -529,6 +607,102 @@ mod tests {
         // 显式名覆盖派生。
         let id2 = resolve_marketplace_identity("acme/skills", Some("custom")).unwrap();
         assert_eq!(id2.name, "custom");
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_name_never_exposes_git_credentials_or_touches_disk() {
+        const SECRET_URL: &str =
+            "https://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#token=FRAGMENT";
+        let dir = tempdir().unwrap();
+        let mut registry = SkillRegistry::new();
+        let err = add_marketplace(
+            &mut registry,
+            dir.path(),
+            None,
+            SECRET_URL,
+            AddMarketplaceParams {
+                name: Some("Turingfocus"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            &err,
+            GovernanceError::InvalidName(name) if name == "Turingfocus"
+        ));
+        let public_forms = format!("{err}\n{err:?}");
+        for secret in ["cnb", "FAKE_TOKEN", "QUERY", "FRAGMENT", SECRET_URL] {
+            assert!(
+                !public_forms.contains(secret),
+                "public error form leaked {secret:?}: {public_forms}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "identity validation must fail before any filesystem write"
+        );
+    }
+
+    #[test]
+    fn credentialed_explicit_name_and_pathless_default_are_safe_errors() {
+        let explicit_errors = [
+            "key=https://user:PW_SECRET@example.com/name",
+            "x=https://public.example/a=https://user2:PW_TWO@secret.example/repo.git",
+            "key=用户@example.com:org/repo.git",
+            "x=https://example.com/r.git?token=;QUERY_SECRET",
+            "x=https://example.com/r.git?token=QUERY_QUOTE'LEAK_SECRET",
+            "x=https://alice:PW_ONE'PW_TWO@example.com/repo.git",
+            "x=alice@my_host:org/repo.git",
+            "x=用户@例子.公司:org/repo.git",
+        ]
+        .map(|name| resolve_marketplace_identity("acme/skills", Some(name)).unwrap_err());
+
+        let derived = resolve_marketplace_identity(
+            "https://user:PW_SECRET@example.com?token=QUERY#FRAGMENT",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(&derived, GovernanceError::InvalidName(name) if name.is_empty()));
+
+        for error in explicit_errors.into_iter().chain(std::iter::once(derived)) {
+            let rendered = format!("{error}\n{error:?}");
+            for secret in [
+                "user",
+                "PW_SECRET",
+                "QUERY",
+                "FRAGMENT",
+                "user2",
+                "PW_TWO",
+                "用户",
+                "QUERY_SECRET",
+                "QUERY_QUOTE",
+                "LEAK_SECRET",
+                "PW_ONE",
+                "alice",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_url_payload_is_safe_for_display_and_debug() {
+        for raw in [
+            "cnb:FAKE_TOKEN@example.com/org/repo.git",
+            "ftp://cnb:FAKE_TOKEN",
+        ] {
+            let err = resolve_marketplace_identity(raw, Some("valid-name")).unwrap_err();
+            assert!(matches!(
+                &err,
+                GovernanceError::InvalidUrl(source) if source == "<redacted-git-source>"
+            ));
+            let public_forms = format!("{err}\n{err:?}");
+            assert!(!public_forms.contains("cnb"));
+            assert!(!public_forms.contains("FAKE_TOKEN"));
+        }
     }
 
     #[tokio::test]
@@ -591,6 +765,83 @@ mod tests {
             .await,
             Err(GovernanceError::UnknownMarketplace(n)) if n == "ghost"
         ));
+    }
+
+    #[tokio::test]
+    async fn unknown_marketplace_and_refresh_target_are_safe_public_values() {
+        let dir = tempdir().unwrap();
+        let mut registry = SkillRegistry::new();
+        let target = "x=https://user:PW_SECRET@example.com/repo.git";
+
+        let error = remove_marketplace(
+            &mut registry,
+            dir.path(),
+            None,
+            target,
+            RemoveMarketplaceParams::default(),
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .unwrap_err();
+        let rows = refresh_marketplaces(&mut registry, dir.path(), None, target).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, RefreshStatus::Missing);
+
+        for rendered in [
+            format!("{error}\n{error:?}"),
+            format!("{:?}\n{}", rows[0], rows[0].name),
+        ] {
+            for secret in ["user", "PW_SECRET"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_hand_edited_invalid_key_deletes_exact_record_without_log_leak() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let raw_name = "x=https://alice:PW_REMOVE@example.com/repo.git";
+        update_known_marketplaces(
+            |data| {
+                data.account.marketplaces.insert(
+                    raw_name.to_string(),
+                    KnownMarketplaceEntry {
+                        source: json!({"type": "git", "url": "https://example.com/repo.git"}),
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let mut registry = SkillRegistry::new();
+        let outcome = remove_marketplace(
+            &mut registry,
+            home,
+            None,
+            raw_name,
+            RemoveMarketplaceParams::default(),
+            &std::collections::HashSet::new(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+
+        assert!(!marketplace_name_taken(home, None, raw_name));
+        assert!(outcome.kept_plugins, "非法 key 不得映射到级联删除路径");
+        let rendered = format!("{outcome:?}\n{}", logs.contents());
+        for secret in ["alice", "PW_REMOVE"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
     #[tokio::test]
@@ -861,7 +1112,7 @@ mod tests {
     fn resolve_identity_dotgit_only_tail_is_invalid_name() {
         assert!(matches!(
             resolve_marketplace_identity("https://example.com/.git", None),
-            Err(GovernanceError::InvalidName(_))
+            Err(GovernanceError::InvalidName(name)) if name.is_empty()
         ));
     }
 
@@ -884,7 +1135,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, GovernanceError::CloneFailed(_)));
+        assert!(matches!(
+            err,
+            GovernanceError::CloneFailed(name) if name == "acme"
+        ));
         // 降级铁律：未落 known_marketplaces。
         assert!(!marketplace_name_taken(home, None, "acme"));
     }

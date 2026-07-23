@@ -48,6 +48,9 @@ use tokio::sync::RwLock;
 use smcp::utils::path::{is_within, normalize_lexical};
 use smcp::A2CSkillRef;
 
+use crate::settings::redaction::{
+    git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
+};
 use crate::settings::{is_valid_marketplace_name, EnvMap};
 use crate::skills::frontmatter::parse_skill_frontmatter;
 use crate::skills::home::{
@@ -524,6 +527,24 @@ fn apply_git_env(cmd: &mut tokio::process::Command, env: Option<&EnvMap>) {
     }
 }
 
+/// Git stderr 可能回显 clone URL；按本次命令中已知 URL 参数逐一替换为安全展示值。
+fn sanitize_git_stderr(args: &[&str], stderr: &str) -> String {
+    let known_args_redacted = args
+        .iter()
+        .filter(|arg| arg.contains("://") || SSH_SCP_LIKE_RE.is_match(arg))
+        .fold(stderr.to_string(), |sanitized, raw_url| {
+            let display = git_url_for_display(raw_url);
+            let mut sanitized = sanitized.replace(*raw_url, &display);
+            if SSH_SCP_LIKE_RE.is_match(raw_url) {
+                if let Some((endpoint, _)) = raw_url.split_once(':') {
+                    sanitized = sanitized.replace(endpoint, &display);
+                }
+            }
+            sanitized
+        });
+    redact_git_urls_in_text(&known_args_redacted)
+}
+
 /// 执行 `git <args>` 并返回 stdout（非零退出 / 超时 → 错误）/ Run `git`, capture stdout。
 async fn run_git(
     args: &[&str],
@@ -551,10 +572,11 @@ async fn run_git(
         }
     };
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let err = sanitize_git_stderr(args, stderr.trim());
         return Err(SkillStagingError::new(format!(
             "git {} failed (rc={:?}): {err}",
-            args.join(" "),
+            args.first().copied().unwrap_or("operation"),
             output.status.code()
         )));
     }
@@ -602,7 +624,12 @@ async fn git_clone_with_fallback(
             let https = ssh_to_https(url);
             match https {
                 Some(h) if h != url => {
-                    tracing::warn!(url, error = %first, https = %h, "git clone failed; retrying via HTTPS");
+                    tracing::warn!(
+                        url = %git_url_for_display(url),
+                        error = %first,
+                        https = %git_url_for_display(&h),
+                        "git clone failed; retrying via HTTPS"
+                    );
                     let _ = std::fs::remove_dir_all(dest);
                     let mut retry: Vec<String> = vec!["clone".to_string()];
                     retry.extend(clone_args.iter().cloned());
@@ -728,7 +755,10 @@ async fn git_head_sha(dest: &Path, timeout: Duration, env: Option<&EnvMap>) -> O
 /// plugin 条目 ID = entry.name / The plugin entry name。
 fn entry_plugin_name(entry: &Map<String, Value>) -> Result<String, SkillStagingError> {
     match entry.get("name").and_then(Value::as_str) {
-        Some(n) if !n.trim().is_empty() => Ok(n.trim().to_string()),
+        Some(n) if is_valid_marketplace_name(n.trim()) => Ok(n.trim().to_string()),
+        Some(_) => Err(SkillStagingError::new(
+            "plugin entry 'name' must be lowercase kebab-case (1-64 characters)",
+        )),
         _ => Err(SkillStagingError::new(
             "plugin entry missing required 'name'",
         )),
@@ -903,10 +933,9 @@ pub(crate) async fn locate_plugin_root(
     };
 
     if !plugin_root.is_dir() {
-        return Err(SkillStagingError::new(format!(
-            "plugin root not found after resolve: {}",
-            plugin_root.display()
-        )));
+        return Err(SkillStagingError::new(
+            "plugin root not found after source resolution",
+        ));
     }
     Ok((plugin_root, version_fallback))
 }
@@ -998,7 +1027,7 @@ pub async fn stage_marketplace_skills(
     // 防御纵深：name 直接作路径段，仅接受严格 kebab marketplace 名（拒 `..` / `/` 穿越）。
     if !is_valid_marketplace_name(name) {
         tracing::error!(
-            marketplace = name,
+            marketplace = %untrusted_name_for_display(name),
             "marketplace name invalid (strict-kebab 1-64), skipped"
         );
         return registered;
@@ -1006,8 +1035,8 @@ pub async fn stage_marketplace_skills(
 
     let url = match marketplace_clone_url(source) {
         Ok(u) => u,
-        Err(e) => {
-            tracing::error!(marketplace = name, error = %e, "invalid marketplace source, skipped");
+        Err(_) => {
+            tracing::error!(marketplace = name, "invalid marketplace source, skipped");
             return registered;
         }
     };
@@ -1425,7 +1454,37 @@ pub async fn stage_mcp_skills(
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     // ---- 安全解包 / safe extraction ----
     #[test]
@@ -1508,6 +1567,59 @@ mod tests {
         );
         assert_eq!(ssh_to_https("https://github.com/owner/repo.git"), None);
         assert_eq!(ssh_to_https("file:///tmp/repo"), None);
+    }
+
+    #[tokio::test]
+    async fn test_git_failure_diagnostics_redact_url_credentials() {
+        const SECRET_URL: &str = "https://cnb:FAKE_TOKEN@127.0.0.1:1/repo.git?token=QUERY#FRAGMENT";
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("clone");
+        let dest_s = dest.to_string_lossy().into_owned();
+        let err = run_git(
+            &["clone", "--", SECRET_URL, &dest_s],
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let public_forms = format!("{err}\n{err:?}");
+        assert!(public_forms.contains("git clone failed"));
+        for secret in ["cnb", "FAKE_TOKEN", "QUERY", "FRAGMENT", SECRET_URL] {
+            assert!(
+                !public_forms.contains(secret),
+                "git diagnostic leaked {secret:?}: {public_forms}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_git_stderr_redacts_abbreviated_scp_endpoint() {
+        for (source, stderr, secrets) in [
+            (
+                "alice@my_host:org/repo.git",
+                "alice@my_host: Permission denied (publickey).",
+                ["alice", "unused"],
+            ),
+            (
+                "用户@例子.公司:org/repo.git",
+                "用户@例子.公司: Permission denied (publickey).",
+                ["用户", "例子.公司"],
+            ),
+            (
+                "alice@my_host:org/repo.git",
+                "alice@my_host's password:",
+                ["alice", "my_host"],
+            ),
+        ] {
+            let rendered = sanitize_git_stderr(&["clone", "--", source], stderr);
+            assert!(
+                rendered.contains(crate::settings::redaction::REDACTED_GIT_SOURCE),
+                "{rendered}"
+            );
+            for secret in secrets {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
     }
 
     // ---- ref 合成 / ref construction ----
@@ -1643,6 +1755,98 @@ mod tests {
         assert_eq!(r.source, "marketplace:acme");
         assert_eq!(r.description, "review code");
         assert!(r.uri.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_plugin_source_error_log_redacts_url_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins":[
+                {"name":"audit","source":{"source":"url","url":"ftp://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT"}},
+                {"name":"prefix","source":"key=https://user:PW_PREFIX@example.com/org/repo.git"},
+                {"name":"scp","source":"key=git@example.com:org/repo.git"},
+                {"name":"x=https://alice:PW_NAME@example.com/repo.git","source":{"source":"url","url":"bogus"}},
+                {"name":"local-leak","source":"./x=https://alice:PW_LOCAL@example.com/repo.git"}
+            ]}"#,
+        )
+        .unwrap();
+        git(&["init", "-q"], &repo);
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let source =
+            serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())});
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(logs.clone())
+            .finish();
+        let mut registry = SkillRegistry::new();
+        let names = stage_marketplace_skills(
+            "acme",
+            &source,
+            &mut registry,
+            &home,
+            MarketplaceStageOptions::default(),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert!(names.is_empty());
+        let rendered = logs.contents();
+        assert!(
+            rendered.contains("plugin staging failed, skipped"),
+            "{rendered}"
+        );
+        for secret in [
+            "cnb",
+            "FAKE_TOKEN",
+            "QUERY",
+            "FRAGMENT",
+            "user",
+            "PW_PREFIX",
+            "PW_NAME",
+            "PW_LOCAL",
+            "git@example.com",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_marketplace_name_log_redacts_embedded_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(logs.clone())
+            .finish();
+        let mut registry = SkillRegistry::new();
+        let names = stage_marketplace_skills(
+            "x=https://public.example/a=https://user2:PW_TWO@secret.example/repo.git",
+            &serde_json::json!({"type": "git", "url": "https://example.com/repo.git"}),
+            &mut registry,
+            tmp.path(),
+            MarketplaceStageOptions::default(),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert!(names.is_empty());
+        let rendered = logs.contents();
+        assert!(rendered.contains("marketplace name invalid"), "{rendered}");
+        for secret in ["user2", "PW_TWO"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
     // ---- mcp 源物化（fake manager，mounted 模式）/ mcp materialization with a fake manager ----

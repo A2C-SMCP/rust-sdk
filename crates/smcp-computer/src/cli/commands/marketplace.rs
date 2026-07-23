@@ -33,6 +33,9 @@ use crate::settings::lifecycle::{
     remove_marketplace, resolve_marketplace_identity, AddMarketplaceParams, GovernanceError,
     MarketplaceRefreshRow, MarketplaceRemoveOutcome, RefreshStatus, RemoveMarketplaceParams,
 };
+use crate::settings::redaction::{
+    git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
+};
 use crate::settings::schema::FIELD_TRUSTED_MARKETPLACES;
 use crate::settings::scope::{
     apply_write, load_settings_file, user_settings_path, EnvMap, WriteValue,
@@ -53,15 +56,77 @@ fn map_store_err(e: SettingsStoreError) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+/// 身份解析错误的 CLI 文案。保持纯函数，使终端文本与 JSON `error` 字段共用同一安全边界。
+fn identity_error_message(error: &GovernanceError) -> String {
+    match error {
+        GovernanceError::InvalidUrl(source) => {
+            format!("not a well-formed git url or owner/repo shorthand: {source:?}")
+        }
+        GovernanceError::InvalidName(name) if name.is_empty() => {
+            "cannot derive a valid marketplace name; pass --name with a lowercase kebab-case name"
+                .to_string()
+        }
+        GovernanceError::InvalidName(name) => format!(
+            "invalid marketplace name {name:?}; expected 1-64 lowercase kebab-case characters"
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn unknown_marketplace_message(name: &str) -> String {
+    format!(
+        "unknown marketplace: {:?}",
+        untrusted_name_for_display(name)
+    )
+}
+
+fn unknown_key_message(key: &str) -> String {
+    format!(
+        "unknown key {:?} (only 'auto-update' supported)",
+        untrusted_name_for_display(key)
+    )
+}
+
+fn redact_public_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_git_urls_in_text(text)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_public_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (redact_git_urls_in_text(key), redact_public_value(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn display_plugin_ids(plugin_ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    plugin_ids
+        .into_iter()
+        .map(|plugin_id| untrusted_name_for_display(&plugin_id))
+        .collect()
+}
+
+fn marketplace_list_row(name: &str, rec: &KnownMarketplaceEntry, trusted: bool) -> Value {
+    json!({
+        "name": untrusted_name_for_display(name),
+        "url": display_source_url(rec),
+        "trusted": trusted,
+        "autoUpdate": rec.extra.get("autoUpdate").and_then(Value::as_bool).unwrap_or(false),
+        "lastUpdated": rec.extra.get("lastUpdated").map_or(Value::Null, redact_public_value),
+        "commitSha": rec.extra.get("commitSha").map_or(Value::Null, redact_public_value),
+    })
+}
+
 /// `marketplace remove` 的 JSON 输出 / remove JSON output。
 ///
 /// 抽成纯函数：键名（`removed`/`pruned`/`uninstalledPlugins`/`keptPlugins`）是**跨 SDK 兼容契约**，
 /// 经独立单测锁定 camelCase 防漂移（handler 内联 `json!` 无法在不捕获 stdout 下断言）。
 fn remove_outcome_json(outcome: &MarketplaceRemoveOutcome) -> Value {
     json!({
-        "removed": outcome.name,
-        "pruned": outcome.pruned,
-        "uninstalledPlugins": outcome.uninstalled_plugins,
+        "removed": untrusted_name_for_display(&outcome.name),
+        "pruned": outcome.pruned.iter().map(|name| untrusted_name_for_display(name)).collect::<Vec<_>>(),
+        "uninstalledPlugins": display_plugin_ids(outcome.uninstalled_plugins.clone()),
         "keptPlugins": outcome.kept_plugins,
     })
 }
@@ -72,8 +137,14 @@ fn remove_outcome_json(outcome: &MarketplaceRemoveOutcome) -> Value {
 fn refresh_rows_json(rows: &[MarketplaceRefreshRow]) -> Vec<Value> {
     rows.iter()
         .map(|r| match r.status {
-            RefreshStatus::Missing => json!({ "name": r.name, "status": "missing" }),
-            _ => json!({ "name": r.name, "status": r.status.as_str(), "skills": r.skills }),
+            RefreshStatus::Missing => {
+                json!({ "name": untrusted_name_for_display(&r.name), "status": "missing" })
+            }
+            _ => json!({
+                "name": untrusted_name_for_display(&r.name),
+                "status": r.status.as_str(),
+                "skills": r.skills
+            }),
         })
         .collect()
 }
@@ -85,6 +156,11 @@ fn load_mps(home: &Path, env: Option<&EnvMap>) -> KnownMarketplaces {
 
 fn source_url(rec: &KnownMarketplaceEntry) -> Option<&str> {
     rec.source.get("url").and_then(Value::as_str)
+}
+
+/// 账本 URL 的 CLI 安全展示值；JSON 与文本输出必须共用，避免某种输出模式绕过脱敏。
+fn display_source_url(rec: &KnownMarketplaceEntry) -> Option<String> {
+    source_url(rec).map(git_url_for_display)
 }
 
 fn read_string_array(map: &Map<String, Value>, key: &str) -> Vec<String> {
@@ -172,24 +248,13 @@ pub async fn marketplace_add(
     // 解析身份（归一 URL + 派生/校验名）——信任门与 stage 共用同一身份语义。
     let identity = match resolve_marketplace_identity(git_url, opts.name) {
         Ok(id) => id,
-        Err(GovernanceError::InvalidUrl(u)) => {
-            return err(
-                &format!("not a well-formed git url or owner/repo shorthand: {u:?}"),
-                json_output,
-                EXIT_USER_ERROR,
-            )
-        }
-        Err(GovernanceError::InvalidName(u)) => {
-            return err(
-                &format!("cannot derive a valid marketplace name from {u:?}; pass --name"),
-                json_output,
-                EXIT_USER_ERROR,
-            )
+        Err(e @ GovernanceError::InvalidUrl(_)) | Err(e @ GovernanceError::InvalidName(_)) => {
+            return err(&identity_error_message(&e), json_output, EXIT_USER_ERROR);
         }
         Err(e) => return err(&e.to_string(), json_output, EXIT_USER_ERROR),
     };
     let mp_name = identity.name.clone();
-    let url = identity.url.clone();
+    let display_url = git_url_for_display(&identity.url);
 
     // 重名校验先于信任提示（保留既有时序：重名直接拒、不弹 confirm、不记 trust）。
     if marketplace_name_taken(home, env, &mp_name) {
@@ -207,7 +272,7 @@ pub async fn marketplace_add(
             None => {
                 return err(
                     &format!(
-                        "untrusted marketplace {mp_name:?} ({url}); pass --trust to confirm non-interactively"
+                        "untrusted marketplace {mp_name:?} ({display_url}); pass --trust to confirm non-interactively"
                     ),
                     json_output,
                     EXIT_USER_ERROR,
@@ -215,7 +280,7 @@ pub async fn marketplace_add(
             }
             Some(confirm) => {
                 if !load_trusted(env).iter().any(|n| n == &mp_name)
-                    && !confirm.confirm(&url).await
+                    && !confirm.confirm(&display_url).await
                 {
                     return err("aborted by user (untrusted)", json_output, EXIT_USER_ERROR);
                 }
@@ -249,9 +314,11 @@ pub async fn marketplace_add(
         )),
         Ok(outcome) => {
             if json_output {
-                print_json(
-                    &json!({ "added": outcome.name, "url": outcome.url, "skills": outcome.skills.len() }),
-                );
+                print_json(&json!({
+                    "added": outcome.name,
+                    "url": git_url_for_display(&outcome.url),
+                    "skills": outcome.skills.len()
+                }));
                 return EXIT_OK;
             }
             ok_msg(&format!(
@@ -259,8 +326,8 @@ pub async fn marketplace_add(
                 outcome.skills.len()
             ))
         }
-        Err(GovernanceError::CloneFailed(u)) => err(
-            &format!("clone/refresh failed for {u:?} (see logs)"),
+        Err(GovernanceError::CloneFailed(name)) => err(
+            &format!("clone/refresh failed for marketplace {name:?} (see logs)"),
             json_output,
             EXIT_NETWORK_ERROR,
         ),
@@ -283,16 +350,7 @@ pub fn marketplace_list(home: &Path, env: Option<&EnvMap>, json_output: bool) ->
         let rows: Vec<Value> = mps
             .marketplaces
             .iter()
-            .map(|(nm, rec)| {
-                json!({
-                    "name": nm,
-                    "url": source_url(rec),
-                    "trusted": is_trusted(nm),
-                    "autoUpdate": rec.extra.get("autoUpdate").and_then(Value::as_bool).unwrap_or(false),
-                    "lastUpdated": rec.extra.get("lastUpdated").cloned().unwrap_or(Value::Null),
-                    "commitSha": rec.extra.get("commitSha").cloned().unwrap_or(Value::Null),
-                })
-            })
+            .map(|(nm, rec)| marketplace_list_row(nm, rec, is_trusted(nm)))
             .collect();
         print_json(&json!(rows));
         return EXIT_OK;
@@ -304,12 +362,14 @@ pub fn marketplace_list(home: &Path, env: Option<&EnvMap>, json_output: bool) ->
     }
     println!("Marketplaces:");
     for (nm, rec) in &mps.marketplaces {
-        let url = source_url(rec).unwrap_or("");
+        let display_name = untrusted_name_for_display(nm);
+        let url = display_source_url(rec).unwrap_or_default();
         let sha = rec
             .extra
             .get("commitSha")
             .and_then(Value::as_str)
-            .unwrap_or("");
+            .map(redact_git_urls_in_text)
+            .unwrap_or_default();
         let sha_disp = if sha.is_empty() {
             "—".to_string()
         } else {
@@ -326,7 +386,7 @@ pub fn marketplace_list(home: &Path, env: Option<&EnvMap>, json_output: bool) ->
             "off"
         };
         println!(
-            "  {nm}  ·  {url}  ·  trusted={}  ·  auto-update={auto}  ·  commit={sha_disp}",
+            "  {display_name}  ·  {url}  ·  trusted={}  ·  auto-update={auto}  ·  commit={sha_disp}",
             if is_trusted(nm) { "✓" } else { "—" },
         );
     }
@@ -336,9 +396,10 @@ pub fn marketplace_list(home: &Path, env: Option<&EnvMap>, json_output: bool) ->
 /// marketplace 详情：URL / clone 路径 / commit / plugins[] / auto_update / trusted。
 pub fn marketplace_info(home: &Path, env: Option<&EnvMap>, name: &str, json_output: bool) -> i32 {
     let mps = load_mps(home, env);
+    let display_name = untrusted_name_for_display(name);
     let Some(rec) = mps.marketplaces.get(name) else {
         return err(
-            &format!("unknown marketplace: {name:?}"),
+            &unknown_marketplace_message(name),
             json_output,
             EXIT_USER_ERROR,
         );
@@ -346,29 +407,30 @@ pub fn marketplace_info(home: &Path, env: Option<&EnvMap>, name: &str, json_outp
 
     let installed = load_installed_plugins(Some(home), env).account;
     let suffix = format!("@{name}");
-    let plugins: Vec<String> = installed
-        .plugins
-        .keys()
-        .filter(|pid| pid.ends_with(&suffix))
-        .cloned()
-        .collect();
+    let plugins = display_plugin_ids(
+        installed
+            .plugins
+            .keys()
+            .filter(|pid| pid.ends_with(&suffix))
+            .cloned(),
+    );
     let trusted = load_trusted(env).iter().any(|t| t == name);
 
     let info = json!({
-        "name": name,
-        "url": source_url(rec),
-        "installLocation": rec.extra.get("installLocation").cloned().unwrap_or(Value::Null),
-        "commitSha": rec.extra.get("commitSha").cloned().unwrap_or(Value::Null),
+        "name": display_name.clone(),
+        "url": display_source_url(rec),
+        "installLocation": rec.extra.get("installLocation").map_or(Value::Null, redact_public_value),
+        "commitSha": rec.extra.get("commitSha").map_or(Value::Null, redact_public_value),
         "autoUpdate": rec.extra.get("autoUpdate").and_then(Value::as_bool).unwrap_or(false),
         "trusted": trusted,
-        "lastUpdated": rec.extra.get("lastUpdated").cloned().unwrap_or(Value::Null),
+        "lastUpdated": rec.extra.get("lastUpdated").map_or(Value::Null, redact_public_value),
         "installedPlugins": plugins,
     });
     if json_output {
         print_json(&info);
         return EXIT_OK;
     }
-    println!("Marketplace · {name}");
+    println!("Marketplace · {display_name}");
     for key in [
         "url",
         "installLocation",
@@ -419,16 +481,17 @@ pub async fn marketplace_remove(
     non_plugin_bundle_ids: &std::collections::HashSet<crate::mcp_clients::model::BundleId>,
 ) -> i32 {
     let json_output = opts.json_output;
+    let display_name = untrusted_name_for_display(name);
     // 未知校验先于 confirm（保留既有时序：未知直接拒、不弹 confirm）。
     if !marketplace_name_taken(home, env, name) {
         return err(
-            &format!("unknown marketplace: {name:?}"),
+            &unknown_marketplace_message(name),
             json_output,
             EXIT_USER_ERROR,
         );
     }
     if let Some(confirm) = opts.confirm {
-        if !confirm.confirm(name).await {
+        if !confirm.confirm(&display_name).await {
             return err("aborted by user", json_output, EXIT_USER_ERROR);
         }
     }
@@ -454,7 +517,7 @@ pub async fn marketplace_remove(
     // 无错误处理）——写失败仅告警、**不**把已完成的卸载/prune 级联翻成用户错（destructive 工作已落地）。
     if let Err(e) = revoke_trust(name, env) {
         msg_dim(&format!(
-            "warning: failed to revoke trust for {name:?}: {e}"
+            "warning: failed to revoke trust for {display_name:?}: {e}"
         ));
     }
 
@@ -472,7 +535,7 @@ pub async fn marketplace_remove(
     } else {
         String::new()
     };
-    ok_msg(&format!("removed marketplace {name:?}{detail}"))
+    ok_msg(&format!("removed marketplace {display_name:?}{detail}"))
 }
 
 /// `git pull` 失败则全量重 clone；与缓存 plugin 集合对账 + 失败汇总（§10.4）/ refresh marketplaces。
@@ -498,7 +561,11 @@ pub async fn marketplace_refresh(
             RefreshStatus::Unchanged => "·",
             RefreshStatus::Missing => "✗",
         };
-        println!("  {mark} {}  ({})", r.name, r.status.as_str());
+        println!(
+            "  {mark} {}  ({})",
+            untrusted_name_for_display(&r.name),
+            r.status.as_str()
+        );
     }
     let updated = rows
         .iter()
@@ -524,12 +591,9 @@ pub fn marketplace_set(
     value: &str,
     json_output: bool,
 ) -> i32 {
+    let display_name = untrusted_name_for_display(name);
     if key != "auto-update" {
-        return err(
-            &format!("unknown key {key:?} (only 'auto-update' supported)"),
-            json_output,
-            EXIT_USER_ERROR,
-        );
+        return err(&unknown_key_message(key), json_output, EXIT_USER_ERROR);
     }
     let val = matches!(
         value.trim().to_lowercase().as_str(),
@@ -537,7 +601,7 @@ pub fn marketplace_set(
     );
     if !load_mps(home, env).marketplaces.contains_key(name) {
         return err(
-            &format!("unknown marketplace: {name:?}"),
+            &unknown_marketplace_message(name),
             json_output,
             EXIT_USER_ERROR,
         );
@@ -561,10 +625,10 @@ pub fn marketplace_set(
         );
     }
     if json_output {
-        print_json(&json!({ "name": name, "autoUpdate": val }));
+        print_json(&json!({ "name": display_name, "autoUpdate": val }));
         return EXIT_OK;
     }
-    ok_msg(&format!("{name:?} auto-update set to {val}"))
+    ok_msg(&format!("{display_name:?} auto-update set to {val}"))
 }
 
 #[cfg(test)]
@@ -578,6 +642,7 @@ mod tests {
     struct MockConfirm {
         answer: bool,
         called: std::sync::atomic::AtomicBool,
+        target: std::sync::Mutex<Option<String>>,
     }
 
     impl MockConfirm {
@@ -585,22 +650,170 @@ mod tests {
             Self {
                 answer,
                 called: std::sync::atomic::AtomicBool::new(false),
+                target: std::sync::Mutex::new(None),
             }
         }
         fn was_called(&self) -> bool {
             self.called.load(std::sync::atomic::Ordering::SeqCst)
         }
+        fn target(&self) -> Option<String> {
+            self.target.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl Confirm for MockConfirm {
-        async fn confirm(&self, _target: &str) -> bool {
+        async fn confirm(&self, target: &str) -> bool {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.target.lock().unwrap() = Some(target.to_string());
             self.answer
         }
     }
 
     // URL 归一 / 名派生纯函数的单测随实现迁移到 settings::lifecycle（#94），不在此重复。
+
+    #[test]
+    fn identity_error_cli_message_never_echoes_credentialed_url() {
+        const SECRET_URL: &str = "https://cnb:FAKE_TOKEN@example.com/org/repo.git";
+        let error = resolve_marketplace_identity(SECRET_URL, Some("Turingfocus")).unwrap_err();
+        let message = identity_error_message(&error);
+        assert!(message.contains("Turingfocus"));
+        assert!(!message.contains("cnb"));
+        assert!(!message.contains("FAKE_TOKEN"));
+        assert!(!message.contains(SECRET_URL));
+    }
+
+    #[test]
+    fn identity_error_cli_message_redacts_url_embedded_in_explicit_name() {
+        let error = resolve_marketplace_identity(
+            "acme/skills",
+            Some("key=https://user:PW_SECRET@example.com/name"),
+        )
+        .unwrap_err();
+        let message = identity_error_message(&error);
+        assert!(message.contains("key="));
+        for secret in ["user", "PW_SECRET"] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+
+    #[test]
+    fn identity_error_cli_message_for_pathless_url_contains_no_credentials() {
+        let error = resolve_marketplace_identity(
+            "https://user:PW_SECRET@example.com?token=QUERY#FRAGMENT",
+            None,
+        )
+        .unwrap_err();
+        let message = identity_error_message(&error);
+        assert!(message.contains("cannot derive a valid marketplace name"));
+        for secret in ["user", "PW_SECRET", "QUERY", "FRAGMENT"] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+
+    #[test]
+    fn unknown_name_and_key_cli_messages_never_echo_credentials() {
+        for message in [
+            unknown_marketplace_message(
+                "x=https://public.example/a=https://user2:PW_TWO@secret.example/repo.git",
+            ),
+            unknown_marketplace_message(
+                "x=https://example.com/r.git?token=QUERY_QUOTE'LEAK_SECRET",
+            ),
+            unknown_marketplace_message("x=https://alice:PW_ONE'PW_TWO@example.com/repo.git"),
+            unknown_marketplace_message("key=用户@example.com:org/repo.git"),
+            unknown_key_message("https://user:PW_SECRET@example.com/repo.git"),
+        ] {
+            for secret in [
+                "user",
+                "PW_SECRET",
+                "user2",
+                "PW_TWO",
+                "用户",
+                "QUERY_QUOTE",
+                "LEAK_SECRET",
+                "PW_ONE",
+            ] {
+                assert!(!message.contains(secret), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn ledger_url_display_is_credential_free_for_text_and_json_paths() {
+        let rec = KnownMarketplaceEntry {
+            source: json!({
+                "type": "git",
+                "url": "https://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT"
+            }),
+            extra: Map::new(),
+        };
+        let displayed = display_source_url(&rec).unwrap();
+        assert_eq!(displayed, "https://example.com/org/repo.git");
+        for secret in ["cnb", "FAKE_TOKEN", "QUERY", "FRAGMENT"] {
+            assert!(!displayed.contains(secret));
+        }
+    }
+
+    #[test]
+    fn hand_edited_ledger_identifiers_are_safe_for_text_and_json() {
+        let rec = KnownMarketplaceEntry {
+            source: json!({"type": "git", "url": "https://example.com/repo.git"}),
+            extra: Map::from_iter([
+                (
+                    "commitSha".to_string(),
+                    json!("https://alice:PW_META@example.com/r.git?token=;META_SECRET"),
+                ),
+                (
+                    "lastUpdated".to_string(),
+                    json!({
+                        "x=https://alice:PW_KEY@example.com/r.git": {
+                            "source": "git@secret.example:org/repo.git"
+                        }
+                    }),
+                ),
+            ]),
+        };
+        let row = marketplace_list_row("x=https://alice:PW_NAME@example.com/repo.git", &rec, false);
+        let plugin_ids =
+            display_plugin_ids(["x=https://alice:PW_PLUGIN@example.com/repo.git@safe".to_string()]);
+        let remove = remove_outcome_json(&MarketplaceRemoveOutcome {
+            name: "x=https://alice:PW_REMOVE@example.com/repo.git".to_string(),
+            pruned: vec!["git@secret.example:PW_PRUNED".to_string()],
+            uninstalled_plugins: vec![
+                "x=https://alice:PW_UNINSTALL@example.com/repo.git@safe".to_string()
+            ],
+            kept_plugins: false,
+        });
+        let refresh = refresh_rows_json(&[MarketplaceRefreshRow {
+            name: "x=https://alice:PW_REFRESH@example.com/repo.git".to_string(),
+            status: RefreshStatus::Missing,
+            skills: 0,
+        }]);
+        let rendered = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            serde_json::to_string(&row).unwrap(),
+            row["name"],
+            plugin_ids.join(", "),
+            serde_json::to_string(&remove).unwrap(),
+            serde_json::to_string(&refresh).unwrap(),
+        );
+        for secret in [
+            "alice",
+            "PW_META",
+            "META_SECRET",
+            "PW_KEY",
+            "secret.example",
+            "PW_NAME",
+            "PW_PLUGIN",
+            "PW_REMOVE",
+            "PW_PRUNED",
+            "PW_UNINSTALL",
+            "PW_REFRESH",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
 
     #[tokio::test]
     async fn add_non_interactive_requires_trust() {
@@ -811,6 +1024,34 @@ mod tests {
         .await;
         assert_eq!(code, EXIT_USER_ERROR);
         assert!(confirm.was_called());
+        assert!(load_mps(home, Some(&env)).marketplaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_interactive_confirm_receives_credential_free_url() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let env = test_env(home);
+        let mut registry = SkillRegistry::new();
+        let confirm = MockConfirm::new(false);
+        let code = marketplace_add(
+            &mut registry,
+            home,
+            Some(&env),
+            "https://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT",
+            MarketplaceAddOptions {
+                name: Some("valid-name"),
+                confirm: Some(&confirm),
+                json_output: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(code, EXIT_USER_ERROR);
+        assert_eq!(
+            confirm.target().as_deref(),
+            Some("https://example.com/org/repo.git")
+        );
         assert!(load_mps(home, Some(&env)).marketplaces.is_empty());
     }
 

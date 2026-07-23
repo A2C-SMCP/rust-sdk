@@ -31,6 +31,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
+use crate::settings::redaction::url_with_redacted_userinfo;
+
 use super::crud::{load_project_config_doc, save_config, ConfigCrudError, ProjectConfigDoc};
 use super::validate::{validate_config, ValidationReport};
 
@@ -134,31 +136,10 @@ fn redact_string_map_values(params: &mut Map<String, Value>, field: &str) {
 /// 只动 authority 段的 userinfo（`@` 前、authority 内）——host/path/query 不动（query token 属声明外未覆盖面）。
 fn redact_url_userinfo(params: &mut Map<String, Value>) {
     if let Some(Value::String(url)) = params.get_mut("url") {
-        if let Some(redacted) = url_with_redacted_userinfo(url) {
+        if let Some(redacted) = url_with_redacted_userinfo(url, REDACTED_PLACEHOLDER) {
             *url = redacted;
         }
     }
-}
-
-/// 若 `url` 的 authority 段含非空 userinfo → 返回抹去 userinfo 的新串；否则 `None`（不改）。
-fn url_with_redacted_userinfo(url: &str) -> Option<String> {
-    let after_scheme = url.find("://")? + 3;
-    // authority 终止于首个 '/'（path 起点）或串尾。
-    let authority_end = url[after_scheme..]
-        .find('/')
-        .map(|i| after_scheme + i)
-        .unwrap_or(url.len());
-    let at_rel = url[after_scheme..authority_end].find('@')?;
-    let at = after_scheme + at_rel;
-    if at <= after_scheme {
-        return None; // userinfo 为空（`scheme://@host`）→ 无 secret。
-    }
-    Some(format!(
-        "{}{}{}",
-        &url[..after_scheme],
-        REDACTED_PLACEHOLDER,
-        &url[at..]
-    ))
 }
 
 /// **分段脱敏**一个字符串：逐字保留合法闭合且可识别（`input:`/`env:`）的占位符引用，其余**每段字面**抹为哨兵。
