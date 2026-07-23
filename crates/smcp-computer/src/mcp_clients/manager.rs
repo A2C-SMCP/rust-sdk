@@ -1196,6 +1196,28 @@ impl MCPServerManager {
             .collect()
     }
 
+    /// 活动客户端快照，附 `bundle_id`（身份键）+ 展示名。供需要身份的窗口枚举路径共用。
+    ///
+    /// 与 [`active_clients_by_name`](Self::active_clients_by_name) 的区别：保留 `bundle_id`（server 唯一身份），
+    /// 仅把展示名作为 `.1` 附带——身份/分组/寻址一律用 `bundle_id`（协议 §身份正交性：`name` 允许碰撞）。
+    /// 极端情况下（config 已移除但 client 尚存）展示名回退用 `bundle_id` 作名。
+    async fn active_clients_with_identity(
+        &self,
+    ) -> Vec<(BundleId, ServerName, StdArc<dyn MCPClientProtocol>)> {
+        let clients = self.active_clients.read().await;
+        let configs = self.servers_config.read().await;
+        clients
+            .iter()
+            .map(|(bundle_id, client)| {
+                let name = configs
+                    .get(bundle_id)
+                    .map(|c| c.name().to_string())
+                    .unwrap_or_else(|| bundle_id.to_string());
+                (bundle_id.clone(), name, client.clone())
+            })
+            .collect()
+    }
+
     /// 列出所有窗口资源 / List all window resources
     /// 聚合所有活动客户端的 window:// 资源，可选按 URI 完全匹配过滤
     /// Aggregates window:// resources from all active clients, optionally filtered by exact URI match
@@ -1221,6 +1243,49 @@ impl MCPServerManager {
                         server_name, e
                     );
                 }
+            }
+        }
+        results
+    }
+
+    /// 枚举所有窗口资源，携带**稳定身份 `bundle_id`** + 展示名，**不读取窗口内容**。
+    ///
+    /// Enumerate all window resources tagged with **stable identity `bundle_id`** + display name,
+    /// **without reading window contents**.
+    ///
+    /// 介于 [`list_all_windows`](Self::list_all_windows)（仅展示名、丢身份）与
+    /// [`get_windows_details`](Self::get_windows_details)（携带身份但 eager-read 且读取失败丢窗）之间：
+    /// 只调用 [`list_windows`](MCPClientProtocol::list_windows)（resources/list），**从不调用**
+    /// [`get_window_detail`](MCPClientProtocol::get_window_detail)（resources/read）。因此：
+    /// - 两个展示名相同、`bundle_id` 不同的 server，其窗口均无歧义返回（协议 §身份正交性）。
+    /// - 单个窗口 `resources/read` 失败**不影响**该窗口或其余窗口的枚举结果（本方法压根不读取）。
+    ///
+    /// `window://` host 属 MCP 自选、透传不解释（正交）。`window_uri` 为 `Some` 时按 URI 完全匹配过滤。
+    /// 需读取单个窗口详情请用 [`get_window_detail`](Self::get_window_detail)。
+    pub async fn list_windows_with_identity(
+        &self,
+        window_uri: Option<&str>,
+    ) -> Vec<(BundleId, ServerName, Resource)> {
+        let entries = self.active_clients_with_identity().await;
+        let mut results = Vec::new();
+        for (bundle_id, server_name, client) in entries {
+            let windows = match client.list_windows().await {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(
+                        "Failed to list windows from server '{}': {}",
+                        server_name, e
+                    );
+                    continue;
+                }
+            };
+            for resource in windows {
+                if let Some(uri_filter) = window_uri {
+                    if resource.uri.as_str() != uri_filter {
+                        continue;
+                    }
+                }
+                results.push((bundle_id.clone(), server_name.clone(), resource));
             }
         }
         results
@@ -1343,21 +1408,9 @@ impl MCPServerManager {
         &self,
         window_uri: Option<&str>,
     ) -> Vec<(BundleId, ServerName, Resource, ReadResourceResult)> {
-        // (bundle_id, name, client) 快照：bundle_id = active_clients 键（分组），name 从 servers_config 取（展示）。
-        let entries: Vec<(BundleId, ServerName, StdArc<dyn MCPClientProtocol>)> = {
-            let clients = self.active_clients.read().await;
-            let configs = self.servers_config.read().await;
-            clients
-                .iter()
-                .map(|(bundle_id, client)| {
-                    let name = configs
-                        .get(bundle_id)
-                        .map(|c| c.name().to_string())
-                        .unwrap_or_else(|| bundle_id.to_string());
-                    (bundle_id.clone(), name, client.clone())
-                })
-                .collect()
-        };
+        // (bundle_id, name, client) 快照与 `list_windows_with_identity` 共用：bundle_id = active_clients 键
+        // （分组），name 从 servers_config 取（展示）。
+        let entries = self.active_clients_with_identity().await;
         let mut results = Vec::new();
         for (bundle_id, server_name, client) in entries {
             let windows = match client.list_windows().await {
@@ -2104,9 +2157,14 @@ pub(crate) mod test_support {
         }
     }
 
-    /// 返回一个固定 `window://` 资源 + 空 detail 的假 client，供 `get_windows_details` 的 bundle_id 投影测试（#118）。
+    /// 返回一个固定 `window://` 资源 + 空 detail 的假 client，供 `get_windows_details` / `list_windows_with_identity`
+    /// 的身份投影与「读取失败不丢窗」测试（#118 / #153）。`fail_detail = true` 让 `get_window_detail` 报错
+    /// （`list_windows` 仍成功），用于演练单窗口 `resources/read` 失败。`detail_calls` 计 `get_window_detail`
+    /// 调用次数，供 #153 锁死「`list_windows_with_identity` 从不读取」契约（仿 [`CountingToolsClient`]）。
     pub(crate) struct WindowMockClient {
         pub(crate) uri: String,
+        pub(crate) fail_detail: bool,
+        pub(crate) detail_calls: StdArc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -2143,7 +2201,13 @@ pub(crate) mod test_support {
             &self,
             _resource: Resource,
         ) -> Result<ReadResourceResult, MCPClientError> {
-            Ok(ReadResourceResult { contents: vec![] })
+            self.detail_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_detail {
+                Err(MCPClientError::ProtocolError("forced read failure".into()))
+            } else {
+                Ok(ReadResourceResult { contents: vec![] })
+            }
         }
         async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
             Ok(())
@@ -2760,6 +2824,8 @@ mod tests {
             bid("id_x"),
             StdArc::new(WindowMockClient {
                 uri: "window://a.mcp.com/w".to_string(),
+                fail_detail: false,
+                detail_calls: StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
             }),
         );
 
@@ -2776,6 +2842,109 @@ mod tests {
             resource.uri.as_str(),
             "window://a.mcp.com/w",
             "window://host 属 MCP 自选、原样保留（正交，不受 #118 改动）"
+        );
+    }
+
+    /// #153：`list_windows_with_identity` 的 `.0` = **bundle_id**（`active_clients` 键），`.1` = 展示名。
+    ///
+    /// 两个 display 名相同、`bundle_id` 不同的合法共存 server：旧 `list_all_windows` 路径经
+    /// `active_clients_by_name()` 把两者都标成同一展示名，下游无法区分；新方法按 bundle_id 标注，两者无歧义。
+    /// 且本方法只调 `list_windows`（resources/list），不读取窗口内容。
+    #[tokio::test]
+    async fn list_windows_with_identity_keys_by_bundle_id_153() {
+        use super::test_support::{stdio_cfg_with_bundle, WindowMockClient};
+        let manager = MCPServerManager::new();
+        // 两个 server 共用 display 名 "same-display-name"，bundle_id 各异（协议：name 允许碰撞）。
+        for (id, uri) in [
+            ("id_a", "window://a.example.com/w"),
+            ("id_b", "window://b.example.com/w"),
+        ] {
+            manager.servers_config.write().await.insert(
+                bid(id),
+                stdio_cfg_with_bundle("same-display-name", Some(id)),
+            );
+            manager.active_clients.write().await.insert(
+                bid(id),
+                StdArc::new(WindowMockClient {
+                    uri: uri.to_string(),
+                    fail_detail: false,
+                    detail_calls: StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+            );
+        }
+
+        let mut entries = manager.list_windows_with_identity(None).await;
+        entries.sort_by_key(|(bid, _, _)| bid.clone());
+        assert_eq!(entries.len(), 2, "两个同名 server 的窗口均应返回");
+
+        let (bid_a, name_a, res_a) = &entries[0];
+        let (bid_b, name_b, res_b) = &entries[1];
+        assert_eq!(
+            bid_a.as_str(),
+            "id_a",
+            ".0 应为 bundle_id（active_clients 键）"
+        );
+        assert_eq!(bid_b.as_str(), "id_b");
+        assert_eq!(
+            name_a, "same-display-name",
+            ".1 应为展示名（servers_config）"
+        );
+        assert_eq!(
+            name_b, "same-display-name",
+            "两 server 共用展示名但仍可由 bundle_id 区分"
+        );
+        assert_eq!(res_a.uri.as_str(), "window://a.example.com/w");
+        assert_eq!(res_b.uri.as_str(), "window://b.example.com/w");
+    }
+
+    /// #153：`list_windows_with_identity` 只调 `list_windows`（resources/list）、**从不调**
+    /// `get_window_detail`（resources/read），故单窗口读取失败不会令窗口从结果中消失。
+    ///
+    /// 契约 #1/#3 的**确定性**证明：用共享计数器断言新方法后 `detail_calls == 0`（压根没读取），
+    /// 再调 `get_windows_details` 断言计数 `> 0`——既证明计数器接线正常（免「恒 0」假绿），又演示两路径差异
+    /// （此处只看是否触发 `resources/read`，不依赖 `get_windows_details` 的丢窗行为，免未来耦合误红）。
+    #[tokio::test]
+    async fn list_windows_with_identity_survives_read_failure_153() {
+        use super::test_support::{stdio_cfg_with_bundle, WindowMockClient};
+        let manager = MCPServerManager::new();
+        manager.servers_config.write().await.insert(
+            bid("id_x"),
+            stdio_cfg_with_bundle("display-name", Some("id_x")),
+        );
+        // list_windows 成功、get_window_detail 失败；detail_calls 共享计数以锁死「从不读取」。
+        let detail_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        manager.active_clients.write().await.insert(
+            bid("id_x"),
+            StdArc::new(WindowMockClient {
+                uri: "window://a.mcp.com/w".to_string(),
+                fail_detail: true,
+                detail_calls: detail_calls.clone(),
+            }),
+        );
+
+        let enumerated = manager.list_windows_with_identity(None).await;
+        assert_eq!(
+            enumerated.len(),
+            1,
+            "读取失败不应令窗口从枚举结果消失（本方法不读取）"
+        );
+        let (bid, name, resource) = &enumerated[0];
+        assert_eq!(bid.as_str(), "id_x");
+        assert_eq!(name, "display-name");
+        assert_eq!(resource.uri.as_str(), "window://a.mcp.com/w");
+        // 确定性契约证明：新方法不应触发任何 resources/read。
+        assert_eq!(
+            detail_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "list_windows_with_identity 不应调用 get_window_detail（resources/read）"
+        );
+
+        // 计数器接线自检 + 行为对照：get_windows_details 会 eager-read（计数 >0）。
+        // 证明计数非恒 0（防 mock 忘增计数致假绿），且新方法确未读取——不依赖丢窗行为。
+        let _details = manager.get_windows_details(None).await;
+        assert!(
+            detail_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "对照：get_windows_details 应触发 resources/read（证明计数器接线 + 新方法确未读取）"
         );
     }
 

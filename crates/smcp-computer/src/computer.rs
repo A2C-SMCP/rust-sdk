@@ -2559,6 +2559,25 @@ impl<S: Session> Computer<S> {
         }
     }
 
+    /// 枚举所有窗口资源，携带稳定身份（`bundle_id` + 展示名），**不读取窗口内容**。
+    ///
+    /// 供需要以 `BundleId + URI` 作为窗口稳定身份、且按需读取详情的下游客户端使用：同名 server
+    /// （`bundle_id` 不同）可无歧义区分，单窗口 `resources/read` 失败不会令窗口从列表消失
+    /// （本方法只枚举、不读取）。读取单个窗口详情请用 [`get_window_detail`](Self::get_window_detail)。
+    pub async fn list_windows_with_identity(
+        &self,
+        window_uri: Option<&str>,
+    ) -> ComputerResult<Vec<(BundleId, ServerName, Resource)>> {
+        let manager = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager {
+            Ok(manager.list_windows_with_identity(window_uri).await)
+        } else {
+            Err(ComputerError::InvalidState(
+                "Computer not initialized".to_string(),
+            ))
+        }
+    }
+
     /// 获取所有窗口资源的详情 / Get details of all window resources
     ///
     /// 元组 = `(bundle_id, server_name, resource, read_result)`：`bundle_id` = desktop 分组键（协议 0.3.0 #18），
