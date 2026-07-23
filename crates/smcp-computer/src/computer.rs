@@ -302,6 +302,11 @@ pub struct Computer<S: Session> {
     auto_connect: bool,
     /// 自动重连标志 / Auto reconnect flag
     auto_reconnect: bool,
+    /// MCP client factory override（#152 测试接缝；缺省 `None` 用真实 `client_factory`）/ client factory override.
+    ///
+    /// 经 [`with_client_factory`](Self::with_client_factory) 注入；[`new_manager`](Self::new_manager)（boot_up /
+    /// mount_server 惰性建 manager 处）应用到 manager，使 hermetic 测试能注入假 client 测「mount→running」。
+    client_factory_override: Option<crate::mcp_clients::manager::ClientFactory>,
     /// 工具调用历史 / Tool call history
     tool_history: Arc<Mutex<Vec<ToolCallRecord>>>,
     /// Session实例 / Session instance
@@ -692,6 +697,7 @@ impl<S: Session> Computer<S> {
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
             auto_reconnect,
+            client_factory_override: None,
             tool_history: Arc::new(Mutex::new(Vec::new())),
             session,
             socketio_client,
@@ -729,6 +735,20 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_blob_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.blob_cache_root_override = Some(root.into());
+        self
+    }
+
+    /// 注入 MCP client factory override（#152 测试接缝）/ Inject a client factory override（test seam）。
+    ///
+    /// 缺省不注入 → manager 用真实 `client_factory`（stdio/sse/http 真实连接）。注入后由内部 `new_manager`
+    /// 应用到 boot/mount 建出的 manager，使 hermetic 测试能注入假 client（如 `MockSkillClient`）复现
+    /// 「mount→running」。**生产路径不调用**。
+    #[must_use]
+    pub fn with_client_factory(
+        mut self,
+        factory: crate::mcp_clients::manager::ClientFactory,
+    ) -> Self {
+        self.client_factory_override = Some(factory);
         self
     }
 
@@ -1259,15 +1279,17 @@ impl<S: Session> Computer<S> {
     /// 冷启动 / 进程重启后，从 `installed_plugins_intent.json`（安装意图，v0.3.0 权威）+ `known_marketplaces.json`
     /// 重挂**已装且启用**（intent ∧ `enabledPlugins==true`）的 marketplace plugin skills；给定 `hooks` 时再经
     /// [`McpInstallHooks`] 重挂其 bundled MCP server（SDK 决定
-    /// 「哪些」= 已装且启用 plugin 的 bundled server，client 经 hooks 决定「如何物化」）。由
-    /// [`boot_up`](Self::boot_up)（`hooks = None`）自动调用，亦允许 client 显式调用驱动 MCP 重挂。
+    /// 「哪些」= 已装且启用 plugin 的 bundled server，client 经 hooks 决定「如何物化」）并**启动**之达 running
+    /// （#152：协议 #11「enable 原子激活 servers」）。由 [`boot_up`](Self::boot_up)（`hooks = None`）自动调用，
+    /// 亦允许 client 显式调用驱动 MCP 重挂 + 启动。
     ///
     /// - **幂等**：重复调用（boot 自动 + client 显式）结果一致，不重复注册 / 重复 staging。
     /// - **enabled 门控（v0.3.0 翻转）**：仅 `enabledPlugins[pid] == true` 的已装 plugin 恢复——`absent`/`false`
     ///   均**不**激活（install 不再装即活跃；含 disable / #94 enable-rollback 落定 `false` 的半装 plugin）。install-set
     ///   取自 `installedPlugins` 意图（账本 `installed_plugins.json` 仅供 installPath 等 materialization 细节）。
     /// - **降级铁律**：marketplace 源不可达 / clone 树缺失 → WARN 降级、**不**阻断；`register_server` 失败 →
-    ///   WARN、**不**阻断（best-effort 重挂）。
+    ///   WARN、**不**阻断（best-effort 重挂）；重挂后 [`start_mcp_client`](Self::start_mcp_client) 失败（#152，
+    ///   进程缺失 / 连接拒绝等）→ WARN、**不**阻断（server 留 `pending`，不阻断其余）。
     /// - **边界**（#93 Non-Goal）：只在**构造期固定的 `skill_home`** 内重建派生态，**不**改 `skill_home` /
     ///   配置根 / skill 源根。`home = skill_home()`、`env = None`（进程环境）。
     /// - **锁纪律**：阶段一持 `skill_registry` 写锁重挂 skills；**释放写锁后**再经 hooks 重挂 server，避免
@@ -1278,7 +1300,9 @@ impl<S: Session> Computer<S> {
     ///   不重挂任何 bundled MCP server**（boot 期 SDK 无 hooks 对象）。bundled MCP 恢复由 **client** 承担：要么
     ///   client 在重启时把 bundled server 物化进**自己的 MCP 配置模型**（boot 的 `manager.initialize` 自然重挂），
     ///   要么 client 重启后**显式**调 `reconcile_governance(Some(hooks))` 让 SDK 决定「哪些」、client hooks 物化
-    ///   「如何」。此为 #93 point 4「client owns MCP config」边界的直接后果，非疏漏。
+    ///   「如何」。**后者（显式 `reconcile_governance(Some(hooks))`）现会一并启动重挂的 bundled server 达 running**
+    ///   （#152：协议 #11 enable 激活 servers）——client 无需再单独 `start_all`。此为 #93 point 4「client owns MCP
+    ///   config」边界（boot 不擅拉进程）的直接后果，非疏漏；激活发生在 client 显式驱动的恢复路径上。
     /// - **运行期显式调用会阻塞 skill 读**：阶段一对**全部** marketplace 串行 stage 且写锁跨 stage await。常态
     ///   （clone 树已存在、`refresh = false`）仅本地 FS、无网络，开销小；但 clone 树缺失需 clone 时单源最坏
     ///   `DEFAULT_GIT_TIMEOUT`，期间 `get_skills` 等 skill 读阻塞。宜**低频 / 受控**触发（恢复语义本就一次性）。
@@ -1373,8 +1397,17 @@ impl<S: Session> Computer<S> {
                 }
                 match h.register_server(rec.config).await {
                     Ok(()) => {
-                        existing.insert(bid);
-                        report.remounted_servers.push(name);
+                        existing.insert(bid.clone());
+                        report.remounted_servers.push(name.clone());
+                        // #152：enabled bundled MCP 重挂后**启动**达 running（协议 #11「enable 原子激活
+                        // servers」；boot 活跃集 = installed ∧ enabled）。best-effort：启动失败（进程缺失 /
+                        // 连接拒绝等）仅 WARN、不阻断其余 server 恢复（与 register_server 失败降级铁律一致）。
+                        // `start_mcp_client` 幂等（已启动返 Ok）且成功自带 capability bump + joined 时广播
+                        // `update_tool_list`——恢复后 plugin tools 立即可见，无需额外接线。
+                        if let Err(e) = self.start_mcp_client(&bid).await {
+                            warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id, error = %e,
+                                "reconcile_governance: remounted server failed to start (non-blocking; stays pending)");
+                        }
                     }
                     Err(e) => {
                         warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id, error = %e,
@@ -1679,8 +1712,8 @@ impl<S: Session> Computer<S> {
         // #114 S7：进入 Starting（加载 config / 解析本地状态 / 启动 MCP 资源，契约 §3）。
         self.status.transition(LifecycleState::Starting);
 
-        // 创建MCP服务器管理器 / Create MCP server manager
-        let manager = MCPServerManager::new();
+        // 创建MCP服务器管理器 / Create MCP server manager（#152：经 new_manager 应用 client factory override 接缝）
+        let manager = self.new_manager().await;
 
         // #106：建 MCP 运行期变化通知 channel，并在**客户端启动前**把 sender 注入 manager（start_client 据此
         // 为每个新客户端携带 ClientNotifyCtx）。stdio/sse/http 三传输的服务器主动通知经此 channel 汇聚。
@@ -2060,7 +2093,8 @@ impl<S: Session> Computer<S> {
         if self.mcp_manager.read().await.is_none() {
             let mut manager_guard = self.mcp_manager.write().await;
             if manager_guard.is_none() {
-                *manager_guard = Some(MCPServerManager::new());
+                // #152：经 new_manager 应用 client factory override 接缝（hermetic 测试 mount→running）。
+                *manager_guard = Some(self.new_manager().await);
             }
         }
 
@@ -3240,6 +3274,19 @@ impl<S: Session> Computer<S> {
         ComputerError::InvalidState("MCP Manager not initialized".to_string())
     }
 
+    /// 建一个 `MCPServerManager` 并应用本实例的 client factory override（#152 测试接缝）/ new manager.
+    ///
+    /// 统一 [`boot_up`](Self::boot_up) 与 [`mount_rendered`](Self::mount_rendered) 惰性建 manager 两处：注入了
+    /// [`with_client_factory`](Self::with_client_factory) override 时应用到 manager（hermetic 测试用），否则保持
+    /// 真实 `client_factory`。**`change_sender` 仍由 `boot_up` 在调用本方法后单独注入**（本方法不涉及）。
+    async fn new_manager(&self) -> MCPServerManager {
+        let manager = MCPServerManager::new();
+        if let Some(factory) = self.client_factory_override.clone() {
+            manager.set_client_factory(Some(factory)).await;
+        }
+        manager
+    }
+
     /// #148：MCP 起停**真有变更**后：bump capability revision（§12 R2：改变 Agent-facing 工具投影）
     /// 并（joined 时）向 Office 广播 `server:update_tool_list`（events.md §server:update_tool_list）。
     /// 与 [`McpChangeReactor`] 的 `tools/list_changed` 路径合流——二者皆由 [`broadcast_tool_list_update`] 收口。
@@ -3293,6 +3340,7 @@ impl<S: Session> Computer<S> {
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
+            client_factory_override: self.client_factory_override.clone(),
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: detached_socketio.clone(),
@@ -3526,6 +3574,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
+            client_factory_override: self.client_factory_override.clone(),
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: Arc::clone(&self.socketio_client),
@@ -4681,6 +4730,54 @@ mod tests {
         }
     }
 
+    /// **挂载式** `McpInstallHooks` 替身（#152）：与 `RecordingRemountHooks` 不同——`register_server` 真调
+    /// [`Computer::mount_server`] 把 bundled server 物化进 manager（而非仅记录名），用于断言重挂后是否
+    /// **启动**达 running。镜像生产 `CliMcpHooks` / tfrobot `RuntimeMcpHooks` 的落点（mount_server）。
+    struct MountingRemountHooks<'a, S: Session> {
+        comp: &'a Computer<S>,
+    }
+    impl<'a, S: Session> MountingRemountHooks<'a, S> {
+        fn new(comp: &'a Computer<S>) -> Self {
+            Self { comp }
+        }
+    }
+    #[async_trait::async_trait]
+    impl<'a, S: Session> McpInstallHooks for MountingRemountHooks<'a, S> {
+        fn existing_servers(&self) -> std::collections::HashMap<BundleId, ServerName> {
+            // `existing_servers` 是同步方法，无法 await `list_mcp_servers`；fresh Computer 重挂期 manager 空
+            // ⇒ 返回空集（reconcile 内首见胜、不与既有冲突）。对齐 `CliMcpHooks::new_remount` 的「构造期快照」
+            // 语义——此处 comp 初始无 server，快照即空。
+            std::collections::HashMap::new()
+        }
+        async fn register_server(
+            &self,
+            cfg: MCPServerConfig,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            self.comp
+                .mount_server(cfg)
+                .await
+                .map_err(|e| crate::settings::installer::McpHookError(e.to_string()))
+        }
+        async fn remove_server(
+            &self,
+            id: &BundleId,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            self.comp
+                .unmount_server(id)
+                .await
+                .map(|_| ())
+                .map_err(|e| crate::settings::installer::McpHookError(e.to_string()))
+        }
+        async fn inject_inputs(
+            &self,
+            _plugin_root: &std::path::Path,
+        ) -> Result<(), crate::settings::installer::McpHookError> {
+            // 测试 plugin（audit-mcp）无 `${input:}` ⇒ 无需注入；保持 no-op（生产 `CliMcpHooks` 此处加载
+            // plugin inputs，本替身不复现该细节——#152 聚焦「重挂→启动」）。
+            Ok(())
+        }
+    }
+
     /// 重启前装配：Computer A add marketplace（真实 clone）+ install audit@acme（写 ledger）→ 返回 home。
     async fn cold_start_setup95(tmp: &tempfile::TempDir) -> std::path::PathBuf {
         let home = tmp.path().join("home");
@@ -4833,6 +4930,52 @@ mod tests {
             .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
             .await;
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
+    }
+
+    /// #152：cold-start 治理恢复重挂 enabled bundled MCP server 后，应**启动**达 running（协议 #11「enable
+    /// 原子激活 servers」）。经 `MountingRemountHooks` 真挂载进 manager + 注入假 client factory（`MockSkillClient`，
+    /// `connect()`→Ok）使启动 hermetic 可复现。修复前：mount 仅 pending（`is_active=false`）⇒ 断言 running **失败**。
+    #[tokio::test]
+    async fn reconcile_governance_starts_remounted_bundled_servers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        // 假 client factory：返回 MockSkillClient（connect()→Ok、state()→Connected），使 start hermetic 成功。
+        let fake_factory: crate::mcp_clients::manager::ClientFactory = std::sync::Arc::new(
+            |_cfg: MCPServerConfig, _notify: Option<crate::mcp_clients::model::ClientNotifyCtx>| {
+                std::sync::Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                    pages: vec![],
+                    fail: false,
+                    cap_fail: false,
+                    read_text: String::new(),
+                })
+                    as std::sync::Arc<dyn crate::mcp_clients::model::MCPClientProtocol>
+            },
+        );
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"))
+            .with_client_factory(fake_factory);
+        let hooks = MountingRemountHooks::new(&comp_b);
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+
+        // 重挂成功（mount 进 manager）。
+        assert_eq!(report.remounted_servers, vec!["audit-mcp".to_string()]);
+
+        // #152 核心：重挂后应**启动**达 running（is_active=true），而非停留 pending。
+        let status = comp_b.get_server_status().await;
+        let audit = status
+            .iter()
+            .find(|(_, name, _, _)| name == "audit-mcp")
+            .expect("audit-mcp 应在 server status 中");
+        assert!(
+            audit.2,
+            "enabled bundled MCP 应在治理恢复后启动（running），实得 status={}",
+            audit.3
+        );
     }
 
     /// §63（#104）：账本被外部删除后，reconcile_governance 从 `installedPlugins` 意图重建账本派生缓存

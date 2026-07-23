@@ -46,6 +46,16 @@ pub struct ExposedToolRoute {
     pub alias: Option<String>,
 }
 
+/// client factory 类型（#152 测试接缝）/ client factory type（test seam）。
+///
+/// [`MCPServerManager::start_client_by_id`] 默认用自由函数 [`client_factory`]
+/// 创建真实 rmcp 客户端（stdio/sse/http）。经 [`MCPServerManager::set_client_factory`] 注入 override 后改用之——
+/// **仅为 hermetic 测试**「mount→running」而设：真实 MCP 连接无法在单测复现，注入假 client（如 `MockSkillClient`）
+/// 使 `connect()` 成功，方能断言 server 达 `active`。生产路径不注入（保持真实连接）。
+pub type ClientFactory = StdArc<
+    dyn Fn(MCPServerConfig, Option<ClientNotifyCtx>) -> StdArc<dyn MCPClientProtocol> + Send + Sync,
+>;
+
 /// MCP服务器管理器 / MCP server manager
 ///
 /// **身份键 = `bundle_id`（协议 0.3.0，rust-sdk#117）**：`servers_config` / `active_clients` / `retry_counts`
@@ -92,6 +102,11 @@ pub struct MCPServerManager {
     /// 三传输的服务器主动通知（tools/resources list_changed / resource updated）能上报给 Computer 消费者任务。
     /// 未注入（None）时客户端不转发通知，行为与历史一致。
     change_tx: Arc<RwLock<Option<mpsc::UnboundedSender<McpServerNotification>>>>,
+    /// client factory override（#152 测试接缝）/ client factory override（test seam）。
+    ///
+    /// `None` → [`start_client_by_id`](Self::start_client_by_id) 用真实 [`client_factory`]；
+    /// `Some` → 用注入的 factory（hermetic 测试注入假 client）。详见 [`ClientFactory`]。
+    client_factory_override: Arc<RwLock<Option<ClientFactory>>>,
 }
 
 /// 管理器状态 / Manager state
@@ -125,6 +140,7 @@ impl MCPServerManager {
             health_monitor_handle: Arc::new(RwLock::new(None)),
             retry_counts: Arc::new(RwLock::new(HashMap::new())),
             change_tx: Arc::new(RwLock::new(None)),
+            client_factory_override: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -148,6 +164,7 @@ impl MCPServerManager {
             health_monitor_handle: Arc::new(RwLock::new(None)),
             retry_counts: Arc::new(RwLock::new(HashMap::new())),
             change_tx: Arc::new(RwLock::new(None)),
+            client_factory_override: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -162,6 +179,31 @@ impl MCPServerManager {
     /// 创建的客户端携带 [`ClientNotifyCtx`]。已激活客户端不追溯注入（对齐"启动前接线"约定）。
     pub async fn set_change_sender(&self, tx: mpsc::UnboundedSender<McpServerNotification>) {
         *self.change_tx.write().await = Some(tx);
+    }
+
+    /// 注入 client factory override（#152 测试接缝）/ inject a client factory override（test seam）。
+    ///
+    /// `None`（默认）→ [`start_client_by_id`](Self::start_client_by_id) 用真实
+    /// [`client_factory`]；`Some` → 改用注入 factory（hermetic 测试用）。须在
+    /// `start_client_by_id` / `start_all` **之前**调用（已激活客户端不追溯）。详见 [`ClientFactory`]。
+    pub async fn set_client_factory(&self, factory: Option<ClientFactory>) {
+        *self.client_factory_override.write().await = factory;
+    }
+
+    /// 按 config + 通知接缝创建客户端：override 优先，否则真实 [`client_factory`]（#152）/ make a client.
+    fn make_client(
+        &self,
+        config: MCPServerConfig,
+        notify: Option<ClientNotifyCtx>,
+    ) -> StdArc<dyn MCPClientProtocol> {
+        match self.client_factory_override.try_read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(factory) => factory(config, notify),
+                None => client_factory(config, notify),
+            },
+            // 仅 async 上下文写（set_client_factory）；start 路径无写竞争 → 立即重读真实 factory。
+            Err(_) => client_factory(config, notify),
+        }
     }
 
     /// 为指定 server 构造通知上报接缝（发送端已注入时）/ build a per-client notify seam if a sender is set。
@@ -378,7 +420,7 @@ impl MCPServerManager {
 
         // 创建客户端（注入通知上报接缝，用 **bundle_id** 打来源标签——消费侧定向重挂按身份寻址，#106/#127）。
         let notify = self.notify_ctx_for(bundle_id).await;
-        let client = client_factory(config, notify);
+        let client = self.make_client(config, notify);
 
         // 连接服务器 / Connect to server
         client.connect().await.map_err(|e| {
