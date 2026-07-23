@@ -2,6 +2,84 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-07-23
+
+### Bug Fixes
+
+- *(computer)* List_available_tools 每 server 仅拉一次 tools/list (#91)
+- *(computer)* 账本删除后从 installedPlugins 意图重建 bundled MCP server (#104)
+- *(computer,agent)* #106 接通三传输 MCP 运行期变化通知全链路
+- *(computer)* #117 BundleID fallback 摘要改用 raw 连接身份（对齐协议 #17）
+- *(computer)* [**breaking**] #121 实例 config 上下文注入 + CRUD 改 bundle_id 寻址
+- *(computer)* [**breaking**] #123 add_or_update_server 新 server 默认落 local（不入 git）+ 显式 scope opt-in（协议#19 加固）
+- *(computer)* #122 runtime-only 外部通道 rustdoc 前置条件 + 复活守护测试自足
+- *(computer)* #125 补齐 available plugin 目录声明能力（DeclaredCapabilities）
+- *(computer)* #126 同名用户 MCP 归属门控上移 Computer 层（enabled-gated）、config 层去插件感知
+- *(computer)* [**breaking**] #127 SKILL mcp <server> 段改用 bundle_id + display-name-as-identity 全面扫漏
+- *(computer)* [**breaking**] #131 删除 MCP 审批门档④（bundled 名免批准）—— 授权门绕过 + gate 签名收敛
+- *(computer)* [**breaking**] #143 不受信 scope 不得自我批准 —— TRUSTED_SCOPE_ONLY_FIELDS（档④ 残留同构面收口）
+- *(computer)* [**breaking**] #134 default_tool_meta.alias 塌名根治——alias 不从 default 继承 + 配置诊断
+- *(computer)* [**breaking**] #138 snapshot.bundled 改 origin==Plugin 推导 + 删 bundled_mcp_server_names（F8 判据②）
+- *(computer)* [**breaking**] #139 ledger 纯 bundle_id 数组 + 回收判据(b) + hook seam 收 bundle_id（D3/D5/F1·Discussion#32）
+- *(computer)* [**breaking**] #141 库层 API 收 bundle_id + CLI resolve_target 按协议 §5.1（R4·Epic#129 收官）
+- *(computer)* #150 401+WWW-Authenticate 保型穿过 MCPClientError 边界→结构化 downcast 产出 4006（AUTH-01 收口）
+- *(computer)* #148 高层 disconnect/shutdown 真关 transport + MCP start/stop 同步 server:update_tool_list
+- *(computer)* #144 boot_up 上抛 InputResolution(对齐 mount_server,非仅日志)
+- *(computer)* #145 settings get 越权诊断——改 read_scope_with_errors + 删吞错误包装
+- *(computer)* #128 损坏配置诊断穿出 snapshot——diagnostics 字段收口 MCP+settings 双吞错
+- *(computer)* #151 part1 跨 scope 遮蔽非法声明诊断穿出
+- *(computer)* #152 enabled Plugin bundled MCP 冷启动后恢复运行态
+- *(computer)* AUTH-01 真实传输测试 flake 根治——删裸 403/401 marker + 收尾 fmt
+
+### Documentation
+
+- *(computer)* #131/#130 隔离复审整改 —— 记录档⑤/⑥ 残留攻击面(#143) + 订正文档过度声称
+- *(smcp)* #133 契约注释订正 —— mcp_server doc 从「名称」订正为 bundle_id（照注释传 display 名必 4014）
+- *(workspace)* #146 rustdoc 清零——73 处 pre-existing 警告归零 + CI -D warnings 门禁
+
+### Features
+
+- *(computer)* 暴露 MCP server ownership + active-inventory 查询 API (#97)
+- *(computer)* 治理恢复同构对齐 python-sdk#117——CLI 重挂接线 + remount inputs 注入/同名跳过 (#100)
+- *(computer)* [**breaking**] V0.3.0 plugin install/enable 生命周期分离 (#102)
+- *(protocol)* [**breaking**] PROTOCOL_VERSION 0.2.0 → 0.3.0，握手测试解耦具体值
+- *(computer)* #108 S1 ComputerConfig 快照 + provenance
+- *(computer)* #109 S2 写目标消解器（对称纯函数，disable≠remove）
+- *(computer)* #110 S3 Config CRUD + 写计划执行器
+- *(computer)* #111 config validate/migrate/import/export（schema-only + 脱敏）
+- *(computer)* [**breaking**] #112 S5 inputs 边界订正（D1 运行期 resolver 注入）
+- *(computer)* #114 S7 ComputerStatusSnapshot + 分离 revision + 事件订阅
+- *(computer)* #113 S6 runtime mutate 落盘接线（补 #96 洞）
+- *(computer)* #115 S8 集成回归守护 + R1 enable/disable bump 对称化
+- *(computer)* [**breaking**] #117 BundleID 模型统一 MCP tool 命名与路由（协议 0.3.0）
+- *(computer)* [**breaking**] #118 server-facing wire 身份 flip 到 bundle_id（协议 #18）
+- *(computer)* #124 高层 API-only Marketplace/plugin governance snapshot/inventory
+- *(smcp)* [**breaking**] #136 SMCPTool.bundle_id + Agent get_computer_config（F2 servers=运行期活跃集）
+- *(skills)* Upgrade-guidance —— 向下游兄弟生成升级指导报告（含首次真跑 golden 示例）
+- *(computer)* [**breaking**] #137 R1/F6 scope 完整序 + origin=plugin 读侧投影 + flag 次高 + --mcp-config
+- *(computer)* [**breaking**] #147 embed origin 运行期投影——宿主构造入参入权威声明集（S14/Discussion #32）
+- *(computer)* [**breaking**] #140 input env 名 ENV_SEGMENT 单一权威 + A2C_INPUT_→A2C_SMCP_ 硬切（D2/F4-F5·PROTO-5）
+- *(computer)* #151 part2 typed MCP import + 零写 preflight
+- *(computer)* #153 携带 BundleId 的窗口元数据枚举 API
+
+### Miscellaneous Tasks
+
+- Bump version 0.2.4-dev.0 → 0.3.0-dev.0
+
+### Refactor
+
+- *(computer)* [**breaking**] 移除 workdir/workspace 概念——project/local 锚定进程 cwd (#98)
+- *(smcp)* [**breaking**] #130 BundleId newtype（构造即校验）—— 消除 name/bundle_id 类型同型的结构性根因
+- *(computer)* #132 卫生批次 —— 清除「名叫 server_name、值是 bundle_id」残留（归并 #119）
+- *(computer)* #151 隔离复审 🟡 三项——${input:} 文法单一权威 + 原子性文档收窄 + facade 测试
+
+### Testing
+
+- *(computer)* #143 隔离复审整改 —— 补 merge 交互守护 + 诊断回路闭合（settings show / boot 呈现）
+- *(computer)* AUTH-01 真实传输 401/403 可达性判据（协议 Discussion #34）
+- *(computer)* #142 R5/F7 收官守护——夹具取值分叉 + 异 id 同名寻址对拍 + 消三处假绿（Epic#129 收官）
+- *(computer)* #149 共享 Streamable mock 去重 + auto_reconnect 分支真覆盖
+
 ## [0.2.3] - 2026-06-18
 
 ### Bug Fixes
