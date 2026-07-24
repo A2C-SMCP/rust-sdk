@@ -37,6 +37,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::settings::config::snapshot::{resolve_snapshot, SnapshotArgs};
+use crate::settings::redaction::{
+    git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
+};
+use crate::settings::schema::is_valid_marketplace_name;
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{load_installed_plugins, load_known_marketplaces};
 use crate::skills::frontmatter::parse_skill_frontmatter;
@@ -96,8 +100,40 @@ impl GovernanceDiagnostic {
     fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.to_string(),
-            message: message.into(),
+            message: redact_git_urls_in_text(&message.into()),
         }
+    }
+}
+
+fn public_optional_text(value: Option<String>) -> Option<String> {
+    value.map(|text| redact_git_urls_in_text(&text))
+}
+
+fn public_texts(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|text| untrusted_name_for_display(&text))
+        .collect()
+}
+
+fn sanitize_declared_capabilities(capabilities: &mut DeclaredCapabilities) {
+    capabilities.version = public_optional_text(capabilities.version.take());
+    capabilities.description = public_optional_text(capabilities.description.take());
+    capabilities.mcp_servers = public_texts(std::mem::take(&mut capabilities.mcp_servers));
+    capabilities.skills = public_texts(std::mem::take(&mut capabilities.skills));
+}
+
+fn sanitize_plugin_snapshot(plugin: &mut PluginSnapshot) {
+    plugin.id = untrusted_name_for_display(&plugin.id);
+    plugin.plugin = untrusted_name_for_display(&plugin.plugin);
+    plugin.marketplace = untrusted_name_for_display(&plugin.marketplace);
+    plugin.name = public_optional_text(plugin.name.take());
+    plugin.version = public_optional_text(plugin.version.take());
+    plugin.install_scope = public_optional_text(plugin.install_scope.take());
+    plugin.install_path = public_optional_text(plugin.install_path.take());
+    plugin.bundled_mcp_servers = public_texts(std::mem::take(&mut plugin.bundled_mcp_servers));
+    if let Some(declared) = &mut plugin.declared {
+        sanitize_declared_capabilities(declared);
     }
 }
 
@@ -441,6 +477,14 @@ pub(crate) fn resolve_governance_snapshot(
                         let Some(pn) = e.get("name").and_then(Value::as_str) else {
                             continue;
                         };
+                        let pn = pn.trim();
+                        if !is_valid_marketplace_name(pn) {
+                            diagnostics.push(GovernanceDiagnostic::new(
+                                "plugin_entry_invalid",
+                                "plugin entry name must be lowercase kebab-case (1-64 characters)",
+                            ));
+                            continue;
+                        }
                         let id = format!("{pn}@{name}");
                         declared_by_id.insert(
                             id.clone(),
@@ -464,19 +508,19 @@ pub(crate) fn resolve_governance_snapshot(
         available_by_mp.insert(name.clone(), available_plugin_ids.clone());
 
         marketplaces.push(MarketplaceSnapshot {
-            name: name.clone(),
-            source_url,
+            name: untrusted_name_for_display(name),
+            source_url: source_url.map(|url| git_url_for_display(&url)),
             trusted: is_trusted,
             blocked: is_blocked,
             strict,
             decision,
-            install_location,
-            commit_sha,
-            last_updated,
+            install_location: public_optional_text(install_location),
+            commit_sha: public_optional_text(commit_sha),
+            last_updated: public_optional_text(last_updated),
             auto_update,
             status,
-            plugin_ids,
-            available_plugin_ids,
+            plugin_ids: public_texts(plugin_ids),
+            available_plugin_ids: public_texts(available_plugin_ids),
             diagnostics,
         });
     }
@@ -617,14 +661,18 @@ pub(crate) fn resolve_governance_snapshot(
     }
 
     plugins.sort_by(|a, b| a.id.cmp(&b.id));
+    let overlay_plugin_ids: Vec<String> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
+    for plugin in &mut plugins {
+        sanitize_plugin_snapshot(plugin);
+    }
 
     // --- revision = 磁盘核心投影摘要（**在填 overlay 之前**计算 → 排除 live 叠加）---
     let revision = compute_revision(&marketplaces, &plugins);
 
     // --- 填 live overlay（不影响已算好的 revision）---
-    for p in &mut plugins {
-        if let Some(skills) = overlay.bundled_skills_by_plugin.get(&p.id) {
-            p.bundled_skills = skills.clone();
+    for (p, raw_id) in plugins.iter_mut().zip(overlay_plugin_ids) {
+        if let Some(skills) = overlay.bundled_skills_by_plugin.get(&raw_id) {
+            p.bundled_skills = public_texts(skills.clone());
         }
         p.materialized_mcp_servers = p
             .bundled_mcp_servers
@@ -1020,6 +1068,131 @@ mod tests {
     }
 
     #[test]
+    fn hand_edited_governance_dto_never_echoes_git_credentials() {
+        let td = TempDir::new().unwrap();
+        let env = xdg_env(&td);
+        let home = td.path().join("home");
+        let catalog = td.path().join("catalog");
+        seed_catalog(
+            &catalog,
+            &["x=https://manifest:PW_PLUGIN@example.com/repo.git"],
+        );
+
+        update_known_marketplaces(
+            |f| {
+                f.account.marketplaces.insert(
+                    "x=https://alice:PW_NAME@secret.example/repo.git".to_string(),
+                    KnownMarketplaceEntry {
+                        source: json!({
+                            "type": "git",
+                            "url": "https://bob:PW_URL@example.com/r.git?token=QUERY#FRAGMENT"
+                        }),
+                        extra: Map::from_iter([
+                            (
+                                "installLocation".to_string(),
+                                json!("/tmp/x=https:/carol:PW_PATH@example.com/repo.git"),
+                            ),
+                            (
+                                "commitSha".to_string(),
+                                json!("https://dave:PW_SHA@example.com/r.git"),
+                            ),
+                            (
+                                "lastUpdated".to_string(),
+                                json!("git@secret.example:PW_UPDATED"),
+                            ),
+                        ]),
+                    },
+                );
+                f.account.marketplaces.insert(
+                    "safe".to_string(),
+                    KnownMarketplaceEntry {
+                        source: json!({"type": "git", "url": "https://example.com/safe.git"}),
+                        extra: Map::from_iter([(
+                            "installLocation".to_string(),
+                            json!(catalog.to_string_lossy()),
+                        )]),
+                    },
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+        update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("audit@safe".to_string());
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+        update_installed_plugins(
+            |f| {
+                let mut extra = Map::new();
+                extra.insert(
+                    "version".to_string(),
+                    json!("https://eve:PW_VERSION@example.com/r.git"),
+                );
+                f.account.plugins.insert(
+                    "audit@safe".to_string(),
+                    vec![InstalledPluginRecord {
+                        install_path: Some(
+                            "/tmp/x=https:/frank:PW_INSTALL@example.com/repo.git".to_string(),
+                        ),
+                        mcp_servers: vec![],
+                        extra,
+                    }],
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+
+        let snap = resolve_governance_snapshot(
+            GovernanceArgs {
+                cwd: Some(td.path()),
+                env: Some(&env),
+                home: Some(&home),
+                managed_mcp_path: Some(&no_managed(&td)),
+                ..Default::default()
+            },
+            &GovernanceRuntimeOverlay::default(),
+        );
+        let rendered = format!("{snap:?}\n{}", serde_json::to_string(&snap).unwrap());
+        for secret in [
+            "alice",
+            "PW_NAME",
+            "bob",
+            "PW_URL",
+            "QUERY",
+            "FRAGMENT",
+            "carol",
+            "PW_PATH",
+            "dave",
+            "PW_SHA",
+            "PW_UPDATED",
+            "PW_PLUGIN",
+            "eve",
+            "PW_VERSION",
+            "frank",
+            "PW_INSTALL",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        let safe = snap
+            .marketplaces
+            .iter()
+            .find(|marketplace| marketplace.name == "safe")
+            .unwrap();
+        assert!(safe.available_plugin_ids.is_empty());
+        assert!(safe
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "plugin_entry_invalid"));
+    }
+
+    #[test]
     fn revision_stable_and_excludes_overlay() {
         let td = TempDir::new().unwrap();
         let env = xdg_env(&td);
@@ -1200,6 +1373,57 @@ mod tests {
         let (declared, diags, root_broken) =
             probe_declared_capabilities(td.path(), "./plugins", "x", &entry);
         assert!(declared.is_none() && diags.is_empty() && !root_broken);
+    }
+
+    #[test]
+    fn probe_malformed_source_diagnostic_never_echoes_url_credentials() {
+        let td = TempDir::new().unwrap();
+        for source in [
+            json!({
+                "source": "url",
+                "url": "ftp://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT"
+            }),
+            json!("key=https://cnb:FAKE_TOKEN@example.com/org/repo.git"),
+            json!("key=git@example.com:org/repo.git"),
+            json!("x=https://public.example/a=https://user2:PW_TWO@secret.example/repo.git"),
+            json!("key=用户@example.com:org/repo.git"),
+            json!("x=https://example.com/r.git?token=;QUERY_SECRET"),
+            json!("x=https://example.com/r.git?token=QUERY_QUOTE'LEAK_SECRET"),
+            json!("x=https://alice:PW_ONE'PW_TWO@example.com/repo.git"),
+            json!("x=alice@my_host:org/repo.git"),
+            json!("x=用户@例子.公司:org/repo.git"),
+        ] {
+            let entry = obj(json!({"name": "x", "source": source}));
+            let (declared, diags, root_broken) =
+                probe_declared_capabilities(td.path(), "./plugins", "x", &entry);
+            assert!(declared.is_none() && !root_broken);
+            let diagnostic = diags
+                .iter()
+                .find(|d| d.code == "plugin_source_unresolved")
+                .expect("malformed source must produce a governance diagnostic");
+            let rendered = format!(
+                "{}\n{diagnostic:?}\n{}",
+                diagnostic.message,
+                serde_json::to_string(diagnostic).unwrap()
+            );
+            for secret in [
+                "cnb",
+                "FAKE_TOKEN",
+                "QUERY",
+                "FRAGMENT",
+                "git@example.com",
+                "user2",
+                "PW_TWO",
+                "用户",
+                "QUERY_SECRET",
+                "QUERY_QUOTE",
+                "LEAK_SECRET",
+                "PW_ONE",
+                "alice",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
     }
 
     #[test]
