@@ -849,6 +849,7 @@ impl<S: Session> Computer<S> {
     /// 与 [`ensure_skill_home`](Self::ensure_skill_home) 的区别是**无副作用**：后者会解析并落缓存（且下游
     /// `skill_home()` 会建目录）。只读路径（如 #141 的 CLI 候选表）用本方法——boot 后恒已解析，boot 前
     /// 返回 `None` 而不是凭空造出一个 home。对齐 python `collect_candidates` 读裸 `_skill_home` 的约定。
+    #[cfg(feature = "cli")]
     fn skill_home_opt(&self) -> Option<PathBuf> {
         self.skill_home
             .read()
@@ -1170,6 +1171,7 @@ impl<S: Session> Computer<S> {
     ///
     /// 与 [`non_plugin_declared_bundle_ids`](Self::non_plugin_declared_bundle_ids) 同源同参（同一次
     /// `resolve_snapshot`、同样必须传全 flag/embed 输入），差别只在此处返回 config、那处返回 bundle_id 集。
+    #[cfg(feature = "cli")]
     pub(crate) fn declared_mcp_servers(&self) -> Vec<crate::mcp_clients::model::MCPServerConfig> {
         use crate::settings::config::snapshot::{resolve_snapshot, SnapshotArgs};
         let config_dir = self.config_dir();
@@ -1724,7 +1726,7 @@ impl<S: Session> Computer<S> {
         let servers = self.mcp_servers.read().await;
         let mut validated_servers = Vec::new();
 
-        for (_name, server_config) in servers.iter() {
+        for server_config in servers.values() {
             match self.render_server_config(server_config).await {
                 Ok(validated) => validated_servers.push(validated),
                 Err(e) => {
