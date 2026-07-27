@@ -2082,13 +2082,11 @@ impl<S: Session> Computer<S> {
                                 kind,
                                 ..
                             }) => ComputerError::InputResolution(InputResolutionError::missing(
-                                &scoped_id,
-                                kind,
+                                &scoped_id, kind,
                             )),
-                            ComputerError::InputResolution(InputResolutionError::ResolverFailed {
-                                reason,
-                                ..
-                            }) => ComputerError::InputResolution(
+                            ComputerError::InputResolution(
+                                InputResolutionError::ResolverFailed { reason, .. },
+                            ) => ComputerError::InputResolution(
                                 InputResolutionError::resolver_failed(&scoped_id, reason),
                             ),
                             other => other,
@@ -7125,7 +7123,10 @@ mod tests {
             def: &MCPServerInput,
         ) -> Result<Option<serde_json::Value>, InputResolutionError> {
             if def.id() == self.scoped_id {
-                Err(InputResolutionError::resolver_failed(def.id(), "scoped-boom"))
+                Err(InputResolutionError::resolver_failed(
+                    def.id(),
+                    "scoped-boom",
+                ))
             } else if def.id() == "token" {
                 Ok(Some(serde_json::Value::String(self.global_val.clone())))
             } else {
@@ -7169,7 +7170,7 @@ mod tests {
             prompt_def("figma@acme/token", None, false), // value
         );
         inputs.insert("token".to_string(), prompt_def("token", None, true)); // secret
-        // scoped value 无 input_resolver 值 → Missing；global secret 有 secret_resolver 值但跨 kind 不回退。
+                                                                             // scoped value 无 input_resolver 值 → Missing；global secret 有 secret_resolver 值但跨 kind 不回退。
         let mut sec = HashMap::new();
         sec.insert("token".to_string(), "secret-val".to_string());
         let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
@@ -7198,18 +7199,11 @@ mod tests {
             prompt_def("figma@acme/token", None, false),
         );
         inputs.insert("token".to_string(), prompt_def("token", None, false));
-        let computer = Computer::new(
-            "c",
-            SilentSession::new("t"),
-            Some(inputs),
-            None,
-            true,
-            true,
-        )
-        .with_input_resolver(Arc::new(ScopedOnlyFailingResolver {
-            scoped_id: "figma@acme/token".to_string(),
-            global_val: "global-val".to_string(),
-        }));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(ScopedOnlyFailingResolver {
+                scoped_id: "figma@acme/token".to_string(),
+                global_val: "global-val".to_string(),
+            }));
         let scope = pscope("figma", "acme");
         let err = computer
             .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))
