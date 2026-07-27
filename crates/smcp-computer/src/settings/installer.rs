@@ -136,6 +136,27 @@ pub trait McpInstallHooks: Send + Sync {
     /// # Errors
     /// 注册失败 → [`McpHookError`]（触发 install 补偿回滚）。
     async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError>;
+    /// 注册一个 server，携带它归属的 plugin_id（`<plugin>@<marketplace>`；`None` = 非 plugin-bound）/
+    /// register with the owning plugin id.
+    ///
+    /// §5.11（a2c-smcp-protocol v0.3.1）：plugin-bound server 配置里的裸 `${input:<id>}` 须按
+    /// `<plugin>@<marketplace>/<id>` → 全局 `<id>`（同 kind）序解析。`plugin_id` 即该归属，由 enable/reconcile
+    /// （已知 plugin）透传；SDK 据此派生 `PluginScope`（`crate::inputs::plugin_pool::PluginScope`，内部类型）注入渲染路径。
+    ///
+    /// **默认实现忽略 `plugin_id`**、退化为 [`register_server`](Self::register_server)（外部 hook 未覆盖时维持
+    /// 旧行为：plugin 裸 input 仅按全局解析）。SDK 自带 hook 覆盖此方法以启用 scoped 解析；外部 client 欲启用，
+    /// 覆盖此方法、在内部把 `plugin_id` 交给 scope-aware mount 路径即可，无需新建公开 API（分叉二裁决）。
+    ///
+    /// # Errors
+    /// 同 [`register_server`](Self::register_server)。
+    async fn register_server_with_input_scope(
+        &self,
+        cfg: MCPServerConfig,
+        plugin_id: Option<&str>,
+    ) -> Result<(), McpHookError> {
+        let _ = plugin_id;
+        self.register_server(cfg).await
+    }
     /// 停止并摘除一个 server（按 **bundle_id** 寻址）/ stop & remove a server by bundle_id。
     ///
     /// #139/R4：由 `name: &str` 改 `id: &BundleId`——非对称合理（register 需完整 cfg 才能挂；remove 只需身份
@@ -1050,7 +1071,10 @@ pub async fn enable_plugin(
         let mut remounted: Vec<BundleId> = Vec::new();
         for cfg in servers {
             let bid = resolve_bundle_id(&cfg);
-            if let Err(e) = h.register_server(cfg).await {
+            if let Err(e) = h
+                .register_server_with_input_scope(cfg, Some(plugin_id))
+                .await
+            {
                 for done in &remounted {
                     if let Err(re) = h.remove_server(done).await {
                         tracing::warn!(bundle_id = %done.as_str(), error = %re, "enable rollback: remove_server failed");

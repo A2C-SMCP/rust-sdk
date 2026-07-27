@@ -66,6 +66,7 @@ use crate::errors::{ComputerError, ComputerResult};
 use crate::inputs::handler::InputHandler;
 use crate::inputs::load_env_file;
 use crate::inputs::model::InputValue;
+use crate::inputs::plugin_pool::PluginScope;
 use crate::inputs::runtime_resolver::{
     InputKind, InputResolutionError, InputValueResolver, SecretValueResolver,
 };
@@ -1397,7 +1398,10 @@ impl<S: Session> Computer<S> {
                     }
                     injected_roots.insert(rec.install_path.clone());
                 }
-                match h.register_server(rec.config).await {
+                match h
+                    .register_server_with_input_scope(rec.config, Some(&rec.plugin_id))
+                    .await
+                {
                     Ok(()) => {
                         existing.insert(bid.clone());
                         report.remounted_servers.push(name.clone());
@@ -1890,16 +1894,10 @@ impl<S: Session> Computer<S> {
             return self.session.resolve_input(input).await;
         }
 
-        let is_secret =
-            matches!(input, MCPServerInput::PromptString(p) if p.password.unwrap_or(false));
-        let kind = if is_secret {
-            InputKind::Secret
-        } else {
-            InputKind::Value
-        };
+        let kind = InputKind::of(input);
 
         // 1. client resolver（D1 权威源；keyring 亦作为一种 secret resolver 由 client opt-in 注入）。
-        if is_secret {
+        if matches!(kind, InputKind::Secret) {
             if let Some(resolver) = &self.secret_resolver {
                 if let Some(secret) = resolver.resolve_secret(input).await? {
                     return Ok(serde_json::Value::String(secret));
@@ -1957,6 +1955,22 @@ impl<S: Session> Computer<S> {
         &self,
         config: &MCPServerConfig,
     ) -> ComputerResult<MCPServerConfig> {
+        // 用户/未绑定 plugin 的 server：scope=None → 裸 `${input:}` 仅按全局解析（§5.11 用户 server，行为不变）。
+        self.render_server_config_with_scope(config, None).await
+    }
+
+    /// [`render_server_config`] 的 plugin-scope 变体（私有；§5.11 解析序落点）。
+    ///
+    /// `scope = Some(P@M)` 表示当前 server 绑定 plugin P@M：裸 `${input:<id>}` 按 §5.11 顺序解析——
+    /// ① 先查 plugin-scoped `<P>@<M>/<id>`；② 未命中且存在**同 kind**（value/secret）的全局 `<id>` → 回退全局；
+    /// ③ 仍不可解析 → 结构化 `Missing(id = <P>@<M>/<id>)`（不透露全局侧是否命中）。显式完整引用
+    /// `${input:<P>@<M>/<id>}` 直接精确命中、不回退；`scope = None`（用户/未绑定 server）裸引用仅按全局 `<id>`
+    /// 精确解析（行为不变）。resolver-agnostic：规定「用哪个 id 问 resolver」，不规定 resolver 实现。
+    async fn render_server_config_with_scope(
+        &self,
+        config: &MCPServerConfig,
+        scope: Option<&PluginScope>,
+    ) -> ComputerResult<MCPServerConfig> {
         // 将配置序列化为 JSON / Serialize config to JSON
         let config_json = serde_json::to_value(config)?;
 
@@ -1979,19 +1993,120 @@ impl<S: Session> Computer<S> {
         let mut deferred_errors: std::collections::HashMap<String, ComputerError> =
             std::collections::HashMap::new();
         for input_id in &referenced {
-            // 未定义的引用（不在 inputs 池）→ 跳过，闭包将回退 `InputNotFound` → 保留占位符原样（VS Code parity）。
-            let Some(input) = inputs_clone.get(input_id) else {
+            // §5.11（a2c-smcp-protocol v0.3.1）：plugin-bound server 的裸 `${input:<id>}` 按
+            // `<P>@<M>/<id>` → 全局 `<id>`（同 kind）序解析；显式 scoped 引用与用户 server（scope=None）走精确命中。
+            // `prefix_input_id` 引入 `/` 作 scoped 分隔符 ⇒ 引用 id 含 `/` 即「显式完整 scoped 引用」。
+            // 依赖 input id 规范不含 `/`（scoped 形态是 `/` 的唯一来源）；用户裸 id 若含 `/` 亦落此分支走精确查找，
+            // 与用户 server 路径的「精确池查找」行为等价、无功能性回归。
+            if input_id.contains('/') {
+                // ④ 显式完整 scoped 引用：精确命中（scoped def 或裸 def），不回退全局。
+                match inputs_clone.get(input_id) {
+                    Some(def) => match self.resolve_one_input(def).await {
+                        Ok(v) => {
+                            resolved_values.insert(input_id.clone(), v);
+                        }
+                        Err(e) => {
+                            deferred_errors.insert(input_id.clone(), e);
+                        }
+                    },
+                    None => continue, // 池中无此精确 id → 占位符原样保留（InputNotFound，VS Code parity）
+                }
+                continue;
+            }
+
+            // 裸引用：scope=None（用户/未绑定 server）→ 仅全局精确命中（行为不变）。
+            let Some(scope) = scope else {
+                match inputs_clone.get(input_id) {
+                    Some(def) => match self.resolve_one_input(def).await {
+                        Ok(v) => {
+                            resolved_values.insert(input_id.clone(), v);
+                        }
+                        Err(e) => {
+                            deferred_errors.insert(input_id.clone(), e);
+                        }
+                    },
+                    None => continue,
+                }
                 continue;
             };
-            match self.resolve_one_input(input).await {
-                Ok(value) => {
-                    resolved_values.insert(input_id.clone(), value);
-                }
-                Err(e) => {
-                    // 未解析（无默认值的结构化缺失 / resolver 硬失败 / command 执行失败 / session 硬失败）→ 暂存；引用取用时上抛。
-                    deferred_errors.insert(input_id.clone(), e);
+
+            // 裸引用 + plugin scope → §5.11 scoped-first → global-fallback。
+            let scoped_id = scope.prefixed_id(input_id);
+            let scoped_def = inputs_clone.get(&scoped_id);
+            let global_def = inputs_clone.get(input_id);
+            // 期望 kind：优先 scoped def；scoped 缺失时用 global def 的 kind（供 client 补录 UI 分流 value/secret）。
+            let scoped_kind = scoped_def
+                .or(global_def)
+                .map(InputKind::of)
+                .unwrap_or(InputKind::Value);
+
+            // ① scoped def 存在 → 先解析 scoped（命中即胜）。
+            if let Some(sd) = scoped_def {
+                match self.resolve_one_input(sd).await {
+                    Ok(v) => {
+                        resolved_values.insert(input_id.clone(), v);
+                        continue;
+                    }
+                    // 仅「未解析（Missing）」触发全局回退；ResolverFailed 等硬错直接上抛（id 已是 scoped）。
+                    Err(ComputerError::InputResolution(InputResolutionError::Missing {
+                        ..
+                    })) => {}
+                    Err(e) => {
+                        deferred_errors.insert(input_id.clone(), e);
+                        continue;
+                    }
                 }
             }
+
+            // ② 全局回退：仅当存在**同 kind** 的全局 def（跨 kind 不回退，§5.11 ③）。
+            //   scoped def 不存在时无 kind 约束 → 直接试 global（若在）。
+            let same_kind_global = match (scoped_def, global_def) {
+                (Some(sd), Some(gd)) if InputKind::of(gd) == InputKind::of(sd) => Some(gd),
+                (None, Some(gd)) => Some(gd),
+                _ => None,
+            };
+            if let Some(gd) = same_kind_global {
+                match self.resolve_one_input(gd).await {
+                    Ok(v) => {
+                        resolved_values.insert(input_id.clone(), v);
+                        continue;
+                    }
+                    Err(ComputerError::InputResolution(InputResolutionError::Missing {
+                        ..
+                    })) => {}
+                    Err(e) => {
+                        // 非 Missing（ResolverFailed 等）：保留诊断类型，仅 id 改写为 scoped（plugin-bound server
+                        // 错误一律 scoped、不透露 global 侧是否命中）。与 scoped_def 自身硬错（上方原样上抛）对齐。
+                        let scoped_err = match e {
+                            ComputerError::InputResolution(InputResolutionError::Missing {
+                                kind,
+                                ..
+                            }) => ComputerError::InputResolution(InputResolutionError::missing(
+                                &scoped_id,
+                                kind,
+                            )),
+                            ComputerError::InputResolution(InputResolutionError::ResolverFailed {
+                                reason,
+                                ..
+                            }) => ComputerError::InputResolution(
+                                InputResolutionError::resolver_failed(&scoped_id, reason),
+                            ),
+                            other => other,
+                        };
+                        deferred_errors.insert(input_id.clone(), scoped_err);
+                        continue;
+                    }
+                }
+            }
+
+            // ③ scoped 与全局均不可解析 → 结构化 Missing（id = 完整 scoped；不透露 global 侧是否命中，§5.11）。
+            deferred_errors.insert(
+                input_id.clone(),
+                ComputerError::InputResolution(InputResolutionError::missing(
+                    &scoped_id,
+                    scoped_kind,
+                )),
+            );
         }
 
         // 渲染配置。输入解析闭包：命中 → 值；已定义但未解析 → `InputUnresolved`（向上传播）；未定义 →
@@ -2076,8 +2191,23 @@ impl<S: Session> Computer<S> {
     /// # Errors
     /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；运行期物化失败（manager 错）。
     pub async fn mount_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
+        // 公开入口：未绑定 plugin scope（外部直挂 / 用户路径）→ 裸 `${input:}` 仅按全局解析（§5.11 用户 server）。
+        self.mount_server_with_scope(server, None).await
+    }
+
+    /// [`mount_server`] 的 plugin-scope 变体（`pub(crate)`，分叉二裁决：不进客户端可见 API）。
+    ///
+    /// plugin 生命周期（enable/reconcile 经 `McpInstallHooks::register_server_with_input_scope`）传入 `scope`，
+    /// 使绑定该 plugin 的 server 配置里裸 `${input:<id>}` 按 §5.11 `<P>@<M>/<id>` → 全局 `<id>`（同 kind）序解析。
+    pub(crate) async fn mount_server_with_scope(
+        &self,
+        server: MCPServerConfig,
+        scope: Option<PluginScope>,
+    ) -> ComputerResult<()> {
         // 渲染并验证配置（**唯一一次** render——resolver 可能有副作用如 keyring/交互取值，禁重复调用）。
-        let validated = self.render_server_config(&server).await?;
+        let validated = self
+            .render_server_config_with_scope(&server, scope.as_ref())
+            .await?;
         self.mount_rendered(server, validated).await
     }
 
@@ -6721,6 +6851,399 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rendered_arg0(rendered), "cmd-out");
+    }
+
+    // ── §5.11（a2c-smcp-protocol v0.3.1）plugin input scoped→global 解析序 ──────────────────
+    /// 测试用 PluginScope 构造 / build a PluginScope for tests.
+    fn pscope(plugin: &str, marketplace: &str) -> PluginScope {
+        PluginScope {
+            plugin: plugin.to_string(),
+            marketplace: marketplace.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn s511_scoped_input_wins_over_global_when_both_present() {
+        // §5.11 ①：scoped 与 global 同存且同 kind → scoped 胜。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            prompt_def("figma@acme/token", None, false),
+        );
+        inputs.insert("token".to_string(), prompt_def("token", None, false));
+        let mut m = HashMap::new();
+        m.insert(
+            "figma@acme/token".to_string(),
+            serde_json::Value::String("scoped-val".into()),
+        );
+        m.insert(
+            "token".to_string(),
+            serde_json::Value::String("global-val".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let scope = pscope("figma", "acme");
+        let rendered = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "scoped-val");
+    }
+
+    #[tokio::test]
+    async fn s511_falls_back_to_global_when_scoped_def_absent() {
+        // §5.11 ②：scoped def 不在池 → 回退全局（同 kind）。
+        let mut inputs = HashMap::new();
+        inputs.insert("token".to_string(), prompt_def("token", None, false));
+        let mut m = HashMap::new();
+        m.insert(
+            "token".to_string(),
+            serde_json::Value::String("global-val".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let scope = pscope("figma", "acme");
+        let rendered = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "global-val");
+    }
+
+    #[tokio::test]
+    async fn s511_does_not_fall_back_across_kinds() {
+        // §5.11 ③：scoped secret 缺失 MUST NOT 回退 global value → Missing(scoped, Secret)。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            prompt_def("figma@acme/token", None, true), // secret
+        );
+        inputs.insert("token".to_string(), prompt_def("token", None, false)); // value
+        let mut vals = HashMap::new();
+        vals.insert(
+            "token".to_string(),
+            serde_json::Value::String("global-val".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(vals)));
+        let scope = pscope("figma", "acme");
+        let err = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))
+            .await
+            .unwrap_err();
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::Missing { id, kind, .. }) => {
+                assert_eq!(id, "figma@acme/token");
+                assert_eq!(*kind, InputKind::Secret);
+            }
+            other => panic!("expected scoped Secret Missing (not global value), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn s511_explicit_scoped_reference_hits_directly_no_global_fallback() {
+        // §5.11 ④：显式 `${input:<P>@<M>/<id>}` 直接命中 scoped，不回退全局（即便 global 也在池中）。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            prompt_def("figma@acme/token", None, false),
+        );
+        inputs.insert("token".to_string(), prompt_def("token", None, false));
+        let mut m = HashMap::new();
+        m.insert(
+            "figma@acme/token".to_string(),
+            serde_json::Value::String("scoped-val".into()),
+        );
+        m.insert(
+            "token".to_string(),
+            serde_json::Value::String("global-val".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let scope = pscope("figma", "acme");
+        let rendered = computer
+            .render_server_config_with_scope(
+                &stdio_with_arg("${input:figma@acme/token}"),
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "scoped-val");
+    }
+
+    #[tokio::test]
+    async fn s511_plugin_input_isolated_across_plugins_same_bare_id() {
+        // acceptance「两个 Plugin 同名 input 完全隔离」：scope=a 取 a；scope=b 取 b；a 缺失不串 b。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "a@mp/token".to_string(),
+            prompt_def("a@mp/token", None, false),
+        );
+        inputs.insert(
+            "b@mp/token".to_string(),
+            prompt_def("b@mp/token", None, false),
+        );
+        let mut m = HashMap::new();
+        m.insert(
+            "a@mp/token".to_string(),
+            serde_json::Value::String("val-a".into()),
+        );
+        m.insert(
+            "b@mp/token".to_string(),
+            serde_json::Value::String("val-b".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+
+        let ra = computer
+            .render_server_config_with_scope(
+                &stdio_with_arg("${input:token}"),
+                Some(&pscope("a", "mp")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(ra), "val-a");
+
+        let rb = computer
+            .render_server_config_with_scope(
+                &stdio_with_arg("${input:token}"),
+                Some(&pscope("b", "mp")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rb), "val-b");
+
+        // a 缺失（resolver 无 a 值、池里也无 bare token）→ Missing(a@mp/token)，**不**串 b 的值。
+        let mut m_only_b = HashMap::new();
+        m_only_b.insert(
+            "b@mp/token".to_string(),
+            serde_json::Value::String("val-b".into()),
+        );
+        let mut inputs2 = HashMap::new();
+        inputs2.insert(
+            "a@mp/token".to_string(),
+            prompt_def("a@mp/token", None, false),
+        );
+        inputs2.insert(
+            "b@mp/token".to_string(),
+            prompt_def("b@mp/token", None, false),
+        );
+        let computer2 = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs2),
+            None,
+            true,
+            true,
+        )
+        .with_input_resolver(Arc::new(MapInputResolver(m_only_b)));
+        let err = computer2
+            .render_server_config_with_scope(
+                &stdio_with_arg("${input:token}"),
+                Some(&pscope("a", "mp")),
+            )
+            .await
+            .unwrap_err();
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::Missing { id, .. }) => {
+                assert_eq!(id, "a@mp/token"); // 不泄漏 b；id 是 a 的 scoped
+            }
+            other => panic!("expected a's scoped Missing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn s511_user_server_bare_ref_resolves_global_only_regression() {
+        // §5.11 用户 server（scope=None）：裸引用仅全局，行为不变（回归）。
+        let mut inputs = HashMap::new();
+        inputs.insert("token".to_string(), prompt_def("token", None, false));
+        let mut m = HashMap::new();
+        m.insert(
+            "token".to_string(),
+            serde_json::Value::String("global-val".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let rendered = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:token}"), None)
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "global-val");
+    }
+
+    #[tokio::test]
+    async fn s511_scoped_secret_wins_and_falls_back_same_kind() {
+        // acceptance #9 value/secret 覆盖：scoped secret 胜（①-secret）+ scoped 缺失回退全局 secret（②-secret，同 kind）。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/key".to_string(),
+            prompt_def("figma@acme/key", None, true),
+        );
+        inputs.insert("key".to_string(), prompt_def("key", None, true));
+        let mut sec = HashMap::new();
+        sec.insert("figma@acme/key".to_string(), "scoped-sec".to_string());
+        sec.insert("key".to_string(), "global-sec".to_string());
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_secret_resolver(Arc::new(MapSecretResolver(sec)));
+        let scope = pscope("figma", "acme");
+        let rendered = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:key}"), Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "scoped-sec"); // scoped secret 胜
+
+        // scoped 缺失 → 回退全局 secret（同 kind）
+        let mut inputs2 = HashMap::new();
+        inputs2.insert("key".to_string(), prompt_def("key", None, true));
+        let mut sec2 = HashMap::new();
+        sec2.insert("key".to_string(), "global-sec".to_string());
+        let computer2 = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs2),
+            None,
+            true,
+            true,
+        )
+        .with_secret_resolver(Arc::new(MapSecretResolver(sec2)));
+        let rendered2 = computer2
+            .render_server_config_with_scope(&stdio_with_arg("${input:key}"), Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered2), "global-sec");
+    }
+
+    /// 仅对 scoped id 硬失败、对全局 id 返回值的 resolver（钉死「scoped ResolverFailed 不触发 global 回退」）。
+    struct ScopedOnlyFailingResolver {
+        scoped_id: String,
+        global_val: String,
+    }
+    #[async_trait]
+    impl crate::inputs::runtime_resolver::InputValueResolver for ScopedOnlyFailingResolver {
+        async fn resolve_input(
+            &self,
+            def: &MCPServerInput,
+        ) -> Result<Option<serde_json::Value>, InputResolutionError> {
+            if def.id() == self.scoped_id {
+                Err(InputResolutionError::resolver_failed(def.id(), "scoped-boom"))
+            } else if def.id() == "token" {
+                Ok(Some(serde_json::Value::String(self.global_val.clone())))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s511_falls_back_to_global_when_scoped_def_present_but_unresolved() {
+        // §5.11 ② 核心：scoped def **存在**但解析 Missing（resolver 无值、无 env、无默认）→ 回退同 kind global。
+        // （区别于 s511_falls_back_to_global_when_scoped_def_absent，后者 scoped def 不在池。）
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            prompt_def("figma@acme/token", None, false),
+        );
+        inputs.insert("token".to_string(), prompt_def("token", None, false));
+        // resolver 只给 global 值；scoped 无值 → Missing → 回退 global。
+        let mut m = HashMap::new();
+        m.insert(
+            "token".to_string(),
+            serde_json::Value::String("global-val".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let scope = pscope("figma", "acme");
+        let rendered = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "global-val");
+    }
+
+    #[tokio::test]
+    async fn s511_does_not_fall_back_across_kinds_reverse() {
+        // §5.11 ③ 反向：scoped value 缺失 MUST NOT 回退 global secret → Missing(scoped, Value)。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            prompt_def("figma@acme/token", None, false), // value
+        );
+        inputs.insert("token".to_string(), prompt_def("token", None, true)); // secret
+        // scoped value 无 input_resolver 值 → Missing；global secret 有 secret_resolver 值但跨 kind 不回退。
+        let mut sec = HashMap::new();
+        sec.insert("token".to_string(), "secret-val".to_string());
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_secret_resolver(Arc::new(MapSecretResolver(sec)));
+        let scope = pscope("figma", "acme");
+        let err = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))
+            .await
+            .unwrap_err();
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::Missing { id, kind, .. }) => {
+                assert_eq!(id, "figma@acme/token");
+                assert_eq!(*kind, InputKind::Value);
+            }
+            other => panic!("expected scoped Value Missing (not global secret), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn s511_scoped_resolver_failed_does_not_fall_back_to_global() {
+        // §5.11 不变量：scoped def 的 resolver **硬失败**（ResolverFailed）→ 原样上抛（scoped id），**不**回退 global。
+        // 若算法误把 fall-through 从 Missing 放宽为 Err(_)，会回退命中 global 值 → 本测试变红。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            prompt_def("figma@acme/token", None, false),
+        );
+        inputs.insert("token".to_string(), prompt_def("token", None, false));
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(inputs),
+            None,
+            true,
+            true,
+        )
+        .with_input_resolver(Arc::new(ScopedOnlyFailingResolver {
+            scoped_id: "figma@acme/token".to_string(),
+            global_val: "global-val".to_string(),
+        }));
+        let scope = pscope("figma", "acme");
+        let err = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))
+            .await
+            .unwrap_err();
+        match &err {
+            ComputerError::InputResolution(InputResolutionError::ResolverFailed { id, reason }) => {
+                assert_eq!(id, "figma@acme/token");
+                assert!(reason.contains("scoped-boom"));
+            }
+            other => panic!("expected scoped ResolverFailed (not global fallback), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn s511_explicit_scoped_ref_with_no_scope_user_server() {
+        // §5.11：显式完整 scoped 引用（含 `/`）即便 scope=None（用户 server）也走精确命中分支。
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            prompt_def("figma@acme/token", None, false),
+        );
+        let mut m = HashMap::new();
+        m.insert(
+            "figma@acme/token".to_string(),
+            serde_json::Value::String("scoped-val".into()),
+        );
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(m)));
+        let rendered = computer
+            .render_server_config_with_scope(&stdio_with_arg("${input:figma@acme/token}"), None)
+            .await
+            .unwrap();
+        assert_eq!(rendered_arg0(rendered), "scoped-val");
     }
 
     #[test]

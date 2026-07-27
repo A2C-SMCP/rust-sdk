@@ -49,6 +49,19 @@ impl std::fmt::Display for InputKind {
     }
 }
 
+impl InputKind {
+    /// 从 input 定义派生 kind：`PromptString { password: true }` → [`InputKind::Secret`]；其余（含 `Command`）→ [`InputKind::Value`] / derive kind.
+    ///
+    /// §5.11 跨 kind 守卫与各 resolver 链的 kind 派生共用此单一实现（DRY；原内联在 `Computer::resolve_one_input`
+    /// 与 `InputResolver::resolve_by_id` 两处）。
+    pub fn of(input: &MCPServerInput) -> Self {
+        match input {
+            MCPServerInput::PromptString(p) if p.password.unwrap_or(false) => InputKind::Secret,
+            _ => InputKind::Value,
+        }
+    }
+}
+
 /// D1 结构化 input 解析错误（**非仅日志**，供 client 驱动补录）/ structured input-resolution error。
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum InputResolutionError {

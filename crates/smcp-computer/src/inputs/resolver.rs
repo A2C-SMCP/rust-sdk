@@ -15,7 +15,10 @@
 //! 解析链参考实现；运行期（server-start）的 client 注入契约见 [`runtime_resolver`](super::runtime_resolver)。
 //!
 //! 解析链（命中即返回、并按解析后池 id 进程内缓存）：
-//! 1. **定位定义**：裸 id 未命中且给了 plugin 上下文 → 回退查带前缀池条目（`<plugin>@<mp>/<id>`，§9.3 D2）。
+//! 1. **定位定义**（§5.11 def-location **子集**）：plugin 上下文下裸 id **先**查带前缀池条目
+//!    `<plugin>@<mp>/<id>`（scoped 优先），未命中再回退全局裸 id；显式完整 scoped 引用精确命中。注：本交互式
+//!    resolver 仅实现 §5.11 的「def 位置」抉择——**不**含运行期路径的「scoped 已定位但取值失败 → 回退 global
+//!    取值」与「跨 kind 守卫」（完整算法见 `Computer::render_server_config_with_scope`）；待 CLI-02（#51）接线时补齐。
 //! 2. **进程内 cache**（按解析后池 id，避免不同 plugin 同裸 id 串味）。
 //! 3. **环境变量** `A2C_SMCP_<ENV_SEGMENT(id)>`（编排层注入）。
 //! 4. **OS keyring**（仅 `password:true`）。
@@ -150,19 +153,32 @@ impl InputResolver {
         plugin: Option<&str>,
         marketplace: Option<&str>,
     ) -> Result<Value, InputResolveError> {
-        // 1. 定位定义：裸 id 未命中 + plugin 上下文 → 回退带前缀池条目（§9.3 D2）
-        let (cfg, resolved_id) = match self.inputs.get(input_id) {
-            Some(c) => (c.clone(), input_id.to_string()),
-            None => match (plugin, marketplace) {
-                (Some(p), Some(m)) => {
-                    let prefixed = prefix_input_id(p, m, input_id);
-                    match self.inputs.get(&prefixed) {
-                        Some(c) => (c.clone(), prefixed),
-                        None => return Err(InputResolveError::NotFound(input_id.to_string())),
-                    }
-                }
-                _ => return Err(InputResolveError::NotFound(input_id.to_string())),
-            },
+        // 1. 定位定义（§5.11：plugin 上下文下 scoped-first → global-fallback）。
+        //    - 显式完整 scoped 引用（id 含 `/`，由 `prefix_input_id` 引入）→ 精确命中，不回退。
+        //    - 裸引用 + plugin 上下文 → 先查 scoped `<p>@<m>/<id>`，未命中回退全局 `<id>`；皆无 → NotFound(scoped)。
+        //    - 裸引用无 plugin 上下文 → 仅全局精确命中。
+        //    注：「scoped 已定位但取值失败 → 回退 global 取值」须 try-then-fallback 重构，留待 CLI-02（#51）接线
+        //    （本交互式 resolver 零生产 caller；运行期路径 `Computer::render_server_config_with_scope` 已完整实现
+        //    §5.11 含该回退与跨 kind 守卫）。
+        let (cfg, resolved_id) = if input_id.contains('/') {
+            match self.inputs.get(input_id) {
+                Some(c) => (c.clone(), input_id.to_string()),
+                None => return Err(InputResolveError::NotFound(input_id.to_string())),
+            }
+        } else if let (Some(p), Some(m)) = (plugin, marketplace) {
+            let scoped_id = prefix_input_id(p, m, input_id);
+            match self.inputs.get(&scoped_id) {
+                Some(c) => (c.clone(), scoped_id),
+                None => match self.inputs.get(input_id) {
+                    Some(c) => (c.clone(), input_id.to_string()),
+                    None => return Err(InputResolveError::NotFound(scoped_id)),
+                },
+            }
+        } else {
+            match self.inputs.get(input_id) {
+                Some(c) => (c.clone(), input_id.to_string()),
+                None => return Err(InputResolveError::NotFound(input_id.to_string())),
+            }
         };
 
         // 2. 进程内 cache（按解析后池 id）
@@ -530,6 +546,46 @@ mod tests {
             resolver.resolve_by_id("token", None, None),
             Err(InputResolveError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn scoped_def_wins_over_global_when_both_present() {
+        // §5.11 ①（交互式 resolver 对偶）：池里 scoped 与 global 同 bare id 并存 → scoped 胜（翻转后的新行为）。
+        let scoped = prompt_input("figma@acme/token", false);
+        let global = prompt_input("token", false);
+        let mut env = EnvMap::new();
+        env.insert(
+            "A2C_SMCP_figma_acme_token".to_string(),
+            "scoped-v".to_string(),
+        );
+        env.insert("A2C_SMCP_token".to_string(), "global-v".to_string());
+        let resolver = InputResolver::new(
+            [scoped, global],
+            Box::new(NonInteractivePrompter),
+            Some(env),
+            Some(secret_store(true)),
+        );
+        assert_eq!(
+            resolver
+                .resolve_by_id("token", Some("figma"), Some("acme"))
+                .unwrap(),
+            json!("scoped-v")
+        );
+    }
+
+    #[test]
+    fn bare_ref_in_plugin_context_not_found_carries_scoped_id() {
+        // §5.11：plugin 上下文下裸引用皆不可命中 → NotFound 的 id 为完整 scoped 形态（供 client 创建 scoped input）。
+        let resolver = InputResolver::new(
+            Vec::<MCPServerInput>::new(),
+            Box::new(NonInteractivePrompter),
+            Some(EnvMap::new()),
+            Some(secret_store(true)),
+        );
+        match resolver.resolve_by_id("token", Some("figma"), Some("acme")) {
+            Err(InputResolveError::NotFound(id)) => assert_eq!(id, "figma@acme/token"),
+            other => panic!("expected NotFound with scoped id, got {other:?}"),
+        }
     }
 
     // ---- pick（交互 seam）---------------------------------------------------

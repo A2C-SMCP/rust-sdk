@@ -279,13 +279,27 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
     }
 
     async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError> {
-        // TODO(#74 INT-04): 透传 plugin/marketplace 上下文给 add_or_update_server，使 bundled server 的裸
-        // `${input:id}` 经 resolver D2 前缀回退命中带前缀池条目（Python `_plugin_register_cb` 已传上下文；
-        // 当前 Computer::add_or_update_server 尚不接受该上下文——故 inject_inputs 前缀注入、register 不透传，
-        // 暂以「显式引用带前缀 id」可用，裸 id 回退待 #74）。
+        // 无 scope 路径（trait 必需方法 + 外部直接调用）：走公开 [`Computer::mount_server`]（裸 input 仅全局解析）。
+        // plugin-bound 注册走 [`Self::register_server_with_input_scope`]。
         // #113 S6：治理物化走**运行期挂载**（不落盘）——bundled server 归属 ledger 意图，不得写入 project mcp.json。
         self.comp
             .mount_server(cfg)
+            .await
+            .map_err(|e| McpHookError(e.to_string()))
+    }
+
+    async fn register_server_with_input_scope(
+        &self,
+        cfg: MCPServerConfig,
+        plugin_id: Option<&str>,
+    ) -> Result<(), McpHookError> {
+        // §5.11（a2c-smcp-protocol v0.3.1）：把既有 plugin_id（`<plugin>@<marketplace>`，enable/reconcile 透传）
+        // 派生为 [`PluginScope`]，透传进 scope-aware [`Computer::mount_server_with_scope`]，使 plugin-bound server
+        // 裸 `${input:<id>}` 按 `<P>@<M>/<id>` → 全局 `<id>` 序解析。分叉二裁决：客户端用标准生命周期即无感，
+        // scope 从自有 ledger 派生、**不**经客户端可见 API。plugin_id 非法/None → 退化为无 scope（mount_server）。
+        let scope = plugin_id.and_then(crate::inputs::plugin_pool::PluginScope::from_plugin_id);
+        self.comp
+            .mount_server_with_scope(cfg, scope)
             .await
             .map_err(|e| McpHookError(e.to_string()))
     }
@@ -449,6 +463,64 @@ mod tests {
         // inject 无 inputs.json → no-op（不 panic）。
         let tmp = std::env::temp_dir();
         assert!(hooks.inject_inputs(&tmp).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cli_hooks_register_with_input_scope_threads_scope_into_render() {
+        // §5.11 wiring（#155）：register_server_with_input_scope(Some(plugin_id)) 经 CliMcpHooks override →
+        // mount_server_with_scope → render 按 plugin scope 解析裸 `${input:}`。池里仅 scoped def（无值/默认/resolver）
+        // → Missing(scoped) 上抛。证明 scope 透传：若 wiring 断了（退化为无 scope 的 register_server），裸 "token"
+        // 查不到 scoped 池条目 → 占位符字面保留 → Ok，本测试会失败。
+        use crate::mcp_clients::model::{
+            MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
+            StdioServerParameters,
+        };
+        use std::collections::HashMap;
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "figma@acme/token".to_string(),
+            MCPServerInput::PromptString(PromptStringInput {
+                id: "figma@acme/token".to_string(),
+                description: String::new(),
+                default: None,
+                password: Some(false),
+            }),
+        );
+        let comp = Computer::new(
+            "wiring",
+            SilentSession::new("t"),
+            Some(inputs),
+            None,
+            false,
+            false,
+        );
+        let hooks = CliMcpHooks::new(&comp, Some("figma".into()), Some("acme".into())).await;
+        let cfg = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
+            name: "s".to_string(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["${input:token}".to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        let err = hooks
+            .register_server_with_input_scope(cfg, Some("figma@acme"))
+            .await
+            .unwrap_err();
+        let McpHookError(msg) = err;
+        assert!(
+            msg.contains("figma@acme/token"),
+            "scoped id should surface in error, got: {msg}"
+        );
     }
 
     /// #100 item1：`new_remount` 从 ledger 建 `install_path → 归属` 索引；`inject_inputs` **按记录归属**
