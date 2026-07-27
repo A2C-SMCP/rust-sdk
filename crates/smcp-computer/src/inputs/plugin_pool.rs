@@ -52,6 +52,7 @@ pub(crate) struct PluginScope {
 
 impl PluginScope {
     /// `<plugin>@<marketplace>` → scope；非法（无 `@` 或空段）→ `None` / parse a plugin_id into scope.
+    #[cfg(any(feature = "cli", test))]
     pub fn from_plugin_id(plugin_id: &str) -> Option<Self> {
         let (plugin, marketplace) = plugin_id.split_once('@')?;
         if plugin.is_empty() || marketplace.is_empty() {
