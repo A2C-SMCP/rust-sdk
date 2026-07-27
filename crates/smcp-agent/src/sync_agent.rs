@@ -14,7 +14,10 @@ use crate::{
     error::{Result, SmcpAgentError},
     AsyncSmcpAgent,
 };
-use smcp::{A2CSkillRef, GetBlobRet, GetResourcesRet, GetSkillRet, SMCPTool, SessionInfo};
+use smcp::{
+    A2CSkillRef, GetBlobRet, GetComputerConfigRet, GetResourcesRet, GetSkillRet, SMCPTool,
+    SessionInfo,
+};
 use tokio::runtime::Runtime;
 
 /// 同步SMCP Agent
@@ -61,6 +64,15 @@ impl SyncSmcpAgent {
         self.runtime.block_on(self.async_agent.get_tools(computer))
     }
 
+    /// 获取指定 Computer 的配置（同步，#136）/ Get a Computer's config (sync)。
+    ///
+    /// 阻塞包装 [`AsyncSmcpAgent::get_computer_config`](crate::AsyncSmcpAgent::get_computer_config)：
+    /// `servers` = 运行期活跃集（key = `bundle_id`），`inputs` = input 定义列表。
+    pub fn get_computer_config(&self, computer: &str) -> Result<GetComputerConfigRet> {
+        self.runtime
+            .block_on(self.async_agent.get_computer_config(computer))
+    }
+
     /// 获取指定Computer的桌面信息
     pub fn get_desktop(
         &self,
@@ -74,6 +86,7 @@ impl SyncSmcpAgent {
 
     /// 获取指定 Computer 上某 MCP Server 的资源列表（v0.2.0，同步）/ Get a MCP Server's resources (sync)。
     ///
+    /// `mcp_server`：目标 MCP Server 的 **bundle_id**（**非** display 名；传 display 名 → `4014`）。
     /// 阻塞包装 [`AsyncSmcpAgent::get_resources`]：透明转发 MCP `resources/list`，`cursor` 调用方控制
     /// （首次 `None`），flat ErrorPayload（`4014`/`4015`）透传为协议错误。
     pub fn get_resources(

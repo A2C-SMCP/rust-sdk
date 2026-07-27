@@ -161,7 +161,8 @@ a2c> status
 
 - Socket.IO 是否已连接、URL、namespace、是否加入 office
 - MCP Manager 是否初始化
-- Active servers 数量
+- Active servers 数量，**每行打印 `- <name> [bundle_id=<id>]: <status>`**——`bundle_id` 是 `start`/`stop`/
+  `server rm` 的消歧目标（协议 §身份：同名 server 须以 `bundle_id` 精确寻址）
 - 可用工具数量（Available Tools）
 
 ### 5.2 连接 Socket.IO（可选）
@@ -264,8 +265,25 @@ a2c> server add {"name":"iterm-mcp","type":"stdio","disabled":false,"forbidden_t
 移除服务器：
 
 ```text
-a2c> server rm <name>
+a2c> server rm <target>
 ```
+
+`target` = 唯一 `name` 或 `bundle_id`（协议 §身份：`name` 允许碰撞、非身份键——同名多 server 时须用
+`bundle_id` 消歧，可经 `status` 查看每行的 `[bundle_id=...]`）。
+
+#141 起 `target` 的解析严格按协议 §5.1，且**双端（Rust / Python）逐字一致**：
+
+1. 先按 **display name** 反查，唯一命中 → 其 bundle_id；
+2. 多命中 → 列出候选（bundle_id + name + 归属）报错，要求改用 bundle_id 重试（**禁**字典序最小任选）；
+3. 0 命中且 token 是**合法且已注册**的 bundle_id → 按 bundle_id 执行；
+4. 其余 → `❌ 未找到服务器 '<token>'`。
+
+即**拼错的名字会报错**，不会静默成功——「语法合法 ≠ 存在」（bundle_id 字符集是 `[A-Za-z0-9_-]`，多数拼写
+错误仍是合法字面量，故必须查「是否已注册」而不只是「语法是否合法」）。查找空间 = 运行期活跃集 ∪ 声明面，
+故已落盘但未挂载的声明（如卡在审批门外的 pending server）也能按名寻址。
+
+回执如实：确有声明被删或实例被停摘才报「已移除」；否则报 `ℹ️ …未做任何操作`。`stop`/`restart` 同理
+（`stop` 对已注册但未挂载的 server 打 `ℹ️ …尚未挂载，无需停止`）。
 
 查看当前 MCP 配置（servers + inputs）：
 

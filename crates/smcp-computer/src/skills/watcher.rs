@@ -14,10 +14,11 @@
 //! SDK 设计 / Design: python-sdk `docs/design-0.2.1-cli-marketplace-ux.md` §8.3。
 //!
 //! 监控范围 / Scope（§8.3）：
-//! - 监控根（**递归**）= `$A2C_SKILL_HOME/user/` + **全部已登记** `<workdir>/.tfrobot/skills/`（能力发现层、
-//!   全局并集、不随 active workdir 切换）；过滤器为 `**/SKILL.md`。**绝不监** marketplace clone 树
-//!   （`<home>/marketplace/<mp>/...`）——clone 树是物化产物，变更只经 CLI 操作发生（操作自调去抖标脏），
-//!   监控它会引发 `git pull` 雪崩并破坏「意图层 / 物化层」单向同步边界。
+//! - 监控根（**递归**）= `$A2C_SKILL_HOME/user/`（#98：`Computer` 不再持有 workspace，故仅此**单一** home 级
+//!   全局 DropIn 根；per-workdir `<workdir>/.tfrobot/skills/` 维度已随 workdir 概念瘦身移除，workdir 范围
+//!   SKILL 改由 mcp 源 + `skill://` 承载，对齐 protocol#10 / python-sdk#116）；过滤器为 `**/SKILL.md`。
+//!   **绝不监** marketplace clone 树（`<home>/marketplace/<mp>/...`）——clone 树是物化产物，变更只经 CLI
+//!   操作发生（操作自调去抖标脏），监控它会引发 `git pull` 雪崩并破坏「意图层 / 物化层」单向同步边界。
 //! - **监控范围 ≠ 发现单元**：watcher 监根递归子树并过滤 `SKILL.md`；深度过滤由
 //!   [`stage_user_skills`](super::staging::stage_user_skills) 在重扫时负责，watcher 只管「有 SKILL.md
 //!   变更 → 标脏」。

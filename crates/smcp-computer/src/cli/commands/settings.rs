@@ -8,12 +8,12 @@
 * 描述: `settings` 命令 handler（show / get / set / edit）
 *       Settings command handlers.
 *
-* 对标 Python `a2c_smcp/computer/cli/commands/settings.py`：读经 [`resolved_settings`]（merged，含 policy
+* 对标 Python `a2c_smcp/computer/cli/commands/settings.py`：读经 [`super::resolved_settings`]（merged，含 policy
 * first-source-wins）或单层 [`load_settings_file`]；写经 [`apply_write`]（**数组整体替换**；删键仅经 DELETE
 * 哨兵，`null` 写 JSON null，§5.4）+ store 持锁原子写。
 *
 * - **scope**：`user` / `project` / `local` 可写；`flag` / `policy` **只读**（set/edit 拒绝，退出码 1）；
-*   `merged`（默认 show）= 六层合并视图。project/local 需 active workdir。
+*   `merged`（默认 show）= 五层合并视图。#98：project/local 锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
 * - settings.json **无 version 字段**（复刻 CC passthrough，§5）；写不注 version/保护头。
 * - `edit` 用 `$EDITOR` 打开该层文件；保存后的 reconcile（mark_skills_dirty）由 REPL（#54）承担。
 */
@@ -23,13 +23,15 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use super::{err_flat as err, ok_msg, print_json, resolved_settings, EXIT_OK, EXIT_USER_ERROR};
+use super::{
+    err_flat as err, ok_msg, print_json, resolved_settings_with_errors, EXIT_OK, EXIT_USER_ERROR,
+};
 use crate::settings::scope::{
-    apply_write, load_settings_file, user_settings_path, workdir_local_settings_path,
+    apply_write, load_settings_file, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
 };
 use crate::settings::store::{atomic_write_settings_json, with_settings_lock};
-use crate::settings::{resolve_policy_settings, SettingsScope};
+use crate::settings::{resolve_policy_settings, SettingsScope, SettingsValidationError};
 
 // 可读 scope（show/get）/ readable scopes；可写 scope（set/edit）/ writable scopes。
 const READABLE: [&str; 6] = ["user", "project", "local", "flag", "policy", "merged"];
@@ -49,21 +51,23 @@ pub fn is_emit_key(key: &str) -> bool {
 }
 
 /// 解析可写 scope 的 settings.json 路径 + enum；flag/policy/unknown → `Err`（对标 Python `_writable_path`）。
+///
+/// #98：project/local 锚定 `cwd`（`None` → 进程 cwd）；进程 cwd 不可读 → `Err`（罕见）。
 fn writable_path(
     scope: &str,
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     env: Option<&EnvMap>,
 ) -> Result<(PathBuf, SettingsScope), String> {
     match scope {
         "user" => Ok((user_settings_path(env), SettingsScope::User)),
         "project" | "local" => {
-            let aw = active_workdir.ok_or_else(|| {
-                format!("scope {scope:?} requires an active workdir (use --add-dir at startup)")
+            let base = resolve_cwd(cwd).ok_or_else(|| {
+                format!("scope {scope:?} anchor unavailable (process cwd unreadable)")
             })?;
             if scope == "project" {
-                Ok((workdir_project_settings_path(aw), SettingsScope::Project))
+                Ok((workdir_project_settings_path(&base), SettingsScope::Project))
             } else {
-                Ok((workdir_local_settings_path(aw), SettingsScope::Local))
+                Ok((workdir_local_settings_path(&base), SettingsScope::Local))
             }
         }
         _ => Err(format!(
@@ -72,36 +76,53 @@ fn writable_path(
     }
 }
 
-/// 读单 scope（或 merged）settings dict；scope 缺 active workdir → `None`（调用方报错）/ read one scope。
-fn read_scope(
+/// 读单 scope（或 merged）settings dict **连同校验错误**；进程 cwd 不可读时 project/local → 空层 / read one scope。
+///
+/// #98：project/local 锚定 `cwd`（`None` → 进程 cwd）。
+///
+/// #143/#145：**恒带出 errors**（无吞错误包装）—— scope 越权会静默丢字段（policy-only / 审批门 enable 方向
+/// 判据），`settings show`/`get` 是用户排查「我的 settings 莫名不生效」时**最先跑**的命令，若吞错误则诊断回路
+/// 断裂、`get` 还会答「not set in scope」主动误导。呈现由调用方统一走 stderr（`format_settings_errors`）。
+/// 协议 §3「响亮失败」。对拍 python `_read_scope_with_errors`（python#157 已删吞错误包装，rust 同构）。
+fn read_scope_with_errors(
     scope: &str,
     env: Option<&EnvMap>,
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     flag_path: Option<&Path>,
-) -> Option<Map<String, Value>> {
+) -> Option<(Map<String, Value>, Vec<SettingsValidationError>)> {
     match scope {
-        "merged" => Some(resolved_settings(
-            registered_workdirs,
-            active_workdir,
-            env,
-            flag_path,
+        "merged" => {
+            let rs = resolved_settings_with_errors(cwd, env, flag_path);
+            Some((rs.settings, rs.errors))
+        }
+        "user" => Some(load_settings_file(
+            &user_settings_path(env),
+            SettingsScope::User,
         )),
-        "user" => Some(load_settings_file(&user_settings_path(env), SettingsScope::User).0),
         "project" | "local" => {
-            let aw = active_workdir?;
+            let base = resolve_cwd(cwd);
             let (path, enum_) = if scope == "project" {
-                (workdir_project_settings_path(aw), SettingsScope::Project)
+                (
+                    base.map(|b| workdir_project_settings_path(&b)),
+                    SettingsScope::Project,
+                )
             } else {
-                (workdir_local_settings_path(aw), SettingsScope::Local)
+                (
+                    base.map(|b| workdir_local_settings_path(&b)),
+                    SettingsScope::Local,
+                )
             };
-            Some(load_settings_file(&path, enum_).0)
+            // cwd 不可读 → 空层（不 panic）。
+            Some(match path {
+                Some(p) => load_settings_file(&p, enum_),
+                None => (Map::new(), Vec::new()),
+            })
         }
         "flag" => match flag_path {
-            Some(fp) => Some(load_settings_file(fp, SettingsScope::Flag).0),
-            None => Some(Map::new()),
+            Some(fp) => Some(load_settings_file(fp, SettingsScope::Flag)),
+            None => Some((Map::new(), Vec::new())),
         },
-        "policy" => Some(resolve_policy_settings(env, None, None)),
+        "policy" => Some((resolve_policy_settings(env, None, None), Vec::new())),
         _ => None,
     }
 }
@@ -121,8 +142,7 @@ fn editor_from_env(env: Option<&EnvMap>, key: &str) -> Option<String> {
 pub fn settings_show(
     env: Option<&EnvMap>,
     scope: &str,
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     flag_path: Option<&Path>,
     json_output: bool,
 ) -> i32 {
@@ -133,13 +153,18 @@ pub fn settings_show(
             EXIT_USER_ERROR,
         );
     }
-    let Some(data) = read_scope(scope, env, registered_workdirs, active_workdir, flag_path) else {
+    // READABLE 预检后 read_scope_with_errors 恒 Some；None 仅在未知 scope（防御）。
+    let Some((data, errors)) = read_scope_with_errors(scope, env, cwd, flag_path) else {
         return err(
-            &format!("scope {scope:?} requires an active workdir (use --add-dir at startup)"),
+            &format!("unknown scope {scope:?}"),
             json_output,
             EXIT_USER_ERROR,
         );
     };
+    // #143：scope 越权被过滤的字段在此有解释（打 stderr，不污染 stdout 的 JSON）。
+    for line in super::format_settings_errors(&errors) {
+        eprintln!("{line}");
+    }
     print_json(&Value::Object(data));
     EXIT_OK
 }
@@ -149,8 +174,7 @@ pub fn settings_get(
     env: Option<&EnvMap>,
     key: &str,
     scope: &str,
-    registered_workdirs: &[PathBuf],
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     flag_path: Option<&Path>,
     json_output: bool,
 ) -> i32 {
@@ -161,13 +185,20 @@ pub fn settings_get(
             EXIT_USER_ERROR,
         );
     }
-    let Some(data) = read_scope(scope, env, registered_workdirs, active_workdir, flag_path) else {
+    // READABLE 预检后 read_scope_with_errors 恒 Some；None 仅在未知 scope（防御）。
+    let Some((data, errors)) = read_scope_with_errors(scope, env, cwd, flag_path) else {
         return err(
-            &format!("scope {scope:?} requires an active workdir (use --add-dir at startup)"),
+            &format!("unknown scope {scope:?}"),
             json_output,
             EXIT_USER_ERROR,
         );
     };
+    // #145：越权字段会被过滤出 data —— 若不呈现，下面的 "not set in scope" 会**主动误导**
+    // （文件里明明写了，却被安全策略过滤谎报成「你没配」）。故在判 key 命中之前先经 stderr 解释。
+    // 对齐 settings_show 与 python-sdk#157（emit 置于 key 判空之前）；stdout JSON 契约不变。
+    for line in super::format_settings_errors(&errors) {
+        eprintln!("{line}");
+    }
     let Some(value) = data.get(key) else {
         return err(
             &format!("key {key:?} not set in scope {scope:?}"),
@@ -188,7 +219,7 @@ pub fn settings_set(
     key: &str,
     value: &str,
     scope: &str,
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     json_output: bool,
 ) -> i32 {
     if !WRITABLE.contains(&scope) {
@@ -201,7 +232,7 @@ pub fn settings_set(
             EXIT_USER_ERROR,
         );
     }
-    let (path, enum_) = match writable_path(scope, active_workdir, env) {
+    let (path, enum_) = match writable_path(scope, cwd, env) {
         Ok(pair) => pair,
         Err(e) => return err(&e, json_output, EXIT_USER_ERROR),
     };
@@ -245,7 +276,7 @@ pub fn settings_set(
 pub fn settings_edit(
     env: Option<&EnvMap>,
     scope: &str,
-    active_workdir: Option<&Path>,
+    cwd: Option<&Path>,
     editor: Option<&str>,
     json_output: bool,
 ) -> i32 {
@@ -259,7 +290,7 @@ pub fn settings_edit(
             EXIT_USER_ERROR,
         );
     }
-    let (path, _enum) = match writable_path(scope, active_workdir, env) {
+    let (path, _enum) = match writable_path(scope, cwd, env) {
         Ok(pair) => pair,
         Err(e) => return err(&e, json_output, EXIT_USER_ERROR),
     };
@@ -322,7 +353,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
         assert_eq!(
-            settings_show(Some(&env), "bogus", &[], None, None, true),
+            settings_show(Some(&env), "bogus", None, None, true),
             EXIT_USER_ERROR
         );
     }
@@ -343,13 +374,20 @@ mod tests {
     }
 
     #[test]
-    fn set_project_without_active_workdir_rejected() {
+    fn set_project_anchors_cwd_and_succeeds() {
+        // #98：project scope 不再要求 active workdir——锚定注入 cwd 写 <cwd>/.tfrobot/settings.json。
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
         assert_eq!(
-            settings_set(Some(&env), "k", "1", "project", None, true),
-            EXIT_USER_ERROR
+            settings_set(Some(&env), "k", "1", "project", Some(&wd), true),
+            EXIT_OK
         );
+        let data = read_scope_with_errors("project", Some(&env), Some(&wd), None)
+            .unwrap()
+            .0;
+        assert_eq!(data.get("k"), Some(&json!(1)));
+        assert!(workdir_project_settings_path(&wd).exists());
     }
 
     #[test]
@@ -362,15 +400,17 @@ mod tests {
             EXIT_OK
         );
         // 直读 user scope 验证落盘。
-        let data = read_scope("user", Some(&env), &[], None, None).unwrap();
+        let data = read_scope_with_errors("user", Some(&env), None, None)
+            .unwrap()
+            .0;
         assert_eq!(data.get("maxConcurrency"), Some(&json!(7)));
         // get 命中 → 0；缺失 key → 1。
         assert_eq!(
-            settings_get(Some(&env), "maxConcurrency", "user", &[], None, None, true),
+            settings_get(Some(&env), "maxConcurrency", "user", None, None, true),
             EXIT_OK
         );
         assert_eq!(
-            settings_get(Some(&env), "nope", "user", &[], None, None, true),
+            settings_get(Some(&env), "nope", "user", None, None, true),
             EXIT_USER_ERROR
         );
     }
@@ -381,8 +421,9 @@ mod tests {
         let env = test_env(dir.path());
         settings_set(Some(&env), "foo", "\"bar\"", "user", None, true);
         assert_eq!(
-            read_scope("user", Some(&env), &[], None, None)
+            read_scope_with_errors("user", Some(&env), None, None)
                 .unwrap()
+                .0
                 .get("foo"),
             Some(&json!("bar"))
         );
@@ -392,8 +433,9 @@ mod tests {
             EXIT_OK
         );
         assert_eq!(
-            read_scope("user", Some(&env), &[], None, None)
+            read_scope_with_errors("user", Some(&env), None, None)
                 .unwrap()
+                .0
                 .get("foo"),
             Some(&Value::Null)
         );
@@ -407,8 +449,9 @@ mod tests {
         // 数组整体替换（非拼接）。
         settings_set(Some(&env), "list", "[9]", "user", None, true);
         assert_eq!(
-            read_scope("user", Some(&env), &[], None, None)
+            read_scope_with_errors("user", Some(&env), None, None)
                 .unwrap()
+                .0
                 .get("list"),
             Some(&json!([9]))
         );
@@ -418,7 +461,9 @@ mod tests {
     fn flag_scope_without_path_is_empty() {
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
-        let data = read_scope("flag", Some(&env), &[], None, None).unwrap();
+        let data = read_scope_with_errors("flag", Some(&env), None, None)
+            .unwrap()
+            .0;
         assert!(data.is_empty());
     }
 

@@ -10,6 +10,7 @@
 // 模块声明 / Module declarations
 pub mod auth_error;
 pub mod base_client;
+pub mod bundle_id;
 pub mod http_client;
 pub mod manager;
 pub mod model;
@@ -23,7 +24,7 @@ pub mod vrl_runtime;
 
 // 重新导出核心类型 / Re-export core types
 pub use base_client::BaseMCPClient;
-pub use manager::{MCPServerManager, ToolNameDuplicatedError};
+pub use manager::{ExposedToolRoute, MCPServerManager};
 pub use model::*;
 pub use render::{ConfigRender, RenderError};
 pub use resource_cache::{CachedResource, ResourceCache};

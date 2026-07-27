@@ -15,17 +15,21 @@ use crate::{
     events::AsyncAgentEventHandler,
     protocol_error::raise_for_error_payload,
     request_builders::{
-        build_get_blob_request, build_get_desktop_request, build_get_resources_request,
-        build_get_skill_request, build_get_skills_request, build_get_tools_request,
-        build_tool_call_cancel, build_tool_call_request,
+        build_get_blob_request, build_get_config_request, build_get_desktop_request,
+        build_get_resources_request, build_get_skill_request, build_get_skills_request,
+        build_get_tools_request, build_tool_call_cancel, build_tool_call_request,
     },
-    response::{ensure_req_id, parse_get_blob_response, parse_get_resources_response},
+    response::{
+        ensure_req_id, parse_get_blob_response, parse_get_config_response,
+        parse_get_resources_response,
+    },
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport},
 };
 use smcp::{
-    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetResourcesRet,
-    GetSkillRet, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
+    events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetComputerConfigRet,
+    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo,
+    SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -158,9 +162,19 @@ impl AsyncSmcpAgent {
                         }
                     }
                     NotificationMessage::UpdateToolList(data) => {
-                        // Python 的自动行为：收到 update_tool_list 后自动触发 get_tools
-                        // Auto behavior: fetch tools when tool list is updated
+                        // #106 三段式（预清 → 回拉 → 重加，对标 python#127）：先派发预清回调
+                        // on_computer_update_tool_list，让加法式下游消费方清空该 computer 的旧工具视图，再自动
+                        // 重拉 get_tools → on_tools_received 重加——使运行期**移除 / 同名换 schema**正确生效
+                        // （否则纯回拉+加法式 merge 会残留旧定义）。预清失败独立捕获、不阻断后续回拉。
+                        //
+                        // 预清与回拉**成对**，故一并 gate 在 auto_fetch_tools 内：若消费方显式关闭 auto_fetch，
+                        // 则既不预清也不回拉（由消费方自管），避免「清空却因不回拉而永不重填 → 工具凭空消失」。
                         if auto_fetch_tools {
+                            if let Some(ref handler) = event_handler {
+                                let _ = handler
+                                    .on_computer_update_tool_list(data.clone(), &agent_clone)
+                                    .await;
+                            }
                             match agent_clone.get_tools(&data.computer).await {
                                 Ok(tools) => {
                                     debug!(
@@ -306,6 +320,41 @@ impl AsyncSmcpAgent {
         Ok(tools)
     }
 
+    /// 获取指定 Computer 的配置（`client:get_config`，#136 / D#23 B-1）/ Get a Computer's config。
+    ///
+    /// 返回 [`GetComputerConfigRet`]：`servers` = Computer 的**运行期活跃** MCP Server 集（字典
+    /// key = **`bundle_id`**，server 唯一身份；F2/PROTO-2：读运行期权威配置集、非构造期快照），`inputs`
+    /// = input 定义列表。**唯一途径**取纯资源型 server（无工具、只出 `window://`）的 `bundle_id`，供
+    /// 后续 [`get_resources`](Self::get_resources)（其 `mcp_server` 参即此处 `servers` 的 key）。
+    ///
+    /// flat ErrorPayload 经 ack 透传为协议错误、不吞错。`GetComputerConfigRet` 无 `req_id` 字段 ⇒
+    /// 不做回显校验（见 `response::parse_get_config_response`）。对标 Python
+    /// `a2c_smcp/agent/client.py::get_config`（SDK 方法名各按语言惯例，D#23 R5：无需跨端对拍）。
+    pub async fn get_computer_config(&self, computer: &str) -> Result<GetComputerConfigRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_get_config_request(&agent_config.agent, computer);
+
+        debug!("Getting config from computer: {}", computer);
+
+        let transport = self.transport.read().await;
+        let transport = transport
+            .as_ref()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_GET_CONFIG, data, self.config.get_timeout)
+            .await?;
+
+        // flat ErrorPayload 透传 + 整包解析单点收敛于纯函数（无 req_id 回显校验，见 parse_get_config_response）。
+        let ret = parse_get_config_response(&response)?;
+        info!(
+            "Received config from computer {} ({} servers)",
+            computer,
+            ret.servers.as_object().map(|m| m.len()).unwrap_or(0)
+        );
+        Ok(ret)
+    }
+
     /// 获取指定Computer的桌面信息
     pub async fn get_desktop(
         &self,
@@ -346,6 +395,10 @@ impl AsyncSmcpAgent {
     }
 
     /// 获取指定 Computer 上某 MCP Server 的资源列表（v0.2.0）/ Get a MCP Server's resource list。
+    ///
+    /// `mcp_server`：目标 MCP Server 的 **bundle_id**（**非** display 名；协议 0.3.0 §身份正交性 #18）。
+    /// Computer 按 bundle_id 直查、不经 name 解析 ⇒ 传 display 名必得 `4014`。bundle_id 取自
+    /// `client:get_config` 响应的 `servers` map 键（typed 消费方法由 #136 补齐）。
     ///
     /// 透明转发 MCP `resources/list`：SDK **不**自动翻页——`cursor` 由调用方控制，首次传 `None`，
     /// 响应含 `next_cursor` 时由调用方决定是否带该 cursor 继续请求（协议指南 §5.3 #3）。flat
@@ -431,7 +484,7 @@ impl AsyncSmcpAgent {
     /// - 二进制或过大文本 → `blob_handle` **原样返回**，由调用方经 `client:get_blob` 自取字节。
     ///
     /// 文本 MIME 的 `blob_handle` 自动经 `drain_blob` 拉回并 UTF-8 解码回填 `body`，对调用方透明；
-    /// 文本性判定经单一权威 [`mime_is_textual`]（协议 §6.4(2)）。对标 Python
+    /// 文本性判定经单一权威 `mime_is_textual`（协议 §6.4(2)）。对标 Python
     /// `a2c_smcp/agent/client.py::get_skill`。
     pub async fn get_skill(
         &self,
@@ -495,7 +548,7 @@ impl AsyncSmcpAgent {
     /// 直接对应协议 `client:get_blob`：按 `chunk_offset`（资源字节绝对偏移，缺省 0）+ `max_chunk_bytes`
     /// （客户建议单块上限，Computer clamp 至 `BlobThresholds.chunk_max_bytes`）取一块，返回 [`GetBlobRet`]
     /// （含 `total_size`/`sha256`/`eof`/base64 `blob`）。flat ErrorPayload（`4018` invalid_handle/
-    /// forbidden/gone/range）经 ack 透传为协议错误。多块重组/校验/重试请用 [`Self::drain_blob_bytes`]。
+    /// forbidden/gone/range）经 ack 透传为协议错误。多块重组/校验/重试请用 `Self::drain_blob_bytes`。
     /// 对标 Python `a2c_smcp/agent/client.py::get_blob`。
     pub async fn get_blob(
         &self,
@@ -673,14 +726,8 @@ impl AsyncSmcpAgent {
                     error!("Failed to send cancel request: {}", e);
                 }
 
-                // 返回超时错误
-                Ok(serde_json::json!({
-                    "content": [{
-                        "type": "text",
-                        "text": format!("工具调用超时 / Tool call timeout, req_id={}", req_id_for_cancel.as_str())
-                    }],
-                    "isError": true
-                }))
+                // 返回超时错误（结果级 meta.a2c_timeout=true → Agent 三态分类归 TimedOut，#92 P1）
+                Ok(local_timeout_call_result(req_id_for_cancel.as_str()))
             }
             Err(e) => {
                 error!(
@@ -740,7 +787,7 @@ impl AsyncSmcpAgent {
     /// 协议合规预期，**MUST NOT** 当作失败。
     ///
     /// 取消是否真正中断由 Computer 侧协作式处理（INT-02 #70）；Agent 随后从原 `client:tool_call` 的 ack
-    /// 拿到取消态 `CallToolResult`（结果级 `a2c_cancelled=true`），用 [`classify_tool_call_outcome`]
+    /// 拿到取消态 `CallToolResult`（结果级 `a2c_cancelled=true`），用 [`crate::response::classify_tool_call_outcome`]
     /// 区分取消 / 超时 / 失败。
     ///
     /// 注：取消载体 `AgentCallData` 仅 `{agent, req_id}`，**不含** reason 字段——取消原因
@@ -843,6 +890,29 @@ impl Clone for AsyncSmcpAgent {
     }
 }
 
+/// 构造 Agent **本地**超时兜底的 `CallToolResult`-shape 响应（P1 #92）。
+///
+/// 写结果级 `meta.a2c_timeout=true`（协议规范 wire key `meta`，键用单一权威常量
+/// [`smcp::tool_meta::A2C_TIMEOUT_KEY`]），使 [`crate::response::classify_tool_call_outcome`] 把该响应归类为
+/// `TimedOut`（而非 `Failed`），与 Computer 侧超时态语义对齐。纯函数，便于单测（本仓 transport
+/// 无 mock 接缝，约定抽纯 helper 单测）。
+fn local_timeout_call_result(req_id: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!("工具调用超时 / Tool call timeout, req_id={}", req_id)
+        }],
+        "isError": true,
+    });
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        smcp::tool_meta::A2C_TIMEOUT_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    v["meta"] = serde_json::Value::Object(meta);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,5 +939,24 @@ mod tests {
         assert!(!mime_is_textual(Some("image/png")));
         assert!(!mime_is_textual(Some("")));
         assert!(!mime_is_textual(None));
+    }
+
+    /// #92 P1：本地超时兜底结果写结果级 `meta.a2c_timeout=true`，使三态分类归 `TimedOut`（非 `Failed`）。
+    #[test]
+    fn test_local_timeout_result_classifies_as_timed_out() {
+        use crate::response::{classify_tool_call_outcome, ToolCallOutcome};
+        let v = local_timeout_call_result("rid-42");
+        // 结果级标记落协议规范的 wire key `meta`。
+        assert_eq!(
+            v["meta"][smcp::tool_meta::A2C_TIMEOUT_KEY],
+            serde_json::json!(true)
+        );
+        assert_eq!(v["isError"], serde_json::json!(true));
+        assert!(
+            v["content"][0]["text"].as_str().unwrap().contains("rid-42"),
+            "超时文案应含 req_id"
+        );
+        // 关键：被三态分类器归为 TimedOut（之前无 meta 时归 Failed）。
+        assert_eq!(classify_tool_call_outcome(&v), ToolCallOutcome::TimedOut);
     }
 }

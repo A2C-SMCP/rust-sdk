@@ -1,8 +1,9 @@
 use smcp_computer::{
-    computer::{Computer, ManagerChangeMessage, SilentSession},
+    computer::{Computer, SilentSession},
+    mcp_clients::bundle_id::resolve_bundle_id,
     mcp_clients::model::{
-        MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
-        StdioServerParameters,
+        BundleId, MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification,
+        PromptStringInput, StdioServerConfig, StdioServerParameters,
     },
 };
 /**
@@ -21,8 +22,10 @@ use tempfile::TempDir;
 /// INT-01 #68：boot_up 起 FS 副作用（建 ~/.a2c/.blobspool + watch ~/.a2c/skills）→ 隔离到 TempDir。
 /// Isolate boot_up's FS side-effects to a TempDir so tests never touch the real home。
 fn isolate_boot(c: Computer<SilentSession>, td: &TempDir) -> Computer<SilentSession> {
+    // #113 S6：add/remove_server 现落盘到 config_dir（缺省进程 cwd）→ 隔离到 TempDir，避免污染仓库工作树。
     c.with_skill_home(td.path().join("skills"))
         .with_blob_cache_root(td.path().join("blob"))
+        .with_config_dir(td.path().join("config"))
 }
 
 #[tokio::test]
@@ -153,21 +156,15 @@ async fn test_computer_edge_case_servers() {
     computer.boot_up().await.unwrap();
 
     // 测试空服务器名称 / Test empty server name
-    let empty_server = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let empty_server = MCPServerConfig::Stdio(StdioServerConfig::new(
+        "",
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
     // 应该能添加空名称服务器
     // Should be able to add empty name server
@@ -175,45 +172,37 @@ async fn test_computer_edge_case_servers() {
 
     // 测试超长服务器名称 / Test very long server name
     let long_name = "a".repeat(10000);
-    let long_server = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: long_name.clone(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let long_server = MCPServerConfig::Stdio(StdioServerConfig::new(
+        long_name.clone(),
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
+    // #141：remove 按身份键寻址；display 名未必是合法 bundle_id 字面量 → 由同一份 config 派生。
+    let long_bundle_id = resolve_bundle_id(&long_server);
     computer.add_or_update_server(long_server).await.unwrap();
-    computer.remove_server(&long_name).await.unwrap();
+    computer.remove_server(&long_bundle_id).await.unwrap();
 
     // 测试特殊字符服务器名称 / Test special character server name
     let special_name = "!@#$%^&*()".to_string();
-    let special_server = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: special_name.clone(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let special_server = MCPServerConfig::Stdio(StdioServerConfig::new(
+        special_name.clone(),
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
+    // 全特殊字符名 normalize 后为空 → bundle_id 走确定性摘要 fallback，故必须派生而非字面量。
+    let special_bundle_id = resolve_bundle_id(&special_server);
     computer.add_or_update_server(special_server).await.unwrap();
-    computer.remove_server(&special_name).await.unwrap();
+    computer.remove_server(&special_bundle_id).await.unwrap();
 
     computer.shutdown().await.unwrap();
 }
@@ -312,33 +301,35 @@ async fn test_computer_batch_update_inputs() {
 }
 
 #[tokio::test]
-async fn test_computer_manager_change_handler() {
-    use smcp_computer::computer::ManagerChangeHandler;
-
+async fn test_computer_handle_mcp_notification_no_deps() {
+    // #106：未 boot（mcp_manager 为 None）、无 Socket.IO 客户端时，handle_mcp_notification 应对三类通知
+    // 均安全 no-op（reactor 的 manager.upgrade()/read() 命中 None → 跳过；emit 无 client → no-op），不 panic。
     let session = SilentSession::new("test");
     let computer = Computer::new("test_computer", session, None, None, false, false);
 
-    // 测试工具列表变更消息 / Test tool list change message
-    let result = computer
-        .on_change(ManagerChangeMessage::ToolListChanged)
-        .await;
-    assert!(result.is_ok()); // 应该成功，即使没有Socket.IO客户端
-
-    // 测试资源列表变更消息 / Test resource list change message
-    let result = computer
-        .on_change(ManagerChangeMessage::ResourceListChanged {
-            windows: vec!["window1".to_string(), "window2".to_string()],
+    computer
+        .handle_mcp_notification(McpServerNotification {
+            server: BundleId::try_from("srv").expect("夹具 bundle_id 须合法"),
+            kind: McpChangeKind::ToolListChanged,
         })
         .await;
-    assert!(result.is_ok());
 
-    // 测试资源更新消息 / Test resource update message
-    let result = computer
-        .on_change(ManagerChangeMessage::ResourceUpdated {
-            uri: "file:///test.txt".to_string(),
+    computer
+        .handle_mcp_notification(McpServerNotification {
+            server: BundleId::try_from("srv").expect("夹具 bundle_id 须合法"),
+            kind: McpChangeKind::ResourceListChanged,
         })
         .await;
-    assert!(result.is_ok());
+
+    computer
+        .handle_mcp_notification(McpServerNotification {
+            server: BundleId::try_from("srv").expect("夹具 bundle_id 须合法"),
+            kind: McpChangeKind::ResourceUpdated {
+                uri: "window://1".to_string(),
+            },
+        })
+        .await;
+    // 到达此处即证明三类通知在无依赖时均安全返回。
 }
 
 #[tokio::test]

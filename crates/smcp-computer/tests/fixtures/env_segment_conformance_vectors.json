@@ -1,0 +1,29 @@
+{
+  "$schema_note": "A2C-SMCP 协议 0.3.0 input 环境变量命名（ENV_SEGMENT）一致性测试向量（跨 SDK 逐字节一致锚点）。source of truth = a2c-smcp-protocol docs/guides/computer-mcp-config-guide.md §「环境变量命名规则（双端统一规范）」（PROTO-5 / Discussion #23 F4-F5）。python-sdk 首版提供，rust-sdk 对拍锁定。任一 SDK 的 env_var_name(input_id, bundle_id, tool_name) MUST 产出 expected_env_var_name 方为合规。",
+  "algorithm": {
+    "prefix": "A2C_SMCP_（0.3.0 起）。历史 A2C_INPUT_ 前缀废止，F5 终审硬切、无双读、无过渡期。",
+    "env_segment": "ENV_SEGMENT(s)：按 Unicode 码点迭代 s（rust chars() / python for-in-str，MUST NOT 按 UTF-8 字节或 grapheme），非 [A-Za-z0-9_] 码点 → '_'。保留大小写（MUST NOT upper()/lower()）。MUST 用显式 ASCII 字符类，MUST NOT 用 \\w（各语言 Unicode \\w 集合不一致）。",
+    "no_folding": "ENV_SEGMENT 与 bundle_id 的 normalize_name 是**两个不同函数**：ENV_SEGMENT **不**折叠连续 '_'、**不**裁首尾 [_-]。复用 normalize_name 会让 a_b/a__b 坍缩且 _lead_ 变 lead，属实现错误。向量 no-fold-consecutive / no-trim-edges 钉住此点。",
+    "compose": "env_var_name = 'A2C_SMCP_' ‖ ENV_SEGMENT(input_id) ‖ ['_' ‖ ENV_SEGMENT(bundle_id)] ‖ ['_' ‖ ENV_SEGMENT(tool_name)]。server 上下文段用 bundle_id（运行期唯一身份），MUST NOT 用 display name。段缺省则整段省略（含其前导 '_'）。",
+    "case_preserved": "保留大小写的理由：POSIX env 名本就大小写敏感；折叠会让 MyServer / myserver（两个合法且可同时挂载的 bundle_id）坍缩到同一变量名。向量 case-preserved-upper / case-preserved-lower 为对照对。",
+    "collision": "ENV_SEGMENT 非单射（'-' 与 '_' 同映射为 '_'）。SDK MUST 在注册期计算全部活跃 env 变量名，检测到**完整变量名**相同（不同身份映射到同一变量名）即硬错误。仅某段 ENV_SEGMENT 相同但完整名不同的情形无害，MUST NOT 报错（按段判会误拒）。向量 collision-pair-hyphen / collision-pair-underscore 为已知坍缩对。"
+  },
+  "vectors": [
+    {"desc": "裸 id 无 server 段（live 路径缺省形态）", "id": "bare-id", "input_id": "api_key", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_api_key"},
+    {"desc": "server 段 = bundle_id，'-' → '_'", "id": "with-bundle", "input_id": "api_key", "bundle_id": "feishu-mcp", "tool_name": null, "expected_env_var_name": "A2C_SMCP_api_key_feishu_mcp"},
+    {"desc": "server + tool 三段全形态", "id": "with-bundle-and-tool", "input_id": "token", "bundle_id": "MyServer", "tool_name": "auth", "expected_env_var_name": "A2C_SMCP_token_MyServer_auth"},
+    {"desc": "带前缀池条目：'@' 与 '/' 均归一（否则非法 POSIX env 名）", "id": "prefixed-pool-id", "input_id": "frontend@team/figma_token", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_frontend_team_figma_token"},
+    {"desc": "保留大小写：MyServer 不坍缩（与下条为对照对）", "id": "case-preserved-upper", "input_id": "token", "bundle_id": "MyServer", "tool_name": null, "expected_env_var_name": "A2C_SMCP_token_MyServer"},
+    {"desc": "保留大小写：myserver 不坍缩（与上条为对照对）", "id": "case-preserved-lower", "input_id": "token", "bundle_id": "myserver", "tool_name": null, "expected_env_var_name": "A2C_SMCP_token_myserver"},
+    {"desc": "INPUT_ID 段不再 upper()：全大写 id 原样保留", "id": "no-upper-already-upper", "input_id": "API_KEY", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_API_KEY"},
+    {"desc": "INPUT_ID 段不再 upper()：小写 id 保持小写", "id": "no-upper-mixed-case", "input_id": "Figma_Token", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_Figma_Token"},
+    {"desc": "不折叠连续 '_'（与 bundle_id normalize_name 相反）", "id": "no-fold-consecutive", "input_id": "a--b", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_a__b"},
+    {"desc": "不裁首尾 [_-]（与 bundle_id normalize_name 相反）", "id": "no-trim-edges", "input_id": "_lead_trail_", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP__lead_trail_"},
+    {"desc": "已知坍缩对 ①：'-' → '_'（与下条产出同名 ⇒ 注册期 fail-fast）", "id": "collision-pair-hyphen", "input_id": "a-b", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_a_b"},
+    {"desc": "已知坍缩对 ②：原样 '_'（与上条产出同名 ⇒ 注册期 fail-fast）", "id": "collision-pair-underscore", "input_id": "a_b", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_a_b"},
+    {"desc": "'.' 归一（禁 '.' in env 名）", "id": "dot-normalized", "input_id": "api.key", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_api_key"},
+    {"desc": "CJK 逐码点 → '_'（2 码点 → 2 个 '_'）", "id": "cjk-per-codepoint", "input_id": "令牌", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP___"},
+    {"desc": "astral 平面 emoji = 单码点 → 单个 '_'（rust chars() 与 python for-in-str 同）", "id": "astral-single-codepoint", "input_id": "a😀b", "bundle_id": null, "tool_name": null, "expected_env_var_name": "A2C_SMCP_a_b"},
+    {"desc": "tool 段同样走 ENV_SEGMENT（'-' → '_'）", "id": "tool-segment-normalized", "input_id": "token", "bundle_id": "srv", "tool_name": "get-file", "expected_env_var_name": "A2C_SMCP_token_srv_get_file"}
+  ]
+}

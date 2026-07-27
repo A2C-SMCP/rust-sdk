@@ -30,13 +30,24 @@ pub(crate) fn server_declares_resources(init_result: &serde_json::Value) -> bool
 }
 
 /// 根据配置创建客户端 / Create client based on configuration
-pub fn client_factory(config: MCPServerConfig) -> StdArc<dyn MCPClientProtocol> {
+///
+/// `notify`（#106）：可选的运行期变化通知上报接缝，由 [`MCPServerManager`](super::manager::MCPServerManager)
+/// 在启动客户端时按 server 名注入，透传给具体客户端构造函数，使 stdio/sse/http 三传输的服务器主动通知能
+/// 上报给 Computer 消费者任务。为 `None` 时客户端不转发通知（行为与历史一致）。
+pub fn client_factory(
+    config: MCPServerConfig,
+    notify: Option<ClientNotifyCtx>,
+) -> StdArc<dyn MCPClientProtocol> {
     match config {
         MCPServerConfig::Stdio(config) => {
-            StdArc::new(StdioMCPClient::new(config.server_parameters))
+            StdArc::new(StdioMCPClient::new(config.server_parameters).with_notify(notify))
         }
-        MCPServerConfig::Sse(config) => StdArc::new(SseMCPClient::new(config.server_parameters)),
-        MCPServerConfig::Http(config) => StdArc::new(HttpMCPClient::new(config.server_parameters)),
+        MCPServerConfig::Sse(config) => {
+            StdArc::new(SseMCPClient::new(config.server_parameters).with_notify(notify))
+        }
+        MCPServerConfig::Http(config) => {
+            StdArc::new(HttpMCPClient::new(config.server_parameters).with_notify(notify))
+        }
     }
 }
 
@@ -86,6 +97,7 @@ mod tests {
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
             name: "test_stdio".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: HashMap::new(),
@@ -99,7 +111,7 @@ mod tests {
             },
         });
 
-        let client = client_factory(config);
+        let client = client_factory(config, None);
         assert_eq!(client.state(), ClientState::Initialized);
     }
 
@@ -108,6 +120,7 @@ mod tests {
         let config = MCPServerConfig::Http(HttpServerConfig {
             env_file: None,
             name: "test_http".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: HashMap::new(),
@@ -119,7 +132,7 @@ mod tests {
             },
         });
 
-        let client = client_factory(config);
+        let client = client_factory(config, None);
         assert_eq!(client.state(), ClientState::Initialized);
     }
 
@@ -128,6 +141,7 @@ mod tests {
         let config = MCPServerConfig::Sse(SseServerConfig {
             env_file: None,
             name: "test_sse".to_string(),
+            bundle_id: None,
             disabled: false,
             forbidden_tools: vec![],
             tool_meta: HashMap::new(),
@@ -139,7 +153,7 @@ mod tests {
             },
         });
 
-        let client = client_factory(config);
+        let client = client_factory(config, None);
         assert_eq!(client.state(), ClientState::Initialized);
     }
 }

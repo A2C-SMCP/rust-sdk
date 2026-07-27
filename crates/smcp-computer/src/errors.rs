@@ -16,34 +16,28 @@ pub type ComputerResult<T> = Result<T, ComputerError>;
 /// Computer模块的错误类型 / Error type for Computer module
 #[derive(Debug, Error)]
 pub enum ComputerError {
-    #[error("Tool name duplicated: {tool_name} in servers: {servers:?}")]
-    /// 工具名称重复 / Tool name duplicated
-    ToolNameDuplicated {
-        tool_name: String,
-        servers: Vec<String>,
-    },
-
     #[error("Input not found: {input_id}")]
     /// 输入项未找到 / Input not found
     InputNotFound { input_id: String },
 
-    #[error("Server {server_name} is not active")]
-    /// 服务器未激活 / Server not active
-    ServerNotActive { server_name: String },
+    #[error("Server {bundle_id} is not active")]
+    /// 服务器未激活 / Server not active。
+    /// 字段 `bundle_id`：目标 server 身份键（**非** display 名，协议 0.3.0 §身份正交性 #18）。
+    ServerNotActive { bundle_id: String },
 
     #[error("MCP server not found: {0}")]
     /// 目标 MCP Server 未注册（`get_resources` → 处理器映射 4014）/ target MCP server not registered
     /// (`get_resources` → handler maps 4014)。对标 Python `MCPServerNotFoundError`。
     McpServerNotFound(String),
 
-    #[error("MCP capability '{capability}' not supported by server '{server_name}'")]
+    #[error("MCP capability '{capability}' not supported by server '{bundle_id}'")]
     /// MCP Server 未声明所需 capability（`get_resources` → 处理器映射 4015）/ required capability not
     /// declared (`get_resources` → handler maps 4015)。对标 Python `MCPCapabilityNotSupportedError`。
-    /// 结构化分流字段：`server_name` + `capability` 供 #72 handler 直接平铺为 flat ErrorPayload 顶层
-    /// `mcp_server_name`/`capability`（`with_mcp_server_name`/`with_capability`），无需再解析字符串。
+    /// 结构化分流字段：`bundle_id`（server 身份键，协议 0.3.0 §身份正交性 #18）+ `capability` 供 handler 直接平铺为
+    /// flat ErrorPayload 顶层 `mcp_server`/`capability`（`with_mcp_server`/`with_capability`），无需再解析字符串。
     McpCapabilityNotSupported {
-        /// 目标 MCP Server 名（顶层 `mcp_server_name`）。
-        server_name: String,
+        /// 目标 MCP Server 的 bundle_id（顶层 `mcp_server`）。
+        bundle_id: String,
         /// 缺失的 capability 名（顶层 `capability`，如 `"resources"`）。
         capability: String,
     },
@@ -120,6 +114,19 @@ pub enum ComputerError {
     #[error("Render error: {0}")]
     /// 渲染错误 / Render error
     RenderError(String),
+
+    #[error("Input resolution error: {0}")]
+    /// D1 运行期 input/secret 解析错误（#112 S5）：必填 input 未解析且无默认值 → 结构化错误（**非仅日志**），
+    /// 由 client 经 `RuntimeOptions.input_resolver` / `secret_resolver` 补录。SDK 不落盘明文值/secret。
+    /// Structured input-resolution error surfaced instead of silently defaulting to an empty string。
+    InputResolution(#[from] crate::inputs::runtime_resolver::InputResolutionError),
+
+    #[error("Config persistence error: {0}")]
+    /// #113 S6：SDK-owned config CRUD 落盘失败（只读 origin / synthesized bundled / 文件锁 / I/O / 损坏文件）。
+    /// 消息由 [`crate::settings::config::ConfigCrudError`] 的 Display 派生——**只含写目标 / 路径 / 原因，无 secret
+    /// 值**（落盘的是原始 `${input:*}` 引用，D1/§4.6.6）。runtime mutate（add_or_update/remove_server）经此报错。
+    /// Config-layer persistence failure surfaced from `update_config`; carries no secret values。
+    ConfigPersist(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {
@@ -140,7 +147,6 @@ impl ComputerError {
     pub fn error_code(&self) -> i32 {
         match self {
             // 工具相关错误 / Tool related errors
-            ComputerError::ToolNameDuplicated { .. } => 4002, // TOOL_DISABLED
             ComputerError::ToolExecutionTimeout { .. } => 4004, // TOOL_TIMEOUT
 
             // 输入相关错误 / Input related errors
@@ -160,6 +166,7 @@ impl ComputerError {
             ComputerError::ValidationError(_) => 400,    // BAD_REQUEST
             ComputerError::InvalidConfiguration(_) => 400, // BAD_REQUEST
             ComputerError::RenderError(_) => 400,        // BAD_REQUEST
+            ComputerError::InputResolution(_) => 400, // BAD_REQUEST（client 须补录 input/secret）
 
             // 连接错误 / Connection errors
             ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR
@@ -192,6 +199,9 @@ impl ComputerError {
 
             // 运行时错误 / Runtime errors
             ComputerError::RuntimeError(_) => 500, // INTERNAL_ERROR
+
+            // #113 S6：config 落盘错误（只读 origin / synthesized / I/O）/ config persistence errors
+            ComputerError::ConfigPersist(_) => 400, // BAD_REQUEST（写目标不可写 / 非法实体）
         }
     }
 }

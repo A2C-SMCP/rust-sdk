@@ -45,6 +45,8 @@ pub struct SseMCPClient {
     resource_cache: ResourceCache,
     /// 资源更新通知发送器 / Resource update notification sender
     update_tx: Arc<Mutex<Option<mpsc::UnboundedSender<ResourceUpdate>>>>,
+    /// 运行期变化通知上报接缝（#106，None=不转发）/ runtime change-notification seam。
+    notify: Option<ClientNotifyCtx>,
 }
 
 /// 资源更新通知
@@ -56,6 +58,33 @@ pub struct ResourceUpdate {
     pub data: serde_json::Value,
     /// 版本号
     pub version: u64,
+}
+
+/// 把一条 SSE 事件 JSON 分类为可转发的 MCP 变化通知（#106）。纯函数，供 SSE 流任务调用 + 单测覆盖。
+///
+/// - `Some(kind)`：三类标准 MCP 通知（`notifications/tools/list_changed` /
+///   `notifications/resources/list_changed` / `notifications/resources/updated`）及本仓历史非标准命名
+///   `resources/update` —— 应转发给 Computer 消费者任务；
+/// - `None`：非通知（JSON-RPC 响应 / 带 id 的服务器请求）或未识别的通知 method —— 不转发到 A2C channel。
+///
+/// 修复要点：取代历史 `method.contains("update")` 松散匹配 + 把带 method 的消息误投进 response 通道
+/// （破坏请求/响应关联）的做法——仅精确识别的通知才转发，且不再污染 response 通道。
+pub(crate) fn classify_sse_notification(value: &serde_json::Value) -> Option<McpChangeKind> {
+    let method = value.get("method")?.as_str()?;
+    match method {
+        "notifications/tools/list_changed" => Some(McpChangeKind::ToolListChanged),
+        "notifications/resources/list_changed" => Some(McpChangeKind::ResourceListChanged),
+        "notifications/resources/updated" | "resources/update" => {
+            let uri = value
+                .get("params")
+                .and_then(|p| p.get("uri"))
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(McpChangeKind::ResourceUpdated { uri })
+        }
+        _ => None,
+    }
 }
 
 impl std::fmt::Debug for SseMCPClient {
@@ -87,7 +116,17 @@ impl SseMCPClient {
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
             update_tx: Arc::new(Mutex::new(None)),
+            notify: None,
         }
+    }
+
+    /// 注入运行期变化通知上报接缝（#106）/ attach the runtime change-notification seam。
+    ///
+    /// 由 [`client_factory`](super::utils::client_factory) 在 manager 启动客户端时调用；须在 `connect` 前设置
+    /// （SSE 常驻流任务据此把服务器主动通知转成 [`McpServerNotification`] 上报）。
+    pub fn with_notify(mut self, notify: Option<ClientNotifyCtx>) -> Self {
+        self.notify = notify;
+        self
     }
 
     /// 发送JSON-RPC请求 / Send JSON-RPC request
@@ -189,6 +228,8 @@ impl SseMCPClient {
         let base_url = url.clone();
         let http_client = self.http_client.clone();
         let headers = self.base.params.headers.clone();
+        // #106：把服务器主动通知上报给 Computer 消费者任务（None=不转发）。
+        let notify = self.notify.clone();
 
         // 启动SSE事件处理任务 / Start SSE event handling task
         let stream: Pin<Box<dyn Stream<Item = Result<es::SSE, es::Error>> + Send + Sync>> =
@@ -219,24 +260,19 @@ impl SseMCPClient {
                                         }
 
                                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event_data.data) {
-                                            // 区分消息类型 / Distinguish message types
-
-                                            // 检查是否是资源更新通知
-                                            if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-                                                if method == "resources/update" || method.contains("update") {
-                                                    debug!("Received resource update notification");
-
-                                                    // 提取 URI 和数据
-                                                    if let Some(params) = value.get("params") {
-                                                        if let Some(uri) = params.get("uri").and_then(|u| u.as_str()) {
-                                                            // 刷新缓存
-                                                            if let Some(data) = params.get("data") {
+                                            // 分类 MCP 服务器→客户端消息（#106）：已识别的变化通知转发 A2C channel、
+                                            // 绝不投 response_tx（修历史误投通知进响应通道 → 请求/响应关联错乱）；
+                                            // 未识别的 notifications/* 忽略；其余（响应 / 带 id 的服务器请求）维持路由。
+                                            match classify_sse_notification(&value) {
+                                                Some(kind) => {
+                                                    // resources/updated：保留既有内部缓存刷新（历史 resources/update 携带 data 时）。
+                                                    if let McpChangeKind::ResourceUpdated { uri } = &kind {
+                                                        if !uri.is_empty() {
+                                                            if let Some(data) = value.get("params").and_then(|p| p.get("data")) {
                                                                 let _ = resource_cache.refresh(uri, data.clone()).await;
-
-                                                                // 发送更新通知
                                                                 if let Some(tx) = update_tx.lock().await.as_ref() {
                                                                     let _ = tx.send(ResourceUpdate {
-                                                                        uri: uri.to_string(),
+                                                                        uri: uri.clone(),
                                                                         data: data.clone(),
                                                                         version: 1,
                                                                     });
@@ -244,13 +280,24 @@ impl SseMCPClient {
                                                             }
                                                         }
                                                     }
-                                                } else {
-                                                    // 其他通知，也发送到 response channel
-                                                    let _ = response_tx.send(value);
+                                                    debug!("SSE MCP notification forwarded: {:?}", kind);
+                                                    if let Some(n) = &notify {
+                                                        n.notify(kind);
+                                                    }
                                                 }
-                                            } else {
-                                                // JSON-RPC 响应
-                                                let _ = response_tx.send(value);
+                                                None => {
+                                                    let is_unhandled_notification = value
+                                                        .get("method")
+                                                        .and_then(|m| m.as_str())
+                                                        .map(|m| m.starts_with("notifications/"))
+                                                        .unwrap_or(false);
+                                                    if is_unhandled_notification {
+                                                        debug!("SSE: ignoring unhandled MCP notification");
+                                                    } else {
+                                                        // JSON-RPC 响应 或 带 id 的服务器请求 → response channel（维持历史）。
+                                                        let _ = response_tx.send(value);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -823,6 +870,79 @@ impl MCPClientProtocol for SseMCPClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── #106：SSE 通知分类器单测（先红后绿：修复前 method.contains("update") 松散匹配 + 误投 response）──
+
+    #[test]
+    fn classify_tools_list_changed() {
+        let v = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
+        assert_eq!(
+            classify_sse_notification(&v),
+            Some(McpChangeKind::ToolListChanged)
+        );
+    }
+
+    #[test]
+    fn classify_resources_list_changed() {
+        let v = json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" });
+        assert_eq!(
+            classify_sse_notification(&v),
+            Some(McpChangeKind::ResourceListChanged)
+        );
+    }
+
+    #[test]
+    fn classify_resources_updated_carries_uri() {
+        let v = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": { "uri": "window://desk/1" }
+        });
+        assert_eq!(
+            classify_sse_notification(&v),
+            Some(McpChangeKind::ResourceUpdated {
+                uri: "window://desk/1".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn classify_legacy_resources_update_still_supported() {
+        // 历史非标准命名 `resources/update` 保留兼容（映射为 ResourceUpdated）。
+        let v = json!({ "method": "resources/update", "params": { "uri": "skill://s/1" } });
+        assert_eq!(
+            classify_sse_notification(&v),
+            Some(McpChangeKind::ResourceUpdated {
+                uri: "skill://s/1".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn classify_response_and_server_request_are_none() {
+        // JSON-RPC 响应（无 method）→ None（走 response 通道，不转发）。
+        assert_eq!(
+            classify_sse_notification(&json!({ "jsonrpc": "2.0", "id": 1, "result": {} })),
+            None
+        );
+        // 带 id 的服务器请求（如 sampling）→ None（不误判为变化通知）。
+        assert_eq!(
+            classify_sse_notification(
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "sampling/createMessage" })
+            ),
+            None
+        );
+        // 未识别的 notifications/*（如 progress）→ None（不转发、由调用方忽略）。
+        assert_eq!(
+            classify_sse_notification(&json!({ "method": "notifications/progress" })),
+            None
+        );
+        // 历史松散匹配的陷阱：含 "update" 但非标准的其它 method 不再被误判为资源更新。
+        assert_eq!(
+            classify_sse_notification(&json!({ "method": "some/other_update_thing" })),
+            None
+        );
+    }
     use std::collections::HashMap;
 
     #[test]

@@ -21,7 +21,10 @@
 //! - **无 version 字段**：人编文件不背版本负担；`version` 只在 CLI 维护的物化文件。
 //! - **字段级容错**：单个已知键 / map 项 / 数组元素校验失败 → **逐条过滤**（回退默认）、其余保留、
 //!   错误收进 [`SettingsValidationError`] 列表（错误不阻断启动、不整文件作废）。
-//! - **scope 越权**：[`POLICY_ONLY_FIELDS`] 是 policy-only；出现在非 policy scope → 过滤 + 记错。
+//! - **scope 越权**（两类，均为「过滤 + 记错」）：
+//!   1. [`POLICY_ONLY_FIELDS`]：policy-only；出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
+//!   2. [`TRUSTED_SCOPE_ONLY_FIELDS`]：审批门 **enable 方向**判据；出现在 **project** scope → 过滤 + 记错
+//!      （杜绝**不受信 scope 自我批准**，#143 / 协议 `mcp-approval-gate-alignment.md` §2.1）。
 
 use std::sync::LazyLock;
 
@@ -31,20 +34,26 @@ use serde_json::Value;
 
 /// settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high).
 ///
-/// `Capability` 是 A2C 特有的**能力发现层**（最低优先级）：跨**全部登记工作目录**取
-/// `enabledPlugins` / `extraKnownMarketplaces` 并集，让 Agent 能力面稳定、不随 active workdir
-/// 跳变。其余五级 = Claude Code 完整对齐（user/project/local/flag/policy）。
+/// 与 Claude Code 对齐（user/project/local/flag/policy）。`Embed` 为 A2C 特有的**宿主构造挂载层**
+/// （`Computer::new(mcp_servers=…)`），**仅存在于 mcp.json 轴**——settings.json 无此来源（#147/S14）。
+/// #98：能力发现层 `Capability` 已随 workdir 概念瘦身移除（对齐 protocol#10 / python-sdk#116）——
+/// project/local 现锚定进程 cwd，`enabledPlugins` / `extraKnownMarketplaces` 经常规 project/local 层进入，
+/// 无需专门的能力并集层。
 ///
-/// 序列化为小写字符串，与 Python `StrEnum` 字面一致（`capability` / `user` / `project` /
-/// `local` / `flag` / `policy`）。
+/// **顺序权威在 [`ProvenanceScope::priority`](super::config::ProvenanceScope::priority)**（协议
+/// `runtime-contract.md` §2.5 第3条 `plugin < user < project < local < embed < flag < policy`），
+/// **不在本枚举的成员声明序**——成员序恰好一致，勿依赖。
+///
+/// 序列化为小写字符串，与 Python `StrEnum` 字面一致（`user` / `project` / `local` / `embed` / `flag` /
+/// `policy`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SettingsScope {
-    /// 能力发现层（最低）/ capability-discovery (lowest)。
-    Capability,
     User,
     Project,
     Local,
+    /// 宿主构造挂载（`Computer::new(mcp_servers=…)`）；仅 mcp.json 轴（#147）/ embedded-constructor, mcp.json axis only。
+    Embed,
     Flag,
     /// 企业策略层（最高）/ enterprise policy (highest)。
     Policy,
@@ -54,10 +63,10 @@ impl SettingsScope {
     /// 返回 scope 的小写字面量（与序列化一致）/ Lowercase literal (matches serialization).
     pub fn as_str(self) -> &'static str {
         match self {
-            SettingsScope::Capability => "capability",
             SettingsScope::User => "user",
             SettingsScope::Project => "project",
             SettingsScope::Local => "local",
+            SettingsScope::Embed => "embed",
             SettingsScope::Flag => "flag",
             SettingsScope::Policy => "policy",
         }
@@ -81,12 +90,38 @@ pub const FIELD_ALLOWED_MCP_SERVERS: &str = "allowedMcpServers";
 pub const FIELD_DENIED_MCP_SERVERS: &str = "deniedMcpServers";
 pub const FIELD_PERMISSIONS: &str = "permissions";
 
-/// 仅能在能力发现层取并集的字段（合并时取并集，见 SET-02）/ Fields contributed by the capability layer.
-pub const CAPABILITY_FIELDS: &[&str] = &[FIELD_ENABLED_PLUGINS, FIELD_EXTRA_KNOWN_MARKETPLACES];
-
 /// policy-only 字段：出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
 /// Policy-only fields: filtered + recorded if seen outside the policy scope.
 pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS];
+
+/// 审批门 **enable 方向**判据：出现在 **project** scope → 过滤 + 记错（#143）。
+/// Approval-gate ENABLE-direction inputs: filtered + recorded if supplied by the **project** scope.
+///
+/// 协议依据：[审批门对齐指南][guide] §2.1 通则 ——
+/// > 审批门的输入 MUST 来自比被判定 server 更高信任的来源；任何 scope 都不得为「自身是否受信」提供判据。
+///
+/// `.tfrobot/settings.json`（project scope）与 `mcp.json` 一样**入 git、随仓库分发**。若门接受它供给
+/// 档⑤/⑥，被 clone 的仓库携一份 `{"enableAllProjectMcpServers": true}` 即可让其 `mcp.json` 里的任意
+/// server 启动期免批准框直挂 —— 与 #131 删掉的档④ **同构且更易达成**（无需装任何插件、无需猜任何名字）。
+///
+/// # 为何**只拒 `Project`**（而非复用 mcp.json 声明面的预信任集 `is_trusted_origin`）
+///
+/// 受信供给方 = `user` / `local` / `flag` / `policy`（协议 §2.1 表）——**含 `Local`**。这与 mcp.json
+/// **声明面**的预信任集（`ProvenanceScope::is_trusted_origin` = `{user, embed, flag, policy}`，文件 scope
+/// 落到即 `{user, flag, policy}`，**不含 Local**）**有意不同**，勿混用：
+/// 三个批准写助手（`approve_mcp_server` / `deny_mcp_server` / `approve_all_project_mcp`）**只写 local
+/// scope**（个人决定不污染共享层）。若把 `Local` 也判为不受信，**每次批准都会在读回时被自己过滤掉、
+/// 批准永远不生效**。读面与写面 MUST 对称。
+///
+/// # 为何**不含** `disabledMcpjsonServers`
+///
+/// 那是 **DENY** 方向（协议 §2.1 表第 3 行）：**任意 scope（含 project）可供给** —— fail-safe，仓库禁自己的
+/// server 无安全影响，更严格永远安全。把它收进本类目属**过度矫正**，由
+/// `disabled_mcpjson_from_project_scope_is_honored_143` 守护。
+///
+/// [guide]: https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/develop/docs/guides/mcp-approval-gate-alignment.md
+pub const TRUSTED_SCOPE_ONLY_FIELDS: &[&str] =
+    &[FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP];
 
 /// 字符串数组字段（读合并：拼接去重；写回：整体替换）/ String-array fields.
 pub const STRING_ARRAY_FIELDS: &[&str] = &[
@@ -477,6 +512,18 @@ pub fn validate_settings(
             ));
             continue;
         }
+        // #143：审批门 enable 方向判据 MUST NOT 由 project scope（入 git、随仓库分发）供给——
+        // 否则被 clone 的仓库可自我批准（与档④ 同构）。协议指南 §2.1。DENY 方向不在本类目（fail-safe）。
+        if TRUSTED_SCOPE_ONLY_FIELDS.contains(&key.as_str()) && scope == SettingsScope::Project {
+            errors.push(err(
+                scope,
+                key.as_str(),
+                "approval-gate field not allowed in the project scope (filtered): it is a personal \
+                 decision and project settings.json is git-tracked — move it to settings.local.json \
+                 (not git-tracked) or the user scope",
+            ));
+            continue;
+        }
         match dispatch_validator(key, value, scope) {
             None => {
                 cleaned.insert(key.clone(), value.clone()); // passthrough 未知字段。
@@ -697,6 +744,92 @@ mod tests {
         assert!(errors.is_empty());
     }
 
+    // ---- #143：审批门 enable 方向判据的 scope 越权 / trusted-scope-only overreach ----
+
+    /// project scope（**入 git**）供给 enable 方向判据 → 过滤 + 记错（自我批准闭环，与档④ 同构）。
+    #[test]
+    fn test_trusted_scope_only_fields_filtered_in_project() {
+        let raw = json!({
+            "enabledMcpjsonServers": ["evil"],
+            "enableAllProjectMcpServers": true,
+            "disabledMcpjsonServers": ["x"],   // DENY 方向 → 不受限，须保留
+            "trustedMarketplaces": ["mp"]      // 无关字段 → 须保留
+        });
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::Project, None);
+        assert!(!cleaned.contains_key("enabledMcpjsonServers"));
+        assert!(!cleaned.contains_key("enableAllProjectMcpServers"));
+        assert_eq!(cleaned["disabledMcpjsonServers"], json!(["x"]));
+        assert_eq!(cleaned["trustedMarketplaces"], json!(["mp"]));
+        let bad: std::collections::BTreeSet<&str> =
+            errors.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(
+            bad,
+            ["enableAllProjectMcpServers", "enabledMcpjsonServers"]
+                .into_iter()
+                .collect(),
+            "只该拒 enable 方向两个字段"
+        );
+        // 文案须给出可操作去向（团队升级后能自助）。
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.reason.contains("settings.local.json")),
+            "错误文案须含迁移指引，实得 {errors:?}"
+        );
+    }
+
+    /// **含 `Local`**——这条是 mcp.json 声明面预信任集（`is_trusted_origin`，不含 Local）的反面守护：三个
+    /// 批准写助手只写 local scope，若 local 被判不受信，则「批准 → 写 local → 读回」链断裂、批准永不生效。
+    #[test]
+    fn test_trusted_scope_only_fields_kept_in_user_local_flag_policy() {
+        for scope in [
+            SettingsScope::User,
+            SettingsScope::Local,
+            SettingsScope::Flag,
+            SettingsScope::Policy,
+        ] {
+            let raw = json!({"enabledMcpjsonServers": ["s"], "enableAllProjectMcpServers": true});
+            let (cleaned, errors) = validate_settings(&raw, scope, None);
+            assert_eq!(
+                cleaned["enabledMcpjsonServers"],
+                json!(["s"]),
+                "{scope:?} 是受信供给方，MUST 保留"
+            );
+            assert_eq!(
+                cleaned["enableAllProjectMcpServers"],
+                json!(true),
+                "{scope:?}"
+            );
+            assert!(errors.is_empty(), "{scope:?} 不应记错，实得 {errors:?}");
+        }
+    }
+
+    /// ★**防过度矫正**：`disabledMcpjsonServers` 是 DENY 方向，协议 §2.1 表第 3 行明定**任意 scope 可供给**
+    /// （fail-safe）。后人若顺手把它收进 [`TRUSTED_SCOPE_ONLY_FIELDS`]，此测立刻红。
+    #[test]
+    fn test_disabled_mcpjson_allowed_from_any_scope() {
+        assert!(
+            !TRUSTED_SCOPE_ONLY_FIELDS.contains(&FIELD_DISABLED_MCPJSON_SERVERS),
+            "DENY 方向 MUST NOT 进 enable-方向类目（§2.1 表第 3 行 fail-safe）"
+        );
+        for scope in [
+            SettingsScope::User,
+            SettingsScope::Project,
+            SettingsScope::Local,
+            SettingsScope::Flag,
+            SettingsScope::Policy,
+        ] {
+            let raw = json!({"disabledMcpjsonServers": ["srv"]});
+            let (cleaned, errors) = validate_settings(&raw, scope, None);
+            assert_eq!(
+                cleaned["disabledMcpjsonServers"],
+                json!(["srv"]),
+                "{scope:?}：DENY 方向任意 scope 可供给（更严格永远安全）"
+            );
+            assert!(errors.is_empty(), "{scope:?} 不应记错");
+        }
+    }
+
     // ---- enabledPlugins 逐条过滤 ----
     #[test]
     fn test_enabled_plugins_per_entry_filtering() {
@@ -860,7 +993,6 @@ mod tests {
     #[test]
     fn test_settings_scope_serializes_lowercase() {
         let pairs = [
-            (SettingsScope::Capability, "capability"),
             (SettingsScope::User, "user"),
             (SettingsScope::Project, "project"),
             (SettingsScope::Local, "local"),
@@ -881,12 +1013,13 @@ mod tests {
     #[test]
     fn test_field_sets_exact() {
         assert_eq!(
-            CAPABILITY_FIELDS,
-            &["enabledPlugins", "extraKnownMarketplaces"]
-        );
-        assert_eq!(
             POLICY_ONLY_FIELDS,
             &["allowedMcpServers", "deniedMcpServers"]
+        );
+        // #143：enable 方向判据（拒 project）。**不含** disabledMcpjsonServers —— DENY 方向 fail-safe。
+        assert_eq!(
+            TRUSTED_SCOPE_ONLY_FIELDS,
+            &["enabledMcpjsonServers", "enableAllProjectMcpServers"]
         );
         assert_eq!(
             BOOL_FIELDS,

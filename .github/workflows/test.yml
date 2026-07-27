@@ -40,6 +40,13 @@ jobs:
       - name: Build
         run: cargo build --workspace --features agent,computer,server
 
+      # rustdoc 门禁（#146）：intra-doc 链接 / HTML 标签 / 冗余链接等警告一律视为错误，防新增。
+      # Docs gate (#146): treat rustdoc warnings (intra-doc links, HTML tags, …) as errors.
+      - name: Docs (rustdoc deny-warnings gate)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps
+
       - name: Run tests
         run: cargo test --workspace --features agent,computer,server
 

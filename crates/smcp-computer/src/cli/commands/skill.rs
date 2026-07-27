@@ -180,7 +180,7 @@ pub async fn rebuild_registry(home: &Path, env: Option<&EnvMap>) -> SkillRegistr
         )
         .await;
     }
-    stage_user_skills(&mut registry, home, &[]);
+    stage_user_skills(&mut registry, home);
     registry
 }
 

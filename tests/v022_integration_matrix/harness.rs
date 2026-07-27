@@ -192,21 +192,15 @@ pub async fn spawn_computer(
     let mut servers = HashMap::new();
     servers.insert(
         MCP_NAME.to_string(),
-        MCPServerConfig::Stdio(StdioServerConfig {
-            name: MCP_NAME.into(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            env_file: None,
-            server_parameters: StdioServerParameters {
+        MCPServerConfig::Stdio(StdioServerConfig::new(
+            MCP_NAME,
+            StdioServerParameters {
                 command: "node".into(),
                 args: vec![mcp_server_path()],
                 env: HashMap::new(),
                 cwd: None,
             },
-        }),
+        )),
     );
 
     let mut computer = Computer::new(
@@ -227,7 +221,7 @@ pub async fn spawn_computer(
     // boot_up 仅注册配置（manager auto_connect 默认 false），需显式启动 stdio MCP 子进程，
     // 否则 get_resources/tool_call 命中未连接服务 → 4014。
     computer
-        .start_mcp_client("all")
+        .start_all_mcp_clients()
         .await
         .expect("start MCP servers");
     computer

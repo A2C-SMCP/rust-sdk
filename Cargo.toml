@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.2.3"
+version = "0.3.1"
 
 [package]
 name = "a2c-smcp"
@@ -143,7 +143,9 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 eventsource-client = "0.13"
 
 # MCP SDK
-rmcp = { version = "0.11.0", features = ["client", "server", "transport-child-process", "transport-io", "server-side-http", "transport-streamable-http-server"] }
+# transport-streamable-http-client-reqwest（#106）：HTTP MCP 客户端改用 rmcp 官方 Streamable HTTP 传输，
+# 与 stdio 共享 RunningService + ClientHandler 通知接缝（SSE 保持手写——rmcp 0.11 已移除 legacy SSE client）。
+rmcp = { version = "0.11.0", features = ["client", "server", "transport-child-process", "transport-io", "server-side-http", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 
 # CLI相关 / CLI related
 clap = { version = "4.4", features = ["derive"] }
@@ -157,12 +159,12 @@ rpassword = "7.2"
 vrl = "0.29.0"
 
 # 内部 crate / Internal crates
-smcp = { path = "crates/smcp", version = "0.2.3" }
-smcp-agent = { path = "crates/smcp-agent", version = "0.2.3" }
-smcp-client-transport = { path = "crates/smcp-client-transport", version = "0.2.3" }
-smcp-computer = { path = "crates/smcp-computer", version = "0.2.3" }
-smcp-server-core = { path = "crates/smcp-server-core", version = "0.2.3" }
-smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.2.3" }
+smcp = { path = "crates/smcp", version = "0.3.1" }
+smcp-agent = { path = "crates/smcp-agent", version = "0.3.1" }
+smcp-client-transport = { path = "crates/smcp-client-transport", version = "0.3.1" }
+smcp-computer = { path = "crates/smcp-computer", version = "0.3.1" }
+smcp-server-core = { path = "crates/smcp-server-core", version = "0.3.1" }
+smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.3.1" }
 
 # 测试 / Testing
 tempfile = "3.8"

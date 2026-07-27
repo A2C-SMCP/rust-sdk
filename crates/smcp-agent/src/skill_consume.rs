@@ -102,7 +102,7 @@ mod tests {
         let resp = json!({
             "code": 4014,
             "message": "mcp server not found",
-            "mcp_server_name": "tfrobot-tools"
+            "mcp_server": "tfrobot-tools"
         });
         let err = parse_get_skills_response(&resp, "R1").unwrap_err();
         // flat ErrorPayload → 协议错误（经 From<SmcpProtocolError> 转 SmcpAgentError）

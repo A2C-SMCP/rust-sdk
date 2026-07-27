@@ -28,6 +28,7 @@
 use serde_json::{Map, Value};
 
 use crate::settings::is_valid_git_url;
+use crate::settings::redaction::redact_git_urls_in_text;
 
 // ---------------------------------------------------------------------------
 // 常量 / Constants
@@ -57,9 +58,10 @@ pub struct SkillSourceError {
 
 impl SkillSourceError {
     fn new(raw: &str, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
         Self {
-            raw: raw.to_string(),
-            reason: reason.into(),
+            raw: redact_git_urls_in_text(raw),
+            reason: redact_git_urls_in_text(&reason),
         }
     }
 }
@@ -577,5 +579,101 @@ mod tests {
         assert!(marketplace_clone_url(&json!({"type": "github", "url": "owner/repo"})).is_err());
         assert!(marketplace_clone_url(&json!({"type": "git", "url": "bogus"})).is_err());
         assert!(marketplace_clone_url(&json!("https://h/r.git")).is_err());
+    }
+
+    #[test]
+    fn public_source_errors_never_echo_url_credentials() {
+        let cases = [
+            resolve_plugin_source(
+                &json!({
+                    "source": "url",
+                    "url": "https://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT",
+                    "sha": "bad"
+                }),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!({
+                    "source": "url",
+                    "url": "ftp://cnb:FAKE_TOKEN@example.com/org/repo.git"
+                }),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!({
+                    "source": "github",
+                    "repo": "git@example.com:org/repo.git"
+                }),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            marketplace_clone_url(&json!({
+                "type": "git",
+                "url": "ftp://cnb:FAKE_TOKEN@example.com/org/repo.git"
+            }))
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!("key=https://cnb:FAKE_TOKEN@example.com/org/repo.git"),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!("key=git@example.com:org/repo.git"),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!("x=https://public.example/a=https://user2:PW_TWO@secret.example/repo.git"),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!("key=用户@example.com:org/repo.git"),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!("x=https://example.com/r.git?token=;QUERY_SECRET"),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!("x=https://example.com/r.git?token=QUERY_QUOTE'LEAK_SECRET"),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(
+                &json!("x=https://alice:PW_ONE'PW_TWO@example.com/repo.git"),
+                DEFAULT_PLUGIN_ROOT,
+            )
+            .unwrap_err(),
+            resolve_plugin_source(&json!("x=alice@my_host:org/repo.git"), DEFAULT_PLUGIN_ROOT)
+                .unwrap_err(),
+            resolve_plugin_source(&json!("x=用户@例子.公司:org/repo.git"), DEFAULT_PLUGIN_ROOT)
+                .unwrap_err(),
+        ];
+
+        for error in cases {
+            let rendered = format!("{error}\n{error:?}\n{}\n{}", error.raw, error.reason);
+            for secret in [
+                "cnb",
+                "FAKE_TOKEN",
+                "QUERY",
+                "FRAGMENT",
+                "git@example.com",
+                "user2",
+                "PW_TWO",
+                "用户",
+                "QUERY_SECRET",
+                "QUERY_QUOTE",
+                "LEAK_SECRET",
+                "PW_ONE",
+                "alice",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
     }
 }

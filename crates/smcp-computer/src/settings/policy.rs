@@ -31,7 +31,7 @@
 //! [`resolve_settings`](crate::settings::scope::resolve_settings) 按 POLICY scope 统一执行（policy-only 字段
 //! `allowedMcpServers` / `deniedMcpServers` 只在该层生效）。
 //!
-//! 条件编译 / Conditional compilation：macOS plist（[`plist`] crate）与 Windows 注册表（`winreg` crate）读取器
+//! 条件编译 / Conditional compilation：macOS plist（`plist` crate）与 Windows 注册表（`winreg` crate）读取器
 //! 按 `#[cfg(target_os = ...)]` 编译真实实现，其它平台为 `None` stub —— 跨平台构建不破坏，平台依赖经
 //! `[target.'cfg(...)'.dependencies]` off-platform 零成本。Windows 路径 best-effort、**无 CI lane 验证**（与
 //! Python `policy.py` win32 同姿态）。

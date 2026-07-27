@@ -27,8 +27,8 @@
 //! 线程模型 / Threading：本结构**不**内建锁（对齐 Python 单线程 asyncio）；与 watcher / reconciler 并发
 //! 访问时由上层以 `Arc<Mutex<SkillRegistry>>` 持有（见 SKL-06 / SKL-07 / INT-01）。
 //!
-//! 顺序 / Ordering：用 [`IndexMap`] 保持**插入顺序**（对齐 Python `dict`），故 [`active_refs`] /
-//! [`all_refs`] 按注册先后返回（`get_skills` 不排序、不去重，Agent 当作集合）。
+//! 顺序 / Ordering：用 [`IndexMap`] 保持**插入顺序**（对齐 Python `dict`），故 [`SkillRegistry::active_refs`] /
+//! [`SkillRegistry::all_refs`] 按注册先后返回（`get_skills` 不排序、不去重，Agent 当作集合）。
 
 use indexmap::IndexMap;
 use std::path::Path;

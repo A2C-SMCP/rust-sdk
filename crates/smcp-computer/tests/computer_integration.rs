@@ -2,7 +2,7 @@ use smcp_computer::{
     computer::{Computer, Session, SilentSession},
     errors::ComputerError,
     mcp_clients::model::{
-        MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
+        BundleId, MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
         StdioServerParameters,
     },
 };
@@ -11,8 +11,10 @@ use tempfile::TempDir;
 /// INT-01 #68：boot_up 起 FS 副作用（建 ~/.a2c/.blobspool + watch ~/.a2c/skills）→ 隔离到 TempDir。
 /// Isolate boot_up's FS side-effects to a TempDir so tests never touch the real home。
 fn isolate_boot(c: Computer<SilentSession>, td: &TempDir) -> Computer<SilentSession> {
+    // #113 S6：add/remove_server 现落盘到 config_dir（缺省进程 cwd）→ 隔离到 TempDir，避免污染仓库工作树。
     c.with_skill_home(td.path().join("skills"))
         .with_blob_cache_root(td.path().join("blob"))
+        .with_config_dir(td.path().join("config"))
 }
 /**
 * 文件名: computer_integration
@@ -143,21 +145,15 @@ async fn test_computer_server_lifecycle() {
     computer.boot_up().await.unwrap();
 
     // 添加服务器 / Add server
-    let server_config = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "test_server".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let server_config = MCPServerConfig::Stdio(StdioServerConfig::new(
+        "test_server",
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec!["test".to_string()],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
     computer.add_or_update_server(server_config).await.unwrap();
 
@@ -269,56 +265,46 @@ async fn test_computer_multiple_servers() {
     computer.boot_up().await.unwrap();
 
     // 添加多个服务器 / Add multiple servers
-    let server1 = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "server1".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    let server1 = MCPServerConfig::Stdio(StdioServerConfig::new(
+        "server1",
+        StdioServerParameters {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
             cwd: None,
         },
-    });
+    ));
 
-    let server2 = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "server2".to_string(),
-        disabled: false,
-        forbidden_tools: vec!["dangerous_tool".to_string()],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
-            command: "cat".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            cwd: None,
-        },
+    let server2 = MCPServerConfig::Stdio({
+        let mut c = StdioServerConfig::new(
+            "server2",
+            StdioServerParameters {
+                command: "cat".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.forbidden_tools = vec!["dangerous_tool".to_string()];
+        c
     });
 
     computer.add_or_update_server(server1).await.unwrap();
     computer.add_or_update_server(server2).await.unwrap();
 
     // 更新服务器配置 / Update server configuration
-    let updated_server1 = MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "server1".to_string(),
-        disabled: true, // 禁用服务器 / Disable server
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
-            command: "echo".to_string(),
-            args: vec!["updated".to_string()],
-            env: HashMap::new(),
-            cwd: None,
-        },
+    let updated_server1 = MCPServerConfig::Stdio({
+        let mut c = StdioServerConfig::new(
+            "server1",
+            StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["updated".to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.disabled = true; // 禁用服务器 / Disable server
+        c
     });
 
     computer
@@ -327,7 +313,10 @@ async fn test_computer_multiple_servers() {
         .unwrap();
 
     // 移除一个服务器 / Remove one server
-    computer.remove_server("server2").await.unwrap();
+    computer
+        .remove_server(&BundleId::try_from("server2".to_string()).unwrap())
+        .await
+        .unwrap();
 
     computer.shutdown().await.unwrap();
 }
@@ -353,7 +342,9 @@ async fn test_computer_error_handling() {
     computer.boot_up().await.unwrap();
 
     // 尝试移除不存在的服务器 / Try to remove non-existent server
-    let result = computer.remove_server("non_existent").await;
+    let result = computer
+        .remove_server(&BundleId::try_from("non_existent".to_string()).unwrap())
+        .await;
     // 应该成功，即使服务器不存在
     // Should succeed even if server doesn't exist
     assert!(result.is_ok());

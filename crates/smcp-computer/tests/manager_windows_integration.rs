@@ -6,7 +6,8 @@
 //! ```
 
 use smcp_computer::mcp_clients::model::{
-    make_resource, MCPServerConfig, ResourceContents, StdioServerConfig, StdioServerParameters,
+    make_resource, BundleId, MCPServerConfig, ResourceContents, StdioServerConfig,
+    StdioServerParameters,
 };
 use smcp_computer::mcp_clients::MCPServerManager;
 use std::collections::HashMap;
@@ -19,21 +20,15 @@ fn echo_server_path() -> String {
 }
 
 fn stdio_config(name: &str) -> MCPServerConfig {
-    MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: name.to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
+    MCPServerConfig::Stdio(StdioServerConfig::new(
+        name,
+        StdioServerParameters {
             command: "node".to_string(),
             args: vec![echo_server_path()],
             env: HashMap::new(),
             cwd: None,
         },
-    })
+    ))
 }
 
 async fn setup_manager() -> MCPServerManager {
@@ -101,7 +96,7 @@ async fn test_manager_get_windows_details() {
         "expected at least one window with details"
     );
 
-    for (server_name, resource, detail) in &details {
+    for (_bundle_id, server_name, resource, detail) in &details {
         assert_eq!(server_name, "echo-server");
         assert!(resource.uri.starts_with("window://"));
         assert!(
@@ -116,9 +111,9 @@ async fn test_manager_get_windows_details() {
     // Verify actual content text to ensure end-to-end JSON serialization correctness
     let status_detail = details
         .iter()
-        .find(|(_, r, _)| r.uri.as_str() == "window://echo.mcp.test/status?priority=10")
+        .find(|(_, _, r, _)| r.uri.as_str() == "window://echo.mcp.test/status?priority=10")
         .expect("expected status window in details");
-    let status_content = &status_detail.2.contents[0];
+    let status_content = &status_detail.3.contents[0];
     match status_content {
         ResourceContents::TextResourceContents { text, .. } => {
             assert_eq!(text, "System status: OK");
@@ -138,8 +133,17 @@ async fn test_manager_get_window_detail_single() {
     assert!(!windows.is_empty());
 
     let (server_name, resource) = &windows[0];
+    // #141：list_all_windows 出的是 display 名，get_window_detail 按身份键寻址
+    // → 经 status 表把 display 名映射回 bundle_id（不假设二者同值）。
+    let bundle_id = manager
+        .get_server_status()
+        .await
+        .into_iter()
+        .find(|(_, name, _, _)| name == server_name)
+        .map(|(id, _, _, _)| id)
+        .expect("列出 window 的 server 必在 status 表中");
     let detail = manager
-        .get_window_detail(server_name, resource.clone())
+        .get_window_detail(&bundle_id, resource.clone())
         .await
         .expect("get_window_detail failed");
     assert!(!detail.contents.is_empty(), "expected non-empty contents");
@@ -160,7 +164,10 @@ async fn test_manager_get_window_detail_unknown_server() {
     );
 
     let result = manager
-        .get_window_detail("nonexistent-server", resource)
+        .get_window_detail(
+            &BundleId::try_from("nonexistent-server".to_string()).expect("夹具 bundle_id 须合法"),
+            resource,
+        )
         .await;
     assert!(result.is_err(), "expected error for unknown server");
 

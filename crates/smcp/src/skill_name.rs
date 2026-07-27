@@ -10,13 +10,22 @@
 //! |--------------|----------------------------|------|
 //! | user         | `<skill>`                  | 1    |
 //! | marketplace  | `<plugin>:<skill>`         | 2    |
-//! | mcp          | `mcp:<server>:<skill>`     | 3    |
+//! | mcp          | `mcp:<bundle_id>:<skill>`  | 3    |
 //!
 //! - `:` 是协议层 reserved separator；`mcp` 是唯一保留字面首段前缀的 source（与 2 段 marketplace 区分）。
 //! - 字符集 / charsets（skill.md §1.4）：
 //!     - `<skill>` / `<plugin>` 段为**严格 kebab**（`[a-z0-9]` + 单连字符分隔，不以 `-` 始末、无连续 `--`、长 1–64）。
-//!     - mcp `<server>` 段为规范化字符集 `[A-Za-z0-9_-]`（大小写保留，长 1–64）。
+//!     - mcp `<server>` 段 **= 该 Server 的 `bundle_id` 原样**（§1.3）：非空、`[A-Za-z0-9_-]`、无 `.`、
+//!       无连续 `__`、**无长度上限**（§1.4 表中该行未列「1–64」，仅 user / marketplace / `<skill>` 段有）。
+//!       合成与解析共用同一判据 [`crate::utils::bundle_id::is_valid_bundle_id`]（单一权威，勿另写等价谓词）。
 //! - 非法 name → [`SkillNameError`]，由 `client:get_skill` 处理器映射为协议 `4016`。
+//!
+//! **`<server>` 段为何取 `bundle_id`（rust-sdk#127，supersede #18 的正交结论）**：post-BundleID，MCP Server
+//! 的 `name` 是纯 display、**允许碰撞、永不做键/寻址**，A2C server 的唯一身份是 `bundle_id`。取 display 名
+//! 会让两个 `name` 巧合相同、`bundle_id` 不同的**合法共存** Server 撞出同一个 `mcp:<name>:<skill>`，迫使
+//! §1.5 拒绝第二注册者、令一个合法 SKILL 对 Agent **隐身**；取 `bundle_id`（缺省生成恒有值 + no-double-open
+//! 保证唯一）则 mcp 形态 name **构造上不碰撞**，且 SKILL 的 server 身份与 `get_config.servers` key /
+//! `get_resources.mcp_server` / `4014`·`4015` 的 `meta.mcp_server` **全协议统一**。
 
 use crate::ErrorCode;
 
@@ -135,33 +144,18 @@ fn is_strict_kebab(segment: &str) -> bool {
     true
 }
 
-/// mcp `<server>` 段是否合规 / Whether the mcp `<server>` segment is valid（`[A-Za-z0-9_-]{1,64}`）。
+/// mcp `<server>` 段是否合规 / Whether the mcp `<server>` segment is valid。
+///
+/// **判据完全委托** [`crate::utils::bundle_id::is_valid_bundle_id`]——`<server>` 段**就是** `bundle_id`
+/// （skill.md §1.3），故其合法性只能有一个来源。此处**不得**另写一份等价谓词：两处一旦漂移（如擅自加
+/// 长度上限、或漏禁连续 `__`），mcp 段就会拒绝合法 `bundle_id` → 该 Server 的 SKILL 对 Agent **隐身**，
+/// 即本模块要消灭的失效模式原地复活；且与 python-sdk 出线分歧（其 `_is_valid_mcp_server_segment` 同样
+/// 委托 `a2c_smcp.utils.bundle_id.is_valid_bundle_id`）。
+///
+/// 注意 `<server>` 段**不受** [`MAX_SEGMENT_LEN`] 约束——§1.4 表中仅 user / marketplace / `<skill>` 段
+/// 明列「1–64」，`<server>` 行只写「= `bundle_id`（§1.3；`[A-Za-z0-9_-]`、无 `.`、无 `__`）」。
 fn is_valid_mcp_server_segment(segment: &str) -> bool {
-    let len = segment.len();
-    if len == 0 || len > MAX_SEGMENT_LEN {
-        return false;
-    }
-    segment
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// MCP `<server>` 段规范化 / Normalize the MCP `<server>` segment（非 `[A-Za-z0-9_-]` → `_`，大小写保留）。
-///
-/// 与 Claude Code `normalizeNameForMCP()` 通用规则等价；**不**实现其 `"claude.ai "` 前缀折叠特例
-/// （Anthropic 平台特化，违反 A2C 协议中立性）。协议依据 skill.md §1.3。
-///
-/// 仅做字符替换，**不**校验结果长度；空串 / 超长由 [`synthesize_mcp_name`] 在合成时判废。
-pub fn normalize_mcp_server_segment(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    crate::utils::bundle_id::is_valid_bundle_id(segment)
 }
 
 /// SKILL name lexer：段数消歧 + 逐段字符集校验 / Lexer: segment-count disambiguation + per-segment charset。
@@ -221,7 +215,7 @@ pub fn parse_skill_name(name: &str) -> Result<ParsedSkillName, SkillNameError> {
             if !is_valid_mcp_server_segment(server) {
                 return Err(SkillNameError::new(
                     name,
-                    "mcp <server> segment must match [A-Za-z0-9_-]{1,64}",
+                    "mcp <server> segment must be a valid bundle_id: non-empty, charset [A-Za-z0-9_-], no '.', no '__'",
                 ));
             }
             if !is_strict_kebab(skill) {
@@ -285,28 +279,34 @@ pub fn synthesize_marketplace_name(plugin: &str, skill: &str) -> Result<String, 
     Ok(combined)
 }
 
-/// 合成 mcp 源 name / Synthesize an mcp-source name：`mcp:<normalized-server>:<skill>`（3 段）。
+/// 合成 mcp 源 name / Synthesize an mcp-source name：`mcp:<bundle_id>:<skill>`（3 段）。
 ///
-/// `server` 先经 [`normalize_mcp_server_segment`] 规范化；规范化后长度 = 0 或 > 64 → 判废。
+/// `bundle_id` 是该 MCP Server 的**唯一身份**，**原样**进段——不做任何规范化（协议 skill.md §1.3）。
+/// 下方 guard 的判据即 [`crate::utils::bundle_id::is_valid_bundle_id`]（**同一权威**，非等价重写），故
+/// 合法 `bundle_id` 恒通过；guard 只用于挡住「误传 display 名」这类调用方错误。
+///
+/// 取 `bundle_id` 而非 display `name` 使 mcp 形态 name **构造上不碰撞**（`bundle_id` 缺省生成恒有值、
+/// no-double-open 保证唯一）——取 display 名则两个 `name` 巧合相同、`bundle_id` 不同的合法共存 Server
+/// 会撞出同一个 name，迫使其中一个的 SKILL 对 Agent 隐身（§1.5）。
 ///
 /// # Errors
-/// 规范化 server 越界或 `skill` 非严格 kebab 时返回 [`SkillNameError`]。
-pub fn synthesize_mcp_name(server: &str, skill: &str) -> Result<String, SkillNameError> {
-    let normalized = normalize_mcp_server_segment(server);
-    if !is_valid_mcp_server_segment(&normalized) {
+/// `bundle_id` 非法（空 / 含 `[A-Za-z0-9_-]` 之外的字符 / 含连续 `__`）或 `skill` 非严格 kebab 时返回
+/// [`SkillNameError`]。**无长度上限**（协议 §BundleID 未设）。
+pub fn synthesize_mcp_name(bundle_id: &str, skill: &str) -> Result<String, SkillNameError> {
+    if !is_valid_mcp_server_segment(bundle_id) {
         return Err(SkillNameError::new(
-            format!("{MCP_SEGMENT}{SEPARATOR}{normalized}{SEPARATOR}{skill}"),
-            "normalized mcp <server> must match [A-Za-z0-9_-]{1,64} (empty or >64 rejected)",
+            format!("{MCP_SEGMENT}{SEPARATOR}{bundle_id}{SEPARATOR}{skill}"),
+            "mcp <server> must be a valid bundle_id (taken verbatim, never normalized): non-empty, charset [A-Za-z0-9_-], no '.', no '__'",
         ));
     }
     if !is_strict_kebab(skill) {
         return Err(SkillNameError::new(
-            format!("{MCP_SEGMENT}{SEPARATOR}{normalized}{SEPARATOR}{skill}"),
+            format!("{MCP_SEGMENT}{SEPARATOR}{bundle_id}{SEPARATOR}{skill}"),
             "mcp <skill> leaf must be strict kebab",
         ));
     }
     Ok(format!(
-        "{MCP_SEGMENT}{SEPARATOR}{normalized}{SEPARATOR}{skill}"
+        "{MCP_SEGMENT}{SEPARATOR}{bundle_id}{SEPARATOR}{skill}"
     ))
 }
 
@@ -376,8 +376,8 @@ mod tests {
         assert_eq!(p.kind, SkillNameKind::Marketplace);
         assert_eq!(p.plugin.as_deref(), Some("plug"));
 
-        // mcp（server 规范化：含点/空格 → 下划线）
-        let n = synthesize_mcp_name("srv.example com", "do-it").unwrap();
+        // mcp（`<server>` = bundle_id，原样进段——不规范化，见 §1.3）
+        let n = synthesize_mcp_name("srv_example_com", "do-it").unwrap();
         assert_eq!(n, "mcp:srv_example_com:do-it");
         let p = parse_skill_name(&n).unwrap();
         assert_eq!(p.kind, SkillNameKind::Mcp);
@@ -390,15 +390,75 @@ mod tests {
         assert!(synthesize_user_name("Bad").is_err());
         assert!(synthesize_marketplace_name("ok", "Bad").is_err());
         assert!(synthesize_marketplace_name("Bad", "ok").is_err());
-        // server 规范化后为空（全非法字符且……实际会变成等长下划线，不会空）；用真正空串触发
+        // `<server>` 非合法 bundle_id → 判废（合法 bundle_id 恒通过，故此仅挡调用方错误）
         assert!(synthesize_mcp_name("", "ok").is_err());
         assert!(synthesize_mcp_name("srv", "Bad").is_err());
     }
 
+    /// #127 跨 SDK 对拍：mcp `<server>` 段判据 == `bundle_id` 判据，**不得**另加约束。
+    ///
+    /// 两个曾漂移的点（隔离审查 🔴，python-sdk#142 `4a5050a` 同源修复）：
+    /// - **无长度上限**：§1.4 表中 `<server>` 行未列「1–64」（仅 user / marketplace / `<skill>` 有）、
+    ///   §BundleID 亦未设。擅自加 64 上限会拒绝合法 `bundle_id`（显式长值 / 长 display 名的缺省生成
+    ///   结果）→ 其 SKILL 对 Agent 隐身，且 Python 侧能正常合成 → 出线跨 SDK 分歧。
+    /// - **禁连续 `__`**：§BundleID **MUST NOT** 含 `__`（它是 `bundle_id` 与工具名的保留分隔符）。
+    ///   漏禁则 Rust 能合成出 `mcp:a__b:ok`，而 Python lexer 判 4016 → name 跨 SDK 不可解析。
     #[test]
-    fn test_normalize_mcp_server_segment() {
-        assert_eq!(normalize_mcp_server_segment("Already_OK-1"), "Already_OK-1");
-        assert_eq!(normalize_mcp_server_segment("a.b/c d"), "a_b_c_d");
-        assert_eq!(normalize_mcp_server_segment("café"), "caf_"); // 非 ASCII → _
+    fn test_mcp_server_segment_predicate_matches_bundle_id_127() {
+        // 无长度上限：65 / 256 字符的合法 bundle_id 须能合成、且可被 lexer 解回。
+        for len in [MAX_SEGMENT_LEN + 1, 256] {
+            let long = "a".repeat(len);
+            let n = synthesize_mcp_name(&long, "ok")
+                .unwrap_or_else(|e| panic!("长 bundle_id（{len} 字符）应合法: {}", e.reason));
+            assert_eq!(n, format!("mcp:{long}:ok"));
+            assert_eq!(
+                parse_skill_name(&n).unwrap().server.as_deref(),
+                Some(&*long)
+            );
+        }
+
+        // 连续 `__` 非法（合成与解析两侧一致）。
+        assert!(synthesize_mcp_name("a__b", "ok").is_err());
+        assert!(parse_skill_name("mcp:a__b:ok").is_err());
+
+        // `<skill>` leaf 仍受严格 kebab + 1–64 约束（该段协议**确有**长度上限，勿一并放开）。
+        assert!(synthesize_mcp_name("srv", &"a".repeat(MAX_SEGMENT_LEN + 1)).is_err());
+    }
+
+    /// #127：mcp `<server>` 段 = `bundle_id` **原样**，合成侧**不再**做任何规范化。
+    ///
+    /// 本段的判据**就是** `bundle_id` 的判据（同一谓词 [`crate::utils::bundle_id::is_valid_bundle_id`]，
+    /// 恒等而非「子集」——判据委托后二者不可能分歧，这正是本次修复的要点）。故越界字符只可能来自
+    /// 「调用方传了 display 名而不是 bundle_id」——必须**判废**，不能静默改写成一个与该 server 真实身份
+    /// 不符的段：旧的静默规范化正是把两个不同 CJK 名、不同 `bundle_id` 的合法 server 撞成同一个 `___`
+    /// 段，从而令其中一个的 SKILL 对 Agent 隐身。
+    #[test]
+    fn test_synthesize_mcp_takes_bundle_id_verbatim_127() {
+        // 越界字符 → Err（旧行为：静默规范化为 `mcp:srv_example_com:do-it` / `mcp:___:summarize`）。
+        assert!(synthesize_mcp_name("srv.example com", "do-it").is_err());
+        assert!(synthesize_mcp_name("服务器", "summarize").is_err());
+
+        // 合法 bundle_id 原样进段，并恒可被 lexer 解析回同一段（skill.md §1.6 合成示例）。
+        for (bundle_id, skill, expected) in [
+            (
+                "tfrobot-tools",
+                "code-review",
+                "mcp:tfrobot-tools:code-review",
+            ),
+            ("my_api", "csv-aggregator", "mcp:my_api:csv-aggregator"),
+            ("acme-editor", "format", "mcp:acme-editor:format"),
+            (
+                "bundle_a1b2c3d4e5f60718",
+                "summarize",
+                "mcp:bundle_a1b2c3d4e5f60718:summarize",
+            ),
+        ] {
+            let n = synthesize_mcp_name(bundle_id, skill).unwrap();
+            assert_eq!(n, expected);
+            let p = parse_skill_name(&n).unwrap();
+            assert_eq!(p.kind, SkillNameKind::Mcp);
+            assert_eq!(p.server.as_deref(), Some(bundle_id));
+            assert_eq!(p.skill, skill);
+        }
     }
 }

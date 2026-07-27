@@ -14,15 +14,16 @@
 //! wire `_meta`），使 Agent 区分「工具坏了」与「需用户授权」——**不**走路由级 flat ErrorPayload。
 //!
 //! 本模块为**纯函数**（无 I/O，可独立单测）：
-//! - [`classify_auth_error`]：按 §423 决策表把上游错误（现仅字符串化于 [`MCPClientError`]）尽力归类为
+//! - [`classify_auth_error`](crate::mcp_clients::auth_error::classify_auth_error)：按 §423 决策表把上游错误（现仅字符串化于 [`MCPClientError`]）尽力归类为
 //!   `4006`（需授权）/ `4007`（授权失败）/ `None`（非授权，保持通用错误路径）。仅 transport 级 `Err`，
 //!   不解析 `Ok(CallToolResult{isError:true})` 的 content 文本（best-effort 边界）。
-//! - [`sanitize_auth_hint`]：按 §454「auth_hint 安全边界」MUST NOT 清单脱敏（删敏感键 + URL 去 query/fragment）。
-//! - [`build_default_auth_hint`] / [`build_auth_error_result`]：构造协议形状的授权错误结果。
+//! - [`sanitize_auth_hint`](crate::mcp_clients::auth_error::sanitize_auth_hint)：按 §454「auth_hint 安全边界」MUST NOT 清单脱敏（删敏感键 + URL 去 query/fragment）。
+//! - [`build_default_auth_hint`](crate::mcp_clients::auth_error::build_default_auth_hint) / [`build_auth_error_result`](crate::mcp_clients::auth_error::build_auth_error_result)：构造协议形状的授权错误结果。
 //!
 //! Python 参考实现**不存在**（仅有 `ErrorCode` 枚举），Rust 领先实现，依据为协议决策表。
 
 use rmcp::model::{CallToolResult, Content, Meta};
+use rmcp::transport::streamable_http_client::StreamableHttpError;
 use serde_json::{json, Value};
 use smcp::tool_meta::{AUTH_ERROR_CODE_KEY, AUTH_HINT_KEY, AUTH_MCP_SERVER_KEY};
 use smcp::ErrorCode;
@@ -31,8 +32,11 @@ use super::model::MCPClientError;
 
 /// §423「授权失败 / 权限不足 / 凭证失效」→ `4007` 的判别子串（小写比较）。
 /// 403 / scope 不足 / token 过期+刷新失败 / revoked / invalid_grant 等「曾授权但当前不可用」。
+///
+/// **不含裸 `403`**：错误 Display 常携 URL（如 `http://127.0.0.1:40397/`），裸状态码子串会误命中
+/// 端口号；标准 rmcp/reqwest 的 `error_for_status` Display 形如 `(403 Forbidden)`，原因短语
+/// `forbidden` 已覆盖标准形态，故裸 `403` 既冗余又有害（曾令 AUTH-01 真实传输测试间歇性误判）。
 const FAILED_MARKERS: &[&str] = &[
-    "403",
     "forbidden",
     "insufficient scope",
     "insufficient_scope",
@@ -48,8 +52,10 @@ const FAILED_MARKERS: &[&str] = &[
 
 /// §423「需要授权 / 未认证」→ `4006` 的判别子串（小写比较）。
 /// 401 / 无凭证 / 未登录等「从未授权或需重新授权」。
+///
+/// **不含裸 `401`**：同 FAILED_MARKERS——裸状态码子串误命中 URL 中的端口号（如 `:40123`）；
+/// 原因短语 `unauthorized` 已覆盖标准 `(401 Unauthorized)` 形态。
 const REQUIRED_MARKERS: &[&str] = &[
-    "401",
     "unauthorized",
     "unauthenticated",
     "not authenticated",
@@ -89,14 +95,20 @@ const SENSITIVE_HINT_KEY_MARKERS: &[&str] = &[
 /// 把上游 MCP 工具调用错误尽力归类为协议授权错误码 / Best-effort classify an upstream tool-call
 /// error into a protocol authorization code。
 ///
-/// 现状：`MCPClientError` 把 HTTP 状态（如 `401`/`403`）与 JSON-RPC error 均字符串化（见
-/// `http_client.rs`），故按 `Display` 小写子串归类。`Some(4006/4007)` → 调用方应改以授权
-/// `CallToolResult` 透传；`None` → 非授权（5xx / 网络 / 其它，§435），保持通用错误路径。
+/// 判别顺序：先 `classify_structured`（保型 downcast，覆盖最规范的 `401 + WWW-Authenticate`，
+/// #150），再退化到 `Display` 小写子串 marker 表（覆盖 SSE 自建错误串 / `McpError` 等非保型路径）。
+/// `Some(4006/4007)` → 调用方应改以授权 `CallToolResult` 透传；`None` → 非授权（5xx / 网络 / 其它，
+/// §435），保持通用错误路径。
 ///
 /// **边界（best-effort）**：仅作用于 `Err(MCPClientError)`（transport 级）；上游若把授权失败作为
 /// `Ok(CallToolResult{isError:true})` 返回（stdio/SSE 常见），不解析其 content 文本、不重分类——按
-/// 原样透传。精确 401/403 区分与 `isError` 内容解析留后续（rmcp 错误面结构化上浮）。
+/// 原样透传。`isError` 内容解析留后续。
 pub fn classify_auth_error(err: &MCPClientError) -> Option<ErrorCode> {
+    // #150：保型优先——结构化 downcast 命中 `AuthRequired` → 4006（字符串表对 "Auth required" 永不命中）。
+    if let Some(code) = classify_structured(err) {
+        return Some(code);
+    }
+
     let msg = err.to_string().to_lowercase();
 
     // 先判「授权失败（4007）」：403/scope 等先于泛 auth 命中，避免被兜底成 4006。
@@ -111,6 +123,35 @@ pub fn classify_auth_error(err: &MCPClientError) -> Option<ErrorCode> {
         return Some(ErrorCode::ToolAuthorizationRequired);
     }
     None
+}
+
+/// 结构化判别（#150）：对保型 [`MCPClientError::ToolCallError`] 直接按型匹配，**不依赖 rmcp `Display`
+/// 字面量**。
+///
+/// 仅处理最规范的 `401 + WWW-Authenticate`：rmcp 在 `error_for_status()` 之前短路成
+/// `StreamableHttpError::AuthRequired`，其 `Display` 为无状态码的 `"Auth required"`，三张字符串 marker
+/// 表全不命中（[`classify_auth_error`] 的退化路径对此形态**永不**产出 4006，违反 §425/§432 MUST）。
+/// 本函数对该保型错误做 downcast 命中 → `4006`（与裸 401 一致）。
+///
+/// 其余形态（`403` / 裸 `401` 经 `error_for_status` 携状态码；`McpError`；非流式 HTTP 传输）回退到
+/// [`classify_auth_error`] 的字符串 marker 路径，故此函数仅特判 `AuthRequired` 一种变体。
+fn classify_structured(err: &MCPClientError) -> Option<ErrorCode> {
+    let MCPClientError::ToolCallError(service_err) = err else {
+        return None;
+    };
+    // 仅 transport 发送错误携带可 downcast 的底层类型；`McpError` / `Timeout` 等无保型底层 → 回退字符串路径。
+    let rmcp::ServiceError::TransportSend(dte) = service_err else {
+        return None;
+    };
+    // 直接对内层 `Box<dyn Error + Send + Sync>` 做 downcast，**免绑 transport `TypeId`**——
+    // `DynamicTransportError::downcast::<T, R>` 还要校验 transport 具体类型，过严且耦合；此处只需知道
+    // 底层是否为 streamable-HTTP 的 `AuthRequired`。
+    dte.error
+        .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+        .and_then(|she| match she {
+            StreamableHttpError::AuthRequired(_) => Some(ErrorCode::ToolAuthorizationRequired),
+            _ => None,
+        })
 }
 
 /// 按 §454 脱敏 auth_hint：递归删敏感键、URL 去 query/fragment / sanitize an auth hint per the
@@ -316,6 +357,53 @@ mod tests {
                 "signal {s:?} must not be auth"
             );
         }
+    }
+
+    // ── classify_structured（#150 保型 downcast，免依赖 rmcp `Display` 字面量）──────
+    /// 合成 `ToolCallError(TransportSend(StreamableHttpError::AuthRequired(_)))` 直接验证结构化路径
+    /// 命中 4006——亚毫秒级回归栅栏，不依赖真实传输/socket（端到端由 `auth_error_real_transport.rs`
+    /// 覆盖；此单测把"结构化路径命中"的判据下沉到 unit 层，且对 rmcp 上游改名/重构会编译红而非静默退化）。
+    #[test]
+    fn test_classify_structured_auth_required_reaches_4006() {
+        use rmcp::transport::streamable_http_client::{AuthRequiredError, StreamableHttpError};
+        use rmcp::transport::{DynamicTransportError, StreamableHttpClientTransport};
+        use rmcp::RoleClient;
+
+        // 401 + WWW-Authenticate → rmcp 短路成 AuthRequired（Display 无状态码，字符串表永不命中）。
+        let she = StreamableHttpError::AuthRequired(AuthRequiredError {
+            www_authenticate_header: "Bearer realm=\"mcp\"".to_string(),
+        });
+        let dte = DynamicTransportError::new::<
+            StreamableHttpClientTransport<reqwest::Client>,
+            RoleClient,
+        >(she);
+        let err = MCPClientError::ToolCallError(rmcp::ServiceError::TransportSend(dte));
+        assert_eq!(
+            classify_auth_error(&err),
+            Some(ErrorCode::ToolAuthorizationRequired),
+            "401 + WWW-Authenticate via structured downcast must reach 4006"
+        );
+    }
+
+    /// 非 `AuthRequired` 的保型 streamable-HTTP transport 错误 → 结构化路径不命中 → 退到字符串 fallback；
+    /// 该 Display（"Server does not support SSE"）无 marker → `None`。
+    #[test]
+    fn test_classify_structured_non_auth_required_falls_through() {
+        use rmcp::transport::streamable_http_client::StreamableHttpError;
+        use rmcp::transport::{DynamicTransportError, StreamableHttpClientTransport};
+        use rmcp::RoleClient;
+
+        let she = StreamableHttpError::<reqwest::Error>::ServerDoesNotSupportSse;
+        let dte = DynamicTransportError::new::<
+            StreamableHttpClientTransport<reqwest::Client>,
+            RoleClient,
+        >(she);
+        let err = MCPClientError::ToolCallError(rmcp::ServiceError::TransportSend(dte));
+        assert_eq!(
+            classify_auth_error(&err),
+            None,
+            "non-AuthRequired transport error must not be classified as auth"
+        );
     }
 
     // ── sanitize_auth_hint（§454 安全边界）──────────────────────────────────────

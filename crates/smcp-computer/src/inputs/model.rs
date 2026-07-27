@@ -212,7 +212,12 @@ pub type InputResult<T> = Result<T, InputError>;
 /// 输入上下文 / Input context
 #[derive(Debug, Clone)]
 pub struct InputContext {
-    /// 服务器名称 / Server name
+    /// 服务器身份段（env 名 server 段 + cache 键）/ server-identity segment (env name + cache key)。
+    ///
+    /// ⚠️ **#140/D2：本字段接线到 live 时 MUST 填 `bundle_id`（运行期唯一身份），MUST NOT 填 display name**——
+    /// 否则同名 server 会串用彼此的 env 派生值 / cache 条目（含 `password:true` 密钥）。当前本通道为死代码
+    /// （`with_server_name` 调用点全在 `#[cfg(test)]`），故为预防性约束；`build_env_name` / `build_cache_key`
+    /// 均据此段构键。字段名 `server_name` 是历史遗留，语义应读作「server 身份键」。
     pub server_name: Option<String>,
     /// 工具名称 / Tool name
     pub tool_name: Option<String>,

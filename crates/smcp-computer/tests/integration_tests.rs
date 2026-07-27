@@ -12,6 +12,11 @@ use smcp_computer::mcp_clients::*;
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 
+/// 测试夹具：构造合法 [`BundleId`]（#141：库层 API 由 display 名改按身份键寻址）。
+fn bid(s: &str) -> BundleId {
+    BundleId::try_from(s.to_string()).expect("测试夹具的 bundle_id 字面量必须合法")
+}
+
 /// 测试完整的MCP服务器管理工作流 / Test complete MCP server management workflow
 #[tokio::test]
 async fn test_complete_workflow() {
@@ -22,12 +27,17 @@ async fn test_complete_workflow() {
     let mut configs = Vec::new();
 
     // STDIO服务器配置 / STDIO server configuration
-    configs.push(MCPServerConfig::Stdio(StdioServerConfig {
-        env_file: None,
-        name: "calculator_server".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: {
+    configs.push(MCPServerConfig::Stdio({
+        let mut c = StdioServerConfig::new(
+            "calculator_server",
+            StdioServerParameters {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.tool_meta = {
             let mut meta = HashMap::new();
             meta.insert("add".to_string(), ToolMeta {
                 auto_apply: Some(true),
@@ -42,35 +52,27 @@ async fn test_complete_workflow() {
                 ret_object_mapper: None,
             });
             meta
-        },
-        default_tool_meta: Some(ToolMeta {
+        };
+        c.default_tool_meta = Some(ToolMeta {
             auto_apply: Some(false),
             alias: None,
             tags: Some(vec!["default".to_string()]),
             ret_object_mapper: None,
-        }),
-        vrl: None,
-        server_parameters: StdioServerParameters {
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
-            env: HashMap::new(),
-            cwd: None,
-        },
+        });
+        c
     }));
 
     // HTTP服务器配置 / HTTP server configuration
-    configs.push(MCPServerConfig::Http(HttpServerConfig {
-        env_file: None,
-        name: "http_server".to_string(),
-        disabled: true, // 禁用以避免实际连接 / Disable to avoid actual connection
-        forbidden_tools: vec![],
-        tool_meta: HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: HttpServerParameters {
-            url: "http://localhost:8080".to_string(),
-            headers: HashMap::new(),
-        },
+    configs.push(MCPServerConfig::Http({
+        let mut c = HttpServerConfig::new(
+            "http_server",
+            HttpServerParameters {
+                url: "http://localhost:8080".to_string(),
+                headers: HashMap::new(),
+            },
+        );
+        c.disabled = true; // 禁用以避免实际连接 / Disable to avoid actual connection
+        c
     }));
 
     // 3. 初始化管理器 / Initialize manager
@@ -97,18 +99,19 @@ async fn test_complete_workflow() {
     sleep(Duration::from_millis(200)).await;
 
     // 7. 检查运行状态 / Check running status
+    // #127：get_server_status 现出 (bundle_id, name, is_active, state)——`.1` 是展示名、`.2` 是活跃标志。
     let status = manager.get_server_status().await;
     let calc_status = status
         .iter()
-        .find(|(name, _, _)| name == "calculator_server")
+        .find(|(_, name, _, _)| name == "calculator_server")
         .unwrap();
-    assert!(calc_status.1); // calculator_server 应该已激活 / calculator_server should be active
+    assert!(calc_status.2); // calculator_server 应该已激活 / calculator_server should be active
 
     let http_status = status
         .iter()
-        .find(|(name, _, _)| name == "http_server")
+        .find(|(_, name, _, _)| name == "http_server")
         .unwrap();
-    assert!(!http_status.1); // http_server 应该未激活（被禁用）/ http_server should not be active (disabled)
+    assert!(!http_status.2); // http_server 应该未激活（被禁用）/ http_server should not be active (disabled)
 
     // 8. 停止所有服务器 / Stop all servers
     let result = manager.stop_all().await;
@@ -116,7 +119,7 @@ async fn test_complete_workflow() {
 
     // 9. 检查最终状态 / Check final status
     let status = manager.get_server_status().await;
-    for (_, active, _) in status {
+    for (_, _, active, _) in status {
         assert!(!active); // 所有服务器都应该未激活 / All servers should be inactive
     }
 
@@ -142,8 +145,9 @@ async fn test_input_system_integration() {
     let provider = EnvironmentInputProvider::new().with_prefix("TEST_".to_string());
 
     // 设置测试环境变量 / Set test environment variables
-    // 环境变量名格式: TEST_ + request.id + server_name + tool_name
-    std::env::set_var("TEST_TEST_INPUT_TEST_SERVER_TEST_TOOL", "test_value");
+    // #140：环境变量名 = prefix + ENV_SEGMENT(id) + '_' + ENV_SEGMENT(server) + '_' + ENV_SEGMENT(tool)
+    // 保留大小写（不再 upper()）：TEST_ + test_input + _test_server + _test_tool。
+    std::env::set_var("TEST_test_input_test_server_test_tool", "test_value");
 
     // 创建输入请求 / Create input request
     let request = InputRequest {
@@ -168,8 +172,8 @@ async fn test_input_system_integration() {
     // 环境变量提供者应该返回环境变量的值
     // The environment provider should return the environment variable value
 
-    // 清理环境变量 / Clean up environment variables
-    std::env::remove_var("TEST_TEST_INPUT_TEST_SERVER_TEST_TOOL");
+    // 清理环境变量 / Clean up environment variables（#140：须与上方 set 的**新名**一致，否则残留污染同进程后续测试）
+    std::env::remove_var("TEST_test_input_test_server_test_tool");
 }
 
 /// 测试错误处理 / Test error handling
@@ -178,18 +182,24 @@ async fn test_error_handling() {
     let manager = MCPServerManager::new();
 
     // 尝试启动不存在的服务器 / Try to start non-existent server
-    let result = manager.start_client("non_existent").await;
+    let result = manager.start_client_by_id(&bid("non_existent")).await;
     assert!(result.is_err());
 
-    // 尝试停止不存在的服务器 - 应该成功（幂等操作）
-    // Try to stop non-existent server - should succeed (idempotent operation)
-    let result = manager.stop_client("non_existent").await;
-    assert!(result.is_ok());
+    // 停止不存在的服务器：幂等 `Ok` —— 但 #141 起回执必须**如实**说「什么都没停」（`false`），
+    // 否则 CLI 会把拼错的 target 打成 ✅。
+    // Stopping a non-existent server stays idempotent-Ok, but must honestly report `false`.
+    let stopped = manager
+        .stop_client_by_id(&bid("non_existent"))
+        .await
+        .expect("幂等：不存在的 bundle_id 不报错");
+    assert!(!stopped, "本无活跃客户端 ⇒ 回执 MUST 为 false（禁假成功）");
 
-    // 尝试移除不存在的服务器 - 应该成功（幂等操作）
-    // Try to remove non-existent server - should succeed (idempotent operation)
-    let result = manager.remove_server("non_existent").await;
-    assert!(result.is_ok());
+    // 移除不存在的服务器同理。/ Same for remove.
+    let removed = manager
+        .remove_server_by_id(&bid("non_existent"))
+        .await
+        .expect("幂等：不存在的 bundle_id 不报错");
+    assert!(!removed, "本无该声明 ⇒ 回执 MUST 为 false（禁假成功）");
 }
 
 /// 测试并发操作 / Test concurrent operations
@@ -203,35 +213,39 @@ async fn test_concurrent_operations() {
     for i in 0..5 {
         let manager_clone = manager.clone();
         let handle = tokio::spawn(async move {
-            let config = MCPServerConfig::Stdio(StdioServerConfig {
-                env_file: None,
-                name: format!("calculator_{}", i),
-                disabled: false,
-                forbidden_tools: vec![],
-                tool_meta: {
+            let config = MCPServerConfig::Stdio({
+                let mut c = StdioServerConfig::new(
+                    format!("calculator_{}", i),
+                    StdioServerParameters {
+                        command: "sh".to_string(),
+                        args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
+                        env: HashMap::new(),
+                        cwd: None,
+                    },
+                );
+                c.tool_meta = {
                     let mut meta = HashMap::new();
-                    meta.insert("add".to_string(), ToolMeta {
-                        auto_apply: Some(true),
-                        alias: Some(format!("calc_add_{}", i)), // 为每个服务器添加唯一别名
-                        tags: Some(vec!["math".to_string(), "calculator".to_string()]),
-                        ret_object_mapper: None,
-                    });
-                    meta.insert("echo".to_string(), ToolMeta {
-                        auto_apply: Some(true),
-                        alias: Some(format!("calc_echo_{}", i)), // 为每个服务器添加唯一别名
-                        tags: Some(vec!["utility".to_string()]),
-                        ret_object_mapper: None,
-                    });
+                    meta.insert(
+                        "add".to_string(),
+                        ToolMeta {
+                            auto_apply: Some(true),
+                            alias: Some(format!("calc_add_{}", i)), // 为每个服务器添加唯一别名
+                            tags: Some(vec!["math".to_string(), "calculator".to_string()]),
+                            ret_object_mapper: None,
+                        },
+                    );
+                    meta.insert(
+                        "echo".to_string(),
+                        ToolMeta {
+                            auto_apply: Some(true),
+                            alias: Some(format!("calc_echo_{}", i)), // 为每个服务器添加唯一别名
+                            tags: Some(vec!["utility".to_string()]),
+                            ret_object_mapper: None,
+                        },
+                    );
                     meta
-                },
-                default_tool_meta: None,
-                vrl: None,
-                server_parameters: StdioServerParameters {
-                    command: "sh".to_string(),
-                    args: vec!["-c".to_string(), r#"echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"mock","version":"0.1.0"}}}'; while IFS= read -r line; do id=$(echo "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); [ -n "$id" ] && echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[]}}"; done"#.to_string()],
-                    env: HashMap::new(),
-                    cwd: None,
-                },
+                };
+                c
             });
 
             manager_clone.add_or_update_server(config).await
@@ -256,7 +270,8 @@ async fn test_concurrent_operations() {
     for i in 0..5 {
         let manager_clone = manager.clone();
         let server_name = format!("calculator_{}", i);
-        let handle = tokio::spawn(async move { manager_clone.start_client(&server_name).await });
+        let handle =
+            tokio::spawn(async move { manager_clone.start_client_by_id(&bid(&server_name)).await });
 
         handles.push(handle);
     }

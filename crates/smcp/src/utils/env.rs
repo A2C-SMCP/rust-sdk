@@ -13,10 +13,10 @@ const TRUTHY: [&str; 4] = ["1", "true", "yes", "on"];
 
 /// 判断**值**是否为真 / Whether a value is truthy（值级谓词）。
 ///
-/// 先 `trim().to_ascii_lowercase()`，命中 [`TRUTHY`]（`1` / `true` / `yes` / `on`）为真；
+/// 先 `trim().to_ascii_lowercase()`，命中 `TRUTHY`（`1` / `true` / `yes` / `on`）为真；
 /// 空白或其它值（如 `0` / `false` / `off`）→ `false`。
 ///
-/// Trims + lowercases, then checks membership in [`TRUTHY`]; blank or anything else → `false`.
+/// Trims + lowercases, then checks membership in `TRUTHY`; blank or anything else → `false`.
 pub fn is_truthy(value: &str) -> bool {
     let norm = value.trim().to_ascii_lowercase();
     TRUTHY.contains(&norm.as_str())
@@ -31,7 +31,7 @@ pub fn env_truthy(key: &str) -> bool {
 
 /// 判断布尔型环境变量是否为真，可指定回退 / Whether a boolean env var is truthy, with a fallback。
 ///
-/// 取 `std::env::var(key)` 后 `trim().to_ascii_lowercase()`：命中 [`TRUTHY`] 为真；
+/// 取 `std::env::var(key)` 后 `trim().to_ascii_lowercase()`：命中 `TRUTHY` 为真；
 /// **未设置或空白** → `default`；其它值（如 `0` / `false` / `off`）→ `false`。
 /// 语义与 Python `env_truthy(key, *, default)` 完全一致。
 ///

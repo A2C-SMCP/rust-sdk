@@ -189,7 +189,8 @@ Inputs 子系统设计：`BaseInputResolver`/`InputResolver`、`ConfigRender` �
   - extra allow（使用 `#[serde(flatten)]` 处理动态字段）
 
 - `MCPServerConfig` 基类：
-  - `name`: 服务器名称（唯一标识）
+  - `name`: 服务器**展示名**（human-readable，**非唯一标识**——协议 §身份：`name` 允许碰撞；软件唯一身份是
+    从 config 派生的 `bundle_id`，见 #117/#127/#141）
   - `disabled`: 是否禁用
   - `forbidden_tools`: 禁用工具列表
   - `tool_meta`: 按工具名的元数据映射

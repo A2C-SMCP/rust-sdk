@@ -47,6 +47,7 @@ fn test_tool_call_req() {
 fn test_smcp_tool() {
     let tool = SMCPTool {
         name: "test_tool".to_string(),
+        bundle_id: "test_bundle".to_string(),
         description: "A test tool".to_string(),
         params_schema: serde_json::json!({
             "type": "object",
@@ -61,10 +62,39 @@ fn test_smcp_tool() {
     let json = serde_json::to_string(&tool).unwrap();
     let deserialized: SMCPTool = serde_json::from_str(&json).unwrap();
     assert_eq!(tool.name, deserialized.name);
+    assert_eq!(tool.bundle_id, deserialized.bundle_id);
     assert_eq!(tool.description, deserialized.description);
     assert_eq!(tool.params_schema, deserialized.params_schema);
     assert_eq!(tool.return_schema, deserialized.return_schema);
     assert!(deserialized.meta.is_none());
+}
+
+/// 协议 0.3.0 D1（#136）：`SMCPTool` 必带 `bundle_id`（required，snake_case wire 字段），
+/// 位于 `name` 之后——Agent 据此归属工具，**禁止**切 exposed name 的 `__` 前缀反推。
+#[test]
+fn test_smcp_tool_bundle_id_wire_field() {
+    let tool = SMCPTool {
+        name: "everything__echo".to_string(),
+        bundle_id: "everything".to_string(),
+        description: "echo".to_string(),
+        params_schema: serde_json::json!({"type": "object"}),
+        return_schema: None,
+        meta: None,
+    };
+
+    let json: serde_json::Value = serde_json::to_value(&tool).unwrap();
+    // wire 字段名 = snake_case `bundle_id`，值 = 解析后 bundle_id（非从 `name` 切 `__` 得来）。
+    assert_eq!(json["bundle_id"], serde_json::json!("everything"));
+
+    // 声明序须与协议一致：name, bundle_id, description, ...（供跨 SDK 逐字节对拍）。
+    let serialized = serde_json::to_string(&tool).unwrap();
+    let name_pos = serialized.find("\"name\"").unwrap();
+    let bundle_pos = serialized.find("\"bundle_id\"").unwrap();
+    let desc_pos = serialized.find("\"description\"").unwrap();
+    assert!(
+        name_pos < bundle_pos && bundle_pos < desc_pos,
+        "字段序应为 name < bundle_id < description，实际: {serialized}"
+    );
 }
 
 #[test]

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 // Re-export MCP protocol types from rmcp
@@ -24,8 +25,73 @@ pub const A2C_TOOL_META: &str = "a2c_tool_meta";
 pub const A2C_VRL_TRANSFORMED: &str = "a2c_vrl_transformed";
 
 // 类型别名 / Type aliases
+/// MCP Server 的 **display 名**（给人看、允许碰撞、**非身份**）/ display name (may collide; NOT identity)。
+///
+/// #130：**有意**保持 `String`——display 名混用无害，不值得付 newtype 的 `.0` / `.as_str()` 噪声。
+/// 身份请用 [`BundleId`]（**不同型**，混用即编译红）。
 pub type ServerName = String;
 pub type ToolName = String;
+/// 聚合后暴露给 LLM 的工具名 `{bundle_id}__{alias ?? 原始名}` / aggregated exposed tool name。
+///
+/// #130：同 [`ServerName`]，本轮**有意**保持 `String`。
+pub type ExposedToolName = String;
+
+/// MCP Server 唯一标识（BundleID，**构造即校验**）/ MCP Server unique identity (valid by construction)。
+///
+/// #130：由 `pub type BundleId = String`（与 [`ServerName`] 对编译器**完全同型**）改为协议 crate 的
+/// **newtype**——权威定义与合法性判据同处 [`smcp::utils::bundle_id`]，使 wire / SKILL / computer / agent
+/// 共用同一类型与同一权威。缺省生成算法仍在 [`super::bundle_id`]。
+pub use smcp::utils::bundle_id::BundleId;
+
+/// MCP Server 运行期变化通知的种类（#106）/ Kind of a runtime MCP server change notification。
+///
+/// 由各 MCP 客户端（stdio 经 rmcp `ClientHandler`；sse/http 经其常驻通知流）在收到服务器主动通知时构造，
+/// 经 [`ClientNotifyCtx`] 的 channel 上报给 Computer 的单消费者任务，触发对应的 emit / 回拉链。
+/// 生产端**只发 channel、不做任何 peer 请求**（避免在通知回调上下文里重入；见 stdio handler 注释）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpChangeKind {
+    /// `notifications/tools/list_changed` —— 工具集变化 / tool set changed。
+    ToolListChanged,
+    /// `notifications/resources/list_changed` —— 资源集变化（window:// / skill:// 需消费方重枚举）。
+    ResourceListChanged,
+    /// `notifications/resources/updated` —— 指定 URI 内容更新 / a specific resource's content updated。
+    ResourceUpdated { uri: String },
+}
+
+/// 携带来源 server 身份的 MCP 变化通知 / An MCP change notification tagged with its origin server。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerNotification {
+    /// 触发变化的 MCP Server 唯一身份 `bundle_id`（= manager 各映射的键）/ origin server's bundle_id。
+    ///
+    /// #127：改携 `bundle_id`（此前为 display 名，且注释误称其为「manager 映射的 key」——manager 的键
+    /// 一直是 `bundle_id`）。定向重挂（`resources/updated{skill://…}` → 单 server restage）据此寻址；
+    /// 用 display 名则同名 server 之间无从区分。
+    pub server: BundleId,
+    /// 变化种类 / change kind。
+    pub kind: McpChangeKind,
+}
+
+/// 注入给单个 MCP 客户端的通知上报接缝（#106）/ per-client notification-forwarding seam。
+///
+/// `client_factory` 在创建客户端时注入：`bundle_id` 让客户端能给通知打上来源标签（客户端本身不知道自己
+/// 的身份——见 [`super::utils::client_factory`]），`tx` 是喂给 Computer 单消费者任务的发送端。
+#[derive(Debug, Clone)]
+pub struct ClientNotifyCtx {
+    /// 该客户端对应的 MCP Server 唯一身份 `bundle_id`（#127；非 display 名）/ this client's bundle_id。
+    pub bundle_id: BundleId,
+    /// 变化通知发送端（Computer 侧持有接收端）/ change-notification sender。
+    pub tx: mpsc::UnboundedSender<McpServerNotification>,
+}
+
+impl ClientNotifyCtx {
+    /// 构造一条 [`McpServerNotification`] 并非阻塞发送（channel 关闭时静默丢弃）/ build & send, drop on closed。
+    pub fn notify(&self, kind: McpChangeKind) {
+        let _ = self.tx.send(McpServerNotification {
+            server: self.bundle_id.clone(),
+            kind,
+        });
+    }
+}
 
 /// MCP工具元数据 / MCP tool metadata
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,7 +139,10 @@ pub enum MCPServerConfig {
     #[serde(alias = "sse", alias = "SSE")]
     Sse(SseServerConfig),
     /// HTTP类型服务器 / HTTP type server
-    #[serde(alias = "http", alias = "HTTP")]
+    ///
+    /// `streamable` = 协议 §9.1 / Python `StreamableHttpServerConfig` 的**规范判别符**（跨 SDK 一致）；
+    /// `http`/`HTTP` 为 Rust 历史别名。#113 S6 落盘时归一化写 `streamable`，故读端须接受之（否则重启不回读）。
+    #[serde(alias = "http", alias = "HTTP", alias = "streamable")]
     Http(HttpServerConfig),
 }
 
@@ -84,6 +153,35 @@ impl MCPServerConfig {
             MCPServerConfig::Stdio(config) => &config.name,
             MCPServerConfig::Sse(config) => &config.name,
             MCPServerConfig::Http(config) => &config.name,
+        }
+    }
+
+    /// 获取**显式** `bundle_id`（若配置了）/ Get the **explicit** bundle_id if configured。
+    ///
+    /// 返回 `None` 表示未显式配置——此时**唯一身份**须经 [`super::bundle_id::resolve_bundle_id`]（或
+    /// [`derive_bundle_id`](super::bundle_id::derive_bundle_id)）从 `name` 缺省生成。**恒有值的身份**用
+    /// [`resolve_bundle_id`](super::bundle_id::resolve_bundle_id)，本访问器只暴露原始显式字段（如用于落盘保真）。
+    ///
+    /// #130：返回 [`BundleId`] 而非 `&str`——身份不在此处退化为字符串（退化即混用的起点）。
+    #[must_use]
+    pub fn bundle_id(&self) -> Option<&BundleId> {
+        match self {
+            MCPServerConfig::Stdio(config) => config.bundle_id.as_ref(),
+            MCPServerConfig::Sse(config) => config.bundle_id.as_ref(),
+            MCPServerConfig::Http(config) => config.bundle_id.as_ref(),
+        }
+    }
+
+    /// 设置 `bundle_id` 字段（**derive-on-load 物化用**，非回写配置源）/ set the bundle_id field。
+    ///
+    /// 协议 0.3.0 §connection-identity = **raw**：缺省生成须用**未渲染**连接身份。Computer 在 render 后把从
+    /// **raw config**（占位字面）派生的 `bundle_id` stamp 到渲染后配置上，使 manager 不再从渲染后连接身份派生
+    /// （避免无名 server 的 `${input:*}` 轮换致 bundle_id / exposed_tool_name 漂移）。仅改内存投影，**不写 mcp.json**。
+    pub fn set_bundle_id(&mut self, bundle_id: Option<BundleId>) {
+        match self {
+            MCPServerConfig::Stdio(config) => config.bundle_id = bundle_id,
+            MCPServerConfig::Sse(config) => config.bundle_id = bundle_id,
+            MCPServerConfig::Http(config) => config.bundle_id = bundle_id,
         }
     }
 
@@ -143,10 +241,22 @@ impl MCPServerConfig {
 }
 
 /// STDIO服务器配置 / STDIO server configuration
+///
+/// `#[non_exhaustive]`：跨 crate 禁结构体字面量构造，须经 [`StdioServerConfig::new`]（协议 0.3.0
+/// bundle_id 已算 breaking，一步到位杜绝未来加字段 source-break 外部消费者，rust-sdk#117）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StdioServerConfig {
-    /// 服务器名称 / Server name
+    /// 服务器名称（人类可读，非唯一身份）/ Server name (human-readable, not the unique identity)。
     pub name: ServerName,
+    /// MCP Server 唯一标识（BundleID）。省略时由 `name` 经确定性算法缺省生成（[`super::bundle_id`]，
+    /// **derive-on-load、不回写 mcp.json**）。
+    ///
+    /// #130：显式非法值（含 `.` / `__` / 空）在 **serde 反序列化的字段级**即判废（[`BundleId`] 构造即校验），
+    /// **不再**是"注册边界报错"——`resolve_key` 的校验分支已随之删除。**无长度上限**（协议 §BundleID 未设，
+    /// 由 `smcp` 的 `valid_bundle_id_has_no_length_cap` 专测守护），故不存在"越界"一说。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<BundleId>,
     /// 是否禁用 / Whether disabled
     #[serde(default)]
     pub disabled: bool,
@@ -176,10 +286,16 @@ pub struct StdioServerConfig {
 }
 
 /// SSE服务器配置 / SSE server configuration
+///
+/// `#[non_exhaustive]`：跨 crate 须经 [`SseServerConfig::new`]（见 [`StdioServerConfig`]，rust-sdk#117）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SseServerConfig {
-    /// 服务器名称 / Server name
+    /// 服务器名称（人类可读，非唯一身份）/ Server name (human-readable, not the unique identity)。
     pub name: ServerName,
+    /// MCP Server 唯一标识（BundleID），省略时缺省生成（见 [`StdioServerConfig::bundle_id`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<BundleId>,
     /// 是否禁用 / Whether disabled
     #[serde(default)]
     pub disabled: bool,
@@ -208,10 +324,16 @@ pub struct SseServerConfig {
 }
 
 /// HTTP服务器配置 / HTTP server configuration
+///
+/// `#[non_exhaustive]`：跨 crate 须经 [`HttpServerConfig::new`]（见 [`StdioServerConfig`]，rust-sdk#117）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HttpServerConfig {
-    /// 服务器名称 / Server name
+    /// 服务器名称（人类可读，非唯一身份）/ Server name (human-readable, not the unique identity)。
     pub name: ServerName,
+    /// MCP Server 唯一标识（BundleID），省略时缺省生成（见 [`StdioServerConfig::bundle_id`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<BundleId>,
     /// 是否禁用 / Whether disabled
     #[serde(default)]
     pub disabled: bool,
@@ -237,6 +359,60 @@ pub struct HttpServerConfig {
     pub env_file: Option<String>,
     /// HTTP服务器参数 / HTTP server parameters
     pub server_parameters: HttpServerParameters,
+}
+
+impl StdioServerConfig {
+    /// 构造一个 stdio server 配置（其余字段取默认；`#[non_exhaustive]` 下跨 crate 唯一构造入口）。
+    ///
+    /// 缺省：`bundle_id = None`（触发缺省生成）、`disabled = false`、`forbidden_tools`/`tool_meta` 为空、
+    /// `default_tool_meta`/`vrl`/`env_file` 为 `None`。字段均 `pub`，构造后可按需赋值。
+    pub fn new(name: impl Into<ServerName>, server_parameters: StdioServerParameters) -> Self {
+        Self {
+            name: name.into(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: Vec::new(),
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            env_file: None,
+            server_parameters,
+        }
+    }
+}
+
+impl SseServerConfig {
+    /// 构造一个 SSE server 配置（其余字段取默认；见 [`StdioServerConfig::new`]）。
+    pub fn new(name: impl Into<ServerName>, server_parameters: SseServerParameters) -> Self {
+        Self {
+            name: name.into(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: Vec::new(),
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            env_file: None,
+            server_parameters,
+        }
+    }
+}
+
+impl HttpServerConfig {
+    /// 构造一个 streamable-HTTP server 配置（其余字段取默认；见 [`StdioServerConfig::new`]）。
+    pub fn new(name: impl Into<ServerName>, server_parameters: HttpServerParameters) -> Self {
+        Self {
+            name: name.into(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: Vec::new(),
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            env_file: None,
+            server_parameters,
+        }
+    }
 }
 
 fn null_to_empty_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
@@ -663,6 +839,15 @@ pub enum MCPClientError {
     /// MCP Server did not declare the required capability (e.g. `resources`) → mapped to 4015 upstream.
     #[error("Capability not supported: {0}")]
     CapabilityNotSupported(String),
+    /// 上游工具调用错误（**保型**，供 AUTH-01 结构化分类）/ Upstream tool-call error, type preserved.
+    ///
+    /// 与 `ProtocolError(String)` 的区别：保留 rmcp [`rmcp::ServiceError`] 原始类型，使
+    /// [`classify_auth_error`](crate::mcp_clients::auth_error::classify_auth_error) 能对
+    /// `ServiceError::TransportSend` 做结构化 downcast（如 `StreamableHttpError::AuthRequired` → 4006），
+    /// 不再依赖 rmcp `Display` 字面量——后者对最规范的 401+`WWW-Authenticate` 仅产出无状态码的
+    /// `"Auth required"`，导致字符串分类器漏报（#150）。
+    #[error("Call tool error: {0}")]
+    ToolCallError(rmcp::ServiceError),
     /// IO错误 / IO error
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),

@@ -142,7 +142,10 @@ async fn handle_command(
                 }
                 "rm" | "remove" => {
                     if parts.len() < 3 {
-                        return Err(CommandError::InvalidCommand("缺少服务器名称".to_string()));
+                        return Err(CommandError::InvalidCommand(
+                            "用法: server rm <bundle_id>（bundle_id 可经 status 查看）/ Usage: server rm <bundle_id>"
+                                .to_string(),
+                        ));
                     }
                     handler.remove_server(parts[2]).await?;
                 }
@@ -165,6 +168,14 @@ async fn handle_command(
                 return Err(CommandError::InvalidCommand("缺少目标名称".to_string()));
             }
             handler.stop_client(parts[1]).await?;
+        }
+        // #141：兑现 `Computer::restart_mcp_client` 的公开面——此前该 API 有 doc 声称「供 CLI `restart`」
+        // 却无任何调用点。`restart` 不收 `all`（全量重启语义未定，勿凭空发明）。
+        "restart" => {
+            if parts.len() < 2 {
+                return Err(CommandError::InvalidCommand("缺少目标名称".to_string()));
+            }
+            handler.restart_client(parts[1]).await?;
         }
         "inputs" => {
             if parts.len() < 2 {

@@ -9,6 +9,7 @@
 */
 use super::model::*;
 use async_trait::async_trait;
+use smcp::utils::env_segment::env_segment;
 use std::env;
 use std::io::{self, Write};
 use std::process::Command;
@@ -340,15 +341,20 @@ impl EnvironmentInputProvider {
     }
 
     /// 构建环境变量名 / Build environment variable name
+    ///
+    /// #140：全段统一 [`env_segment`]（保留大小写、非 `[A-Za-z0-9_]`→`_`、不折叠不裁），替代旧 `to_uppercase()`
+    /// 拼接（会让 `figma-token`/`figma_token`/`Figma_Token` 静默坍缩到同一名）。⚠️ 本 provider 通道为**死代码**
+    /// （`with_server_name` 调用点全在 `#[cfg(test)]`）；接线时 `context.server_name` **MUST 填 bundle_id**
+    /// （运行期唯一身份，非 display 名——否则同名 server 串味），见 [`InputContext`]。
     fn build_env_name(&self, id: &str, context: &InputContext) -> String {
-        let mut name = format!("{}{}", self.prefix, id.to_uppercase());
+        let mut name = format!("{}{}", self.prefix, env_segment(id));
 
         if let Some(server) = &context.server_name {
-            name = format!("{}_{}", name, server.to_uppercase());
+            name = format!("{}_{}", name, env_segment(server));
         }
 
         if let Some(tool) = &context.tool_name {
-            name = format!("{}_{}", name, tool.to_uppercase());
+            name = format!("{}_{}", name, env_segment(tool));
         }
 
         name

@@ -8,7 +8,7 @@
 * 描述: 分组 help 渲染 + 命令分类法（REPL help / completer 共用单一事实源）/ grouped help + command taxonomy.
 *
 * 对标 Python `a2c_smcp/computer/cli/help.py`：`render_help` 默认列 namespace（折叠），`help <ns>` 列该
-* namespace 命令。分类法（[`NAMESPACES`] / [`namespace_commands`] / [`subcommands`] / [`flags_for`] / [`ROOT_WORDS`]）
+* namespace 命令。分类法（[`NAMESPACES`] / `namespace_commands` / [`subcommands`] / [`flags_for`] / [`ROOT_WORDS`]）
 * 是 REPL help 与 [`super::completer`] 的单一事实源。
 */
 
@@ -125,9 +125,22 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
                 "server add <json|@file>",
                 "添加或更新 MCP 配置 / add or update config",
             ),
-            ("server rm <name>", "移除 MCP 配置 / remove config"),
-            ("start <name>|all", "启动客户端 / start client(s)"),
-            ("stop <name>|all", "停止客户端 / stop client(s)"),
+            (
+                "server rm <target>",
+                "移除 MCP 配置（target = 唯一 name 或 bundle_id，可经 status 查看）/ remove config",
+            ),
+            (
+                "start <target>|all",
+                "启动客户端（target = name 或 bundle_id）/ start client(s)",
+            ),
+            (
+                "stop <target>|all",
+                "停止客户端（target = name 或 bundle_id）/ stop client(s)",
+            ),
+            (
+                "restart <target>",
+                "重启客户端（target = name 或 bundle_id）/ restart client",
+            ),
         ],
         "inputs" => &[
             (

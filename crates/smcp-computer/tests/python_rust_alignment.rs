@@ -14,6 +14,10 @@ use smcp_computer::inputs::{
 };
 use smcp_computer::mcp_clients::{ConfigRender, RenderError};
 
+// #149：共享 Streamable HTTP mock（非 cli 门控）；auto_reconnect 测试复用寻址 / AUTH-01 同源 mock。
+#[path = "common/streamable_mock.rs"]
+mod streamable_mock;
+
 #[tokio::test]
 async fn test_config_render_placeholder() {
     // 测试ConfigRender的${input:xxx}占位符解析
@@ -149,20 +153,18 @@ async fn test_vrl_integration_with_manager() {
         .timestamp_added = "2025-12-16"
     "#;
 
-    let config = StdioServerConfig {
-        env_file: None,
-        name: "vrl_test_server".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: std::collections::HashMap::new(),
-        default_tool_meta: None,
-        vrl: Some(vrl_script.to_string()),
-        server_parameters: StdioServerParameters {
-            command: "echo".to_string(),
-            args: vec!["test".to_string()],
-            env: std::collections::HashMap::new(),
-            cwd: None,
-        },
+    let config = {
+        let mut c = StdioServerConfig::new(
+            "vrl_test_server",
+            StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec!["test".to_string()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+            },
+        );
+        c.vrl = Some(vrl_script.to_string());
+        c
     };
 
     let manager = MCPServerManager::new();
@@ -200,35 +202,31 @@ async fn test_vrl_multiple_server_configs() {
     };
 
     let configs = vec![
-        MCPServerConfig::Stdio(StdioServerConfig {
-            env_file: None,
-            name: "server1".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: std::collections::HashMap::new(),
-            default_tool_meta: None,
-            vrl: Some(".server = 1".to_string()),
-            server_parameters: StdioServerParameters {
-                command: "echo".to_string(),
-                args: vec!["server1".to_string()],
-                env: std::collections::HashMap::new(),
-                cwd: None,
-            },
+        MCPServerConfig::Stdio({
+            let mut c = StdioServerConfig::new(
+                "server1",
+                StdioServerParameters {
+                    command: "echo".to_string(),
+                    args: vec!["server1".to_string()],
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+            );
+            c.vrl = Some(".server = 1".to_string());
+            c
         }),
-        MCPServerConfig::Stdio(StdioServerConfig {
-            env_file: None,
-            name: "server2".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: std::collections::HashMap::new(),
-            default_tool_meta: None,
-            vrl: Some(".server = 2".to_string()),
-            server_parameters: StdioServerParameters {
-                command: "echo".to_string(),
-                args: vec!["server2".to_string()],
-                env: std::collections::HashMap::new(),
-                cwd: None,
-            },
+        MCPServerConfig::Stdio({
+            let mut c = StdioServerConfig::new(
+                "server2",
+                StdioServerParameters {
+                    command: "echo".to_string(),
+                    args: vec!["server2".to_string()],
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+            );
+            c.vrl = Some(".server = 2".to_string());
+            c
         }),
     ];
 
@@ -417,50 +415,110 @@ async fn test_inputs_type_compatibility() {
     assert!(matches!(request.input_type, InputType::String { .. }));
 }
 
+/// `auto_reconnect` 分支真覆盖（#149）：`add_or_update_server` 在 server **已激活**时按 `auto_reconnect`
+/// 分流（`manager.rs:263-275`）——true 重启放行、false 拒绝。
+///
+/// **#142 / R5① 夹具取值分叉**：display 名 `"auto.reconnect (display)"` 派生 bundle_id
+/// `auto_reconnect_display`，二者取值分叉（conformance §2.0-1）。原夹具名 `"test"` 规范化后逐字等于自身
+/// bundle_id，name 与身份恰好重合，把身份裂缝整个盖住。
+///
+/// **#142 修身份维度假绿**：原断言 `status.iter().find(|(_, name, _, _)| name == "test")` 把 `.0`（bundle_id、
+/// 唯一身份键）丢进 `_`、只按 display 名断言存在性 ⇒ bundle_id 全线错乱此测试照样绿。现断言落在 **bundle_id
+/// 维度**，并同时钉住 display 名不被身份键顶替（两识别空间分账）。
+///
+/// **#149 修死分支假绿**：原测试从未 `start_all()` 起真实客户端 ⇒ `MCPServerManager::new()` 默认
+/// `auto_connect=false`（`manager.rs:121`）、`add_or_update_server` 里 `is_active` 恒 false ⇒ `auto_reconnect`
+/// 的 if/else 分支**从未执行**（原测试自带注释承认此缺口）。现先 `start_all()` 令 `is_active=true`，再正/负
+/// 两例分别覆盖「重启放行」（`manager.rs:265-267`）与「拒绝」（`manager.rs:268-274`）两分支。
+///
+/// **变异验证（守卫非恒真）**：把分流改坏（恒放行 / 恒拒绝），正/负两例必有一条转红——任一单向恒真实现
+/// 无法同时通过（与 `bundle_id_addressing_conformance` 四景③「该回收」互为对照同构）。
 #[tokio::test]
 async fn test_auto_reconnect_semantics() {
-    // 测试auto_reconnect语义与Python一致（配置热更新）
     use smcp_computer::mcp_clients::{
-        MCPServerConfig, MCPServerManager, StdioServerConfig, StdioServerParameters,
+        HttpServerConfig, HttpServerParameters, MCPServerConfig, MCPServerManager,
+    };
+    use streamable_mock::{spawn_streamable_mock, MockOpts};
+
+    // R5①：display 名 ≠ bundle_id（`.`/空格/括号 → `_`，折叠连续 `_`，裁首尾）。
+    const DISPLAY_NAME: &str = "auto.reconnect (display)";
+    const EXPECTED_BID: &str = "auto_reconnect_display";
+
+    // 起一台握手放行、`tools/call` 返 403 的 Streamable HTTP mock（与寻址对拍 / AUTH-01 测试同源，#149）。
+    let port = spawn_streamable_mock(MockOpts::default()).await;
+    let mk_cfg = |rev: &str| {
+        MCPServerConfig::Http(HttpServerConfig::new(
+            DISPLAY_NAME,
+            HttpServerParameters {
+                url: format!("http://127.0.0.1:{port}"),
+                headers: if rev.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    std::iter::once(("x-rev".to_string(), rev.to_string())).collect()
+                },
+            },
+        ))
     };
 
+    // 默认 `auto_reconnect=true`（`MCPServerManager::new()`）。
     let manager = MCPServerManager::new();
+    manager.initialize(vec![mk_cfg("")]).await.unwrap();
 
-    // 创建初始配置
-    let config1 = StdioServerConfig {
-        env_file: None,
-        name: "test".to_string(),
-        disabled: false,
-        forbidden_tools: vec![],
-        tool_meta: std::collections::HashMap::new(),
-        default_tool_meta: None,
-        vrl: None,
-        server_parameters: StdioServerParameters {
-            command: "echo".to_string(),
-            args: vec!["v1".to_string()],
-            env: std::collections::HashMap::new(),
-            cwd: None,
-        },
-    };
-
-    // 初始化
-    manager
-        .initialize(vec![MCPServerConfig::Stdio(config1.clone())])
+    // 起真实客户端 ⇒ `is_active=true`（`auto_reconnect` 分支的前置条件）。
+    // time-box：驱动真实 socket 的路径 MUST 有超时保护（握手实测亚秒级，60s 仅为防无限挂，见 #149 第 3 项）。
+    tokio::time::timeout(std::time::Duration::from_secs(60), manager.start_all())
         .await
+        .expect("HANG: start_all 未在 60s 内完成")
         .unwrap();
 
-    // 更新配置（auto_reconnect=true应该允许热更新）
-    let mut config2 = config1.clone();
-    config2.server_parameters.args = vec!["v2".to_string()];
+    // ── 正例（auto_reconnect=true）：热更新活跃 server 走 restart 分支 → Ok（覆盖 manager.rs:265-267）。
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        manager.add_or_update_server(mk_cfg("v2")),
+    )
+    .await
+    .expect("HANG: add_or_update (restart) 未在 60s 内完成");
+    assert!(
+        result.is_ok(),
+        "auto_reconnect=true 时热更新活跃 server MUST 经 restart 放行：{result:?}"
+    );
 
-    // 这应该成功（auto_reconnect=true）
-    let result = manager
-        .add_or_update_server(MCPServerConfig::Stdio(config2.clone()))
-        .await;
-    assert!(result.is_ok());
-
-    // 验证配置已更新（通过get_server_status间接验证）
+    // 身份维度（#142 已修，保留）：热更新是**替换**非新增；身份键是 bundle_id 非 display 名。
     let status = manager.get_server_status().await;
-    let test_server = status.iter().find(|(name, _, _)| name == "test");
-    assert!(test_server.is_some());
+    assert_eq!(
+        status.len(),
+        1,
+        "热更新 MUST 替换同一 bundle_id 的既有条目，而非新增一条"
+    );
+    let (bundle_id, name, _, _) = &status[0];
+    assert_eq!(
+        bundle_id.as_str(),
+        EXPECTED_BID,
+        "身份键 MUST 是派生 bundle_id（`.0`），非 display 名"
+    );
+    assert_eq!(
+        *name, DISPLAY_NAME,
+        "display 名 MUST 原样保留（人看的那一半），MUST NOT 被身份键顶替"
+    );
+    // 夹具分叉自检（#142）：钉到**真实派生函数**（比较两个常量恒真，守不住派生算法漂移）。
+    assert_eq!(
+        smcp_computer::mcp_clients::bundle_id::derive_bundle_id(&mk_cfg("")).as_str(),
+        EXPECTED_BID,
+        "EXPECTED_BID 须是 DISPLAY_NAME 的真实派生值（conformance §2.0-1 取值分叉由此自动蕴含）"
+    );
+
+    // ── 关闭 auto_reconnect，再热更新活跃 server → 走拒绝分支（覆盖 manager.rs:268-274）。
+    manager.disable_auto_reconnect().await;
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        manager.add_or_update_server(mk_cfg("v3")),
+    )
+    .await
+    .expect("HANG: add_or_update (reject) 未在 30s 内完成")
+    .expect_err("auto_reconnect=false 时热更新活跃 server MUST 被拒绝");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(DISPLAY_NAME) || msg.contains(EXPECTED_BID),
+        "拒绝错误 MUST 携带 name 或 bundle_id 便于诊断；实际：{msg}"
+    );
 }

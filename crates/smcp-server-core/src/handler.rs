@@ -33,7 +33,7 @@ pub enum HandlerError {
     /// 对标 Python `SMCPNamespaceError`（见 `server/namespace.py`）。属安全不变量——以**运行期**
     /// `Result` 表达（**非** `debug_assert!`），故 release build（无 `debug_assert!`）下隔离同样硬化。
     /// 投递语义：`client:*` 路由命中此变体时**不投递协议 ack**（镜像 Python `raise`，发起方侧自行超时，
-    /// 不泄露 Computer 存在性、不造非协议错误码），见 [`SmcpHandler::relay_client_call`]。
+    /// 不泄露 Computer 存在性、不造非协议错误码），见 `SmcpHandler::relay_client_call`。
     #[error("Isolation rejected: {0}")]
     Isolation(String),
 }
@@ -60,7 +60,7 @@ impl HandlerError {
     ///
     /// ✅ SRV-01 (#47) 已收敛 `client:*` 路径：`client:*` ack **永不**承载裸 `HandlerError`——
     /// 目标未命中经 [`smcp::build_computer_not_found_error`]（[`smcp::ErrorCode::NotFound`] 404）以
-    /// bare flat ErrorPayload 投递，隔离拒绝则不投递 ack（见 [`Self::relay_client_call`]）。因此
+    /// bare flat ErrorPayload 投递，隔离拒绝则不投递 ack（见 `SmcpHandler::relay_client_call`）。因此
     /// Agent 端按 [`smcp::is_protocol_error_payload`] 判定的协议级闭集（404/4006–4018）不会被本方法
     /// 的传输层码污染。
     pub fn to_error_payload(&self) -> smcp::ErrorPayload {
@@ -81,7 +81,7 @@ impl serde::Serialize for HandlerError {
 /// 在途断连信号注册表 / In-flight disconnect signal registry.
 ///
 /// 对标 Python `SMCPNamespace._inflight_disconnect_signals`（#100 Phase 1）。每个在途
-/// [`SmcpHandler::relay_client_call`] 针对其**目标 Computer SID** 登记一个独立 [`Notify`]；目标
+/// `SmcpHandler::relay_client_call` 针对其**目标 Computer SID** 登记一个独立 [`Notify`]；目标
 /// `on_disconnect` 时唤醒所有以该 SID 为目标的信号，使在途 relay 立即放弃等待、回 flat 404，而非
 /// 空等满 timeout（socketioxide `emit_with_ack` 的等待原语不监听连接掉线）。
 ///

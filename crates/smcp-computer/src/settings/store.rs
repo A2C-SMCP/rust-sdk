@@ -32,7 +32,7 @@
 //! 写保护：物化文件顶端写一行 JSONC 注释 [`WRITE_PROTECTION_HEADER`]；读时容错剥离前导 `//` 行再解析。
 //! 发现手编痕迹（version 不符 / 未知顶层键）→ WARN + 用 in-memory 解析、下次 save 重写覆盖。
 //!
-//! DRY：账本记录类型（[`KnownMarketplaceEntry`] / [`KnownMarketplaces`] / [`InstalledPluginRecord`] /
+//! DRY：账本记录类型（[`KnownMarketplaceEntry`] / [`KnownMarketplaces`] / [`InstalledPluginRecord`](crate::settings::reconciler::InstalledPluginRecord) /
 //! [`InstalledPlugins`]）复用 [`reconciler`] 已定义者（`#[serde(flatten)] extra` 已对全部字段保真 round-trip）；
 //! 本模块仅新增带 `version` 的 `*File` 信封 + 持久化 I/O。
 //!
@@ -54,6 +54,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use indexmap::IndexSet;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -61,8 +62,10 @@ use smcp::utils::atomic_io::atomic_write_text;
 use smcp::utils::path::normalize_lexical;
 
 use crate::settings::reconciler::{
-    InstalledPlugins, KnownMarketplaceEntry, KnownMarketplaces, SkillGovernanceStore,
+    InstalledPlugins, InstalledPluginsIntent, KnownMarketplaceEntry, KnownMarketplaces,
+    SkillGovernanceStore,
 };
+use crate::settings::schema::is_valid_enabled_plugin_key;
 use crate::settings::scope::EnvMap;
 use crate::skills::home::resolve_skill_home;
 use crate::skills::staging::{KnownMarketplaceRecord, KnownMarketplaceRecorder};
@@ -70,7 +73,7 @@ use crate::skills::staging::{KnownMarketplaceRecord, KnownMarketplaceRecorder};
 // ===========================================================================
 // 常量 / Constants
 // ===========================================================================
-/// 物化文件顶端写保护注释（JSONC 单行；读时被 [`strip_jsonc_header`] 剥离）/ Write-protection header line。
+/// 物化文件顶端写保护注释（JSONC 单行；读时被 `strip_jsonc_header` 剥离）/ Write-protection header line。
 pub const WRITE_PROTECTION_HEADER: &str =
     "// Maintained automatically by a2c-computer. DO NOT EDIT.";
 
@@ -81,6 +84,8 @@ pub const MATERIALIZED_VERSION: u32 = 1;
 pub const KNOWN_MARKETPLACES_FILENAME: &str = "known_marketplaces.json";
 /// `installed_plugins.json` 文件名 / filename。
 pub const INSTALLED_PLUGINS_FILENAME: &str = "installed_plugins.json";
+/// `installed_plugins_intent.json` 文件名（v0.3.0 全局安装意图，权威）/ install-intent filename。
+pub const INSTALLED_PLUGINS_INTENT_FILENAME: &str = "installed_plugins_intent.json";
 
 /// 文件锁退避重试次数（指数退避）/ default lock backoff retry count。
 pub const DEFAULT_LOCK_RETRIES: u32 = 10;
@@ -169,6 +174,29 @@ pub fn empty_installed_plugins() -> InstalledPluginsFile {
     InstalledPluginsFile {
         version: MATERIALIZED_VERSION,
         account: InstalledPlugins::default(),
+    }
+}
+
+/// `installed_plugins_intent.json` 整文件结构（v0.3.0，§2.4 全局安装意图）/ the install-intent file shape。
+///
+/// `version` 信封 + [`InstalledPluginsIntent`]（`installedPlugins` 经 `#[serde(flatten)]` 与 `version` 同层）。
+/// 与账本 `installed_plugins.json` **同为物化族**（SKILL Home、带写保护头 + version），但语义是**权威意图**、
+/// 非派生缓存：删账本可从本文件重建，删本文件才真丢安装集。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InstalledPluginsIntentFile {
+    /// 物化 schema 版本 / materialized schema version。
+    #[serde(default = "default_materialized_version")]
+    pub version: u32,
+    /// 全局安装意图集合 / the global install intent（复用 reconciler 类型）。
+    #[serde(flatten)]
+    pub account: InstalledPluginsIntent,
+}
+
+/// 空的 `installed_plugins_intent` 物化结构 / an empty install-intent file。
+pub fn empty_installed_plugins_intent() -> InstalledPluginsIntentFile {
+    InstalledPluginsIntentFile {
+        version: MATERIALIZED_VERSION,
+        account: InstalledPluginsIntent::default(),
     }
 }
 
@@ -372,6 +400,11 @@ pub fn installed_plugins_path(home: Option<&Path>, env: Option<&EnvMap>) -> Path
     resolve_home(home, env).join(INSTALLED_PLUGINS_FILENAME)
 }
 
+/// `$A2C_SKILL_HOME/installed_plugins_intent.json` 路径 / Path to installed_plugins_intent.json。
+pub fn installed_plugins_intent_path(home: Option<&Path>, env: Option<&EnvMap>) -> PathBuf {
+    resolve_home(home, env).join(INSTALLED_PLUGINS_INTENT_FILENAME)
+}
+
 // ===========================================================================
 // 手编痕迹容错 / Hand-edit tolerance（§6.3：WARN + in-memory + 下次 save 重写）
 // ===========================================================================
@@ -449,6 +482,51 @@ fn coerce_installed_plugins(data: &Map<String, Value>, path: &Path) -> Installed
     }
 }
 
+/// 把读到的对象 map 规整为 [`InstalledPluginsIntentFile`]（容错 + 手编 WARN + 丢非法 plugin id）/ Coerce。
+fn coerce_installed_plugins_intent(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> InstalledPluginsIntentFile {
+    warn_hand_edit(
+        path,
+        data.get("version"),
+        &["version", "installedPlugins"],
+        data,
+    );
+    let mut set: IndexSet<String> = IndexSet::new();
+    match data.get("installedPlugins") {
+        Some(Value::Array(arr)) => {
+            for v in arr {
+                match v.as_str() {
+                    Some(s) if is_valid_enabled_plugin_key(s) => {
+                        set.insert(s.to_string());
+                    }
+                    Some(s) => tracing::warn!(
+                        path = %path.display(),
+                        id = %s,
+                        "installed_plugins_intent: dropping invalid plugin id (expect '<plugin>@<marketplace>')"
+                    ),
+                    None => tracing::warn!(
+                        path = %path.display(),
+                        "installed_plugins_intent: dropping non-string entry in 'installedPlugins'"
+                    ),
+                }
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => tracing::warn!(
+            path = %path.display(),
+            "field 'installedPlugins' is not an array; treating as empty"
+        ),
+    }
+    InstalledPluginsIntentFile {
+        version: MATERIALIZED_VERSION,
+        account: InstalledPluginsIntent {
+            installed_plugins: set,
+        },
+    }
+}
+
 // ===========================================================================
 // 高层读写 / High-level load & save
 // ===========================================================================
@@ -470,9 +548,25 @@ pub fn load_installed_plugins(home: Option<&Path>, env: Option<&EnvMap>) -> Inst
     }
 }
 
+/// 加载 `installed_plugins_intent.json`（缺失 / 损坏 → 空配置）/ Load the install-intent file。
+///
+/// ⚠️ 「缺失 → 空」既是降级也是**迁移触发信号**：boot 的一次性迁移据文件是否存在判定是否需回填（见
+/// `Computer::boot_up`）。因此调用方若需区分「文件不存在」与「文件存在但空」，应改用
+/// [`installed_plugins_intent_path`] + `Path::exists` 判定，而非仅看本函数返回的空集。
+pub fn load_installed_plugins_intent(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> InstalledPluginsIntentFile {
+    let path = installed_plugins_intent_path(home, env);
+    match read_jsonc_with_recovery(&path) {
+        Some(data) => coerce_installed_plugins_intent(&data, &path),
+        None => empty_installed_plugins_intent(),
+    }
+}
+
 /// 加锁 + 原子写 `known_marketplaces.json`（带写保护头 + `version`）/ Locked atomic write。
 ///
-/// ⚠️ **不可**在已持有 [`with_file_lock`] 的上下文内调用；读-改-写请改用 [`update_known_marketplaces`]。
+/// ⚠️ **不可**在已持有 `with_file_lock` 的上下文内调用；读-改-写请改用 [`update_known_marketplaces`]。
 pub fn save_known_marketplaces(
     file: &KnownMarketplacesFile,
     home: Option<&Path>,
@@ -492,7 +586,7 @@ pub fn save_known_marketplaces(
 
 /// 加锁 + 原子写 `installed_plugins.json`（带写保护头 + `version`）/ Locked atomic write。
 ///
-/// ⚠️ **不可**在已持有 [`with_file_lock`] 的上下文内调用；读-改-写请改用 [`update_installed_plugins`]。
+/// ⚠️ **不可**在已持有 `with_file_lock` 的上下文内调用；读-改-写请改用 [`update_installed_plugins`]。
 pub fn save_installed_plugins(
     file: &InstalledPluginsFile,
     home: Option<&Path>,
@@ -561,6 +655,35 @@ pub fn update_installed_plugins(
             let mut current = match read_jsonc_with_recovery(&path) {
                 Some(data) => coerce_installed_plugins(&data, &path),
                 None => empty_installed_plugins(),
+            };
+            mutator(&mut current);
+            current.version = MATERIALIZED_VERSION;
+            atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            Ok(current)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 持锁原子读-改-写 `installed_plugins_intent.json`（语义同 [`update_known_marketplaces`]）/ Locked atomic RMW。
+///
+/// install/uninstall 经此写全局安装意图（config-first）。缺失文件 → 空集起步；`mutator` 就地增删 id。
+/// **落盘即建文件**——boot 迁移据此文件存在与否幂等（首次写入即标记迁移完成）。
+pub fn update_installed_plugins_intent(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile),
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    let path = installed_plugins_intent_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<InstalledPluginsIntentFile> {
+            let mut current = match read_jsonc_with_recovery(&path) {
+                Some(data) => coerce_installed_plugins_intent(&data, &path),
+                None => empty_installed_plugins_intent(),
             };
             mutator(&mut current);
             current.version = MATERIALIZED_VERSION;
@@ -758,6 +881,21 @@ impl SkillGovernanceStore for FileSkillGovernanceStore {
         }
     }
 
+    fn load_installed_plugins_intent(&self) -> InstalledPluginsIntent {
+        load_installed_plugins_intent(Some(&self.home), self.env()).account
+    }
+
+    fn update_installed_plugins_intent(&self, mutate: &mut dyn FnMut(&mut InstalledPluginsIntent)) {
+        let res = update_installed_plugins_intent(
+            |file| mutate(&mut file.account),
+            Some(&self.home),
+            self.env(),
+        );
+        if let Err(e) = res {
+            tracing::error!(error = %e, "update installed_plugins_intent.json failed (degraded)");
+        }
+    }
+
     fn as_recorder(&self) -> &dyn KnownMarketplaceRecorder {
         self
     }
@@ -773,6 +911,52 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    // ---- installedPlugins 意图文件（v0.3.0）/ install-intent store -----------
+    #[test]
+    fn installed_plugins_intent_roundtrip_and_coerce_drops_invalid() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        // 空起步 + 文件不存在（迁移触发信号）。
+        assert!(load_installed_plugins_intent(Some(home), None)
+            .account
+            .installed_plugins
+            .is_empty());
+        assert!(!installed_plugins_intent_path(Some(home), None).exists());
+
+        // update RMW：加两个 id → 落盘建文件。
+        update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("audit@acme".to_string());
+                f.account.installed_plugins.insert("lint@acme".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        assert!(installed_plugins_intent_path(Some(home), None).exists());
+        let loaded = load_installed_plugins_intent(Some(home), None)
+            .account
+            .installed_plugins;
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains("audit@acme") && loaded.contains("lint@acme"));
+
+        // coerce 丢非法项：手写含非法 id / 非字符串的文件，load 后仅合法项存留。
+        let bad =
+            json!({"version": 1, "installedPlugins": ["ok@mp", "no-at-sign", 123, "Bad_Name@mp"]});
+        std::fs::write(
+            installed_plugins_intent_path(Some(home), None),
+            serde_json::to_string(&bad).unwrap(),
+        )
+        .unwrap();
+        let loaded2 = load_installed_plugins_intent(Some(home), None)
+            .account
+            .installed_plugins;
+        assert_eq!(
+            loaded2.into_iter().collect::<Vec<_>>(),
+            vec!["ok@mp".to_string()]
+        );
     }
 
     // ---- 纯逻辑 / pure logic ------------------------------------------------
@@ -867,7 +1051,10 @@ mod tests {
             "figma@acme".to_string(),
             vec![InstalledPluginRecord {
                 install_path: Some("/home/.plugins/figma".to_string()),
-                bundled_mcp_servers: vec!["figma-mcp".to_string()],
+                mcp_servers: vec![crate::mcp_clients::model::BundleId::try_from(
+                    "figma-mcp".to_string(),
+                )
+                .unwrap()],
                 extra: {
                     let mut m = Map::new();
                     m.insert("scope".into(), json!("user"));
@@ -884,7 +1071,10 @@ mod tests {
             recs[0].install_path.as_deref(),
             Some("/home/.plugins/figma")
         );
-        assert_eq!(recs[0].bundled_mcp_servers, vec!["figma-mcp".to_string()]);
+        assert_eq!(
+            recs[0].mcp_servers,
+            vec![crate::mcp_clients::model::BundleId::try_from("figma-mcp".to_string()).unwrap()]
+        );
         assert_eq!(recs[0].extra.get("scope"), Some(&json!("user")));
     }
 

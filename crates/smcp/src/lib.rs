@@ -7,9 +7,8 @@ pub mod utils;
 /// SKILL name 解析与合成（段数消歧 lexer）/ SKILL name parse & synthesis (segment-count lexer)。
 pub mod skill_name;
 pub use skill_name::{
-    is_valid_skill_name, normalize_mcp_server_segment, parse_skill_name,
-    synthesize_marketplace_name, synthesize_mcp_name, synthesize_user_name, ParsedSkillName,
-    SkillNameError, SkillNameKind,
+    is_valid_skill_name, parse_skill_name, synthesize_marketplace_name, synthesize_mcp_name,
+    synthesize_user_name, ParsedSkillName, SkillNameError, SkillNameKind,
 };
 
 /// 协议版本解析与兼容性判定 / Protocol version parse & compatibility。
@@ -23,16 +22,17 @@ pub const SMCP_NAMESPACE: &str = "/smcp";
 
 /// A2C-SMCP 协议版本号 / A2C-SMCP protocol version
 ///
-/// 锁定为 `MAJOR.MINOR` = `0.2.0`。SKILL（v0.2.1）与通用二进制传输（v0.2.1）等均为**加性升级**，
-/// 不改变 `MAJOR.MINOR`，因此该常量保持 `"0.2.0"`，用于 HTTP 握手阶段的版本协商。
+/// `MAJOR.MINOR` = `0.3.0`。v0.3.0 为 plugin install/enable 生命周期分离（`computer-management.md` §2.4，
+/// 非加性、破坏性），故从 `0.2.x` bump 到 `0.3.0`，用于 HTTP 握手阶段的版本协商。**v0.x 阶段 MINOR 严格相等**
+/// （见 [`version::is_compatible`]）——三方（Agent/Computer/Server）必须同为 `0.3.x` 才能握手，`0.2.x` 与
+/// `0.3.x` 互不兼容（4008）。PATCH 不影响兼容性。
 ///
-/// Locked to `MAJOR.MINOR` = `0.2.0`. SKILL (v0.2.1) and generic binary transfer (v0.2.1) are
-/// **additive** upgrades that do not bump `MAJOR.MINOR`; this constant stays `"0.2.0"` and is used
-/// for version negotiation during the HTTP handshake.
+/// `MAJOR.MINOR` = `0.3.0`. v0.3.0 splits the plugin install/enable lifecycle (breaking, not additive),
+/// bumping from `0.2.x`. In v0.x MINOR must match exactly, so all three roles must be `0.3.x` to handshake.
 ///
 /// 协议依据 / Protocol: `a2c-smcp-protocol` versioning.md。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py`。
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 /// 标准错误码模块 / Standard error codes module
 ///
@@ -201,9 +201,9 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// `total=False` TypedDict）：
 /// - 4008（协议版本不兼容）→ `server_version` / `client_version` / `min_supported` /
 ///   `max_supported`（HS-01 #21 / HS-02 #22；构造见 [`ErrorPayload::version_mismatch`]）。
-/// - 4014（MCP Server 未命中）→ `mcp_server_name`；4015（能力不支持）→ `mcp_server_name` /
-///   `capability`（SRV-01 #47 / AUTH-01 #23；构造见 [`ErrorPayload::with_mcp_server_name`] /
-///   [`ErrorPayload::with_capability`]）。
+/// - 4014（MCP Server 未命中）→ `mcp_server`（值 = **bundle_id**，协议 0.3.0 §身份正交性 #18）；
+///   4015（能力不支持）→ `mcp_server`（bundle_id）/ `capability`（SRV-01 #47 / AUTH-01 #23；构造见
+///   [`ErrorPayload::with_mcp_server`] / [`ErrorPayload::with_capability`]）。
 /// - 4016 / 4017 / 4018 的 code-specific 字段下沉到 `details` 子对象（无顶层平铺新字段）。
 ///
 /// 未知顶层字段由 [`ErrorPayload::extra`]（`#[serde(flatten)]`）**捕获并保留**，跨-SDK 往返
@@ -230,9 +230,10 @@ pub struct ErrorPayload {
     /// 4008 顶层分流：服务端支持的最大版本 / top-level for 4008: max supported。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_supported: Option<String>,
-    /// 4014 / 4015 顶层分流：未命中 / 缺能力的 MCP Server 名 / top-level for 4014&4015: MCP server name。
+    /// 4014 / 4015 顶层分流：未命中 / 缺能力的 MCP Server 的 **bundle_id**（协议 0.3.0 §身份正交性 #18）。
+    /// top-level for 4014&4015: the target MCP server's bundle_id。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_server_name: Option<String>,
+    pub mcp_server: Option<String>,
     /// 4015 顶层分流：缺失的 capability 名（如 `"resources"`）/ top-level for 4015: missing capability。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
@@ -254,7 +255,7 @@ impl ErrorPayload {
             client_version: None,
             min_supported: None,
             max_supported: None,
-            mcp_server_name: None,
+            mcp_server: None,
             capability: None,
             extra: serde_json::Map::new(),
         }
@@ -295,9 +296,9 @@ impl ErrorPayload {
         self
     }
 
-    /// 顶层平铺 `mcp_server_name`（4014 / 4015 分流字段）/ Set top-level `mcp_server_name` (4014/4015).
-    pub fn with_mcp_server_name(mut self, name: impl Into<String>) -> Self {
-        self.mcp_server_name = Some(name.into());
+    /// 顶层平铺 `mcp_server`（4014 / 4015 分流字段，值 = **bundle_id**，协议 0.3.0 #18）/ Set top-level `mcp_server`.
+    pub fn with_mcp_server(mut self, bundle_id: impl Into<String>) -> Self {
+        self.mcp_server = Some(bundle_id.into());
         self
     }
 
@@ -321,7 +322,7 @@ impl ErrorPayload {
             client_version: Some(client.to_string()),
             min_supported: Some(format!("{}.{}.0", server.major, server.minor)),
             max_supported: Some(format!("{}.{}.999", server.major, server.minor)),
-            mcp_server_name: None,
+            mcp_server: None,
             capability: None,
             extra: serde_json::Map::new(),
         }
@@ -555,10 +556,12 @@ pub mod tool_meta {
     // 不走 flat ErrorPayload，而内嵌 CallToolResult(isError=true) + 下列三键，使 Agent 区分「工具坏了」
     // 与「需授权」。Protocol-literal keys (NOT a2c-prefixed) for the upstream-auth CallToolResult.meta.
 
-    /// 结果级（MUST）：授权错误码 `4006`/`4007`（整数，[`ErrorCode::ToolAuthorizationRequired`] /
-    /// [`ErrorCode::ToolAuthorizationFailed`]）。
+    /// 结果级（MUST）：授权错误码 `4006`/`4007`（整数，[`crate::ErrorCode::ToolAuthorizationRequired`] /
+    /// [`crate::ErrorCode::ToolAuthorizationFailed`]）。
     pub const AUTH_ERROR_CODE_KEY: &str = "error_code";
-    /// 结果级（MUST）：触发授权错误的 MCP Server 标识 / the MCP server that raised the auth error。
+    /// 结果级（MUST）：触发授权错误的 MCP Server 的 **bundle_id**（值 = bundle_id，协议 0.3.0 §身份正交性 #18；
+    /// 生产方发 `call_tool` 传入的 bundle_id 身份键，与 `get_config` 归属一致）/
+    /// the MCP server (bundle_id) that raised the auth error。
     pub const AUTH_MCP_SERVER_KEY: &str = "mcp_server";
     /// 结果级（SHOULD）：面向用户的**非敏感**授权提示对象（`action`/`message`，已脱敏）/
     /// non-sensitive user-facing auth hint object (sanitized per error-handling.md §454)。
@@ -694,9 +697,20 @@ pub struct GetToolsReq {
 }
 
 /// SMCP工具定义
+///
+/// **协议 0.3.0 D1（#136）**：`bundle_id` 为**必填** wire 字段（snake_case），承载该工具所属 MCP
+/// Server 的**解析后** `bundle_id`（`resolve_bundle_id` 产物，恒非空；非配置显式声明值，缺省下二者可能不同）。
+/// 它与 [`GetComputerConfigRet.servers`] 的字典 key、错误码 `meta.mcp_server` 属**同一身份空间**——Agent
+/// 据此把工具归属回具体 server（分组展示、关联配置与资源）。`name` 是聚合后的 `exposed_tool_name`
+/// （`{bundle_id}__{alias ?? 原始名}`），对 Agent **不透明**：**MUST NOT** 通过切分 `__` 前缀反推归属，
+/// 本字段即归属的唯一正解。
+///
+/// [`GetComputerConfigRet.servers`]: GetComputerConfigRet
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SMCPTool {
     pub name: String,
+    /// 所属 MCP Server 的**解析后** `bundle_id`（server 唯一身份，非 display 名）。
+    pub bundle_id: String,
     pub description: String,
     pub params_schema: serde_json::Value,
     pub return_schema: Option<serde_json::Value>,
@@ -836,7 +850,9 @@ pub struct GetResourcesReq {
     pub base: AgentCallData,
     /// 目标 Computer 名 / target Computer name。
     pub computer: String,
-    /// 必填：目标 MCP Server 名称 / required: target MCP Server name。
+    /// 必填：目标 MCP Server 的 **bundle_id**（**非** display 名；协议 0.3.0 §身份正交性 #18）。
+    /// Computer 侧按 bundle_id 直查 `active_clients`、不经 name 解析 ⇒ 传 display 名 → `4014`。
+    /// required: the target MCP server's **bundle_id** (NOT the display name; a display name → `4014`)。
     pub mcp_server: String,
     /// MCP 标准翻页游标（可选；缺省取首页）/ MCP-standard pagination cursor (optional)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1368,12 +1384,12 @@ mod tests {
     fn test_error_payload_with_details_serialization() {
         // details 以对象形式平铺在顶层 details 容器内
         let payload = ErrorPayload::new(4014, "boom")
-            .with_detail("mcp_server_name", "srv-a")
+            .with_detail("mcp_server", "srv-a")
             .with_detail("hint", "retry");
         let v = serde_json::to_value(&payload).unwrap();
 
         assert_eq!(v["code"], 4014);
-        assert_eq!(v["details"]["mcp_server_name"], "srv-a");
+        assert_eq!(v["details"]["mcp_server"], "srv-a");
         assert_eq!(v["details"]["hint"], "retry");
     }
 
@@ -1470,17 +1486,17 @@ mod tests {
         let v = serde_json::to_value(&payload).unwrap();
         assert!(is_protocol_error_payload(&v));
         // 顶层分流字段未设置时不序列化
-        assert!(v.get("mcp_server_name").is_none());
+        assert!(v.get("mcp_server").is_none());
         assert!(v.get("capability").is_none());
         assert!(v.get("details").is_none());
     }
 
     #[test]
     fn test_error_payload_4014_top_level_field() {
-        // 4014：mcp_server_name 顶层平铺（非 details 子对象）
+        // 4014：mcp_server 顶层平铺（非 details 子对象）
         let v = serde_json::to_value(
             ErrorPayload::from_error_code(ErrorCode::McpServerNotFound, "not found")
-                .with_mcp_server_name("filesystem"),
+                .with_mcp_server("filesystem"),
         )
         .unwrap();
         assert_eq!(
@@ -1488,17 +1504,17 @@ mod tests {
             serde_json::json!({
                 "code": 4014,
                 "message": "not found",
-                "mcp_server_name": "filesystem"
+                "mcp_server": "filesystem"
             })
         );
     }
 
     #[test]
     fn test_error_payload_4015_top_level_fields_python_shape() {
-        // 4015：mcp_server_name + capability 双顶层字段，与 Python smcp.py:484 total=False 形态一致
+        // 4015：mcp_server + capability 双顶层字段，与 Python smcp.py:484 total=False 形态一致
         let v = serde_json::to_value(
             ErrorPayload::from_error_code(ErrorCode::McpCapabilityNotSupported, "unsupported")
-                .with_mcp_server_name("docs-server")
+                .with_mcp_server("docs-server")
                 .with_capability("resources"),
         )
         .unwrap();
@@ -1507,7 +1523,7 @@ mod tests {
             serde_json::json!({
                 "code": 4015,
                 "message": "unsupported",
-                "mcp_server_name": "docs-server",
+                "mcp_server": "docs-server",
                 "capability": "resources"
             })
         );
@@ -1519,7 +1535,7 @@ mod tests {
         let wire = serde_json::json!({
             "code": 4014,
             "message": "x",
-            "mcp_server_name": "srv",   // 已建模顶层字段 → 落入 typed field，不进 extra
+            "mcp_server": "srv",   // 已建模顶层字段 → 落入 typed field，不进 extra
             "future_string": "keep-me", // 未建模 → 落入 extra
             "future_object": { "nested": true },
             "future_number": 7
@@ -1527,8 +1543,8 @@ mod tests {
         let payload: ErrorPayload = serde_json::from_value(wire.clone()).unwrap();
 
         // 已建模字段不污染 extra
-        assert_eq!(payload.mcp_server_name.as_deref(), Some("srv"));
-        assert!(!payload.extra.contains_key("mcp_server_name"));
+        assert_eq!(payload.mcp_server.as_deref(), Some("srv"));
+        assert!(!payload.extra.contains_key("mcp_server"));
         assert!(!payload.extra.contains_key("code"));
         // 未建模字段被 extra 捕获
         assert_eq!(payload.extra.get("future_string").unwrap(), "keep-me");
@@ -1541,8 +1557,15 @@ mod tests {
 
     #[test]
     fn test_protocol_version_constant() {
-        // PROTOCOL_VERSION 锁定 MAJOR.MINOR = 0.2.0（SKILL/blob 为加性升级，不改主次版本）
-        assert_eq!(PROTOCOL_VERSION, "0.2.0");
+        // 不与具体值耦合（协议版本会随发布演进）：仅校验 PROTOCOL_VERSION 是**合法且规范**（解析后往返一致）
+        // 的 3 段版本——这是握手中间件 `parse().expect()` 依赖的唯一不变式。升级协议版本时本测试无需改。
+        let v = crate::version::ProtocolVersion::parse(PROTOCOL_VERSION)
+            .expect("PROTOCOL_VERSION must be a valid 3-segment version");
+        assert_eq!(
+            v.to_string(),
+            PROTOCOL_VERSION,
+            "PROTOCOL_VERSION 应为规范形（无前导零 / 恰好 3 段）"
+        );
     }
 
     #[test]

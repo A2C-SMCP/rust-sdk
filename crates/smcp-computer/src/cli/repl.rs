@@ -11,9 +11,11 @@
 * registry/home/session）；变更后触发去抖 emit（`mark_skills_dirty`）。Rust 经 `Computer::skill_registry_arc`
 * 取写锁拿 `&mut SkillRegistry`，`CliMcpHooks` 装配 MCP 注入回调，`ReplConfirm`/`ReplTeardown` 走 stdin 交互。
 *
-* **锁序（注意）**：本路径取 `skill_registry.write` → 经 hooks 间接取 `mcp_manager` 锁，与 `Computer::restage_mcp_skills`
-* 的 `mcp_manager.read` → `skill_registry.write` 相反。当前安全（restage 仅 boot_up 调、无并发 MCP 通知接线，
-* 见 computer.rs `restage_mcp_skills` 注释）；写锁在 `mark_skills_dirty` 前均显式 `drop`（去抖 emit 不同步回锁）。
+ * **锁序（#106 后）**：本路径取 `skill_registry.write` → 经 hooks 调 `add_or_update_server`/`remove_server`
+ * 取 `mcp_manager` 锁。运行期 MCP 变化消费者（McpChangeReactor）已并发接线、取 `mcp_manager.read` →
+ * `skill_registry.write`（相反序）；为消除 ABBA，`add_or_update_server` 惰性初始化改为「先 read 探测、仅 None 才
+ * write」，使 post-boot 本路径退化为 `skill_registry.write` → `mcp_manager.read`，与消费者读锁读读相容（详见
+ * computer.rs `add_or_update_server` / `restage_mcp_skills` 注释）；写锁在 `mark_skills_dirty` 前均显式 `drop`。
 */
 
 use std::path::Path;
@@ -69,9 +71,13 @@ struct ReplTeardown<'a, S: Session> {
 
 #[async_trait]
 impl<S: Session> McpTeardown for ReplTeardown<'_, S> {
-    async fn teardown(&self, servers: Vec<String>) {
-        for name in servers {
-            let _ = self.comp.remove_server(&name).await;
+    async fn teardown(&self, servers: Vec<crate::mcp_clients::model::BundleId>) {
+        for id in servers {
+            // #113 S6：gc 停摘 bundled server 走**运行期卸载**（不删 config 声明）——bundled 归属 ledger、非用户 config。
+            // #139/#141：按 **bundle_id** 精确停摘——经合并后的 `unmount_server(&BundleId)`（R4）。
+            if let Err(e) = self.comp.unmount_server(&id).await {
+                tracing::warn!(bundle_id = %id.as_str(), error = %e, "gc teardown: unmount failed");
+            }
         }
     }
 }
@@ -151,6 +157,8 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
                 return;
             };
             let hooks = CliMcpHooks::new(comp, None, None).await;
+            // #139：marketplace 级联卸载的回收判据数据源（全集）——传空集会连坐用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
             let code = marketplace_remove(
                 &mut registry,
@@ -163,6 +171,7 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
                     hooks: Some(&hooks),
                     json_output: json,
                 },
+                &non_plugin,
             )
             .await;
             drop(registry);
@@ -201,8 +210,8 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
     let pos = positionals(&args);
     let home = comp.skill_home();
     let reg_arc = comp.skill_registry_arc();
-    let active = comp.active_workdir();
-    let workdirs = comp.registered_workdirs();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
 
     match sub.as_str() {
         "install" => {
@@ -217,7 +226,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
             let scope = flag_value(&args, "--scope").unwrap_or_else(|| "user".to_string());
             let version = flag_value(&args, "--version");
             let project_path = if scope == "project" || scope == "local" {
-                active.as_deref().and_then(Path::to_str)
+                cwd.as_deref().and_then(Path::to_str)
             } else {
                 None
             };
@@ -250,6 +259,9 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, None, None).await;
+            // #139：回收判据数据源（durable + flag + embed 的 `origin != plugin` 全集）——传空集会连坐
+            // 用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
             let code = plugin_uninstall(
                 &mut registry,
@@ -257,6 +269,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 None,
                 id,
                 has_flag(&args, "--keep-servers"),
+                &non_plugin,
                 Some(&hooks),
                 json,
             )
@@ -289,8 +302,19 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, None, None).await;
+            // #139：回收判据数据源（同 uninstall）——传空集会连坐用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
-            let code = plugin_disable(&mut registry, &home, None, id, Some(&hooks), json).await;
+            let code = plugin_disable(
+                &mut registry,
+                &home,
+                None,
+                id,
+                &non_plugin,
+                Some(&hooks),
+                json,
+            )
+            .await;
             drop(registry);
             if code == EXIT_OK {
                 comp.mark_skills_dirty();
@@ -300,8 +324,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
             plugin_list(
                 &home,
                 None,
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
                 has_flag(&args, "--available"),
                 json,
             );
@@ -311,18 +334,20 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 msg_warn("usage: plugin info <plugin>@<marketplace>");
                 return;
             };
-            plugin_info(&home, None, id, &workdirs, active.as_deref(), json);
+            plugin_info(&home, None, id, cwd.as_deref(), json);
         }
         "gc" => {
             let confirm = ReplConfirm;
             let teardown = ReplTeardown { comp };
+            // #139：回收判据数据源（同 uninstall）——传空集会连坐用户/宿主自有 server。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
             let code = plugin_gc(
                 &mut registry,
                 &home,
                 None,
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
+                &non_plugin,
                 Some(&teardown),
                 Some(&confirm),
                 json,
@@ -344,16 +369,15 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
     let json = has_flag(&args, "--json");
     let pos = positionals(&args);
     let scope = flag_value(&args, "--scope");
-    let workdirs = comp.registered_workdirs();
-    let active = comp.active_workdir();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
 
     match sub.as_str() {
         "show" => {
             settings_show(
                 None,
                 scope.as_deref().unwrap_or("merged"),
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
                 flag_path,
                 json,
             );
@@ -369,8 +393,7 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
                 None,
                 key,
                 scope.as_deref().unwrap_or("merged"),
-                &workdirs,
-                active.as_deref(),
+                cwd.as_deref(),
                 flag_path,
                 json,
             );
@@ -389,7 +412,7 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
                 key,
                 &value,
                 scope.as_deref().unwrap_or("user"),
-                active.as_deref(),
+                cwd.as_deref(),
                 json,
             );
             if code == EXIT_OK && is_emit_key(key) {
@@ -400,7 +423,7 @@ pub fn dispatch_settings<S: Session>(comp: &Computer<S>, parts: &[&str], flag_pa
             let code = settings_edit(
                 None,
                 scope.as_deref().unwrap_or("user"),
-                active.as_deref(),
+                cwd.as_deref(),
                 None,
                 json,
             );

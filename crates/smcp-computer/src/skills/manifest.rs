@@ -5,7 +5,7 @@
 * 最后修改日期: 2026/06/03
 * 版权: 2023 JQQ. All rights reserved.
 * 依赖: serde_json, smcp (utils::path), crate::mcp_clients::model, crate::skills::sources
-* 描述: Plugin manifest 文件式解析（marketplace.json + plugin.json + mcp-servers/<n>.json）
+* 描述: Plugin manifest 文件式解析（marketplace.json + plugin.json + `mcp-servers/<n>.json`）
 *       对标 Python computer/skills/manifest.py / Plugin manifest file parsing.
 */
 
@@ -305,8 +305,20 @@ pub fn enumerate_bundled_server_files(plugin_root: &Path) -> Vec<PathBuf> {
 ///
 /// 强制**文件名（去 `.json`）== 配置内 `name`**（mcp-servers 协议 §1）。
 ///
+/// # ⚠️ #130 起：畸形 `bundle_id` 会在此判废，爆炸半径 = **整个 plugin**（非单个 server）
+///
+/// [`BundleId`](crate::mcp_clients::model::BundleId) 构造即校验后，`bundle_id` 成为 **parse 级**判据——
+/// 此前它**不是**（`Option<String>` 恒解析成功、到 manager 注册期才逐条诊断跳过）。因 [`load_bundled_servers`]
+/// 是 `collect::<Result<Vec<_>, _>>()` **原子**语义，一个畸形 `bundle_id` ⇒ 该 plugin 的**全部** bundled server
+/// 一起废：install / enable **硬失败**（合理——install 原子前置，§2.4 禁半态），但 **boot recovery** 路径
+/// （`settings::recovery`）会 WARN 跳过该 plugin 的全部 server。
+///
+/// **升级路径注意**：旧版下已安装、携畸形 `bundleId` 的 plugin，升级后其 bundled server 会整包消失（仅 WARN）。
+/// recovery 路径是否应改为**逐-server** 降级（install 保持原子）是待评估项。对比：`mcp.json` 路径是**逐-server**
+/// 降级（`settings::mcp_config::validate_server`，整份文件不 abort）——两条路径的粒度**有意不同**。
+///
 /// # Errors
-/// 解析/校验失败或文件名 stem 与 `name` 不一致 → [`PluginManifestError`]。
+/// 解析/校验失败（含畸形 `bundle_id`）或文件名 stem 与 `name` 不一致 → [`PluginManifestError`]。
 pub fn parse_bundled_server(path: &Path) -> Result<MCPServerConfig, PluginManifestError> {
     let data = read_json_object(path, "bundled MCP server")?;
     let cfg: MCPServerConfig = serde_json::from_value(Value::Object(data)).map_err(|e| {

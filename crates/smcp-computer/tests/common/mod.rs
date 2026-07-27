@@ -44,21 +44,15 @@ pub async fn create_test_computer_with_servers() -> Computer<SilentSession> {
     // 添加测试服务器配置 / Add test server config
     servers.insert(
         "test_server".to_string(),
-        MCPServerConfig::Stdio(StdioServerConfig {
-            env_file: None,
-            name: "test_server".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            server_parameters: StdioServerParameters {
+        MCPServerConfig::Stdio(StdioServerConfig::new(
+            "test_server",
+            StdioServerParameters {
                 command: "echo".to_string(),
                 args: vec!["hello".to_string()],
                 env: HashMap::new(),
                 cwd: None,
             },
-        }),
+        )),
     );
 
     let mut inputs = HashMap::new();
@@ -74,6 +68,10 @@ pub async fn create_test_computer_with_servers() -> Computer<SilentSession> {
         }),
     );
 
+    // #113 S6：add/remove_server 落盘 → 定向隔离临时目录（forget 保留至进程退出），避免污染仓库工作树。
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
     Computer::new(
         "test_computer",
         SilentSession::new("test_session"),
@@ -82,6 +80,7 @@ pub async fn create_test_computer_with_servers() -> Computer<SilentSession> {
         false,
         false,
     )
+    .with_config_dir(config_dir)
 }
 
 /// 创建测试服务器配置文件 / Create test server config file
@@ -177,6 +176,10 @@ pub async fn create_command_handler() -> CommandHandler {
 
 /// 创建未初始化的 CommandHandler 实例 / Create uninitialized CommandHandler instance
 pub async fn create_uninitialized_command_handler() -> CommandHandler {
+    // #113 S6：remove_server 落盘 → 定向隔离临时目录（forget 保留至进程退出），避免污染仓库工作树。
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
     let computer = Computer::new(
         "uninitialized_computer",
         SilentSession::new("uninitialized_session"),
@@ -184,7 +187,8 @@ pub async fn create_uninitialized_command_handler() -> CommandHandler {
         None,
         false,
         false,
-    );
+    )
+    .with_config_dir(config_dir);
     let cli_config = CliConfig {
         url: None,
         namespace: "test_namespace".to_string(),

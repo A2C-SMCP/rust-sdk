@@ -43,7 +43,8 @@ use tempfile::TempDir;
 
 use smcp::{
     events, is_protocol_error_payload, AgentCallData, GetBlobReq, GetBlobRet, GetDesktopReq,
-    GetResourcesReq, GetSkillReq, GetSkillsReq, ReqId, Role, ToolCallReq, PROTOCOL_VERSION,
+    GetResourcesReq, GetSkillReq, GetSkillsReq, ProtocolVersion, ReqId, Role, ToolCallReq,
+    PROTOCOL_VERSION,
 };
 
 use harness::{
@@ -78,8 +79,10 @@ async fn handshake_tristate_http() {
     assert_eq!(body["code"], 400);
     assert!(hdr.is_none());
 
-    // 不兼容
-    let (status, hdr, body) = http_get(&format!("{base}&a2c_version=0.1.0")).await;
+    // 不兼容：从 PROTOCOL_VERSION 派生一个**必然不兼容**的 client（MAJOR+1），与具体协议版本解耦。
+    let server_v = ProtocolVersion::parse(PROTOCOL_VERSION).unwrap();
+    let client_v = ProtocolVersion::new(server_v.major + 1, server_v.minor, server_v.patch);
+    let (status, hdr, body) = http_get(&format!("{base}&a2c_version={client_v}")).await;
     assert_eq!(status, 400, "incompatible 应 400");
     assert_eq!(body["code"], 4008, "不兼容应回 4008, body={body}");
     assert_eq!(
@@ -87,10 +90,17 @@ async fn handshake_tristate_http() {
         Some("4008"),
         "mismatch 应带 X-A2C-Error-Code: 4008"
     );
+    // 诊断字段从 server_v 派生（min/max = server 的 MAJOR.MINOR.{0,999}），不与具体版本耦合。
     assert_eq!(body["server_version"], PROTOCOL_VERSION);
-    assert_eq!(body["client_version"], "0.1.0");
-    assert_eq!(body["min_supported"], "0.2.0");
-    assert_eq!(body["max_supported"], "0.2.999");
+    assert_eq!(body["client_version"], client_v.to_string());
+    assert_eq!(
+        body["min_supported"],
+        format!("{}.{}.0", server_v.major, server_v.minor)
+    );
+    assert_eq!(
+        body["max_supported"],
+        format!("{}.{}.999", server_v.major, server_v.minor)
+    );
 
     // 兼容 → 放行（200）
     let (status, hdr, _body) = http_get(&format!("{base}&a2c_version={PROTOCOL_VERSION}")).await;
@@ -745,10 +755,20 @@ async fn tool_call_timeout_marks_meta() {
         body.get("code").is_none(),
         "tool_call 不应回协议错误: {body}"
     );
-    let timed_out = deep_find(&body, "a2c_timeout")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    assert!(timed_out, "超时结果 meta 应 a2c_timeout=true, got: {body}");
+    // #92：在**真实 ack 线形态**上钉死协议规范出线 key——结果级标记 MUST 落顶层 `meta`（非 `_meta`），
+    // 否则只读 `meta` 的 consumer（如 Python Agent）识别不到超时态。用 key-精确断言（**不**用 key-agnostic
+    // 的 deep_find）以守护 promote_result_meta_to_meta 的接线：若该重映射被移除，标记将落 `_meta.a2c_timeout`，
+    // 本断言即失败（验收点 #1/#3 的端到端回归守护）。
+    assert_eq!(
+        body.pointer("/meta/a2c_timeout").and_then(Value::as_bool),
+        Some(true),
+        "超时结果须出线为顶层 meta.a2c_timeout=true, got: {body}"
+    );
+    // 且顶层 `_meta` 不再携带该结果级标记（producer 已合规、已提升为 `meta`）。
+    assert!(
+        body.pointer("/_meta/a2c_timeout").is_none(),
+        "重映射后顶层 _meta 不应再携带 a2c_timeout, got: {body}"
+    );
     // 1s 超时态远早于 4s 自然完成（证明超时分支胜出而非自然返回）。
     assert!(
         elapsed < Duration::from_millis(3500),

@@ -832,6 +832,9 @@ impl SmcpComputerClient {
                     .await?;
                 let mut value =
                     serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
+                // #92：顶层结果级 `_meta`（rmcp rename）→ 协议规范的 `meta`（producer MUST，跨 SDK 互通）。
+                // 先提升顶层、再铸造 content 旁路（二者操作不相交键：顶层 meta vs content[*]._meta）。
+                promote_result_meta_to_meta(&mut value);
                 // 铸造旁路（>内联预算的二进制 → toolspool 句柄 + 内联清空；超 too_large_cap 拒绝 + WARN）。
                 // mint 失败/小尺寸不致命：保留原内联，不阻断 tool_call 应答。
                 mint_oversize_binary_content(ops.as_ref(), &mut value).await;
@@ -853,7 +856,11 @@ impl SmcpComputerClient {
                         }
                     }
                 };
-                serde_json::to_value(result).map_err(ComputerError::SerializationError)?
+                let mut value =
+                    serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
+                // #92：同上——旧 manager 兜底路径亦须把顶层 `_meta` 提升为 `meta`（无标记则 no-op）。
+                promote_result_meta_to_meta(&mut value);
+                value
             }
         };
 
@@ -888,10 +895,14 @@ impl SmcpComputerClient {
                 Some(mgr) => {
                     // 转换Tool为SMCPTool
                     // Convert Tool to SMCPTool
-                    let tool_list = mgr.list_available_tools().await;
+                    // 携 bundle_id 拉取（协议 0.3.0 D1 / #136）：每个 SMCPTool 必带其所属 server 的
+                    // 解析后 bundle_id，供 Agent 归属工具（禁切 exposed `__` 前缀反推）。
+                    let tool_list = mgr.list_available_tools_with_bundle_id().await;
                     tool_list
                         .into_iter()
-                        .map(convert_tool_to_smcp_tool)
+                        .map(|(bundle_id, tool)| {
+                            convert_tool_to_smcp_tool(tool, bundle_id.as_str())
+                        })
                         .collect()
                 }
                 None => {
@@ -1009,8 +1020,10 @@ impl SmcpComputerClient {
                 let raw_windows = mgr.get_windows_details(req.window.as_deref()).await;
                 let windows: Vec<WindowInfo> = raw_windows
                     .into_iter()
-                    .map(|(server_name, resource, read_result)| {
-                        WindowInfo::new(server_name, resource, read_result)
+                    .map(|(bundle_id, server_name, resource, read_result)| {
+                        // `WindowInfo.bundle_id` 仍标 `ServerName`（desktop/model.rs 的既有误标）——
+                        // newtype 一上来就照出了它；改型归 #132 卫生批次，此处先按边界转换。
+                        WindowInfo::new(bundle_id.into_string(), server_name, resource, read_result)
                     })
                     .collect();
                 organize_desktop(windows, req.desktop_size.map(|s| s as usize), &[])
@@ -1032,8 +1045,8 @@ impl SmcpComputerClient {
     ///
     /// 透明转发指定 MCP Server 的 `resources/list`：单页透传（cursor 入参/`next_cursor` 出参原样转发），
     /// **不**聚合、**不**做 scheme/元数据过滤、**不**返回 `resourceTemplates`。错误经 ACK 第一参回传
-    /// **flat ErrorPayload**（禁止嵌套 envelope）：未知 `mcp_server` → 4014（顶层平铺 `mcp_server_name`）；
-    /// 目标 server 未声明 `resources` 能力 → 4015（顶层平铺 `mcp_server_name` + `capability`）。对齐
+    /// **flat ErrorPayload**（禁止嵌套 envelope）：未知 `mcp_server` → 4014（顶层平铺 `mcp_server`）；
+    /// 目标 server 未声明 `resources` 能力 → 4015（顶层平铺 `mcp_server` + `capability`）。对齐
     /// Python `on_get_resources`（RES-01 #30，协议 0.2.0 `client:get_resources`）。
     async fn handle_get_resources_with_ack(
         payload: Payload,
@@ -1091,23 +1104,23 @@ impl SmcpComputerClient {
                     smcp::ErrorCode::McpServerNotFound,
                     "MCP Server not registered",
                 )
-                .with_mcp_server_name(server);
+                .with_mcp_server(server);
                 Ok((ack_id, serde_json::to_value(payload)?))
             }
             // capability 不支持 → 4015 flat ErrorPayload。
             Err(ComputerError::McpCapabilityNotSupported {
-                server_name,
+                bundle_id,
                 capability,
             }) => {
                 warn!(
                     "client:get_resources MCP server '{}' does not support '{}' capability",
-                    server_name, capability
+                    bundle_id, capability
                 );
                 let payload = smcp::ErrorPayload::from_error_code(
                     smcp::ErrorCode::McpCapabilityNotSupported,
                     "MCP Server does not support the requested capability",
                 )
-                .with_mcp_server_name(server_name)
+                .with_mcp_server(bundle_id)
                 .with_capability(capability);
                 Ok((ack_id, serde_json::to_value(payload)?))
             }
@@ -1369,9 +1382,15 @@ impl SmcpComputerClient {
         }
     }
 
-    /// 断开连接
-    /// Disconnect from server
-    pub async fn disconnect(self) -> ComputerResult<()> {
+    /// 断开连接（发 Socket.IO DISCONNECT 包并关 transport）。
+    ///
+    /// #148：取 `&self`（底层 [`tf_rust_socketio::asynchronous::Client::disconnect`] 本就 `&self`），
+    /// 解除「`disconnect(self)` 按值取参被 `Arc` 挡住」的约束——使 `Computer::disconnect_socketio` /
+    /// `Computer::shutdown`（见 `computer` 模块）能直接对槽内 `Arc<SmcpComputerClient>` 调用，无需
+    /// 调用方 `try_unwrap` 取出内部句柄（这正是 tfrobot-client TFRC-65 要消除的封装边界缺口）。
+    ///
+    /// Disconnect from server (sends the Socket.IO DISCONNECT packet and closes the transport).
+    pub async fn disconnect(&self) -> ComputerResult<()> {
         debug!("Disconnecting from server");
         self.client
             .disconnect()
@@ -1449,9 +1468,15 @@ pub(crate) fn to_a2c_resource(resource: &crate::mcp_clients::model::Resource) ->
     }
 }
 
-/// 将内部 Tool 转换为协议类型 SMCPTool
-/// Convert internal Tool to protocol type SMCPTool
-pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -> smcp::SMCPTool {
+/// 将内部 `Tool`（rmcp 模型）转成协议类型 `SMCPTool` / Convert internal Tool to protocol SMCPTool。
+///
+/// `bundle_id`：该工具所属 MCP Server 的**解析后** `bundle_id`（协议 0.3.0 D1 / #136），由调用方从
+/// [`list_available_tools_with_bundle_id`](crate::mcp_clients::manager::MCPServerManager::list_available_tools_with_bundle_id)
+/// 与 `tool` 配对传入——**绝不**从 `tool.name`（exposed 名）切 `__` 前缀反推。
+pub(crate) fn convert_tool_to_smcp_tool(
+    tool: crate::mcp_clients::model::Tool,
+    bundle_id: &str,
+) -> smcp::SMCPTool {
     let mut meta_map = serde_json::Map::new();
 
     // 传递 tool.meta 中的所有键值（如 a2c_tool_meta）
@@ -1487,6 +1512,7 @@ pub(crate) fn convert_tool_to_smcp_tool(tool: crate::mcp_clients::model::Tool) -
     let params_schema = tool.schema_as_json_value();
     smcp::SMCPTool {
         name: tool.name.to_string(),
+        bundle_id: bundle_id.to_string(),
         description,
         params_schema,
         return_schema: None,
@@ -1613,6 +1639,46 @@ async fn mint_oversize_binary_content(ops: &dyn ComputerHandlerOps, raw: &mut Va
     }
 }
 
+/// 把已序列化 tool_call ack 的**顶层**结果级 `_meta` 重映射为协议规范的 `meta`
+/// （data-structures.md §234：producer MUST 写结果级 `meta`）。
+///
+/// 背景：rmcp `CallToolResult.meta` 为 `#[serde(rename = "_meta")]`（**无条件** rename），故
+/// `serde_json::to_value` 后 A2C 结果级标记出线为 `_meta.a2c_*`；而 Python 参考实现用 `result.meta=`
+/// 配合 `model_dump(mode="json")`（按字段名 dump）出线为 `meta`。为跨 SDK 互通，须在 wire 边界把顶层
+/// `_meta` 整体提升为 `meta`，覆盖所有结果级标记：`a2c_cancelled`、`a2c_cancel_reason`、`a2c_timeout`
+/// 及 AUTH-01 授权失败键（`error_code`、`mcp_server`、`auth_hint` 等，同根因顺带覆盖）。
+///
+/// 边界：**仅**动顶层；**不**触碰 `content[*]._meta`（blob 句柄子级，data-structures.md §683 规定
+/// MUST 保持 `_meta`）。非 object 的顶层 `_meta`（畸形）原样保留。已有顶层 `meta` 时按键合并、不覆盖
+/// 既有键（幂等、防丢键）。
+fn promote_result_meta_to_meta(raw: &mut Value) {
+    let Some(obj) = raw.as_object_mut() else {
+        return;
+    };
+    // 仅当顶层 `_meta` 为 object 时提升；非 object（畸形）原样保留、不报错。
+    if !obj.get("_meta").is_some_and(Value::is_object) {
+        return;
+    }
+    let Some(Value::Object(underscored)) = obj.remove("_meta") else {
+        return; // 不可达（上面已确认是 object），防御性返回。
+    };
+    // 并入顶层 `meta`：缺省新建；已存在则按键合并、不覆盖既有键（幂等、防丢键）。
+    let meta = obj
+        .entry("meta".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    match meta.as_object_mut() {
+        Some(meta_map) => {
+            for (k, v) in underscored {
+                meta_map.entry(k).or_insert(v);
+            }
+        }
+        // 顶层 `meta` 已存在但非 object（畸形，rmcp 不会产生）：不破坏既有值，整体放回 `_meta`。
+        None => {
+            obj.insert("_meta".to_string(), Value::Object(underscored));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,8 +1718,11 @@ mod tests {
             idempotent_hint: None,
             open_world_hint: Some(false),
         };
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)));
+        let smcp_tool =
+            convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)), "fs-bundle");
 
+        // 协议 0.3.0 D1 / #136：bundle_id 由调用方传入，原样填 wire 字段（不受 meta/annotations 影响）。
+        assert_eq!(smcp_tool.bundle_id, "fs-bundle");
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();
         assert!(meta_map.contains_key("a2c_tool_meta"));
@@ -1667,7 +1736,7 @@ mod tests {
     fn test_tool_to_smcp_tool_only_meta() {
         let mut meta = serde_json::Map::new();
         meta.insert("a2c_tool_meta".to_string(), json!({"tags": ["fs"]}));
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None));
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None), "test_bundle");
 
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();
@@ -1684,7 +1753,8 @@ mod tests {
             idempotent_hint: None,
             open_world_hint: Some(false),
         };
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, Some(annotations)));
+        let smcp_tool =
+            convert_tool_to_smcp_tool(make_tool(None, Some(annotations)), "test_bundle");
 
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();
@@ -1694,7 +1764,8 @@ mod tests {
 
     #[test]
     fn test_tool_to_smcp_tool_no_meta_no_annotations() {
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, None));
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(None, None), "test_bundle");
+        assert_eq!(smcp_tool.bundle_id, "test_bundle");
         assert!(smcp_tool.meta.is_none());
     }
 
@@ -1705,7 +1776,7 @@ mod tests {
             "simple_key".to_string(),
             serde_json::Value::String("already_a_string".to_string()),
         );
-        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None));
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None), "test_bundle");
 
         let meta_obj = smcp_tool.meta.unwrap();
         let meta_map = meta_obj.as_object().unwrap();
@@ -1823,13 +1894,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resources_single_page_passthrough() {
-        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::manager::{
+            test_support::{bid, inject},
+            MCPServerManager,
+        };
         use crate::mcp_clients::model::make_resource;
 
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "srv-1",
+            &bid("srv-1"),
             mock(
                 vec![vec![
                     make_resource("window://app/w1", "W1", None, None),
@@ -1860,13 +1934,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resources_cursor_passthrough() {
-        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::manager::{
+            test_support::{bid, inject},
+            MCPServerManager,
+        };
         use crate::mcp_clients::model::make_resource;
 
         let manager = MCPServerManager::new();
         inject(
             &manager,
-            "srv-1",
+            &bid("srv-1"),
             mock(
                 vec![
                     vec![make_resource("res://0", "r0", None, None)],
@@ -1916,21 +1993,24 @@ mod tests {
         .await
         .unwrap();
 
-        // flat ErrorPayload 4014（经 ACK 第一参回传），顶层平铺 mcp_server_name。
+        // flat ErrorPayload 4014（经 ACK 第一参回传），顶层平铺 mcp_server。
         assert_eq!(ack, Some(3));
         let err: smcp::ErrorPayload = serde_json::from_value(value).unwrap();
         assert_eq!(err.code, 4014);
-        assert_eq!(err.mcp_server_name.as_deref(), Some("missing"));
+        assert_eq!(err.mcp_server.as_deref(), Some("missing"));
         // 无嵌套 envelope：顶层即 code。
         assert!(err.capability.is_none());
     }
 
     #[tokio::test]
     async fn test_get_resources_capability_not_supported_4015() {
-        use crate::mcp_clients::manager::{test_support::inject, MCPServerManager};
+        use crate::mcp_clients::manager::{
+            test_support::{bid, inject},
+            MCPServerManager,
+        };
 
         let manager = MCPServerManager::new();
-        inject(&manager, "srv-1", mock(vec![], true)).await;
+        inject(&manager, &bid("srv-1"), mock(vec![], true)).await;
         let manager = Arc::new(RwLock::new(Some(manager)));
 
         let (_, value) = SmcpComputerClient::handle_get_resources_with_ack(
@@ -1941,10 +2021,10 @@ mod tests {
         .await
         .unwrap();
 
-        // flat ErrorPayload 4015，顶层平铺 mcp_server_name + capability。
+        // flat ErrorPayload 4015，顶层平铺 mcp_server + capability。
         let err: smcp::ErrorPayload = serde_json::from_value(value).unwrap();
         assert_eq!(err.code, 4015);
-        assert_eq!(err.mcp_server_name.as_deref(), Some("srv-1"));
+        assert_eq!(err.mcp_server.as_deref(), Some("srv-1"));
         assert_eq!(err.capability.as_deref(), Some("resources"));
     }
 
@@ -2201,5 +2281,98 @@ mod tests {
         );
         let r = SmcpComputerClient::handle_get_blob_with_ack(p, None, "c".to_string()).await;
         assert!(matches!(r, Err(ComputerError::InvalidState(_))));
+    }
+
+    // ── #92：tool_call ack 顶层结果级 `_meta`→`meta` 重映射（协议 §234 producer MUST=meta）──────
+
+    #[test]
+    fn test_promote_result_meta_top_level_cancel_timeout_to_meta() {
+        // rmcp CallToolResult 出线形态：顶层结果级标记落 `_meta`（rename）。重映射后须为协议规范的 `meta`。
+        let mut v = json!({
+            "content": [{ "type": "text", "text": "x" }],
+            "isError": true,
+            "_meta": { "a2c_cancelled": true, "a2c_cancel_reason": "agent_requested" }
+        });
+        promote_result_meta_to_meta(&mut v);
+        // 顶层标记出线为 `meta.*`，且顶层不再残留 `_meta`。
+        assert_eq!(v["meta"]["a2c_cancelled"], json!(true));
+        assert_eq!(v["meta"]["a2c_cancel_reason"], json!("agent_requested"));
+        assert!(
+            v.get("_meta").is_none(),
+            "顶层 _meta 应被提升为 meta 后移除"
+        );
+
+        // 超时态同理。
+        let mut t = json!({ "isError": true, "_meta": { "a2c_timeout": true } });
+        promote_result_meta_to_meta(&mut t);
+        assert_eq!(t["meta"]["a2c_timeout"], json!(true));
+        assert!(t.get("_meta").is_none());
+    }
+
+    #[test]
+    fn test_promote_result_meta_preserves_content_item_meta() {
+        // 子级 content[*]._meta（blob 句柄）MUST 保持 `_meta` 不变（data-structures.md §683）。
+        let mut v = json!({
+            "content": [
+                { "type": "text", "text": "x" },
+                { "type": "image", "data": "", "_meta": { "a2c_blob_handle": "ts:img", "a2c_total_size": 1024 } }
+            ],
+            "_meta": { "a2c_cancelled": true }
+        });
+        promote_result_meta_to_meta(&mut v);
+        // 顶层提升为 meta。
+        assert_eq!(v["meta"]["a2c_cancelled"], json!(true));
+        assert!(v.get("_meta").is_none());
+        // content item 的 `_meta` 原封不动（绝不被提升/移除）。
+        assert_eq!(v["content"][1]["_meta"]["a2c_blob_handle"], json!("ts:img"));
+        assert_eq!(v["content"][1]["_meta"]["a2c_total_size"], json!(1024));
+        assert!(
+            v["content"][1].get("meta").is_none(),
+            "content item 不应长出 meta"
+        );
+    }
+
+    #[test]
+    fn test_promote_result_meta_covers_auth_error_keys() {
+        // 同根因：AUTH-01 的 error_code / mcp_server 亦经 rmcp `_meta` 出线，顺带覆盖。
+        let mut v = json!({
+            "content": [{ "type": "text", "text": "denied" }],
+            "isError": true,
+            "_meta": { "error_code": 4006, "mcp_server": "srv-a" }
+        });
+        promote_result_meta_to_meta(&mut v);
+        assert_eq!(v["meta"]["error_code"], json!(4006));
+        assert_eq!(v["meta"]["mcp_server"], json!("srv-a"));
+        assert!(v.get("_meta").is_none());
+    }
+
+    #[test]
+    fn test_promote_result_meta_noop_and_merge_and_malformed() {
+        // 1) 无顶层 `_meta` → no-op（含完全无 meta 的成功结果）。
+        let mut ok = json!({ "content": [{ "type": "text", "text": "ok" }] });
+        let before = ok.clone();
+        promote_result_meta_to_meta(&mut ok);
+        assert_eq!(ok, before, "无 _meta 应原样返回");
+
+        // 2) 顶层已有 `meta` 时按键合并、不覆盖既有键，并清掉 `_meta`。
+        let mut both = json!({
+            "meta": { "a2c_cancelled": true, "keep": "orig" },
+            "_meta": { "a2c_timeout": true, "keep": "shadow" }
+        });
+        promote_result_meta_to_meta(&mut both);
+        assert_eq!(both["meta"]["a2c_cancelled"], json!(true));
+        assert_eq!(both["meta"]["a2c_timeout"], json!(true), "新键并入");
+        assert_eq!(
+            both["meta"]["keep"],
+            json!("orig"),
+            "既有 meta 键不被 _meta 覆盖"
+        );
+        assert!(both.get("_meta").is_none());
+
+        // 3) 畸形非-object 顶层 `_meta` → 原样保留（不提升、不报错）。
+        let mut bad = json!({ "_meta": "i-am-a-string" });
+        promote_result_meta_to_meta(&mut bad);
+        assert_eq!(bad["_meta"], json!("i-am-a-string"));
+        assert!(bad.get("meta").is_none());
     }
 }

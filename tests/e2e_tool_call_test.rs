@@ -38,17 +38,9 @@ async fn test_tool_call_with_echo_server() {
         cwd: None,
     };
 
-    let echo_config =
-        MCPServerConfig::Stdio(smcp_computer::mcp_clients::model::StdioServerConfig {
-            env_file: None,
-            name: "echo_server".to_string(),
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            server_parameters: server_params,
-        });
+    let echo_config = MCPServerConfig::Stdio(
+        smcp_computer::mcp_clients::model::StdioServerConfig::new("echo_server", server_params),
+    );
 
     servers.insert("echo_server".to_string(), echo_config);
 

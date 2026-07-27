@@ -150,6 +150,7 @@ async fn test_smcp_tool_serialization() {
     // 测试 SMCPTool 的序列化格式
     let tool = SMCPTool {
         name: "test_tool".to_string(),
+        bundle_id: "test_bundle".to_string(),
         description: "A test tool".to_string(),
         params_schema: serde_json::json!({
             "type": "object",

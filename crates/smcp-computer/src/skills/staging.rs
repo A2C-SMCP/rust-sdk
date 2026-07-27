@@ -20,7 +20,8 @@
 //! - **marketplace**：`git clone --depth 1` catalog → 读 `marketplace.json` → 解析 plugin source（5 类）
 //!   → 扫 `<plugin>/skills/<skill>/SKILL.md` → 注册（name = `<plugin>:<skill>`）。
 //! - **mcp**：经 [`SkillResourceManager`] 枚举 `skill://` 资源，按 mounted/archive/resources 物化到
-//!   `<home>/mcp/<server>/<skill>/`，name = `mcp:<server>:<frontmatter.name>`。
+//!   `<home>/mcp/<bundle_id>/<skill>/`，name = `mcp:<bundle_id>:<frontmatter.name>`（#127：`<server>`
+//!   段 = server 唯一身份 `bundle_id` 原样，**非** display 名——见 [`smcp::skill_name`] 模块文档）。
 //!
 //! 安全 / Security：tar.gz/zip 解包防 zip-slip（[`is_within`]）、拒符号/硬链接、解压累计 / 成员数 cap；
 //! git 经 `tokio::process` **显式 argv**（非 shell，杜绝注入）+ `GIT_TERMINAL_PROMPT=0` 非交互。
@@ -47,11 +48,13 @@ use tokio::sync::RwLock;
 use smcp::utils::path::{is_within, normalize_lexical};
 use smcp::A2CSkillRef;
 
+use crate::settings::redaction::{
+    git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
+};
 use crate::settings::{is_valid_marketplace_name, EnvMap};
 use crate::skills::frontmatter::parse_skill_frontmatter;
 use crate::skills::home::{
-    marketplace_skill_dir, mcp_skill_dir, user_dropin_root, workdir_skill_root, SOURCE_MARKETPLACE,
-    SOURCE_USER,
+    marketplace_skill_dir, mcp_skill_dir, user_dropin_root, SOURCE_MARKETPLACE, SOURCE_USER,
 };
 use crate::skills::manifest::{
     check_strict_conflict, entry_is_strict, plugin_root_base as resolve_plugin_root_base,
@@ -59,8 +62,7 @@ use crate::skills::manifest::{
     resolve_skill_override_dirs, PluginManifestError,
 };
 use crate::skills::naming::{
-    normalize_mcp_server_segment, synthesize_marketplace_name, synthesize_mcp_name,
-    synthesize_user_name,
+    synthesize_marketplace_name, synthesize_mcp_name, synthesize_user_name,
 };
 use crate::skills::registry::SkillRegistry;
 use crate::skills::sources::{
@@ -163,16 +165,23 @@ pub struct McpResource {
 }
 
 /// MCP manager 接缝（#74 注入真实实现）/ MCP manager seam (real impl injected by #74)。
+///
+/// **身份寻址（#127）**：本接缝以 server 唯一身份 `bundle_id` 标注与寻址，**不使用** display `name`
+/// （协议 §身份正交性：`name` 允许碰撞、永不做键）。mcp 形态 SKILL 的 name / `source` / 磁盘落点均由
+/// 此 `bundle_id` 构成，故此处若退回 display 名，两个同名 server 会撞名并令其一的 SKILL 隐身。
 #[async_trait::async_trait]
 pub trait SkillResourceManager: Send + Sync {
-    /// 完整消费 cursor 枚举 `(server, skill 资源)` / Enumerate `(server, skill resource)`。
+    /// 完整消费 cursor 枚举 `(bundle_id, skill 资源)` / Enumerate `(bundle_id, skill resource)`。
+    ///
+    /// `bundle_id` 给定则仅枚举该 server（**按身份寻址**，非 display 名）。
     async fn list_skill_resources(
         &self,
-        server_name: Option<&str>,
+        bundle_id: Option<&str>,
     ) -> Result<Vec<(String, McpResource)>, SkillStagingError>;
 
-    /// 读取单个资源的字节（content 块已拼接）/ Read a single resource's bytes。
-    async fn read_resource(&self, server: &str, uri: &str) -> Result<Vec<u8>, SkillStagingError>;
+    /// 读取单个资源的字节（content 块已拼接；**按 `bundle_id` 寻址**）/ Read a resource's bytes by bundle_id。
+    async fn read_resource(&self, bundle_id: &str, uri: &str)
+        -> Result<Vec<u8>, SkillStagingError>;
 }
 
 /// `known_marketplaces.json` 物化记录入参 / Inputs for recording a known marketplace。
@@ -403,24 +412,6 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<(), SkillStagingError> {
 // ===========================================================================
 // user 源 DropIn（就地发现，不复制）/ user-source in-place DropIn
 // ===========================================================================
-/// user 源 DropIn 发现根，按优先级升序（低→高，后者覆盖）+ 解析去重 / Ascending-priority deduped roots。
-fn user_dropin_roots(home: &Path, workdirs: &[PathBuf]) -> Vec<PathBuf> {
-    let mut ordered: Vec<PathBuf> = vec![normalize_lexical(&user_dropin_root(home))];
-    ordered.extend(
-        workdirs
-            .iter()
-            .map(|wd| normalize_lexical(&workdir_skill_root(wd))),
-    );
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut deduped = Vec::new();
-    for root in ordered {
-        if seen.insert(root.clone()) {
-            deduped.push(root);
-        }
-    }
-    deduped
-}
-
 /// 枚举发现根下一级、含直接 `SKILL.md` 的 SKILL 目录（排序）/ One-level skill dirs with a direct SKILL.md。
 fn iter_user_skill_dirs(root: &Path) -> Vec<PathBuf> {
     if !root.is_dir() {
@@ -476,38 +467,35 @@ fn build_user_ref(name: &str, skill_dir: &Path) -> Option<A2CSkillRef> {
 
 /// 枚举 user 源 DropIn 并注册进 Registry（就地发现、不复制）/ Discover user-source DropIn skills in place。
 ///
-/// 扫 `<home>/user/` + 各 `<workdir>/.tfrobot/skills/`；name = 目录 basename（单段裸名）。同名按发现根优先级
-/// **后者覆盖前者**，覆盖时记 WARN。返回本次发现并成功注册/刷新的 name 列表（供 reconciler/watcher diff 孤儿）。
-pub fn stage_user_skills(
-    registry: &mut SkillRegistry,
-    home: &Path,
-    workdirs: &[PathBuf],
-) -> Vec<String> {
+/// #98：仅扫 home 级全局 DropIn 根 `<home>/user/`（`Computer` 不再持有 workspace；workdir 范围 SKILL 改由
+/// MCP `mcp` 源 + `skill://` 承载，对齐 protocol#10 / python-sdk#116）。name = 目录 basename（单段裸名）。
+/// 单根下 basename 唯一；同名冲突（不同 basename 归一为同 name）记 WARN、后者胜。返回本次发现并成功注册/刷新
+/// 的 name 列表（供 reconciler/watcher diff 孤儿）。
+pub fn stage_user_skills(registry: &mut SkillRegistry, home: &Path) -> Vec<String> {
     // name → (ref, 发现目录)；后者覆盖前者。保插入序便于确定性。
     let mut winners: indexmap::IndexMap<String, (A2CSkillRef, PathBuf)> = indexmap::IndexMap::new();
-    for root in user_dropin_roots(home, workdirs) {
-        for skill_dir in iter_user_skill_dirs(&root) {
-            let basename = skill_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            let name = match synthesize_user_name(basename) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(path = %skill_dir.display(), reason = %e.reason,
-                        "user DropIn skill dir name invalid, skipped");
-                    continue;
-                }
-            };
-            let Some(skill_ref) = build_user_ref(&name, &skill_dir) else {
+    let root = normalize_lexical(&user_dropin_root(home));
+    for skill_dir in iter_user_skill_dirs(&root) {
+        let basename = skill_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let name = match synthesize_user_name(basename) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(path = %skill_dir.display(), reason = %e.reason,
+                    "user DropIn skill dir name invalid, skipped");
                 continue;
-            };
-            if let Some((_, prev)) = winners.get(&name) {
-                tracing::warn!(name = %name, at = %skill_dir.display(), shadows = %prev.display(),
-                    "user SKILL shadows earlier DropIn (later root wins)");
             }
-            winners.insert(name, (skill_ref, skill_dir));
+        };
+        let Some(skill_ref) = build_user_ref(&name, &skill_dir) else {
+            continue;
+        };
+        if let Some((_, prev)) = winners.get(&name) {
+            tracing::warn!(name = %name, at = %skill_dir.display(), shadows = %prev.display(),
+                "user SKILL name collides with earlier DropIn (later entry wins)");
         }
+        winners.insert(name, (skill_ref, skill_dir));
     }
 
     let mut registered = Vec::new();
@@ -539,6 +527,24 @@ fn apply_git_env(cmd: &mut tokio::process::Command, env: Option<&EnvMap>) {
     }
 }
 
+/// Git stderr 可能回显 clone URL；按本次命令中已知 URL 参数逐一替换为安全展示值。
+fn sanitize_git_stderr(args: &[&str], stderr: &str) -> String {
+    let known_args_redacted = args
+        .iter()
+        .filter(|arg| arg.contains("://") || SSH_SCP_LIKE_RE.is_match(arg))
+        .fold(stderr.to_string(), |sanitized, raw_url| {
+            let display = git_url_for_display(raw_url);
+            let mut sanitized = sanitized.replace(*raw_url, &display);
+            if SSH_SCP_LIKE_RE.is_match(raw_url) {
+                if let Some((endpoint, _)) = raw_url.split_once(':') {
+                    sanitized = sanitized.replace(endpoint, &display);
+                }
+            }
+            sanitized
+        });
+    redact_git_urls_in_text(&known_args_redacted)
+}
+
 /// 执行 `git <args>` 并返回 stdout（非零退出 / 超时 → 错误）/ Run `git`, capture stdout。
 async fn run_git(
     args: &[&str],
@@ -566,10 +572,11 @@ async fn run_git(
         }
     };
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let err = sanitize_git_stderr(args, stderr.trim());
         return Err(SkillStagingError::new(format!(
             "git {} failed (rc={:?}): {err}",
-            args.join(" "),
+            args.first().copied().unwrap_or("operation"),
             output.status.code()
         )));
     }
@@ -617,7 +624,12 @@ async fn git_clone_with_fallback(
             let https = ssh_to_https(url);
             match https {
                 Some(h) if h != url => {
-                    tracing::warn!(url, error = %first, https = %h, "git clone failed; retrying via HTTPS");
+                    tracing::warn!(
+                        url = %git_url_for_display(url),
+                        error = %first,
+                        https = %git_url_for_display(&h),
+                        "git clone failed; retrying via HTTPS"
+                    );
                     let _ = std::fs::remove_dir_all(dest);
                     let mut retry: Vec<String> = vec!["clone".to_string()];
                     retry.extend(clone_args.iter().cloned());
@@ -743,7 +755,10 @@ async fn git_head_sha(dest: &Path, timeout: Duration, env: Option<&EnvMap>) -> O
 /// plugin 条目 ID = entry.name / The plugin entry name。
 fn entry_plugin_name(entry: &Map<String, Value>) -> Result<String, SkillStagingError> {
     match entry.get("name").and_then(Value::as_str) {
-        Some(n) if !n.trim().is_empty() => Ok(n.trim().to_string()),
+        Some(n) if is_valid_marketplace_name(n.trim()) => Ok(n.trim().to_string()),
+        Some(_) => Err(SkillStagingError::new(
+            "plugin entry 'name' must be lowercase kebab-case (1-64 characters)",
+        )),
         _ => Err(SkillStagingError::new(
             "plugin entry missing required 'name'",
         )),
@@ -918,10 +933,9 @@ pub(crate) async fn locate_plugin_root(
     };
 
     if !plugin_root.is_dir() {
-        return Err(SkillStagingError::new(format!(
-            "plugin root not found after resolve: {}",
-            plugin_root.display()
-        )));
+        return Err(SkillStagingError::new(
+            "plugin root not found after source resolution",
+        ));
     }
     Ok((plugin_root, version_fallback))
 }
@@ -1013,7 +1027,7 @@ pub async fn stage_marketplace_skills(
     // 防御纵深：name 直接作路径段，仅接受严格 kebab marketplace 名（拒 `..` / `/` 穿越）。
     if !is_valid_marketplace_name(name) {
         tracing::error!(
-            marketplace = name,
+            marketplace = %untrusted_name_for_display(name),
             "marketplace name invalid (strict-kebab 1-64), skipped"
         );
         return registered;
@@ -1021,8 +1035,8 @@ pub async fn stage_marketplace_skills(
 
     let url = match marketplace_clone_url(source) {
         Ok(u) => u,
-        Err(e) => {
-            tracing::error!(marketplace = name, error = %e, "invalid marketplace source, skipped");
+        Err(_) => {
+            tracing::error!(marketplace = name, "invalid marketplace source, skipped");
             return registered;
         }
     };
@@ -1219,7 +1233,7 @@ async fn materialize_archive(
 /// resources：逐个读子资源，按相对路径安全写入 staging / resources materialization。
 async fn materialize_resources(
     manager: &dyn SkillResourceManager,
-    server: &str,
+    bundle_id: &str,
     root_uri: &str,
     sub_resources: &[McpResource],
     dest: &Path,
@@ -1238,7 +1252,7 @@ async fn materialize_resources(
             continue;
         }
         let target = resolved_member_target(dest, rel)?;
-        let bytes = manager.read_resource(server, &res.uri).await?;
+        let bytes = manager.read_resource(bundle_id, &res.uri).await?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
@@ -1254,10 +1268,11 @@ async fn materialize_resources(
 }
 
 /// 读 frontmatter → 真冲突拒绝 → 校正包根目录名 → register/update（失败 → `None`）/ Finalize one mcp SKILL。
-#[allow(clippy::too_many_arguments)]
+///
+/// `bundle_id` 同时构成合成 name 的 `<server>` 段、`source` 与磁盘落点的分组目录（#127：三者同源于
+/// server 唯一身份，此前是 raw display 名 + 其规范化结果**两个**标识并行）。
 fn finalize_and_register(
-    server_name: &str,
-    normalized_server: &str,
+    bundle_id: &str,
     meta: &Map<String, Value>,
     staged: &Path,
     root_uri: &str,
@@ -1286,7 +1301,7 @@ fn finalize_and_register(
         let _ = std::fs::remove_dir_all(staged);
         return None;
     };
-    let name = match synthesize_mcp_name(server_name, fm_name) {
+    let name = match synthesize_mcp_name(bundle_id, fm_name) {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(uri = root_uri, reason = %e.reason, "skill name synthesis failed, skipped");
@@ -1309,7 +1324,7 @@ fn finalize_and_register(
     // A 已 rename 落盘的内容（A 仍在 registry 但磁盘被毁）。seen_this_run 仅对合成 name 去重、不覆盖
     // staging↔final 路径。加固（如 rename 前探测 final_dir 是否为本 run 内其它落点）须协议/Python 先行，
     // 以维持跨 SDK 一致——不在 Rust 单侧修改。
-    let final_dir = mcp_skill_dir(home, normalized_server, fm_name);
+    let final_dir = mcp_skill_dir(home, bundle_id, fm_name);
     if final_dir != staged {
         if final_dir.exists() {
             let _ = std::fs::remove_dir_all(&final_dir);
@@ -1330,7 +1345,7 @@ fn finalize_and_register(
         .map(scalar_to_string);
     let skill_ref = build_ref(
         name.clone(),
-        format!("mcp:{normalized_server}"),
+        format!("mcp:{bundle_id}"),
         Some(root_uri.to_string()),
         &final_dir,
         description,
@@ -1342,8 +1357,14 @@ fn finalize_and_register(
 
 /// 枚举并物化 mcp 源 SKILL，注册进 Registry / Enumerate, materialize and register mcp-source SKILLs。
 ///
-/// `server_name` 给定则仅物化该 server。`fetcher` 为归档拉取替身（`None` → [`DefaultArchiveFetcher`]）。
-/// 返回成功注册（或刷新）的 SKILL name 列表。
+/// `bundle_id` 给定则仅物化该 server（**按身份寻址**，非 display 名）。`fetcher` 为归档拉取替身
+/// （`None` → [`DefaultArchiveFetcher`]）。返回成功注册（或刷新）的 SKILL name 列表。
+///
+/// **磁盘落点按 `bundle_id` 分组（#127）**：`<home>/mcp/<bundle_id>/<skill>/`。升级前若某 server 的
+/// display 名规范化结果 ≠ 其 `bundle_id`（含 CJK / 连续 `__` / 首尾 `_-` / 显式指定 `bundle_id` 等边角
+/// 情形），旧 `<home>/mcp/<旧段>/` 目录会**留在盘上**——全量重挂时其 name 经 registry 孤儿对账标 orphan、
+/// 对 Agent 不可见（`get_skills` / `get_skill` 不返回），仅占磁盘，可由用户手动清理。常见情形（display 名
+/// 本就是 ASCII kebab）缺省生成结果与旧规范化结果一致，落点不变、无残留。
 ///
 /// **两阶段持锁（#77 INT 硬化）**：写锁 **不再** 跨 `materialize_*` 的网络/FS await 持有——
 /// `registry` 改为 `&RwLock<SkillRegistry>`，按 SKILL 仅在 `finalize_and_register`（FS rename + 内存注册，
@@ -1361,22 +1382,21 @@ pub async fn stage_mcp_skills(
     manager: &dyn SkillResourceManager,
     registry: &RwLock<SkillRegistry>,
     home: &Path,
-    server_name: Option<&str>,
+    bundle_id: Option<&str>,
     fetcher: Option<&dyn ArchiveFetcher>,
 ) -> Result<Vec<String>, SkillStagingError> {
     let default_fetcher = DefaultArchiveFetcher;
     let fetch: &dyn ArchiveFetcher = fetcher.unwrap_or(&default_fetcher);
 
-    let pairs = manager.list_skill_resources(server_name).await?;
+    let pairs = manager.list_skill_resources(bundle_id).await?;
     let mut by_server: indexmap::IndexMap<String, Vec<McpResource>> = indexmap::IndexMap::new();
-    for (sname, res) in pairs {
-        by_server.entry(sname).or_default().push(res);
+    for (bid, res) in pairs {
+        by_server.entry(bid).or_default().push(res);
     }
 
     let mut registered = Vec::new();
     let mut seen_this_run: HashSet<String> = HashSet::new();
-    for (sname, resources) in &by_server {
-        let normalized_server = normalize_mcp_server_segment(sname);
+    for (bid, resources) in &by_server {
         for res in resources {
             let mode = res.meta.get("source").and_then(Value::as_str).unwrap_or("");
             if !MCP_SOURCE_MODES.contains(&mode) {
@@ -1391,7 +1411,7 @@ pub async fn stage_mcp_skills(
                 );
                 continue;
             }
-            let staged = mcp_skill_dir(home, &normalized_server, leaf);
+            let staged = mcp_skill_dir(home, bid, leaf);
             // phase 1（不持 Registry 锁）：物化到 staged——archive 网络下载 / resources MCP read_resource。
             let materialize = match mode {
                 "mounted" => materialize_mounted(&res.meta, &staged),
@@ -1402,7 +1422,7 @@ pub async fn stage_mcp_skills(
                         .filter(|r| r.uri.starts_with(&format!("{root_uri}/")))
                         .cloned()
                         .collect();
-                    materialize_resources(manager, sname, root_uri, &subs, &staged).await
+                    materialize_resources(manager, bid, root_uri, &subs, &staged).await
                 }
             };
             if let Err(e) = materialize {
@@ -1414,8 +1434,7 @@ pub async fn stage_mcp_skills(
             // 网络，并严格保持 per-SKILL materialize→finalize 交错（维持 rename 冲突的跨 SDK 边界）。
             let mut reg = registry.write().await;
             if let Some(name) = finalize_and_register(
-                sname,
-                &normalized_server,
+                bid,
                 &res.meta,
                 &staged,
                 root_uri,
@@ -1435,7 +1454,37 @@ pub async fn stage_mcp_skills(
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     // ---- 安全解包 / safe extraction ----
     #[test]
@@ -1520,6 +1569,59 @@ mod tests {
         assert_eq!(ssh_to_https("file:///tmp/repo"), None);
     }
 
+    #[tokio::test]
+    async fn test_git_failure_diagnostics_redact_url_credentials() {
+        const SECRET_URL: &str = "https://cnb:FAKE_TOKEN@127.0.0.1:1/repo.git?token=QUERY#FRAGMENT";
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("clone");
+        let dest_s = dest.to_string_lossy().into_owned();
+        let err = run_git(
+            &["clone", "--", SECRET_URL, &dest_s],
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let public_forms = format!("{err}\n{err:?}");
+        assert!(public_forms.contains("git clone failed"));
+        for secret in ["cnb", "FAKE_TOKEN", "QUERY", "FRAGMENT", SECRET_URL] {
+            assert!(
+                !public_forms.contains(secret),
+                "git diagnostic leaked {secret:?}: {public_forms}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_git_stderr_redacts_abbreviated_scp_endpoint() {
+        for (source, stderr, secrets) in [
+            (
+                "alice@my_host:org/repo.git",
+                "alice@my_host: Permission denied (publickey).",
+                ["alice", "unused"],
+            ),
+            (
+                "用户@例子.公司:org/repo.git",
+                "用户@例子.公司: Permission denied (publickey).",
+                ["用户", "例子.公司"],
+            ),
+            (
+                "alice@my_host:org/repo.git",
+                "alice@my_host's password:",
+                ["alice", "my_host"],
+            ),
+        ] {
+            let rendered = sanitize_git_stderr(&["clone", "--", source], stderr);
+            assert!(
+                rendered.contains(crate::settings::redaction::REDACTED_GIT_SOURCE),
+                "{rendered}"
+            );
+            for secret in secrets {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
+    }
+
     // ---- ref 合成 / ref construction ----
     #[test]
     fn test_apply_frontmatter_optional_fields() {
@@ -1551,9 +1653,10 @@ mod tests {
         assert_eq!(r.allowed_tools.as_deref(), Some(&["solo".to_string()][..]));
     }
 
-    // ---- user 源 staging（就地）/ user-source staging ----
+    // ---- user 源 staging（就地，仅 home 级）/ user-source staging (home-only) ----
     #[test]
-    fn test_stage_user_skills_in_place_and_override() {
+    fn test_stage_user_skills_home_only_no_workdir_dimension() {
+        // #98：仅扫 <home>/user/；workdir 的 .tfrobot/skills/ 不再是发现维度（对齐 python-sdk#116）。
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         // <home>/user/my-helper/SKILL.md
@@ -1564,34 +1667,31 @@ mod tests {
             "---\nname: my-helper\ndescription: from home\n---\nbody",
         )
         .unwrap();
-        // workdir/.tfrobot/skills/my-helper/SKILL.md（覆盖 home）+ another
-        let wd = tmp.path().join("wd");
-        let wd_skill = wd.join(".tfrobot/skills/my-helper");
-        fs::create_dir_all(&wd_skill).unwrap();
-        fs::write(
-            wd_skill.join("SKILL.md"),
-            "---\nname: my-helper\ndescription: from workdir\n---\nb",
-        )
-        .unwrap();
-        let wd_other = wd.join(".tfrobot/skills/other-skill");
-        fs::create_dir_all(&wd_other).unwrap();
-        fs::write(wd_other.join("SKILL.md"), "---\ndescription: other\n---\nb").unwrap();
+        // <home>/user/other-skill/SKILL.md
+        let other = home.join("user/other-skill");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("SKILL.md"), "---\ndescription: other\n---\nb").unwrap();
         // 非 kebab basename → 跳过。
-        let bad = wd.join(".tfrobot/skills/Bad_Name");
+        let bad = home.join("user/Bad_Name");
         fs::create_dir_all(&bad).unwrap();
         fs::write(bad.join("SKILL.md"), "---\ndescription: bad\n---\nb").unwrap();
+        // workdir/.tfrobot/skills/proj-a/SKILL.md —— #98 后**不**应被发现。
+        let wd_skill = tmp.path().join("wd/.tfrobot/skills/proj-a");
+        fs::create_dir_all(&wd_skill).unwrap();
+        fs::write(wd_skill.join("SKILL.md"), "---\ndescription: proj\n---\nb").unwrap();
 
         let mut reg = SkillRegistry::new();
-        let names = stage_user_skills(&mut reg, &home, std::slice::from_ref(&wd));
+        let names = stage_user_skills(&mut reg, &home);
         assert!(names.contains(&"my-helper".to_string()));
         assert!(names.contains(&"other-skill".to_string()));
         assert!(!names.contains(&"Bad_Name".to_string()));
-        // workdir 覆盖 home（就地 path 指向 workdir，description=from workdir）。
+        assert!(!names.contains(&"proj-a".to_string())); // workdir 维度已移除
+        assert!(reg.resolve("proj-a").is_none());
+        // home DropIn 就地注册。
         let r = reg.resolve("my-helper").unwrap();
-        assert_eq!(r.description, "from workdir");
+        assert_eq!(r.description, "from home");
         assert_eq!(r.source, "user");
         assert!(r.uri.is_none()); // user 源无 uri
-        assert!(r.path.contains(".tfrobot"));
     }
 
     // ---- marketplace 源 git staging（真实 git，离线 file://）/ real-git integration ----
@@ -1655,6 +1755,98 @@ mod tests {
         assert_eq!(r.source, "marketplace:acme");
         assert_eq!(r.description, "review code");
         assert!(r.uri.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_plugin_source_error_log_redacts_url_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins":[
+                {"name":"audit","source":{"source":"url","url":"ftp://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT"}},
+                {"name":"prefix","source":"key=https://user:PW_PREFIX@example.com/org/repo.git"},
+                {"name":"scp","source":"key=git@example.com:org/repo.git"},
+                {"name":"x=https://alice:PW_NAME@example.com/repo.git","source":{"source":"url","url":"bogus"}},
+                {"name":"local-leak","source":"./x=https://alice:PW_LOCAL@example.com/repo.git"}
+            ]}"#,
+        )
+        .unwrap();
+        git(&["init", "-q"], &repo);
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let source =
+            serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())});
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(logs.clone())
+            .finish();
+        let mut registry = SkillRegistry::new();
+        let names = stage_marketplace_skills(
+            "acme",
+            &source,
+            &mut registry,
+            &home,
+            MarketplaceStageOptions::default(),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert!(names.is_empty());
+        let rendered = logs.contents();
+        assert!(
+            rendered.contains("plugin staging failed, skipped"),
+            "{rendered}"
+        );
+        for secret in [
+            "cnb",
+            "FAKE_TOKEN",
+            "QUERY",
+            "FRAGMENT",
+            "user",
+            "PW_PREFIX",
+            "PW_NAME",
+            "PW_LOCAL",
+            "git@example.com",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_marketplace_name_log_redacts_embedded_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(logs.clone())
+            .finish();
+        let mut registry = SkillRegistry::new();
+        let names = stage_marketplace_skills(
+            "x=https://public.example/a=https://user2:PW_TWO@secret.example/repo.git",
+            &serde_json::json!({"type": "git", "url": "https://example.com/repo.git"}),
+            &mut registry,
+            tmp.path(),
+            MarketplaceStageOptions::default(),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert!(names.is_empty());
+        let rendered = logs.contents();
+        assert!(rendered.contains("marketplace name invalid"), "{rendered}");
+        for secret in ["user2", "PW_TWO"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
     // ---- mcp 源物化（fake manager，mounted 模式）/ mcp materialization with a fake manager ----

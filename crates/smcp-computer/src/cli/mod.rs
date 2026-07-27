@@ -7,13 +7,15 @@
 * 依赖: clap, tokio, console, rustyline
 * 描述: CLI 模块入口 + 治理层子命令树 + 根级全局 flag 透传 / CLI entry + governance subcommand tree.
 *
-* 对标 Python `a2c_smcp/computer/cli/main.py`：根回调采集全局 flag（`--settings` / `--add-dir` / `--approve-all-mcp`）
+* 对标 Python `a2c_smcp/computer/cli/main.py`：根回调采集全局 flag（`--settings` / `--approve-all-mcp`）
 * 经 [`RootState`] 透传给**所有**子命令（含 `settings`）——修 #97「flag scope 恒空」bug（此前仅 `run` 路径拿到）。
+* #98：`--add-dir` 已随 workdir 概念瘦身移除；project/local scope 锚定进程 cwd。
 * 非交互子命令（marketplace/plugin/settings/skill）不 boot Computer，离线经 `rebuild_registry` 构上下文；
 * `run`（默认）进 REPL：建 Computer、banner、启动期 MCP 批准框、交互循环。
 */
 
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::computer::{Computer, SilentSession};
@@ -78,13 +80,9 @@ pub struct Args {
     #[arg(long)]
     pub no_color: bool,
 
-    /// flag scope settings.json 路径（最低优先级，§5.5）/ flag-scope settings.json file
+    /// flag scope settings.json 路径（次高，仅低于 policy；F6，协议 §2.5）/ flag-scope settings.json file
     #[arg(long)]
     pub settings: Option<PathBuf>,
-
-    /// 注册工作目录（可重复；首个作 active-workdir）/ register a workdir (repeatable; first = active)
-    #[arg(long = "add-dir")]
-    pub add_dir: Vec<PathBuf>,
 
     /// 启动期一次性批准全部待决 MCP server（不落盘）/ approve all pending MCP servers this run (no persist)
     #[arg(long)]
@@ -98,12 +96,10 @@ pub struct Args {
 pub enum Commands {
     /// 启动计算机并进入持续运行模式（REPL）
     Run {
-        /// 在启动时从文件加载 MCP Servers 配置
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-        /// 在启动时从文件加载 Inputs 定义
-        #[arg(short, long)]
-        inputs: Option<PathBuf>,
+        /// flag 层 mcp.json 文件（次高，仅低于 policy；覆盖 user/project/local 同 bundle_id）。文件含 servers
+        /// 与 inputs 段，本次运行受信直挂、不落盘。-c 短参保留（与 Claude Code 同名）。
+        #[arg(short = 'c', long = "mcp-config")]
+        mcp_config: Option<PathBuf>,
     },
     /// SKILL marketplace 管理（git 源）/ SKILL marketplaces
     Marketplace {
@@ -164,6 +160,9 @@ pub enum MarketplaceCmd {
         json: bool,
     },
     /// marketplace set <name> auto-update=<bool>
+    // clap 逐字消费此 doc 作 `--help` about 文案；尖括号是 CLI metavar（与 repl.rs / help.rs 的
+    // usage 串一致），rustdoc 的 invalid_html_tags 在此属误报——窄作用域 allow 以保 help 输出字节不变。
+    #[allow(rustdoc::invalid_html_tags)]
     Set {
         name: String,
         assignment: String,
@@ -267,36 +266,7 @@ pub enum SkillCmd {
 #[derive(Debug, Clone, Default)]
 pub struct RootState {
     pub flag_path: Option<PathBuf>,
-    pub registered_workdirs: Vec<PathBuf>,
-    pub active_workdir: Option<PathBuf>,
     pub approve_all_mcp: bool,
-}
-
-/// `--add-dir` → `(registered_workdirs, active_workdir)`：绝对化、去重保序；active 取首个 / resolve workdirs。
-fn resolve_workdirs(add_dir: &[PathBuf]) -> (Vec<PathBuf>, Option<PathBuf>) {
-    let mut registered: Vec<PathBuf> = Vec::new();
-    for dir in add_dir {
-        let abs = absolutize(dir);
-        if !registered.contains(&abs) {
-            registered.push(abs);
-        }
-    }
-    let active = registered.first().cloned();
-    (registered, active)
-}
-
-fn absolutize(path: &Path) -> PathBuf {
-    // `~` 展开。
-    let expanded = if let Ok(rest) = path.strip_prefix("~") {
-        match dirs::home_dir() {
-            Some(home) => home.join(rest),
-            None => path.to_path_buf(),
-        }
-    } else {
-        path.to_path_buf()
-    };
-    // 词法绝对化（不要求存在，对齐 Python `Path.resolve(strict=False)`）。
-    std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
 fn skill_home() -> PathBuf {
@@ -315,11 +285,8 @@ pub fn main() {
 }
 
 async fn dispatch(mut args: Args) -> i32 {
-    let (registered_workdirs, active_workdir) = resolve_workdirs(&args.add_dir);
     let root = RootState {
         flag_path: args.settings.clone(),
-        registered_workdirs,
-        active_workdir,
         approve_all_mcp: args.approve_all_mcp,
     };
 
@@ -330,20 +297,30 @@ async fn dispatch(mut args: Args) -> i32 {
         Some(Commands::Plugin { action }) => dispatch_plugin(action, &root).await,
         Some(Commands::Settings { action }) => dispatch_settings(action, &root),
         Some(Commands::Skill { action }) => dispatch_skill(action).await,
-        Some(Commands::Run { config, inputs }) => {
-            run_repl(&args, &root, config, inputs).await;
+        Some(Commands::Run { mcp_config }) => {
+            run_repl(&args, &root, mcp_config).await;
             0
         }
         None => {
-            run_repl(&args, &root, None, None).await;
+            run_repl(&args, &root, None).await;
             0
         }
+    }
+}
+
+/// v0.3.0 一次性迁移收口：非交互一次性子命令**不 boot Computer**（故 `boot_up` 的迁移不跑），若 v0.2.x 账本
+/// 尚未迁移，intent 缺失会让已装 plugin 被判「未安装」——`plugin list`/`info` 空、`plugin gc` 更会**静默删光**
+/// 全部已装 plugin。故所有非交互治理入口读 intent 前必须先跑此迁移（idempotent：intent 文件存在即跳过）。
+fn migrate_governance_once(home: &Path) {
+    if let Err(e) = crate::settings::installer::migrate_ledger_to_intent_once(home, None) {
+        eprintln!("v0.3.0 迁移失败（非阻塞，将在下次重试）: {e}");
     }
 }
 
 // ── 非交互子命令分发（不 boot Computer；离线 registry）/ non-interactive dispatch ──
 async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
     let home = skill_home();
+    migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
     match action {
         MarketplaceCmd::Add {
@@ -389,6 +366,8 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
                     hooks: None, // ledger-only：MCP 摘除延到下次 REPL boot。
                     json_output: json,
                 },
+                // hooks=None ⇒ 无停摘发生，回收判据集不被读取，空集安全（同 plugin 一次性子命令路径）。
+                &HashSet::new(),
             )
             .await
         }
@@ -416,10 +395,12 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
     }
 }
 
-async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
+async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
     let home = skill_home();
+    migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
-    let active = root.active_workdir.as_deref();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
     match action {
         PluginCmd::Install {
             id,
@@ -428,7 +409,7 @@ async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
             json,
         } => {
             let project_path = if scope == "project" || scope == "local" {
-                active.and_then(Path::to_str)
+                cwd.as_deref().and_then(Path::to_str)
             } else {
                 None
             };
@@ -448,35 +429,43 @@ async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
             )
             .await
         }
+        // #139：本组**一次性子命令**路径 `hooks`/`teardown` 恒为 `None`（无活跃 Computer ⇒ 无运行期 server 可
+        // 停摘），回收判据的「非用户声明」集**不会被读取**，故传空集安全。真正会停摘的是 REPL 路径
+        // （`cli::repl::dispatch_plugin`），那里经 `Computer::non_plugin_declared_bundle_ids` 供给全集。
         PluginCmd::Uninstall {
             id,
             keep_servers,
             json,
-        } => plugin_uninstall(&mut registry, &home, None, &id, keep_servers, None, json).await,
+        } => {
+            plugin_uninstall(
+                &mut registry,
+                &home,
+                None,
+                &id,
+                keep_servers,
+                &HashSet::new(),
+                None,
+                json,
+            )
+            .await
+        }
         PluginCmd::Enable { id, json } => {
             plugin_enable(&mut registry, &home, None, &id, None, json).await
         }
         PluginCmd::Disable { id, json } => {
-            plugin_disable(&mut registry, &home, None, &id, None, json).await
+            plugin_disable(&mut registry, &home, None, &id, &HashSet::new(), None, json).await
         }
-        PluginCmd::List { available, json } => plugin_list(
-            &home,
-            None,
-            &root.registered_workdirs,
-            active,
-            available,
-            json,
-        ),
-        PluginCmd::Info { id, json } => {
-            plugin_info(&home, None, &id, &root.registered_workdirs, active, json)
+        PluginCmd::List { available, json } => {
+            plugin_list(&home, None, cwd.as_deref(), available, json)
         }
+        PluginCmd::Info { id, json } => plugin_info(&home, None, &id, cwd.as_deref(), json),
         PluginCmd::Gc { json } => {
             plugin_gc(
                 &mut registry,
                 &home,
                 None,
-                &root.registered_workdirs,
-                active,
+                cwd.as_deref(),
+                &HashSet::new(),
                 None,
                 None,
                 json,
@@ -487,23 +476,19 @@ async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
 }
 
 fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
-    let active = root.active_workdir.as_deref();
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
+    let cwd = cwd.as_deref();
     let flag = root.flag_path.as_deref();
     match action {
-        SettingsCmd::Show { scope, json } => settings_show(
-            None,
-            scope.as_deref().unwrap_or("merged"),
-            &root.registered_workdirs,
-            active,
-            flag,
-            json,
-        ),
+        SettingsCmd::Show { scope, json } => {
+            settings_show(None, scope.as_deref().unwrap_or("merged"), cwd, flag, json)
+        }
         SettingsCmd::Get { key, scope, json } => settings_get(
             None,
             &key,
             scope.as_deref().unwrap_or("merged"),
-            &root.registered_workdirs,
-            active,
+            cwd,
             flag,
             json,
         ),
@@ -517,11 +502,11 @@ fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
             &key,
             &value,
             scope.as_deref().unwrap_or("user"),
-            active,
+            cwd,
             json,
         ),
         SettingsCmd::Edit { scope, json } => {
-            settings_edit(None, scope.as_deref().unwrap_or("user"), active, None, json)
+            settings_edit(None, scope.as_deref().unwrap_or("user"), cwd, None, json)
         }
     }
 }
@@ -536,7 +521,7 @@ async fn dispatch_skill(action: SkillCmd) -> i32 {
 }
 
 // ── REPL 运行模式 / REPL run mode ─────────────────────────────────────────────
-async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs: Option<PathBuf>) {
+async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
     let session = SilentSession::new("cli-session");
     let mut computer = Computer::new(
         "friday_hands",
@@ -546,9 +531,13 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
         args.auto_connect,
         args.auto_reconnect,
     );
-    if !root.registered_workdirs.is_empty() {
-        computer = computer.with_registered_workdirs(root.registered_workdirs.clone());
+    // #139：把 `--mcp-config`（flag 层）作为**当次 boot 的声明式输入**绑到 Computer 上——回收判据的
+    // 「非用户声明」集据此包含 flag 层声明，否则经 `--mcp-config` 声明的用户 server 会在 plugin
+    // uninstall/disable/gc 时被连坐停摘（§2.5-5 / #153 缺口形状）。
+    if let Some(ref p) = mcp_config {
+        computer = computer.with_mcp_flag_config(p.clone());
     }
+    let computer = computer;
 
     let cli_config = commands::CliConfig {
         url: args.url.clone(),
@@ -557,8 +546,10 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
         headers: args.headers.clone(),
     };
 
-    // 启动前缀（inputs/config 加载 → boot_up 子系统装配 → socket.io 连接）抽出为可测 helper。
-    let handler = prepare_handler(computer, cli_config, config, inputs).await;
+    // 启动前缀（boot_up 子系统装配 → 治理重挂 → socket.io 连接）抽出为可测 helper。
+    // #137：`--mcp-config` 不再走此处（旧 `--config` 的持久化加载已退役）——改为 flag 层喂启动期批准框
+    // （见下方 `run_mcp_approval`），flag scope 次高、受信直挂、不落盘。
+    let handler = prepare_handler(computer, cli_config, root.flag_path.clone()).await;
 
     // 启动 banner（版本 / 协议版本 / home）。
     let home = handler.computer.skill_home();
@@ -571,11 +562,13 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
         smcp::PROTOCOL_VERSION,
     );
 
-    // 启动期 MCP 批准框（--approve-all-mcp / 逐项 y-a-n）。
+    // 启动期 MCP 批准框（--approve-all-mcp / 逐项 y-a-n）。#137：`--mcp-config` 作 flag 层 mcp.json 喂入
+    // ——flag scope 次高、受信（`is_trusted_origin`）⇒ 门判 Enabled 直挂（非持久）；文件 `inputs` 段一并消费。
     approval::run_mcp_approval(
         &handler.computer,
         root.approve_all_mcp,
         root.flag_path.as_deref(),
+        mcp_config.as_deref(),
     )
     .await;
 
@@ -594,8 +587,7 @@ async fn run_repl(args: &Args, root: &RootState, config: Option<PathBuf>, inputs
 async fn prepare_handler(
     computer: Computer<SilentSession>,
     cli_config: commands::CliConfig,
-    config: Option<PathBuf>,
-    inputs: Option<PathBuf>,
+    flag_path: Option<PathBuf>,
 ) -> CommandHandler {
     let url = cli_config.url.clone();
     let namespace = cli_config.namespace.clone();
@@ -603,22 +595,20 @@ async fn prepare_handler(
     let headers = cli_config.headers.clone();
     let mut handler = CommandHandler::new(computer, cli_config);
 
-    if let Some(inputs_path) = inputs {
-        if let Err(e) = handler.load_inputs(&inputs_path).await {
-            eprintln!("加载 inputs 失败: {e}");
-        }
-    }
-    if let Some(config_path) = config {
-        if let Err(e) = handler.load_config(&config_path).await {
-            eprintln!("加载 config 失败: {e}");
-        }
-    }
+    // #137：旧 `--config`/`--inputs` 的持久化加载（`add_or_update_server` 写 local + `update_inputs`）已退役。
+    // 启动期 mcp.json 定义（含 flag 层 `--mcp-config`）改由 `run_mcp_approval` 经 `resolve_mcp_config` 统一解析
+    // + 门控 + 运行期挂载（非持久）；`inputs` 段亦经该解析入池。
 
     // #83 修复：装配 SKILL/blob/watcher 子系统（对齐 Python `a2c-computer run`）。
     // 必须在 connect_socketio 之前完成——Computer 一旦在线，Agent 可立即 get_skills/get_skill/mint blob。
     if let Err(e) = handler.computer.boot_up().await {
         eprintln!("初始化 SKILL/blob 子系统失败: {e}");
     }
+
+    // #100 设计 Y：boot 仅恢复 skills；CLI 作为参考 client 经公共 API 显式重挂 enabled bundled MCP server
+    // （§4.8.2 conformance「重启恢复」；外部 client/GUI 照抄 run_governance_remount）。flag-aware（`--settings`
+    // scope 生效）、非阻塞、须在上线前完成。
+    commands::run_governance_remount(&handler.computer, flag_path.as_deref()).await;
 
     if let Some(url) = &url {
         if let Err(e) = handler
@@ -661,31 +651,42 @@ mod tests {
             auth: None,
             headers: None,
         };
-        let handler = prepare_handler(computer, cli_config, None, None).await;
+        let handler = prepare_handler(computer, cli_config, None).await;
 
         // 修复后：prepare_handler 内 boot_up 已发现 user 源 SKILL。
         assert_eq!(handler.computer.get_skills().await.len(), 1);
         handler.computer.shutdown().await.unwrap();
     }
 
+    /// #137 A6：`run --mcp-config`（`-c`）解析成功；旧 `--config` / `--inputs` 已删除 → 解析失败。
     #[test]
-    fn resolve_workdirs_absolutize_dedup_order() {
-        // 去重保序 + active=first。
-        let (registered, active) = resolve_workdirs(&[
-            PathBuf::from("/a/b"),
-            PathBuf::from("/a/b"),
-            PathBuf::from("/c"),
-        ]);
-        assert_eq!(registered, vec![PathBuf::from("/a/b"), PathBuf::from("/c")]);
-        assert_eq!(active, Some(PathBuf::from("/a/b")));
-        // 相对路径 → 绝对化（不要求存在）。
-        let (rel, rel_active) = resolve_workdirs(&[PathBuf::from("relative/dir")]);
-        assert!(rel[0].is_absolute());
-        assert_eq!(rel_active, Some(rel[0].clone()));
-        // 空 → 无 active。
-        let (empty, none) = resolve_workdirs(&[]);
-        assert!(empty.is_empty());
-        assert!(none.is_none());
+    fn run_accepts_mcp_config_and_rejects_legacy_flags_137() {
+        use clap::Parser;
+        // 长参 --mcp-config。
+        let a = Args::try_parse_from(["smcp-computer", "run", "--mcp-config", "f.json"]).unwrap();
+        assert!(matches!(
+            a.command,
+            Some(Commands::Run {
+                mcp_config: Some(ref p),
+            }) if p == std::path::Path::new("f.json")
+        ));
+        // 短参 -c 保留。
+        let b = Args::try_parse_from(["smcp-computer", "run", "-c", "g.json"]).unwrap();
+        assert!(matches!(
+            b.command,
+            Some(Commands::Run {
+                mcp_config: Some(_)
+            })
+        ));
+        // 旧 --config / --inputs 已删除。
+        assert!(
+            Args::try_parse_from(["smcp-computer", "run", "--config", "f.json"]).is_err(),
+            "--config 应已删除（更名 --mcp-config）"
+        );
+        assert!(
+            Args::try_parse_from(["smcp-computer", "run", "--inputs", "i.json"]).is_err(),
+            "--inputs 应已删除（并入 --mcp-config 文件 inputs 段）"
+        );
     }
 
     #[test]
@@ -715,39 +716,6 @@ mod tests {
             SettingsCmd::Get {
                 key: "trustedMarketplaces".to_string(),
                 scope: Some("flag".to_string()),
-                json: true,
-            },
-            &RootState::default(),
-        );
-        assert_eq!(code, EXIT_USER_ERROR);
-    }
-
-    #[test]
-    fn add_dir_propagates_active_workdir_for_project_scope() {
-        // #97 回归：--add-dir 解析的 active_workdir 经 RootState 透传 → project scope 可写。
-        let tmp = tempdir().unwrap();
-        let root = RootState {
-            registered_workdirs: vec![tmp.path().to_path_buf()],
-            active_workdir: Some(tmp.path().to_path_buf()),
-            ..Default::default()
-        };
-        let code = dispatch_settings(
-            SettingsCmd::Set {
-                key: "foo".to_string(),
-                value: "1".to_string(),
-                scope: Some("project".to_string()),
-                json: true,
-            },
-            &root,
-        );
-        assert_eq!(code, EXIT_OK);
-
-        // 无 active_workdir → project scope 缺 active workdir → EXIT_USER_ERROR。
-        let code = dispatch_settings(
-            SettingsCmd::Set {
-                key: "foo".to_string(),
-                value: "1".to_string(),
-                scope: Some("project".to_string()),
                 json: true,
             },
             &RootState::default(),

@@ -5,12 +5,12 @@
 * 最后修改日期: 2026/06/02
 * 版权: 2023 JQQ. All rights reserved.
 * 依赖: serde_json, smcp::utils::path, tracing
-* 描述: 五级 scope 路径解析 + 读/写两套合并语义 + active-workdir / 能力层解析
-*       Five-level scope path resolution + read/write merge customizers + capability resolution.
+* 描述: 五级 scope 路径解析 + 读/写两套合并语义 + 进程 cwd 锚定 project/local 解析（#98）
+*       Five-level scope path resolution + read/write merge customizers + process-cwd-anchored resolution.
 */
 
-//! 五级 scope 路径解析 + 读/写两套合并语义 + active-workdir / 能力层解析。
-//! Five-level scope path resolution + read/write merge customizers + active-workdir / capability resolution.
+//! 五级 scope 路径解析 + 读/写两套合并语义 + 进程 cwd 锚定 project/local 解析（#98）。
+//! Five-level scope path resolution + read/write merge customizers + process-cwd-anchored resolution.
 //!
 //! 对标 Python 参考实现 / Mirrors the Python reference: `a2c_smcp/computer/settings/scope.py`
 //! （SDK 设计 `docs/design-0.2.1-cli-marketplace-ux.md` §5.0 / §5.1 / §5.4）。
@@ -32,9 +32,10 @@
 //!
 //! ## scope 分层（low → high，§5.1）/ Scope layering
 //!
-//! 能力发现层（全部登记目录并集，仅 `enabledPlugins` / `extraKnownMarketplaces`）< user（主）
-//! < project（active workdir 单根）< local（active workdir 单根）< flag < policy。
-//! **无 active workdir** 时 project/local 全空，仅 user + 能力层（+ flag/policy）。
+//! user（主）< project（进程 cwd 单根）< local（进程 cwd 单根）< flag < policy。#98（对齐 protocol#10 /
+//! python-sdk#116）：能力发现层已移除，`Computer` 不再持有 workspace——project/local **无条件**锚定进程 cwd
+//! （`<cwd>/.tfrobot/settings[.local].json`），`enabledPlugins` / `extraKnownMarketplaces` 经常规 project/local
+//! 层进入，无需专门的能力并集层。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +43,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use smcp::utils::path::resolve_xdg_first;
 
-use super::schema::{validate_settings, SettingsScope, SettingsValidationError, CAPABILITY_FIELDS};
+use super::schema::{validate_settings, SettingsScope, SettingsValidationError};
 
 // ---------------------------------------------------------------------------
 // 路径常量 / Path constants
@@ -117,16 +118,6 @@ pub fn workdir_local_settings_path(workdir: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 // 合并原语 / Merge primitives
 // ---------------------------------------------------------------------------
-/// 跨目录能力层合并冲突 / A capability-layer merge conflict。
-///
-/// 记录冲突点路径与低/高取值，供能力层跨登记目录同名覆盖时 WARN 诊断（对标 Python
-/// `_on_conflict(path, old, new)`）。
-struct MergeConflict {
-    path: String,
-    low: Value,
-    high: Value,
-}
-
 /// 去重保序（首次出现胜出）/ Order-preserving dedup (first occurrence wins)。
 fn dedup_preserve_order(low: &[Value], high: &[Value]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(low.len() + high.len());
@@ -138,32 +129,19 @@ fn dedup_preserve_order(low: &[Value], high: &[Value]) -> Vec<Value> {
     out
 }
 
-/// 读合并并收集冲突 / Read-merge collecting scalar-leaf conflicts。
+/// 读合并 customizer（深合并 / 数组拼接去重 / 标量高覆盖）/ Read-merge customizer。
 ///
-/// 与 Claude Code `settingsMergeCustomizer` 等价：customizer 只特判数组（拼接去重），其余交给默认
-/// 递归深合并；标量 / 类型不一致由高 scope 覆盖。当**叶子标量被不同值覆盖**时，把其点路径追加进
-/// `conflicts`（供能力层跨目录同名告警，§5.4）；数组拼接是既定语义、**不**记冲突。
-fn merge_read_collecting(
-    low: &Value,
-    high: &Value,
-    path: &str,
-    conflicts: &mut Vec<MergeConflict>,
-) -> Value {
+/// 与 Claude Code `settingsMergeCustomizer` 等价：customizer 只特判数组（低在前拼接去重），其余交给
+/// 默认递归深合并；标量 / 类型不一致由高 scope 覆盖（既定语义）。#98：跨目录能力层已移除，故不再收集
+/// 同名覆盖冲突（原冲突诊断仅服务能力层 WARN）。
+pub fn merge_read(low: &Value, high: &Value) -> Value {
     match (low, high) {
         (Value::Object(lo), Value::Object(ho)) => {
             let mut merged = lo.clone();
             for (key, hv) in ho {
-                let child = if path.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{path}.{key}")
-                };
                 match merged.get(key).cloned() {
                     Some(lv) => {
-                        merged.insert(
-                            key.clone(),
-                            merge_read_collecting(&lv, hv, &child, conflicts),
-                        );
+                        merged.insert(key.clone(), merge_read(&lv, hv));
                     }
                     None => {
                         merged.insert(key.clone(), hv.clone());
@@ -172,29 +150,11 @@ fn merge_read_collecting(
             }
             Value::Object(merged)
         }
-        // 数组：低在前拼接去重（拼接是既定语义，不触发冲突记录）。
+        // 数组：低在前拼接去重（既定语义）。
         (Value::Array(la), Value::Array(ha)) => Value::Array(dedup_preserve_order(la, ha)),
         // 标量 / 类型不一致：高 scope 覆盖。
-        _ => {
-            if low != high {
-                conflicts.push(MergeConflict {
-                    path: path.to_string(),
-                    low: low.clone(),
-                    high: high.clone(),
-                });
-            }
-            high.clone()
-        }
+        _ => high.clone(),
     }
-}
-
-/// 读合并 customizer（深合并 / 数组拼接去重 / 标量高覆盖）/ Read-merge customizer。
-///
-/// 普通 scope 叠加（高覆盖低是既定语义、非冲突），故忽略冲突收集。需要冲突告警的场景（能力层跨
-/// 登记目录）走内部 [`merge_read_collecting`]。
-pub fn merge_read(low: &Value, high: &Value) -> Value {
-    let mut sink = Vec::new();
-    merge_read_collecting(low, high, "", &mut sink)
 }
 
 /// 按 low → high 顺序折叠多层 settings（读合并）/ Fold multiple layers low → high (read merge)。
@@ -325,15 +285,6 @@ pub fn load_settings_file(
     }
 }
 
-/// 只保留能力发现层字段（`enabledPlugins` / `extraKnownMarketplaces`）/ Keep only capability fields。
-pub fn filter_capability_fields(settings: &Map<String, Value>) -> Map<String, Value> {
-    settings
-        .iter()
-        .filter(|(k, _)| CAPABILITY_FIELDS.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // 解析编排 / Resolution orchestration
 // ---------------------------------------------------------------------------
@@ -349,52 +300,10 @@ pub struct ResolvedSettings {
     pub errors: Vec<SettingsValidationError>,
 }
 
-/// 能力发现层 (A)：跨**全部登记工作目录**取能力字段并集 / capability layer (A)。
+/// 按出现顺序去重错误 / Order-preserving dedup。
 ///
-/// 单目录内 local 覆盖 project；跨目录按**登记顺序**后者覆盖前者并 WARN（§5.0「同名优先级」）。
-fn build_capability_layer(
-    registered_workdirs: &[PathBuf],
-) -> (Map<String, Value>, Vec<SettingsValidationError>) {
-    let mut errors: Vec<SettingsValidationError> = Vec::new();
-    let mut accumulated = Value::Object(Map::new());
-
-    for workdir in registered_workdirs {
-        let (proj, proj_errors) = load_settings_file(
-            &workdir_project_settings_path(workdir),
-            SettingsScope::Project,
-        );
-        let (local, local_errors) =
-            load_settings_file(&workdir_local_settings_path(workdir), SettingsScope::Local);
-        errors.extend(proj_errors);
-        errors.extend(local_errors);
-
-        // 单目录内：local 覆盖 project（仅能力字段，within-workdir 覆盖不告警）。
-        let per_workdir = merge_read(
-            &Value::Object(filter_capability_fields(&proj)),
-            &Value::Object(filter_capability_fields(&local)),
-        );
-
-        // 跨目录累积：后登记目录覆盖前者；同名叶子冲突 → WARN。
-        let mut conflicts = Vec::new();
-        accumulated = merge_read_collecting(&accumulated, &per_workdir, "", &mut conflicts);
-        for c in conflicts {
-            tracing::warn!(
-                field = %c.path,
-                low = %c.low,
-                high = %c.high,
-                "Capability-layer conflict across registered workdirs: later registration wins"
-            );
-        }
-    }
-
-    let accumulated = match accumulated {
-        Value::Object(map) => map,
-        _ => Map::new(),
-    };
-    (accumulated, errors)
-}
-
-/// 按出现顺序去重错误（active workdir 文件在能力层 + B 层被读两次，错误天然重复）/ Order-preserving dedup。
+/// #98 后各层各读一份独立文件，天然不再产生重复错误；此去重现为**防御性**保留（对齐
+/// python-sdk#116 `_dedup_errors` 的处置）。
 fn dedup_errors(errors: Vec<SettingsValidationError>) -> Vec<SettingsValidationError> {
     let mut out: Vec<SettingsValidationError> = Vec::with_capacity(errors.len());
     for e in errors {
@@ -405,16 +314,28 @@ fn dedup_errors(errors: Vec<SettingsValidationError>) -> Vec<SettingsValidationE
     out
 }
 
+/// 解析 project/local 锚定目录：注入 `cwd` 优先，否则进程 cwd / Resolve the project/local anchor dir。
+///
+/// #98：镜像本模块 `env` 注入范式。`None`（生产）→ `std::env::current_dir()`（SDK 本地部署行为）；
+/// 进程 cwd 不可读 → `None`（调用方将 project/local 判空，不 panic）。`Some(p)`（测试注入）→ 原样。
+pub(crate) fn resolve_cwd(cwd: Option<&Path>) -> Option<PathBuf> {
+    match cwd {
+        Some(p) => Some(p.to_path_buf()),
+        None => std::env::current_dir().ok(),
+    }
+}
+
 /// [`resolve_settings`] 的入参（镜像 Python keyword-only 参数）/ Inputs for [`resolve_settings`]。
 ///
 /// 用 `..Default::default()` 省略缺省字段：
-/// `resolve_settings(ResolveSettingsArgs { registered_workdirs: &wds, ..Default::default() })`。
+/// `resolve_settings(ResolveSettingsArgs { cwd: Some(&dir), ..Default::default() })`。
 #[derive(Debug, Default)]
 pub struct ResolveSettingsArgs<'a> {
-    /// workspace 持久登记的全部工作目录（能力层来源）/ all registered workdirs (capability source)。
-    pub registered_workdirs: &'a [PathBuf],
-    /// 当前绑定任务的单根（project/local 来源）；`None` = 空闲 / the active single-root, `None` = idle。
-    pub active_workdir: Option<&'a Path>,
+    /// project/local 锚定的工作目录；`None` → 进程 cwd（`std::env::current_dir()`）/ project/local anchor,
+    /// `None` → process cwd。#98：`Computer` 不再持有 workspace，project/local 锚定进程 cwd（SDK 本地部署
+    /// 行为）。此字段是**测试注入接缝**（镜像 `env` 语义）；生产恒传 `None`。它**不是** workspace 概念——
+    /// 无存储、非可选“空闲”态，恒解析到一个真实目录。
+    pub cwd: Option<&'a Path>,
     /// 环境映射（解析 user config dir），`None` → 进程环境 / env mapping, `None` → process env。
     pub env: Option<&'a EnvMap>,
     /// `--settings <file>` 指定文件 / the `--settings` flag file, if any。
@@ -423,17 +344,15 @@ pub struct ResolveSettingsArgs<'a> {
     pub policy_settings: Option<&'a Map<String, Value>>,
 }
 
-/// 解析六层 settings 视图（能力层 / user / project / local / flag / policy）/ Resolve the six-layer view。
+/// 解析五层 settings 视图（user / project / local / flag / policy）/ Resolve the five-layer view。
 ///
-/// 两层模型（§5.0 / §5.1）/ Two-layer model:
-/// - **(A) 能力发现层**：`enabledPlugins` / `extraKnownMarketplaces` 跨**全部** `registered_workdirs`
-///   取并集、置最低优先级（稳定能力面、不随 active 跳变）。
-/// - **(B) active-workdir 单根**：project/local **只取** `active_workdir` 的 `.tfrobot/settings[.local].json`，
-///   不跨目录并集；**`active_workdir is None` 时 project/local 全空**（仅 user + 能力层 + flag/policy）。
+/// #98（对齐 protocol#10 / python-sdk#116）：能力发现层已移除。project/local **无条件**锚定进程 cwd
+/// （`cwd` 注入接缝，`None` → `std::env::current_dir()`；cwd 不可读则该两层判空——不 panic）：读
+/// `<cwd>/.tfrobot/settings[.local].json`。`enabledPlugins` / `extraKnownMarketplaces` 经常规
+/// project/local 层进入，无需专门的能力并集层。优先级低→高 = user < project < local < flag < policy。
 pub fn resolve_settings(args: ResolveSettingsArgs) -> ResolvedSettings {
     let ResolveSettingsArgs {
-        registered_workdirs,
-        active_workdir,
+        cwd,
         env,
         flag_settings_path,
         policy_settings,
@@ -441,24 +360,20 @@ pub fn resolve_settings(args: ResolveSettingsArgs) -> ResolvedSettings {
 
     let mut errors: Vec<SettingsValidationError> = Vec::new();
 
-    // (A) 能力发现层（最低）/ capability layer (lowest)。
-    let (capability_layer, cap_errors) = build_capability_layer(registered_workdirs);
-    errors.extend(cap_errors);
-
     // user（主）/ user (primary)。
     let (user_layer, user_errors) =
         load_settings_file(&user_settings_path(env), SettingsScope::User);
     errors.extend(user_errors);
 
-    // (B) active-workdir 单根 project/local / active-workdir single-root。
-    let (project_layer, local_layer) = match active_workdir {
-        Some(workdir) => {
+    // project/local：无条件锚定进程 cwd（cwd 不可读 → 两层判空）/ anchored to process cwd。
+    let (project_layer, local_layer) = match resolve_cwd(cwd) {
+        Some(base) => {
             let (project_layer, proj_errors) = load_settings_file(
-                &workdir_project_settings_path(workdir),
+                &workdir_project_settings_path(&base),
                 SettingsScope::Project,
             );
             let (local_layer, local_errors) =
-                load_settings_file(&workdir_local_settings_path(workdir), SettingsScope::Local);
+                load_settings_file(&workdir_local_settings_path(&base), SettingsScope::Local);
             errors.extend(proj_errors);
             errors.extend(local_errors);
             (project_layer, local_layer)
@@ -487,7 +402,6 @@ pub fn resolve_settings(args: ResolveSettingsArgs) -> ResolvedSettings {
     errors.extend(policy_errors);
 
     let merged = merge_layers(&[
-        capability_layer,
         user_layer,
         project_layer,
         local_layer,
@@ -610,21 +524,15 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_read_conflict_collected_on_scalar_only() {
-        let mut conflicts = Vec::new();
-        merge_read_collecting(
-            &json!({"x": 1, "arr": ["a"], "obj": {"k": 1}}),
+    fn test_merge_read_deep_merges_and_concats_arrays() {
+        // 深合并对象、数组低在前拼接去重、标量高覆盖（#98 后 merge_read 不再收集冲突）。
+        let merged = merge_read(
+            &json!({"x": 1, "arr": ["a"], "obj": {"k": 1, "keep": 9}}),
             &json!({"x": 2, "arr": ["b"], "obj": {"k": 2}}),
-            "",
-            &mut conflicts,
         );
-        // 标量 x 与嵌套叶子 obj.k 冲突；数组拼接不记冲突。
-        let paths: std::collections::BTreeSet<&str> =
-            conflicts.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, ["obj.k", "x"].into_iter().collect());
-        // 冲突记录带上低/高取值（供能力层 WARN 诊断）。
-        let x = conflicts.iter().find(|c| c.path == "x").unwrap();
-        assert_eq!((&x.low, &x.high), (&json!(1), &json!(2)));
+        assert_eq!(merged["x"], json!(2)); // 标量高覆盖
+        assert_eq!(merged["arr"], json!(["a", "b"])); // 数组拼接去重
+        assert_eq!(merged["obj"], json!({"k": 2, "keep": 9})); // 对象深合并
     }
 
     // ---- 写 merge / write-merge ----
@@ -811,65 +719,16 @@ mod tests {
         );
     }
 
-    // ---- active-workdir / 能力层解析 / resolution ----
+    // ---- cwd-anchored 解析 / resolution（#98：能力层已移除，project/local 锚定进程 cwd）----
     #[test]
-    fn test_no_active_workdir_project_local_empty() {
+    fn test_resolve_settings_anchors_project_local_at_cwd() {
+        // project/local 锚定注入 cwd；local 覆盖 project；能力字段（enabledPlugins）经常规 project 层进入，
+        // 无需专门的能力并集层（对齐 python-sdk#116）。
         let tmp = TempDir::new().unwrap();
         let wd = tmp.path().join("wd");
         write_json(
             &workdir_project_settings_path(&wd),
             &json!({"strictKnownMarketplaces": true, "enabledPlugins": {"p@mp": true}}),
-        );
-        let env = empty_user_env(tmp.path());
-        let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: &[wd],
-            active_workdir: None,
-            env: Some(&env),
-            ..Default::default()
-        });
-        // strictKnownMarketplaces 是 project（B 层）键，无 active → 不贡献。
-        assert!(!resolved.settings.contains_key("strictKnownMarketplaces"));
-        // enabledPlugins 属能力层（A 层），跨登记目录并集 → 仍在。
-        assert_eq!(resolved.settings["enabledPlugins"], json!({"p@mp": true}));
-    }
-
-    #[test]
-    fn test_non_active_dir_contributes_capability_not_scalars() {
-        let tmp = TempDir::new().unwrap();
-        let wd_active = tmp.path().join("active");
-        let wd_other = tmp.path().join("other");
-        write_json(
-            &workdir_project_settings_path(&wd_active),
-            &json!({"enabledPlugins": {"a@mp": true}}),
-        );
-        write_json(
-            &workdir_project_settings_path(&wd_other),
-            &json!({"strictKnownMarketplaces": true, "enabledPlugins": {"b@mp": true}, "trustedMarketplaces": ["x"]}),
-        );
-        let env = empty_user_env(tmp.path());
-        let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: &[wd_active.clone(), wd_other],
-            active_workdir: Some(&wd_active),
-            env: Some(&env),
-            ..Default::default()
-        });
-        // 非 active 的 wd_other：标量 / 数组不贡献。
-        assert!(!resolved.settings.contains_key("strictKnownMarketplaces"));
-        assert!(!resolved.settings.contains_key("trustedMarketplaces"));
-        // 能力层全局并集：两个目录的 enabledPlugins 都进。
-        assert_eq!(
-            resolved.settings["enabledPlugins"],
-            json!({"a@mp": true, "b@mp": true})
-        );
-    }
-
-    #[test]
-    fn test_active_workdir_full_contribution() {
-        let tmp = TempDir::new().unwrap();
-        let wd = tmp.path().join("wd");
-        write_json(
-            &workdir_project_settings_path(&wd),
-            &json!({"strictKnownMarketplaces": true}),
         );
         write_json(
             &workdir_local_settings_path(&wd),
@@ -877,33 +736,33 @@ mod tests {
         );
         let env = empty_user_env(tmp.path());
         let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: std::slice::from_ref(&wd),
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             ..Default::default()
         });
         // local 覆盖 project（高 scope 赢）。
         assert_eq!(resolved.settings["strictKnownMarketplaces"], json!(false));
         assert_eq!(resolved.settings["trustedMarketplaces"], json!(["m"]));
+        // 能力字段经 project 层进入（无专门能力层）。
+        assert_eq!(resolved.settings["enabledPlugins"], json!({"p@mp": true}));
     }
 
     #[test]
-    fn test_capability_union_across_extra_marketplaces() {
+    fn test_extra_known_marketplaces_deep_merge_at_cwd() {
+        // extraKnownMarketplaces（dict）在 cwd 的 project/local 层深合并：键并集，同名叶子高层胜。
         let tmp = TempDir::new().unwrap();
-        let wd1 = tmp.path().join("wd1");
-        let wd2 = tmp.path().join("wd2");
+        let wd = tmp.path().join("wd");
         write_json(
-            &workdir_project_settings_path(&wd1),
+            &workdir_project_settings_path(&wd),
             &json!({"extraKnownMarketplaces": {"mp1": {"source": {"type": "git", "url": "git@h:a.git"}}}}),
         );
         write_json(
-            &workdir_project_settings_path(&wd2),
+            &workdir_local_settings_path(&wd),
             &json!({"extraKnownMarketplaces": {"mp2": {"source": {"type": "git", "url": "git@h:b.git"}}}}),
         );
         let env = empty_user_env(tmp.path());
         let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: &[wd1, wd2],
-            active_workdir: None,
+            cwd: Some(&wd),
             env: Some(&env),
             ..Default::default()
         });
@@ -927,8 +786,7 @@ mod tests {
         let env = empty_user_env(tmp.path());
         let policy = obj(json!({"strictKnownMarketplaces": true, "allowedMcpServers": ["srv"]}));
         let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: std::slice::from_ref(&wd),
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             policy_settings: Some(&policy),
             ..Default::default()
@@ -950,8 +808,7 @@ mod tests {
         );
         let env = empty_user_env(tmp.path());
         let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: std::slice::from_ref(&wd),
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             ..Default::default()
         });
@@ -971,8 +828,7 @@ mod tests {
         std::fs::write(&path, "{not valid json").unwrap();
         let env = empty_user_env(tmp.path());
         let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: std::slice::from_ref(&wd),
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             ..Default::default()
         });
@@ -995,57 +851,6 @@ mod tests {
     }
 
     #[test]
-    fn test_errors_deduped_when_active_dir_read_twice() {
-        // active workdir 文件在能力层 + B 层各读一次；同一错误应去重。
-        let tmp = TempDir::new().unwrap();
-        let wd = tmp.path().join("wd");
-        write_json(
-            &workdir_project_settings_path(&wd),
-            &json!({"strictKnownMarketplaces": "bad"}),
-        );
-        let env = empty_user_env(tmp.path());
-        let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: std::slice::from_ref(&wd),
-            active_workdir: Some(&wd),
-            env: Some(&env),
-            ..Default::default()
-        });
-        let scalar_errors: Vec<_> = resolved
-            .errors
-            .iter()
-            .filter(|e| e.field == "strictKnownMarketplaces")
-            .collect();
-        assert_eq!(scalar_errors.len(), 1);
-    }
-
-    #[test]
-    fn test_capability_cross_workdir_conflict_later_wins() {
-        // 两登记目录对同一 enabledPlugins["foo@mp"] 给不同 bool → 后者(wd2)覆盖（§5.4）。
-        let tmp = TempDir::new().unwrap();
-        let wd1 = tmp.path().join("wd1");
-        let wd2 = tmp.path().join("wd2");
-        write_json(
-            &workdir_project_settings_path(&wd1),
-            &json!({"enabledPlugins": {"foo@mp": true}}),
-        );
-        write_json(
-            &workdir_project_settings_path(&wd2),
-            &json!({"enabledPlugins": {"foo@mp": false}}),
-        );
-        let env = empty_user_env(tmp.path());
-        let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: &[wd1, wd2],
-            active_workdir: None,
-            env: Some(&env),
-            ..Default::default()
-        });
-        assert_eq!(
-            resolved.settings["enabledPlugins"],
-            json!({"foo@mp": false})
-        ); // 后者胜出
-    }
-
-    #[test]
     fn test_flag_layer_overrides_user_and_project() {
         // flag 层（--settings <file>）优先级高于 project，仅低于 policy。
         let tmp = TempDir::new().unwrap();
@@ -1065,8 +870,7 @@ mod tests {
         .unwrap();
         let env = empty_user_env(tmp.path());
         let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: std::slice::from_ref(&wd),
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             flag_settings_path: Some(&flag_file),
             ..Default::default()
@@ -1099,8 +903,7 @@ mod tests {
         write_json(&workdir_project_settings_path(&wd), &Value::Object(written));
         let env = empty_user_env(tmp.path());
         let resolved = resolve_settings(ResolveSettingsArgs {
-            registered_workdirs: std::slice::from_ref(&wd),
-            active_workdir: Some(&wd),
+            cwd: Some(&wd),
             env: Some(&env),
             ..Default::default()
         });

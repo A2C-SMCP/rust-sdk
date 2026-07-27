@@ -137,6 +137,7 @@ pub fn create_test_tools() -> Vec<SMCPTool> {
     vec![
         SMCPTool {
             name: "echo".to_string(),
+            bundle_id: "echo_bundle".to_string(),
             description: "Echo the input text / 回显输入的文本".to_string(),
             params_schema: json!({
                 "type": "object",
@@ -153,6 +154,7 @@ pub fn create_test_tools() -> Vec<SMCPTool> {
         },
         SMCPTool {
             name: "add".to_string(),
+            bundle_id: "add_bundle".to_string(),
             description: "Add two numbers / 计算两个数的和".to_string(),
             params_schema: json!({
                 "type": "object",

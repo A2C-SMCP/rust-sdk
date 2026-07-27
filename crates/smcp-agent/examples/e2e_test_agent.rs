@@ -312,7 +312,7 @@ async fn run_mode(
                     &format!("R-02 未含 window:// 资源: {uris:?}"),
                 );
             }
-            // R-03：未知 MCP server → 4014（顶层 mcp_server_name 分流）。
+            // R-03：未知 MCP server → 4014（顶层 mcp_server 分流）。
             match timeout(
                 CALL_TIMEOUT,
                 agent.get_resources(computer, "nonexistent-server", None),

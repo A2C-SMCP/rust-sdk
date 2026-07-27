@@ -12,10 +12,10 @@
 //!
 //! 当前承载 `client:*` ack 的 `req_id` 回显校验——`get_tools` / `get_desktop` / `list_room` /
 //! SKILL 消费（`skill_consume`）均经此单点收敛，避免「错误处理逻辑重复」（DRY）——以及
-//! `get_resources` 响应解析（[`parse_get_resources_response`]，与 `skill_consume` 同款纯函数约定）。
+//! `get_resources` 响应解析（`parse_get_resources_response`，与 `skill_consume` 同款纯函数约定）。
 
 use serde_json::Value;
-use smcp::{GetBlobRet, GetResourcesRet};
+use smcp::{GetBlobRet, GetComputerConfigRet, GetResourcesRet};
 
 use crate::error::{Result, SmcpAgentError};
 use crate::protocol_error::raise_for_error_payload;
@@ -51,6 +51,18 @@ pub(crate) fn parse_get_resources_response(
     raise_for_error_payload(response)?;
     ensure_req_id(response, expected_req_id)?;
     let ret: GetResourcesRet = serde_json::from_value(response.clone())?;
+    Ok(ret)
+}
+
+/// 解析 `client:get_config` 响应为 [`GetComputerConfigRet`] / parse a `client:get_config` ack。
+///
+/// 与兄弟消费方（[`parse_get_resources_response`]）同款约定：flat ErrorPayload → 协议错误；整包
+/// 反序列化。**区别**：`GetComputerConfigRet`（`inputs` 可选 + `servers` = 运行期活跃集，key = `bundle_id`）
+/// **无 `req_id` 字段**（协议如是定义）⇒ **不做** `ensure_req_id` 回显校验。无 I/O，供 async/sync Agent
+/// 共享并独立单测（不依赖 Socket.IO 传输）。对标 Python `a2c_smcp/agent/client.py::get_config` 响应段（#136）。
+pub(crate) fn parse_get_config_response(response: &Value) -> Result<GetComputerConfigRet> {
+    raise_for_error_payload(response)?;
+    let ret: GetComputerConfigRet = serde_json::from_value(response.clone())?;
     Ok(ret)
 }
 
@@ -194,7 +206,7 @@ mod tests {
         let resp = json!({
             "code": 4014,
             "message": "MCP Server not registered",
-            "mcp_server_name": "srv-x"
+            "mcp_server": "srv-x"
         });
         let err = parse_get_resources_response(&resp, "R1").unwrap_err();
         assert!(matches!(err, SmcpAgentError::Protocol(_)), "got {err:?}");
@@ -206,7 +218,7 @@ mod tests {
         let resp = json!({
             "code": 4015,
             "message": "capability not supported",
-            "mcp_server_name": "srv-x",
+            "mcp_server": "srv-x",
             "capability": "resources"
         });
         let err = parse_get_resources_response(&resp, "R1").unwrap_err();
@@ -222,6 +234,45 @@ mod tests {
             matches!(err, SmcpAgentError::ReqIdMismatch { .. }),
             "got {err:?}"
         );
+    }
+
+    // ── parse_get_config_response（#136）─────────────────────────────────────
+    // GetComputerConfigRet 无 req_id 字段 ⇒ 不做回显校验；servers 为运行期活跃集（key = bundle_id）。
+
+    #[test]
+    fn test_get_config_happy_servers_and_inputs() {
+        // servers 以 bundle_id 为 key、value 带 name display；inputs 为定义列表。
+        let resp = json!({
+            "servers": {
+                "id_x": { "name": "Display Name", "type": "stdio" }
+            },
+            "inputs": [ { "id": "token", "type": "promptString" } ]
+        });
+        let ret = parse_get_config_response(&resp).unwrap();
+        // servers 保持原样 Value（Agent 侧不强类型化，按 bundle_id key 消费）。
+        assert_eq!(ret.servers["id_x"]["name"], json!("Display Name"));
+        assert!(
+            ret.servers.get("Display Name").is_none(),
+            "key = bundle_id 非 name"
+        );
+        assert_eq!(ret.inputs.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn test_get_config_no_inputs_key_is_none() {
+        // inputs 缺省（无键）→ None（不 panic、不做 req_id 校验，即便响应无 req_id）。
+        let resp = json!({ "servers": {} });
+        let ret = parse_get_config_response(&resp).unwrap();
+        assert!(ret.inputs.is_none());
+        assert!(ret.servers.as_object().expect("object").is_empty());
+    }
+
+    #[test]
+    fn test_get_config_flat_error_raises_protocol_error() {
+        // flat ErrorPayload（协议识别码，如 404）经 ack 透传 → 协议错误，不被吞、不落进整包反序列化。
+        let resp = json!({ "code": 404, "message": "boom" });
+        let err = parse_get_config_response(&resp).unwrap_err();
+        assert!(matches!(err, SmcpAgentError::Protocol(_)), "got {err:?}");
     }
 
     // ── AGT-05 #44：tool_call 结果三态区分（classify_tool_call_outcome）──────────────────

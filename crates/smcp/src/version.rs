@@ -258,8 +258,9 @@ mod tests {
 
     #[test]
     fn test_protocol_version_constant_parses() {
-        // 暴露的 PROTOCOL_VERSION 常量必须是合法 3 段版本
+        // 暴露的 PROTOCOL_VERSION 常量必须是合法 3 段版本，且解析后往返一致（规范形）。
+        // **不与具体值耦合**——升级协议版本时本测试无需改。
         let v = ProtocolVersion::parse(crate::PROTOCOL_VERSION).unwrap();
-        assert_eq!(v, ProtocolVersion::new(0, 2, 0));
+        assert_eq!(v.to_string(), crate::PROTOCOL_VERSION);
     }
 }

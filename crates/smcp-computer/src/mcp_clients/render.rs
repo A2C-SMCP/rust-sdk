@@ -14,12 +14,49 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum RenderError {
+    /// 占位符引用的 input **未定义**（不在 inputs 池中）——**保留占位符原样、不报错**（VS Code parity）。
+    /// Placeholder references an undefined input → left verbatim, not an error.
     #[error("Input not found: {0}")]
     InputNotFound(String),
+    /// 占位符引用的 input **已定义但无法解析**（无 resolver / env / 默认值，#112 S5 D1）——**向上传播**，
+    /// 由调用方映射为结构化 [`ComputerError::InputResolution`](crate::errors::ComputerError::InputResolution)。
+    /// 与 [`RenderError::InputNotFound`] 的「保留原样」语义**刻意区分**：这是必填值缺失，绝不静默用空串。
+    #[error("Input unresolved: {0}")]
+    InputUnresolved(String),
     #[error("Render depth exceeded")]
     DepthExceeded,
     #[error("Invalid placeholder format")]
     InvalidPlaceholder,
+}
+
+/// `${input:<id>}` 占位符文法（单一权威：renderer 替换 + preflight/resolve 收集共用此 pattern）/
+/// the `${input:<id>}` placeholder grammar (single source for renderer substitution + collector extraction).
+pub(crate) const INPUT_PLACEHOLDER_PATTERN: &str = r"\$\{input:([^}]+)}";
+
+/// 收集配置 JSON 树里所有 `${input:<id>}` 引用的 input id（递归；纯语法扫描、**不取真实值**）/
+/// collect all `${input:<id>}` referenced ids from a config JSON tree (pure syntax scan, no value resolution).
+///
+/// **单一收集器**（#151 收口）：`Computer::render_server_config` 的「只解析被引用 input」判定与 typed-import
+/// preflight（`settings::config::import` 的引用可达校验）共用，避免 `${input:}` 文法分叉。
+pub(crate) fn collect_input_placeholder_ids(value: &Value) -> Vec<String> {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(INPUT_PLACEHOLDER_PATTERN).expect("input-placeholder regex")
+    });
+    fn walk(v: &Value, re: &Regex, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for cap in re.captures_iter(s) {
+                    out.push(cap[1].to_string());
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, re, out)),
+            Value::Object(m) => m.values().for_each(|x| walk(x, re, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &RE, &mut out);
+    out
 }
 
 /// 配置渲染器，用于处理 ${input:xxx} 占位符
@@ -32,7 +69,7 @@ impl ConfigRender {
     /// 创建新的配置渲染器
     pub fn new(max_depth: usize) -> Self {
         Self {
-            placeholder_regex: Regex::new(r"\$\{input:([^}]+)}").unwrap(),
+            placeholder_regex: Regex::new(INPUT_PLACEHOLDER_PATTERN).unwrap(),
             max_depth,
         }
     }
