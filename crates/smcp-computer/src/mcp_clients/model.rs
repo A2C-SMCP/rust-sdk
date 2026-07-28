@@ -16,9 +16,22 @@ use tokio_util::sync::CancellationToken;
 
 // Re-export MCP protocol types from rmcp
 pub use rmcp::model::{
-    Annotated, CallToolResult, Content, RawContent, RawResource, RawTextContent,
-    ReadResourceResult, Resource, ResourceContents, Tool, ToolAnnotations,
+    CallToolResult, ContentBlock as Content, ReadResourceResult, Resource, ResourceContents, Tool,
+    ToolAnnotations,
 };
+
+/// Compatibility shim for the pre-2.0 rmcp annotated-resource construction API.
+#[doc(hidden)]
+pub type RawResource = Resource;
+#[doc(hidden)]
+pub struct Annotated;
+impl Annotated {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(mut resource: Resource, annotations: Option<rmcp::model::Annotations>) -> Resource {
+        resource.annotations = annotations;
+        resource
+    }
+}
 
 // 常量定义 / Constants definition
 pub const A2C_TOOL_META: &str = "a2c_tool_meta";
@@ -357,6 +370,9 @@ pub struct HttpServerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub env_file: Option<String>,
+    /// OAuth configuration for protected Streamable HTTP servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::oauth::OAuthOptions>,
     /// HTTP服务器参数 / HTTP server parameters
     pub server_parameters: HttpServerParameters,
 }
@@ -410,6 +426,7 @@ impl HttpServerConfig {
             default_tool_meta: None,
             vrl: None,
             env_file: None,
+            oauth: None,
             server_parameters,
         }
     }
@@ -869,11 +886,10 @@ pub fn make_resource(
     description: Option<String>,
     mime_type: Option<String>,
 ) -> Resource {
-    use rmcp::model::AnnotateAble;
-    let mut raw = RawResource::new(uri, name);
-    raw.description = description;
-    raw.mime_type = mime_type;
-    raw.no_annotation()
+    let mut resource = Resource::new(uri, name);
+    resource.description = description;
+    resource.mime_type = mime_type;
+    resource
 }
 
 /// 便捷函数：检查 CallToolResult 是否为错误 / Convenience: check if CallToolResult is error
@@ -985,10 +1001,10 @@ mod tests {
     #[test]
     fn test_make_resource() {
         let resource = make_resource("window://test", "Test", Some("desc".into()), None);
-        assert_eq!(resource.raw.uri, "window://test");
-        assert_eq!(resource.raw.name, "Test");
-        assert_eq!(resource.raw.description, Some("desc".into()));
-        assert!(resource.raw.mime_type.is_none());
+        assert_eq!(resource.uri, "window://test");
+        assert_eq!(resource.name, "Test");
+        assert_eq!(resource.description, Some("desc".into()));
+        assert!(resource.mime_type.is_none());
     }
 
     // ---- #74 INT-04：envFile 字段解析（envFile alias + env_file 名）----

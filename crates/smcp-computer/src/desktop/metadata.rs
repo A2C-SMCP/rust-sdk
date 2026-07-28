@@ -27,7 +27,11 @@ use crate::mcp_clients::model::Resource;
 /// Note: rmcp `Annotations.priority` is already a typed `Option<f32>`, so there is no
 /// "non-numeric" branch like Python's.
 pub fn read_priority(resource: &Resource) -> f32 {
-    match resource.priority() {
+    match resource
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.priority)
+    {
         None => 0.0,
         Some(p) if (0.0..=1.0).contains(&p) => p,
         Some(p) => {
@@ -133,11 +137,7 @@ mod tests {
     /// `annotations.priority`。`None` 表示不附带 annotations。
     fn res_with_priority(priority: Option<f32>) -> Resource {
         let raw = RawResource::new("window://host/path", "win");
-        let annotations = priority.map(|p| Annotations {
-            audience: None,
-            priority: Some(p),
-            last_modified: None,
-        });
+        let annotations = priority.map(|p| Annotations::default().with_priority(p));
         Annotated::new(raw, annotations)
     }
 
@@ -227,21 +227,13 @@ mod tests {
         let raw = RawResource::new("window://host/path", "win");
         let with_assistant = Annotated::new(
             raw.clone(),
-            Some(Annotations {
-                audience: Some(vec![Role::Assistant]),
-                priority: None,
-                last_modified: None,
-            }),
+            Some(Annotations::default().with_audience(vec![Role::Assistant])),
         );
         check_audience(&with_assistant);
 
         let user_only = Annotated::new(
             raw,
-            Some(Annotations {
-                audience: Some(vec![Role::User]),
-                priority: None,
-                last_modified: None,
-            }),
+            Some(Annotations::default().with_audience(vec![Role::User])),
         );
         check_audience(&user_only);
     }

@@ -22,7 +22,7 @@
 //!
 //! Python 参考实现**不存在**（仅有 `ErrorCode` 枚举），Rust 领先实现，依据为协议决策表。
 
-use rmcp::model::{CallToolResult, Content, Meta};
+use rmcp::model::{CallToolResult, ContentBlock as Content, Meta};
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 use serde_json::{json, Value};
 use smcp::tool_meta::{AUTH_ERROR_CODE_KEY, AUTH_HINT_KEY, AUTH_MCP_SERVER_KEY};
@@ -370,9 +370,9 @@ mod tests {
         use rmcp::RoleClient;
 
         // 401 + WWW-Authenticate → rmcp 短路成 AuthRequired（Display 无状态码，字符串表永不命中）。
-        let she = StreamableHttpError::AuthRequired(AuthRequiredError {
-            www_authenticate_header: "Bearer realm=\"mcp\"".to_string(),
-        });
+        let she = StreamableHttpError::AuthRequired(AuthRequiredError::new(
+            "Bearer realm=\"mcp\"".to_string(),
+        ));
         let dte = DynamicTransportError::new::<
             StreamableHttpClientTransport<reqwest::Client>,
             RoleClient,

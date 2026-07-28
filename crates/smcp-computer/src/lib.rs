@@ -16,6 +16,7 @@ pub mod governance;
 pub mod inputs;
 pub mod inventory;
 pub mod mcp_clients;
+pub mod oauth;
 pub mod settings;
 pub mod skills;
 pub mod socketio_client;
@@ -27,6 +28,10 @@ pub mod cli;
 #[cfg(test)]
 pub use errors::{ComputerError, ComputerResult};
 
+pub use oauth::{
+    OAuthBeginRequest, OAuthCallback, OAuthClientMode, OAuthClientRegistration, OAuthError,
+    OAuthLaunch, OAuthOptions, OAuthStatus,
+};
 /// #107 S7（#114）：runtime status / 事件公开面 re-export / runtime status surface re-export。
 pub use status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 

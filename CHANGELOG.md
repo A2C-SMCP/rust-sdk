@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Breaking Changes
+
+- *(computer)* #157 upgrades the public MCP model and transport surface from `rmcp 0.11`
+  to exactly `rmcp 2.2.0`. Downstream code must use the rmcp 2.2 resource/content
+  layouts; removed legacy aliases such as `RawContent` and `RawTextContent` are no
+  longer re-exported.
+- *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
+
+### Features
+
+- *(computer)* #157 adds OAuth status, begin, callback completion, and credential
+  clearing APIs for Streamable HTTP servers. Supported grants include Authorization
+  Code + PKCE (pre-registered, CIMD, or DCR clients) and Client Credentials
+  (`client_secret` or `private_key_jwt`), with refresh and bounded
+  `insufficient_scope` step-up.
+- *(computer)* OAuth credentials are isolated by protected resource, issuer, client
+  mode, client identity, and configured scopes; persisted secrets use the OS
+  credential vault with process-memory fallback.
+
+### Migration Notes
+
+- Add the optional `oauth` object to an HTTP server configuration and provide secret
+  values through `SecretValueResolver` input IDs. Do not combine OAuth with a static
+  `Authorization` header.
+- The embedding Desktop/CLI must open `OAuthLaunch.authorization_url`, receive the
+  loopback/HTTPS callback, and pass its `code`, `state`, and optional `issuer` to
+  `complete_oauth`. The SDK does not open a browser or bind a callback listener.
+- OAuth configuration and status fields serialize as camelCase. Existing non-OAuth
+  HTTP servers retain normal redirect behavior; OAuth requests only follow
+  same-origin redirects.
+
 ## [0.3.0] - 2026-07-23
 
 ### Bug Fixes
@@ -424,4 +457,3 @@ All notable changes to this project will be documented in this file.
 ### Ci
 
 - 添加 GitHub Actions 流水线配置
-

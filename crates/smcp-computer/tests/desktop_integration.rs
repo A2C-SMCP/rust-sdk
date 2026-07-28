@@ -35,18 +35,15 @@ fn window_with_meta(
         map.insert("fullscreen".to_string(), serde_json::Value::Bool(true));
         raw.meta = Some(Meta(map));
     }
-    let annotations = priority.map(|p| Annotations {
-        audience: None,
-        priority: Some(p),
-        last_modified: None,
-    });
+    let annotations = priority.map(|p| Annotations::default().with_priority(p));
     WindowInfo {
         bundle_id: server.to_string(),
         server_name: server.to_string(),
         resource: Annotated::new(raw, annotations),
-        read_result: ReadResourceResult {
-            contents: vec![ResourceContents::text(content, uri.to_string())],
-        },
+        read_result: ReadResourceResult::new(vec![ResourceContents::text(
+            content,
+            uri.to_string(),
+        )]),
     }
 }
 
@@ -137,15 +134,13 @@ fn test_complex_content_rendering() {
             None,
             None,
         ),
-        read_result: ReadResourceResult {
-            contents: vec![
-                ResourceContents::text(
-                    "First paragraph\nwith multiple lines",
-                    "window://server.mcp.com/complex",
-                ),
-                ResourceContents::text("Second paragraph", "window://server.mcp.com/complex"),
-            ],
-        },
+        read_result: ReadResourceResult::new(vec![
+            ResourceContents::text(
+                "First paragraph\nwith multiple lines",
+                "window://server.mcp.com/complex",
+            ),
+            ResourceContents::text("Second paragraph", "window://server.mcp.com/complex"),
+        ]),
     }];
 
     let result = organize_desktop(windows, None, &[]);
@@ -166,34 +161,28 @@ fn test_size_limit_across_servers() {
             bundle_id: "server_a".to_string(),
             server_name: "server_a".to_string(),
             resource: make_resource("window://server_a.mcp.com/window1", "Window A1", None, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "A1",
-                    "window://server_a.mcp.com/window1",
-                )],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "A1",
+                "window://server_a.mcp.com/window1",
+            )]),
         },
         WindowInfo {
             bundle_id: "server_a".to_string(),
             server_name: "server_a".to_string(),
             resource: make_resource("window://server_a.mcp.com/window2", "Window A2", None, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "A2",
-                    "window://server_a.mcp.com/window2",
-                )],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "A2",
+                "window://server_a.mcp.com/window2",
+            )]),
         },
         WindowInfo {
             bundle_id: "server_b".to_string(),
             server_name: "server_b".to_string(),
             resource: make_resource("window://server_b.mcp.com/window1", "Window B1", None, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "B1",
-                    "window://server_b.mcp.com/window1",
-                )],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "B1",
+                "window://server_b.mcp.com/window1",
+            )]),
         },
     ];
 
@@ -222,12 +211,10 @@ fn test_window_uri_parsing_errors() {
             bundle_id: "server".to_string(),
             server_name: "server".to_string(),
             resource: make_resource("window://server.mcp.com/valid", "Valid Window", None, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "Valid",
-                    "window://server.mcp.com/valid",
-                )],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "Valid",
+                "window://server.mcp.com/valid",
+            )]),
         },
         // 无效scheme的窗口
         WindowInfo {
@@ -239,21 +226,20 @@ fn test_window_uri_parsing_errors() {
                 None,
                 None,
             ),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "Invalid",
-                    "http://server.mcp.com/invalid",
-                )],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "Invalid",
+                "http://server.mcp.com/invalid",
+            )]),
         },
         // 缺少host的窗口
         WindowInfo {
             bundle_id: "server".to_string(),
             server_name: "server".to_string(),
             resource: make_resource("window:///nohost", "No Host Window", None, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text("No Host", "window:///nohost")],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "No Host",
+                "window:///nohost",
+            )]),
         },
     ];
 

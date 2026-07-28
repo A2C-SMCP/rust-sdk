@@ -2082,13 +2082,11 @@ impl<S: Session> Computer<S> {
                                 kind,
                                 ..
                             }) => ComputerError::InputResolution(InputResolutionError::missing(
-                                &scoped_id,
-                                kind,
+                                &scoped_id, kind,
                             )),
-                            ComputerError::InputResolution(InputResolutionError::ResolverFailed {
-                                reason,
-                                ..
-                            }) => ComputerError::InputResolution(
+                            ComputerError::InputResolution(
+                                InputResolutionError::ResolverFailed { reason, .. },
+                            ) => ComputerError::InputResolution(
                                 InputResolutionError::resolver_failed(&scoped_id, reason),
                             ),
                             other => other,
@@ -3432,10 +3430,60 @@ impl<S: Session> Computer<S> {
     /// 真实 `client_factory`。**`change_sender` 仍由 `boot_up` 在调用本方法后单独注入**（本方法不涉及）。
     async fn new_manager(&self) -> MCPServerManager {
         let manager = MCPServerManager::new();
+        manager
+            .set_secret_resolver(self.secret_resolver.clone())
+            .await;
         if let Some(factory) = self.client_factory_override.clone() {
             manager.set_client_factory(Some(factory)).await;
         }
         manager
+    }
+
+    /// Query OAuth state for a protected remote MCP server.
+    pub async fn oauth_status(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<crate::oauth::OAuthStatus, crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.oauth_status(bundle_id).await
+    }
+
+    /// Begin Authorization Code + PKCE. The embedding app opens the returned URL.
+    pub async fn begin_oauth(
+        &self,
+        bundle_id: &BundleId,
+        request: crate::oauth::OAuthBeginRequest,
+    ) -> Result<crate::oauth::OAuthLaunch, crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.begin_oauth(bundle_id, request).await
+    }
+
+    /// Complete the browser callback without starting an SDK-owned listener.
+    pub async fn complete_oauth(
+        &self,
+        bundle_id: &BundleId,
+        callback: crate::oauth::OAuthCallback,
+    ) -> Result<(), crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.complete_oauth(bundle_id, callback).await
+    }
+
+    /// Clear persisted tokens and pending authorization state.
+    pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.clear_oauth(bundle_id).await
     }
 
     /// #148：MCP 起停**真有变更**后：bump capability revision（§12 R2：改变 Agent-facing 工具投影）
@@ -7125,7 +7173,10 @@ mod tests {
             def: &MCPServerInput,
         ) -> Result<Option<serde_json::Value>, InputResolutionError> {
             if def.id() == self.scoped_id {
-                Err(InputResolutionError::resolver_failed(def.id(), "scoped-boom"))
+                Err(InputResolutionError::resolver_failed(
+                    def.id(),
+                    "scoped-boom",
+                ))
             } else if def.id() == "token" {
                 Ok(Some(serde_json::Value::String(self.global_val.clone())))
             } else {
@@ -7169,7 +7220,7 @@ mod tests {
             prompt_def("figma@acme/token", None, false), // value
         );
         inputs.insert("token".to_string(), prompt_def("token", None, true)); // secret
-        // scoped value 无 input_resolver 值 → Missing；global secret 有 secret_resolver 值但跨 kind 不回退。
+                                                                             // scoped value 无 input_resolver 值 → Missing；global secret 有 secret_resolver 值但跨 kind 不回退。
         let mut sec = HashMap::new();
         sec.insert("token".to_string(), "secret-val".to_string());
         let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
@@ -7198,18 +7249,11 @@ mod tests {
             prompt_def("figma@acme/token", None, false),
         );
         inputs.insert("token".to_string(), prompt_def("token", None, false));
-        let computer = Computer::new(
-            "c",
-            SilentSession::new("t"),
-            Some(inputs),
-            None,
-            true,
-            true,
-        )
-        .with_input_resolver(Arc::new(ScopedOnlyFailingResolver {
-            scoped_id: "figma@acme/token".to_string(),
-            global_val: "global-val".to_string(),
-        }));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(ScopedOnlyFailingResolver {
+                scoped_id: "figma@acme/token".to_string(),
+                global_val: "global-val".to_string(),
+            }));
         let scope = pscope("figma", "acme");
         let err = computer
             .render_server_config_with_scope(&stdio_with_arg("${input:token}"), Some(&scope))

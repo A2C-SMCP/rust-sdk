@@ -212,8 +212,6 @@ impl SseMCPClient {
             })?;
         }
 
-        let es_client = builder.build();
-
         // 创建通信通道 / Create communication channels
         let (request_tx, request_rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let (response_tx, response_rx) = mpsc::unbounded_channel::<serde_json::Value>();
@@ -232,8 +230,15 @@ impl SseMCPClient {
         let notify = self.notify.clone();
 
         // 启动SSE事件处理任务 / Start SSE event handling task
+        // Avoid constructing a TLS connector (and loading the platform certificate store) for
+        // plain-HTTP endpoints. Besides being unnecessary work, concurrent macOS keychain reads
+        // can fail with errSecIO (-36) when many local SSE clients start together.
         let stream: Pin<Box<dyn Stream<Item = Result<es::SSE, es::Error>> + Send + Sync>> =
-            es_client.stream();
+            if url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "http") {
+                builder.build_http().stream()
+            } else {
+                builder.build().stream()
+            };
 
         tokio::spawn(async move {
             let mut stream = Box::pin(stream);

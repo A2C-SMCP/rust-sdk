@@ -261,11 +261,7 @@ mod tests {
             map.insert("fullscreen".to_string(), serde_json::Value::Bool(true));
             raw.meta = Some(Meta(map));
         }
-        let annotations = Some(Annotations {
-            audience: None,
-            priority: Some(priority as f32 / 100.0),
-            last_modified: None,
-        });
+        let annotations = Some(Annotations::default().with_priority(priority as f32 / 100.0));
         let resource = Annotated::new(raw, annotations);
 
         WindowInfo {
@@ -273,9 +269,10 @@ mod tests {
             bundle_id: server.to_string(),
             server_name: server.to_string(),
             resource,
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(content, uri.to_string())],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                content,
+                uri.to_string(),
+            )]),
         }
     }
 
@@ -467,9 +464,7 @@ mod tests {
             bundle_id: "server1".to_string(),
             server_name: "server1".to_string(),
             resource: make_resource("window://server1.mcp.com/window1", "Window 1", None, None),
-            read_result: ReadResourceResult {
-                contents: Vec::new(),
-            },
+            read_result: ReadResourceResult::new(Vec::new()),
         }];
 
         let result = organize_desktop(windows, None, &[]);
@@ -501,9 +496,10 @@ mod tests {
                 bundle_id: "server1".to_string(),
                 server_name: "server1".to_string(),
                 resource: make_resource(":::this_is_not_a_uri", "Bad Window", None, None),
-                read_result: ReadResourceResult {
-                    contents: vec![ResourceContents::text("bad", ":::this_is_not_a_uri")],
-                },
+                read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                    "bad",
+                    ":::this_is_not_a_uri",
+                )]),
             },
             create_test_window("server1", "window://server1.mcp.com/good", "good", 0, false),
         ];
@@ -704,12 +700,10 @@ mod tests {
             bundle_id: "server1".to_string(),
             server_name: "server1".to_string(),
             resource: Annotated::new(raw, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "bare",
-                    "window://server1.mcp.com/no-ann",
-                )],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "bare",
+                "window://server1.mcp.com/no-ann",
+            )]),
         };
         let high = create_test_window(
             "server1",

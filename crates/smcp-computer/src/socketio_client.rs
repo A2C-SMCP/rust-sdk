@@ -1462,7 +1462,7 @@ pub(crate) fn to_a2c_resource(resource: &crate::mcp_clients::model::Resource) ->
         name: Some(resource.name.clone()),
         description: resource.description.clone(),
         mime_type: resource.mime_type.clone(),
-        size: resource.size.map(u64::from),
+        size: resource.size,
         annotations,
         meta,
     }
@@ -1692,16 +1692,10 @@ mod tests {
         use std::sync::Arc;
         let input_schema: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(json!({"type": "object"})).unwrap();
-        Tool {
-            name: "test_tool".into(),
-            title: None,
-            description: Some("A test tool".into()),
-            input_schema: Arc::new(input_schema),
-            output_schema: None,
-            annotations,
-            icons: None,
-            meta: meta.map(rmcp::model::Meta),
-        }
+        let mut tool = Tool::new("test_tool", "A test tool", Arc::new(input_schema));
+        tool.annotations = annotations;
+        tool.meta = meta.map(rmcp::model::Meta);
+        tool
     }
 
     #[test]
@@ -1711,13 +1705,13 @@ mod tests {
             "a2c_tool_meta".to_string(),
             json!({"tags": ["browser"], "priority": 1}),
         );
-        let annotations = ToolAnnotations {
-            title: Some("Test".to_string()),
-            read_only_hint: Some(false),
-            destructive_hint: Some(false),
-            idempotent_hint: None,
-            open_world_hint: Some(false),
-        };
+        let annotations = ToolAnnotations::from_raw(
+            Some("Test".to_string()),
+            Some(false),
+            Some(false),
+            None,
+            Some(false),
+        );
         let smcp_tool =
             convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)), "fs-bundle");
 
@@ -1746,13 +1740,13 @@ mod tests {
 
     #[test]
     fn test_tool_to_smcp_tool_only_annotations() {
-        let annotations = ToolAnnotations {
-            title: Some("My Tool".to_string()),
-            read_only_hint: Some(true),
-            destructive_hint: Some(false),
-            idempotent_hint: None,
-            open_world_hint: Some(false),
-        };
+        let annotations = ToolAnnotations::from_raw(
+            Some("My Tool".to_string()),
+            Some(true),
+            Some(false),
+            None,
+            Some(false),
+        );
         let smcp_tool =
             convert_tool_to_smcp_tool(make_tool(None, Some(annotations)), "test_bundle");
 
@@ -1800,11 +1794,10 @@ mod tests {
         raw.meta = Some(Meta(m));
         // last_modified 设为定值，覆盖 DateTime<Utc> → RFC3339 映射分支。
         let dt: chrono::DateTime<chrono::Utc> = "2025-01-02T03:04:05Z".parse().unwrap();
-        let ann = Annotations {
-            audience: Some(vec![Role::Assistant]),
-            priority: Some(0.7),
-            last_modified: Some(dt),
-        };
+        let ann = Annotations::default()
+            .with_audience(vec![Role::Assistant])
+            .with_priority(0.7)
+            .with_timestamp(dt);
         let a2c = to_a2c_resource(&Annotated::new(raw, Some(ann)));
 
         assert_eq!(a2c.uri.as_deref(), Some("window://app/w1"));
