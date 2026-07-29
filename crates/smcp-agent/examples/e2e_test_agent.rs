@@ -166,7 +166,11 @@ async fn run_mode(
             let probe = "hello-uat";
             match timeout(
                 CALL_TIMEOUT,
-                agent.tool_call(computer, "echo", serde_json::json!({ "message": probe })),
+                agent.tool_call(
+                    computer,
+                    "echo__echo",
+                    serde_json::json!({ "message": probe }),
+                ),
             )
             .await
             {
@@ -373,7 +377,11 @@ async fn run_mode(
             const N: usize = 40000;
             let result = match timeout(
                 CALL_TIMEOUT,
-                agent.tool_call(computer, "gen_image", serde_json::json!({ "bytes": N })),
+                agent.tool_call(
+                    computer,
+                    "echo__gen_image",
+                    serde_json::json!({ "bytes": N }),
+                ),
             )
             .await
             {
