@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing_subscriber::fmt::MakeWriter;
 
+use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::inputs::{InputResolutionError, SecretValueResolver};
 use smcp_computer::mcp_clients::http_client::HttpMCPClient;
 use smcp_computer::mcp_clients::model::*;
@@ -31,9 +32,11 @@ use smcp_computer::mcp_clients::sse_client::SseMCPClient;
 use smcp_computer::mcp_clients::MCPServerManager;
 use smcp_computer::oauth::{
     InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
-    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialStore,
-    OAuthError, OAuthOptions, OAuthStatus,
+    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialKey,
+    OAuthCredentialRecordKind, OAuthCredentialStore, OAuthCredentialStoreError, OAuthError,
+    OAuthOptions, OAuthStatus,
 };
+use tempfile::TempDir;
 
 // ============================================================
 // BoxBody helper
@@ -70,6 +73,64 @@ impl<'a> MakeWriter<'a> for CapturedLogs {
 impl CapturedLogs {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().expect("log capture lock poisoned")).into_owned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialStoreOperation {
+    Load(OAuthCredentialKey),
+    Save(OAuthCredentialKey),
+    Delete(OAuthCredentialKey),
+}
+
+#[derive(Default)]
+struct RecordingOAuthCredentialStore {
+    entries: Mutex<HashMap<OAuthCredentialKey, String>>,
+    operations: Mutex<Vec<CredentialStoreOperation>>,
+}
+
+impl RecordingOAuthCredentialStore {
+    async fn operations(&self) -> Vec<CredentialStoreOperation> {
+        self.operations.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl OAuthCredentialStore for RecordingOAuthCredentialStore {
+    async fn load(
+        &self,
+        key: &OAuthCredentialKey,
+    ) -> Result<Option<String>, OAuthCredentialStoreError> {
+        self.operations
+            .lock()
+            .await
+            .push(CredentialStoreOperation::Load(key.clone()));
+        Ok(self.entries.lock().await.get(key).cloned())
+    }
+
+    async fn save(
+        &self,
+        key: &OAuthCredentialKey,
+        value: &str,
+    ) -> Result<(), OAuthCredentialStoreError> {
+        self.operations
+            .lock()
+            .await
+            .push(CredentialStoreOperation::Save(key.clone()));
+        self.entries
+            .lock()
+            .await
+            .insert(key.clone(), value.to_string());
+        Ok(())
+    }
+
+    async fn delete(&self, key: &OAuthCredentialKey) -> Result<(), OAuthCredentialStoreError> {
+        self.operations
+            .lock()
+            .await
+            .push(CredentialStoreOperation::Delete(key.clone()));
+        self.entries.lock().await.remove(key);
+        Ok(())
     }
 }
 
@@ -1300,6 +1361,53 @@ async fn configure_authorization_code_manager(
     manager
 }
 
+fn authorization_code_server_config(base_url: &str, bundle_id: BundleId) -> MCPServerConfig {
+    let mut config = HttpServerConfig::new(
+        bundle_id.as_str(),
+        HttpServerParameters {
+            url: format!("{base_url}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id);
+    config.oauth = Some(authorization_code_options(
+        OAuthFixtureMode::PreregisteredPublic,
+    ));
+    MCPServerConfig::Http(config)
+}
+
+async fn configure_authorization_code_computer(
+    base_url: &str,
+    bundle_ids: &[BundleId],
+    store: Arc<dyn OAuthCredentialStore>,
+) -> (Computer<SilentSession>, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+    let servers = bundle_ids
+        .iter()
+        .cloned()
+        .map(|bundle_id| {
+            (
+                bundle_id.to_string(),
+                authorization_code_server_config(base_url, bundle_id),
+            )
+        })
+        .collect();
+    let computer = Computer::new(
+        "oauth-store-computer",
+        SilentSession::new("oauth-store-session"),
+        None,
+        Some(servers),
+        false,
+        false,
+    )
+    .with_oauth_credential_store(store)
+    .with_skill_home(temp_dir.path().join("skills"))
+    .with_blob_cache_root(temp_dir.path().join("blob"))
+    .with_config_dir(temp_dir.path().join("config"));
+    computer.boot_up().await.unwrap();
+    (computer, temp_dir)
+}
+
 struct CallbackRoute {
     tenant: String,
     cli_session: String,
@@ -1436,6 +1544,34 @@ async fn authorize_manager(
         .await
         .unwrap();
     query.get("client_id").cloned().unwrap()
+}
+
+async fn authorize_computer(
+    computer: &Computer<SilentSession>,
+    bundle_id: &BundleId,
+    state: &OAuthMockState,
+) {
+    let launch = computer
+        .begin_oauth(
+            bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    computer
+        .complete_oauth(
+            bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2004,6 +2140,109 @@ async fn test_authorization_code_restores_after_manager_rebuild_with_injected_st
         OAuthStatus::Unauthorized
     );
     cleared.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_computer_injected_oauth_store_routes_all_bundles_and_restores_after_rebuild() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let recording_store = Arc::new(RecordingOAuthCredentialStore::default());
+    let store: Arc<dyn OAuthCredentialStore> = recording_store.clone();
+    let first_bundle = BundleId::try_from("oauth-computer-a").unwrap();
+    let second_bundle = BundleId::try_from("oauth-computer-b").unwrap();
+
+    let (first_computer, first_temp_dir) = configure_authorization_code_computer(
+        &state.base_url,
+        &[first_bundle.clone(), second_bundle.clone()],
+        Arc::clone(&store),
+    )
+    .await;
+    authorize_computer(&first_computer, &first_bundle, &state).await;
+    authorize_computer(&first_computer, &second_bundle, &state).await;
+
+    let operations = recording_store.operations().await;
+    for bundle_id in [&first_bundle, &second_bundle] {
+        assert!(
+            operations.iter().any(|operation| matches!(
+                operation,
+                CredentialStoreOperation::Save(key)
+                    if key.bundle_id == *bundle_id
+                        && key.record_kind == OAuthCredentialRecordKind::Credentials
+            )),
+            "the host store must receive credentials for {bundle_id}"
+        );
+    }
+
+    let clear_operation_start = operations.len();
+    first_computer.clear_oauth(&first_bundle).await.unwrap();
+    let operations = recording_store.operations().await;
+    let clear_operations = &operations[clear_operation_start..];
+    assert!(
+        clear_operations
+            .iter()
+            .any(|operation| matches!(operation, CredentialStoreOperation::Delete(_))),
+        "clear_oauth must delete through the host store"
+    );
+    assert!(
+        clear_operations.iter().all(|operation| match operation {
+            CredentialStoreOperation::Load(key)
+            | CredentialStoreOperation::Save(key)
+            | CredentialStoreOperation::Delete(key) => key.bundle_id == first_bundle,
+        }),
+        "clearing one bundle must not address another bundle's credential keys"
+    );
+    assert!(matches!(
+        first_computer.oauth_status(&first_bundle).await.unwrap(),
+        OAuthStatus::Unauthorized
+    ));
+    assert!(matches!(
+        first_computer.oauth_status(&second_bundle).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+
+    first_computer.shutdown().await.unwrap();
+    drop(first_computer);
+    drop(first_temp_dir);
+
+    let authorized_requests_before_restore = state.authorized_mcp_requests.load(Ordering::SeqCst);
+    let (restored_computer, restored_temp_dir) = configure_authorization_code_computer(
+        &state.base_url,
+        std::slice::from_ref(&second_bundle),
+        Arc::clone(&store),
+    )
+    .await;
+    assert!(matches!(
+        restored_computer
+            .oauth_status(&second_bundle)
+            .await
+            .unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+    restored_computer
+        .start_mcp_client(&second_bundle)
+        .await
+        .unwrap();
+    assert!(
+        state.authorized_mcp_requests.load(Ordering::SeqCst) > authorized_requests_before_restore,
+        "the rebuilt Computer must restore credentials and initialize over real HTTP"
+    );
+    restored_computer.clear_oauth(&second_bundle).await.unwrap();
+    restored_computer.shutdown().await.unwrap();
+    drop(restored_computer);
+    drop(restored_temp_dir);
+
+    let operations = recording_store.operations().await;
+    assert!(
+        operations
+            .iter()
+            .any(|operation| matches!(operation, CredentialStoreOperation::Load(_)))
+            && operations
+                .iter()
+                .any(|operation| matches!(operation, CredentialStoreOperation::Save(_)))
+            && operations
+                .iter()
+                .any(|operation| matches!(operation, CredentialStoreOperation::Delete(_))),
+        "the injected store must receive load, save, and delete operations"
+    );
 }
 
 #[tokio::test]

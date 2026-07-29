@@ -761,7 +761,15 @@ impl<S: Session> Computer<S> {
     /// Inject the host-owned OAuth credential store shared by every manager this computer creates.
     ///
     /// The default is an in-memory store. Hosts that require cross-process resume may inject their
-    /// own durable implementation without changing the SDK's storage policy.
+    /// own durable implementation without changing the SDK's storage policy. Rebuilding a
+    /// `Computer` restores credentials when the new instance receives the same durable store (or
+    /// another handle to the same backend) and the OAuth bundle/resource/issuer/grant key is
+    /// unchanged.
+    ///
+    /// Multi-tenant hosts should bind trusted tenant/principal context when constructing `store`;
+    /// that context does not belong in serializable OAuth configuration. An explicitly injected
+    /// store is authoritative: backend failures are returned and never trigger a silent in-memory
+    /// fallback.
     #[must_use]
     pub fn with_oauth_credential_store(mut self, store: Arc<dyn OAuthCredentialStore>) -> Self {
         self.oauth_credential_store = store;

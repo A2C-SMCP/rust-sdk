@@ -55,6 +55,9 @@ pub enum OAuthCredentialRecordKind {
 ///
 /// `tenant` and `principal` remain host runtime context: a multi-tenant store can prepend them to
 /// [`Self::stable_id`] without putting deployment identity into serializable MCP configuration.
+/// The key separates bundle, canonical protected resource, authorization server, grant/client
+/// fingerprint, and SDK record kind; hosts must preserve every dimension rather than keying only
+/// by MCP display name or resource URL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthCredentialKey {
@@ -67,6 +70,10 @@ pub struct OAuthCredentialKey {
 
 impl OAuthCredentialKey {
     /// Deterministic, non-secret identifier suitable for keyring/database keys.
+    ///
+    /// Multi-tenant hosts should namespace this value with trusted tenant/principal context captured
+    /// when constructing their store. Callback parameters and serialized MCP configuration are not
+    /// trusted sources for that context.
     pub fn stable_id(&self) -> String {
         let mut digest = Sha256::new();
         digest.update(self.bundle_id.as_str().as_bytes());
@@ -101,6 +108,15 @@ pub enum OAuthCredentialStoreError {
 ///
 /// Values contain tokens and MUST be encrypted at rest by persistent implementations. The SDK
 /// defaults to [`InMemoryOAuthCredentialStore`] and never probes an OS keyring on its own.
+///
+/// One store instance may serve every OAuth MCP owned by a [`crate::computer::Computer`]. Methods
+/// can be called concurrently and implementations must provide their own synchronization. A store
+/// must not log or expose `value`; configured client secrets and private keys remain inputs resolved
+/// by [`SecretValueResolver`] and are not part of the stored envelope.
+///
+/// Pending PKCE/CSRF state and host callback routing are separate concerns: this trait only stores
+/// credentials after authorization. Returning an error fails the OAuth operation; the SDK does not
+/// silently fall back to memory after a host store has been injected.
 #[async_trait]
 pub trait OAuthCredentialStore: Send + Sync {
     async fn load(

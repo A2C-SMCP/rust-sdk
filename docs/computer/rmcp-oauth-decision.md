@@ -313,18 +313,18 @@ beta 相对 2.2 的源码增量很大：
 ### 分层
 
 ```text
-Desktop / CLI
+Desktop / CLI / cloud host Flow Driver
   - 打开浏览器
-  - 启动/选择 callback receiver
+  - 启动 loopback callback receiver，或维护 HTTPS Callback Gateway
+  - 云端维护一次性 state -> tenant/CLI/Computer/bundle 路由
   - 展示授权状态
               │
               ▼
 Computer public OAuth API
-  - authorization_status
-  - begin_authorization
-  - complete_authorization
-  - clear_authorization
-  - subscribe authorization events
+  - oauth_status
+  - begin_oauth
+  - complete_oauth / cancel_oauth
+  - clear_oauth
               │
               ▼
 OAuthCoordinator
@@ -332,47 +332,37 @@ OAuthCoordinator
   - token restore / refresh / step-up
   - state machine / retry limits
   - rmcp compatibility facade
-       │                         │
-       ▼                         ▼
-CredentialStore             StateStore
-OS Keyring                  Memory + TTL
-       │                         │
-       └──────────┬──────────────┘
-                  ▼
+       │                              │
+       ▼                              ▼
+ExpiringStateStore             ScopedCredentialStore
+PKCE/CSRF + TTL                bundle/resource/issuer/grant adapter
+                                      │
+                                      ▼
+                            host OAuthCredentialStore
+                       default: keyed process memory
+                       injected: Keychain / DB / Vault
+                                      │
+                                      ▼
 rmcp AuthClient<reqwest 0.13>
-                  │
-                  ▼
+              │
+              ▼
 Streamable HTTP MCP Server
 ```
 
+宿主 callback 路由表位于 SDK 外部，既不属于 `ExpiringStateStore`，也不进入
+`OAuthCredentialStore`。
+
 ### 授权状态
 
-建议公开稳定的 SMCP 类型：
+当前公开类型为：
 
 ```rust
-pub enum AuthorizationStatus {
-    Unknown,
-    NotRequired,
-    Discovering,
-    AuthorizationRequired {
-        scopes: Vec<String>,
-        registration: RegistrationMethod,
-    },
-    AwaitingCallback {
-        scopes: Vec<String>,
-    },
-    Authorized {
-        scopes: Vec<String>,
-        expires_at: Option<SystemTime>,
-    },
-    Refreshing,
-    ReauthorizationRequired {
-        scopes: Vec<String>,
-    },
-    Failed {
-        kind: AuthorizationFailureKind,
-        retryable: bool,
-    },
+pub enum OAuthStatus {
+    Unauthorized,
+    AuthorizationPending,
+    Authorized { scopes: Vec<String> },
+    ReauthorizationRequired { required_scope: String },
+    Error { message: String },
 }
 ```
 
@@ -380,31 +370,34 @@ pub enum AuthorizationStatus {
 
 ### SDK API
 
-建议增加：
+当前 `Computer` 公开 API：
 
 ```rust
-impl Computer {
-    pub async fn authorization_status(
+impl<S: Session> Computer<S> {
+    pub async fn oauth_status(
         &self,
-        bundle_id: &str,
-    ) -> Result<AuthorizationStatus, ComputerError>;
+        bundle_id: &BundleId,
+    ) -> Result<OAuthStatus, OAuthError>;
 
-    pub async fn begin_authorization(
+    pub async fn begin_oauth(
         &self,
-        bundle_id: &str,
-        request: BeginAuthorizationRequest,
-    ) -> Result<AuthorizationLaunch, ComputerError>;
+        bundle_id: &BundleId,
+        request: OAuthBeginRequest,
+    ) -> Result<OAuthLaunch, OAuthError>;
 
-    pub async fn complete_authorization(
+    pub async fn complete_oauth(
         &self,
-        bundle_id: &str,
-        callback: AuthorizationCallback,
-    ) -> Result<AuthorizationStatus, ComputerError>;
+        bundle_id: &BundleId,
+        callback: OAuthCallback,
+    ) -> Result<(), OAuthError>;
 
-    pub async fn clear_authorization(
+    pub async fn cancel_oauth(
         &self,
-        bundle_id: &str,
-    ) -> Result<(), ComputerError>;
+        bundle_id: &BundleId,
+        cancellation: OAuthCancellation,
+    ) -> Result<(), OAuthError>;
+
+    pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), OAuthError>;
 }
 ```
 
@@ -412,43 +405,61 @@ impl Computer {
 
 - `connect()` 可恢复 token 并自动刷新；
 - 首次需要用户参与时，返回 typed `AuthorizationRequired`；
-- `begin_authorization()` 是 SDK 主动触发协议流程的入口；
+- `begin_oauth()` 是 SDK 主动触发协议流程的入口；
 - SDK 不调用 `open`、浏览器或 GUI API；
-- Desktop/CLI 收到 `AuthorizationLaunch` 后负责用户交互；
+- Desktop/CLI 收到 `OAuthLaunch` 后负责用户交互；
 - callback URL 必须同时校验 `state` 与可用的 `iss`。
 
 ### 配置模型
 
-在 `HttpServerParameters` 增加向后兼容的：
+在 `HttpServerConfig` 增加向后兼容的：
 
 ```rust
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub oauth: Option<OAuthOptions>
 ```
 
-建议配置语义：
+实际序列化形态（camelCase）：
 
 ```yaml
 oauth:
-  flow: authorization_code       # authorization_code | client_credentials
   scopes: [files:read]
-  registration:
-    mode: auto                   # auto | preregistered | cimd | dcr
-    clientMetadataUrl: https://client.example/smcp.json
-  redirectUri: http://127.0.0.1:0/callback
+  mode:
+    type: authorizationCode
+    registration: preregistered
+    clientId: my-client
 ```
 
-M2M：
+`registration: dynamic` 表示 DCR；CIMD 使用
+`registration: clientMetadataDocument` 并提供 `url`。
+
+`redirect_uri` 不属于可序列化配置。宿主先绑定 callback listener，再把精确地址作为
+`OAuthBeginRequest` 的运行期参数：
+
+```rust
+let listener = TcpListener::bind("127.0.0.1:0").await?;
+let redirect_uri = format!("http://{}/callback", listener.local_addr()?);
+let launch = computer
+    .begin_oauth(
+        &bundle_id,
+        OAuthBeginRequest {
+            redirect_uri,
+            required_scope: None,
+        },
+    )
+    .await?;
+```
+
+M2M `private_key_jwt`：
 
 ```yaml
 oauth:
-  flow: client_credentials
-  credential:
-    method: private_key_jwt      # client_secret | private_key_jwt
+  scopes: [files:read]
+  mode:
+    type: clientCredentialsPrivateKeyJwt
     clientId: my-service
     privateKeyInput: oauth_private_key
     algorithm: RS256
-  scopes: [files:read]
 ```
 
 所有 secret 字段必须通过现有 `SecretValueResolver`/input 引用解析，不能直接序列化明文。
@@ -457,7 +468,8 @@ oauth:
 
 1. 配置显式 `oauth`：走 OAuth，禁止同时提供手写 `Authorization` header。
 2. 未配置 OAuth、但存在 `Authorization` header：保持现有静态鉴权，不做自动 OAuth。
-3. 两者都没有：允许连接探测；收到规范 401 时返回 `AuthorizationRequired`，由调用方决定是否 `begin_authorization`。
+3. 两者都没有：允许连接探测；收到规范 401 时返回 `AuthorizationRequired`。调用
+   `begin_oauth` 前必须先为该 HTTP server 提供 `OAuthOptions`；SDK 不从 401 自动推断或持久化 OAuth 配置。
 4. 非 Authorization 自定义 headers 可与 OAuth 共存，但必须验证 redirect 不会跨 origin 泄漏。
 
 ### 凭据存储
@@ -468,43 +480,76 @@ oauth:
   - Desktop 可注入独立 service/key namespace 的 Keychain adapter；
   - 多租户服务必须在宿主运行时把 tenant/principal 上下文绑定到 store，不能写进可序列化 MCP 配置。
 - 持久 store 必须加密静态 value，且不能与普通 input ID 共用裸 key。
+- 已显式注入的 store 是权威后端：后端失败返回 `OAuthCredentialStoreError`，SDK 不静默降级到内存。
+- 同一个 store 实例会接收该 `Computer` 下所有 OAuth MCP 的异步 `load/save/delete`；实现必须支持并发调用。
 
-最小装配形态：
-
-```rust
-let store: Arc<dyn OAuthCredentialStore> = Arc::new(DesktopKeychainStore::new()?);
-let manager = MCPServerManager::with_oauth_credential_store(store);
-```
-
-云端 store 的实现应在构造时捕获可信运行时上下文，而不是从 callback/config 取业务标识：
+Desktop/本地宿主装配形态（Keychain adapter 由宿主实现，不属于 SDK 默认策略）：
 
 ```rust
-let store = TenantPrincipalOAuthStore::new(vault, trusted_tenant, trusted_principal);
-let manager = MCPServerManager::with_oauth_credential_store(Arc::new(store));
+let store: Arc<dyn OAuthCredentialStore> =
+    Arc::new(DesktopKeychainStore::new("com.example.app.oauth")?);
+let computer = Computer::new(/* host arguments */)
+    .with_oauth_credential_store(store);
 ```
+
+Keychain adapter 应使用 `key.stable_id()` 作为非敏感 account/key，并把 `value` 作为 secret
+写入；不得记录 `value` 或把 Keychain 不可用伪装成“无凭据”。
+
+云端 DB/Vault adapter 必须在构造时捕获可信运行时上下文，而不是从 callback/config 取业务标识：
+
+```rust
+let store = TenantPrincipalOAuthStore::new(
+    vault,
+    authenticated_tenant,
+    authenticated_principal,
+);
+let computer = Computer::new(/* host arguments */)
+    .with_oauth_credential_store(Arc::new(store));
+```
+
+其后端 locator 应形如
+`oauth/<trusted-tenant>/<trusted-principal>/<key.stable_id()>`；tenant/principal 来自已认证运行时
+上下文，不能信任 callback 携带的 `bundle_id`、`computer_id` 或租户字段。
 
 未调用 `with_oauth_credential_store` 时，`MCPServerManager::new()` 和 `Computer::new(...)`
 均使用进程内 store；进程退出后不会恢复 OAuth 凭据。
-- namespace：
+
+SDK key 的完整隔离维度为：
 
 ```text
-version / bundle_id / canonical_resource / authorization_server_issuer / account_hint
+bundle_id
++ canonical protected resource
++ authorization server identity
++ grant/client/scopes fingerprint
++ record kind (credentials | issuer-index)
 ```
 
-- value 是版本化 envelope：
+`OAuthCredentialKey::stable_id()` 对以上维度做带分隔符的 SHA-256，适合作为后端 locator；
+host tenant/principal namespace 位于该 stable ID 外层。SDK value 有两种版本化 envelope：
 
 ```text
-schema_version
-resource
-issuer
-registration_method
-serialized rmcp StoredCredentials
+credentials:
+  version
+  mode_fingerprint
+  serialized rmcp StoredCredentials
+
+issuer-index:
+  version
+  issuers[]
 ```
 
 - 先 discovery 得到 issuer，再加载对应 namespace。
 - rmcp 2.2 自身不在 StoredCredentials 中保存 issuer，因此 SMCP envelope 必须验证 issuer，Authorization Server 迁移时不得复用旧 token/DCR client。
-- CIMD client ID 可跨 issuer 保留；DCR/预注册 client secret 必须按 issuer 隔离。
-- PKCE/CSRF `StateStore` 默认只在内存保存并设置 TTL；应用重启后重新发起授权。
+- CIMD client ID 可跨 issuer 保留；DCR client registration 与 token 必须按 issuer 隔离。
+- `StoredCredentials` 保存 token 与 client ID；配置提供的 client secret/private key 不复制进
+  CredentialStore，仍由 `SecretValueResolver` 在交换或恢复 client 时提供。
+
+三类状态不得合并：
+
+1. SDK `ExpiringStateStore`：PKCE verifier、CSRF state、generation、TTL；进程重启后重新发起授权。
+2. 宿主 callback 路由表：`state -> tenant/CLI/Computer/bundle`，短期且一次性消费；只用于把
+   Gateway callback 私密路由回原 coordinator。
+3. `OAuthCredentialStore`：授权完成后的 token 凭据；不负责 callback 路由、Socket 或浏览器交互。
 
 ### 错误与事件
 

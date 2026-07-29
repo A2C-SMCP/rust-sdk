@@ -19,7 +19,8 @@ All notable changes to this project will be documented in this file.
   Code + PKCE (pre-registered, CIMD, or DCR clients) and Client Credentials
   (`client_secret` or `private_key_jwt`), with refresh and bounded
   `insufficient_scope` step-up.
-- *(computer)* OAuth credentials are isolated by bundle ID, canonical protected resource,
+- *(computer)* #159 makes OAuth credential policy host-injectable through
+  `Computer::with_oauth_credential_store`; credentials are isolated by bundle ID, canonical protected resource,
   issuer, client mode, client identity, and configured scopes. The SDK default is
   process-local memory and never probes an OS credential vault; hosts that need
   cross-process resume must inject an `OAuthCredentialStore`.
