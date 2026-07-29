@@ -3,8 +3,8 @@
 //! The SDK owns protocol state and tokens. The embedding Desktop/CLI owns opening the
 //! authorization URL and receiving the loopback callback.
 
-use crate::inputs::secret_store::SecretStore;
 use crate::inputs::SecretValueResolver;
+use crate::mcp_clients::bundle_id::BundleId;
 use crate::mcp_clients::model::{MCPServerInput, PromptStringInput};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -32,7 +32,6 @@ use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use tracing::instrument::WithSubscriber;
 use url::Url;
 
-const OAUTH_KEYRING_SERVICE: &str = "a2c-computer-oauth";
 const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCOVERY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTHORIZATION_STATE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -42,24 +41,119 @@ const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const DISCOVERY_PROTOCOL_VERSION: &str = "2024-11-05";
 
-fn credential_index_lock(resource: &str) -> Arc<StdMutex<()>> {
-    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<StdMutex<()>>>>> = OnceLock::new();
-    LOCKS
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .expect("OAuth credential index lock registry poisoned")
-        .entry(resource.to_string())
-        .or_insert_with(|| Arc::new(StdMutex::new(())))
-        .clone()
+/// Record type stored through [`OAuthCredentialStore`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum OAuthCredentialRecordKind {
+    /// Serialized OAuth client registration and token credentials.
+    Credentials,
+    /// Core-owned issuer index used to clear every credential slot without network discovery.
+    IssuerIndex,
+}
+
+/// Stable, bundle-aware key supplied to a host-provided OAuth credential store.
+///
+/// `tenant` and `principal` remain host runtime context: a multi-tenant store can prepend them to
+/// [`Self::stable_id`] without putting deployment identity into serializable MCP configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthCredentialKey {
+    pub bundle_id: BundleId,
+    pub resource: String,
+    pub issuer: Option<String>,
+    pub grant_fingerprint: String,
+    pub record_kind: OAuthCredentialRecordKind,
+}
+
+impl OAuthCredentialKey {
+    /// Deterministic, non-secret identifier suitable for keyring/database keys.
+    pub fn stable_id(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.bundle_id.as_str().as_bytes());
+        digest.update(b"\0");
+        digest.update(self.resource.as_bytes());
+        digest.update(b"\0");
+        digest.update(self.issuer.as_deref().unwrap_or("<none>").as_bytes());
+        digest.update(b"\0");
+        digest.update(self.grant_fingerprint.as_bytes());
+        digest.update(b"\0");
+        digest.update(match self.record_kind {
+            OAuthCredentialRecordKind::Credentials => b"credentials".as_slice(),
+            OAuthCredentialRecordKind::IssuerIndex => b"issuer-index".as_slice(),
+        });
+        format!("mcp-oauth-{:x}", digest.finalize())
+    }
+}
+
+/// Failure returned by a host OAuth credential store.
+///
+/// Variants intentionally carry no backend payload so a vault error cannot accidentally echo a
+/// credential, tenant identifier, or provider response through SDK diagnostics.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum OAuthCredentialStoreError {
+    #[error("OAuth credential store is unavailable")]
+    Unavailable,
+    #[error("OAuth credential store operation failed")]
+    OperationFailed,
+}
+
+/// Host-injected storage for opaque serialized OAuth credentials.
+///
+/// Values contain tokens and MUST be encrypted at rest by persistent implementations. The SDK
+/// defaults to [`InMemoryOAuthCredentialStore`] and never probes an OS keyring on its own.
+#[async_trait]
+pub trait OAuthCredentialStore: Send + Sync {
+    async fn load(
+        &self,
+        key: &OAuthCredentialKey,
+    ) -> Result<Option<String>, OAuthCredentialStoreError>;
+    async fn save(
+        &self,
+        key: &OAuthCredentialKey,
+        value: &str,
+    ) -> Result<(), OAuthCredentialStoreError>;
+    async fn delete(&self, key: &OAuthCredentialKey) -> Result<(), OAuthCredentialStoreError>;
+}
+
+/// Default keyed process-memory OAuth credential store.
+#[derive(Default)]
+pub struct InMemoryOAuthCredentialStore {
+    entries: RwLock<HashMap<OAuthCredentialKey, String>>,
+}
+
+#[async_trait]
+impl OAuthCredentialStore for InMemoryOAuthCredentialStore {
+    async fn load(
+        &self,
+        key: &OAuthCredentialKey,
+    ) -> Result<Option<String>, OAuthCredentialStoreError> {
+        Ok(self.entries.read().await.get(key).cloned())
+    }
+
+    async fn save(
+        &self,
+        key: &OAuthCredentialKey,
+        value: &str,
+    ) -> Result<(), OAuthCredentialStoreError> {
+        self.entries
+            .write()
+            .await
+            .insert(key.clone(), value.to_string());
+        Ok(())
+    }
+
+    async fn delete(&self, key: &OAuthCredentialKey) -> Result<(), OAuthCredentialStoreError> {
+        self.entries.write().await.remove(key);
+        Ok(())
+    }
 }
 
 struct OAuthResourceLifecycle {
     generation: AtomicU64,
     request_gate: Arc<RwLock<()>>,
-    memory: Arc<StdMutex<HashMap<String, StoredCredentials>>>,
 }
 
-type OAuthLifecycleKey = (String, String);
+type OAuthLifecycleKey = (usize, BundleId, String, String);
 type OAuthLifecycleRegistry = StdMutex<HashMap<OAuthLifecycleKey, Weak<OAuthResourceLifecycle>>>;
 
 /// Process-local PKCE/CSRF state with deterministic expiry and explicit deletion.
@@ -131,20 +225,30 @@ impl StateStore for ExpiringStateStore {
     }
 }
 
-fn oauth_resource_lifecycle(resource: &str, mode_fingerprint: &str) -> Arc<OAuthResourceLifecycle> {
+fn oauth_resource_lifecycle(
+    credential_store: &Arc<dyn OAuthCredentialStore>,
+    bundle_id: &BundleId,
+    resource: &str,
+    mode_fingerprint: &str,
+) -> Arc<OAuthResourceLifecycle> {
     static LIFECYCLES: OnceLock<OAuthLifecycleRegistry> = OnceLock::new();
     let mut lifecycles = LIFECYCLES
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()
         .expect("OAuth lifecycle registry poisoned");
-    let slot = (resource.to_string(), mode_fingerprint.to_string());
+    let store_identity = Arc::as_ptr(credential_store) as *const () as usize;
+    let slot = (
+        store_identity,
+        bundle_id.clone(),
+        resource.to_string(),
+        mode_fingerprint.to_string(),
+    );
     if let Some(lifecycle) = lifecycles.get(&slot).and_then(Weak::upgrade) {
         return lifecycle;
     }
     let lifecycle = Arc::new(OAuthResourceLifecycle {
         generation: AtomicU64::new(0),
         request_gate: Arc::new(RwLock::new(())),
-        memory: Arc::new(StdMutex::new(HashMap::new())),
     });
     lifecycles.insert(slot, Arc::downgrade(&lifecycle));
     lifecycle
@@ -584,6 +688,41 @@ impl std::fmt::Debug for OAuthCallback {
     }
 }
 
+/// Host-reported termination of a pending browser authorization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OAuthCancellationReason {
+    /// The authorization server returned `access_denied`.
+    AccessDenied,
+    /// The user or embedding application cancelled the flow.
+    Cancelled,
+    /// The embedding application's callback deadline elapsed.
+    Timeout,
+}
+
+/// Structured cancellation input for a flow previously started by [`OAuthBeginRequest`].
+///
+/// The host must return the exact state it received from [`OAuthLaunch`]. Arbitrary provider error
+/// descriptions are deliberately excluded so they cannot be retained or echoed by SDK errors.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthCancellation {
+    pub state: String,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    pub reason: OAuthCancellationReason,
+}
+
+impl std::fmt::Debug for OAuthCancellation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCancellation")
+            .field("state", &"[REDACTED]")
+            .field("issuer", &self.issuer)
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
 /// Observable authorization state for a server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
@@ -626,21 +765,16 @@ struct PendingAuthorization {
     generation: u64,
 }
 
-/// Credential storage scoped by protected resource and discovered issuer.
-///
-/// Values are persisted only in the OS credential vault. If it is unavailable, the
-/// fallback is process memory; plaintext is never written to a config or ordinary file.
+/// Thin rmcp adapter over the host-provided, bundle-aware credential store.
 #[derive(Clone)]
 struct ScopedCredentialStore {
+    bundle_id: BundleId,
     resource: String,
     mode_fingerprint: String,
     issuer: Arc<RwLock<Option<String>>>,
-    keyring: Arc<SecretStore>,
-    memory: Arc<StdMutex<HashMap<String, StoredCredentials>>>,
+    backend: Arc<dyn OAuthCredentialStore>,
     known_issuers: Arc<StdMutex<HashSet<Option<String>>>>,
-    index_lock: Arc<StdMutex<()>>,
     lifecycle: Arc<OAuthResourceLifecycle>,
-    persistent: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -650,144 +784,112 @@ struct StoredCredentialEnvelope {
     credentials: StoredCredentials,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct StoredCredentialSlot {
-    key: String,
-    mode_fingerprint: String,
-}
-
 #[derive(Serialize, Deserialize)]
 struct StoredCredentialIndex {
     version: u8,
-    slots: Vec<StoredCredentialSlot>,
+    issuers: Vec<Option<String>>,
 }
 
 impl ScopedCredentialStore {
-    fn new(resource: String, persistent: bool, mode_fingerprint: String) -> Self {
-        let index_lock = credential_index_lock(&resource);
-        let lifecycle = oauth_resource_lifecycle(&resource, &mode_fingerprint);
-        let memory = Arc::clone(&lifecycle.memory);
+    fn new(
+        bundle_id: BundleId,
+        resource: String,
+        mode_fingerprint: String,
+        backend: Arc<dyn OAuthCredentialStore>,
+    ) -> Self {
+        let lifecycle =
+            oauth_resource_lifecycle(&backend, &bundle_id, &resource, &mode_fingerprint);
         Self {
+            bundle_id,
             resource,
             mode_fingerprint,
             issuer: Arc::new(RwLock::new(None)),
-            keyring: Arc::new(SecretStore::with_backend(
-                OAUTH_KEYRING_SERVICE,
-                Box::new(crate::inputs::secret_store::OsKeyring),
-            )),
-            memory,
+            backend,
             known_issuers: Arc::new(StdMutex::new(HashSet::from([None]))),
-            index_lock,
             lifecycle,
-            persistent,
         }
     }
 
-    async fn set_issuer(&self, issuer: Option<String>) {
+    async fn set_issuer(&self, issuer: Option<String>) -> Result<(), RmcpAuthError> {
         self.known_issuers
             .lock()
             .expect("OAuth issuer registry poisoned")
             .insert(issuer.clone());
         *self.issuer.write().await = issuer;
-        self.persist_issuer_locator().await;
+        self.persist_issuer_index().await
     }
 
-    fn locator_key(&self) -> String {
-        let mut digest = Sha256::new();
-        digest.update(self.resource.as_bytes());
-        format!("mcp-oauth-resource-{:x}", digest.finalize())
+    async fn issuer(&self) -> Option<String> {
+        self.issuer.read().await.clone()
     }
 
-    async fn persist_issuer_locator(&self) {
-        if !self.persistent {
-            return;
-        }
-        if self.issuer.read().await.is_some() {
-            let key = self.key().await;
-            let _index_guard = self
-                .index_lock
-                .lock()
-                .expect("OAuth credential index lock poisoned");
-            let mut slots = self.persisted_slots();
-            if !slots.iter().any(|known| known.key == key) {
-                slots.push(StoredCredentialSlot {
-                    key,
-                    mode_fingerprint: self.mode_fingerprint.clone(),
-                });
-            }
-            self.save_persisted_slots(&slots);
+    fn key_for_issuer(&self, issuer: Option<String>) -> OAuthCredentialKey {
+        OAuthCredentialKey {
+            bundle_id: self.bundle_id.clone(),
+            resource: self.resource.clone(),
+            issuer,
+            grant_fingerprint: self.mode_fingerprint.clone(),
+            record_kind: OAuthCredentialRecordKind::Credentials,
         }
     }
 
-    fn persisted_slots(&self) -> Vec<StoredCredentialSlot> {
-        let Some(encoded) = self.keyring.get(&self.locator_key()) else {
-            return Vec::new();
+    fn index_key(&self) -> OAuthCredentialKey {
+        OAuthCredentialKey {
+            bundle_id: self.bundle_id.clone(),
+            resource: self.resource.clone(),
+            issuer: None,
+            grant_fingerprint: self.mode_fingerprint.clone(),
+            record_kind: OAuthCredentialRecordKind::IssuerIndex,
+        }
+    }
+
+    async fn key(&self) -> OAuthCredentialKey {
+        self.key_for_issuer(self.issuer.read().await.clone())
+    }
+
+    fn backend_error(_: OAuthCredentialStoreError) -> RmcpAuthError {
+        RmcpAuthError::InternalError("OAuth credential store operation failed".to_string())
+    }
+
+    async fn persisted_issuers(&self) -> Result<HashSet<Option<String>>, RmcpAuthError> {
+        let encoded = self
+            .backend
+            .load(&self.index_key())
+            .await
+            .map_err(Self::backend_error)?;
+        let Some(encoded) = encoded else {
+            return Ok(HashSet::new());
         };
-        if let Ok(index) = serde_json::from_str::<StoredCredentialIndex>(&encoded) {
-            if index.version == 2 {
-                return index.slots;
-            }
+        let index = serde_json::from_str::<StoredCredentialIndex>(&encoded)
+            .map_err(|_| RmcpAuthError::InternalError("OAuth issuer index is invalid".into()))?;
+        if index.version != 1 {
+            return Err(RmcpAuthError::InternalError(
+                "OAuth issuer index version is unsupported".into(),
+            ));
         }
-        let entries =
-            serde_json::from_str::<Vec<String>>(&encoded).unwrap_or_else(|_| vec![encoded]);
-        entries
-            .into_iter()
-            .map(|entry| {
-                let key = if entry.starts_with("mcp-oauth-") {
-                    entry
-                } else {
-                    self.legacy_key_for_issuer(Some(&entry))
-                };
-                let mode_fingerprint = self
-                    .keyring
-                    .get(&key)
-                    .and_then(|stored| {
-                        serde_json::from_str::<StoredCredentialEnvelope>(&stored).ok()
-                    })
-                    .map(|envelope| envelope.mode_fingerprint)
-                    .unwrap_or_default();
-                StoredCredentialSlot {
-                    key,
-                    mode_fingerprint,
-                }
-            })
-            .collect()
+        Ok(index.issuers.into_iter().collect())
     }
 
-    fn save_persisted_slots(&self, slots: &[StoredCredentialSlot]) {
-        if slots.is_empty() {
-            self.keyring.delete(&self.locator_key());
-            return;
-        }
-        if let Ok(encoded) = serde_json::to_string(&StoredCredentialIndex {
-            version: 2,
-            slots: slots.to_vec(),
-        }) {
-            self.keyring.set(&self.locator_key(), &encoded);
-        }
-    }
-
-    fn key_for_issuer(&self, issuer: Option<&str>) -> String {
-        let mut digest = Sha256::new();
-        digest.update(self.resource.as_bytes());
-        digest.update(b"\0");
-        digest.update(issuer.unwrap_or("<unknown>").as_bytes());
-        digest.update(b"\0");
-        digest.update(self.mode_fingerprint.as_bytes());
-        format!("mcp-oauth-{:x}", digest.finalize())
-    }
-
-    fn legacy_key_for_issuer(&self, issuer: Option<&str>) -> String {
-        let mut digest = Sha256::new();
-        digest.update(self.resource.as_bytes());
-        digest.update(b"\0");
-        digest.update(issuer.unwrap_or("<unknown>").as_bytes());
-        format!("mcp-oauth-{:x}", digest.finalize())
-    }
-
-    async fn key(&self) -> String {
-        let issuer = self.issuer.read().await;
-        self.key_for_issuer(issuer.as_deref())
+    async fn persist_issuer_index(&self) -> Result<(), RmcpAuthError> {
+        let mut issuers = self.persisted_issuers().await?;
+        issuers.extend(
+            self.known_issuers
+                .lock()
+                .expect("OAuth issuer registry poisoned")
+                .iter()
+                .cloned(),
+        );
+        let mut issuers: Vec<Option<String>> = issuers.into_iter().collect();
+        issuers.sort();
+        let encoded = serde_json::to_string(&StoredCredentialIndex {
+            version: 1,
+            issuers,
+        })
+        .map_err(|_| RmcpAuthError::InternalError("OAuth issuer index encoding failed".into()))?;
+        self.backend
+            .save(&self.index_key(), &encoded)
+            .await
+            .map_err(Self::backend_error)
     }
 
     async fn overwrite_granted_scopes(&self, scopes: Vec<String>) -> Result<(), RmcpAuthError> {
@@ -803,38 +905,27 @@ impl ScopedCredentialStore {
 impl CredentialStore for ScopedCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, RmcpAuthError> {
         let key = self.key().await;
-        if self.persistent {
-            if let Some(encoded) = self.keyring.get(&key) {
-                return match serde_json::from_str::<StoredCredentialEnvelope>(&encoded) {
-                    Ok(envelope)
-                        if envelope.version == 1
-                            && envelope.mode_fingerprint == self.mode_fingerprint =>
-                    {
-                        Ok(Some(envelope.credentials))
-                    }
-                    Ok(_) => {
-                        self.keyring.delete(&key);
-                        Ok(None)
-                    }
-                    Err(envelope_error) => {
-                        if serde_json::from_str::<StoredCredentials>(&encoded).is_ok() {
-                            // Credentials written before the mode envelope cannot be safely
-                            // attributed to a grant type.
-                            self.keyring.delete(&key);
-                            Ok(None)
-                        } else {
-                            Err(RmcpAuthError::InternalError(envelope_error.to_string()))
-                        }
-                    }
-                };
+        let encoded = self.backend.load(&key).await.map_err(Self::backend_error)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<StoredCredentialEnvelope>(&encoded) {
+            Ok(envelope)
+                if envelope.version == 1 && envelope.mode_fingerprint == self.mode_fingerprint =>
+            {
+                Ok(Some(envelope.credentials))
             }
+            Ok(_) => {
+                self.backend
+                    .delete(&key)
+                    .await
+                    .map_err(Self::backend_error)?;
+                Ok(None)
+            }
+            Err(_) => Err(RmcpAuthError::InternalError(
+                "stored OAuth credentials are invalid".to_string(),
+            )),
         }
-        Ok(self
-            .memory
-            .lock()
-            .expect("OAuth memory store poisoned")
-            .get(&key)
-            .cloned())
     }
 
     async fn save(&self, mut credentials: StoredCredentials) -> Result<(), RmcpAuthError> {
@@ -850,82 +941,51 @@ impl CredentialStore for ScopedCredentialStore {
             mode_fingerprint: self.mode_fingerprint.clone(),
             credentials: credentials.clone(),
         })
-        .map_err(|e| RmcpAuthError::InternalError(e.to_string()))?;
+        .map_err(|_| RmcpAuthError::InternalError("OAuth credential encoding failed".into()))?;
         let key = self.key().await;
-        let persisted = if self.persistent {
-            let _index_guard = self
-                .index_lock
-                .lock()
-                .expect("OAuth credential index lock poisoned");
-            let mut slots = self.persisted_slots();
-            if !slots.iter().any(|known| known.key == key) {
-                slots.push(StoredCredentialSlot {
-                    key: key.clone(),
-                    mode_fingerprint: self.mode_fingerprint.clone(),
-                });
-            }
-            self.save_persisted_slots(&slots);
-            self.keyring.set(&key, &encoded)
-        } else {
-            false
-        };
-        if !persisted {
-            self.memory
-                .lock()
-                .expect("OAuth memory store poisoned")
-                .insert(key, credentials);
-        }
+        self.persist_issuer_index().await?;
+        self.backend
+            .save(&key, &encoded)
+            .await
+            .map_err(Self::backend_error)?;
         self.lifecycle.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     async fn clear(&self) -> Result<(), RmcpAuthError> {
-        let issuers = self
+        let mut issuers = self
             .known_issuers
             .lock()
             .expect("OAuth issuer registry poisoned")
             .clone();
-        let mut keys: HashSet<String> = issuers
-            .iter()
-            .map(|issuer| self.key_for_issuer(issuer.as_deref()))
-            .collect();
-        if self.persistent {
-            let _index_guard = self
-                .index_lock
-                .lock()
-                .expect("OAuth credential index lock poisoned");
-            let mut slots = self.persisted_slots();
-            slots.retain(|slot| {
-                let belongs_to_current_mode = slot.mode_fingerprint.is_empty()
-                    || slot.mode_fingerprint == self.mode_fingerprint;
-                if belongs_to_current_mode {
-                    keys.insert(slot.key.clone());
-                }
-                !belongs_to_current_mode
-            });
-            for key in &keys {
-                self.keyring.delete(key);
-            }
-            self.save_persisted_slots(&slots);
+        issuers.extend(self.persisted_issuers().await?);
+        for issuer in issuers {
+            self.backend
+                .delete(&self.key_for_issuer(issuer))
+                .await
+                .map_err(Self::backend_error)?;
         }
-        self.memory
-            .lock()
-            .expect("OAuth memory store poisoned")
-            .clear();
+        self.backend
+            .delete(&self.index_key())
+            .await
+            .map_err(Self::backend_error)?;
         self.lifecycle.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
 
 pub(crate) async fn clear_stored_oauth_credentials(
+    bundle_id: &BundleId,
     resource: &str,
     options: &OAuthOptions,
-    persistent: bool,
+    credential_store: Arc<dyn OAuthCredentialStore>,
 ) -> Result<(), OAuthError> {
+    let resource = canonical_resource_identity(resource)?;
     let store = ScopedCredentialStore::new(
-        resource.to_string(),
-        persistent,
+        bundle_id.clone(),
+        resource,
         oauth_mode_fingerprint(options),
+        credential_store,
     );
     let _request_guard = store.lifecycle.request_gate.write().await;
     // `clear` filters the resource locator to this OAuth mode/client/scope slot.
@@ -963,12 +1023,13 @@ impl OAuthRequestGuard {
 
 impl OAuthCoordinator {
     pub(crate) async fn new(
+        bundle_id: &BundleId,
         resource: &str,
         options: OAuthOptions,
+        credential_store: Arc<dyn OAuthCredentialStore>,
         resolver: Option<Arc<dyn SecretValueResolver>>,
         http_client: reqwest::Client,
         protected_resource_headers: HeaderMap,
-        persist_credentials: bool,
     ) -> Result<Self, OAuthError> {
         let oauth_http_client = Arc::new(
             DiscoveryCleanupOAuthHttpClient::with_protected_resource_headers(
@@ -977,34 +1038,37 @@ impl OAuthCoordinator {
             )?,
         );
         Self::new_with_oauth_http_client(
+            bundle_id,
             resource,
             options,
+            credential_store,
             resolver,
             http_client,
-            persist_credentials,
             oauth_http_client,
         )
         .await
     }
 
     async fn new_with_oauth_http_client(
+        bundle_id: &BundleId,
         resource: &str,
         options: OAuthOptions,
+        credential_store: Arc<dyn OAuthCredentialStore>,
         resolver: Option<Arc<dyn SecretValueResolver>>,
         http_client: reqwest::Client,
-        persist_credentials: bool,
         oauth_http_client: Arc<dyn OAuthHttpClient>,
     ) -> Result<Self, OAuthError> {
-        validate_secure_url(resource, "protected resource")?;
+        let resource = canonical_resource_identity(resource)?;
         let store = ScopedCredentialStore::new(
-            resource.to_string(),
-            persist_credentials,
+            bundle_id.clone(),
+            resource.clone(),
             oauth_mode_fingerprint(&options),
+            credential_store,
         );
         let request_gate = Arc::clone(&store.lifecycle.request_gate);
         let initialization_guard = request_gate.write().await;
         let mut manager = AuthorizationManager::new_with_oauth_http_client(
-            resource,
+            &resource,
             Arc::clone(&oauth_http_client),
         )
         .await?;
@@ -1018,7 +1082,7 @@ impl OAuthCoordinator {
         )?;
         store
             .set_issuer(Some(authorization_server_credential_identity(&metadata)?))
-            .await;
+            .await?;
         manager.set_metadata(metadata);
         let mut stored = store.load().await?;
         if stored
@@ -1042,7 +1106,7 @@ impl OAuthCoordinator {
             manager.initialize_from_store().await?;
             configure_restored_authorization_client(
                 &mut manager,
-                resource,
+                &resource,
                 &options,
                 &restored_scopes,
                 stored
@@ -1079,7 +1143,7 @@ impl OAuthCoordinator {
         let client = SensitiveAuthClient::new(AuthClient::new(http_client, manager));
         drop(initialization_guard);
         Ok(Self {
-            resource: resource.to_string(),
+            resource,
             options,
             client,
             store,
@@ -1199,7 +1263,7 @@ impl OAuthCoordinator {
         )?;
         self.store
             .set_issuer(Some(authorization_server_credential_identity(&metadata)?))
-            .await;
+            .await?;
         manager.set_metadata(metadata.clone());
         Ok(metadata)
     }
@@ -1538,6 +1602,46 @@ impl OAuthCoordinator {
         }
     }
 
+    pub(crate) async fn cancel(&self, cancellation: OAuthCancellation) -> Result<(), OAuthError> {
+        let _request_guard = self.request_gate.write().await;
+        let _credential_guard = self.machine_scope_upgrade_gate.lock().await;
+        let mut pending = self.pending.lock().await;
+        let Some(active) = pending.as_ref() else {
+            return Err(OAuthError::StateMismatch);
+        };
+        if active.launch.state != cancellation.state
+            || active.generation != self.credential_generation()
+        {
+            return Err(OAuthError::StateMismatch);
+        }
+        if let Some(callback_issuer) = cancellation.issuer.as_deref() {
+            let callback_issuer =
+                validate_secure_url(callback_issuer, "authorization issuer")?.to_string();
+            if self.store.issuer().await.as_deref() != Some(callback_issuer.as_str()) {
+                return Err(OAuthError::StateMismatch);
+            }
+        }
+
+        *pending = None;
+        drop(pending);
+        self.state_store.delete(&cancellation.state).await?;
+        let restored = self.store.load().await?;
+        let status = match restored {
+            Some(credentials) if credentials.token_response.is_some() => {
+                let scopes = if credentials.granted_scopes.is_empty() {
+                    self.options.scopes.clone()
+                } else {
+                    credentials.granted_scopes
+                };
+                *self.granted_scopes.write().await = scopes.clone();
+                OAuthStatus::Authorized { scopes }
+            }
+            _ => OAuthStatus::Unauthorized,
+        };
+        *self.status.write().await = status;
+        Ok(())
+    }
+
     pub(crate) async fn clear(&self) -> Result<(), OAuthError> {
         self.invalidate_credentials(None).await
     }
@@ -1730,6 +1834,10 @@ fn validate_redirect_uri(value: &str) -> Result<(), OAuthError> {
         ));
     }
     Ok(())
+}
+
+fn canonical_resource_identity(value: &str) -> Result<String, OAuthError> {
+    Ok(validate_secure_url(value, "protected resource")?.to_string())
 }
 
 fn validate_authorization_metadata(
@@ -1957,7 +2065,7 @@ fn spawn_client_credentials_exchange(
                             )
                         })?,
                     ))
-                    .await;
+                    .await?;
                 manager.set_metadata(metadata);
                 manager.validate_client_credentials_metadata(&config)?;
                 manager.configure_client_credentials(&config)?;
@@ -1990,13 +2098,57 @@ mod tests {
     use hyper::{Request, Response, StatusCode};
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    fn test_bundle_id() -> BundleId {
+        BundleId::try_from("oauth-test".to_string()).unwrap()
+    }
+
+    fn memory_credential_store() -> Arc<dyn OAuthCredentialStore> {
+        Arc::new(InMemoryOAuthCredentialStore::default())
+    }
 
     const TEST_EC_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgp9PptiYIX1DoplcU
 CrXJICvftS6mTCVk+I+JynptjaShRANCAAT54hAudKCxTrTPlQUCSAHZtmOxl6fL
 hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
 -----END PRIVATE KEY-----"#;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured log lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log lock poisoned").clone())
+                .expect("tracing output must be UTF-8")
+        }
+    }
 
     struct JwtTestSecretResolver;
 
@@ -2148,9 +2300,15 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             authorization_url: "https://issuer.example/authorize?state=secret".into(),
             state: "secret".into(),
         };
-        let text = format!("{callback:?} {launch:?}");
+        let cancellation = OAuthCancellation {
+            state: "cancel-secret-state".into(),
+            issuer: Some("https://issuer.example".into()),
+            reason: OAuthCancellationReason::Timeout,
+        };
+        let text = format!("{callback:?} {launch:?} {cancellation:?}");
         assert!(!text.contains("secret-code"));
         assert!(!text.contains("secret-state"));
+        assert!(!text.contains("cancel-secret-state"));
         assert!(!text.contains("authorize?"));
     }
 
@@ -2192,26 +2350,107 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     fn credential_namespace_includes_resource_and_issuer() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let a =
-                ScopedCredentialStore::new("https://a.example/mcp".into(), false, "mode".into());
-            let b =
-                ScopedCredentialStore::new("https://b.example/mcp".into(), false, "mode".into());
-            a.set_issuer(Some("https://issuer.example".into())).await;
-            b.set_issuer(Some("https://issuer.example".into())).await;
+            let backend = memory_credential_store();
+            let a = ScopedCredentialStore::new(
+                test_bundle_id(),
+                "https://a.example/mcp".into(),
+                "mode".into(),
+                Arc::clone(&backend),
+            );
+            let b = ScopedCredentialStore::new(
+                test_bundle_id(),
+                "https://b.example/mcp".into(),
+                "mode".into(),
+                backend,
+            );
+            a.set_issuer(Some("https://issuer.example".into()))
+                .await
+                .unwrap();
+            b.set_issuer(Some("https://issuer.example".into()))
+                .await
+                .unwrap();
             assert_ne!(a.key().await, b.key().await);
         });
     }
 
     #[tokio::test]
+    async fn canonical_resource_identity_restores_and_clears_equivalent_urls() {
+        let first = "https://EXAMPLE.com:443/a/../mcp";
+        let equivalent = "https://example.com/mcp";
+        assert_eq!(
+            canonical_resource_identity(first).unwrap(),
+            canonical_resource_identity(equivalent).unwrap()
+        );
+
+        let options = OAuthOptions {
+            scopes: vec!["tools.read".into()],
+            client_name: None,
+            mode: OAuthClientMode::AuthorizationCode {
+                registration: OAuthClientRegistration::Preregistered {
+                    client_id: "canonical-client".into(),
+                    client_secret_input: None,
+                },
+            },
+        };
+        let backend = memory_credential_store();
+        let stored = ScopedCredentialStore::new(
+            test_bundle_id(),
+            canonical_resource_identity(first).unwrap(),
+            oauth_mode_fingerprint(&options),
+            Arc::clone(&backend),
+        );
+        stored
+            .set_issuer(Some("https://issuer.example".into()))
+            .await
+            .unwrap();
+        stored
+            .save(StoredCredentials::new(
+                "canonical-client".into(),
+                None,
+                vec!["tools.read".into()],
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let restored = ScopedCredentialStore::new(
+            test_bundle_id(),
+            canonical_resource_identity(equivalent).unwrap(),
+            oauth_mode_fingerprint(&options),
+            Arc::clone(&backend),
+        );
+        restored
+            .set_issuer(Some("https://issuer.example".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.load().await.unwrap().unwrap().client_id,
+            "canonical-client"
+        );
+
+        clear_stored_oauth_credentials(
+            &test_bundle_id(),
+            equivalent,
+            &options,
+            Arc::clone(&backend),
+        )
+        .await
+        .unwrap();
+        assert!(stored.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn credential_store_preserves_granted_scopes_when_refresh_omits_scope() {
         let store = ScopedCredentialStore::new(
+            test_bundle_id(),
             "https://resource.example/scope-preservation".into(),
-            false,
             "mode".into(),
+            memory_credential_store(),
         );
         store
             .set_issuer(Some("https://issuer.example".into()))
-            .await;
+            .await
+            .unwrap();
         store
             .save(StoredCredentials::new(
                 "client-id".into(),
@@ -2240,8 +2479,15 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     #[tokio::test]
     async fn credential_generation_advances_on_save_and_clear() {
         let resource = "https://resource.example/generation";
-        let store = ScopedCredentialStore::new(resource.into(), false, "mode".into());
-        let peer = ScopedCredentialStore::new(resource.into(), false, "mode".into());
+        let backend = memory_credential_store();
+        let store = ScopedCredentialStore::new(
+            test_bundle_id(),
+            resource.into(),
+            "mode".into(),
+            Arc::clone(&backend),
+        );
+        let peer =
+            ScopedCredentialStore::new(test_bundle_id(), resource.into(), "mode".into(), backend);
         assert!(Arc::ptr_eq(&store.lifecycle, &peer.lifecycle));
         let initial = store.lifecycle.generation.load(Ordering::Acquire);
 
@@ -2288,23 +2534,28 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                 token_endpoint_audience: None,
             },
         };
+        let backend = memory_credential_store();
         let secret_store = ScopedCredentialStore::new(
+            test_bundle_id(),
             resource.into(),
-            false,
             oauth_mode_fingerprint(&secret_options),
+            Arc::clone(&backend),
         );
         let jwt_store = ScopedCredentialStore::new(
+            test_bundle_id(),
             resource.into(),
-            false,
             oauth_mode_fingerprint(&jwt_options),
+            Arc::clone(&backend),
         );
         assert!(!Arc::ptr_eq(&secret_store.lifecycle, &jwt_store.lifecycle));
         secret_store
             .set_issuer(Some("https://issuer.example".into()))
-            .await;
+            .await
+            .unwrap();
         jwt_store
             .set_issuer(Some("https://issuer.example".into()))
-            .await;
+            .await
+            .unwrap();
         secret_store
             .save(StoredCredentials::new(
                 "client-a".into(),
@@ -2325,9 +2576,14 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             .unwrap();
         let jwt_generation = jwt_store.lifecycle.generation.load(Ordering::Acquire);
 
-        clear_stored_oauth_credentials(resource, &secret_options, false)
-            .await
-            .unwrap();
+        clear_stored_oauth_credentials(
+            &test_bundle_id(),
+            resource,
+            &secret_options,
+            Arc::clone(&backend),
+        )
+        .await
+        .unwrap();
 
         assert!(secret_store.load().await.unwrap().is_none());
         assert_eq!(
@@ -2344,7 +2600,12 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     #[tokio::test]
     async fn issuer_migration_does_not_restore_previous_authorization_server_credentials() {
         let resource = "https://resource.example/issuer-migration";
-        let store = ScopedCredentialStore::new(resource.into(), false, "mode".into());
+        let store = ScopedCredentialStore::new(
+            test_bundle_id(),
+            resource.into(),
+            "mode".into(),
+            memory_credential_store(),
+        );
         let mut first = AuthorizationMetadata::default();
         first.authorization_endpoint = "https://first.example/authorize".into();
         first.token_endpoint = "https://first.example/token".into();
@@ -2356,7 +2617,8 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             .set_issuer(Some(
                 authorization_server_credential_identity(&first).unwrap(),
             ))
-            .await;
+            .await
+            .unwrap();
         store
             .save(StoredCredentials::new(
                 "dynamic-client-from-first".into(),
@@ -2370,7 +2632,8 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             .set_issuer(Some(
                 authorization_server_credential_identity(&second).unwrap(),
             ))
-            .await;
+            .await
+            .unwrap();
 
         assert!(store.load().await.unwrap().is_none());
     }
@@ -2782,12 +3045,14 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                 token_endpoint_audience: Some("https://audience.example/token".into()),
             },
         };
+        let credential_store = memory_credential_store();
         let coordinator = OAuthCoordinator::new_with_oauth_http_client(
+            &test_bundle_id(),
             &resource,
             options.clone(),
+            Arc::clone(&credential_store),
             Some(Arc::new(JwtTestSecretResolver)),
             reqwest::Client::new(),
-            false,
             Arc::clone(&oauth_http_client),
         )
         .await
@@ -2853,11 +3118,12 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         }
 
         let restored = OAuthCoordinator::new_with_oauth_http_client(
+            &test_bundle_id(),
             &resource,
             options,
+            credential_store,
             Some(Arc::new(JwtTestSecretResolver)),
             reqwest::Client::new(),
-            false,
             oauth_http_client,
         )
         .await
@@ -3027,6 +3293,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             Arc::new(TlsFixtureOAuthHttpClient::new(certificate));
         let resource = format!("{base_url}/mcp");
         let coordinator = OAuthCoordinator::new_with_oauth_http_client(
+            &test_bundle_id(),
             &resource,
             OAuthOptions {
                 scopes: vec!["tools.read".into()],
@@ -3038,21 +3305,39 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                     token_endpoint_audience: None,
                 },
             },
+            memory_credential_store(),
             Some(Arc::new(JwtTestSecretResolver)),
             http_client,
-            false,
             oauth_http_client,
         )
         .await
         .unwrap();
 
-        coordinator.ensure_machine_authorized().await.unwrap();
+        let captured_logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(captured_logs.clone())
+            .finish();
+        coordinator
+            .ensure_machine_authorized()
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
         assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+        let logs = captured_logs.text();
+        for sensitive in ["tls-token", TEST_EC_PRIVATE_KEY, "p9PptiYIX1DoplcU"] {
+            assert!(
+                !logs.contains(sensitive),
+                "private key material and access tokens must not reach tracing output"
+            );
+        }
         server.abort();
     }
 
     #[tokio::test]
-    async fn lifecycle_generation_protects_pending_and_tracks_refresh() {
+    async fn lifecycle_generation_protects_concurrent_pending_expiry_and_refresh() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let token_requests = Arc::new(AtomicUsize::new(0));
@@ -3169,36 +3454,45 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                 },
             },
         };
+        let credential_store = memory_credential_store();
         let peer_coordinator = OAuthCoordinator::new(
+            &test_bundle_id(),
             &resource,
             options.clone(),
+            Arc::clone(&credential_store),
             None,
             reqwest::Client::new(),
             HeaderMap::new(),
-            false,
         )
         .await
         .unwrap();
-        let coordinator = OAuthCoordinator::new(
-            &resource,
-            options,
-            None,
-            reqwest::Client::new(),
-            HeaderMap::new(),
-            false,
-        )
-        .await
-        .unwrap();
+        let coordinator = Arc::new(
+            OAuthCoordinator::new(
+                &test_bundle_id(),
+                &resource,
+                options,
+                credential_store,
+                None,
+                reqwest::Client::new(),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap(),
+        );
         let old_generation = peer_coordinator.credential_generation();
         let begin_request = OAuthBeginRequest {
             redirect_uri: "http://127.0.0.1:9876/callback".into(),
             required_scope: None,
         };
-        let launch = coordinator.begin(begin_request.clone()).await.unwrap();
+        let (first_begin, concurrent_begin) = tokio::join!(
+            coordinator.begin(begin_request.clone()),
+            coordinator.begin(begin_request.clone())
+        );
+        let launch = first_begin.unwrap();
         assert_eq!(
-            coordinator.begin(begin_request.clone()).await.unwrap(),
+            concurrent_begin.unwrap(),
             launch,
-            "an identical begin request is idempotent"
+            "concurrent identical begin requests must share one pending authorization"
         );
         assert!(matches!(
             coordinator
@@ -3253,7 +3547,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         let replacement = coordinator.begin(begin_request.clone()).await.unwrap();
         assert_ne!(replacement.state, launch.state);
         peer_coordinator.clear().await.unwrap();
-        let launch = coordinator.begin(begin_request).await.unwrap();
+        let launch = coordinator.begin(begin_request.clone()).await.unwrap();
         assert_ne!(
             launch.state, replacement.state,
             "begin must replace a pending launch invalidated by a peer clear"
@@ -3287,20 +3581,80 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         assert!(coordinator.store.load().await.unwrap().is_none());
 
         coordinator
-            .complete(OAuthCallback {
-                code: "authorization-code".into(),
-                state: launch.state,
-                issuer: None,
-            })
+            .state_store
+            .states
+            .write()
             .await
-            .unwrap();
-        let before_refresh = coordinator.credential_generation();
-        let refreshed_request = coordinator.prepare_request().await.unwrap();
-        let refreshed_generation = refreshed_request.generation();
-        assert!(refreshed_generation > before_refresh);
-        assert_eq!(token_requests.load(Ordering::SeqCst), 2);
-        drop(refreshed_request);
+            .get_mut(&launch.state)
+            .expect("active OAuth state must exist")
+            .created_at = 1;
+        assert!(matches!(
+            coordinator
+                .complete(OAuthCallback {
+                    code: "expired-authorization-code".into(),
+                    state: launch.state,
+                    issuer: Some(base_url.clone()),
+                })
+                .await,
+            Err(OAuthError::Protocol(_))
+        ));
+        assert!(coordinator.store.load().await.unwrap().is_none());
 
+        coordinator.clear().await.unwrap();
+        let issuer_mismatch = coordinator.begin(begin_request.clone()).await.unwrap();
+        assert!(matches!(
+            coordinator
+                .complete(OAuthCallback {
+                    code: "issuer-mismatch-code".into(),
+                    state: issuer_mismatch.state,
+                    issuer: Some("https://wrong-issuer.example".into()),
+                })
+                .await,
+            Err(OAuthError::Protocol(_))
+        ));
+        assert!(coordinator.store.load().await.unwrap().is_none());
+
+        coordinator.clear().await.unwrap();
+        let launch = coordinator.begin(begin_request).await.unwrap();
+        let captured_logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(captured_logs.clone())
+            .finish();
+        let refreshed_generation = async {
+            coordinator
+                .complete(OAuthCallback {
+                    code: "authorization-code".into(),
+                    state: launch.state.clone(),
+                    issuer: Some(base_url),
+                })
+                .await
+                .unwrap();
+            let before_refresh = coordinator.credential_generation();
+            let refreshed_request = coordinator.prepare_request().await.unwrap();
+            let refreshed_generation = refreshed_request.generation();
+            assert!(refreshed_generation > before_refresh);
+            assert_eq!(token_requests.load(Ordering::SeqCst), 2);
+            drop(refreshed_request);
+            refreshed_generation
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = captured_logs.text();
+        for sensitive in [
+            "authorization-code",
+            "initial-token",
+            "refresh-token",
+            "refreshed-token",
+            launch.state.as_str(),
+        ] {
+            assert!(
+                !logs.contains(sensitive),
+                "OAuth code, state, and tokens must not reach tracing output"
+            );
+        }
         let refreshed_401 = rmcp::transport::streamable_http_client::StreamableHttpError::Auth(
             RmcpAuthError::AuthorizationRequired,
         );

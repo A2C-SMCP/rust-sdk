@@ -19,9 +19,10 @@ All notable changes to this project will be documented in this file.
   Code + PKCE (pre-registered, CIMD, or DCR clients) and Client Credentials
   (`client_secret` or `private_key_jwt`), with refresh and bounded
   `insufficient_scope` step-up.
-- *(computer)* OAuth credentials are isolated by protected resource, issuer, client
-  mode, client identity, and configured scopes; persisted secrets use the OS
-  credential vault with process-memory fallback.
+- *(computer)* OAuth credentials are isolated by bundle ID, canonical protected resource,
+  issuer, client mode, client identity, and configured scopes. The SDK default is
+  process-local memory and never probes an OS credential vault; hosts that need
+  cross-process resume must inject an `OAuthCredentialStore`.
 
 ### Migration Notes
 
@@ -31,6 +32,9 @@ All notable changes to this project will be documented in this file.
 - The embedding Desktop/CLI must open `OAuthLaunch.authorization_url`, receive the
   loopback/HTTPS callback, and pass its `code`, `state`, and optional `issuer` to
   `complete_oauth`. The SDK does not open a browser or bind a callback listener.
+- Persistent OAuth is now host policy: Desktop applications may inject a Keychain-backed
+  `OAuthCredentialStore`, while multi-tenant services should bind their injected store to
+  tenant/principal runtime context. Without injection, credentials are lost on process exit.
 - OAuth configuration and status fields serialize as camelCase. Existing non-OAuth
   HTTP servers retain normal redirect behavior; OAuth requests only follow
   same-origin redirects.

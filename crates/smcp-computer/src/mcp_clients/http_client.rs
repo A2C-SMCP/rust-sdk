@@ -8,13 +8,15 @@
 * 描述: HTTP类型的MCP客户端实现
 */
 use super::base_client::BaseMCPClient;
+use super::bundle_id::BundleId;
 use super::model::*;
 use super::stdio_client::A2cClientHandler;
 use super::{ResourceCache, SubscriptionManager};
 use crate::inputs::SecretValueResolver;
 use crate::oauth::{
-    clear_stored_oauth_credentials, OAuthBeginRequest, OAuthCallback, OAuthCoordinator, OAuthError,
-    OAuthLaunch, OAuthOptions, OAuthRequestGuard, OAuthStatus,
+    clear_stored_oauth_credentials, InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback,
+    OAuthCancellation, OAuthCoordinator, OAuthCredentialStore, OAuthError, OAuthLaunch,
+    OAuthOptions, OAuthRequestGuard, OAuthStatus,
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -54,7 +56,8 @@ pub struct HttpMCPClient {
     notify: StdRwLock<Option<ClientNotifyCtx>>,
     oauth_options: Option<OAuthOptions>,
     secret_resolver: Option<Arc<dyn SecretValueResolver>>,
-    persist_oauth_credentials: bool,
+    oauth_bundle_id: BundleId,
+    oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     oauth: OnceCell<Arc<OAuthCoordinator>>,
 }
 
@@ -82,7 +85,9 @@ impl HttpMCPClient {
             notify: StdRwLock::new(None),
             oauth_options: None,
             secret_resolver: None,
-            persist_oauth_credentials: true,
+            oauth_bundle_id: BundleId::try_from("standalone-http-oauth")
+                .expect("static standalone OAuth bundle ID must be valid"),
+            oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             oauth: OnceCell::new(),
         }
     }
@@ -96,9 +101,23 @@ impl HttpMCPClient {
         self
     }
 
-    /// Keep OAuth credentials only for this process instead of using the OS credential vault.
+    /// Reset this standalone client to a private process-memory OAuth credential store.
+    ///
+    /// OAuth credentials are already in memory by default. This method remains as an explicit
+    /// isolation convenience for callers that otherwise inject a shared store.
     pub fn with_ephemeral_oauth_credentials(mut self) -> Self {
-        self.persist_oauth_credentials = false;
+        self.oauth_credential_store = Arc::new(InMemoryOAuthCredentialStore::default());
+        self
+    }
+
+    /// Attach the manager-resolved bundle identity and host credential store.
+    pub(crate) fn with_oauth_context(
+        mut self,
+        bundle_id: BundleId,
+        credential_store: Arc<dyn OAuthCredentialStore>,
+    ) -> Self {
+        self.oauth_bundle_id = bundle_id;
+        self.oauth_credential_store = credential_store;
         self
     }
 
@@ -181,12 +200,13 @@ impl HttpMCPClient {
             .get_or_try_init(|| async {
                 let protected_resource_headers = self.build_http_headers()?;
                 OAuthCoordinator::new(
+                    &self.oauth_bundle_id,
                     &self.base.params.url,
                     options,
+                    Arc::clone(&self.oauth_credential_store),
                     self.secret_resolver.clone(),
                     self.build_http_client_with_headers(protected_resource_headers.clone())?,
                     protected_resource_headers,
-                    self.persist_oauth_credentials,
                 )
                 .await
                 .map(Arc::new)
@@ -218,6 +238,13 @@ impl HttpMCPClient {
         self.oauth().await?.complete(callback).await
     }
 
+    pub(crate) async fn cancel_oauth(
+        &self,
+        cancellation: OAuthCancellation,
+    ) -> Result<(), OAuthError> {
+        self.oauth().await?.cancel(cancellation).await
+    }
+
     pub(crate) async fn clear_oauth(&self) -> Result<(), OAuthError> {
         if self.oauth_options.is_none() {
             return Err(OAuthError::NotConfigured);
@@ -226,11 +253,12 @@ impl HttpMCPClient {
             oauth.clear().await
         } else {
             clear_stored_oauth_credentials(
+                &self.oauth_bundle_id,
                 &self.base.params.url,
                 self.oauth_options
                     .as_ref()
                     .expect("OAuth options were checked above"),
-                self.persist_oauth_credentials,
+                Arc::clone(&self.oauth_credential_store),
             )
             .await
         }

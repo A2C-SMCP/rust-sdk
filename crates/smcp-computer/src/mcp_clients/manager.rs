@@ -15,7 +15,10 @@ use super::utils::client_factory;
 use super::vrl_runtime::VrlRuntime;
 use crate::errors::ComputerError;
 use crate::inputs::SecretValueResolver;
-use crate::oauth::{OAuthBeginRequest, OAuthCallback, OAuthError, OAuthLaunch, OAuthStatus};
+use crate::oauth::{
+    InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
+    OAuthCredentialStore, OAuthError, OAuthLaunch, OAuthStatus,
+};
 use crate::skills::{McpResource, SkillResourceManager, SkillStagingError};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -112,6 +115,8 @@ pub struct MCPServerManager {
     client_factory_override: Arc<RwLock<Option<ClientFactory>>>,
     /// HTTP OAuth clients are retained even when the initial MCP handshake requires authorization.
     oauth_clients: Arc<RwLock<HashMap<BundleId, Arc<HttpMCPClient>>>>,
+    /// One host-injected keyed store shared by every OAuth MCP managed by this instance.
+    oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     secret_resolver: Arc<RwLock<Option<Arc<dyn SecretValueResolver>>>>,
     /// Serialize start/stop/update for each server identity without blocking unrelated servers.
     lifecycle_locks: Arc<StdMutex<HashMap<BundleId, Arc<Mutex<()>>>>>,
@@ -159,6 +164,7 @@ impl MCPServerManager {
             change_tx: Arc::new(RwLock::new(None)),
             client_factory_override: Arc::new(RwLock::new(None)),
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
+            oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             secret_resolver: Arc::new(RwLock::new(None)),
             lifecycle_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -186,8 +192,19 @@ impl MCPServerManager {
             change_tx: Arc::new(RwLock::new(None)),
             client_factory_override: Arc::new(RwLock::new(None)),
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
+            oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             secret_resolver: Arc::new(RwLock::new(None)),
             lifecycle_locks: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create a manager with a host-provided keyed OAuth credential store.
+    ///
+    /// The store is runtime state and is never serialized into MCP configuration.
+    pub fn with_oauth_credential_store(store: Arc<dyn OAuthCredentialStore>) -> Self {
+        Self {
+            oauth_credential_store: store,
+            ..Self::new()
         }
     }
 
@@ -466,6 +483,10 @@ impl MCPServerManager {
                 } else {
                     let candidate = Arc::new(
                         HttpMCPClient::new(http.server_parameters)
+                            .with_oauth_context(
+                                bundle_id.clone(),
+                                Arc::clone(&self.oauth_credential_store),
+                            )
                             .with_oauth(
                                 http.oauth.expect("guarded by is_some"),
                                 self.secret_resolver.read().await.clone(),
@@ -1983,6 +2004,18 @@ impl MCPServerManager {
         client.complete_oauth(callback).await
     }
 
+    /// Cancel a pending browser flow and delete its PKCE/CSRF state.
+    pub async fn cancel_oauth(
+        &self,
+        bundle_id: &BundleId,
+        cancellation: OAuthCancellation,
+    ) -> Result<(), OAuthError> {
+        let lifecycle = self.lifecycle_lock(bundle_id);
+        let _lifecycle_guard = lifecycle.lock().await;
+        let client = self.oauth_client_for(bundle_id).await?;
+        client.cancel_oauth(cancellation).await
+    }
+
     /// Remove stored tokens and pending authorization state.
     pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), OAuthError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
@@ -2011,6 +2044,7 @@ impl MCPServerManager {
         let options = http.oauth.ok_or(OAuthError::NotConfigured)?;
         let client = Arc::new(
             HttpMCPClient::new(http.server_parameters)
+                .with_oauth_context(bundle_id.clone(), Arc::clone(&self.oauth_credential_store))
                 .with_oauth(options, self.secret_resolver.read().await.clone()),
         );
         let mut oauth_clients = self.oauth_clients.write().await;

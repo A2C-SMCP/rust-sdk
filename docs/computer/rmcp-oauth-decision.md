@@ -462,7 +462,29 @@ oauth:
 
 ### 凭据存储
 
-- keyring service 使用独立 OAuth service name，不能与普通 input ID 共用裸 key。
+- SDK 默认使用进程内 `InMemoryOAuthCredentialStore`，不主动探测 OS Keychain、云密钥服务或
+  其他持久化后端。
+- 需要跨进程恢复时，宿主必须显式注入 `OAuthCredentialStore`：
+  - Desktop 可注入独立 service/key namespace 的 Keychain adapter；
+  - 多租户服务必须在宿主运行时把 tenant/principal 上下文绑定到 store，不能写进可序列化 MCP 配置。
+- 持久 store 必须加密静态 value，且不能与普通 input ID 共用裸 key。
+
+最小装配形态：
+
+```rust
+let store: Arc<dyn OAuthCredentialStore> = Arc::new(DesktopKeychainStore::new()?);
+let manager = MCPServerManager::with_oauth_credential_store(store);
+```
+
+云端 store 的实现应在构造时捕获可信运行时上下文，而不是从 callback/config 取业务标识：
+
+```rust
+let store = TenantPrincipalOAuthStore::new(vault, trusted_tenant, trusted_principal);
+let manager = MCPServerManager::with_oauth_credential_store(Arc::new(store));
+```
+
+未调用 `with_oauth_credential_store` 时，`MCPServerManager::new()` 和 `Computer::new(...)`
+均使用进程内 store；进程退出后不会恢复 OAuth 凭据。
 - namespace：
 
 ```text
@@ -535,7 +557,8 @@ serialized rmcp StoredCredentials
 
 范围：
 
-- `KeyringCredentialStore`；
+- host-injected `OAuthCredentialStore` 与默认 `InMemoryOAuthCredentialStore`；
+- Desktop Keychain / 云端 tenant-principal store 由宿主 adapter 提供，不进入 SDK 默认策略；
 - OAuth namespace/envelope；
 - in-memory TTL `StateStore`；
 - token refresh、rotation、clear；
@@ -545,7 +568,7 @@ serialized rmcp StoredCredentials
 
 - 模拟进程重启后恢复 token；
 - issuer 改变后旧 token/DCR credentials 不复用；
-- keyring 不可用时安全降级为 session-only；
+- 未注入持久 store 时行为明确为 session-only，持久 store 不可用时返回 typed error、不得静默误报恢复；
 - 配置、Debug、tracing 不出现 secret。
 
 ### PR 4：全部 OAuth 方式
@@ -630,7 +653,7 @@ serialized rmcp StoredCredentials
 - full workspace tests 通过；
 - 真实 HTTPS IdP 或 TLS fixture 至少验证一次 `private_key_jwt`；
 - 没有明文 token/secret 日志；
-- keyring unavailable 的降级行为明确；
+- 默认 session-only 与 host-injected persistent store 的行为、失败语义明确；
 - discovery probe 不产生孤儿 session；
 - public API breaking change 与版本升级说明完成；
 - Desktop/CLI 能只依赖公开 SDK API 完成浏览器授权，不访问 rmcp 内部类型。

@@ -9,9 +9,10 @@
 */
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -21,6 +22,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tracing_subscriber::fmt::MakeWriter;
 
 use smcp_computer::inputs::{InputResolutionError, SecretValueResolver};
 use smcp_computer::mcp_clients::http_client::HttpMCPClient;
@@ -28,14 +30,48 @@ use smcp_computer::mcp_clients::model::*;
 use smcp_computer::mcp_clients::sse_client::SseMCPClient;
 use smcp_computer::mcp_clients::MCPServerManager;
 use smcp_computer::oauth::{
-    OAuthBeginRequest, OAuthCallback, OAuthClientMode, OAuthClientRegistration, OAuthError,
-    OAuthOptions, OAuthStatus,
+    InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
+    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialStore,
+    OAuthError, OAuthOptions, OAuthStatus,
 };
 
 // ============================================================
 // BoxBody helper
 // ============================================================
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+
+struct CapturedLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+impl Write for CapturedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log capture lock poisoned")
+            .extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogWriter(Arc::clone(&self.0))
+    }
+}
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log capture lock poisoned")).into_owned()
+    }
+}
 
 fn full_body(s: impl Into<Bytes>) -> BoxBody {
     Full::new(s.into()).map_err(|never| match never {}).boxed()
@@ -262,6 +298,7 @@ enum OAuthFixtureMode {
 struct OAuthMockState {
     base_url: String,
     mode: OAuthFixtureMode,
+    mcp_response_sse: bool,
     token_expires_in: u64,
     total_requests: AtomicUsize,
     token_requests: AtomicUsize,
@@ -567,13 +604,23 @@ async fn oauth_http_mock_handler(
         ),
         _ => serde_json::json!({}),
     };
-    Ok(Response::builder()
-        .header("Content-Type", "application/json")
-        .header("mcp-session-id", "oauth-e2e-session")
-        .body(full_body(
-            serde_json::to_vec(&jsonrpc_response(&id, result)).unwrap(),
-        ))
-        .unwrap())
+    let response = jsonrpc_response(&id, result);
+    if state.mcp_response_sse {
+        Ok(Response::builder()
+            .header("Content-Type", "text/event-stream")
+            .header("mcp-session-id", "oauth-e2e-session")
+            .body(full_body(format!(
+                "event: message\ndata: {}\n\n",
+                serde_json::to_string(&response).unwrap()
+            )))
+            .unwrap())
+    } else {
+        Ok(Response::builder()
+            .header("Content-Type", "application/json")
+            .header("mcp-session-id", "oauth-e2e-session")
+            .body(full_body(serde_json::to_vec(&response).unwrap()))
+            .unwrap())
+    }
 }
 
 async fn spawn_oauth_http_mock(
@@ -588,10 +635,28 @@ async fn spawn_oauth_http_mock_with_expiry(
     challenge_tools_write_count: usize,
     token_expires_in: u64,
 ) -> (u16, Arc<OAuthMockState>) {
+    spawn_oauth_http_mock_with_options(mode, challenge_tools_write_count, token_expires_in, false)
+        .await
+}
+
+async fn spawn_oauth_http_sse_mock(
+    mode: OAuthFixtureMode,
+    challenge_tools_write_count: usize,
+) -> (u16, Arc<OAuthMockState>) {
+    spawn_oauth_http_mock_with_options(mode, challenge_tools_write_count, 3600, true).await
+}
+
+async fn spawn_oauth_http_mock_with_options(
+    mode: OAuthFixtureMode,
+    challenge_tools_write_count: usize,
+    token_expires_in: u64,
+    mcp_response_sse: bool,
+) -> (u16, Arc<OAuthMockState>) {
     let (listener, port) = bind_random().await;
     let state = Arc::new(OAuthMockState {
         base_url: format!("http://127.0.0.1:{port}"),
         mode,
+        mcp_response_sse,
         token_expires_in,
         total_requests: AtomicUsize::new(0),
         token_requests: AtomicUsize::new(0),
@@ -871,6 +936,14 @@ async fn test_streamable_http_static_authorization_header_reaches_every_http_met
 
 #[tokio::test]
 async fn test_streamable_http_oauth_client_credentials_end_to_end() {
+    let captured_logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(captured_logs.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
     let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::ClientCredentials, 0).await;
     let client = HttpMCPClient::new(HttpServerParameters {
         url: format!("http://127.0.0.1:{port}/mcp"),
@@ -910,6 +983,13 @@ async fn test_streamable_http_oauth_client_credentials_end_to_end() {
         state.authorized_mcp_requests.load(Ordering::SeqCst) >= 3,
         "initialize, tools/list, and tools/call must carry the OAuth token"
     );
+    let logs = captured_logs.text();
+    for sensitive in ["oauth-e2e-secret", "oauth-e2e-token"] {
+        assert!(
+            !logs.contains(sensitive),
+            "client secret and access token must not reach tracing output"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1196,6 +1276,119 @@ async fn authorization_code_manager(
     (manager, bundle_id, state)
 }
 
+async fn configure_authorization_code_manager(
+    base_url: &str,
+    bundle_id: BundleId,
+    store: Arc<dyn OAuthCredentialStore>,
+) -> MCPServerManager {
+    let manager = MCPServerManager::with_oauth_credential_store(store);
+    let mut config = HttpServerConfig::new(
+        bundle_id.as_str(),
+        HttpServerParameters {
+            url: format!("{base_url}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id);
+    config.oauth = Some(authorization_code_options(
+        OAuthFixtureMode::PreregisteredPublic,
+    ));
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+    manager
+}
+
+struct CallbackRoute {
+    tenant: String,
+    cli_session: String,
+    computer_id: String,
+    bundle_id: BundleId,
+    user_id: String,
+    expires_at: Instant,
+}
+
+struct GatewayCallback {
+    code: String,
+    state: String,
+    issuer: Option<String>,
+    untrusted_business_ids: HashMap<String, String>,
+}
+
+struct RoutedCallback {
+    tenant: String,
+    computer_id: String,
+    bundle_id: BundleId,
+    callback: OAuthCallback,
+}
+
+#[derive(Default)]
+struct CloudFlowHarness {
+    routes: HashMap<String, CallbackRoute>,
+    user_inboxes: HashMap<String, Vec<String>>,
+    cli_inboxes: HashMap<String, Vec<RoutedCallback>>,
+}
+
+impl CloudFlowHarness {
+    fn register_route(&mut self, state: String, route: CallbackRoute) {
+        assert!(
+            self.routes.insert(state, route).is_none(),
+            "OAuth state routes must be unique"
+        );
+        tracing::info!("registered one-time OAuth callback route");
+    }
+
+    fn send_authorization_link(&mut self, user_id: &str, authorization_url: String) {
+        self.user_inboxes
+            .entry(user_id.to_string())
+            .or_default()
+            .push(authorization_url);
+        tracing::info!("delivered OAuth authorization link to target user");
+    }
+
+    fn route_callback(
+        &mut self,
+        callback: GatewayCallback,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        let GatewayCallback {
+            code,
+            state,
+            issuer,
+            untrusted_business_ids,
+        } = callback;
+        drop(untrusted_business_ids);
+        let route = self
+            .routes
+            .remove(&state)
+            .ok_or("unknown-or-replayed-state")?;
+        if now >= route.expires_at {
+            tracing::warn!("rejected expired OAuth callback route");
+            return Err("expired-state");
+        }
+        self.cli_inboxes
+            .entry(route.cli_session)
+            .or_default()
+            .push(RoutedCallback {
+                tenant: route.tenant,
+                computer_id: route.computer_id,
+                bundle_id: route.bundle_id,
+                callback: OAuthCallback {
+                    code,
+                    state,
+                    issuer,
+                },
+            });
+        tracing::info!("routed OAuth callback to original CLI session");
+        Ok(())
+    }
+
+    fn take_cli_callback(&mut self, cli_session: &str) -> Option<RoutedCallback> {
+        self.cli_inboxes.get_mut(cli_session)?.pop()
+    }
+}
+
 async fn authorize_manager(
     manager: &MCPServerManager,
     bundle_id: &BundleId,
@@ -1243,6 +1436,194 @@ async fn authorize_manager(
         .await
         .unwrap();
     query.get("client_id").cloned().unwrap()
+}
+
+#[tokio::test]
+async fn test_cloud_flow_driver_routes_callback_privately_to_original_cli() {
+    const CALLBACK_URI: &str = "https://callback.example.test/oauth/callback";
+    const TARGET_TENANT: &str = "tenant-a";
+    const TARGET_USER: &str = "user-a";
+    const TARGET_CLI: &str = "cli-a";
+    const TARGET_COMPUTER: &str = "computer-a";
+    const OTHER_USER: &str = "user-b";
+    const OTHER_CLI: &str = "cli-b";
+    const AUTHORIZATION_CODE: &str = "authorization-code";
+
+    let captured_logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(captured_logs.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let (manager, bundle_id, mock_state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: CALLBACK_URI.to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let authorization_url = url::Url::parse(&launch.authorization_url).unwrap();
+    let query: HashMap<String, String> = authorization_url.query_pairs().into_owned().collect();
+    assert_eq!(
+        query.get("redirect_uri").map(String::as_str),
+        Some(CALLBACK_URI),
+        "headless hosts must use their stable HTTPS callback URI"
+    );
+    assert!(
+        query
+            .get("state")
+            .is_some_and(|state| state == &launch.state),
+        "authorization URL must carry the generated OAuth state"
+    );
+
+    let now = Instant::now();
+    let mut host = CloudFlowHarness::default();
+    host.register_route(
+        launch.state.clone(),
+        CallbackRoute {
+            tenant: TARGET_TENANT.to_string(),
+            cli_session: TARGET_CLI.to_string(),
+            computer_id: TARGET_COMPUTER.to_string(),
+            bundle_id: bundle_id.clone(),
+            user_id: TARGET_USER.to_string(),
+            expires_at: now + Duration::from_secs(300),
+        },
+    );
+    let target_user = host
+        .routes
+        .get(&launch.state)
+        .expect("registered route must exist")
+        .user_id
+        .clone();
+    host.send_authorization_link(&target_user, launch.authorization_url);
+    assert_eq!(host.user_inboxes[TARGET_USER].len(), 1);
+    assert!(!host.user_inboxes.contains_key(OTHER_USER));
+
+    host.route_callback(
+        GatewayCallback {
+            code: AUTHORIZATION_CODE.to_string(),
+            state: launch.state.clone(),
+            issuer: Some(mock_state.base_url.clone()),
+            untrusted_business_ids: HashMap::from([
+                ("tenant".to_string(), "attacker-tenant".to_string()),
+                ("cli_session".to_string(), OTHER_CLI.to_string()),
+                ("computer_id".to_string(), "attacker-computer".to_string()),
+                ("bundle_id".to_string(), "attacker-bundle".to_string()),
+            ]),
+        },
+        now,
+    )
+    .unwrap();
+
+    assert!(
+        host.user_inboxes
+            .values()
+            .flatten()
+            .all(|message| !message.contains(AUTHORIZATION_CODE)),
+        "authorization codes must never be broadcast to user UI channels"
+    );
+    assert!(!host.cli_inboxes.contains_key(OTHER_CLI));
+    assert!(matches!(
+        host.route_callback(
+            GatewayCallback {
+                code: AUTHORIZATION_CODE.to_string(),
+                state: launch.state.clone(),
+                issuer: Some(mock_state.base_url.clone()),
+                untrusted_business_ids: HashMap::new(),
+            },
+            now,
+        ),
+        Err("unknown-or-replayed-state")
+    ));
+
+    let delivery = host
+        .take_cli_callback(TARGET_CLI)
+        .expect("only the original CLI must receive the callback");
+    assert_eq!(delivery.tenant, TARGET_TENANT);
+    assert_eq!(delivery.computer_id, TARGET_COMPUTER);
+    assert_eq!(delivery.bundle_id, bundle_id);
+    manager
+        .complete_oauth(&delivery.bundle_id, delivery.callback)
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+
+    manager.start_client_by_id(&bundle_id).await.unwrap();
+    let tools = manager.list_available_tools().await;
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.name.as_ref().ends_with("__echo")),
+        "the authorized path must complete initialize and tools/list"
+    );
+    let result = manager
+        .call_tool(
+            bundle_id.as_str(),
+            "echo",
+            serde_json::json!({"message": "cloud flow authorized"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.content[0].as_text().unwrap().text,
+        "cloud flow authorized"
+    );
+    assert!(
+        mock_state.authorized_mcp_requests.load(Ordering::SeqCst) >= 3,
+        "initialize, tools/list, and tools/call must cross the real HTTP boundary"
+    );
+
+    host.register_route(
+        "expired-state".to_string(),
+        CallbackRoute {
+            tenant: TARGET_TENANT.to_string(),
+            cli_session: TARGET_CLI.to_string(),
+            computer_id: TARGET_COMPUTER.to_string(),
+            bundle_id: bundle_id.clone(),
+            user_id: TARGET_USER.to_string(),
+            expires_at: now,
+        },
+    );
+    assert!(matches!(
+        host.route_callback(
+            GatewayCallback {
+                code: "expired-code".to_string(),
+                state: "expired-state".to_string(),
+                issuer: Some(mock_state.base_url.clone()),
+                untrusted_business_ids: HashMap::new(),
+            },
+            now,
+        ),
+        Err("expired-state")
+    ));
+    assert!(host.take_cli_callback(TARGET_CLI).is_none());
+    manager.close().await.unwrap();
+
+    let logs = captured_logs.text();
+    for sensitive in [
+        AUTHORIZATION_CODE,
+        launch.state.as_str(),
+        "oauth-e2e-token",
+        "attacker-tenant",
+        "attacker-computer",
+        "attacker-bundle",
+    ] {
+        assert!(
+            !logs.contains(sensitive),
+            "cloud flow secrets and routing identifiers must not reach tracing output"
+        );
+    }
 }
 
 async fn assert_tool_call_is_blocked_before_http(
@@ -1322,7 +1703,87 @@ async fn test_streamable_http_authorization_code_registration_matrix_end_to_end(
 }
 
 #[tokio::test]
-async fn test_authorization_code_clear_peer_clear_and_401_never_reuse_old_token() {
+async fn test_authorization_code_oauth_covers_sse_responses_403_and_401() {
+    let (port, state) = spawn_oauth_http_sse_mock(OAuthFixtureMode::PreregisteredPublic, 1).await;
+    let bundle_id = BundleId::try_from("oauth-code-sse").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-code-sse",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.oauth = Some(authorization_code_options(
+        OAuthFixtureMode::PreregisteredPublic,
+    ));
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    authorize_manager(&manager, &bundle_id, &state, None).await;
+    manager.start_client_by_id(&bundle_id).await.unwrap();
+    assert!(
+        manager
+            .list_available_tools()
+            .await
+            .iter()
+            .any(|tool| tool.name.as_ref().ends_with("__echo")),
+        "OAuth initialize and tools/list must decode SSE-framed POST responses"
+    );
+
+    let challenged = manager
+        .call_tool(
+            bundle_id.as_str(),
+            "echo",
+            serde_json::json!({"message": "scope challenge"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(challenged.is_error, Some(true));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::ReauthorizationRequired {
+            required_scope: "tools.write".to_string()
+        }
+    );
+
+    authorize_manager(
+        &manager,
+        &bundle_id,
+        &state,
+        Some("tools.write".to_string()),
+    )
+    .await;
+    let result = manager
+        .call_tool(
+            bundle_id.as_str(),
+            "echo",
+            serde_json::json!({"message": "SSE OAuth works"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.content[0].as_text().unwrap().text, "SSE OAuth works");
+
+    state.reject_authorized_remaining.store(1, Ordering::SeqCst);
+    let _ = manager
+        .call_tool(
+            bundle_id.as_str(),
+            "echo",
+            serde_json::json!({"message": "reject token"}),
+            None,
+        )
+        .await;
+    assert_tool_call_is_blocked_before_http(&manager, &bundle_id, &state).await;
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_authorization_code_clear_is_bundle_scoped_and_401_never_reuses_old_token() {
     let (manager, bundle_id, state) =
         authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
     authorize_manager(&manager, &bundle_id, &state, None).await;
@@ -1359,10 +1820,21 @@ async fn test_authorization_code_clear_peer_clear_and_401_never_reuse_old_token(
         .await
         .unwrap();
     peer_manager.clear_oauth(&peer_bundle_id).await.unwrap();
-    assert_tool_call_is_blocked_before_http(&manager, &bundle_id, &state).await;
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+    manager
+        .call_tool(
+            bundle_id.as_str(),
+            "echo",
+            serde_json::json!({"message": "peer clear is isolated"}),
+            None,
+        )
+        .await
+        .expect("clearing a peer bundle must not revoke this bundle");
     peer_manager.close().await.unwrap();
 
-    authorize_manager(&manager, &bundle_id, &state, None).await;
     state.reject_authorized_remaining.store(1, Ordering::SeqCst);
     let _ = manager
         .call_tool(
@@ -1374,6 +1846,164 @@ async fn test_authorization_code_clear_peer_clear_and_401_never_reuse_old_token(
         .await;
     assert_tool_call_is_blocked_before_http(&manager, &bundle_id, &state).await;
     manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_authorization_code_cancellation_validates_callback_and_cleans_pending_state() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager
+            .cancel_oauth(
+                &bundle_id,
+                OAuthCancellation {
+                    state: "wrong-state".to_string(),
+                    issuer: Some(state.base_url.clone()),
+                    reason: OAuthCancellationReason::AccessDenied,
+                },
+            )
+            .await,
+        Err(OAuthError::StateMismatch)
+    ));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::AuthorizationPending
+    );
+
+    manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: launch.state,
+                issuer: Some(state.base_url.clone()),
+                reason: OAuthCancellationReason::AccessDenied,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+
+    let replacement = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .expect("cancellation must remove the old pending flow");
+    manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: replacement.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Timeout,
+            },
+        )
+        .await
+        .unwrap();
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_shared_oauth_store_clear_isolated_by_bundle_id() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(InMemoryOAuthCredentialStore::default());
+    let first_bundle = BundleId::try_from("oauth-bundle-a").unwrap();
+    let second_bundle = BundleId::try_from("oauth-bundle-b").unwrap();
+    let first = configure_authorization_code_manager(
+        &state.base_url,
+        first_bundle.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    let second = configure_authorization_code_manager(
+        &state.base_url,
+        second_bundle.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+
+    authorize_manager(&first, &first_bundle, &state, None).await;
+    authorize_manager(&second, &second_bundle, &state, None).await;
+    first.clear_oauth(&first_bundle).await.unwrap();
+
+    assert_eq!(
+        first.oauth_status(&first_bundle).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    assert!(matches!(
+        second.oauth_status(&second_bundle).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_authorization_code_restores_after_manager_rebuild_with_injected_store() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(InMemoryOAuthCredentialStore::default());
+    let bundle_id = BundleId::try_from("oauth-persistent-rebuild").unwrap();
+
+    let first = configure_authorization_code_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    authorize_manager(&first, &bundle_id, &state, None).await;
+    first.close().await.unwrap();
+    drop(first);
+
+    let restored = configure_authorization_code_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    assert!(matches!(
+        restored.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+    restored.start_client_by_id(&bundle_id).await.unwrap();
+    let result = restored
+        .call_tool(
+            bundle_id.as_str(),
+            "echo",
+            serde_json::json!({"message": "restored"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.content[0].as_text().unwrap().text, "restored");
+    restored.clear_oauth(&bundle_id).await.unwrap();
+    restored.close().await.unwrap();
+    drop(restored);
+
+    let cleared =
+        configure_authorization_code_manager(&state.base_url, bundle_id.clone(), store).await;
+    assert_eq!(
+        cleared.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    cleared.close().await.unwrap();
 }
 
 #[tokio::test]

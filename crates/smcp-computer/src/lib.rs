@@ -29,7 +29,9 @@ pub mod cli;
 pub use errors::{ComputerError, ComputerResult};
 
 pub use oauth::{
-    OAuthBeginRequest, OAuthCallback, OAuthClientMode, OAuthClientRegistration, OAuthError,
+    InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
+    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialKey,
+    OAuthCredentialRecordKind, OAuthCredentialStore, OAuthCredentialStoreError, OAuthError,
     OAuthLaunch, OAuthOptions, OAuthStatus,
 };
 /// #107 S7（#114）：runtime status / 事件公开面 re-export / runtime status surface re-export。
