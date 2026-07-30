@@ -3,20 +3,18 @@
 //! This example intentionally prints only redacted PASS/FAIL records. It never
 //! prints authorization URLs, callback codes, state, or stored credentials.
 
-use async_trait::async_trait;
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use smcp_computer::inputs::{OsKeyring, SecretStore};
 use smcp_computer::mcp_clients::bundle_id::BundleId;
 use smcp_computer::mcp_clients::{
     HttpServerConfig, HttpServerParameters, MCPServerConfig, MCPServerManager,
 };
 use smcp_computer::{
-    OAuthBeginRequest, OAuthCallback, OAuthCancellation, OAuthCancellationReason, OAuthClientMode,
-    OAuthClientRegistration, OAuthCredentialKey, OAuthCredentialStore, OAuthCredentialStoreError,
+    InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
+    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialStore,
     OAuthFlowOutcome, OAuthOptions, OAuthStatus,
 };
 use std::collections::{BTreeSet, HashMap};
@@ -42,75 +40,34 @@ const OAUTH_SCOPES: &[&str] = &[
     "read:jira-work",
     "offline_access",
 ];
-const LEGACY_OAUTH_SCOPES: &[&str] = &["read:me", "read:account", "offline_access"];
 const DEFAULT_CALLBACK_PORT: u16 = 3334;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 
 type UatResult<T> = Result<T, &'static str>;
-
-struct KeyringOAuthCredentialStore {
-    secrets: SecretStore,
-}
-
-impl KeyringOAuthCredentialStore {
-    fn new() -> UatResult<Self> {
-        let secrets = SecretStore::with_backend("a2c-computer-oauth-uat", Box::new(OsKeyring));
-        if !secrets.available() {
-            return Err("credential-vault-unavailable");
-        }
-        Ok(Self { secrets })
-    }
-}
-
-#[async_trait]
-impl OAuthCredentialStore for KeyringOAuthCredentialStore {
-    async fn load(
-        &self,
-        key: &OAuthCredentialKey,
-    ) -> Result<Option<String>, OAuthCredentialStoreError> {
-        if !self.secrets.available() {
-            return Err(OAuthCredentialStoreError::Unavailable);
-        }
-        Ok(self.secrets.get(&key.stable_id()))
-    }
-
-    async fn save(
-        &self,
-        key: &OAuthCredentialKey,
-        value: &str,
-    ) -> Result<(), OAuthCredentialStoreError> {
-        self.secrets
-            .set(&key.stable_id(), value)
-            .then_some(())
-            .ok_or(OAuthCredentialStoreError::OperationFailed)
-    }
-
-    async fn delete(&self, key: &OAuthCredentialKey) -> Result<(), OAuthCredentialStoreError> {
-        if !self.secrets.available() {
-            return Err(OAuthCredentialStoreError::Unavailable);
-        }
-        let id = key.stable_id();
-        if self.secrets.get(&id).is_none() || self.secrets.delete(&id) {
-            Ok(())
-        } else {
-            Err(OAuthCredentialStoreError::OperationFailed)
-        }
-    }
-}
 
 enum CallbackEvent {
     Complete(OAuthCallback),
     Cancel(OAuthCancellation),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UatCommand {
+    Run,
+}
+
+fn parse_command(argument: Option<&str>) -> UatResult<UatCommand> {
+    match argument {
+        Some("run") => Ok(UatCommand::Run),
+        _ => Err("usage: expected run"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let phase = env::args().nth(1).unwrap_or_default();
-    let result = match phase.as_str() {
-        "authorize" => authorize().await,
-        "resume" => resume().await,
-        "clear" => clear().await,
-        _ => Err("usage: expected authorize, resume, or clear"),
+    let argument = env::args().nth(1);
+    let result = match parse_command(argument.as_deref()) {
+        Ok(UatCommand::Run) => run().await,
+        Err(stage) => Err(stage),
     };
 
     if let Err(stage) = result {
@@ -119,22 +76,23 @@ async fn main() {
     }
 }
 
-async fn authorize() -> UatResult<()> {
+async fn run() -> UatResult<()> {
     let port = callback_port()?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|_| "callback-bind")?;
     let callback_uri = format!("http://127.0.0.1:{port}/callback");
-    let (manager, bundle_id) = configured_manager().await?;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(InMemoryOAuthCredentialStore::default());
+    let (manager, bundle_id) = configured_manager(Arc::clone(&store)).await?;
 
-    if matches!(
+    if !matches!(
         manager
             .oauth_status(&bundle_id)
             .await
             .map_err(|_| "status-before-authorize")?,
-        OAuthStatus::Authorized { .. }
+        OAuthStatus::Unauthorized
     ) {
-        return Err("already-authorized-run-clear-first");
+        return Err("in-memory-store-not-empty");
     }
 
     let launch = manager
@@ -201,6 +159,24 @@ async fn authorize() -> UatResult<()> {
     validate_read_only_path(&manager, &bundle_id).await?;
     manager.close().await.map_err(|_| "manager-close")?;
     println!("UAT_RESULT: PASS phase=authorize");
+
+    let (restored_manager, restored_bundle_id) = configured_manager(Arc::clone(&store)).await?;
+    assert_authorized(&restored_manager, &restored_bundle_id).await?;
+    println!("UAT_RESULT: PASS manager-rebuild-restored");
+    validate_read_only_path(&restored_manager, &restored_bundle_id).await?;
+    println!("UAT_RESULT: PASS phase=manager-rebuild");
+
+    restored_manager
+        .clear_oauth(&restored_bundle_id)
+        .await
+        .map_err(|_| "clear-oauth")?;
+    assert_unauthorized(&restored_manager, &restored_bundle_id).await?;
+    println!("UAT_RESULT: PASS phase=clear status=Unauthorized");
+    restored_manager
+        .close()
+        .await
+        .map_err(|_| "manager-close")?;
+    println!("UAT_RESULT: PASS phase=run");
     Ok(())
 }
 
@@ -263,32 +239,8 @@ fn validate_cancellation_outcome(
     }
 }
 
-async fn resume() -> UatResult<()> {
-    let (manager, bundle_id) = configured_manager().await?;
-    assert_authorized(&manager, &bundle_id).await?;
-    println!("UAT_RESULT: PASS credentials-restored");
-
-    validate_read_only_path(&manager, &bundle_id).await?;
-    manager.close().await.map_err(|_| "manager-close")?;
-    println!("UAT_RESULT: PASS phase=resume");
-    Ok(())
-}
-
-async fn clear() -> UatResult<()> {
-    let store: Arc<dyn OAuthCredentialStore> = Arc::new(KeyringOAuthCredentialStore::new()?);
-    clear_uat_credential_slots(store).await?;
-    println!("UAT_RESULT: PASS phase=clear status=Unauthorized");
-    Ok(())
-}
-
-async fn configured_manager() -> UatResult<(MCPServerManager, BundleId)> {
-    let store: Arc<dyn OAuthCredentialStore> = Arc::new(KeyringOAuthCredentialStore::new()?);
-    configured_manager_with_scopes(store, OAUTH_SCOPES).await
-}
-
-async fn configured_manager_with_scopes(
+async fn configured_manager(
     store: Arc<dyn OAuthCredentialStore>,
-    scopes: &[&str],
 ) -> UatResult<(MCPServerManager, BundleId)> {
     let bundle_id = BundleId::try_from(BUNDLE_ID).map_err(|_| "bundle-id")?;
     let manager = MCPServerManager::with_oauth_credential_store(store);
@@ -301,7 +253,10 @@ async fn configured_manager_with_scopes(
     );
     config.bundle_id = Some(bundle_id.clone());
     config.oauth = Some(OAuthOptions {
-        scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+        scopes: OAUTH_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect(),
         client_name: Some("A2C SMCP Rust SDK UAT".to_string()),
         mode: OAuthClientMode::AuthorizationCode {
             registration: OAuthClientRegistration::Dynamic,
@@ -312,22 +267,6 @@ async fn configured_manager_with_scopes(
         .await
         .map_err(|_| "configure-server")?;
     Ok((manager, bundle_id))
-}
-
-async fn clear_uat_credential_slots(store: Arc<dyn OAuthCredentialStore>) -> UatResult<()> {
-    clear_uat_credential_slot(Arc::clone(&store), LEGACY_OAUTH_SCOPES).await?;
-    clear_uat_credential_slot(store, OAUTH_SCOPES).await
-}
-
-async fn clear_uat_credential_slot(
-    store: Arc<dyn OAuthCredentialStore>,
-    scopes: &[&str],
-) -> UatResult<()> {
-    let (manager, bundle_id) = configured_manager_with_scopes(store, scopes).await?;
-    let clear_result = manager.clear_oauth(&bundle_id).await;
-    let close_result = manager.close().await;
-    clear_result.map_err(|_| "clear-oauth")?;
-    close_result.map_err(|_| "manager-close")
 }
 
 async fn assert_authorized(manager: &MCPServerManager, bundle_id: &BundleId) -> UatResult<()> {
@@ -341,6 +280,20 @@ async fn assert_authorized(manager: &MCPServerManager, bundle_id: &BundleId) -> 
         Ok(())
     } else {
         Err("status-not-authorized")
+    }
+}
+
+async fn assert_unauthorized(manager: &MCPServerManager, bundle_id: &BundleId) -> UatResult<()> {
+    if matches!(
+        manager
+            .oauth_status(bundle_id)
+            .await
+            .map_err(|_| "oauth-status-after-clear")?,
+        OAuthStatus::Unauthorized
+    ) {
+        Ok(())
+    } else {
+        Err("clear-did-not-remove-authorization")
     }
 }
 
@@ -563,7 +516,8 @@ fn browser_command(authorization_url: &str) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smcp_computer::OAuthCredentialRecordKind;
+    use async_trait::async_trait;
+    use smcp_computer::{OAuthCredentialKey, OAuthCredentialRecordKind, OAuthCredentialStoreError};
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -814,6 +768,14 @@ mod tests {
     }
 
     #[test]
+    fn driver_accepts_only_single_process_run_command() {
+        assert_eq!(parse_command(Some("run")), Ok(UatCommand::Run));
+        assert_eq!(parse_command(None), Err("usage: expected run"));
+        assert_eq!(parse_command(Some("resume")), Err("usage: expected run"));
+        assert_eq!(parse_command(Some("clear")), Err("usage: expected run"));
+    }
+
+    #[test]
     fn cancellation_outcome_requires_matching_terminated_reason_and_final_status() {
         assert!(validate_cancellation_outcome(
             OAuthFlowOutcome::Terminated {
@@ -899,9 +861,10 @@ mod tests {
         let fake = Arc::new(FakeOAuthCredentialStore::default());
         let store: Arc<dyn OAuthCredentialStore> = fake.clone();
 
-        clear_uat_credential_slot(Arc::clone(&store), OAUTH_SCOPES)
-            .await
-            .unwrap();
+        let (probe_manager, probe_bundle_id) =
+            configured_manager(Arc::clone(&store)).await.unwrap();
+        probe_manager.clear_oauth(&probe_bundle_id).await.unwrap();
+        probe_manager.close().await.unwrap();
         let credential_key = fake
             .credential_keys_deleted()
             .into_iter()
@@ -910,9 +873,7 @@ mod tests {
         fake.insert(credential_key);
         fake.clear_deleted();
 
-        let (manager, bundle_id) = configured_manager_with_scopes(store, OAUTH_SCOPES)
-            .await
-            .unwrap();
+        let (manager, bundle_id) = configured_manager(store).await.unwrap();
         let outcome = OAuthFlowOutcome::Authorized {
             scopes: OAUTH_SCOPES
                 .iter()
@@ -928,30 +889,5 @@ mod tests {
         );
         assert!(fake.is_empty());
         assert_eq!(fake.credential_keys_deleted().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn clear_removes_legacy_and_current_scope_credential_slots() {
-        let fake = Arc::new(FakeOAuthCredentialStore::default());
-        let store: Arc<dyn OAuthCredentialStore> = fake.clone();
-
-        clear_uat_credential_slots(Arc::clone(&store))
-            .await
-            .unwrap();
-        let credential_keys = fake.credential_keys_deleted();
-        assert_eq!(credential_keys.len(), 2);
-        assert_ne!(
-            credential_keys[0].grant_fingerprint,
-            credential_keys[1].grant_fingerprint
-        );
-
-        for key in credential_keys {
-            fake.insert(key);
-        }
-        fake.clear_deleted();
-
-        clear_uat_credential_slots(store).await.unwrap();
-        assert!(fake.is_empty());
-        assert_eq!(fake.credential_keys_deleted().len(), 2);
     }
 }

@@ -117,7 +117,9 @@ bash .codex/skills/UAT/resources/full-protocol-uat.sh
 真实浏览器 consent 不属于默认全量套件，也不得在 CI/fork PR 自动运行。仅当用户明确调用
 `$uat oauth-atlassian` 时，加载
 `resources/scenarios/oauth-atlassian.md`，使用仓库内 UAT example 完成 DCR + PKCE、loopback
-callback、`initialize`、`tools/list`、只读资源查询、跨进程凭据恢复与清除。API token smoke 必须
+callback、`initialize`、`tools/list`、只读资源查询、共享内存 store 的 manager 重建恢复与清除。
+该场景不得访问 OS Keychain、系统凭据库或把 token 写入文件；进程退出即销毁全部凭据。
+API token smoke 必须
 与交互式 OAuth 分开报告。场景中的自动化前置还会运行无需产品环境的云端 Flow Driver
 harness，验证稳定 HTTPS callback、一次性 state 路由及目标用户/目标 CLI 私有消息隔离。
 consent 页的站点选择、权限审阅与 **接受/Allow** 必须由已连接的浏览器自动化工具通过正常

@@ -7,8 +7,10 @@ Authorization Code + PKCE 流程：SDK 发起授权，上层驱动自动打开�
 回调；用户仅在需要时完成登录、SSO 或 MFA，浏览器自动化选择站点、审阅并同意后，完成
 MCP `initialize`、`tools/list` 和一个只读资源查询。
 
-本场景还验证凭据跨进程恢复、`clear_oauth`，并引用自动化守护验证刷新、过期 state 与
-issuer 不匹配。API token/service account smoke 与本交互式 OAuth 场景严格分开，不能互相替代。
+本场景还在同一进程内以共享 `InMemoryOAuthCredentialStore` 验证 manager 重建恢复和
+`clear_oauth`，并引用自动化守护验证刷新、过期 state 与 issuer 不匹配。它不验证宿主的
+跨进程持久化实现。API token/service account smoke 与本交互式 OAuth 场景严格分开，
+不能互相替代。
 
 此外，自动化前置通过纯测试 harness 验证 headless 云端宿主契约；它不依赖真实 TFClient、
 生产 Socket 服务或公网 callback gateway，不能替代本地浏览器 consent UAT。
@@ -40,9 +42,8 @@ consent UI 在只有 common scopes 时不会渲染 workspace 选择器，同时�
    - 端口空闲；
    - 本机防火墙允许 loopback；
    - 如组织启用了 redirect/domain allowlist，管理员已允许该地址。
-5. OS credential vault 可用，以验证跨进程凭据恢复。SDK 默认 OAuth store 是进程内存；
-   本 UAT 驱动作为宿主显式注入专用 `a2c-computer-oauth-uat` vault adapter。vault 不可用时
-   驱动以 `stage=credential-vault-unavailable` 失败，不会静默退化后再误报 AT-04 PASS。
+5. 本 UAT 只使用 SDK 的进程内存 OAuth store；无需也不得访问 OS Keychain、系统凭据库或
+   token 文件。驱动退出后凭据自然销毁。
 6. 编译 UAT 驱动：
 
    ```bash
@@ -65,6 +66,8 @@ export A2C_OAUTH_UAT_PORT=43334
   - client secret、private key。
 - 失败报告只记录 `stage`、退出码和不含敏感值的环境事实。
 - 不开启 HTTP wire dump，不把浏览器地址栏或 callback query 截图附到 Issue。
+- OAuth 凭据只存在于当前 UAT 进程内存；不得改用 Keychain、Secret Service、Credential
+  Manager 或文件持久化来延长生命周期。
 
 ### Consent 卡住时的浏览器诊断
 
@@ -87,8 +90,8 @@ export A2C_OAUTH_UAT_PORT=43334
    cloudId、context、state、code、token 一律脱敏。
 4. 控制台只记录 error/warning，并先脱敏完整 URL、长随机值、账号标识；禁止保存 HAR、
    wire dump、截图地址栏或响应原文。
-5. 等待 2-3 秒后刷新一次并重复检查，作为 FAIL 二次复验。完成证据采集后停止等待并执行
-   `clear`，不为凑满 callback timeout 而空等。
+5. 等待 2-3 秒后刷新一次并重复检查，作为 FAIL 二次复验。完成证据采集后终止驱动并确认
+   进程退出；内存凭据随进程销毁，不为凑满 callback timeout 而空等。
 
 判定参考：
 
@@ -134,7 +137,7 @@ cargo test -p smcp-computer --example oauth_atlassian_uat
 ```
 
 覆盖范围包括 PKCE、预注册/CIMD/DCR、Client Credentials secret/`private_key_jwt`、
-刷新、凭据恢复与清除、401、403 `insufficient_scope`、并发 begin、过期 callback、
+刷新、共享内存 store 的 manager 重建恢复与清除、401、403 `insufficient_scope`、并发 begin、过期 callback、
 state/issuer 校验、重复 callback 参数拒绝、deny/cancel/timeout 清理、bundle/resource/issuer
 隔离、默认内存 store、真实 HTTP/SSE 边界及敏感 tracing/Debug 守护；
 云端 harness 另覆盖稳定 HTTPS redirect URI、一次性 opaque state 路由、原 CLI coordinator
@@ -142,27 +145,16 @@ state/issuer 校验、重复 callback 参数拒绝、deny/cancel/timeout 清理�
 
 ## 测试步骤
 
-### AT-01：清理 UAT 专属凭据
+### AT-01：进程内存凭据隔离
 
-```bash
-cargo run -q -p smcp-computer --example oauth_atlassian_uat -- clear
-```
-
-预期：
-
-```text
-UAT_RESULT: PASS phase=clear status=Unauthorized
-```
-
-该操作只清理显式注入 store 中 bundle ID `oauth-atlassian-uat`、上述 Atlassian resource
-和当前 OAuth 模式对应的凭据槽；同时迁移清理旧版三项 scope
-`read:me read:account offline_access` 的 UAT 槽。即使其他 bundle 共用同一 store 与
-resource，也不受影响。
+驱动每次启动都新建 `InMemoryOAuthCredentialStore`，并在打开浏览器前确认状态是
+`Unauthorized`。不得读取旧进程凭据、OS Keychain、系统凭据库或 token 文件；因此不需要
+预清理命令。
 
 ### AT-02：真实浏览器自动化授权
 
 ```bash
-cargo run -q -p smcp-computer --example oauth_atlassian_uat -- authorize
+cargo run -q -p smcp-computer --example oauth_atlassian_uat -- run
 ```
 
 浏览器自动化操作：
@@ -187,6 +179,13 @@ UAT_RESULT: PASS initialize
 UAT_RESULT: PASS tools-list count=<正整数>
 UAT_RESULT: PASS read-only-resource-query
 UAT_RESULT: PASS phase=authorize
+UAT_RESULT: PASS manager-rebuild-restored
+UAT_RESULT: PASS initialize
+UAT_RESULT: PASS tools-list count=<正整数>
+UAT_RESULT: PASS read-only-resource-query
+UAT_RESULT: PASS phase=manager-rebuild
+UAT_RESULT: PASS phase=clear status=Unauthorized
+UAT_RESULT: PASS phase=run
 ```
 
 ### AT-03：MCP 路径验收
@@ -200,37 +199,21 @@ AT-02 驱动必须自行完成以下真实 Streamable HTTP 路径，不能用 mo
 
 AT-02 全部 PASS 即 AT-03 PASS。
 
-### AT-04：进程重启后凭据恢复
+### AT-04：共享内存 store 的 manager 重建恢复
 
-AT-02 命令已经退出，另起一个新进程：
-
-```bash
-cargo run -q -p smcp-computer --example oauth_atlassian_uat -- resume
-```
-
-预期不打开浏览器，直接输出：
-
-```text
-UAT_RESULT: PASS credentials-restored
-UAT_RESULT: PASS initialize
-UAT_RESULT: PASS tools-list count=<正整数>
-UAT_RESULT: PASS read-only-resource-query
-UAT_RESULT: PASS phase=resume
-```
+AT-02 在完成第一次只读调用后关闭第一个 manager，但保留同一进程内的共享
+`Arc<InMemoryOAuthCredentialStore>`；随后重建第二个 manager，必须输出
+`manager-rebuild-restored`，且不再次打开浏览器，并再次完成真实 MCP 只读路径。
 
 该公开状态只能证明凭据恢复与复用，不能区分请求使用了原 token 还是 refresh token。
 因此 UAT 报告不得声称 refresh 已触发，也不得为等待过期而轮询；refresh 由 AT-06 的
-可控自动化测试独立验收。
+可控自动化测试独立验收。该用例也不声称验证 OS 进程退出后的宿主持久化。
 
 ### AT-05：清除授权
 
-```bash
-cargo run -q -p smcp-computer --example oauth_atlassian_uat -- clear
-cargo run -q -p smcp-computer --example oauth_atlassian_uat -- resume
-```
-
-预期第一条 PASS；第二条以 `stage=status-not-authorized` 失败，且不发送已清除 token、
-不自动打开浏览器。
+AT-02 的第二个 manager 完成只读调用后必须在同一进程内执行 `clear_oauth`，确认状态为
+`Unauthorized`，再关闭 manager。无单独 `clear` 或 `resume` 命令；即使驱动异常退出，
+凭据也只存在于进程内存并随之销毁。
 
 ### AT-06：state / issuer / cancel / timeout callback
 
@@ -274,18 +257,20 @@ SKIP api-token-smoke: protected secrets unavailable
 测试结束必须执行：
 
 ```bash
-cargo run -q -p smcp-computer --example oauth_atlassian_uat -- clear
 unset A2C_OAUTH_UAT_PORT
 ```
+
+浏览器工具关闭本次已失效的 callback/consent 页面，并确认没有
+`oauth_atlassian_uat` 进程残留。无需清理 OS 凭据。
 
 ## UAT 报告
 
 | 用例 | 结果 | 备注 |
 |---|---|---|
-| AT-01 UAT 凭据清理 | PASS/FAIL | 仅记录 stage |
+| AT-01 进程内存凭据隔离 | PASS/FAIL | 不访问 OS Keychain/文件 |
 | AT-02 浏览器 OAuth consent | PASS/FAIL | 不附授权 URL/callback |
 | AT-03 initialize/tools/list/只读调用 | PASS/FAIL | 只记录工具数 |
-| AT-04 跨进程恢复 | PASS/FAIL | 不声称 refresh 是否触发 |
+| AT-04 manager 重建恢复 | PASS/FAIL | 共享内存 store；不声称跨进程持久化或 refresh |
 | AT-05 clear 后 Unauthorized | PASS/FAIL | |
 | AT-06 refresh/state/issuer/过期 callback | PASS/FAIL | 自动化测试名 |
 | AT-07 headless 云端宿主契约 | PASS/FAIL | 自动化 harness，不依赖产品环境 |
