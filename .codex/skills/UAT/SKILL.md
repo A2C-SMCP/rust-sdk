@@ -112,7 +112,7 @@ bash .codex/skills/UAT/resources/full-protocol-uat.sh
 > 真实 socket.io over loopback）。tmux 版用于人工可观测/对齐文档，bash 版用于快速/CI 一键判定。
 > **依赖 #82（ack 拆封）+ #83（run 补 boot_up）修复**——否则 skill/blob/error 场景必失败。
 
-#### Atlassian OAuth 人工场景（仅显式执行）
+#### Atlassian OAuth 浏览器场景（仅显式执行）
 
 真实浏览器 consent 不属于默认全量套件，也不得在 CI/fork PR 自动运行。仅当用户明确调用
 `$uat oauth-atlassian` 时，加载
@@ -120,6 +120,10 @@ bash .codex/skills/UAT/resources/full-protocol-uat.sh
 callback、`initialize`、`tools/list`、只读资源查询、跨进程凭据恢复与清除。API token smoke 必须
 与交互式 OAuth 分开报告。场景中的自动化前置还会运行无需产品环境的云端 Flow Driver
 harness，验证稳定 HTTPS callback、一次性 state 路由及目标用户/目标 CLI 私有消息隔离。
+consent 页的站点选择、权限审阅与 **接受/Allow** 必须由已连接的浏览器自动化工具通过正常
+可见控件完成；仅账号登录、SSO 或 MFA 可暂停交给用户。不得要求用户代替 agent 点击 consent。
+consent 页缺少站点/权限选择器或 **接受**持续灰色时，按场景中的浏览器诊断规范做只读、
+脱敏 DOM/网络复验；不得输出完整 consent URL，不得强制解除禁用、直接提交表单或伪造 callback。
 
 ### CLI-only 场景 vs 完整链路场景
 
@@ -245,7 +249,7 @@ A2C_SKILL_HOME=$HOME_DIR $A2C marketplace add file://$BARE --trust --json
 settings-scope → plugin-management → strict-mode），完整链路场景随后（full-protocol
 → resource-discovery → blob-transfer → skill-discovery → error-codes）。
 
-`oauth-atlassian` 是需要真实账号与浏览器 consent 的人工场景，必须从默认全量中排除。
+`oauth-atlassian` 是需要真实账号与浏览器自动化 consent 的显式场景，必须从默认全量中排除。
 
 每个场景：环境准备 → 执行全部用例 → 输出报告 → 清理（kill session / 删 tmp）→
 `/compact` 压缩上下文 → 全通过则继续，存在失败则中止并汇总进度。

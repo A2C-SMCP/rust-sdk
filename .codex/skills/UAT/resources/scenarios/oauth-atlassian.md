@@ -1,10 +1,11 @@
-# 场景：oauth-atlassian（Atlassian Rovo MCP 人工 OAuth UAT）
+# 场景：oauth-atlassian（Atlassian Rovo MCP 浏览器自动化 OAuth UAT）
 
 ## 测试目标
 
 以真实上层应用视角验证 `smcp-computer` 对 Atlassian Rovo MCP 的 OAuth 2.1
 Authorization Code + PKCE 流程：SDK 发起授权，上层驱动自动打开浏览器并监听 loopback
-回调，用户登录、选择站点并同意后，完成 MCP `initialize`、`tools/list` 和一个只读资源查询。
+回调；用户仅在需要时完成登录、SSO 或 MFA，浏览器自动化选择站点、审阅并同意后，完成
+MCP `initialize`、`tools/list` 和一个只读资源查询。
 
 本场景还验证凭据跨进程恢复、`clear_oauth`，并引用自动化守护验证刷新、过期 state 与
 issuer 不匹配。API token/service account smoke 与本交互式 OAuth 场景严格分开，不能互相替代。
@@ -14,19 +15,27 @@ issuer 不匹配。API token/service account smoke 与本交互式 OAuth 场景�
 
 ## 类型与执行策略
 
-- **类型**：外部真实服务 + 浏览器人工 consent。
+- **类型**：外部真实服务 + 浏览器自动化 consent；账号登录、SSO、MFA 可由用户完成。
 - **仅显式执行**：`$uat oauth-atlassian`。
 - **禁止默认执行**：默认 CI、fork PR、`$uat` 全量套件不得运行本场景。
 - **服务端点**：`https://mcp.atlassian.com/v1/mcp/authv2`。
 - **授权方式**：DCR + Authorization Code + PKCE S256。
-- **最小 scopes**：`read:me read:account offline_access`。
+- **只读 scopes**：`read:me read:account read:jira-work offline_access`。
 - **只读工具**：`getAccessibleAtlassianResources`；不要求预建 Jira 项目。
+
+`getAccessibleAtlassianResources` 本身只要求 `read:me read:account`，但 Atlassian 的 DCR
+consent UI 在只有 common scopes 时不会渲染 workspace 选择器，同时保持 **接受**为 disabled。
+因此本场景增加最小 Jira 产品只读 scope `read:jira-work`，用于触发站点/产品 consent 步骤；
+驱动仍只调用上述无写入工具。该 scope 可读取测试账号本来有权访问的 Jira 内容，权限范围
+大于资源列表调用本身；应优先使用专用测试账号/站点。代码会将服务端实际授予的 scopes 与
+上述四项做顺序无关的精确 allowlist 校验；缺少、增加或替换任何 scope 都会先清除凭据再 FAIL。
 
 ## 前置条件
 
 1. 有权访问至少一个 Atlassian Cloud 站点的账号；无需创建测试项目。
 2. 组织管理员允许 Atlassian Rovo MCP OAuth 和 Read 权限。
-3. 现代浏览器可用，终端允许启动默认浏览器。
+3. 现代浏览器可用，终端允许启动默认浏览器；有可附着当前页面并按 role/name 操作正常
+   可见控件的浏览器自动化工具。
 4. 默认 callback 为 `http://127.0.0.1:3334/callback`：
    - 端口空闲；
    - 本机防火墙允许 loopback；
@@ -56,6 +65,63 @@ export A2C_OAUTH_UAT_PORT=43334
   - client secret、private key。
 - 失败报告只记录 `stage`、退出码和不含敏感值的环境事实。
 - 不开启 HTTP wire dump，不把浏览器地址栏或 callback query 截图附到 Issue。
+
+### Consent 卡住时的浏览器诊断
+
+当 consent 页缺少站点/权限选择器、**接受**按钮持续灰色，或驱动一直等待 callback 时，
+使用已连接的浏览器工具做**只读、脱敏**诊断。浏览器工具只有在下述授权守卫全部通过后，
+才能通过正常可见控件选择站点、审阅权限并点击 **Allow/接受**；不得绕过禁用按钮。
+
+诊断要求：
+
+1. 优先附着到当前浏览器会话，按 hostname + pathname 在工具内部定位
+   `auth.atlassian.com/consent`；不得调用会把完整 tab URL 原样输出到会话的页面枚举，
+   不得输出 query、fragment 或页面 source。
+2. DOM 只记录：
+   - `document.readyState`；
+   - 站点选择相关 `select` / `combobox` / `radio` 是否存在、是否可见；
+   - **接受**按钮的原生 `disabled` / `aria-disabled` 状态；
+   - 页面步骤文案。账号菜单、邮箱、头像、隐藏 input 值一律排除。
+3. 网络只记录去掉 query/fragment 后的 `hostname + pathname + method + status`。
+   `/consent/info` 如需检查，只输出字段结构、数组长度与布尔值；字符串值、workspace ID、
+   cloudId、context、state、code、token 一律脱敏。
+4. 控制台只记录 error/warning，并先脱敏完整 URL、长随机值、账号标识；禁止保存 HAR、
+   wire dump、截图地址栏或响应原文。
+5. 等待 2-3 秒后刷新一次并重复检查，作为 FAIL 二次复验。完成证据采集后停止等待并执行
+   `clear`，不为凑满 callback timeout 而空等。
+
+判定参考：
+
+| 证据 | 判定 |
+|---|---|
+| 站点选择器存在，选择站点后 **接受**启用 | 页面行为正常，继续浏览器自动化 consent |
+| 独立连接能列出站点，但 consent 响应无 workspace | 账号/组织策略或 Atlassian consent 后端阻塞 |
+| consent 响应有 workspace，DOM 无选择器且 **接受**原生 disabled | Atlassian consent 前端/当前 scopes 兼容问题，不归因于 SDK callback/PKCE |
+| `/consent/info` 非 2xx、请求失败或页面 JS exception | Atlassian consent 加载失败 |
+
+若已有独立 Atlassian 连接，可只读调用 `getAccessibleAtlassianResources` 交叉确认账号确实能
+访问 Cloud 站点；该连接使用的是另一份凭据，只能作为前置条件证据，不能替代本次 OAuth PASS。
+
+### 浏览器自动化授权守卫
+
+浏览器工具内部定位 consent 页后，必须依次执行以下守卫；只输出 PASS/FAIL 布尔结论，不输出
+完整 URL、query、账号标识、workspace ID 或权限响应原文：
+
+1. 页面显示的客户端名称是 `A2C SMCP Rust SDK UAT`。
+2. 页面显示的 callback 与当前端口对应，且 scheme/host/path 严格为
+   `http://127.0.0.1:<port>/callback`。
+3. 页面存在可见的站点 `combobox` 和权限审阅入口，**接受**不是 disabled。
+4. 打开权限审阅控件，确认只包含账号读取、Jira 读取和 offline access 等只读意图；出现
+   create/edit/delete/write/admin 等写入意图立即 FAIL，禁止接受。
+5. workspace 只有一个时自动选择或保留该站点；有多个时必须由
+   `A2C_OAUTH_UAT_SITE=<精确站点 hostname>` 指定，缺失则 FAIL
+   `stage=browser-site-ambiguous`，不得默认选第一个。
+6. 关闭权限审阅浮层后，用正常可见的 **接受/Allow** 按钮点击一次；不得执行脚本移除
+   `disabled`、直接调用 form submit、请求授权端点或构造 callback。
+7. 点击后由终端 loopback callback 与脱敏 `UAT_RESULT` 判定成功；浏览器页面跳转本身不算 PASS。
+
+若需要登录、SSO 或 MFA，浏览器工具停在身份认证页面并提示用户完成；身份认证结束后由工具
+继续上述全部 consent 点击，不能把站点选择或 **接受**转交用户。
 
 ## 自动化前置验收
 
@@ -89,21 +155,28 @@ UAT_RESULT: PASS phase=clear status=Unauthorized
 ```
 
 该操作只清理显式注入 store 中 bundle ID `oauth-atlassian-uat`、上述 Atlassian resource
-和当前 OAuth 模式对应的凭据槽；即使其他 bundle 共用同一 store 与 resource，也不受影响。
+和当前 OAuth 模式对应的凭据槽；同时迁移清理旧版三项 scope
+`read:me read:account offline_access` 的 UAT 槽。即使其他 bundle 共用同一 store 与
+resource，也不受影响。
 
-### AT-02：真实浏览器授权
+### AT-02：真实浏览器自动化授权
 
 ```bash
 cargo run -q -p smcp-computer --example oauth_atlassian_uat -- authorize
 ```
 
-人工操作：
+浏览器自动化操作：
 
 1. 驱动自动打开默认浏览器。
-2. 登录 Atlassian。
-3. 选择可访问的站点。
-4. 审阅授权范围并选择 **Allow**。
-5. 浏览器显示 callback 已接收后关闭页面。
+2. 工具附着到当前 consent 页；如需登录、SSO 或 MFA，只暂停等待用户完成身份认证。
+3. 工具执行[浏览器自动化授权守卫](#浏览器自动化授权守卫)。
+4. 工具选择唯一站点或 `A2C_OAUTH_UAT_SITE` 指定的站点。
+5. 工具审阅权限后，通过正常可见控件点击 **Allow/接受**。
+6. 浏览器显示 callback 已接收后，由工具关闭失效页面。
+
+若站点/权限选择器未出现或 **接受**持续灰色，按
+[Consent 卡住时的浏览器诊断](#consent-卡住时的浏览器诊断) 收集脱敏证据并二次复验；
+不得让用户代点，也不得用脚本移除 `disabled`、直接提交表单或构造 callback。
 
 终端预期只出现脱敏结果：
 
@@ -146,7 +219,7 @@ UAT_RESULT: PASS phase=resume
 ```
 
 该公开状态只能证明凭据恢复与复用，不能区分请求使用了原 token 还是 refresh token。
-因此人工报告不得声称 refresh 已触发，也不得为等待过期而轮询；refresh 由 AT-06 的
+因此 UAT 报告不得声称 refresh 已触发，也不得为等待过期而轮询；refresh 由 AT-06 的
 可控自动化测试独立验收。
 
 ### AT-05：清除授权

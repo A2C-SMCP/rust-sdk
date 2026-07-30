@@ -1,4 +1,4 @@
-//! Manual OAuth acceptance driver for the Atlassian Rovo MCP Server.
+//! Browser-automated OAuth acceptance driver for the Atlassian Rovo MCP Server.
 //!
 //! This example intentionally prints only redacted PASS/FAIL records. It never
 //! prints authorization URLs, callback codes, state, or stored credentials.
@@ -19,7 +19,7 @@ use smcp_computer::{
     OAuthClientRegistration, OAuthCredentialKey, OAuthCredentialStore, OAuthCredentialStoreError,
     OAuthFlowOutcome, OAuthOptions, OAuthStatus,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::env;
 use std::process::{Command, Stdio};
@@ -33,6 +33,16 @@ use url::Url;
 const RESOURCE_URL: &str = "https://mcp.atlassian.com/v1/mcp/authv2";
 const BUNDLE_ID: &str = "oauth-atlassian-uat";
 const READ_ONLY_TOOL: &str = "getAccessibleAtlassianResources";
+// Atlassian's DCR consent UI needs a product scope to render the workspace
+// selection step. Keep the product permission read-only: this UAT never calls
+// a Jira content tool.
+const OAUTH_SCOPES: &[&str] = &[
+    "read:me",
+    "read:account",
+    "read:jira-work",
+    "offline_access",
+];
+const LEGACY_OAUTH_SCOPES: &[&str] = &["read:me", "read:account", "offline_access"];
 const DEFAULT_CALLBACK_PORT: u16 = 3334;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 
@@ -184,7 +194,7 @@ async fn authorize() -> UatResult<()> {
         .complete_oauth(&bundle_id, callback)
         .await
         .map_err(|_| "complete-oauth")?;
-    validate_authorization_outcome(outcome)?;
+    enforce_authorization_outcome(&manager, &bundle_id, outcome).await?;
     assert_authorized(&manager, &bundle_id).await?;
     println!("UAT_RESULT: PASS authorized");
 
@@ -194,11 +204,32 @@ async fn authorize() -> UatResult<()> {
     Ok(())
 }
 
-fn validate_authorization_outcome(outcome: OAuthFlowOutcome) -> UatResult<()> {
+fn validate_authorization_outcome(outcome: &OAuthFlowOutcome) -> UatResult<()> {
     match outcome {
-        OAuthFlowOutcome::Authorized { scopes } if !scopes.is_empty() => Ok(()),
+        OAuthFlowOutcome::Authorized { scopes }
+            if scopes.iter().map(String::as_str).collect::<BTreeSet<_>>()
+                == OAUTH_SCOPES.iter().copied().collect() =>
+        {
+            Ok(())
+        }
         _ => Err("complete-oauth-outcome"),
     }
+}
+
+async fn enforce_authorization_outcome(
+    manager: &MCPServerManager,
+    bundle_id: &BundleId,
+    outcome: OAuthFlowOutcome,
+) -> UatResult<()> {
+    let Err(stage) = validate_authorization_outcome(&outcome) else {
+        return Ok(());
+    };
+
+    let clear_result = manager.clear_oauth(bundle_id).await;
+    let close_result = manager.close().await;
+    clear_result.map_err(|_| "invalid-granted-scopes-clear-oauth")?;
+    close_result.map_err(|_| "invalid-granted-scopes-manager-close")?;
+    Err(stage)
 }
 
 async fn cancel_pending_oauth(
@@ -244,29 +275,23 @@ async fn resume() -> UatResult<()> {
 }
 
 async fn clear() -> UatResult<()> {
-    let (manager, bundle_id) = configured_manager().await?;
-    manager
-        .clear_oauth(&bundle_id)
-        .await
-        .map_err(|_| "clear-oauth")?;
-    if !matches!(
-        manager
-            .oauth_status(&bundle_id)
-            .await
-            .map_err(|_| "status-after-clear")?,
-        OAuthStatus::Unauthorized
-    ) {
-        return Err("clear-did-not-remove-authorization");
-    }
-    manager.close().await.map_err(|_| "manager-close")?;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(KeyringOAuthCredentialStore::new()?);
+    clear_uat_credential_slots(store).await?;
     println!("UAT_RESULT: PASS phase=clear status=Unauthorized");
     Ok(())
 }
 
 async fn configured_manager() -> UatResult<(MCPServerManager, BundleId)> {
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(KeyringOAuthCredentialStore::new()?);
+    configured_manager_with_scopes(store, OAUTH_SCOPES).await
+}
+
+async fn configured_manager_with_scopes(
+    store: Arc<dyn OAuthCredentialStore>,
+    scopes: &[&str],
+) -> UatResult<(MCPServerManager, BundleId)> {
     let bundle_id = BundleId::try_from(BUNDLE_ID).map_err(|_| "bundle-id")?;
-    let store = KeyringOAuthCredentialStore::new()?;
-    let manager = MCPServerManager::with_oauth_credential_store(Arc::new(store));
+    let manager = MCPServerManager::with_oauth_credential_store(store);
     let mut config = HttpServerConfig::new(
         "Atlassian Rovo OAuth UAT",
         HttpServerParameters {
@@ -276,11 +301,7 @@ async fn configured_manager() -> UatResult<(MCPServerManager, BundleId)> {
     );
     config.bundle_id = Some(bundle_id.clone());
     config.oauth = Some(OAuthOptions {
-        scopes: vec![
-            "read:me".to_string(),
-            "read:account".to_string(),
-            "offline_access".to_string(),
-        ],
+        scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
         client_name: Some("A2C SMCP Rust SDK UAT".to_string()),
         mode: OAuthClientMode::AuthorizationCode {
             registration: OAuthClientRegistration::Dynamic,
@@ -291,6 +312,22 @@ async fn configured_manager() -> UatResult<(MCPServerManager, BundleId)> {
         .await
         .map_err(|_| "configure-server")?;
     Ok((manager, bundle_id))
+}
+
+async fn clear_uat_credential_slots(store: Arc<dyn OAuthCredentialStore>) -> UatResult<()> {
+    clear_uat_credential_slot(Arc::clone(&store), LEGACY_OAUTH_SCOPES).await?;
+    clear_uat_credential_slot(store, OAUTH_SCOPES).await
+}
+
+async fn clear_uat_credential_slot(
+    store: Arc<dyn OAuthCredentialStore>,
+    scopes: &[&str],
+) -> UatResult<()> {
+    let (manager, bundle_id) = configured_manager_with_scopes(store, scopes).await?;
+    let clear_result = manager.clear_oauth(&bundle_id).await;
+    let close_result = manager.close().await;
+    clear_result.map_err(|_| "clear-oauth")?;
+    close_result.map_err(|_| "manager-close")
 }
 
 async fn assert_authorized(manager: &MCPServerManager, bundle_id: &BundleId) -> UatResult<()> {
@@ -526,8 +563,71 @@ fn browser_command(authorization_url: &str) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smcp_computer::OAuthCredentialRecordKind;
+    use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    #[derive(Default)]
+    struct FakeOAuthCredentialStore {
+        entries: StdMutex<HashMap<OAuthCredentialKey, String>>,
+        deleted: StdMutex<Vec<OAuthCredentialKey>>,
+    }
+
+    impl FakeOAuthCredentialStore {
+        fn insert(&self, key: OAuthCredentialKey) {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key, "opaque-test-credential".to_string());
+        }
+
+        fn credential_keys_deleted(&self) -> Vec<OAuthCredentialKey> {
+            self.deleted
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| key.record_kind == OAuthCredentialRecordKind::Credentials)
+                .cloned()
+                .collect()
+        }
+
+        fn clear_deleted(&self) {
+            self.deleted.lock().unwrap().clear();
+        }
+
+        fn is_empty(&self) -> bool {
+            self.entries.lock().unwrap().is_empty()
+        }
+    }
+
+    #[async_trait]
+    impl OAuthCredentialStore for FakeOAuthCredentialStore {
+        async fn load(
+            &self,
+            key: &OAuthCredentialKey,
+        ) -> Result<Option<String>, OAuthCredentialStoreError> {
+            Ok(self.entries.lock().unwrap().get(key).cloned())
+        }
+
+        async fn save(
+            &self,
+            key: &OAuthCredentialKey,
+            value: &str,
+        ) -> Result<(), OAuthCredentialStoreError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key.clone(), value.to_string());
+            Ok(())
+        }
+
+        async fn delete(&self, key: &OAuthCredentialKey) -> Result<(), OAuthCredentialStoreError> {
+            self.entries.lock().unwrap().remove(key);
+            self.deleted.lock().unwrap().push(key.clone());
+            Ok(())
+        }
+    }
 
     async fn send_request(port: u16, target: &str) -> String {
         send_request_with_method(port, "GET", target).await
@@ -701,6 +801,19 @@ mod tests {
     }
 
     #[test]
+    fn oauth_scopes_include_read_only_jira_product_access() {
+        assert_eq!(
+            OAUTH_SCOPES,
+            &[
+                "read:me",
+                "read:account",
+                "read:jira-work",
+                "offline_access",
+            ]
+        );
+    }
+
+    #[test]
     fn cancellation_outcome_requires_matching_terminated_reason_and_final_status() {
         assert!(validate_cancellation_outcome(
             OAuthFlowOutcome::Terminated {
@@ -748,21 +861,97 @@ mod tests {
     #[test]
     fn authorization_outcome_requires_authorized_with_granted_scopes() {
         assert!(
-            validate_authorization_outcome(OAuthFlowOutcome::Authorized {
-                scopes: vec!["read:me".to_string()],
+            validate_authorization_outcome(&OAuthFlowOutcome::Authorized {
+                scopes: OAUTH_SCOPES
+                    .iter()
+                    .rev()
+                    .map(|scope| (*scope).to_string())
+                    .collect(),
             })
             .is_ok()
         );
         assert!(
-            validate_authorization_outcome(OAuthFlowOutcome::Authorized { scopes: Vec::new() })
+            validate_authorization_outcome(&OAuthFlowOutcome::Authorized { scopes: Vec::new() })
                 .is_err()
         );
         assert!(
-            validate_authorization_outcome(OAuthFlowOutcome::Terminated {
+            validate_authorization_outcome(&OAuthFlowOutcome::Authorized {
+                scopes: OAUTH_SCOPES
+                    .iter()
+                    .copied()
+                    .chain(["manage:jira-configuration"])
+                    .map(str::to_string)
+                    .collect(),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_authorization_outcome(&OAuthFlowOutcome::Terminated {
                 reason: OAuthCancellationReason::Cancelled,
                 status: OAuthStatus::Unauthorized,
             })
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn unexpected_granted_scope_is_rejected_and_credentials_are_cleared() {
+        let fake = Arc::new(FakeOAuthCredentialStore::default());
+        let store: Arc<dyn OAuthCredentialStore> = fake.clone();
+
+        clear_uat_credential_slot(Arc::clone(&store), OAUTH_SCOPES)
+            .await
+            .unwrap();
+        let credential_key = fake
+            .credential_keys_deleted()
+            .into_iter()
+            .next()
+            .expect("current scope credential key must be deleted");
+        fake.insert(credential_key);
+        fake.clear_deleted();
+
+        let (manager, bundle_id) = configured_manager_with_scopes(store, OAUTH_SCOPES)
+            .await
+            .unwrap();
+        let outcome = OAuthFlowOutcome::Authorized {
+            scopes: OAUTH_SCOPES
+                .iter()
+                .copied()
+                .chain(["manage:jira-configuration"])
+                .map(str::to_string)
+                .collect(),
+        };
+
+        assert_eq!(
+            enforce_authorization_outcome(&manager, &bundle_id, outcome).await,
+            Err("complete-oauth-outcome")
+        );
+        assert!(fake.is_empty());
+        assert_eq!(fake.credential_keys_deleted().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_removes_legacy_and_current_scope_credential_slots() {
+        let fake = Arc::new(FakeOAuthCredentialStore::default());
+        let store: Arc<dyn OAuthCredentialStore> = fake.clone();
+
+        clear_uat_credential_slots(Arc::clone(&store))
+            .await
+            .unwrap();
+        let credential_keys = fake.credential_keys_deleted();
+        assert_eq!(credential_keys.len(), 2);
+        assert_ne!(
+            credential_keys[0].grant_fingerprint,
+            credential_keys[1].grant_fingerprint
+        );
+
+        for key in credential_keys {
+            fake.insert(key);
+        }
+        fake.clear_deleted();
+
+        clear_uat_credential_slots(store).await.unwrap();
+        assert!(fake.is_empty());
+        assert_eq!(fake.credential_keys_deleted().len(), 2);
     }
 }
