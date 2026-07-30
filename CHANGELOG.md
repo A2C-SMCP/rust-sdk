@@ -48,6 +48,16 @@ All notable changes to this project will be documented in this file.
   HTTP servers retain normal redirect behavior; OAuth requests only follow
   same-origin redirects.
 
+## [0.3.1] - 2026-07-27
+
+### Bug Fixes
+
+- *(computer)* Redact marketplace Git credentials (#156)
+
+### Features
+
+- *(computer)* Resolve plugin inputs in scoped-to-global precedence order (#155)
+
 ## [0.3.0] - 2026-07-23
 
 ### Bug Fixes
