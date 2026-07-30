@@ -15,8 +15,8 @@ use super::{ResourceCache, SubscriptionManager};
 use crate::inputs::SecretValueResolver;
 use crate::oauth::{
     clear_stored_oauth_credentials, InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback,
-    OAuthCancellation, OAuthCoordinator, OAuthCredentialStore, OAuthError, OAuthLaunch,
-    OAuthOptions, OAuthRequestGuard, OAuthStatus,
+    OAuthCancellation, OAuthCoordinator, OAuthCredentialStore, OAuthError, OAuthFlowOutcome,
+    OAuthLaunch, OAuthOptions, OAuthRequestGuard, OAuthStatus,
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -234,14 +234,17 @@ impl HttpMCPClient {
         self.oauth().await?.begin(request).await
     }
 
-    pub(crate) async fn complete_oauth(&self, callback: OAuthCallback) -> Result<(), OAuthError> {
+    pub(crate) async fn complete_oauth(
+        &self,
+        callback: OAuthCallback,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
         self.oauth().await?.complete(callback).await
     }
 
     pub(crate) async fn cancel_oauth(
         &self,
         cancellation: OAuthCancellation,
-    ) -> Result<(), OAuthError> {
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
         self.oauth().await?.cancel(cancellation).await
     }
 

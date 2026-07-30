@@ -1,7 +1,4 @@
-//! OAuth 2.1 support for protected remote MCP servers.
-//!
-//! The SDK owns protocol state and tokens. The embedding Desktop/CLI owns opening the
-//! authorization URL and receiving the loopback callback.
+#![doc = include_str!("../docs/oauth-host-integration.md")]
 
 use crate::inputs::SecretValueResolver;
 use crate::mcp_clients::bundle_id::BundleId;
@@ -28,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{oneshot, Mutex, OwnedRwLockReadGuard, RwLock};
 use tracing::instrument::WithSubscriber;
 use url::Url;
 
@@ -179,8 +176,13 @@ type OAuthLifecycleRegistry = StdMutex<HashMap<OAuthLifecycleKey, Weak<OAuthReso
 /// same lifecycle as [`OAuthCoordinator`].
 #[derive(Clone)]
 struct ExpiringStateStore {
-    states: Arc<RwLock<HashMap<String, StoredAuthorizationState>>>,
+    states: Arc<RwLock<HashMap<String, ExpiringAuthorizationState>>>,
     ttl: Duration,
+}
+
+struct ExpiringAuthorizationState {
+    state: StoredAuthorizationState,
+    claimed_for_exchange: bool,
 }
 
 impl ExpiringStateStore {
@@ -191,8 +193,9 @@ impl ExpiringStateStore {
         }
     }
 
-    fn is_expired(&self, state: &StoredAuthorizationState, now: u64) -> bool {
-        now.saturating_sub(state.created_at) > self.ttl.as_secs()
+    fn is_expired(&self, entry: &ExpiringAuthorizationState, now: u64) -> bool {
+        !entry.claimed_for_exchange
+            && now.saturating_sub(entry.state.created_at) > self.ttl.as_secs()
     }
 
     fn now_epoch_secs() -> u64 {
@@ -200,6 +203,27 @@ impl ExpiringStateStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    async fn claim_for_exchange(&self, csrf_token: &str) -> Option<StoredAuthorizationState> {
+        let now = Self::now_epoch_secs();
+        let mut states = self.states.write().await;
+        if states
+            .get(csrf_token)
+            .is_some_and(|entry| self.is_expired(entry, now))
+        {
+            states.remove(csrf_token);
+            return None;
+        }
+        let entry = states.get_mut(csrf_token)?;
+        entry.claimed_for_exchange = true;
+        Some(entry.state.clone())
+    }
+
+    async fn release_exchange_claim(&self, csrf_token: &str) {
+        if let Some(entry) = self.states.write().await.get_mut(csrf_token) {
+            entry.claimed_for_exchange = false;
+        }
     }
 }
 
@@ -213,7 +237,13 @@ impl StateStore for ExpiringStateStore {
         let now = Self::now_epoch_secs();
         let mut states = self.states.write().await;
         states.retain(|_, existing| !self.is_expired(existing, now));
-        states.insert(csrf_token.to_string(), state);
+        states.insert(
+            csrf_token.to_string(),
+            ExpiringAuthorizationState {
+                state,
+                claimed_for_exchange: false,
+            },
+        );
         Ok(())
     }
 
@@ -223,15 +253,14 @@ impl StateStore for ExpiringStateStore {
     ) -> Result<Option<StoredAuthorizationState>, RmcpAuthError> {
         let now = Self::now_epoch_secs();
         let mut states = self.states.write().await;
-        let state = states.get(csrf_token).cloned();
-        if state
-            .as_ref()
-            .is_some_and(|stored| self.is_expired(stored, now))
+        if states
+            .get(csrf_token)
+            .is_some_and(|entry| self.is_expired(entry, now))
         {
             states.remove(csrf_token);
             Ok(None)
         } else {
-            Ok(state)
+            Ok(states.get(csrf_token).map(|entry| entry.state.clone()))
         }
     }
 
@@ -662,6 +691,10 @@ pub enum OAuthClientRegistration {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthBeginRequest {
+    /// Host-owned callback target.
+    ///
+    /// Accepted forms are HTTPS, loopback HTTP, or a reverse-domain private-use URI such as
+    /// `com.example.app:/oauth/callback` for native applications.
     pub redirect_uri: String,
     #[serde(default)]
     pub required_scope: Option<String>,
@@ -710,6 +743,11 @@ impl std::fmt::Debug for OAuthCallback {
 pub enum OAuthCancellationReason {
     /// The authorization server returned `access_denied`.
     AccessDenied,
+    /// The authorization server returned another OAuth error.
+    ///
+    /// Raw provider error strings and `error_description` values remain outside the SDK so they
+    /// cannot be retained or echoed through ordinary error and logging paths.
+    AuthorizationError,
     /// The user or embedding application cancelled the flow.
     Cancelled,
     /// The embedding application's callback deadline elapsed.
@@ -754,6 +792,26 @@ pub enum OAuthStatus {
     Error { message: String },
 }
 
+/// Structured result of completing or terminating an interactive authorization flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum OAuthFlowOutcome {
+    /// The authorization code was exchanged and credentials were stored.
+    Authorized { scopes: Vec<String> },
+    /// The host or authorization server terminated the flow without replacing credentials.
+    ///
+    /// `status` can remain [`OAuthStatus::Authorized`] when a scope-upgrade flow was cancelled and
+    /// earlier credentials are still usable.
+    Terminated {
+        reason: OAuthCancellationReason,
+        status: OAuthStatus,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum OAuthError {
     #[error("server does not have OAuth configured")]
@@ -762,6 +820,10 @@ pub enum OAuthError {
     UnsupportedTransport,
     #[error("OAuth callback state does not match the active authorization request")]
     StateMismatch,
+    #[error("OAuth callback issuer does not match the active authorization request")]
+    IssuerMismatch,
+    #[error("OAuth authorization request has expired")]
+    AuthorizationExpired,
     #[error("a different OAuth authorization request is already pending")]
     AuthorizationAlreadyPending,
     #[error("OAuth secret input '{0}' was not provided")]
@@ -779,6 +841,18 @@ struct PendingAuthorization {
     request: OAuthBeginRequest,
     requested_scopes: Vec<String>,
     generation: u64,
+}
+
+enum AuthorizationFlowState {
+    Idle,
+    Pending(PendingAuthorization),
+    /// Retains only the opaque identity needed to classify one late callback.
+    ///
+    /// Expired flows are terminal and must not participate in active-flow gates for subsequent
+    /// protected-resource 401/403 observations.
+    Expired {
+        state: String,
+    },
 }
 
 /// Thin rmcp adapter over the host-provided, bundle-aware credential store.
@@ -833,10 +907,6 @@ impl ScopedCredentialStore {
             .insert(issuer.clone());
         *self.issuer.write().await = issuer;
         self.persist_issuer_index().await
-    }
-
-    async fn issuer(&self) -> Option<String> {
-        self.issuer.read().await.clone()
     }
 
     fn key_for_issuer(&self, issuer: Option<String>) -> OAuthCredentialKey {
@@ -1016,11 +1086,11 @@ pub(crate) struct OAuthCoordinator {
     client: SensitiveAuthClient,
     store: ScopedCredentialStore,
     resolver: Option<Arc<dyn SecretValueResolver>>,
-    status: RwLock<OAuthStatus>,
-    granted_scopes: RwLock<Vec<String>>,
-    pending: Mutex<Option<PendingAuthorization>>,
+    status: Arc<RwLock<OAuthStatus>>,
+    granted_scopes: Arc<RwLock<Vec<String>>>,
+    authorization_flow: Arc<Mutex<AuthorizationFlowState>>,
     machine_scope_upgrades: Mutex<HashMap<String, usize>>,
-    machine_scope_upgrade_gate: Mutex<()>,
+    machine_scope_upgrade_gate: Arc<Mutex<()>>,
     request_gate: Arc<RwLock<()>>,
     state_store: ExpiringStateStore,
     oauth_http_client: Arc<dyn OAuthHttpClient>,
@@ -1164,11 +1234,11 @@ impl OAuthCoordinator {
             client,
             store,
             resolver,
-            status: RwLock::new(initial_status),
-            granted_scopes: RwLock::new(restored_scopes),
-            pending: Mutex::new(None),
+            status: Arc::new(RwLock::new(initial_status)),
+            granted_scopes: Arc::new(RwLock::new(restored_scopes)),
+            authorization_flow: Arc::new(Mutex::new(AuthorizationFlowState::Idle)),
             machine_scope_upgrades: Mutex::new(HashMap::new()),
-            machine_scope_upgrade_gate: Mutex::new(()),
+            machine_scope_upgrade_gate: Arc::new(Mutex::new(())),
             request_gate,
             state_store,
             oauth_http_client,
@@ -1202,27 +1272,7 @@ impl OAuthCoordinator {
     pub(crate) async fn status(&self) -> OAuthStatus {
         let _request_guard = self.request_gate.write().await;
         if matches!(*self.status.read().await, OAuthStatus::AuthorizationPending) {
-            let mut pending = self.pending.lock().await;
-            let pending_state = pending.as_ref().map(|active| active.launch.state.clone());
-            let pending_is_valid = match pending.as_ref() {
-                Some(active) => {
-                    active.generation == self.credential_generation()
-                        && self
-                            .state_store
-                            .load(&active.launch.state)
-                            .await
-                            .unwrap_or(None)
-                            .is_some()
-                }
-                None => false,
-            };
-            if !pending_is_valid {
-                if let Some(state) = pending_state {
-                    let _ = self.state_store.delete(&state).await;
-                }
-                *pending = None;
-                *self.status.write().await = OAuthStatus::Unauthorized;
-            }
+            let _ = self.expire_invalid_authorization_flow().await;
         }
         if matches!(
             *self.status.read().await,
@@ -1393,7 +1443,13 @@ impl OAuthCoordinator {
         if self.credential_generation() != expected_generation {
             return;
         }
-        if self.pending.lock().await.is_some() {
+        if self.expire_invalid_authorization_flow().await.is_err() {
+            return;
+        }
+        if matches!(
+            *self.authorization_flow.lock().await,
+            AuthorizationFlowState::Pending(_)
+        ) {
             return;
         }
         if matches!(self.options.mode, OAuthClientMode::AuthorizationCode { .. }) {
@@ -1441,24 +1497,14 @@ impl OAuthCoordinator {
         validate_redirect_uri(&request.redirect_uri)?;
         let _request_guard = self.request_gate.write().await;
         let _lifecycle_guard = self.machine_scope_upgrade_gate.lock().await;
-        let mut pending = self.pending.lock().await;
-        if let Some(existing) = pending.as_ref() {
-            let state_is_valid = existing.generation == self.credential_generation()
-                && self
-                    .state_store
-                    .load(&existing.launch.state)
-                    .await?
-                    .is_some();
-            if state_is_valid {
-                return if existing.request == request {
-                    Ok(existing.launch.clone())
-                } else {
-                    Err(OAuthError::AuthorizationAlreadyPending)
-                };
-            }
-            self.state_store.delete(&existing.launch.state).await?;
-            *pending = None;
-            *self.status.write().await = OAuthStatus::Unauthorized;
+        self.expire_invalid_authorization_flow().await?;
+        let mut authorization_flow = self.authorization_flow.lock().await;
+        if let AuthorizationFlowState::Pending(existing) = &*authorization_flow {
+            return if existing.request == request {
+                Ok(existing.launch.clone())
+            } else {
+                Err(OAuthError::AuthorizationAlreadyPending)
+            };
         }
         let mut manager = self.client.inner.auth_manager.lock().await;
         let metadata = self.discover(&mut manager).await?;
@@ -1559,7 +1605,7 @@ impl OAuthCoordinator {
             .generation
             .fetch_add(1, Ordering::AcqRel)
             + 1;
-        *pending = Some(PendingAuthorization {
+        *authorization_flow = AuthorizationFlowState::Pending(PendingAuthorization {
             launch: launch.clone(),
             request,
             requested_scopes,
@@ -1569,93 +1615,230 @@ impl OAuthCoordinator {
         Ok(launch)
     }
 
-    pub(crate) async fn complete(&self, callback: OAuthCallback) -> Result<(), OAuthError> {
-        let _request_guard = self.request_gate.write().await;
-        let _credential_guard = self.machine_scope_upgrade_gate.lock().await;
-        let mut pending = self.pending.lock().await;
-        let Some(active) = pending.as_ref() else {
+    fn validate_callback_issuer(
+        stored_state: &StoredAuthorizationState,
+        issuer: Option<&str>,
+        require_provider_issuer: bool,
+    ) -> Result<(), OAuthError> {
+        let Some(callback_issuer) = issuer else {
+            return if require_provider_issuer && stored_state.require_issuer {
+                Err(OAuthError::IssuerMismatch)
+            } else {
+                Ok(())
+            };
+        };
+        let Some(expected_issuer) = stored_state.expected_issuer.as_deref() else {
+            return Err(OAuthError::IssuerMismatch);
+        };
+        validate_secure_url(callback_issuer, "authorization issuer")
+            .map_err(|_| OAuthError::IssuerMismatch)?;
+        validate_secure_url(expected_issuer, "authorization issuer")
+            .map_err(|_| OAuthError::IssuerMismatch)?;
+        (callback_issuer == expected_issuer)
+            .then_some(())
+            .ok_or(OAuthError::IssuerMismatch)
+    }
+
+    async fn expire_invalid_authorization_flow(&self) -> Result<bool, OAuthError> {
+        let mut authorization_flow = self.authorization_flow.lock().await;
+        let AuthorizationFlowState::Pending(active) = &*authorization_flow else {
+            return Ok(false);
+        };
+        let state_is_valid = active.generation == self.credential_generation()
+            && self.state_store.load(&active.launch.state).await?.is_some();
+        if state_is_valid {
+            return Ok(false);
+        }
+
+        let state = active.launch.state.clone();
+        self.state_store.delete(&state).await?;
+        *authorization_flow = AuthorizationFlowState::Expired { state };
+        drop(authorization_flow);
+        self.restore_status_after_termination().await?;
+        Ok(true)
+    }
+
+    async fn restore_status_after_termination(&self) -> Result<OAuthStatus, OAuthError> {
+        restore_authorization_status(
+            &self.store,
+            &self.options.scopes,
+            &self.granted_scopes,
+            &self.status,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete(
+        &self,
+        callback: OAuthCallback,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
+        let request_guard = Arc::clone(&self.request_gate).write_owned().await;
+        let credential_guard = Arc::clone(&self.machine_scope_upgrade_gate)
+            .lock_owned()
+            .await;
+        let mut authorization_flow = self.authorization_flow.lock().await;
+        if let AuthorizationFlowState::Expired { state } = &*authorization_flow {
+            if state != &callback.state {
+                return Err(OAuthError::StateMismatch);
+            }
+            *authorization_flow = AuthorizationFlowState::Idle;
+            return Err(OAuthError::AuthorizationExpired);
+        }
+        let AuthorizationFlowState::Pending(active) = &*authorization_flow else {
             return Err(OAuthError::StateMismatch);
         };
         if active.launch.state != callback.state {
             return Err(OAuthError::StateMismatch);
         }
-        if active.generation != self.credential_generation() {
+        let stored_state = if active.generation == self.credential_generation() {
+            self.state_store.claim_for_exchange(&callback.state).await
+        } else {
+            None
+        };
+        if active.generation != self.credential_generation() || stored_state.is_none() {
             let callback_state = callback.state.clone();
-            *pending = None;
-            drop(pending);
+            *authorization_flow = AuthorizationFlowState::Idle;
+            drop(authorization_flow);
             self.state_store.delete(&callback_state).await?;
-            *self.status.write().await = OAuthStatus::Unauthorized;
-            return Err(OAuthError::StateMismatch);
+            self.restore_status_after_termination().await?;
+            return Err(OAuthError::AuthorizationExpired);
+        }
+        if let Err(error) = Self::validate_callback_issuer(
+            stored_state
+                .as_ref()
+                .expect("active authorization state was checked above"),
+            callback.issuer.as_deref(),
+            true,
+        ) {
+            self.state_store
+                .release_exchange_claim(&callback.state)
+                .await;
+            return Err(error);
         }
         let requested_scopes = active.requested_scopes.clone();
         let callback_state = callback.state.clone();
-        *pending = None;
-        drop(pending);
+        drop(authorization_flow);
 
-        let exchange = spawn_code_exchange(self.client.clone(), callback).await;
-        match exchange {
-            Ok(mut scopes) => {
-                if scopes.is_empty() {
-                    scopes = requested_scopes;
+        let client = self.client.clone();
+        let store = self.store.clone();
+        let state_store = self.state_store.clone();
+        let status = Arc::clone(&self.status);
+        let granted_scopes = Arc::clone(&self.granted_scopes);
+        let authorization_flow = Arc::clone(&self.authorization_flow);
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _request_guard = request_guard;
+            let _credential_guard = credential_guard;
+            let result = match spawn_code_exchange(client, callback).await {
+                Ok(mut scopes) => {
+                    if scopes.is_empty() {
+                        scopes = requested_scopes;
+                    }
+                    if let Err(error) = store.overwrite_granted_scopes(scopes.clone()).await {
+                        *status.write().await = OAuthStatus::Error {
+                            message: "OAuth credential storage failed".to_string(),
+                        };
+                        Err(error.into())
+                    } else {
+                        *granted_scopes.write().await = scopes.clone();
+                        *status.write().await = OAuthStatus::Authorized {
+                            scopes: scopes.clone(),
+                        };
+                        Ok(OAuthFlowOutcome::Authorized { scopes })
+                    }
                 }
-                if let Err(error) = self.store.overwrite_granted_scopes(scopes.clone()).await {
-                    *self.status.write().await = OAuthStatus::Error {
-                        message: "OAuth credential storage failed".to_string(),
+                Err(error) => {
+                    let result = state_store.delete(&callback_state).await;
+                    *status.write().await = OAuthStatus::Error {
+                        message: "OAuth authorization code exchange failed".to_string(),
                     };
-                    return Err(error.into());
+                    match result {
+                        Ok(()) => Err(error),
+                        Err(delete_error) => Err(delete_error.into()),
+                    }
                 }
-                *self.granted_scopes.write().await = scopes.clone();
-                *self.status.write().await = OAuthStatus::Authorized { scopes };
-                Ok(())
-            }
-            Err(error) => {
-                self.state_store.delete(&callback_state).await?;
-                *self.status.write().await = OAuthStatus::Error {
-                    message: "OAuth authorization code exchange failed".to_string(),
-                };
-                Err(error)
-            }
-        }
+            };
+            *authorization_flow.lock().await = AuthorizationFlowState::Idle;
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            OAuthError::Protocol(RmcpAuthError::InternalError(
+                "OAuth completion task terminated unexpectedly".to_string(),
+            ))
+        })?
     }
 
-    pub(crate) async fn cancel(&self, cancellation: OAuthCancellation) -> Result<(), OAuthError> {
-        let _request_guard = self.request_gate.write().await;
-        let _credential_guard = self.machine_scope_upgrade_gate.lock().await;
-        let mut pending = self.pending.lock().await;
-        let Some(active) = pending.as_ref() else {
-            return Err(OAuthError::StateMismatch);
-        };
-        if active.launch.state != cancellation.state
-            || active.generation != self.credential_generation()
-        {
-            return Err(OAuthError::StateMismatch);
-        }
-        if let Some(callback_issuer) = cancellation.issuer.as_deref() {
-            let callback_issuer =
-                validate_secure_url(callback_issuer, "authorization issuer")?.to_string();
-            if self.store.issuer().await.as_deref() != Some(callback_issuer.as_str()) {
+    pub(crate) async fn cancel(
+        &self,
+        cancellation: OAuthCancellation,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
+        let request_guard = Arc::clone(&self.request_gate).write_owned().await;
+        let credential_guard = Arc::clone(&self.machine_scope_upgrade_gate)
+            .lock_owned()
+            .await;
+        let mut authorization_flow = self.authorization_flow.lock().await;
+        if let AuthorizationFlowState::Expired { state } = &*authorization_flow {
+            if state != &cancellation.state {
                 return Err(OAuthError::StateMismatch);
             }
+            *authorization_flow = AuthorizationFlowState::Idle;
+            return Err(OAuthError::AuthorizationExpired);
         }
-
-        *pending = None;
-        drop(pending);
-        self.state_store.delete(&cancellation.state).await?;
-        let restored = self.store.load().await?;
-        let status = match restored {
-            Some(credentials) if credentials.token_response.is_some() => {
-                let scopes = if credentials.granted_scopes.is_empty() {
-                    self.options.scopes.clone()
-                } else {
-                    credentials.granted_scopes
-                };
-                *self.granted_scopes.write().await = scopes.clone();
-                OAuthStatus::Authorized { scopes }
-            }
-            _ => OAuthStatus::Unauthorized,
+        let AuthorizationFlowState::Pending(active) = &*authorization_flow else {
+            return Err(OAuthError::StateMismatch);
         };
-        *self.status.write().await = status;
-        Ok(())
+        if active.launch.state != cancellation.state {
+            return Err(OAuthError::StateMismatch);
+        }
+        let stored_state = self.state_store.load(&cancellation.state).await?;
+        if active.generation != self.credential_generation() || stored_state.is_none() {
+            *authorization_flow = AuthorizationFlowState::Idle;
+            drop(authorization_flow);
+            self.state_store.delete(&cancellation.state).await?;
+            self.restore_status_after_termination().await?;
+            return Err(OAuthError::AuthorizationExpired);
+        }
+        let provider_callback = matches!(
+            cancellation.reason,
+            OAuthCancellationReason::AccessDenied | OAuthCancellationReason::AuthorizationError
+        );
+        Self::validate_callback_issuer(
+            stored_state
+                .as_ref()
+                .expect("active authorization state was checked above"),
+            cancellation.issuer.as_deref(),
+            provider_callback,
+        )?;
+
+        drop(authorization_flow);
+        let state_store = self.state_store.clone();
+        let store = self.store.clone();
+        let fallback_scopes = self.options.scopes.clone();
+        let status = Arc::clone(&self.status);
+        let granted_scopes = Arc::clone(&self.granted_scopes);
+        let authorization_flow = Arc::clone(&self.authorization_flow);
+        let cancellation_state = cancellation.state;
+        let reason = cancellation.reason;
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _request_guard = request_guard;
+            let _credential_guard = credential_guard;
+            let result = match state_store.delete(&cancellation_state).await {
+                Ok(()) => {
+                    restore_authorization_status(&store, &fallback_scopes, &granted_scopes, &status)
+                        .await
+                        .map(|status| OAuthFlowOutcome::Terminated { reason, status })
+                }
+                Err(error) => Err(error.into()),
+            };
+            *authorization_flow.lock().await = AuthorizationFlowState::Idle;
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            OAuthError::Protocol(RmcpAuthError::InternalError(
+                "OAuth cancellation task terminated unexpectedly".to_string(),
+            ))
+        })?
     }
 
     pub(crate) async fn clear(&self) -> Result<(), OAuthError> {
@@ -1668,20 +1851,27 @@ impl OAuthCoordinator {
     ) -> Result<(), OAuthError> {
         let _request_guard = self.request_gate.write().await;
         let _upgrade_guard = self.machine_scope_upgrade_gate.lock().await;
-        let mut pending = self.pending.lock().await;
-        let _manager_guard = self.client.inner.auth_manager.lock().await;
         if expected_generation.is_some_and(|generation| self.credential_generation() != generation)
         {
             return Ok(());
         }
-        if expected_generation.is_some() && pending.is_some() {
-            return Ok(());
+        if expected_generation.is_some() {
+            self.expire_invalid_authorization_flow().await?;
+            if matches!(
+                *self.authorization_flow.lock().await,
+                AuthorizationFlowState::Pending(_)
+            ) {
+                return Ok(());
+            }
         }
-        if let Some(state) = pending.as_ref().map(|active| active.launch.state.as_str()) {
+        let mut authorization_flow = self.authorization_flow.lock().await;
+        let _manager_guard = self.client.inner.auth_manager.lock().await;
+        if let AuthorizationFlowState::Pending(active) = &*authorization_flow {
+            let state = active.launch.state.as_str();
             self.state_store.delete(state).await?;
         }
         self.store.clear().await?;
-        *pending = None;
+        *authorization_flow = AuthorizationFlowState::Idle;
         self.machine_scope_upgrades.lock().await.clear();
         self.granted_scopes.write().await.clear();
         *self.status.write().await = OAuthStatus::Unauthorized;
@@ -1844,12 +2034,46 @@ fn validate_secure_url(value: &str, label: &str) -> Result<Url, OAuthError> {
 fn validate_redirect_uri(value: &str) -> Result<(), OAuthError> {
     let url = Url::parse(value)
         .map_err(|_| OAuthError::InvalidRedirectUri("redirect URI is invalid".to_string()))?;
-    if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback_host(&url)) {
+    if url.fragment().is_some() {
         return Err(OAuthError::InvalidRedirectUri(
-            "redirect URI must use HTTPS or loopback HTTP".to_string(),
+            "redirect URI must not contain a fragment".to_string(),
+        ));
+    }
+    let secure_web = url.scheme() == "https";
+    let loopback_http = url.scheme() == "http" && is_loopback_host(&url);
+    let private_use = is_private_use_redirect_uri(&url);
+    if !secure_web && !loopback_http && !private_use {
+        return Err(OAuthError::InvalidRedirectUri(
+            "redirect URI must use HTTPS, loopback HTTP, or a reverse-domain private-use scheme"
+                .to_string(),
         ));
     }
     Ok(())
+}
+
+fn is_private_use_redirect_uri(url: &Url) -> bool {
+    let scheme = url.scheme();
+    if matches!(scheme, "http" | "https") {
+        return false;
+    }
+    let labels: Vec<&str> = scheme.split('.').collect();
+    let reverse_domain_scheme = labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        });
+    let prefix = format!("{scheme}:/");
+    let authority_prefix = format!("{scheme}://");
+    reverse_domain_scheme
+        && url.host_str().is_none()
+        && url.as_str().starts_with(&prefix)
+        && !url.as_str().starts_with(&authority_prefix)
+        && url.path().starts_with('/')
+        && url.path().len() > 1
 }
 
 fn canonical_resource_identity(value: &str) -> Result<String, OAuthError> {
@@ -2012,6 +2236,37 @@ async fn configure_restored_authorization_client(
     }
     manager.configure_client(config)?;
     Ok(())
+}
+
+async fn restore_authorization_status(
+    store: &ScopedCredentialStore,
+    fallback_scopes: &[String],
+    granted_scopes: &RwLock<Vec<String>>,
+    status: &RwLock<OAuthStatus>,
+) -> Result<OAuthStatus, OAuthError> {
+    let restored = match store.load().await {
+        Ok(restored) => restored,
+        Err(error) => {
+            *status.write().await = OAuthStatus::Error {
+                message: "OAuth credential state is unavailable".to_string(),
+            };
+            return Err(error.into());
+        }
+    };
+    let restored_status = match restored {
+        Some(credentials) if credentials.token_response.is_some() => {
+            let scopes = if credentials.granted_scopes.is_empty() {
+                fallback_scopes.to_vec()
+            } else {
+                credentials.granted_scopes
+            };
+            *granted_scopes.write().await = scopes.clone();
+            OAuthStatus::Authorized { scopes }
+        }
+        _ => OAuthStatus::Unauthorized,
+    };
+    *status.write().await = restored_status.clone();
+    Ok(restored_status)
 }
 
 async fn spawn_code_exchange(
@@ -2329,7 +2584,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     }
 
     #[test]
-    fn oauth_config_and_status_use_camel_case_fields() {
+    fn oauth_config_status_and_outcome_use_camel_case_fields() {
         let options = OAuthOptions {
             scopes: vec!["tools.read".into()],
             client_name: Some("Desktop".into()),
@@ -2356,6 +2611,14 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         .unwrap();
         assert_eq!(status["requiredScope"], "tools.write");
         assert!(status.get("required_scope").is_none());
+        let outcome = serde_json::to_value(OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::AuthorizationError,
+            status: OAuthStatus::Unauthorized,
+        })
+        .unwrap();
+        assert_eq!(outcome["outcome"], "terminated");
+        assert_eq!(outcome["reason"], "authorizationError");
+        assert_eq!(outcome["status"]["state"], "unauthorized");
         assert_eq!(
             serde_json::from_value::<OAuthOptions>(value).unwrap(),
             options
@@ -2670,6 +2933,54 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         assert!(store.load("state").await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn claimed_authorization_state_survives_exchange_handoff_only_until_release_or_delete() {
+        fn state(csrf_token: &str) -> StoredAuthorizationState {
+            serde_json::from_value(serde_json::json!({
+                "pkce_verifier": "verifier",
+                "csrf_token": csrf_token,
+                "expected_issuer": "https://issuer.example",
+                "require_issuer": true,
+                "created_at": ExpiringStateStore::now_epoch_secs()
+            }))
+            .unwrap()
+        }
+
+        let store = ExpiringStateStore::new(Duration::from_secs(1));
+        store.save("claimed", state("claimed")).await.unwrap();
+        assert!(store.claim_for_exchange("claimed").await.is_some());
+        store
+            .states
+            .write()
+            .await
+            .get_mut("claimed")
+            .unwrap()
+            .state
+            .created_at = 1;
+        assert!(
+            store.load("claimed").await.unwrap().is_some(),
+            "an accepted callback must not expire during the rmcp handoff"
+        );
+        store.delete("claimed").await.unwrap();
+        assert!(store.load("claimed").await.unwrap().is_none());
+
+        store.save("released", state("released")).await.unwrap();
+        assert!(store.claim_for_exchange("released").await.is_some());
+        store.release_exchange_claim("released").await;
+        store
+            .states
+            .write()
+            .await
+            .get_mut("released")
+            .unwrap()
+            .state
+            .created_at = 1;
+        assert!(
+            store.load("released").await.unwrap().is_none(),
+            "a rejected callback must release the claim and restore TTL enforcement"
+        );
+    }
+
     #[test]
     fn stored_client_identity_must_match_fixed_registration() {
         let fixed = OAuthOptions {
@@ -2726,13 +3037,20 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     }
 
     #[test]
-    fn secure_url_policy_rejects_public_http_and_non_http_callbacks() {
+    fn secure_url_policy_accepts_native_private_use_redirects_only() {
         assert!(validate_secure_url("https://resource.example/mcp", "resource").is_ok());
         assert!(validate_secure_url("http://127.0.0.1:8080/mcp", "resource").is_ok());
         assert!(validate_secure_url("http://resource.example/mcp", "resource").is_err());
         assert!(validate_redirect_uri("http://localhost:9876/callback").is_ok());
         assert!(validate_redirect_uri("https://desktop.example/callback").is_ok());
+        assert!(validate_redirect_uri("com.example.app:/oauth/callback").is_ok());
+        assert!(validate_redirect_uri("http://localhost:9876/callback#fragment").is_err());
+        assert!(validate_redirect_uri("https://desktop.example/callback#fragment").is_err());
+        assert!(validate_redirect_uri("com.example.app:/oauth/callback#fragment").is_err());
         assert!(validate_redirect_uri("file:///tmp/callback").is_err());
+        assert!(validate_redirect_uri("custom:/callback").is_err());
+        assert!(validate_redirect_uri("com.example.app://attacker.example/callback").is_err());
+        assert!(validate_redirect_uri("com.example.app:/").is_err());
         assert!(validate_redirect_uri("http://desktop.example/callback").is_err());
     }
 
@@ -3603,6 +3921,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             .await
             .get_mut(&launch.state)
             .expect("active OAuth state must exist")
+            .state
             .created_at = 1;
         assert!(matches!(
             coordinator
@@ -3612,12 +3931,14 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                     issuer: Some(base_url.clone()),
                 })
                 .await,
-            Err(OAuthError::Protocol(_))
+            Err(OAuthError::AuthorizationExpired)
         ));
+        assert_eq!(coordinator.status().await, OAuthStatus::Unauthorized);
         assert!(coordinator.store.load().await.unwrap().is_none());
 
         coordinator.clear().await.unwrap();
         let issuer_mismatch = coordinator.begin(begin_request.clone()).await.unwrap();
+        let issuer_mismatch_state = issuer_mismatch.state.clone();
         assert!(matches!(
             coordinator
                 .complete(OAuthCallback {
@@ -3626,8 +3947,18 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                     issuer: Some("https://wrong-issuer.example".into()),
                 })
                 .await,
-            Err(OAuthError::Protocol(_))
+            Err(OAuthError::IssuerMismatch)
         ));
+        assert!(coordinator
+            .state_store
+            .load(&issuer_mismatch_state)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            coordinator.status().await,
+            OAuthStatus::AuthorizationPending
+        );
         assert!(coordinator.store.load().await.unwrap().is_none());
 
         coordinator.clear().await.unwrap();
@@ -3639,12 +3970,12 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             .with_max_level(tracing::Level::TRACE)
             .with_writer(captured_logs.clone())
             .finish();
-        let refreshed_generation = async {
+        async {
             coordinator
                 .complete(OAuthCallback {
                     code: "authorization-code".into(),
                     state: launch.state.clone(),
-                    issuer: Some(base_url),
+                    issuer: Some(base_url.clone()),
                 })
                 .await
                 .unwrap();
@@ -3654,10 +3985,110 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             assert!(refreshed_generation > before_refresh);
             assert_eq!(token_requests.load(Ordering::SeqCst), 2);
             drop(refreshed_request);
-            refreshed_generation
         }
         .with_subscriber(subscriber)
         .await;
+
+        let expired_upgrade = coordinator
+            .begin(OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".into(),
+                required_scope: Some("tools.write".into()),
+            })
+            .await
+            .unwrap();
+        coordinator
+            .state_store
+            .states
+            .write()
+            .await
+            .get_mut(&expired_upgrade.state)
+            .expect("scope-upgrade OAuth state must exist")
+            .state
+            .created_at = 1;
+        assert!(matches!(
+            coordinator.status().await,
+            OAuthStatus::Authorized { .. }
+        ));
+        let expired_upgrade_generation = coordinator.credential_generation();
+        coordinator
+            .observe_streamable_error(Some(&stale_403), expired_upgrade_generation)
+            .await;
+        assert_eq!(
+            coordinator.status().await,
+            OAuthStatus::ReauthorizationRequired {
+                required_scope: "tools.write".into(),
+            },
+            "an expired flow must not suppress a later insufficient-scope observation"
+        );
+        assert!(matches!(
+            coordinator
+                .complete(OAuthCallback {
+                    code: "expired-upgrade-code".into(),
+                    state: expired_upgrade.state.clone(),
+                    issuer: Some(base_url.clone()),
+                })
+                .await,
+            Err(OAuthError::AuthorizationExpired)
+        ));
+        assert_eq!(
+            coordinator.status().await,
+            OAuthStatus::ReauthorizationRequired {
+                required_scope: "tools.write".into(),
+            },
+            "classifying the late callback must not overwrite newer resource feedback"
+        );
+
+        let expired_cancellation = coordinator
+            .begin(OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".into(),
+                required_scope: Some("tools.write".into()),
+            })
+            .await
+            .unwrap();
+        assert_ne!(expired_cancellation.state, expired_upgrade.state);
+        coordinator
+            .state_store
+            .states
+            .write()
+            .await
+            .get_mut(&expired_cancellation.state)
+            .expect("replacement scope-upgrade OAuth state must exist")
+            .state
+            .created_at = 1;
+        assert!(matches!(
+            coordinator
+                .cancel(OAuthCancellation {
+                    state: expired_cancellation.state.clone(),
+                    issuer: Some(base_url.clone()),
+                    reason: OAuthCancellationReason::Timeout,
+                })
+                .await,
+            Err(OAuthError::AuthorizationExpired)
+        ));
+
+        let fresh_upgrade = coordinator
+            .begin(OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".into(),
+                required_scope: Some("tools.write".into()),
+            })
+            .await
+            .unwrap();
+        assert_ne!(fresh_upgrade.state, expired_cancellation.state);
+        assert!(matches!(
+            coordinator
+                .cancel(OAuthCancellation {
+                    state: fresh_upgrade.state,
+                    issuer: Some(base_url),
+                    reason: OAuthCancellationReason::Cancelled,
+                })
+                .await
+                .unwrap(),
+            OAuthFlowOutcome::Terminated {
+                status: OAuthStatus::Authorized { .. },
+                ..
+            }
+        ));
+
         let logs = captured_logs.text();
         for sensitive in [
             "authorization-code",
@@ -3671,6 +4102,27 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                 "OAuth code, state, and tokens must not reach tracing output"
             );
         }
+        let expired_before_401 = coordinator
+            .begin(OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".into(),
+                required_scope: Some("tools.write".into()),
+            })
+            .await
+            .unwrap();
+        coordinator
+            .state_store
+            .states
+            .write()
+            .await
+            .get_mut(&expired_before_401.state)
+            .expect("scope-upgrade OAuth state before 401 must exist")
+            .state
+            .created_at = 1;
+        assert!(matches!(
+            coordinator.status().await,
+            OAuthStatus::Authorized { .. }
+        ));
+        let refreshed_generation = coordinator.credential_generation();
         let refreshed_401 = rmcp::transport::streamable_http_client::StreamableHttpError::Auth(
             RmcpAuthError::AuthorizationRequired,
         );
@@ -3678,6 +4130,16 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             .observe_streamable_error(Some(&refreshed_401), refreshed_generation)
             .await;
         assert_eq!(coordinator.status().await, OAuthStatus::Unauthorized);
+        assert!(matches!(
+            coordinator
+                .complete(OAuthCallback {
+                    code: "late-code-after-401".into(),
+                    state: expired_before_401.state,
+                    issuer: None,
+                })
+                .await,
+            Err(OAuthError::StateMismatch)
+        ));
         assert!(coordinator.store.load().await.unwrap().is_none());
         server.abort();
     }

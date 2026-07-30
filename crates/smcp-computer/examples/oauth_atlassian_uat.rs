@@ -17,7 +17,7 @@ use smcp_computer::mcp_clients::{
 use smcp_computer::{
     OAuthBeginRequest, OAuthCallback, OAuthCancellation, OAuthCancellationReason, OAuthClientMode,
     OAuthClientRegistration, OAuthCredentialKey, OAuthCredentialStore, OAuthCredentialStoreError,
-    OAuthOptions, OAuthStatus,
+    OAuthFlowOutcome, OAuthOptions, OAuthStatus,
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -143,43 +143,48 @@ async fn authorize() -> UatResult<()> {
     let callback = match receive_callback(listener, &launch.state).await {
         Ok(CallbackEvent::Complete(callback)) => callback,
         Ok(CallbackEvent::Cancel(cancellation)) => {
-            let _ = manager.cancel_oauth(&bundle_id, cancellation).await;
+            let cancellation_result =
+                cancel_pending_oauth(&manager, &bundle_id, cancellation).await;
             let _ = manager.close().await;
+            cancellation_result?;
             return Err("authorization-denied");
         }
         Err("callback-timeout") => {
-            let _ = manager
-                .cancel_oauth(
-                    &bundle_id,
-                    OAuthCancellation {
-                        state: launch.state,
-                        issuer: None,
-                        reason: OAuthCancellationReason::Timeout,
-                    },
-                )
-                .await;
+            let cancellation_result = cancel_pending_oauth(
+                &manager,
+                &bundle_id,
+                OAuthCancellation {
+                    state: launch.state,
+                    issuer: None,
+                    reason: OAuthCancellationReason::Timeout,
+                },
+            )
+            .await;
             let _ = manager.close().await;
+            cancellation_result?;
             return Err("callback-timeout");
         }
         Err(stage) => {
-            let _ = manager
-                .cancel_oauth(
-                    &bundle_id,
-                    OAuthCancellation {
-                        state: launch.state,
-                        issuer: None,
-                        reason: OAuthCancellationReason::Cancelled,
-                    },
-                )
-                .await;
+            let cancellation_result = cancel_pending_oauth(
+                &manager,
+                &bundle_id,
+                OAuthCancellation {
+                    state: launch.state,
+                    issuer: None,
+                    reason: OAuthCancellationReason::Cancelled,
+                },
+            )
+            .await;
             let _ = manager.close().await;
+            cancellation_result?;
             return Err(stage);
         }
     };
-    manager
+    let outcome = manager
         .complete_oauth(&bundle_id, callback)
         .await
         .map_err(|_| "complete-oauth")?;
+    validate_authorization_outcome(outcome)?;
     assert_authorized(&manager, &bundle_id).await?;
     println!("UAT_RESULT: PASS authorized");
 
@@ -187,6 +192,44 @@ async fn authorize() -> UatResult<()> {
     manager.close().await.map_err(|_| "manager-close")?;
     println!("UAT_RESULT: PASS phase=authorize");
     Ok(())
+}
+
+fn validate_authorization_outcome(outcome: OAuthFlowOutcome) -> UatResult<()> {
+    match outcome {
+        OAuthFlowOutcome::Authorized { scopes } if !scopes.is_empty() => Ok(()),
+        _ => Err("complete-oauth-outcome"),
+    }
+}
+
+async fn cancel_pending_oauth(
+    manager: &MCPServerManager,
+    bundle_id: &BundleId,
+    cancellation: OAuthCancellation,
+) -> UatResult<()> {
+    let expected_reason = cancellation.reason;
+    let outcome = manager
+        .cancel_oauth(bundle_id, cancellation)
+        .await
+        .map_err(|_| "cancel-oauth")?;
+    validate_cancellation_outcome(outcome, expected_reason)
+}
+
+fn validate_cancellation_outcome(
+    outcome: OAuthFlowOutcome,
+    expected_reason: OAuthCancellationReason,
+) -> UatResult<()> {
+    match outcome {
+        OAuthFlowOutcome::Terminated { reason, status }
+            if reason == expected_reason
+                && matches!(
+                    status,
+                    OAuthStatus::Unauthorized | OAuthStatus::Authorized { .. }
+                ) =>
+        {
+            Ok(())
+        }
+        _ => Err("cancel-oauth-outcome"),
+    }
 }
 
 async fn resume() -> UatResult<()> {
@@ -358,13 +401,10 @@ async fn callback_response(
                 "Authorization received. You may close this window.",
             )
         }
-        Some(Err(stage)) => {
-            let _ = callback_tx.send(Err(stage));
-            (
-                StatusCode::BAD_REQUEST,
-                "Authorization was not completed. Return to the terminal.",
-            )
-        }
+        Some(Err(_)) => (
+            StatusCode::BAD_REQUEST,
+            "Authorization callback was malformed. Return to the authorization page.",
+        ),
         None => (
             StatusCode::BAD_REQUEST,
             "Authorization callback was invalid. Return to the terminal.",
@@ -391,6 +431,7 @@ fn parse_callback<B>(
     let mut issuer = None;
     let mut error_description_seen = false;
     let mut duplicate = false;
+    let mut empty_protocol_value = false;
     for (key, value) in callback_url.query_pairs() {
         let slot = match key.as_ref() {
             "state" => &mut state,
@@ -404,7 +445,9 @@ fn parse_callback<B>(
             }
             _ => continue,
         };
-        if slot.replace(value.into_owned()).is_some() {
+        let value = value.into_owned();
+        empty_protocol_value |= value.is_empty();
+        if slot.replace(value).is_some() {
             duplicate = true;
         }
     }
@@ -412,7 +455,7 @@ fn parse_callback<B>(
     if state != expected_state {
         return None;
     }
-    if duplicate || (code.is_some() && error.is_some()) {
+    if duplicate || empty_protocol_value || (code.is_some() && error.is_some()) {
         return Some(Err("callback-invalid"));
     }
     match (code, error) {
@@ -427,7 +470,7 @@ fn parse_callback<B>(
             reason: if error == "access_denied" {
                 OAuthCancellationReason::AccessDenied
             } else {
-                OAuthCancellationReason::Cancelled
+                OAuthCancellationReason::AuthorizationError
             },
         }))),
         (Some(_), Some(_)) => Some(Err("callback-invalid")),
@@ -538,6 +581,29 @@ mod tests {
         assert!(missing_code.starts_with("HTTP/1.1 400"));
         assert!(!receiver.is_finished());
 
+        for malformed in [
+            "/callback?code=&state=secret-state",
+            "/callback?error=&state=secret-state",
+            "/callback?code=value&state=secret-state&iss=",
+        ] {
+            let response = send_request(port, malformed).await;
+            assert!(response.starts_with("HTTP/1.1 400"));
+            assert!(!receiver.is_finished());
+        }
+
+        let duplicate =
+            send_request(port, "/callback?code=first&code=second&state=secret-state").await;
+        assert!(duplicate.starts_with("HTTP/1.1 400"));
+        assert!(!receiver.is_finished());
+
+        let conflicting = send_request(
+            port,
+            "/callback?code=wrong-code&error=access_denied&state=secret-state",
+        )
+        .await;
+        assert!(conflicting.starts_with("HTTP/1.1 400"));
+        assert!(!receiver.is_finished());
+
         let callback_response =
             send_request(port, "/callback?code=secret-code&state=secret-state").await;
         assert!(callback_response.starts_with("HTTP/1.1 200"));
@@ -564,6 +630,20 @@ mod tests {
         assert_eq!(cancellation.reason, OAuthCancellationReason::AccessDenied);
         assert_eq!(cancellation.state, "secret");
 
+        let provider_error = Request::builder()
+            .uri("/callback?error=temporarily_unavailable&error_description=sensitive&state=secret")
+            .body(())
+            .unwrap();
+        let Some(Ok(CallbackEvent::Cancel(cancellation))) =
+            parse_callback(&provider_error, "secret")
+        else {
+            panic!("provider errors must produce a structured cancellation");
+        };
+        assert_eq!(
+            cancellation.reason,
+            OAuthCancellationReason::AuthorizationError
+        );
+
         let wrong_state = Request::builder()
             .uri("/callback?code=secret-code&state=wrong")
             .body(())
@@ -574,6 +654,9 @@ mod tests {
     #[test]
     fn callback_rejects_duplicate_or_conflicting_protocol_parameters() {
         for uri in [
+            "/callback?code=&state=secret",
+            "/callback?error=&state=secret",
+            "/callback?code=value&state=secret&iss=",
             "/callback?code=first&code=second&state=secret",
             "/callback?code=value&state=secret&state=secret",
             "/callback?code=value&error=access_denied&state=secret",
@@ -614,6 +697,72 @@ mod tests {
         assert_ne!(
             command.get_program().to_string_lossy().to_ascii_lowercase(),
             "cmd.exe"
+        );
+    }
+
+    #[test]
+    fn cancellation_outcome_requires_matching_terminated_reason_and_final_status() {
+        assert!(validate_cancellation_outcome(
+            OAuthFlowOutcome::Terminated {
+                reason: OAuthCancellationReason::Timeout,
+                status: OAuthStatus::Unauthorized,
+            },
+            OAuthCancellationReason::Timeout,
+        )
+        .is_ok());
+        assert!(validate_cancellation_outcome(
+            OAuthFlowOutcome::Terminated {
+                reason: OAuthCancellationReason::Cancelled,
+                status: OAuthStatus::Authorized {
+                    scopes: vec!["read".to_string()],
+                },
+            },
+            OAuthCancellationReason::Cancelled,
+        )
+        .is_ok());
+        assert!(validate_cancellation_outcome(
+            OAuthFlowOutcome::Terminated {
+                reason: OAuthCancellationReason::AccessDenied,
+                status: OAuthStatus::Unauthorized,
+            },
+            OAuthCancellationReason::Timeout,
+        )
+        .is_err());
+        assert!(validate_cancellation_outcome(
+            OAuthFlowOutcome::Terminated {
+                reason: OAuthCancellationReason::Timeout,
+                status: OAuthStatus::AuthorizationPending,
+            },
+            OAuthCancellationReason::Timeout,
+        )
+        .is_err());
+        assert!(validate_cancellation_outcome(
+            OAuthFlowOutcome::Authorized {
+                scopes: vec!["read".to_string()],
+            },
+            OAuthCancellationReason::Timeout,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn authorization_outcome_requires_authorized_with_granted_scopes() {
+        assert!(
+            validate_authorization_outcome(OAuthFlowOutcome::Authorized {
+                scopes: vec!["read:me".to_string()],
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_authorization_outcome(OAuthFlowOutcome::Authorized { scopes: Vec::new() })
+                .is_err()
+        );
+        assert!(
+            validate_authorization_outcome(OAuthFlowOutcome::Terminated {
+                reason: OAuthCancellationReason::Cancelled,
+                status: OAuthStatus::Unauthorized,
+            })
+            .is_err()
         );
     }
 }

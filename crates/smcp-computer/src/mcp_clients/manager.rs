@@ -17,7 +17,7 @@ use crate::errors::ComputerError;
 use crate::inputs::SecretValueResolver;
 use crate::oauth::{
     InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
-    OAuthCredentialStore, OAuthError, OAuthLaunch, OAuthStatus,
+    OAuthCredentialStore, OAuthError, OAuthFlowOutcome, OAuthLaunch, OAuthStatus,
 };
 use crate::skills::{McpResource, SkillResourceManager, SkillStagingError};
 use serde_json::Value;
@@ -1992,24 +1992,24 @@ impl MCPServerManager {
         client.begin_oauth(request).await
     }
 
-    /// Complete an authorization callback previously started by [`Self::begin_oauth`].
+    /// Complete an authorization callback and return its structured outcome.
     pub async fn complete_oauth(
         &self,
         bundle_id: &BundleId,
         callback: OAuthCallback,
-    ) -> Result<(), OAuthError> {
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
         let client = self.oauth_client_for(bundle_id).await?;
         client.complete_oauth(callback).await
     }
 
-    /// Cancel a pending browser flow and delete its PKCE/CSRF state.
+    /// Terminate a pending browser flow, delete its PKCE/CSRF state, and return the resulting status.
     pub async fn cancel_oauth(
         &self,
         bundle_id: &BundleId,
         cancellation: OAuthCancellation,
-    ) -> Result<(), OAuthError> {
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
         let client = self.oauth_client_for(bundle_id).await?;

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing_subscriber::fmt::MakeWriter;
 
 use smcp_computer::computer::{Computer, SilentSession};
@@ -34,7 +34,7 @@ use smcp_computer::oauth::{
     InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
     OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialKey,
     OAuthCredentialRecordKind, OAuthCredentialStore, OAuthCredentialStoreError, OAuthError,
-    OAuthOptions, OAuthStatus,
+    OAuthFlowOutcome, OAuthOptions, OAuthStatus,
 };
 use tempfile::TempDir;
 
@@ -131,6 +131,40 @@ impl OAuthCredentialStore for RecordingOAuthCredentialStore {
             .push(CredentialStoreOperation::Delete(key.clone()));
         self.entries.lock().await.remove(key);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DelayedLoadOAuthCredentialStore {
+    inner: InMemoryOAuthCredentialStore,
+    delay_next_load: AtomicBool,
+    load_started: Notify,
+    release_load: Notify,
+}
+
+#[async_trait]
+impl OAuthCredentialStore for DelayedLoadOAuthCredentialStore {
+    async fn load(
+        &self,
+        key: &OAuthCredentialKey,
+    ) -> Result<Option<String>, OAuthCredentialStoreError> {
+        if self.delay_next_load.swap(false, Ordering::SeqCst) {
+            self.load_started.notify_one();
+            self.release_load.notified().await;
+        }
+        self.inner.load(key).await
+    }
+
+    async fn save(
+        &self,
+        key: &OAuthCredentialKey,
+        value: &str,
+    ) -> Result<(), OAuthCredentialStoreError> {
+        self.inner.save(key, value).await
+    }
+
+    async fn delete(&self, key: &OAuthCredentialKey) -> Result<(), OAuthCredentialStoreError> {
+        self.inner.delete(key).await
     }
 }
 
@@ -361,6 +395,7 @@ struct OAuthMockState {
     mode: OAuthFixtureMode,
     mcp_response_sse: bool,
     token_expires_in: u64,
+    token_response_delay_ms: AtomicU64,
     total_requests: AtomicUsize,
     token_requests: AtomicUsize,
     registration_requests: AtomicUsize,
@@ -461,6 +496,7 @@ async fn oauth_http_mock_handler(
                     "token_endpoint_auth_methods_supported": token_auth_methods,
                     "code_challenge_methods_supported": ["S256"],
                     "client_id_metadata_document_supported": true,
+                    "authorization_response_iss_parameter_supported": true,
                 })
                 .to_string(),
             ))
@@ -562,6 +598,10 @@ async fn oauth_http_mock_handler(
         }
         state.token_forms.lock().await.push(form.clone());
         let request_index = state.token_requests.fetch_add(1, Ordering::SeqCst);
+        let token_response_delay_ms = state.token_response_delay_ms.load(Ordering::SeqCst);
+        if token_response_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(token_response_delay_ms)).await;
+        }
         let granted_scope = form.get("scope").cloned().unwrap_or_else(|| {
             if !matches!(
                 state.mode,
@@ -719,6 +759,7 @@ async fn spawn_oauth_http_mock_with_options(
         mode,
         mcp_response_sse,
         token_expires_in,
+        token_response_delay_ms: AtomicU64::new(0),
         total_requests: AtomicUsize::new(0),
         token_requests: AtomicUsize::new(0),
         registration_requests: AtomicUsize::new(0),
@@ -1685,10 +1726,14 @@ async fn test_cloud_flow_driver_routes_callback_privately_to_original_cli() {
     assert_eq!(delivery.tenant, TARGET_TENANT);
     assert_eq!(delivery.computer_id, TARGET_COMPUTER);
     assert_eq!(delivery.bundle_id, bundle_id);
-    manager
+    let outcome = manager
         .complete_oauth(&delivery.bundle_id, delivery.callback)
         .await
         .unwrap();
+    let OAuthFlowOutcome::Authorized { scopes } = outcome else {
+        panic!("successful cloud callback must authorize the flow");
+    };
+    assert!(scopes.iter().any(|scope| scope == "tools.read"));
     assert!(matches!(
         manager.oauth_status(&bundle_id).await.unwrap(),
         OAuthStatus::Authorized { .. }
@@ -1720,8 +1765,18 @@ async fn test_cloud_flow_driver_routes_callback_privately_to_original_cli() {
         "initialize, tools/list, and tools/call must cross the real HTTP boundary"
     );
 
+    let expired_launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: CALLBACK_URI.to_string(),
+                required_scope: Some("tools.write".to_string()),
+            },
+        )
+        .await
+        .unwrap();
     host.register_route(
-        "expired-state".to_string(),
+        expired_launch.state.clone(),
         CallbackRoute {
             tenant: TARGET_TENANT.to_string(),
             cli_session: TARGET_CLI.to_string(),
@@ -1735,7 +1790,7 @@ async fn test_cloud_flow_driver_routes_callback_privately_to_original_cli() {
         host.route_callback(
             GatewayCallback {
                 code: "expired-code".to_string(),
-                state: "expired-state".to_string(),
+                state: expired_launch.state.clone(),
                 issuer: Some(mock_state.base_url.clone()),
                 untrusted_business_ids: HashMap::new(),
             },
@@ -1744,11 +1799,43 @@ async fn test_cloud_flow_driver_routes_callback_privately_to_original_cli() {
         Err("expired-state")
     ));
     assert!(host.take_cli_callback(TARGET_CLI).is_none());
+    let timeout_outcome = manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: expired_launch.state.clone(),
+                issuer: Some(mock_state.base_url.clone()),
+                reason: OAuthCancellationReason::Timeout,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout_outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            status: OAuthStatus::Authorized { .. },
+        }
+    ));
+    assert!(matches!(
+        manager
+            .complete_oauth(
+                &bundle_id,
+                OAuthCallback {
+                    code: "expired-code".to_string(),
+                    state: expired_launch.state,
+                    issuer: Some(mock_state.base_url.clone()),
+                },
+            )
+            .await,
+        Err(OAuthError::StateMismatch)
+    ));
     manager.close().await.unwrap();
 
     let logs = captured_logs.text();
     for sensitive in [
         AUTHORIZATION_CODE,
+        "expired-code",
         launch.state.as_str(),
         "oauth-e2e-token",
         "attacker-tenant",
@@ -2017,7 +2104,61 @@ async fn test_authorization_code_cancellation_validates_callback_and_cleans_pend
         OAuthStatus::AuthorizationPending
     );
 
-    manager
+    assert!(matches!(
+        manager
+            .complete_oauth(
+                &bundle_id,
+                OAuthCallback {
+                    code: "authorization-code".to_string(),
+                    state: launch.state.clone(),
+                    issuer: Some("not-an-issuer".to_string()),
+                },
+            )
+            .await,
+        Err(OAuthError::IssuerMismatch)
+    ));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::AuthorizationPending
+    );
+
+    assert!(matches!(
+        manager
+            .cancel_oauth(
+                &bundle_id,
+                OAuthCancellation {
+                    state: launch.state.clone(),
+                    issuer: None,
+                    reason: OAuthCancellationReason::AccessDenied,
+                },
+            )
+            .await,
+        Err(OAuthError::IssuerMismatch)
+    ));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::AuthorizationPending
+    );
+
+    assert!(matches!(
+        manager
+            .complete_oauth(
+                &bundle_id,
+                OAuthCallback {
+                    code: "authorization-code".to_string(),
+                    state: launch.state.clone(),
+                    issuer: Some(format!("{}/", state.base_url)),
+                },
+            )
+            .await,
+        Err(OAuthError::IssuerMismatch)
+    ));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::AuthorizationPending
+    );
+
+    let outcome = manager
         .cancel_oauth(
             &bundle_id,
             OAuthCancellation {
@@ -2029,8 +2170,11 @@ async fn test_authorization_code_cancellation_validates_callback_and_cleans_pend
         .await
         .unwrap();
     assert_eq!(
-        manager.oauth_status(&bundle_id).await.unwrap(),
-        OAuthStatus::Unauthorized
+        outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::AccessDenied,
+            status: OAuthStatus::Unauthorized,
+        }
     );
 
     let replacement = manager
@@ -2043,7 +2187,24 @@ async fn test_authorization_code_cancellation_validates_callback_and_cleans_pend
         )
         .await
         .expect("cancellation must remove the old pending flow");
-    manager
+    assert!(matches!(
+        manager
+            .cancel_oauth(
+                &bundle_id,
+                OAuthCancellation {
+                    state: replacement.state.clone(),
+                    issuer: Some("https://wrong-issuer.example".to_string()),
+                    reason: OAuthCancellationReason::Timeout,
+                },
+            )
+            .await,
+        Err(OAuthError::IssuerMismatch)
+    ));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::AuthorizationPending
+    );
+    let timeout_outcome = manager
         .cancel_oauth(
             &bundle_id,
             OAuthCancellation {
@@ -2054,7 +2215,254 @@ async fn test_authorization_code_cancellation_validates_callback_and_cleans_pend
         )
         .await
         .unwrap();
+    assert_eq!(
+        timeout_outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            status: OAuthStatus::Unauthorized,
+        }
+    );
     manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_required_callback_issuer_failure_does_not_consume_pending_flow() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager
+            .complete_oauth(
+                &bundle_id,
+                OAuthCallback {
+                    code: "authorization-code".to_string(),
+                    state: launch.state.clone(),
+                    issuer: None,
+                },
+            )
+            .await,
+        Err(OAuthError::IssuerMismatch)
+    ));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::AuthorizationPending
+    );
+
+    let outcome = manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let OAuthFlowOutcome::Authorized { scopes } = outcome else {
+        panic!("corrected callback must complete the pending authorization");
+    };
+    assert!(scopes.iter().any(|scope| scope == "tools.read"));
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_aborted_complete_oauth_still_reaches_a_terminal_authorized_status() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    state.token_response_delay_ms.store(250, Ordering::SeqCst);
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let manager = Arc::new(manager);
+    let task_manager = Arc::clone(&manager);
+    let task_bundle = bundle_id.clone();
+    let issuer = state.base_url.clone();
+    let complete_task = tokio::spawn(async move {
+        task_manager
+            .complete_oauth(
+                &task_bundle,
+                OAuthCallback {
+                    code: "authorization-code".to_string(),
+                    state: launch.state,
+                    issuer: Some(issuer),
+                },
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.token_requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("token exchange must start before aborting the caller");
+    complete_task.abort();
+    assert!(complete_task.await.unwrap_err().is_cancelled());
+
+    let status = tokio::time::timeout(Duration::from_secs(2), manager.oauth_status(&bundle_id))
+        .await
+        .expect("detached terminal task must release the lifecycle gate")
+        .unwrap();
+    assert!(matches!(status, OAuthStatus::Authorized { .. }));
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_aborted_cancel_oauth_still_reaches_a_terminal_unauthorized_status() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let delayed_store = Arc::new(DelayedLoadOAuthCredentialStore::default());
+    let store: Arc<dyn OAuthCredentialStore> = delayed_store.clone();
+    let bundle_id = BundleId::try_from("oauth-aborted-cancellation").unwrap();
+    let manager =
+        configure_authorization_code_manager(&state.base_url, bundle_id.clone(), store).await;
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    delayed_store.delay_next_load.store(true, Ordering::SeqCst);
+    let manager = Arc::new(manager);
+    let task_manager = Arc::clone(&manager);
+    let task_bundle = bundle_id.clone();
+    let cancel_task = tokio::spawn(async move {
+        task_manager
+            .cancel_oauth(
+                &task_bundle,
+                OAuthCancellation {
+                    state: launch.state,
+                    issuer: None,
+                    reason: OAuthCancellationReason::Timeout,
+                },
+            )
+            .await
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        delayed_store.load_started.notified(),
+    )
+    .await
+    .expect("credential restoration must start before aborting the caller");
+    cancel_task.abort();
+    assert!(cancel_task.await.unwrap_err().is_cancelled());
+    delayed_store.release_load.notify_one();
+
+    let status = tokio::time::timeout(Duration::from_secs(2), manager.oauth_status(&bundle_id))
+        .await
+        .expect("detached terminal task must release the lifecycle gate")
+        .unwrap();
+    assert_eq!(status, OAuthStatus::Unauthorized);
+
+    let replacement = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .expect("terminal cancellation must not leave an active pending flow");
+    manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: replacement.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_abandoned_callback_is_rejected_by_replacement_coordinator() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(InMemoryOAuthCredentialStore::default());
+    let bundle_id = BundleId::try_from("oauth-replacement-coordinator").unwrap();
+    let first = configure_authorization_code_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    let abandoned = first
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    first.close().await.unwrap();
+    drop(first);
+
+    let replacement =
+        configure_authorization_code_manager(&state.base_url, bundle_id.clone(), store).await;
+    assert!(matches!(
+        replacement
+            .complete_oauth(
+                &bundle_id,
+                OAuthCallback {
+                    code: "abandoned-code".to_string(),
+                    state: abandoned.state.clone(),
+                    issuer: Some(state.base_url.clone()),
+                },
+            )
+            .await,
+        Err(OAuthError::StateMismatch)
+    ));
+    let fresh = replacement
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(fresh.state, abandoned.state);
+    replacement
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: fresh.state,
+                issuer: Some(state.base_url.clone()),
+                reason: OAuthCancellationReason::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    replacement.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -10,6 +10,9 @@ All notable changes to this project will be documented in this file.
   to exactly `rmcp 2.2.0`. Downstream code must use the rmcp 2.2 resource/content
   layouts; removed legacy aliases such as `RawContent` and `RawTextContent` are no
   longer re-exported.
+- *(computer)* #160 changes interactive `complete_oauth` and `cancel_oauth` to return
+  `OAuthFlowOutcome`. Expired and issuer-mismatched callbacks now use dedicated
+  `OAuthError` variants instead of a generic protocol error.
 - *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
 
 ### Features
@@ -24,6 +27,9 @@ All notable changes to this project will be documented in this file.
   issuer, client mode, client identity, and configured scopes. The SDK default is
   process-local memory and never probes an OS credential vault; hosts that need
   cross-process resume must inject an `OAuthCredentialStore`.
+- *(computer)* #160 defines one browser/callback host contract for local loopback and
+  headless HTTPS Gateway flow drivers, with structured completion/termination outcomes,
+  one-time opaque-state routing, deterministic expiry, and rustdoc-integrated guidance.
 
 ### Migration Notes
 
@@ -32,7 +38,9 @@ All notable changes to this project will be documented in this file.
   `Authorization` header.
 - The embedding Desktop/CLI must open `OAuthLaunch.authorization_url`, receive the
   loopback/HTTPS callback, and pass its `code`, `state`, and optional `issuer` to
-  `complete_oauth`. The SDK does not open a browser or bind a callback listener.
+  `complete_oauth`. Map `access_denied` and other OAuth errors to the corresponding
+  `OAuthCancellationReason` and call `cancel_oauth`; neither method returns `()`.
+  The SDK does not open a browser or bind a callback listener.
 - Persistent OAuth is now host policy: Desktop applications may inject a Keychain-backed
   `OAuthCredentialStore`, while multi-tenant services should bind their injected store to
   tenant/principal runtime context. Without injection, credentials are lost on process exit.

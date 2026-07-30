@@ -33,7 +33,11 @@ Desktop hosts may implement the trait with an OS Keychain backend. Cloud hosts s
 tenant/principal context when constructing a DB/Vault-backed store. The injected backend must
 encrypt values at rest and must not log them. Client secrets and private keys remain
 `SecretValueResolver` inputs; pending PKCE state and callback routing are separate from credential
-storage. See [the OAuth architecture and host integration guide](../../docs/computer/rmcp-oauth-decision.md).
+storage. See [the OAuth architecture decision][oauth-architecture].
+For browser/callback ownership, failure mapping, and local/cloud flow-driver requirements, follow
+the normative [OAuth host integration contract](docs/oauth-host-integration.md).
+
+[oauth-architecture]: https://github.com/A2C-SMCP/rust-sdk/blob/main/docs/computer/rmcp-oauth-decision.md
 
 ## 架构设计 / Architecture
 

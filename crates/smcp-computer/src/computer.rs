@@ -3489,11 +3489,14 @@ impl<S: Session> Computer<S> {
     }
 
     /// Complete the browser callback without starting an SDK-owned listener.
+    ///
+    /// The returned outcome contains the granted scopes. Expired, mismatched-state, and
+    /// mismatched-issuer callbacks remain typed [`crate::oauth::OAuthError`] values.
     pub async fn complete_oauth(
         &self,
         bundle_id: &BundleId,
         callback: crate::oauth::OAuthCallback,
-    ) -> Result<(), crate::oauth::OAuthError> {
+    ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
         let manager = self.mcp_manager.read().await;
         let manager = manager
             .as_ref()
@@ -3501,12 +3504,12 @@ impl<S: Session> Computer<S> {
         manager.complete_oauth(bundle_id, callback).await
     }
 
-    /// Cancel a pending browser flow and delete its PKCE/CSRF state.
+    /// Cancel a pending browser flow, delete its PKCE/CSRF state, and return the resulting status.
     pub async fn cancel_oauth(
         &self,
         bundle_id: &BundleId,
         cancellation: crate::oauth::OAuthCancellation,
-    ) -> Result<(), crate::oauth::OAuthError> {
+    ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
         let manager = self.mcp_manager.read().await;
         let manager = manager
             .as_ref()

@@ -5,6 +5,7 @@
 - 结论：**Go（分阶段）**
 - 当前实施目标：升级到精确锁定的 `rmcp = 2.2.0`，实现面向 MCP `2025-11-25` 的完整 OAuth 客户端能力
 - 暂不进入生产默认路径：`rmcp = 3.0.0-beta.2` 与 MCP `2026-07-28` 完整协议生命周期
+- 规范性宿主契约：[Computer OAuth host integration contract](../../crates/smcp-computer/docs/oauth-host-integration.md)
 
 ## 1. 决策摘要
 
@@ -389,13 +390,13 @@ impl<S: Session> Computer<S> {
         &self,
         bundle_id: &BundleId,
         callback: OAuthCallback,
-    ) -> Result<(), OAuthError>;
+    ) -> Result<OAuthFlowOutcome, OAuthError>;
 
     pub async fn cancel_oauth(
         &self,
         bundle_id: &BundleId,
         cancellation: OAuthCancellation,
-    ) -> Result<(), OAuthError>;
+    ) -> Result<OAuthFlowOutcome, OAuthError>;
 
     pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), OAuthError>;
 }
@@ -406,6 +407,12 @@ impl<S: Session> Computer<S> {
 - `connect()` 可恢复 token 并自动刷新；
 - 首次需要用户参与时，返回 typed `AuthorizationRequired`；
 - `begin_oauth()` 是 SDK 主动触发协议流程的入口；
+- `complete_oauth()` 成功返回 `OAuthFlowOutcome::Authorized`；
+- `cancel_oauth()` 返回带规范化原因及最终 `OAuthStatus` 的
+  `OAuthFlowOutcome::Terminated`；
+- 过期、state mismatch 与 issuer mismatch 分别返回
+  `OAuthError::AuthorizationExpired`、`OAuthError::StateMismatch` 和
+  `OAuthError::IssuerMismatch`；
 - SDK 不调用 `open`、浏览器或 GUI API；
 - Desktop/CLI 收到 `OAuthLaunch` 后负责用户交互；
 - callback URL 必须同时校验 `state` 与可用的 `iss`。
