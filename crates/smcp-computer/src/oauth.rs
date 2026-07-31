@@ -3,6 +3,7 @@
 use crate::inputs::SecretValueResolver;
 use crate::mcp_clients::bundle_id::BundleId;
 use crate::mcp_clients::model::{MCPServerInput, PromptStringInput};
+use crate::weak_registry::WeakRegistry;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -22,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex, OwnedRwLockReadGuard, RwLock};
@@ -167,7 +168,12 @@ struct OAuthResourceLifecycle {
 }
 
 type OAuthLifecycleKey = (usize, BundleId, String, String);
-type OAuthLifecycleRegistry = StdMutex<HashMap<OAuthLifecycleKey, Weak<OAuthResourceLifecycle>>>;
+type OAuthLifecycleRegistry = WeakRegistry<OAuthLifecycleKey, OAuthResourceLifecycle>;
+static OAUTH_RESOURCE_LIFECYCLES: OnceLock<OAuthLifecycleRegistry> = OnceLock::new();
+
+fn oauth_lifecycle_registry() -> &'static OAuthLifecycleRegistry {
+    OAUTH_RESOURCE_LIFECYCLES.get_or_init(WeakRegistry::default)
+}
 
 /// Process-local PKCE/CSRF state with deterministic expiry and explicit deletion.
 ///
@@ -276,11 +282,6 @@ fn oauth_resource_lifecycle(
     resource: &str,
     mode_fingerprint: &str,
 ) -> Arc<OAuthResourceLifecycle> {
-    static LIFECYCLES: OnceLock<OAuthLifecycleRegistry> = OnceLock::new();
-    let mut lifecycles = LIFECYCLES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .expect("OAuth lifecycle registry poisoned");
     let store_identity = Arc::as_ptr(credential_store) as *const () as usize;
     let slot = (
         store_identity,
@@ -288,15 +289,10 @@ fn oauth_resource_lifecycle(
         resource.to_string(),
         mode_fingerprint.to_string(),
     );
-    if let Some(lifecycle) = lifecycles.get(&slot).and_then(Weak::upgrade) {
-        return lifecycle;
-    }
-    let lifecycle = Arc::new(OAuthResourceLifecycle {
+    oauth_lifecycle_registry().get_or_insert_with(slot, || OAuthResourceLifecycle {
         generation: AtomicU64::new(0),
         request_gate: Arc::new(RwLock::new(())),
-    });
-    lifecycles.insert(slot, Arc::downgrade(&lifecycle));
-    lifecycle
+    })
 }
 
 /// OAuth HTTP adapter that cleans up a session accidentally created by rmcp's
@@ -812,6 +808,85 @@ pub enum OAuthFlowOutcome {
     },
 }
 
+/// Stable, non-sensitive category for failures reported by the underlying OAuth protocol stack.
+///
+/// Provider response bodies, URLs, tokens, client identifiers, and upstream error strings are
+/// intentionally discarded at the rmcp boundary. Hosts can use this category for control flow and
+/// diagnostics without accidentally exposing authorization-server data through `Display`,
+/// `Debug`, or an error source chain.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OAuthProtocolError {
+    #[error("OAuth authorization is required")]
+    AuthorizationRequired,
+    #[error("OAuth authorization failed")]
+    AuthorizationFailed,
+    #[error("OAuth token exchange failed")]
+    TokenExchangeFailed,
+    #[error("OAuth token refresh failed")]
+    TokenRefreshFailed,
+    #[error("OAuth HTTP request failed")]
+    Http,
+    #[error("OAuth provider rejected the request")]
+    Provider,
+    #[error("OAuth metadata validation failed")]
+    Metadata,
+    #[error("OAuth authorization server does not support PKCE S256")]
+    PkceUnsupported,
+    #[error("OAuth URL is invalid")]
+    InvalidUrl,
+    #[error("OAuth authorization is not supported by the server")]
+    NoAuthorizationSupport,
+    #[error("OAuth internal operation failed")]
+    Internal,
+    #[error("OAuth token type is invalid")]
+    InvalidTokenType,
+    #[error("OAuth token has expired")]
+    TokenExpired,
+    #[error("OAuth scope is invalid")]
+    InvalidScope,
+    #[error("OAuth client registration failed")]
+    RegistrationFailed,
+    #[error("OAuth authorization has insufficient scope")]
+    InsufficientScope,
+    #[error("OAuth authorization server issuer validation failed")]
+    IssuerMismatch,
+    #[error("OAuth client credentials exchange failed")]
+    ClientCredentials,
+    #[error("OAuth JWT signing failed")]
+    JwtSigning,
+    #[error("OAuth protocol operation failed")]
+    Other,
+}
+
+impl From<RmcpAuthError> for OAuthProtocolError {
+    fn from(error: RmcpAuthError) -> Self {
+        match error {
+            RmcpAuthError::AuthorizationRequired => Self::AuthorizationRequired,
+            RmcpAuthError::AuthorizationFailed(_) => Self::AuthorizationFailed,
+            RmcpAuthError::TokenExchangeFailed(_) => Self::TokenExchangeFailed,
+            RmcpAuthError::TokenRefreshFailed(_) => Self::TokenRefreshFailed,
+            RmcpAuthError::HttpError(_) => Self::Http,
+            RmcpAuthError::OAuthError(_) => Self::Provider,
+            RmcpAuthError::MetadataError(_) => Self::Metadata,
+            RmcpAuthError::PkceUnsupported => Self::PkceUnsupported,
+            RmcpAuthError::UrlError(_) => Self::InvalidUrl,
+            RmcpAuthError::NoAuthorizationSupport => Self::NoAuthorizationSupport,
+            RmcpAuthError::InternalError(_) => Self::Internal,
+            RmcpAuthError::InvalidTokenType(_) => Self::InvalidTokenType,
+            RmcpAuthError::TokenExpired => Self::TokenExpired,
+            RmcpAuthError::InvalidScope(_) => Self::InvalidScope,
+            RmcpAuthError::RegistrationFailed(_) => Self::RegistrationFailed,
+            RmcpAuthError::InsufficientScope { .. } => Self::InsufficientScope,
+            RmcpAuthError::AuthorizationServerMismatch { .. }
+            | RmcpAuthError::AuthorizationServerMissingIssuer { .. } => Self::IssuerMismatch,
+            RmcpAuthError::ClientCredentialsError(_) => Self::ClientCredentials,
+            RmcpAuthError::JwtSigningError(_) => Self::JwtSigning,
+            _ => Self::Other,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum OAuthError {
     #[error("server does not have OAuth configured")]
@@ -832,8 +907,16 @@ pub enum OAuthError {
     UnsupportedSigningAlgorithm(String),
     #[error("invalid OAuth redirect URI: {0}")]
     InvalidRedirectUri(String),
+    #[error("OAuth cannot be combined with a static Authorization header")]
+    ConflictingAuthorizationHeader,
     #[error("OAuth protocol error: {0}")]
-    Protocol(#[from] RmcpAuthError),
+    Protocol(#[from] OAuthProtocolError),
+}
+
+impl From<RmcpAuthError> for OAuthError {
+    fn from(error: RmcpAuthError) -> Self {
+        Self::Protocol(error.into())
+    }
 }
 
 struct PendingAuthorization {
@@ -1413,16 +1496,8 @@ impl OAuthCoordinator {
             config,
         )
         .await
-        .map_err(|_| {
-            OAuthError::Protocol(RmcpAuthError::InternalError(
-                "OAuth client credentials task failed".to_string(),
-            ))
-        })?
-        .map_err(|_| {
-            OAuthError::Protocol(RmcpAuthError::InternalError(
-                "OAuth client credentials exchange failed".to_string(),
-            ))
-        })?;
+        .map_err(|_| OAuthError::Protocol(OAuthProtocolError::Internal))?
+        .map_err(|_| OAuthError::Protocol(OAuthProtocolError::ClientCredentials))?;
         let mut scopes = manager.get_current_scopes().await;
         if scopes.is_empty() {
             scopes = requested_scopes;
@@ -1521,11 +1596,7 @@ impl OAuthCoordinator {
                         &scopes,
                     )
                     .await
-                    .map_err(|_| {
-                        OAuthError::Protocol(RmcpAuthError::RegistrationFailed(
-                            "dynamic client registration failed".to_string(),
-                        ))
-                    })?;
+                    .map_err(|_| OAuthError::Protocol(OAuthProtocolError::RegistrationFailed))?;
             }
             OAuthClientRegistration::Preregistered {
                 client_id,
@@ -1543,10 +1614,7 @@ impl OAuthCoordinator {
                     url.scheme() == "https" && url.host_str().is_some() && url.path() != "/"
                 });
                 if !valid_url {
-                    return Err(OAuthError::Protocol(RmcpAuthError::RegistrationFailed(
-                        "client metadata document must be an HTTPS URL with a non-root path"
-                            .to_string(),
-                    )));
+                    return Err(OAuthError::Protocol(OAuthProtocolError::RegistrationFailed));
                 }
                 let supported = metadata
                     .additional_fields
@@ -1554,10 +1622,7 @@ impl OAuthCoordinator {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if !supported {
-                    return Err(OAuthError::Protocol(RmcpAuthError::RegistrationFailed(
-                        "authorization server does not support client metadata documents"
-                            .to_string(),
-                    )));
+                    return Err(OAuthError::Protocol(OAuthProtocolError::RegistrationFailed));
                 }
                 manager.configure_client(
                     OAuthClientConfig::new(url, &request.redirect_uri)
@@ -1590,11 +1655,7 @@ impl OAuthCoordinator {
                     .find(|(key, _)| key == "state")
                     .map(|(_, value)| value.into_owned())
             })
-            .ok_or_else(|| {
-                OAuthError::Protocol(RmcpAuthError::InternalError(
-                    "authorization URL did not contain state".to_string(),
-                ))
-            })?;
+            .ok_or(OAuthError::Protocol(OAuthProtocolError::Internal))?;
         let launch = OAuthLaunch {
             authorization_url,
             state,
@@ -1761,11 +1822,9 @@ impl OAuthCoordinator {
             *authorization_flow.lock().await = AuthorizationFlowState::Idle;
             let _ = result_tx.send(result);
         });
-        result_rx.await.map_err(|_| {
-            OAuthError::Protocol(RmcpAuthError::InternalError(
-                "OAuth completion task terminated unexpectedly".to_string(),
-            ))
-        })?
+        result_rx
+            .await
+            .map_err(|_| OAuthError::Protocol(OAuthProtocolError::Internal))?
     }
 
     pub(crate) async fn cancel(
@@ -1834,11 +1893,9 @@ impl OAuthCoordinator {
             *authorization_flow.lock().await = AuthorizationFlowState::Idle;
             let _ = result_tx.send(result);
         });
-        result_rx.await.map_err(|_| {
-            OAuthError::Protocol(RmcpAuthError::InternalError(
-                "OAuth cancellation task terminated unexpectedly".to_string(),
-            ))
-        })?
+        result_rx
+            .await
+            .map_err(|_| OAuthError::Protocol(OAuthProtocolError::Internal))?
     }
 
     pub(crate) async fn clear(&self) -> Result<(), OAuthError> {
@@ -2017,16 +2074,11 @@ fn is_loopback_host(url: &Url) -> bool {
     })
 }
 
-fn validate_secure_url(value: &str, label: &str) -> Result<Url, OAuthError> {
-    let url = Url::parse(value).map_err(|_| {
-        OAuthError::Protocol(RmcpAuthError::InternalError(format!(
-            "{label} URL is invalid"
-        )))
-    })?;
+fn validate_secure_url(value: &str, _label: &str) -> Result<Url, OAuthError> {
+    let url =
+        Url::parse(value).map_err(|_| OAuthError::Protocol(OAuthProtocolError::InvalidUrl))?;
     if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback_host(&url)) {
-        return Err(OAuthError::Protocol(RmcpAuthError::InternalError(format!(
-            "{label} must use HTTPS (loopback HTTP is allowed for local development)"
-        ))));
+        return Err(OAuthError::Protocol(OAuthProtocolError::InvalidUrl));
     }
     Ok(url)
 }
@@ -2101,7 +2153,7 @@ fn validate_authorization_metadata(
             .as_ref()
             .is_some_and(|methods| methods.iter().any(|method| method == "S256"))
     {
-        return Err(OAuthError::Protocol(RmcpAuthError::PkceUnsupported));
+        return Err(OAuthError::Protocol(OAuthProtocolError::PkceUnsupported));
     }
     Ok(())
 }
@@ -2206,7 +2258,7 @@ async fn resolve_secret_from(
     resolver
         .resolve_secret(&input)
         .await
-        .map_err(|e| OAuthError::Protocol(RmcpAuthError::InternalError(e.to_string())))?
+        .map_err(|_| OAuthError::Protocol(OAuthProtocolError::Internal))?
         .ok_or_else(|| OAuthError::MissingSecret(id.to_string()))
 }
 
@@ -2269,39 +2321,54 @@ async fn restore_authorization_status(
     Ok(restored_status)
 }
 
-async fn spawn_code_exchange(
-    client: SensitiveAuthClient,
-    callback: OAuthCallback,
-) -> Result<Vec<String>, OAuthError> {
+/// Run an rmcp OAuth operation with tracing disabled for its entire async lifetime.
+///
+/// rmcp 2.2 logs authorization codes and full token-exchange results at `debug` level. A tracing
+/// dispatcher is thread-local, while a future running on Tokio's multithreaded runtime may migrate
+/// between worker threads. We therefore enter `NoSubscriber` on a dedicated blocking thread and
+/// drive the future with a current-thread runtime so every poll remains inside that dispatcher.
+/// `spawn_blocking` also avoids nesting `block_on` on an async runtime worker. OAuth exchanges are
+/// infrequent control-plane operations, so the per-exchange runtime cost is accepted until rmcp no
+/// longer emits credential-bearing values.
+fn spawn_sensitive_oauth_task<T, E, F, Fut>(task: F) -> tokio::task::JoinHandle<Result<T, E>>
+where
+    T: Send + 'static,
+    E: From<RmcpAuthError> + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, E>> + 'static,
+{
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| {
-                OAuthError::Protocol(RmcpAuthError::InternalError(error.to_string()))
+            .map_err(|_| {
+                E::from(RmcpAuthError::InternalError(
+                    "isolated OAuth runtime initialization failed".to_string(),
+                ))
             })?;
         let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        tracing::dispatcher::with_default(&dispatch, || {
-            runtime.block_on(async move {
-                let manager = client.inner.auth_manager.lock().await;
-                manager
-                    .exchange_code_for_token_with_issuer(
-                        &callback.code,
-                        &callback.state,
-                        callback.issuer.as_deref(),
-                    )
-                    .await
-                    .map_err(|_| {
-                        OAuthError::Protocol(RmcpAuthError::InternalError(
-                            "OAuth authorization code exchange failed".to_string(),
-                        ))
-                    })?;
-                Ok(manager.get_current_scopes().await)
-            })
-        })
+        tracing::dispatcher::with_default(&dispatch, || runtime.block_on(task()))
+    })
+}
+
+async fn spawn_code_exchange(
+    client: SensitiveAuthClient,
+    callback: OAuthCallback,
+) -> Result<Vec<String>, OAuthError> {
+    spawn_sensitive_oauth_task(move || async move {
+        let manager = client.inner.auth_manager.lock().await;
+        manager
+            .exchange_code_for_token_with_issuer(
+                &callback.code,
+                &callback.state,
+                callback.issuer.as_deref(),
+            )
+            .await
+            .map_err(|_| OAuthError::Protocol(OAuthProtocolError::TokenExchangeFailed))?;
+        Ok(manager.get_current_scopes().await)
     })
     .await
-    .map_err(|error| OAuthError::Protocol(RmcpAuthError::InternalError(error.to_string())))?
+    .map_err(|_| OAuthError::Protocol(OAuthProtocolError::Internal))?
 }
 
 fn spawn_client_credentials_exchange(
@@ -2310,40 +2377,30 @@ fn spawn_client_credentials_exchange(
     oauth_http_client: Arc<dyn OAuthHttpClient>,
     config: ClientCredentialsConfig,
 ) -> tokio::task::JoinHandle<Result<AuthorizationManager, RmcpAuthError>> {
-    tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| RmcpAuthError::InternalError(e.to_string()))?;
-        let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        tracing::dispatcher::with_default(&dispatch, || {
-            runtime.block_on(async move {
-                let mut manager =
-                    AuthorizationManager::new_with_oauth_http_client(&resource, oauth_http_client)
-                        .await?;
-                manager.set_credential_store(store.clone());
-                let metadata = manager.discover_metadata().await?;
-                validate_authorization_metadata(&metadata, false).map_err(|_| {
+    spawn_sensitive_oauth_task(move || async move {
+        let mut manager =
+            AuthorizationManager::new_with_oauth_http_client(&resource, oauth_http_client).await?;
+        manager.set_credential_store(store.clone());
+        let metadata = manager.discover_metadata().await?;
+        validate_authorization_metadata(&metadata, false).map_err(|_| {
+            RmcpAuthError::MetadataError(
+                "authorization metadata contains an insecure endpoint".to_string(),
+            )
+        })?;
+        store
+            .set_issuer(Some(
+                authorization_server_credential_identity(&metadata).map_err(|_| {
                     RmcpAuthError::MetadataError(
-                        "authorization metadata contains an insecure endpoint".to_string(),
+                        "authorization server identity is invalid".to_string(),
                     )
-                })?;
-                store
-                    .set_issuer(Some(
-                        authorization_server_credential_identity(&metadata).map_err(|_| {
-                            RmcpAuthError::MetadataError(
-                                "authorization server identity is invalid".to_string(),
-                            )
-                        })?,
-                    ))
-                    .await?;
-                manager.set_metadata(metadata);
-                manager.validate_client_credentials_metadata(&config)?;
-                manager.configure_client_credentials(&config)?;
-                manager.exchange_client_credentials(&config).await?;
-                Ok(manager)
-            })
-        })
+                })?,
+            ))
+            .await?;
+        manager.set_metadata(metadata);
+        manager.validate_client_credentials_metadata(&config)?;
+        manager.configure_client_credentials(&config)?;
+        manager.exchange_client_credentials(&config).await?;
+        Ok(manager)
     })
 }
 
@@ -2581,6 +2638,58 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         assert!(!text.contains("secret-state"));
         assert!(!text.contains("cancel-secret-state"));
         assert!(!text.contains("authorize?"));
+    }
+
+    #[test]
+    fn protocol_error_display_and_debug_do_not_expose_provider_details() {
+        let marker = "provider-response-secret";
+        let error = OAuthError::from(RmcpAuthError::TokenRefreshFailed(marker.into()));
+
+        assert!(matches!(
+            error,
+            OAuthError::Protocol(OAuthProtocolError::TokenRefreshFailed)
+        ));
+        assert!(
+            !error.to_string().contains(marker),
+            "OAuthError Display must not expose provider-controlled details"
+        );
+        assert!(
+            !format!("{error:?}").contains(marker),
+            "OAuthError Debug must not expose provider-controlled details"
+        );
+        let mut source = std::error::Error::source(&error);
+        while let Some(current) = source {
+            assert!(
+                !current.to_string().contains(marker),
+                "OAuthError source chain must not expose provider-controlled details"
+            );
+            source = current.source();
+        }
+    }
+
+    #[test]
+    fn oauth_lifecycle_registry_reclaims_dead_slots() {
+        let backend = memory_credential_store();
+        let store_identity = Arc::as_ptr(&backend) as *const () as usize;
+        let resource_prefix = "https://resource.example/dead-lifecycle-slot/";
+
+        for index in 0..32 {
+            let store = ScopedCredentialStore::new(
+                test_bundle_id(),
+                format!("{resource_prefix}{index}"),
+                "registry-reclamation".into(),
+                Arc::clone(&backend),
+            );
+            drop(store);
+        }
+
+        let retained = oauth_lifecycle_registry().matching_keys(|(identity, _, resource, _)| {
+            *identity == store_identity && resource.starts_with(resource_prefix)
+        });
+        assert!(
+            retained <= 1,
+            "dead OAuth lifecycle slots must be reclaimed; retained {retained}"
+        );
     }
 
     #[test]

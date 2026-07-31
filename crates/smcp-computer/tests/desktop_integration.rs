@@ -12,7 +12,7 @@ mod common;
 use rmcp::model::{Annotations, Meta};
 use smcp_computer::desktop::{organize_desktop, ToolCallRecord, WindowInfo};
 use smcp_computer::mcp_clients::model::{
-    make_resource, Annotated, RawResource, ReadResourceResult, ResourceContents,
+    make_resource, ReadResourceResult, Resource, ResourceContents,
 };
 use std::collections::HashMap;
 
@@ -29,17 +29,17 @@ fn window_with_meta(
     priority: Option<f32>,
     fullscreen: bool,
 ) -> WindowInfo {
-    let mut raw = RawResource::new(uri.to_string(), format!("Window {uri}"));
+    let mut resource = Resource::new(uri.to_string(), format!("Window {uri}"));
     if fullscreen {
         let mut map = serde_json::Map::new();
         map.insert("fullscreen".to_string(), serde_json::Value::Bool(true));
-        raw.meta = Some(Meta(map));
+        resource.meta = Some(Meta(map));
     }
-    let annotations = priority.map(|p| Annotations::default().with_priority(p));
+    resource.annotations = priority.map(|p| Annotations::default().with_priority(p));
     WindowInfo {
         bundle_id: server.to_string(),
         server_name: server.to_string(),
-        resource: Annotated::new(raw, annotations),
+        resource,
         read_result: ReadResourceResult::new(vec![ResourceContents::text(
             content,
             uri.to_string(),

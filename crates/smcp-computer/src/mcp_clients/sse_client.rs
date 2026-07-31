@@ -230,9 +230,10 @@ impl SseMCPClient {
         let notify = self.notify.clone();
 
         // 启动SSE事件处理任务 / Start SSE event handling task
-        // Avoid constructing a TLS connector (and loading the platform certificate store) for
-        // plain-HTTP endpoints. Besides being unnecessary work, concurrent macOS keychain reads
-        // can fail with errSecIO (-36) when many local SSE clients start together.
+        // Plain HTTP must not initialize a TLS connector. On macOS, doing so loads the platform
+        // certificate store and concurrent local clients can block or fail with errSecIO (-36).
+        // This also keeps non-success POST handling on the prompt-error path covered by the
+        // integration suite instead of waiting for the SSE connection timeout.
         let stream: Pin<Box<dyn Stream<Item = Result<es::SSE, es::Error>> + Send + Sync>> =
             if url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "http") {
                 builder.build_http().stream()

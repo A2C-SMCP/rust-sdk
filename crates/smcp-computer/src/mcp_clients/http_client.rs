@@ -140,12 +140,7 @@ impl HttpMCPClient {
         let mut header_map = HeaderMap::new();
         for (key, value) in &self.base.params.headers {
             if key.eq_ignore_ascii_case("authorization") && self.oauth_options.is_some() {
-                return Err(OAuthError::Protocol(
-                    rmcp::transport::AuthError::InternalError(
-                        "OAuth and a static Authorization header cannot be configured together"
-                            .to_string(),
-                    ),
-                ));
+                return Err(OAuthError::ConflictingAuthorizationHeader);
             }
             match (
                 HeaderName::from_bytes(key.as_bytes()),
@@ -182,9 +177,10 @@ impl HttpMCPClient {
                 }
             }));
         }
-        builder.default_headers(header_map).build().map_err(|e| {
-            OAuthError::Protocol(rmcp::transport::AuthError::InternalError(e.to_string()))
-        })
+        builder
+            .default_headers(header_map)
+            .build()
+            .map_err(|_| OAuthError::Protocol(crate::oauth::OAuthProtocolError::Internal))
     }
 
     fn build_http_client(&self) -> Result<reqwest::Client, OAuthError> {

@@ -1422,7 +1422,7 @@ impl SmcpComputerClient {
     }
 }
 
-/// 将 MCP `Resource`（rmcp `Annotated<RawResource>`）转换为 A2C 协议层 [`smcp::A2CResource`]（snake_case
+/// 将 MCP `Resource` 转换为 A2C 协议层 [`smcp::A2CResource`]（snake_case
 /// mirror）/ Convert an MCP `Resource` to the A2C protocol-level `A2CResource`。
 ///
 /// 元数据分工 / metadata partition：MCP 标准 annotations（`priority`/`audience`/`last_modified`）→
@@ -1782,23 +1782,25 @@ mod tests {
 
     #[test]
     fn test_to_a2c_resource_full() {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
         use rmcp::model::{Annotations, Meta, Role};
 
-        let mut raw = RawResource::new("window://app/w1", "Win");
-        raw.description = Some("desc".into());
-        raw.mime_type = Some("text/plain".into());
-        raw.size = Some(42);
+        let mut resource = Resource::new("window://app/w1", "Win");
+        resource.description = Some("desc".into());
+        resource.mime_type = Some("text/plain".into());
+        resource.size = Some(42);
         let mut m = serde_json::Map::new();
         m.insert("fullscreen".into(), serde_json::Value::Bool(true));
-        raw.meta = Some(Meta(m));
+        resource.meta = Some(Meta(m));
         // last_modified 设为定值，覆盖 DateTime<Utc> → RFC3339 映射分支。
         let dt: chrono::DateTime<chrono::Utc> = "2025-01-02T03:04:05Z".parse().unwrap();
-        let ann = Annotations::default()
-            .with_audience(vec![Role::Assistant])
-            .with_priority(0.7)
-            .with_timestamp(dt);
-        let a2c = to_a2c_resource(&Annotated::new(raw, Some(ann)));
+        resource.annotations = Some(
+            Annotations::default()
+                .with_audience(vec![Role::Assistant])
+                .with_priority(0.7)
+                .with_timestamp(dt),
+        );
+        let a2c = to_a2c_resource(&resource);
 
         assert_eq!(a2c.uri.as_deref(), Some("window://app/w1"));
         assert_eq!(a2c.name.as_deref(), Some("Win"));
@@ -1825,13 +1827,14 @@ mod tests {
 
     #[test]
     fn test_to_a2c_resource_empty_annotations_folded() {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
         use rmcp::model::Annotations;
 
         // MCP server 主动发回 `"annotations": {}` → rmcp 解析为 Some(全 None)。转换器须折叠为 None，
         // 与 Python `if ann:` 守卫字节对齐（否则线格式残留空 `"annotations": {}`）。
-        let raw = RawResource::new("custom://a/b", "R");
-        let a2c = to_a2c_resource(&Annotated::new(raw, Some(Annotations::default())));
+        let mut resource = Resource::new("custom://a/b", "R");
+        resource.annotations = Some(Annotations::default());
+        let a2c = to_a2c_resource(&resource);
         assert!(
             a2c.annotations.is_none(),
             "all-None annotations must fold to None"

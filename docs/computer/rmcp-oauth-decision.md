@@ -563,12 +563,13 @@ issuer-index:
 - 无 token、refresh 被拒绝：4006 + `ReauthorizationRequired`。
 - `403 insufficient_scope`：4007 保持兼容，同时发出 `ReauthorizationRequired`；只有调用方选择后才开始浏览器流程。
 - 非 scope 403：仍为 4007，不触发 step-up。
-- OAuth discovery/registration/token exchange 使用新的 typed cause，不依赖错误字符串。
+- OAuth discovery/registration/token exchange 使用 SDK 自有的 `OAuthProtocolError` typed
+  cause，不依赖错误字符串，也不把 rmcp/provider 原文带入 `Display`、`Debug` 或错误链。
 - scope upgrade 必须设置最大次数，防止循环授权。
 
 ## 9. 实施计划
 
-### PR 1：rmcp 2.2 与兼容层
+### PR 1：rmcp 2.2 与模型迁移
 
 范围：
 
@@ -577,7 +578,8 @@ issuer-index:
 - 对齐直接 `reqwest = "0.13"`；
 - 将 `sse-stream` 锁到兼容版本；
 - 修复 25 个编译错误；
-- 建立 `mcp_clients/rmcp_compat.rs`，集中处理 rmcp builders、model conversions 与 non-exhaustive enums；
+- 直接迁移到 rmcp 2.2 的扁平 `Resource`/content 模型，不保留旧 `Annotated`/`RawResource`
+  construction shim；集中处理 builders、model conversions 与 non-exhaustive enums；
 - 旧的 static headers 和 stdio 行为保持不变。
 
 验收：

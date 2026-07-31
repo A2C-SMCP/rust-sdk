@@ -20,19 +20,6 @@ pub use rmcp::model::{
     ToolAnnotations,
 };
 
-/// Compatibility shim for the pre-2.0 rmcp annotated-resource construction API.
-#[doc(hidden)]
-pub type RawResource = Resource;
-#[doc(hidden)]
-pub struct Annotated;
-impl Annotated {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(mut resource: Resource, annotations: Option<rmcp::model::Annotations>) -> Resource {
-        resource.annotations = annotations;
-        resource
-    }
-}
-
 // 常量定义 / Constants definition
 pub const A2C_TOOL_META: &str = "a2c_tool_meta";
 pub const A2C_VRL_TRANSFORMED: &str = "a2c_vrl_transformed";

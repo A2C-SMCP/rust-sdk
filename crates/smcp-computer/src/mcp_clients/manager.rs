@@ -20,10 +20,11 @@ use crate::oauth::{
     OAuthCredentialStore, OAuthError, OAuthFlowOutcome, OAuthLaunch, OAuthStatus,
 };
 use crate::skills::{McpResource, SkillResourceManager, SkillStagingError};
+use crate::weak_registry::WeakRegistry;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc as StdArc;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -119,7 +120,7 @@ pub struct MCPServerManager {
     oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     secret_resolver: Arc<RwLock<Option<Arc<dyn SecretValueResolver>>>>,
     /// Serialize start/stop/update for each server identity without blocking unrelated servers.
-    lifecycle_locks: Arc<StdMutex<HashMap<BundleId, Arc<Mutex<()>>>>>,
+    lifecycle_locks: Arc<WeakRegistry<BundleId, Mutex<()>>>,
 }
 
 /// 管理器状态 / Manager state
@@ -138,11 +139,12 @@ pub enum ManagerState {
 impl MCPServerManager {
     fn lifecycle_lock(&self, bundle_id: &BundleId) -> Arc<Mutex<()>> {
         self.lifecycle_locks
-            .lock()
-            .expect("MCP lifecycle lock registry poisoned")
-            .entry(bundle_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+            .get_or_insert_with(bundle_id.clone(), || Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    fn lifecycle_registry_len(&self) -> usize {
+        self.lifecycle_locks.len()
     }
 
     /// 创建新的管理器 / Create new manager
@@ -166,7 +168,7 @@ impl MCPServerManager {
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             secret_resolver: Arc::new(RwLock::new(None)),
-            lifecycle_locks: Arc::new(StdMutex::new(HashMap::new())),
+            lifecycle_locks: Arc::new(WeakRegistry::default()),
         }
     }
 
@@ -194,7 +196,7 @@ impl MCPServerManager {
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             secret_resolver: Arc::new(RwLock::new(None)),
-            lifecycle_locks: Arc::new(StdMutex::new(HashMap::new())),
+            lifecycle_locks: Arc::new(WeakRegistry::default()),
         }
     }
 
@@ -1744,11 +1746,7 @@ impl MCPServerManager {
                             // Health reconnect mutates the same server lifecycle as explicit
                             // start/stop/update. Reject a stale snapshot after waiting.
                             let lifecycle = lifecycle_locks
-                                .lock()
-                                .expect("MCP lifecycle lock registry poisoned")
-                                .entry(bundle_id.clone())
-                                .or_insert_with(|| Arc::new(Mutex::new(())))
-                                .clone();
+                                .get_or_insert_with(bundle_id.clone(), || Mutex::new(()));
                             let _lifecycle_guard = lifecycle.lock().await;
                             let is_current = active_clients
                                 .read()
@@ -2160,14 +2158,14 @@ pub(crate) mod test_support {
         mount_dir: &str,
     ) -> Resource {
         use rmcp::model::Meta;
-        let mut raw = RawResource::new(uri, "skill");
+        let mut resource = Resource::new(uri, "skill");
         if let Some(src) = source {
             let mut m = serde_json::Map::new();
             m.insert("source".into(), Value::String(src.to_string()));
             m.insert("mount_dir".into(), Value::String(mount_dir.to_string()));
-            raw.meta = Some(Meta(m));
+            resource.meta = Some(Meta(m));
         }
-        raw
+        resource
     }
 
     /// 把假 client 注入 manager 的 `active_clients`（键 = `bundle_id`）/ inject a fake client。
@@ -2851,6 +2849,21 @@ mod tests {
         assert!(first.is_ok());
         assert!(second.is_ok());
         assert_eq!(created.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lifecycle_registry_reclaims_inactive_server_slots() {
+        let manager = MCPServerManager::new();
+
+        for index in 0..32 {
+            let bundle_id = bid(&format!("inactive-lifecycle-{index}"));
+            drop(manager.lifecycle_lock(&bundle_id));
+        }
+
+        assert!(
+            manager.lifecycle_registry_len() <= 1,
+            "inactive server lifecycle slots must be reclaimed"
+        );
     }
 
     /// #141：`restart_client_by_id` 对**未声明**的 bundle_id 必须报错，不得静默 `Ok`。

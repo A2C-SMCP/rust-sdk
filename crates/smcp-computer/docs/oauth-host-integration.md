@@ -211,6 +211,10 @@ Never log, persist as ordinary configuration, or expose through ordinary `Debug`
 tracing fields. Host route logs should use a generated non-secret correlation ID rather than state
 or business identifiers.
 
+Underlying rmcp/provider failures cross the public API only as the stable
+[`OAuthProtocolError`] category carried by [`OAuthError::Protocol`]. Its `Display` and `Debug`
+representations and error chain never contain the provider response body or upstream error string.
+
 ## Host completion checklist
 
 - Callback entry exists before `begin_oauth`.

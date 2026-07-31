@@ -252,17 +252,16 @@ mod tests {
         priority: i32,
         fullscreen: bool,
     ) -> WindowInfo {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
         use rmcp::model::{Annotations, Meta};
 
-        let mut raw = RawResource::new(uri.to_string(), format!("Window {}", uri));
+        let mut resource = Resource::new(uri.to_string(), format!("Window {}", uri));
         if fullscreen {
             let mut map = serde_json::Map::new();
             map.insert("fullscreen".to_string(), serde_json::Value::Bool(true));
-            raw.meta = Some(Meta(map));
+            resource.meta = Some(Meta(map));
         }
-        let annotations = Some(Annotations::default().with_priority(priority as f32 / 100.0));
-        let resource = Annotated::new(raw, annotations);
+        resource.annotations = Some(Annotations::default().with_priority(priority as f32 / 100.0));
 
         WindowInfo {
             // 测试中 server 串同时充当 bundle_id（分组键）与 server_name（展示名）。
@@ -692,14 +691,13 @@ mod tests {
 
     #[test]
     fn test_organize_desktop_default_priority_when_no_annotations() {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
 
         // 无 annotations 的窗口：priority 视为缺省 0.0，应排在高 priority 窗口之后。
-        let raw = RawResource::new("window://server1.mcp.com/no-ann", "no-ann");
         let bare = WindowInfo {
             bundle_id: "server1".to_string(),
             server_name: "server1".to_string(),
-            resource: Annotated::new(raw, None),
+            resource: Resource::new("window://server1.mcp.com/no-ann", "no-ann"),
             read_result: ReadResourceResult::new(vec![ResourceContents::text(
                 "bare",
                 "window://server1.mcp.com/no-ann",

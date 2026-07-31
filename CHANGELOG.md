@@ -8,8 +8,11 @@ All notable changes to this project will be documented in this file.
 
 - *(computer)* #157 upgrades the public MCP model and transport surface from `rmcp 0.11`
   to exactly `rmcp 2.2.0`. Downstream code must use the rmcp 2.2 resource/content
-  layouts; removed legacy aliases such as `RawContent` and `RawTextContent` are no
-  longer re-exported.
+  layouts; removed legacy aliases and construction shims such as `RawContent`,
+  `RawTextContent`, `RawResource`, and `Annotated` are no longer re-exported.
+- *(computer)* `OAuthError::Protocol` now carries the SDK-owned
+  `OAuthProtocolError` category instead of rmcp's `AuthError`. Provider response
+  details are intentionally discarded at this boundary.
 - *(computer)* #160 changes interactive `complete_oauth` and `cancel_oauth` to return
   `OAuthFlowOutcome`. Expired and issuer-mismatched callbacks now use dedicated
   `OAuthError` variants instead of a generic protocol error.
@@ -31,6 +34,14 @@ All notable changes to this project will be documented in this file.
   headless HTTPS Gateway flow drivers, with structured completion/termination outcomes,
   one-time opaque-state routing, deterministic expiry, and rustdoc-integrated guidance.
 
+### Bug Fixes
+
+- *(computer)* Bound process-local OAuth and MCP lifecycle registries by retaining only
+  weak references and reclaiming dead slots during server/configuration churn.
+- *(computer)* Keep plain-HTTP SSE clients from initializing the platform TLS
+  certificate store. This prevents macOS Keychain contention from delaying or
+  failing concurrent local MCP connections and their prompt error handling.
+
 ### Migration Notes
 
 - Add the optional `oauth` object to an HTTP server configuration and provide secret
@@ -47,6 +58,8 @@ All notable changes to this project will be documented in this file.
 - OAuth configuration and status fields serialize as camelCase. Existing non-OAuth
   HTTP servers retain normal redirect behavior; OAuth requests only follow
   same-origin redirects.
+- Match `OAuthError::Protocol(OAuthProtocolError::...)` for stable control flow. Raw
+  rmcp/provider errors are no longer available through the public error value.
 
 ## [0.3.1] - 2026-07-27
 
