@@ -70,6 +70,9 @@ jobs:
       - name: Install system deps (libdbus for keyring on Linux)
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
+      - name: Check smcp-computer package contents
+        run: cargo package -p smcp-computer --no-verify --list | grep -Fx 'docs/oauth-host-integration.md'
+
       - name: Test smcp
         run: cargo test -p smcp
 
@@ -78,6 +81,9 @@ jobs:
 
       - name: Test smcp-computer
         run: cargo test -p smcp-computer --features vrl,cli
+
+      - name: Test Atlassian OAuth UAT driver
+        run: cargo test -p smcp-computer --example oauth_atlassian_uat
 
       - name: Test smcp-server-core
         # 限制线程数为 1，避免 Socket.IO 集成测试并行运行时的端口冲突和资源争用

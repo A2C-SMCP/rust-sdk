@@ -12,9 +12,9 @@ use super::model::*;
 use super::{ResourceCache, SubscriptionManager};
 use async_trait::async_trait;
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParam, CancelledNotificationParam, ClientInfo, ClientRequest,
-    Implementation, PaginatedRequestParam, ReadResourceRequestParam,
-    ResourceUpdatedNotificationParam, ServerResult, SubscribeRequestParam, UnsubscribeRequestParam,
+    CallToolRequest, CancelledNotificationParam, ClientInfo, ClientRequest, Implementation,
+    PaginatedRequestParams, ReadResourceRequestParams, ResourceUpdatedNotificationParam,
+    ServerResult, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::{
     NotificationContext, PeerRequestOptions, RequestHandle, RunningService, ServiceExt,
@@ -63,17 +63,10 @@ impl A2cClientHandler {
     /// 供 stdio/http 两个 rmcp 客户端共享（#106）。
     pub(crate) fn new(notify: Option<ClientNotifyCtx>) -> Self {
         Self {
-            info: ClientInfo {
-                protocol_version: Default::default(),
-                capabilities: Default::default(),
-                client_info: Implementation {
-                    name: "a2c-smcp-rust".to_string(),
-                    title: None,
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    icons: None,
-                    website_url: None,
-                },
-            },
+            info: ClientInfo::new(
+                Default::default(),
+                Implementation::new("a2c-smcp-rust", env!("CARGO_PKG_VERSION")),
+            ),
             notify,
         }
     }
@@ -363,10 +356,7 @@ impl MCPClientProtocol for StdioMCPClient {
         let service = guard.as_ref().unwrap();
 
         let result = service
-            .call_tool(CallToolRequestParam {
-                name: tool_name.to_string().into(),
-                arguments: params.as_object().cloned(),
-            })
+            .call_tool(super::utils::call_tool_request_params(tool_name, params))
             .await
             .map_err(MCPClientError::ToolCallError)?;
 
@@ -397,14 +387,9 @@ impl MCPClientProtocol for StdioMCPClient {
         let guard = self.get_service().await?;
 
         // 低层下发以捕获 rmcp 分配的 request_id（高层 service.call_tool 不暴露 id）。
-        let request = ClientRequest::CallToolRequest(CallToolRequest {
-            method: Default::default(),
-            params: CallToolRequestParam {
-                name: tool_name.to_string().into(),
-                arguments: params.as_object().cloned(),
-            },
-            extensions: Default::default(),
-        });
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(
+            super::utils::call_tool_request_params(tool_name, params),
+        ));
         // 内联 service 借用：`send_request_with_option` 返回后即结束对 guard 的借用。
         let handle: RequestHandle<RoleClient> = guard
             .as_ref()
@@ -432,10 +417,10 @@ impl MCPClientProtocol for StdioMCPClient {
             },
             _ = cancel.cancelled() => {
                 // best-effort 协作式取消：补发 notifications/cancelled（远端可忽略）；time-box 防 teardown 卡死。
-                let notify = peer.notify_cancelled(CancelledNotificationParam {
-                    request_id,
-                    reason: Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
-                });
+                let notify = peer.notify_cancelled(CancelledNotificationParam::new(
+                    Some(request_id),
+                    Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
+                ));
                 if tokio::time::timeout(Duration::from_secs(2), notify).await.is_err() {
                     warn!("emit MCP notifications/cancelled timed out (best-effort, ignored)");
                 }
@@ -489,7 +474,7 @@ impl MCPClientProtocol for StdioMCPClient {
 
         // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
         // Single-page passthrough: cursor in/out, no aggregation/filter, no resourceTemplates.
-        let param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
+        let param = cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
         let result = service
             .list_resources(param)
             .await
@@ -510,9 +495,7 @@ impl MCPClientProtocol for StdioMCPClient {
         let service = guard.as_ref().unwrap();
 
         let result = service
-            .read_resource(ReadResourceRequestParam {
-                uri: resource.uri.clone(),
-            })
+            .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
             .await
             .map_err(|e| MCPClientError::ProtocolError(format!("Read resource error: {}", e)))?;
 
@@ -528,9 +511,7 @@ impl MCPClientProtocol for StdioMCPClient {
         let service = guard.as_ref().unwrap();
 
         service
-            .subscribe(SubscribeRequestParam {
-                uri: resource.uri.clone(),
-            })
+            .subscribe(SubscribeRequestParams::new(resource.uri.clone()))
             .await
             .map_err(|e| {
                 MCPClientError::ProtocolError(format!("Subscribe resource error: {}", e))
@@ -573,9 +554,7 @@ impl MCPClientProtocol for StdioMCPClient {
         let service = guard.as_ref().unwrap();
 
         service
-            .unsubscribe(UnsubscribeRequestParam {
-                uri: resource.uri.clone(),
-            })
+            .unsubscribe(UnsubscribeRequestParams::new(resource.uri.clone()))
             .await
             .map_err(|e| {
                 MCPClientError::ProtocolError(format!("Unsubscribe resource error: {}", e))

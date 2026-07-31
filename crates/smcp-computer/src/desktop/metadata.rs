@@ -27,7 +27,11 @@ use crate::mcp_clients::model::Resource;
 /// Note: rmcp `Annotations.priority` is already a typed `Option<f32>`, so there is no
 /// "non-numeric" branch like Python's.
 pub fn read_priority(resource: &Resource) -> f32 {
-    match resource.priority() {
+    match resource
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.priority)
+    {
         None => 0.0,
         Some(p) if (0.0..=1.0).contains(&p) => p,
         Some(p) => {
@@ -126,31 +130,27 @@ pub fn check_audience(resource: &Resource) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_clients::model::{Annotated, RawResource};
+    use crate::mcp_clients::model::Resource;
     use rmcp::model::{Annotations, Meta, Role};
 
     /// 构造带 `annotations.priority` 的窗口资源 / Build a window resource carrying
     /// `annotations.priority`。`None` 表示不附带 annotations。
     fn res_with_priority(priority: Option<f32>) -> Resource {
-        let raw = RawResource::new("window://host/path", "win");
-        let annotations = priority.map(|p| Annotations {
-            audience: None,
-            priority: Some(p),
-            last_modified: None,
-        });
-        Annotated::new(raw, annotations)
+        let mut resource = Resource::new("window://host/path", "win");
+        resource.annotations = priority.map(|p| Annotations::default().with_priority(p));
+        resource
     }
 
     /// 构造带 `_meta.fullscreen` 的窗口资源 / Build a window resource carrying
     /// `_meta.fullscreen`。`meta_value` 为写入 `_meta["fullscreen"]` 的原始 JSON（`None` = 无 `_meta`）。
     fn res_with_fullscreen_value(meta_value: Option<serde_json::Value>) -> Resource {
-        let mut raw = RawResource::new("window://host/path", "win");
+        let mut resource = Resource::new("window://host/path", "win");
         if let Some(v) = meta_value {
             let mut map = serde_json::Map::new();
             map.insert("fullscreen".to_string(), v);
-            raw.meta = Some(Meta(map));
+            resource.meta = Some(Meta(map));
         }
-        Annotated::new(raw, None)
+        resource
     }
 
     #[test]
@@ -210,13 +210,11 @@ mod tests {
     #[test]
     fn test_read_fullscreen_missing_key_is_false() {
         // _meta 存在但无 fullscreen 键 → false
-        let raw = RawResource::new("window://host/path", "win");
+        let mut resource = Resource::new("window://host/path", "win");
         let mut map = serde_json::Map::new();
         map.insert("other".to_string(), serde_json::Value::Bool(true));
-        let mut raw = raw;
-        raw.meta = Some(Meta(map));
-        let res = Annotated::new(raw, None);
-        assert!(!read_fullscreen(&res));
+        resource.meta = Some(Meta(map));
+        assert!(!read_fullscreen(&resource));
     }
 
     #[test]
@@ -224,25 +222,13 @@ mod tests {
         // 无 annotations / 含 assistant / 仅 user —— 均不应 panic（WARN 为副作用）。
         check_audience(&res_with_priority(None));
 
-        let raw = RawResource::new("window://host/path", "win");
-        let with_assistant = Annotated::new(
-            raw.clone(),
-            Some(Annotations {
-                audience: Some(vec![Role::Assistant]),
-                priority: None,
-                last_modified: None,
-            }),
-        );
+        let mut with_assistant = Resource::new("window://host/path", "win");
+        with_assistant.annotations =
+            Some(Annotations::default().with_audience(vec![Role::Assistant]));
         check_audience(&with_assistant);
 
-        let user_only = Annotated::new(
-            raw,
-            Some(Annotations {
-                audience: Some(vec![Role::User]),
-                priority: None,
-                last_modified: None,
-            }),
-        );
+        let mut user_only = Resource::new("window://host/path", "win");
+        user_only.annotations = Some(Annotations::default().with_audience(vec![Role::User]));
         check_audience(&user_only);
     }
 }

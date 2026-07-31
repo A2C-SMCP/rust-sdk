@@ -16,10 +16,12 @@ pub mod governance;
 pub mod inputs;
 pub mod inventory;
 pub mod mcp_clients;
+pub mod oauth;
 pub mod settings;
 pub mod skills;
 pub mod socketio_client;
 pub mod status;
+mod weak_registry;
 
 #[cfg(feature = "cli")]
 pub mod cli;
@@ -27,6 +29,12 @@ pub mod cli;
 #[cfg(test)]
 pub use errors::{ComputerError, ComputerResult};
 
+pub use oauth::{
+    InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
+    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialKey,
+    OAuthCredentialRecordKind, OAuthCredentialStore, OAuthCredentialStoreError, OAuthError,
+    OAuthFlowOutcome, OAuthLaunch, OAuthOptions, OAuthProtocolError, OAuthStatus,
+};
 /// #107 S7（#114）：runtime status / 事件公开面 re-export / runtime status surface re-export。
 pub use status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 

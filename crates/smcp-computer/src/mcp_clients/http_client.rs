@@ -8,23 +8,29 @@
 * 描述: HTTP类型的MCP客户端实现
 */
 use super::base_client::BaseMCPClient;
+use super::bundle_id::BundleId;
 use super::model::*;
 use super::stdio_client::A2cClientHandler;
 use super::{ResourceCache, SubscriptionManager};
+use crate::inputs::SecretValueResolver;
+use crate::oauth::{
+    clear_stored_oauth_credentials, InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback,
+    OAuthCancellation, OAuthCoordinator, OAuthCredentialStore, OAuthError, OAuthFlowOutcome,
+    OAuthLaunch, OAuthOptions, OAuthRequestGuard, OAuthStatus,
+};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParam, CancelledNotificationParam, ClientRequest,
-    PaginatedRequestParam, ReadResourceRequestParam, ServerResult, SubscribeRequestParam,
-    UnsubscribeRequestParam,
+    CallToolRequest, CancelledNotificationParam, ClientRequest, PaginatedRequestParams,
+    ReadResourceRequestParams, ServerResult, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::{PeerRequestOptions, RequestHandle, RunningService, ServiceExt};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::RoleClient;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -47,14 +53,22 @@ pub struct HttpMCPClient {
     /// 资源缓存 / Resource cache
     resource_cache: ResourceCache,
     /// 运行期变化通知上报接缝（#106，None=不转发）/ runtime change-notification seam。
-    notify: Option<ClientNotifyCtx>,
+    notify: StdRwLock<Option<ClientNotifyCtx>>,
+    oauth_options: Option<OAuthOptions>,
+    secret_resolver: Option<Arc<dyn SecretValueResolver>>,
+    oauth_bundle_id: BundleId,
+    oauth_credential_store: Arc<dyn OAuthCredentialStore>,
+    oauth: OnceCell<Arc<OAuthCoordinator>>,
 }
 
 impl std::fmt::Debug for HttpMCPClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpMCPClient")
             .field("url", &self.base.params.url)
-            .field("headers", &self.base.params.headers)
+            .field(
+                "header_names",
+                &self.base.params.headers.keys().collect::<Vec<_>>(),
+            )
             .field("state", &self.base.state())
             .finish()
     }
@@ -68,7 +82,13 @@ impl HttpMCPClient {
             running_service: Arc::new(Mutex::new(None)),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
-            notify: None,
+            notify: StdRwLock::new(None),
+            oauth_options: None,
+            secret_resolver: None,
+            oauth_bundle_id: BundleId::try_from("standalone-http-oauth")
+                .expect("static standalone OAuth bundle ID must be valid"),
+            oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
+            oauth: OnceCell::new(),
         }
     }
 
@@ -77,8 +97,227 @@ impl HttpMCPClient {
     /// 由 [`client_factory`](super::utils::client_factory) 在 manager 启动客户端时调用；须在 `connect` 前设置
     /// （`connect` 据此构造 `A2cClientHandler` 传给 `.serve()`）。
     pub fn with_notify(mut self, notify: Option<ClientNotifyCtx>) -> Self {
-        self.notify = notify;
+        *self.notify.get_mut().expect("HTTP notify lock poisoned") = notify;
         self
+    }
+
+    /// Reset this standalone client to a private process-memory OAuth credential store.
+    ///
+    /// OAuth credentials are already in memory by default. This method remains as an explicit
+    /// isolation convenience for callers that otherwise inject a shared store.
+    pub fn with_ephemeral_oauth_credentials(mut self) -> Self {
+        self.oauth_credential_store = Arc::new(InMemoryOAuthCredentialStore::default());
+        self
+    }
+
+    /// Attach the manager-resolved bundle identity and host credential store.
+    pub(crate) fn with_oauth_context(
+        mut self,
+        bundle_id: BundleId,
+        credential_store: Arc<dyn OAuthCredentialStore>,
+    ) -> Self {
+        self.oauth_bundle_id = bundle_id;
+        self.oauth_credential_store = credential_store;
+        self
+    }
+
+    pub(crate) fn set_notify(&self, notify: Option<ClientNotifyCtx>) {
+        *self.notify.write().expect("HTTP notify lock poisoned") = notify;
+    }
+
+    /// Configure OAuth for this remote MCP client.
+    pub fn with_oauth(
+        mut self,
+        options: OAuthOptions,
+        resolver: Option<Arc<dyn SecretValueResolver>>,
+    ) -> Self {
+        self.oauth_options = Some(options);
+        self.secret_resolver = resolver;
+        self
+    }
+
+    fn build_http_headers(&self) -> Result<HeaderMap, OAuthError> {
+        let mut header_map = HeaderMap::new();
+        for (key, value) in &self.base.params.headers {
+            if key.eq_ignore_ascii_case("authorization") && self.oauth_options.is_some() {
+                return Err(OAuthError::ConflictingAuthorizationHeader);
+            }
+            match (
+                HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(val)) => {
+                    header_map.insert(name, val);
+                }
+                _ => warn!(header = %key, "skipping invalid HTTP header"),
+            }
+        }
+        Ok(header_map)
+    }
+
+    fn build_http_client_with_headers(
+        &self,
+        header_map: HeaderMap,
+    ) -> Result<reqwest::Client, OAuthError> {
+        let mut builder =
+            reqwest::Client::builder().timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
+        if self.oauth_options.is_some() {
+            builder = builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let same_origin = attempt.previous().last().is_some_and(|previous| {
+                    previous.scheme() == attempt.url().scheme()
+                        && previous.host_str() == attempt.url().host_str()
+                        && previous.port_or_known_default() == attempt.url().port_or_known_default()
+                });
+                if !same_origin {
+                    attempt.stop()
+                } else if attempt.previous().len() >= 10 {
+                    attempt.error("too many same-origin redirects")
+                } else {
+                    attempt.follow()
+                }
+            }));
+        }
+        builder
+            .default_headers(header_map)
+            .build()
+            .map_err(|_| OAuthError::Protocol(crate::oauth::OAuthProtocolError::Internal))
+    }
+
+    fn build_http_client(&self) -> Result<reqwest::Client, OAuthError> {
+        self.build_http_client_with_headers(self.build_http_headers()?)
+    }
+
+    async fn oauth(&self) -> Result<&Arc<OAuthCoordinator>, OAuthError> {
+        let options = self
+            .oauth_options
+            .clone()
+            .ok_or(OAuthError::NotConfigured)?;
+        self.oauth
+            .get_or_try_init(|| async {
+                let protected_resource_headers = self.build_http_headers()?;
+                OAuthCoordinator::new(
+                    &self.oauth_bundle_id,
+                    &self.base.params.url,
+                    options,
+                    Arc::clone(&self.oauth_credential_store),
+                    self.secret_resolver.clone(),
+                    self.build_http_client_with_headers(protected_resource_headers.clone())?,
+                    protected_resource_headers,
+                )
+                .await
+                .map(Arc::new)
+            })
+            .await
+    }
+
+    pub(crate) async fn oauth_status(&self) -> Result<OAuthStatus, OAuthError> {
+        Ok(self.oauth().await?.status().await)
+    }
+
+    pub(crate) async fn begin_oauth(
+        &self,
+        request: OAuthBeginRequest,
+    ) -> Result<OAuthLaunch, OAuthError> {
+        let Some(options) = self.oauth_options.as_ref() else {
+            return Err(OAuthError::NotConfigured);
+        };
+        if !matches!(
+            options.mode,
+            crate::oauth::OAuthClientMode::AuthorizationCode { .. }
+        ) {
+            return Err(OAuthError::UnsupportedTransport);
+        }
+        self.oauth().await?.begin(request).await
+    }
+
+    pub(crate) async fn complete_oauth(
+        &self,
+        callback: OAuthCallback,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
+        self.oauth().await?.complete(callback).await
+    }
+
+    pub(crate) async fn cancel_oauth(
+        &self,
+        cancellation: OAuthCancellation,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
+        self.oauth().await?.cancel(cancellation).await
+    }
+
+    pub(crate) async fn clear_oauth(&self) -> Result<(), OAuthError> {
+        if self.oauth_options.is_none() {
+            return Err(OAuthError::NotConfigured);
+        }
+        if let Some(oauth) = self.oauth.get() {
+            oauth.clear().await
+        } else {
+            clear_stored_oauth_credentials(
+                &self.oauth_bundle_id,
+                &self.base.params.url,
+                self.oauth_options
+                    .as_ref()
+                    .expect("OAuth options were checked above"),
+                Arc::clone(&self.oauth_credential_store),
+            )
+            .await
+        }
+    }
+
+    async fn prepare_oauth_request(&self) -> Result<Option<OAuthRequestGuard>, MCPClientError> {
+        if self.oauth_options.is_none() {
+            return Ok(None);
+        }
+        let oauth = self.oauth().await.map_err(|error| {
+            MCPClientError::Other(format!("OAuth request preparation failed: {error}"))
+        })?;
+        let guard = oauth.prepare_request().await.map_err(|error| {
+            MCPClientError::Other(format!("OAuth request preparation failed: {error}"))
+        })?;
+        Ok(Some(guard))
+    }
+
+    async fn observe_oauth_service_result<T>(
+        &self,
+        result: &Result<T, rmcp::ServiceError>,
+        expected_generation: Option<u64>,
+    ) {
+        let Some(expected_generation) = expected_generation else {
+            return;
+        };
+        if let Ok(oauth) = self.oauth().await {
+            match result {
+                Ok(_) => oauth.observe_service_success(expected_generation).await,
+                Err(error) => {
+                    oauth
+                        .observe_service_error(error, expected_generation)
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn observe_oauth_service_error(
+        &self,
+        error: &rmcp::ServiceError,
+        expected_generation: Option<u64>,
+    ) {
+        let Some(expected_generation) = expected_generation else {
+            return;
+        };
+        if let Ok(oauth) = self.oauth().await {
+            oauth
+                .observe_service_error(error, expected_generation)
+                .await;
+        }
+    }
+
+    async fn observe_oauth_service_success(&self, expected_generation: Option<u64>) {
+        let Some(expected_generation) = expected_generation else {
+            return;
+        };
+        if let Ok(oauth) = self.oauth().await {
+            oauth.observe_service_success(expected_generation).await;
+        }
     }
 
     /// 获取 running service 的 guard，验证 service 可用（同 stdio 客户端语义）。
@@ -163,47 +402,77 @@ impl MCPClientProtocol for HttpMCPClient {
             )));
         }
 
-        // 用户配置的 headers 预置进 reqwest client 的 default_headers（rmcp Streamable HTTP 传输的 config
-        // 仅支持单一 auth_header，任意自定义 header 需经预置 client 注入）。非法 header 名/值跳过并告警。
-        let mut header_map = HeaderMap::new();
-        for (key, value) in &self.base.params.headers {
-            match (
-                HeaderName::from_bytes(key.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                (Ok(name), Ok(val)) => {
-                    header_map.insert(name, val);
-                }
-                _ => warn!("Skipping invalid HTTP header: {}={}", key, value),
-            }
-        }
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-            .default_headers(header_map)
-            .build()
-            .map_err(|e| {
-                MCPClientError::ConnectionError(format!("Failed to build HTTP client: {}", e))
-            })?;
-
         let config = StreamableHttpClientTransportConfig::with_uri(self.base.params.url.clone());
-        let transport = StreamableHttpClientTransport::with_client(http_client, config);
+        let (service, oauth_request) = if self.oauth_options.is_some() {
+            let oauth = self.oauth().await.map_err(|e| {
+                MCPClientError::ConnectionError(format!("OAuth initialization failed: {e}"))
+            })?;
+            oauth.ensure_machine_authorized().await.map_err(|e| {
+                MCPClientError::ConnectionError(format!("OAuth authorization failed: {e}"))
+            })?;
+            let oauth_request = oauth.prepare_request().await.map_err(|e| {
+                MCPClientError::ConnectionError(format!("OAuth request preparation failed: {e}"))
+            })?;
+            let transport = StreamableHttpClientTransport::with_client(oauth.http_client(), config);
+            let handler = A2cClientHandler::new(
+                self.notify
+                    .read()
+                    .expect("HTTP notify lock poisoned")
+                    .clone(),
+            );
+            (
+                tokio::time::timeout(
+                    Duration::from_secs(CONNECT_TIMEOUT_SECS),
+                    handler.serve(transport),
+                )
+                .await,
+                Some(oauth_request),
+            )
+        } else {
+            let transport = StreamableHttpClientTransport::with_client(
+                self.build_http_client().map_err(|e| {
+                    MCPClientError::ConnectionError(format!("HTTP client build failed: {e}"))
+                })?,
+                config,
+            );
+            let handler = A2cClientHandler::new(
+                self.notify
+                    .read()
+                    .expect("HTTP notify lock poisoned")
+                    .clone(),
+            );
+            (
+                tokio::time::timeout(
+                    Duration::from_secs(CONNECT_TIMEOUT_SECS),
+                    handler.serve(transport),
+                )
+                .await,
+                None,
+            )
+        };
 
-        // #106：与 stdio 共享 A2cClientHandler，运行期 tools/resources 变化通知走同一上报接缝。
-        let handler = A2cClientHandler::new(self.notify.clone());
-
-        let service = tokio::time::timeout(
-            Duration::from_secs(CONNECT_TIMEOUT_SECS),
-            handler.serve(transport),
-        )
-        .await
-        .map_err(|_| {
+        let service = service.map_err(|_| {
             MCPClientError::TimeoutError(format!(
                 "HTTP connect timed out after {}s",
                 CONNECT_TIMEOUT_SECS
             ))
-        })?
-        .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
+        })?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
+        drop(oauth_request);
+        if let Some(oauth_generation) = oauth_generation {
+            if let Ok(oauth) = self.oauth().await {
+                match &service {
+                    Ok(_) => oauth.observe_service_success(oauth_generation).await,
+                    Err(error) => {
+                        oauth
+                            .observe_initialize_error(error, oauth_generation)
+                            .await;
+                    }
+                }
+            }
+        }
+        let service = service
+            .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
 
         *self.running_service.lock().await = Some(service);
         self.base.update_state(ClientState::Connected).await;
@@ -244,9 +513,13 @@ impl MCPClientProtocol for HttpMCPClient {
         let guard = self.get_service().await?;
         let service = guard.as_ref().unwrap();
 
-        let tools = service
-            .list_all_tools()
-            .await
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
+        let result = service.list_all_tools().await;
+        drop(oauth_request);
+        self.observe_oauth_service_result(&result, oauth_generation)
+            .await;
+        let tools = result
             .map_err(|e| MCPClientError::ProtocolError(format!("List tools error: {}", e)))?;
 
         info!("Found {} tools", tools.len());
@@ -265,13 +538,15 @@ impl MCPClientProtocol for HttpMCPClient {
         let guard = self.get_service().await?;
         let service = guard.as_ref().unwrap();
 
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
         let result = service
-            .call_tool(CallToolRequestParam {
-                name: tool_name.to_string().into(),
-                arguments: params.as_object().cloned(),
-            })
-            .await
-            .map_err(MCPClientError::ToolCallError)?;
+            .call_tool(super::utils::call_tool_request_params(tool_name, params))
+            .await;
+        drop(oauth_request);
+        self.observe_oauth_service_result(&result, oauth_generation)
+            .await;
+        let result = result.map_err(MCPClientError::ToolCallError)?;
 
         Ok(result)
     }
@@ -291,42 +566,57 @@ impl MCPClientProtocol for HttpMCPClient {
 
         let guard = self.get_service().await?;
 
-        let request = ClientRequest::CallToolRequest(CallToolRequest {
-            method: Default::default(),
-            params: CallToolRequestParam {
-                name: tool_name.to_string().into(),
-                arguments: params.as_object().cloned(),
-            },
-            extensions: Default::default(),
-        });
-        let handle: RequestHandle<RoleClient> = guard
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(
+            super::utils::call_tool_request_params(tool_name, params),
+        ));
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
+        let handle = guard
             .as_ref()
             .unwrap()
             .send_request_with_option(request, PeerRequestOptions::no_options())
-            .await
-            .map_err(MCPClientError::ToolCallError)?;
+            .await;
+        let handle: RequestHandle<RoleClient> = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&error, oauth_generation)
+                    .await;
+                return Err(MCPClientError::ToolCallError(error));
+            }
+        };
         drop(guard);
         let request_id = handle.id.clone();
         let RequestHandle { rx, peer, .. } = handle;
 
         tokio::select! {
             biased;
-            resp = rx => match resp {
-                Ok(Ok(ServerResult::CallToolResult(r))) => Ok(CancellableCallOutcome::Completed(r)),
-                Ok(Ok(_)) => Err(MCPClientError::ProtocolError(
-                    "Unexpected response variant for tools/call".to_string(),
-                )),
-                Ok(Err(e)) => Err(MCPClientError::ToolCallError(e)),
-                Err(_) => Err(MCPClientError::ConnectionError("MCP transport closed".to_string())),
+            resp = rx => {
+                drop(oauth_request);
+                match resp {
+                    Ok(Ok(ServerResult::CallToolResult(r))) => {
+                        self.observe_oauth_service_success(oauth_generation).await;
+                        Ok(CancellableCallOutcome::Completed(r))
+                    },
+                    Ok(Ok(_)) => Err(MCPClientError::ProtocolError(
+                        "Unexpected response variant for tools/call".to_string(),
+                    )),
+                    Ok(Err(e)) => {
+                        self.observe_oauth_service_error(&e, oauth_generation).await;
+                        Err(MCPClientError::ToolCallError(e))
+                    },
+                    Err(_) => Err(MCPClientError::ConnectionError("MCP transport closed".to_string())),
+                }
             },
             _ = cancel.cancelled() => {
-                let notify = peer.notify_cancelled(CancelledNotificationParam {
-                    request_id,
-                    reason: Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
-                });
+                let notify = peer.notify_cancelled(CancelledNotificationParam::new(
+                    Some(request_id),
+                    Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
+                ));
                 if tokio::time::timeout(Duration::from_secs(2), notify).await.is_err() {
                     warn!("emit MCP notifications/cancelled timed out (best-effort, ignored)");
                 }
+                drop(oauth_request);
                 Ok(CancellableCallOutcome::Cancelled)
             }
         }
@@ -340,9 +630,13 @@ impl MCPClientProtocol for HttpMCPClient {
         let guard = self.get_service().await?;
         let service = guard.as_ref().unwrap();
 
-        let all_resources = service
-            .list_all_resources()
-            .await
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
+        let result = service.list_all_resources().await;
+        drop(oauth_request);
+        self.observe_oauth_service_result(&result, oauth_generation)
+            .await;
+        let all_resources = result
             .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
 
         // 过滤 window:// 资源并按 priority 降序排序（v0.2 元数据下沉，逻辑共享）
@@ -375,10 +669,14 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
-        let param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
-        let result = service
-            .list_resources(param)
-            .await
+        let param = cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
+        let result = service.list_resources(param).await;
+        drop(oauth_request);
+        self.observe_oauth_service_result(&result, oauth_generation)
+            .await;
+        let result = result
             .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
 
         Ok((result.resources, result.next_cursor))
@@ -395,11 +693,15 @@ impl MCPClientProtocol for HttpMCPClient {
         let guard = self.get_service().await?;
         let service = guard.as_ref().unwrap();
 
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
         let result = service
-            .read_resource(ReadResourceRequestParam {
-                uri: resource.uri.clone(),
-            })
-            .await
+            .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
+            .await;
+        drop(oauth_request);
+        self.observe_oauth_service_result(&result, oauth_generation)
+            .await;
+        let result = result
             .map_err(|e| MCPClientError::ProtocolError(format!("Read resource error: {}", e)))?;
 
         Ok(result)
@@ -413,14 +715,17 @@ impl MCPClientProtocol for HttpMCPClient {
         let guard = self.get_service().await?;
         let service = guard.as_ref().unwrap();
 
-        service
-            .subscribe(SubscribeRequestParam {
-                uri: resource.uri.clone(),
-            })
-            .await
-            .map_err(|e| {
-                MCPClientError::ProtocolError(format!("Subscribe resource error: {}", e))
-            })?;
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
+        let result = service
+            .subscribe(SubscribeRequestParams::new(resource.uri.clone()))
+            .await;
+        drop(oauth_request);
+        self.observe_oauth_service_result(&result, oauth_generation)
+            .await;
+        result.map_err(|e| {
+            MCPClientError::ProtocolError(format!("Subscribe resource error: {}", e))
+        })?;
 
         drop(guard);
 
@@ -458,14 +763,17 @@ impl MCPClientProtocol for HttpMCPClient {
         let guard = self.get_service().await?;
         let service = guard.as_ref().unwrap();
 
-        service
-            .unsubscribe(UnsubscribeRequestParam {
-                uri: resource.uri.clone(),
-            })
-            .await
-            .map_err(|e| {
-                MCPClientError::ProtocolError(format!("Unsubscribe resource error: {}", e))
-            })?;
+        let oauth_request = self.prepare_oauth_request().await?;
+        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
+        let result = service
+            .unsubscribe(UnsubscribeRequestParams::new(resource.uri.clone()))
+            .await;
+        drop(oauth_request);
+        self.observe_oauth_service_result(&result, oauth_generation)
+            .await;
+        result.map_err(|e| {
+            MCPClientError::ProtocolError(format!("Unsubscribe resource error: {}", e))
+        })?;
 
         drop(guard);
 

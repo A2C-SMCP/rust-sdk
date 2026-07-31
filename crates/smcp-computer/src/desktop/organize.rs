@@ -252,30 +252,26 @@ mod tests {
         priority: i32,
         fullscreen: bool,
     ) -> WindowInfo {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
         use rmcp::model::{Annotations, Meta};
 
-        let mut raw = RawResource::new(uri.to_string(), format!("Window {}", uri));
+        let mut resource = Resource::new(uri.to_string(), format!("Window {}", uri));
         if fullscreen {
             let mut map = serde_json::Map::new();
             map.insert("fullscreen".to_string(), serde_json::Value::Bool(true));
-            raw.meta = Some(Meta(map));
+            resource.meta = Some(Meta(map));
         }
-        let annotations = Some(Annotations {
-            audience: None,
-            priority: Some(priority as f32 / 100.0),
-            last_modified: None,
-        });
-        let resource = Annotated::new(raw, annotations);
+        resource.annotations = Some(Annotations::default().with_priority(priority as f32 / 100.0));
 
         WindowInfo {
             // 测试中 server 串同时充当 bundle_id（分组键）与 server_name（展示名）。
             bundle_id: server.to_string(),
             server_name: server.to_string(),
             resource,
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(content, uri.to_string())],
-            },
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                content,
+                uri.to_string(),
+            )]),
         }
     }
 
@@ -467,9 +463,7 @@ mod tests {
             bundle_id: "server1".to_string(),
             server_name: "server1".to_string(),
             resource: make_resource("window://server1.mcp.com/window1", "Window 1", None, None),
-            read_result: ReadResourceResult {
-                contents: Vec::new(),
-            },
+            read_result: ReadResourceResult::new(Vec::new()),
         }];
 
         let result = organize_desktop(windows, None, &[]);
@@ -501,9 +495,10 @@ mod tests {
                 bundle_id: "server1".to_string(),
                 server_name: "server1".to_string(),
                 resource: make_resource(":::this_is_not_a_uri", "Bad Window", None, None),
-                read_result: ReadResourceResult {
-                    contents: vec![ResourceContents::text("bad", ":::this_is_not_a_uri")],
-                },
+                read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                    "bad",
+                    ":::this_is_not_a_uri",
+                )]),
             },
             create_test_window("server1", "window://server1.mcp.com/good", "good", 0, false),
         ];
@@ -696,20 +691,17 @@ mod tests {
 
     #[test]
     fn test_organize_desktop_default_priority_when_no_annotations() {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
 
         // 无 annotations 的窗口：priority 视为缺省 0.0，应排在高 priority 窗口之后。
-        let raw = RawResource::new("window://server1.mcp.com/no-ann", "no-ann");
         let bare = WindowInfo {
             bundle_id: "server1".to_string(),
             server_name: "server1".to_string(),
-            resource: Annotated::new(raw, None),
-            read_result: ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "bare",
-                    "window://server1.mcp.com/no-ann",
-                )],
-            },
+            resource: Resource::new("window://server1.mcp.com/no-ann", "no-ann"),
+            read_result: ReadResourceResult::new(vec![ResourceContents::text(
+                "bare",
+                "window://server1.mcp.com/no-ann",
+            )]),
         };
         let high = create_test_window(
             "server1",

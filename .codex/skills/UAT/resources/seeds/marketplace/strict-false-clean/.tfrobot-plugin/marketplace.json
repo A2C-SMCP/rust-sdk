@@ -1,0 +1,1 @@
+{"name":"strict-false-clean","version":"1.0.0","plugins":[{"name":"audit","source":"./plugins/audit","strict":false,"skills":["extra-skills"]}]}

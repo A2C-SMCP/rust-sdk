@@ -80,6 +80,7 @@ use crate::mcp_clients::{
     },
     ConfigRender, RenderError,
 };
+use crate::oauth::{InMemoryOAuthCredentialStore, OAuthCredentialStore};
 use crate::socketio_client::{SmcpComputerClient, SmcpComputerClientBuilder};
 use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
@@ -308,6 +309,9 @@ pub struct Computer<S: Session> {
     /// 经 [`with_client_factory`](Self::with_client_factory) 注入；[`new_manager`](Self::new_manager)（boot_up /
     /// mount_server 惰性建 manager 处）应用到 manager，使 hermetic 测试能注入假 client 测「mount→running」。
     client_factory_override: Option<crate::mcp_clients::manager::ClientFactory>,
+    /// OAuth credential storage is host-owned and explicitly injectable. The default is process-local
+    /// memory, so constructing a `Computer` never probes an OS keyring or cloud secret service.
+    oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     /// 工具调用历史 / Tool call history
     tool_history: Arc<Mutex<Vec<ToolCallRecord>>>,
     /// Session实例 / Session instance
@@ -699,6 +703,7 @@ impl<S: Session> Computer<S> {
             auto_connect,
             auto_reconnect,
             client_factory_override: None,
+            oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             tool_history: Arc::new(Mutex::new(Vec::new())),
             session,
             socketio_client,
@@ -750,6 +755,24 @@ impl<S: Session> Computer<S> {
         factory: crate::mcp_clients::manager::ClientFactory,
     ) -> Self {
         self.client_factory_override = Some(factory);
+        self
+    }
+
+    /// Inject the host-owned OAuth credential store shared by every manager this computer creates.
+    ///
+    /// The default is an in-memory store. Hosts that require cross-process resume may inject their
+    /// own durable implementation without changing the SDK's storage policy. Rebuilding a
+    /// `Computer` restores credentials when the new instance receives the same durable store (or
+    /// another handle to the same backend) and the OAuth bundle/resource/issuer/grant key is
+    /// unchanged.
+    ///
+    /// Multi-tenant hosts should bind trusted tenant/principal context when constructing `store`;
+    /// that context does not belong in serializable OAuth configuration. An explicitly injected
+    /// store is authoritative: backend failures are returned and never trigger a silent in-memory
+    /// fallback.
+    #[must_use]
+    pub fn with_oauth_credential_store(mut self, store: Arc<dyn OAuthCredentialStore>) -> Self {
+        self.oauth_credential_store = store;
         self
     }
 
@@ -3429,11 +3452,78 @@ impl<S: Session> Computer<S> {
     /// [`with_client_factory`](Self::with_client_factory) override 时应用到 manager（hermetic 测试用），否则保持
     /// 真实 `client_factory`。**`change_sender` 仍由 `boot_up` 在调用本方法后单独注入**（本方法不涉及）。
     async fn new_manager(&self) -> MCPServerManager {
-        let manager = MCPServerManager::new();
+        let manager =
+            MCPServerManager::with_oauth_credential_store(Arc::clone(&self.oauth_credential_store));
+        manager
+            .set_secret_resolver(self.secret_resolver.clone())
+            .await;
         if let Some(factory) = self.client_factory_override.clone() {
             manager.set_client_factory(Some(factory)).await;
         }
         manager
+    }
+
+    /// Query OAuth state for a protected remote MCP server.
+    pub async fn oauth_status(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<crate::oauth::OAuthStatus, crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.oauth_status(bundle_id).await
+    }
+
+    /// Begin Authorization Code + PKCE. The embedding app opens the returned URL.
+    pub async fn begin_oauth(
+        &self,
+        bundle_id: &BundleId,
+        request: crate::oauth::OAuthBeginRequest,
+    ) -> Result<crate::oauth::OAuthLaunch, crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.begin_oauth(bundle_id, request).await
+    }
+
+    /// Complete the browser callback without starting an SDK-owned listener.
+    ///
+    /// The returned outcome contains the granted scopes. Expired, mismatched-state, and
+    /// mismatched-issuer callbacks remain typed [`crate::oauth::OAuthError`] values.
+    pub async fn complete_oauth(
+        &self,
+        bundle_id: &BundleId,
+        callback: crate::oauth::OAuthCallback,
+    ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.complete_oauth(bundle_id, callback).await
+    }
+
+    /// Cancel a pending browser flow, delete its PKCE/CSRF state, and return the resulting status.
+    pub async fn cancel_oauth(
+        &self,
+        bundle_id: &BundleId,
+        cancellation: crate::oauth::OAuthCancellation,
+    ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.cancel_oauth(bundle_id, cancellation).await
+    }
+
+    /// Clear persisted tokens and pending authorization state.
+    pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), crate::oauth::OAuthError> {
+        let manager = self.mcp_manager.read().await;
+        let manager = manager
+            .as_ref()
+            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.clear_oauth(bundle_id).await
     }
 
     /// #148：MCP 起停**真有变更**后：bump capability revision（§12 R2：改变 Agent-facing 工具投影）
@@ -3490,6 +3580,7 @@ impl<S: Session> Computer<S> {
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
             client_factory_override: self.client_factory_override.clone(),
+            oauth_credential_store: Arc::clone(&self.oauth_credential_store),
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: detached_socketio.clone(),
@@ -3724,6 +3815,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
             client_factory_override: self.client_factory_override.clone(),
+            oauth_credential_store: Arc::clone(&self.oauth_credential_store),
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: Arc::clone(&self.socketio_client),

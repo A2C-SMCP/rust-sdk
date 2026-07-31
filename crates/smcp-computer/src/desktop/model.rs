@@ -77,12 +77,10 @@ mod tests {
             None,
         );
 
-        let read_result = ReadResourceResult {
-            contents: vec![ResourceContents::text(
-                "Test content",
-                "window://test.mcp.com/window1",
-            )],
-        };
+        let read_result = ReadResourceResult::new(vec![ResourceContents::text(
+            "Test content",
+            "window://test.mcp.com/window1",
+        )]);
 
         let window_info = WindowInfo::new(
             "test_server".to_string(),

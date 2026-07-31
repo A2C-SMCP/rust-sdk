@@ -17,6 +17,28 @@ Rust版本的A2C-SMCP Computer模块实现，提供MCP服务器连接管理和�
 - **超时控制**: 所有操作支持超时机制，防止任务挂起
 - **资源清理**: 显式的shutdown机制，确保资源正确释放
 
+### OAuth Credential Storage
+
+OAuth HTTP MCP credentials are keyed by bundle, canonical resource, authorization server, and
+grant/client identity. `Computer` uses a private `InMemoryOAuthCredentialStore` by default and
+never probes the OS Keychain. Hosts that need persistence inject one shared store:
+
+```rust
+let store: Arc<dyn OAuthCredentialStore> = Arc::new(HostCredentialStore::new()?);
+let computer = Computer::new(name, session, inputs, servers, false, false)
+    .with_oauth_credential_store(store);
+```
+
+Desktop hosts may implement the trait with an OS Keychain backend. Cloud hosts should bind trusted
+tenant/principal context when constructing a DB/Vault-backed store. The injected backend must
+encrypt values at rest and must not log them. Client secrets and private keys remain
+`SecretValueResolver` inputs; pending PKCE state and callback routing are separate from credential
+storage. See [the OAuth architecture decision][oauth-architecture].
+For browser/callback ownership, failure mapping, and local/cloud flow-driver requirements, follow
+the normative [OAuth host integration contract](docs/oauth-host-integration.md).
+
+[oauth-architecture]: https://github.com/A2C-SMCP/rust-sdk/blob/main/docs/computer/rmcp-oauth-decision.md
+
 ## 架构设计 / Architecture
 
 ```

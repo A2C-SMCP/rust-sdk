@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Breaking Changes
+
+- *(computer)* #157 upgrades the public MCP model and transport surface from `rmcp 0.11`
+  to exactly `rmcp 2.2.0`. Downstream code must use the rmcp 2.2 resource/content
+  layouts; removed legacy aliases and construction shims such as `RawContent`,
+  `RawTextContent`, `RawResource`, and `Annotated` are no longer re-exported.
+- *(computer)* `OAuthError::Protocol` now carries the SDK-owned
+  `OAuthProtocolError` category instead of rmcp's `AuthError`. Provider response
+  details are intentionally discarded at this boundary.
+- *(computer)* #160 changes interactive `complete_oauth` and `cancel_oauth` to return
+  `OAuthFlowOutcome`. Expired and issuer-mismatched callbacks now use dedicated
+  `OAuthError` variants instead of a generic protocol error.
+- *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
+
+### Features
+
+- *(computer)* #157 adds OAuth status, begin, callback completion, and credential
+  clearing APIs for Streamable HTTP servers. Supported grants include Authorization
+  Code + PKCE (pre-registered, CIMD, or DCR clients) and Client Credentials
+  (`client_secret` or `private_key_jwt`), with refresh and bounded
+  `insufficient_scope` step-up.
+- *(computer)* #159 makes OAuth credential policy host-injectable through
+  `Computer::with_oauth_credential_store`; credentials are isolated by bundle ID, canonical protected resource,
+  issuer, client mode, client identity, and configured scopes. The SDK default is
+  process-local memory and never probes an OS credential vault; hosts that need
+  cross-process resume must inject an `OAuthCredentialStore`.
+- *(computer)* #160 defines one browser/callback host contract for local loopback and
+  headless HTTPS Gateway flow drivers, with structured completion/termination outcomes,
+  one-time opaque-state routing, deterministic expiry, and rustdoc-integrated guidance.
+
+### Bug Fixes
+
+- *(computer)* Bound process-local OAuth and MCP lifecycle registries by retaining only
+  weak references and reclaiming dead slots during server/configuration churn.
+- *(computer)* Keep plain-HTTP SSE clients from initializing the platform TLS
+  certificate store. This prevents macOS Keychain contention from delaying or
+  failing concurrent local MCP connections and their prompt error handling.
+
+### Migration Notes
+
+- Add the optional `oauth` object to an HTTP server configuration and provide secret
+  values through `SecretValueResolver` input IDs. Do not combine OAuth with a static
+  `Authorization` header.
+- The embedding Desktop/CLI must open `OAuthLaunch.authorization_url`, receive the
+  loopback/HTTPS callback, and pass its `code`, `state`, and optional `issuer` to
+  `complete_oauth`. Map `access_denied` and other OAuth errors to the corresponding
+  `OAuthCancellationReason` and call `cancel_oauth`; neither method returns `()`.
+  The SDK does not open a browser or bind a callback listener.
+- Persistent OAuth is now host policy: Desktop applications may inject a Keychain-backed
+  `OAuthCredentialStore`, while multi-tenant services should bind their injected store to
+  tenant/principal runtime context. Without injection, credentials are lost on process exit.
+- OAuth configuration and status fields serialize as camelCase. Existing non-OAuth
+  HTTP servers retain normal redirect behavior; OAuth requests only follow
+  same-origin redirects.
+- Match `OAuthError::Protocol(OAuthProtocolError::...)` for stable control flow. Raw
+  rmcp/provider errors are no longer available through the public error value.
+
 ## [0.3.1] - 2026-07-27
 
 ### Bug Fixes
@@ -434,4 +493,3 @@ All notable changes to this project will be documented in this file.
 ### Ci
 
 - 添加 GitHub Actions 流水线配置
-
