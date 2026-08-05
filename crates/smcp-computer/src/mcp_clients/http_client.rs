@@ -15,9 +15,10 @@ use super::{ResourceCache, SubscriptionManager};
 use crate::inputs::SecretValueResolver;
 use crate::oauth::{
     clear_stored_oauth_credentials, InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback,
-    OAuthCancellation, OAuthCoordinator, OAuthCredentialStore, OAuthError, OAuthFlowOutcome,
-    OAuthLaunch, OAuthOptions, OAuthRequestGuard, OAuthStatus,
+    OAuthCancellation, OAuthCoordinator, OAuthCoordinatorContext, OAuthCredentialStore, OAuthError,
+    OAuthFlowOutcome, OAuthLaunch, OAuthOptions, OAuthRequestGuard, OAuthStatus,
 };
+use crate::status::RuntimeStatus;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::{
@@ -58,6 +59,7 @@ pub struct HttpMCPClient {
     secret_resolver: Option<Arc<dyn SecretValueResolver>>,
     oauth_bundle_id: BundleId,
     oauth_credential_store: Arc<dyn OAuthCredentialStore>,
+    oauth_events: Option<Arc<RuntimeStatus>>,
     oauth: OnceCell<Arc<OAuthCoordinator>>,
 }
 
@@ -88,6 +90,7 @@ impl HttpMCPClient {
             oauth_bundle_id: BundleId::try_from("standalone-http-oauth")
                 .expect("static standalone OAuth bundle ID must be valid"),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
+            oauth_events: None,
             oauth: OnceCell::new(),
         }
     }
@@ -115,9 +118,11 @@ impl HttpMCPClient {
         mut self,
         bundle_id: BundleId,
         credential_store: Arc<dyn OAuthCredentialStore>,
+        events: Option<Arc<RuntimeStatus>>,
     ) -> Self {
         self.oauth_bundle_id = bundle_id;
         self.oauth_credential_store = credential_store;
+        self.oauth_events = events;
         self
     }
 
@@ -195,11 +200,16 @@ impl HttpMCPClient {
         self.oauth
             .get_or_try_init(|| async {
                 let protected_resource_headers = self.build_http_headers()?;
+                let resource = options.effective_resource(&self.base.params.url)?;
                 OAuthCoordinator::new(
-                    &self.oauth_bundle_id,
+                    OAuthCoordinatorContext::new(
+                        self.oauth_bundle_id.clone(),
+                        Arc::clone(&self.oauth_credential_store),
+                        self.oauth_events.clone(),
+                    ),
                     &self.base.params.url,
+                    &resource,
                     options,
-                    Arc::clone(&self.oauth_credential_store),
                     self.secret_resolver.clone(),
                     self.build_http_client_with_headers(protected_resource_headers.clone())?,
                     protected_resource_headers,
@@ -251,15 +261,24 @@ impl HttpMCPClient {
         if let Some(oauth) = self.oauth.get() {
             oauth.clear().await
         } else {
+            let resource = self
+                .oauth_options
+                .as_ref()
+                .expect("OAuth options were checked above")
+                .effective_resource(&self.base.params.url)?;
             clear_stored_oauth_credentials(
                 &self.oauth_bundle_id,
-                &self.base.params.url,
+                &resource,
                 self.oauth_options
                     .as_ref()
                     .expect("OAuth options were checked above"),
                 Arc::clone(&self.oauth_credential_store),
             )
-            .await
+            .await?;
+            if let Some(events) = self.oauth_events.as_ref() {
+                events.update_oauth_status(self.oauth_bundle_id.clone(), OAuthStatus::Unauthorized);
+            }
+            Ok(())
         }
     }
 

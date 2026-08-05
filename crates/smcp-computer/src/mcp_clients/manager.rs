@@ -20,6 +20,7 @@ use crate::oauth::{
     OAuthCredentialStore, OAuthError, OAuthFlowOutcome, OAuthLaunch, OAuthStatus,
 };
 use crate::skills::{McpResource, SkillResourceManager, SkillStagingError};
+use crate::status::RuntimeStatus;
 use crate::weak_registry::WeakRegistry;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -118,6 +119,8 @@ pub struct MCPServerManager {
     oauth_clients: Arc<RwLock<HashMap<BundleId, Arc<HttpMCPClient>>>>,
     /// One host-injected keyed store shared by every OAuth MCP managed by this instance.
     oauth_credential_store: Arc<dyn OAuthCredentialStore>,
+    /// Optional Computer-owned event sink for OAuth status transitions.
+    oauth_events: Option<Arc<RuntimeStatus>>,
     secret_resolver: Arc<RwLock<Option<Arc<dyn SecretValueResolver>>>>,
     /// Serialize start/stop/update for each server identity without blocking unrelated servers.
     lifecycle_locks: Arc<WeakRegistry<BundleId, Mutex<()>>>,
@@ -167,6 +170,7 @@ impl MCPServerManager {
             client_factory_override: Arc::new(RwLock::new(None)),
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
+            oauth_events: None,
             secret_resolver: Arc::new(RwLock::new(None)),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
         }
@@ -195,6 +199,7 @@ impl MCPServerManager {
             client_factory_override: Arc::new(RwLock::new(None)),
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
+            oauth_events: None,
             secret_resolver: Arc::new(RwLock::new(None)),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
         }
@@ -208,6 +213,11 @@ impl MCPServerManager {
             oauth_credential_store: store,
             ..Self::new()
         }
+    }
+
+    pub(crate) fn with_oauth_events(mut self, events: Arc<RuntimeStatus>) -> Self {
+        self.oauth_events = Some(events);
+        self
     }
 
     /// 获取状态通知器 / Get state notifier
@@ -488,6 +498,7 @@ impl MCPServerManager {
                             .with_oauth_context(
                                 bundle_id.clone(),
                                 Arc::clone(&self.oauth_credential_store),
+                                self.oauth_events.clone(),
                             )
                             .with_oauth(
                                 http.oauth.expect("guarded by is_some"),
@@ -2042,7 +2053,11 @@ impl MCPServerManager {
         let options = http.oauth.ok_or(OAuthError::NotConfigured)?;
         let client = Arc::new(
             HttpMCPClient::new(http.server_parameters)
-                .with_oauth_context(bundle_id.clone(), Arc::clone(&self.oauth_credential_store))
+                .with_oauth_context(
+                    bundle_id.clone(),
+                    Arc::clone(&self.oauth_credential_store),
+                    self.oauth_events.clone(),
+                )
                 .with_oauth(options, self.secret_resolver.read().await.clone()),
         );
         let mut oauth_clients = self.oauth_clients.write().await;

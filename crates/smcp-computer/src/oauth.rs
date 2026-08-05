@@ -3,6 +3,7 @@
 use crate::inputs::SecretValueResolver;
 use crate::mcp_clients::bundle_id::BundleId;
 use crate::mcp_clients::model::{MCPServerInput, PromptStringInput};
+use crate::status::RuntimeStatus;
 use crate::weak_registry::WeakRegistry;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -627,11 +628,22 @@ impl StreamableHttpClient for SensitiveAuthClient {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthOptions {
+    /// Canonical RFC 8707 resource indicator.
+    ///
+    /// When omitted, the Streamable HTTP MCP endpoint is used for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
     #[serde(default)]
     pub client_name: Option<String>,
     pub mode: OAuthClientMode,
+}
+
+impl OAuthOptions {
+    pub(crate) fn effective_resource(&self, mcp_endpoint: &str) -> Result<String, OAuthError> {
+        canonical_resource_identity(self.resource.as_deref().unwrap_or(mcp_endpoint))
+    }
 }
 
 /// Interactive or machine-to-machine OAuth flow.
@@ -1169,7 +1181,7 @@ pub(crate) struct OAuthCoordinator {
     client: SensitiveAuthClient,
     store: ScopedCredentialStore,
     resolver: Option<Arc<dyn SecretValueResolver>>,
-    status: Arc<RwLock<OAuthStatus>>,
+    status: OAuthStatusState,
     granted_scopes: Arc<RwLock<Vec<String>>>,
     authorization_flow: Arc<Mutex<AuthorizationFlowState>>,
     machine_scope_upgrades: Mutex<HashMap<String, usize>>,
@@ -1177,6 +1189,63 @@ pub(crate) struct OAuthCoordinator {
     request_gate: Arc<RwLock<()>>,
     state_store: ExpiringStateStore,
     oauth_http_client: Arc<dyn OAuthHttpClient>,
+}
+
+pub(crate) struct OAuthCoordinatorContext {
+    bundle_id: BundleId,
+    credential_store: Arc<dyn OAuthCredentialStore>,
+    events: Option<Arc<RuntimeStatus>>,
+}
+
+impl OAuthCoordinatorContext {
+    pub(crate) fn new(
+        bundle_id: BundleId,
+        credential_store: Arc<dyn OAuthCredentialStore>,
+        events: Option<Arc<RuntimeStatus>>,
+    ) -> Self {
+        Self {
+            bundle_id,
+            credential_store,
+            events,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OAuthStatusState {
+    current: Arc<RwLock<OAuthStatus>>,
+    bundle_id: BundleId,
+    events: Option<Arc<RuntimeStatus>>,
+}
+
+impl OAuthStatusState {
+    fn new(bundle_id: BundleId, initial: OAuthStatus, events: Option<Arc<RuntimeStatus>>) -> Self {
+        if let Some(events) = events.as_ref() {
+            events.update_oauth_status(bundle_id.clone(), initial.clone());
+        }
+        Self {
+            current: Arc::new(RwLock::new(initial)),
+            bundle_id,
+            events,
+        }
+    }
+
+    async fn get(&self) -> OAuthStatus {
+        self.current.read().await.clone()
+    }
+
+    async fn set(&self, next: OAuthStatus) {
+        let mut current = self.current.write().await;
+        if *current == next {
+            return;
+        }
+        *current = next.clone();
+        // Publish while the state lock still serializes writers so concurrent transitions cannot
+        // reach the host event stream in the reverse order from the queryable coordinator state.
+        if let Some(events) = self.events.as_ref() {
+            events.update_oauth_status(self.bundle_id.clone(), next);
+        }
+    }
 }
 
 pub(crate) struct OAuthRequestGuard {
@@ -1192,25 +1261,24 @@ impl OAuthRequestGuard {
 
 impl OAuthCoordinator {
     pub(crate) async fn new(
-        bundle_id: &BundleId,
+        context: OAuthCoordinatorContext,
+        mcp_endpoint: &str,
         resource: &str,
         options: OAuthOptions,
-        credential_store: Arc<dyn OAuthCredentialStore>,
         resolver: Option<Arc<dyn SecretValueResolver>>,
         http_client: reqwest::Client,
         protected_resource_headers: HeaderMap,
     ) -> Result<Self, OAuthError> {
         let oauth_http_client = Arc::new(
             DiscoveryCleanupOAuthHttpClient::with_protected_resource_headers(
-                resource,
+                mcp_endpoint,
                 protected_resource_headers,
             )?,
         );
         Self::new_with_oauth_http_client(
-            bundle_id,
+            context,
             resource,
             options,
-            credential_store,
             resolver,
             http_client,
             oauth_http_client,
@@ -1219,14 +1287,18 @@ impl OAuthCoordinator {
     }
 
     async fn new_with_oauth_http_client(
-        bundle_id: &BundleId,
+        context: OAuthCoordinatorContext,
         resource: &str,
         options: OAuthOptions,
-        credential_store: Arc<dyn OAuthCredentialStore>,
         resolver: Option<Arc<dyn SecretValueResolver>>,
         http_client: reqwest::Client,
         oauth_http_client: Arc<dyn OAuthHttpClient>,
     ) -> Result<Self, OAuthError> {
+        let OAuthCoordinatorContext {
+            bundle_id,
+            credential_store,
+            events,
+        } = context;
         let resource = canonical_resource_identity(resource)?;
         let store = ScopedCredentialStore::new(
             bundle_id.clone(),
@@ -1311,13 +1383,14 @@ impl OAuthCoordinator {
         };
         let client = SensitiveAuthClient::new(AuthClient::new(http_client, manager));
         drop(initialization_guard);
+        let status = OAuthStatusState::new(bundle_id, initial_status, events);
         Ok(Self {
             resource,
             options,
             client,
             store,
             resolver,
-            status: Arc::new(RwLock::new(initial_status)),
+            status,
             granted_scopes: Arc::new(RwLock::new(restored_scopes)),
             authorization_flow: Arc::new(Mutex::new(AuthorizationFlowState::Idle)),
             machine_scope_upgrades: Mutex::new(HashMap::new()),
@@ -1342,10 +1415,21 @@ impl OAuthCoordinator {
         }
         let guard = Arc::clone(&self.request_gate).read_owned().await;
         let manager = self.client.inner.auth_manager.lock().await;
-        manager
+        let access_token = manager
             .get_access_token()
             .with_subscriber(tracing::subscriber::NoSubscriber::default())
-            .await?;
+            .await;
+        drop(manager);
+        if let Err(error) = access_token {
+            if matches!(&error, RmcpAuthError::TokenRefreshFailed(_)) {
+                self.status
+                    .set(OAuthStatus::Error {
+                        message: "OAuth access token refresh failed".to_string(),
+                    })
+                    .await;
+            }
+            return Err(error.into());
+        }
         Ok(OAuthRequestGuard {
             generation: self.credential_generation(),
             _guard: guard,
@@ -1354,11 +1438,11 @@ impl OAuthCoordinator {
 
     pub(crate) async fn status(&self) -> OAuthStatus {
         let _request_guard = self.request_gate.write().await;
-        if matches!(*self.status.read().await, OAuthStatus::AuthorizationPending) {
+        if matches!(self.status.get().await, OAuthStatus::AuthorizationPending) {
             let _ = self.expire_invalid_authorization_flow().await;
         }
         if matches!(
-            *self.status.read().await,
+            self.status.get().await,
             OAuthStatus::Authorized { .. } | OAuthStatus::Error { .. }
         ) {
             let access_token = self
@@ -1379,22 +1463,26 @@ impl OAuthCoordinator {
                             credentials.granted_scopes
                         };
                         *self.granted_scopes.write().await = scopes.clone();
-                        *self.status.write().await = OAuthStatus::Authorized { scopes };
+                        self.status.set(OAuthStatus::Authorized { scopes }).await;
                     }
                     Ok(None) | Err(_) => {
-                        *self.status.write().await = OAuthStatus::Error {
-                            message: "OAuth credential state is unavailable".to_string(),
-                        };
+                        self.status
+                            .set(OAuthStatus::Error {
+                                message: "OAuth credential state is unavailable".to_string(),
+                            })
+                            .await;
                     }
                 },
                 Err(_) => {
-                    *self.status.write().await = OAuthStatus::Error {
-                        message: "OAuth access token is unavailable".to_string(),
-                    };
+                    self.status
+                        .set(OAuthStatus::Error {
+                            message: "OAuth access token is unavailable".to_string(),
+                        })
+                        .await;
                 }
             }
         }
-        self.status.read().await.clone()
+        self.status.get().await
     }
 
     async fn resolve_secret(&self, id: &str) -> Result<String, OAuthError> {
@@ -1441,10 +1529,10 @@ impl OAuthCoordinator {
             if token_available && has_required_scopes {
                 *self.granted_scopes.write().await = scopes.clone();
                 if !matches!(
-                    *self.status.read().await,
+                    self.status.get().await,
                     OAuthStatus::ReauthorizationRequired { .. }
                 ) {
-                    *self.status.write().await = OAuthStatus::Authorized { scopes };
+                    self.status.set(OAuthStatus::Authorized { scopes }).await;
                 }
                 return Ok(());
             }
@@ -1455,7 +1543,23 @@ impl OAuthCoordinator {
                     requested_scopes.push(required.clone());
                 }
             }
-            return self.exchange_machine_with_scopes(requested_scopes).await;
+            let was_authorized = matches!(
+                self.status.get().await,
+                OAuthStatus::Authorized { .. } | OAuthStatus::ReauthorizationRequired { .. }
+            );
+            let result = self.exchange_machine_with_scopes(requested_scopes).await;
+            if result.is_err() {
+                self.status
+                    .set(OAuthStatus::Error {
+                        message: if was_authorized {
+                            "OAuth access token refresh failed".to_string()
+                        } else {
+                            "OAuth client credentials exchange failed".to_string()
+                        },
+                    })
+                    .await;
+            }
+            return result;
         }
         Ok(())
     }
@@ -1505,7 +1609,7 @@ impl OAuthCoordinator {
         self.store.overwrite_granted_scopes(scopes.clone()).await?;
         *self.granted_scopes.write().await = scopes.clone();
         *self.client.inner.auth_manager.lock().await = manager;
-        *self.status.write().await = OAuthStatus::Authorized { scopes };
+        self.status.set(OAuthStatus::Authorized { scopes }).await;
         Ok(())
     }
 
@@ -1528,15 +1632,15 @@ impl OAuthCoordinator {
             return;
         }
         if matches!(self.options.mode, OAuthClientMode::AuthorizationCode { .. }) {
-            *self.status.write().await = reauthorization;
+            self.status.set(reauthorization).await;
             return;
         }
         let normalized_scopes = normalize_required_scopes(&required_scope);
         if normalized_scopes.is_empty() {
-            *self.status.write().await = reauthorization;
+            self.status.set(reauthorization).await;
             return;
         }
-        *self.status.write().await = reauthorization.clone();
+        self.status.set(reauthorization.clone()).await;
         let reserved = {
             let mut attempts = self.machine_scope_upgrades.lock().await;
             reserve_machine_scope_upgrade(&mut attempts, &required_scope)
@@ -1559,7 +1663,7 @@ impl OAuthCoordinator {
         // A token endpoint accepting the expanded scope does not prove that the
         // protected resource will accept it. Keep the token provisional until a
         // subsequent MCP request succeeds against the resource server.
-        *self.status.write().await = reauthorization;
+        self.status.set(reauthorization).await;
     }
 
     pub(crate) async fn begin(
@@ -1672,7 +1776,7 @@ impl OAuthCoordinator {
             requested_scopes,
             generation,
         });
-        *self.status.write().await = OAuthStatus::AuthorizationPending;
+        self.status.set(OAuthStatus::AuthorizationPending).await;
         Ok(launch)
     }
 
@@ -1783,7 +1887,7 @@ impl OAuthCoordinator {
         let client = self.client.clone();
         let store = self.store.clone();
         let state_store = self.state_store.clone();
-        let status = Arc::clone(&self.status);
+        let status = self.status.clone();
         let granted_scopes = Arc::clone(&self.granted_scopes);
         let authorization_flow = Arc::clone(&self.authorization_flow);
         let (result_tx, result_rx) = oneshot::channel();
@@ -1796,23 +1900,29 @@ impl OAuthCoordinator {
                         scopes = requested_scopes;
                     }
                     if let Err(error) = store.overwrite_granted_scopes(scopes.clone()).await {
-                        *status.write().await = OAuthStatus::Error {
-                            message: "OAuth credential storage failed".to_string(),
-                        };
+                        status
+                            .set(OAuthStatus::Error {
+                                message: "OAuth credential storage failed".to_string(),
+                            })
+                            .await;
                         Err(error.into())
                     } else {
                         *granted_scopes.write().await = scopes.clone();
-                        *status.write().await = OAuthStatus::Authorized {
-                            scopes: scopes.clone(),
-                        };
+                        status
+                            .set(OAuthStatus::Authorized {
+                                scopes: scopes.clone(),
+                            })
+                            .await;
                         Ok(OAuthFlowOutcome::Authorized { scopes })
                     }
                 }
                 Err(error) => {
                     let result = state_store.delete(&callback_state).await;
-                    *status.write().await = OAuthStatus::Error {
-                        message: "OAuth authorization code exchange failed".to_string(),
-                    };
+                    status
+                        .set(OAuthStatus::Error {
+                            message: "OAuth authorization code exchange failed".to_string(),
+                        })
+                        .await;
                     match result {
                         Ok(()) => Err(error),
                         Err(delete_error) => Err(delete_error.into()),
@@ -1873,7 +1983,7 @@ impl OAuthCoordinator {
         let state_store = self.state_store.clone();
         let store = self.store.clone();
         let fallback_scopes = self.options.scopes.clone();
-        let status = Arc::clone(&self.status);
+        let status = self.status.clone();
         let granted_scopes = Arc::clone(&self.granted_scopes);
         let authorization_flow = Arc::clone(&self.authorization_flow);
         let cancellation_state = cancellation.state;
@@ -1931,7 +2041,7 @@ impl OAuthCoordinator {
         *authorization_flow = AuthorizationFlowState::Idle;
         self.machine_scope_upgrades.lock().await.clear();
         self.granted_scopes.write().await.clear();
-        *self.status.write().await = OAuthStatus::Unauthorized;
+        self.status.set(OAuthStatus::Unauthorized).await;
         Ok(())
     }
 
@@ -1959,7 +2069,7 @@ impl OAuthCoordinator {
         if self.credential_generation() != expected_generation
             || matches!(self.options.mode, OAuthClientMode::AuthorizationCode { .. })
             || !matches!(
-                *self.status.read().await,
+                self.status.get().await,
                 OAuthStatus::ReauthorizationRequired { .. }
             )
         {
@@ -1972,7 +2082,7 @@ impl OAuthCoordinator {
             _ => self.granted_scopes.read().await.clone(),
         };
         *self.granted_scopes.write().await = scopes.clone();
-        *self.status.write().await = OAuthStatus::Authorized { scopes };
+        self.status.set(OAuthStatus::Authorized { scopes }).await;
     }
 
     pub(crate) async fn observe_initialize_error(
@@ -2129,7 +2239,12 @@ fn is_private_use_redirect_uri(url: &Url) -> bool {
 }
 
 fn canonical_resource_identity(value: &str) -> Result<String, OAuthError> {
-    Ok(validate_secure_url(value, "protected resource")?.to_string())
+    let resource =
+        Url::parse(value).map_err(|_| OAuthError::Protocol(OAuthProtocolError::InvalidUrl))?;
+    if resource.fragment().is_some() {
+        return Err(OAuthError::Protocol(OAuthProtocolError::InvalidUrl));
+    }
+    Ok(resource.to_string())
 }
 
 fn validate_authorization_metadata(
@@ -2294,14 +2409,16 @@ async fn restore_authorization_status(
     store: &ScopedCredentialStore,
     fallback_scopes: &[String],
     granted_scopes: &RwLock<Vec<String>>,
-    status: &RwLock<OAuthStatus>,
+    status: &OAuthStatusState,
 ) -> Result<OAuthStatus, OAuthError> {
     let restored = match store.load().await {
         Ok(restored) => restored,
         Err(error) => {
-            *status.write().await = OAuthStatus::Error {
-                message: "OAuth credential state is unavailable".to_string(),
-            };
+            status
+                .set(OAuthStatus::Error {
+                    message: "OAuth credential state is unavailable".to_string(),
+                })
+                .await;
             return Err(error.into());
         }
     };
@@ -2317,7 +2434,7 @@ async fn restore_authorization_status(
         }
         _ => OAuthStatus::Unauthorized,
     };
-    *status.write().await = restored_status.clone();
+    status.set(restored_status.clone()).await;
     Ok(restored_status)
 }
 
@@ -2436,6 +2553,12 @@ mod tests {
 
     fn memory_credential_store() -> Arc<dyn OAuthCredentialStore> {
         Arc::new(InMemoryOAuthCredentialStore::default())
+    }
+
+    fn test_coordinator_context(
+        credential_store: Arc<dyn OAuthCredentialStore>,
+    ) -> OAuthCoordinatorContext {
+        OAuthCoordinatorContext::new(test_bundle_id(), credential_store, None)
     }
 
     const TEST_EC_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -2695,6 +2818,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     #[test]
     fn oauth_config_status_and_outcome_use_camel_case_fields() {
         let options = OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".into()],
             client_name: Some("Desktop".into()),
             mode: OAuthClientMode::ClientCredentialsPrivateKeyJwt {
@@ -2705,6 +2829,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             },
         };
         let value = serde_json::to_value(&options).unwrap();
+        assert!(value.get("resource").is_none());
         assert_eq!(value["clientName"], "Desktop");
         assert_eq!(value["mode"]["clientId"], "client");
         assert_eq!(value["mode"]["privateKeyInput"], "oauth-key");
@@ -2731,6 +2856,14 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         assert_eq!(
             serde_json::from_value::<OAuthOptions>(value).unwrap(),
             options
+        );
+
+        let mut explicit = options;
+        explicit.resource = Some("https://resource.example/canonical".into());
+        let explicit_value = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(
+            explicit_value["resource"],
+            "https://resource.example/canonical"
         );
     }
 
@@ -2771,6 +2904,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         );
 
         let options = OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".into()],
             client_name: None,
             mode: OAuthClientMode::AuthorizationCode {
@@ -2905,6 +3039,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     async fn credential_clear_and_generation_are_isolated_by_oauth_slot() {
         let resource = "https://resource.example/slot-isolation";
         let secret_options = OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".into()],
             client_name: None,
             mode: OAuthClientMode::ClientCredentialsSecret {
@@ -2913,6 +3048,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             },
         };
         let jwt_options = OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".into()],
             client_name: None,
             mode: OAuthClientMode::ClientCredentialsPrivateKeyJwt {
@@ -3093,6 +3229,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     #[test]
     fn stored_client_identity_must_match_fixed_registration() {
         let fixed = OAuthOptions {
+            resource: None,
             scopes: Vec::new(),
             client_name: None,
             mode: OAuthClientMode::AuthorizationCode {
@@ -3103,6 +3240,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             },
         };
         let dynamic = OAuthOptions {
+            resource: None,
             scopes: Vec::new(),
             client_name: None,
             mode: OAuthClientMode::AuthorizationCode {
@@ -3118,6 +3256,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
     #[test]
     fn credential_fingerprint_binds_grant_mode_and_scopes() {
         let auth_code = OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".into()],
             client_name: None,
             mode: OAuthClientMode::AuthorizationCode {
@@ -3150,6 +3289,16 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         assert!(validate_secure_url("https://resource.example/mcp", "resource").is_ok());
         assert!(validate_secure_url("http://127.0.0.1:8080/mcp", "resource").is_ok());
         assert!(validate_secure_url("http://resource.example/mcp", "resource").is_err());
+        assert_eq!(
+            canonical_resource_identity("https://EXAMPLE.com:443/a/../mcp").unwrap(),
+            "https://example.com/mcp"
+        );
+        assert_eq!(
+            canonical_resource_identity("urn:example:mcp-resource").unwrap(),
+            "urn:example:mcp-resource"
+        );
+        assert!(canonical_resource_identity("/relative-resource").is_err());
+        assert!(canonical_resource_identity("https://resource.example/mcp#fragment").is_err());
         assert!(validate_redirect_uri("http://localhost:9876/callback").is_ok());
         assert!(validate_redirect_uri("https://desktop.example/callback").is_ok());
         assert!(validate_redirect_uri("com.example.app:/oauth/callback").is_ok());
@@ -3479,6 +3628,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             });
         let resource = format!("{base_url}/mcp");
         let options = OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".into()],
             client_name: None,
             mode: OAuthClientMode::ClientCredentialsPrivateKeyJwt {
@@ -3490,10 +3640,9 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         };
         let credential_store = memory_credential_store();
         let coordinator = OAuthCoordinator::new_with_oauth_http_client(
-            &test_bundle_id(),
+            test_coordinator_context(Arc::clone(&credential_store)),
             &resource,
             options.clone(),
-            Arc::clone(&credential_store),
             Some(Arc::new(JwtTestSecretResolver)),
             reqwest::Client::new(),
             Arc::clone(&oauth_http_client),
@@ -3561,10 +3710,9 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         }
 
         let restored = OAuthCoordinator::new_with_oauth_http_client(
-            &test_bundle_id(),
+            test_coordinator_context(credential_store),
             &resource,
             options,
-            credential_store,
             Some(Arc::new(JwtTestSecretResolver)),
             reqwest::Client::new(),
             oauth_http_client,
@@ -3736,9 +3884,10 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
             Arc::new(TlsFixtureOAuthHttpClient::new(certificate));
         let resource = format!("{base_url}/mcp");
         let coordinator = OAuthCoordinator::new_with_oauth_http_client(
-            &test_bundle_id(),
+            test_coordinator_context(memory_credential_store()),
             &resource,
             OAuthOptions {
+                resource: None,
                 scopes: vec!["tools.read".into()],
                 client_name: None,
                 mode: OAuthClientMode::ClientCredentialsPrivateKeyJwt {
@@ -3748,7 +3897,6 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                     token_endpoint_audience: None,
                 },
             },
-            memory_credential_store(),
             Some(Arc::new(JwtTestSecretResolver)),
             http_client,
             oauth_http_client,
@@ -3888,6 +4036,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
 
         let resource = format!("{base_url}/mcp");
         let options = OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".into()],
             client_name: None,
             mode: OAuthClientMode::AuthorizationCode {
@@ -3899,10 +4048,10 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         };
         let credential_store = memory_credential_store();
         let peer_coordinator = OAuthCoordinator::new(
-            &test_bundle_id(),
+            test_coordinator_context(Arc::clone(&credential_store)),
+            &resource,
             &resource,
             options.clone(),
-            Arc::clone(&credential_store),
             None,
             reqwest::Client::new(),
             HeaderMap::new(),
@@ -3911,10 +4060,10 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         .unwrap();
         let coordinator = Arc::new(
             OAuthCoordinator::new(
-                &test_bundle_id(),
+                test_coordinator_context(credential_store),
+                &resource,
                 &resource,
                 options,
-                credential_store,
                 None,
                 reqwest::Client::new(),
                 HeaderMap::new(),

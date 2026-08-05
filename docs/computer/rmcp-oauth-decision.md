@@ -430,6 +430,8 @@ pub oauth: Option<OAuthOptions>
 
 ```yaml
 oauth:
+  # 可选；缺省为 HTTP MCP URL。仅当 canonical RFC 8707 resource 与传输 endpoint 不同时设置。
+  resource: https://resource.example/canonical-mcp
   scopes: [files:read]
   mode:
     type: authorizationCode
@@ -470,6 +472,11 @@ oauth:
 ```
 
 所有 secret 字段必须通过现有 `SecretValueResolver`/input 引用解析，不能直接序列化明文。
+
+`OAuthOptions.resource` 缺省时取 `HttpServerParameters.url`，保持旧配置兼容；显式值必须是绝对 URI
+且不得包含 fragment。HTTP endpoint 继续承载 MCP 请求，effective resource 则统一进入
+authorization request、token request 与 `OAuthCredentialKey`。两者跨 origin 时，endpoint 自定义 header
+不得泄漏到 canonical resource origin。
 
 ### static headers 与 OAuth 优先级
 
@@ -566,6 +573,11 @@ issuer-index:
 - OAuth discovery/registration/token exchange 使用 SDK 自有的 `OAuthProtocolError` typed
   cause，不依赖错误字符串，也不把 rmcp/provider 原文带入 `Display`、`Debug` 或错误链。
 - scope upgrade 必须设置最大次数，防止循环授权。
+- `Computer::subscribe_events()` 复用 runtime 有界 broadcast，发送
+  `ComputerEvent::OAuthStatusChanged { bundle_id, status }`；同 bundle 同状态去重，覆盖 begin、complete、
+  cancel、clear、refresh 失败、401 与 403 insufficient_scope。
+- receiver `Lagged` 后按 `bundle_id` 调 `oauth_status()` 重同步；shutdown 终态后事件闸断。宿主不得用轮询
+  补偿事件缺失。
 
 ## 9. 实施计划
 

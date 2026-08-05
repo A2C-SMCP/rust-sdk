@@ -3071,9 +3071,10 @@ impl<S: Session> Computer<S> {
 
     /// 订阅 runtime 观测事件流（#114 S7）/ subscribe to runtime observability events。
     ///
-    /// 返回 [`tokio::sync::broadcast::Receiver`]：生命周期迁移 / revision 增长逐条广播。**shutdown 后**（契约
+    /// 返回 [`tokio::sync::broadcast::Receiver`]：生命周期迁移、revision 增长及 OAuth 状态变化逐条广播。**shutdown 后**（契约
     /// §4.7）除进入 shutdown 时的终态 [`ComputerEvent::LifecycleChanged`]`(shutdown)` 外不再收到新事件。滞后订阅者
-    /// 会收到 `Lagged`——可经 [`status`](Self::status) 重新拉取全量快照对齐。
+    /// 会收到 `Lagged`——runtime 状态可经 [`status`](Self::status) 重同步，OAuth 状态可按事件中的
+    /// `bundle_id` 经 [`oauth_status`](Self::oauth_status) 重同步。
     pub fn subscribe_events(&self) -> broadcast::Receiver<ComputerEvent> {
         self.status.subscribe()
     }
@@ -3453,7 +3454,8 @@ impl<S: Session> Computer<S> {
     /// 真实 `client_factory`。**`change_sender` 仍由 `boot_up` 在调用本方法后单独注入**（本方法不涉及）。
     async fn new_manager(&self) -> MCPServerManager {
         let manager =
-            MCPServerManager::with_oauth_credential_store(Arc::clone(&self.oauth_credential_store));
+            MCPServerManager::with_oauth_credential_store(Arc::clone(&self.oauth_credential_store))
+                .with_oauth_events(Arc::clone(&self.status));
         manager
             .set_secret_resolver(self.secret_resolver.clone())
             .await;

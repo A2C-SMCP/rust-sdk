@@ -9,6 +9,28 @@ The SDK never opens a browser, binds a callback port, starts a Web server, conne
 Socket, or waits for a callback. `begin_oauth` returns as soon as discovery, client setup, PKCE,
 CSRF state, and the authorization URL are ready.
 
+## Canonical resource configuration
+
+[`OAuthOptions::resource`] is the optional RFC 8707 canonical resource indicator. When it is
+omitted, the Streamable HTTP MCP endpoint remains the effective resource, so existing serialized
+configuration needs no migration. When it is present, the SDK validates it as an absolute URI
+without a fragment and uses the normalized value consistently for authorization requests,
+token requests, and [`OAuthCredentialKey`] isolation. The MCP transport still connects to the
+configured HTTP endpoint; endpoint headers are not copied to a different resource origin.
+
+```yaml
+oauth:
+  resource: https://resource.example/canonical-mcp
+  scopes: [tools.read]
+  mode:
+    type: authorizationCode
+    registration: preregistered
+    clientId: desktop-client
+```
+
+OAuth remains mutually exclusive with a static `Authorization` header, whether `resource` is
+explicit or inherited from the endpoint.
+
 ## Responsibility matrix
 
 | Capability | `smcp-computer` OAuth core | Host flow driver | Authorization server |
@@ -123,6 +145,20 @@ Protocol failures remain typed errors:
 
 After any returned outcome or terminal error, use the returned status or `oauth_status` to render a
 safe result. Do not infer authorization from the browser redirect alone.
+
+## Status events and resynchronization
+
+Hosts subscribe once through [`crate::computer::Computer::subscribe_events`]. OAuth transitions arrive as
+[`crate::status::ComputerEvent::OAuthStatusChanged`] with the stable `bundle_id` and complete, non-secret
+[`OAuthStatus`]. The event covers interactive begin/complete/cancel, credential clear, background
+refresh failure, protected-resource 401, and `403 insufficient_scope`. Equal consecutive statuses
+for the same bundle are suppressed.
+
+The channel is bounded. A slow receiver can get `RecvError::Lagged`, which reports only how many
+events were skipped, not their bundle IDs. Before continuing, the host must call
+[`crate::computer::Computer::oauth_status`] for every OAuth bundle whose UI state it maintains.
+`shutdown` emits its final lifecycle event and then gates all OAuth emissions, so hosts must not use
+a polling loop as a substitute for the event stream.
 
 ## Local loopback flow driver
 
