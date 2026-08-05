@@ -16,6 +16,9 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #160 changes interactive `complete_oauth` and `cancel_oauth` to return
   `OAuthFlowOutcome`. Expired and issuer-mismatched callbacks now use dedicated
   `OAuthError` variants instead of a generic protocol error.
+- *(computer)* #167 adds `OAuthOptions::resource` and
+  `ComputerEvent::OAuthStatusChanged`. Rust struct literals must initialize `resource` (usually
+  `None`), exhaustive event matches need the new variant, and `ComputerEvent` is no longer `Copy`.
 - *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
 
 ### Features
@@ -33,6 +36,9 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #160 defines one browser/callback host contract for local loopback and
   headless HTTPS Gateway flow drivers, with structured completion/termination outcomes,
   one-time opaque-state routing, deterministic expiry, and rustdoc-integrated guidance.
+- *(computer)* #167 separates the canonical RFC 8707 OAuth resource from the HTTP MCP endpoint and
+  publishes deduplicated, bundle-aware OAuth status changes through the shared Computer event
+  stream, including refresh failure and 401/403 background transitions.
 
 ### Bug Fixes
 
@@ -58,6 +64,10 @@ All notable changes to this project will be documented in this file.
 - OAuth configuration and status fields serialize as camelCase. Existing non-OAuth
   HTTP servers retain normal redirect behavior; OAuth requests only follow
   same-origin redirects.
+- Existing OAuth configuration may omit `resource`; the HTTP MCP URL remains the default. Set an
+  explicit absolute, fragment-free resource URI only when the authorization audience differs from
+  the transport endpoint. After `subscribe_events()` reports lag, call `oauth_status(bundle_id)`
+  to resynchronize OAuth UI state.
 - Match `OAuthError::Protocol(OAuthProtocolError::...)` for stable control flow. Raw
   rmcp/provider errors are no longer available through the public error value.
 

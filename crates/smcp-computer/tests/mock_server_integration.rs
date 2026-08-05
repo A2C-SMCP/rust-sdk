@@ -36,6 +36,7 @@ use smcp_computer::oauth::{
     OAuthCredentialRecordKind, OAuthCredentialStore, OAuthCredentialStoreError, OAuthError,
     OAuthFlowOutcome, OAuthOptions, OAuthStatus,
 };
+use smcp_computer::ComputerEvent;
 use tempfile::TempDir;
 
 // ============================================================
@@ -392,6 +393,7 @@ enum OAuthFixtureMode {
 
 struct OAuthMockState {
     base_url: String,
+    resource: StdMutex<String>,
     mode: OAuthFixtureMode,
     mcp_response_sse: bool,
     token_expires_in: u64,
@@ -402,9 +404,26 @@ struct OAuthMockState {
     authorized_mcp_requests: AtomicUsize,
     challenge_tools_write_remaining: AtomicUsize,
     reject_authorized_remaining: AtomicUsize,
+    reject_token_remaining: AtomicUsize,
     protected_custom_header_requests: AtomicUsize,
     authorization_custom_header_requests: AtomicUsize,
     token_forms: Mutex<Vec<HashMap<String, String>>>,
+}
+
+impl OAuthMockState {
+    fn resource(&self) -> String {
+        self.resource
+            .lock()
+            .expect("OAuth fixture resource lock poisoned")
+            .clone()
+    }
+
+    fn set_resource(&self, resource: String) {
+        *self
+            .resource
+            .lock()
+            .expect("OAuth fixture resource lock poisoned") = resource;
+    }
 }
 
 async fn oauth_http_mock_handler(
@@ -444,7 +463,7 @@ async fn oauth_http_mock_handler(
             .header("Content-Type", "application/json")
             .body(full_body(
                 serde_json::json!({
-                    "resource": format!("{}/mcp", state.base_url),
+                    "resource": state.resource(),
                     "authorization_servers": [&state.base_url],
                     "scopes_supported": ["tools.read"],
                 })
@@ -457,7 +476,7 @@ async fn oauth_http_mock_handler(
             .header("Content-Type", "application/json")
             .body(full_body(
                 serde_json::json!({
-                    "resource": format!("{}/mcp", state.base_url),
+                    "resource": state.resource(),
                     "authorization_servers": [&state.base_url],
                     "scopes_supported": ["tools.read"],
                 })
@@ -588,8 +607,20 @@ async fn oauth_http_mock_handler(
         };
         if !valid_client_id
             || !valid_grant
-            || form.get("resource").map(String::as_str)
-                != Some(format!("{}/mcp", state.base_url).as_str())
+            || form.get("resource").map(String::as_str) != Some(state.resource().as_str())
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(empty_body())
+                .unwrap());
+        }
+        let request_index = state.token_requests.fetch_add(1, Ordering::SeqCst);
+        if state
+            .reject_token_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
         {
             return Ok(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
@@ -597,7 +628,6 @@ async fn oauth_http_mock_handler(
                 .unwrap());
         }
         state.token_forms.lock().await.push(form.clone());
-        let request_index = state.token_requests.fetch_add(1, Ordering::SeqCst);
         let token_response_delay_ms = state.token_response_delay_ms.load(Ordering::SeqCst);
         if token_response_delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(token_response_delay_ms)).await;
@@ -754,8 +784,10 @@ async fn spawn_oauth_http_mock_with_options(
     mcp_response_sse: bool,
 ) -> (u16, Arc<OAuthMockState>) {
     let (listener, port) = bind_random().await;
+    let base_url = format!("http://127.0.0.1:{port}");
     let state = Arc::new(OAuthMockState {
-        base_url: format!("http://127.0.0.1:{port}"),
+        resource: StdMutex::new(format!("{base_url}/mcp")),
+        base_url,
         mode,
         mcp_response_sse,
         token_expires_in,
@@ -766,6 +798,7 @@ async fn spawn_oauth_http_mock_with_options(
         authorized_mcp_requests: AtomicUsize::new(0),
         challenge_tools_write_remaining: AtomicUsize::new(challenge_tools_write_count),
         reject_authorized_remaining: AtomicUsize::new(0),
+        reject_token_remaining: AtomicUsize::new(0),
         protected_custom_header_requests: AtomicUsize::new(0),
         authorization_custom_header_requests: AtomicUsize::new(0),
         token_forms: Mutex::new(Vec::new()),
@@ -1053,6 +1086,7 @@ async fn test_streamable_http_oauth_client_credentials_end_to_end() {
     })
     .with_oauth(
         OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".to_string()],
             client_name: None,
             mode: OAuthClientMode::ClientCredentialsSecret {
@@ -1103,6 +1137,7 @@ async fn test_oauth_custom_headers_stay_on_protected_resource_requests() {
     })
     .with_oauth(
         OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".to_string()],
             client_name: None,
             mode: OAuthClientMode::ClientCredentialsSecret {
@@ -1143,6 +1178,7 @@ async fn test_streamable_http_client_credentials_supports_client_secret_basic() 
     })
     .with_oauth(
         OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".to_string()],
             client_name: None,
             mode: OAuthClientMode::ClientCredentialsSecret {
@@ -1174,6 +1210,7 @@ async fn test_streamable_http_client_credentials_renews_expired_token_without_re
     })
     .with_oauth(
         OAuthOptions {
+            resource: None,
             scopes: vec!["tools.read".to_string()],
             client_name: None,
             mode: OAuthClientMode::ClientCredentialsSecret {
@@ -1217,6 +1254,7 @@ async fn test_machine_begin_oauth_facade_has_no_network_or_secret_side_effects()
     );
     config.bundle_id = Some(bundle_id.clone());
     config.oauth = Some(OAuthOptions {
+        resource: None,
         scopes: vec!["tools.read".to_string()],
         client_name: None,
         mode: OAuthClientMode::ClientCredentialsSecret {
@@ -1263,6 +1301,7 @@ async fn test_machine_insufficient_scope_retries_are_bounded_end_to_end() {
     );
     config.bundle_id = Some(bundle_id.clone());
     config.oauth = Some(OAuthOptions {
+        resource: None,
         scopes: vec!["tools.read".to_string()],
         client_name: None,
         mode: OAuthClientMode::ClientCredentialsSecret {
@@ -1346,6 +1385,7 @@ fn authorization_code_options(mode: OAuthFixtureMode) -> OAuthOptions {
         }
     };
     OAuthOptions {
+        resource: None,
         scopes: vec!["tools.read".to_string()],
         client_name: Some("A2C Computer".to_string()),
         mode: OAuthClientMode::AuthorizationCode { registration },
@@ -1442,6 +1482,7 @@ async fn configure_authorization_code_computer(
         false,
     )
     .with_oauth_credential_store(store)
+    .with_confirm_callback(|_, _, _, _| true)
     .with_skill_home(temp_dir.path().join("skills"))
     .with_blob_cache_root(temp_dir.path().join("blob"))
     .with_config_dir(temp_dir.path().join("config"));
@@ -1564,6 +1605,7 @@ async fn authorize_manager(
     assert!(query
         .get("code_challenge")
         .is_some_and(|value| !value.is_empty()));
+    assert_eq!(query.get("resource"), Some(&state.resource()));
     if is_scope_upgrade {
         let requested_scopes = query.get("scope").cloned().unwrap_or_default();
         assert!(requested_scopes
@@ -1613,6 +1655,25 @@ async fn authorize_computer(
         )
         .await
         .unwrap();
+}
+
+async fn recv_oauth_status_event(
+    events: &mut tokio::sync::broadcast::Receiver<ComputerEvent>,
+    expected_bundle_id: &BundleId,
+) -> OAuthStatus {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let ComputerEvent::OAuthStatusChanged { bundle_id, status } =
+                events.recv().await.unwrap()
+            {
+                if &bundle_id == expected_bundle_id {
+                    return status;
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for OAuth status event")
 }
 
 #[tokio::test]
@@ -1923,6 +1984,355 @@ async fn test_streamable_http_authorization_code_registration_matrix_end_to_end(
         );
         manager.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_computer_oauth_event_lag_resynchronizes_through_public_status_query() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-event-lag-resync").unwrap();
+    let (computer, _temp_dir) = configure_authorization_code_computer(
+        &state.base_url,
+        std::slice::from_ref(&bundle_id),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+    )
+    .await;
+    let mut events = computer.subscribe_events();
+    let begin_request = OAuthBeginRequest {
+        redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+        required_scope: None,
+    };
+
+    // Coordinator construction emits Unauthorized; every cycle then emits Pending followed by
+    // Unauthorized. Thirty-three cycles produce 67 events, exceeding the fixed capacity of 64.
+    for _ in 0..33 {
+        let launch = computer
+            .begin_oauth(&bundle_id, begin_request.clone())
+            .await
+            .unwrap();
+        computer
+            .cancel_oauth(
+                &bundle_id,
+                OAuthCancellation {
+                    state: launch.state,
+                    issuer: None,
+                    reason: OAuthCancellationReason::Cancelled,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        events.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+    ));
+    assert_eq!(
+        computer.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    computer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_computer_oauth_events_cover_facades_dedup_403_and_401() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 1).await;
+    let bundle_id = BundleId::try_from("oauth-events-e2e").unwrap();
+    let (computer, _temp_dir) = configure_authorization_code_computer(
+        &state.base_url,
+        std::slice::from_ref(&bundle_id),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+    )
+    .await;
+    let mut events = computer.subscribe_events();
+    let begin_request = OAuthBeginRequest {
+        redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+        required_scope: None,
+    };
+
+    let launch = computer
+        .begin_oauth(&bundle_id, begin_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Unauthorized
+    );
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::AuthorizationPending
+    );
+    let duplicate = computer
+        .begin_oauth(&bundle_id, begin_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(duplicate, launch);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err()
+    );
+
+    computer
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Authorized { .. }
+    ));
+
+    computer.clear_oauth(&bundle_id).await.unwrap();
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Unauthorized
+    );
+    let cancelled = computer
+        .begin_oauth(&bundle_id, begin_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::AuthorizationPending
+    );
+    computer
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: cancelled.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Unauthorized
+    );
+
+    authorize_computer(&computer, &bundle_id, &state).await;
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::AuthorizationPending
+    );
+    assert!(matches!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Authorized { .. }
+    ));
+    computer.start_mcp_client(&bundle_id).await.unwrap();
+    let exposed_tool = format!("{}__echo", bundle_id.as_str());
+    computer
+        .execute_tool(
+            "oauth-event-403",
+            &exposed_tool,
+            serde_json::json!({"message": "scope challenge"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::ReauthorizationRequired {
+            required_scope: "tools.write".to_string(),
+        }
+    );
+
+    let upgrade = computer
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                required_scope: Some("tools.write".to_string()),
+                ..begin_request
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::AuthorizationPending
+    );
+    computer
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: upgrade.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Authorized { .. }
+    ));
+
+    state.reject_authorized_remaining.store(1, Ordering::SeqCst);
+    let _ = computer
+        .execute_tool(
+            "oauth-event-401",
+            &exposed_tool,
+            serde_json::json!({"message": "reject token"}),
+            None,
+        )
+        .await;
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Unauthorized
+    );
+    computer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_computer_oauth_event_reports_background_refresh_failure() {
+    let (port, state) =
+        spawn_oauth_http_mock_with_expiry(OAuthFixtureMode::ClientCredentials, 0, 31).await;
+    let bundle_id = BundleId::try_from("oauth-refresh-event").unwrap();
+    let mut config = HttpServerConfig::new(
+        "oauth-refresh-event",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.oauth = Some(OAuthOptions {
+        resource: None,
+        scopes: vec!["tools.read".to_string()],
+        client_name: None,
+        mode: OAuthClientMode::ClientCredentialsSecret {
+            client_id: "oauth-e2e-client".to_string(),
+            client_secret_input: "oauth-e2e-secret-input".to_string(),
+        },
+    });
+    let temp_dir = TempDir::new().unwrap();
+    let computer = Computer::new(
+        "oauth-refresh-event",
+        SilentSession::new("oauth-refresh-event-session"),
+        None,
+        Some(HashMap::from([(
+            bundle_id.to_string(),
+            MCPServerConfig::Http(config),
+        )])),
+        false,
+        false,
+    )
+    .with_secret_resolver(Arc::new(OAuthTestSecretResolver))
+    .with_confirm_callback(|_, _, _, _| true)
+    .with_skill_home(temp_dir.path().join("skills"))
+    .with_blob_cache_root(temp_dir.path().join("blob"))
+    .with_config_dir(temp_dir.path().join("config"));
+    computer.boot_up().await.unwrap();
+    computer.start_mcp_client(&bundle_id).await.unwrap();
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 1);
+    let mut events = computer.subscribe_events();
+    state.reject_token_remaining.store(1, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let exposed_tool = format!("{}__echo", bundle_id.as_str());
+    let _ = computer
+        .execute_tool(
+            "oauth-refresh-failure",
+            &exposed_tool,
+            serde_json::json!({"message": "refresh"}),
+            None,
+        )
+        .await;
+    assert_eq!(
+        recv_oauth_status_event(&mut events, &bundle_id).await,
+        OAuthStatus::Error {
+            message: "OAuth access token refresh failed".to_string(),
+        }
+    );
+    computer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_explicit_canonical_resource_reaches_authorization_token_and_credential_key() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    let resource = format!("{endpoint}?audience=canonical");
+    state.set_resource(resource.clone());
+    let bundle_id = BundleId::try_from("oauth-resource-override").unwrap();
+    let recording_store = Arc::new(RecordingOAuthCredentialStore::default());
+    let store: Arc<dyn OAuthCredentialStore> = recording_store.clone();
+    let manager = MCPServerManager::with_oauth_credential_store(store);
+    let mut config = HttpServerConfig::new(
+        "oauth-resource-override",
+        HttpServerParameters {
+            url: endpoint.clone(),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    let mut options = authorization_code_options(OAuthFixtureMode::PreregisteredPublic);
+    options.resource = Some(resource.clone());
+    config.oauth = Some(options);
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    authorize_manager(&manager, &bundle_id, &state, None).await;
+
+    let forms = state.token_forms.lock().await;
+    assert_eq!(forms.len(), 1);
+    assert_eq!(forms[0].get("resource"), Some(&resource));
+    drop(forms);
+    let operations = recording_store.operations().await;
+    assert!(operations.iter().any(|operation| match operation {
+        CredentialStoreOperation::Load(key)
+        | CredentialStoreOperation::Save(key)
+        | CredentialStoreOperation::Delete(key) => key.resource == resource,
+    }));
+    assert_ne!(endpoint, resource);
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_resource_override_preserves_static_authorization_conflict() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-resource-static-conflict").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-resource-static-conflict",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer static-token".to_string(),
+            )]),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    let mut options = authorization_code_options(OAuthFixtureMode::PreregisteredPublic);
+    options.resource = Some(format!("{}/mcp?audience=canonical", state.base_url));
+    config.oauth = Some(options);
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager
+            .begin_oauth(
+                &bundle_id,
+                OAuthBeginRequest {
+                    redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                    required_scope: None,
+                },
+            )
+            .await,
+        Err(OAuthError::ConflictingAuthorizationHeader)
+    ));
+    assert_eq!(state.total_requests.load(Ordering::SeqCst), 0);
+    manager.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -253,6 +253,7 @@ async fn configured_manager(
     );
     config.bundle_id = Some(bundle_id.clone());
     config.oauth = Some(OAuthOptions {
+        resource: None,
         scopes: OAUTH_SCOPES
             .iter()
             .map(|scope| (*scope).to_string())

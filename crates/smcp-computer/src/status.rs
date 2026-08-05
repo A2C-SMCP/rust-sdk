@@ -26,9 +26,12 @@
 //! shutdown 时发的那一条终态 [`ComputerEvent::LifecycleChanged`]`(Shutdown)` 外，不再发出任何 stale 事件，
 //! 后续 revision bump 亦降为 no-op（既有计数不回退，保单调）。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::RwLock as StdRwLock;
 
+use crate::mcp_clients::BundleId;
+use crate::oauth::OAuthStatus;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -157,7 +160,7 @@ pub struct ComputerStatusSnapshot {
 /// runtime 观测事件（[`Computer::subscribe_events`](crate::computer::Computer::subscribe_events) 广播）/ runtime event。
 ///
 /// 事件为**轻量增量**——订阅方收到后可按需调 [`Computer::status`](crate::computer::Computer::status) 取全量快照。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComputerEvent {
     /// 生命周期状态迁移 / lifecycle transition。
@@ -174,6 +177,13 @@ pub enum ComputerEvent {
     CapabilityRevisionBumped {
         /// 新 revision / the new revision。
         revision: u64,
+    },
+    /// OAuth authorization status changed for one MCP server.
+    OAuthStatusChanged {
+        /// Stable MCP server identity.
+        bundle_id: BundleId,
+        /// Complete, non-secret status after the transition.
+        status: OAuthStatus,
     },
 }
 
@@ -203,6 +213,8 @@ pub struct RuntimeStatus {
     shutdown: AtomicBool,
     /// 公开诊断 / diagnostics。
     diagnostics: StdRwLock<Diagnostics>,
+    /// Last published OAuth status per bundle, used to suppress duplicate events.
+    oauth_statuses: StdRwLock<HashMap<BundleId, OAuthStatus>>,
     /// 事件广播发送端（订阅方经 `subscribe` 取 Receiver）/ event broadcast sender。
     events: broadcast::Sender<ComputerEvent>,
 }
@@ -217,6 +229,7 @@ impl RuntimeStatus {
             capability_revision: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             diagnostics: StdRwLock::new(Diagnostics::default()),
+            oauth_statuses: StdRwLock::new(HashMap::new()),
             events,
         }
     }
@@ -292,6 +305,40 @@ impl RuntimeStatus {
         let new = self.capability_revision.fetch_add(1, Ordering::AcqRel) + 1;
         self.emit(ComputerEvent::CapabilityRevisionBumped { revision: new });
         new
+    }
+
+    /// Publish a changed OAuth status through the shared Computer event stream.
+    ///
+    /// Equal consecutive states for the same bundle are suppressed. After shutdown all emissions
+    /// are gated, so the terminal lifecycle event remains the final observable event.
+    pub(crate) fn update_oauth_status(&self, bundle_id: BundleId, status: OAuthStatus) {
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let changed = {
+            let mut statuses = self
+                .oauth_statuses
+                .write()
+                .expect("OAuth status cache poisoned");
+            if statuses.get(&bundle_id) == Some(&status) {
+                false
+            } else {
+                statuses.insert(bundle_id.clone(), status.clone());
+                true
+            }
+        };
+        if changed {
+            self.emit(ComputerEvent::OAuthStatusChanged { bundle_id, status });
+        }
+    }
+
+    #[cfg(test)]
+    fn latest_oauth_status(&self, bundle_id: &BundleId) -> Option<OAuthStatus> {
+        self.oauth_statuses
+            .read()
+            .expect("OAuth status cache poisoned")
+            .get(bundle_id)
+            .cloned()
     }
 
     /// 记 / 清最近公开错误（`None` 清除）/ set-or-clear the last public error。
@@ -462,6 +509,63 @@ mod tests {
         // 通道再无事件（try_recv 为 Empty，非新事件）。
         assert!(matches!(
             rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oauth_events_are_deduplicated_lag_resyncable_and_shutdown_gated() {
+        let s = RuntimeStatus::new();
+        let bundle_id = BundleId::try_from("oauth-events").unwrap();
+        let mut rx = s.subscribe();
+
+        s.update_oauth_status(bundle_id.clone(), OAuthStatus::Unauthorized);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            ComputerEvent::OAuthStatusChanged {
+                bundle_id: bundle_id.clone(),
+                status: OAuthStatus::Unauthorized,
+            }
+        );
+        s.update_oauth_status(bundle_id.clone(), OAuthStatus::Unauthorized);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        for index in 0..=EVENT_CHANNEL_CAPACITY {
+            let status = if index % 2 == 0 {
+                OAuthStatus::AuthorizationPending
+            } else {
+                OAuthStatus::Unauthorized
+            };
+            s.update_oauth_status(bundle_id.clone(), status);
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        assert_eq!(
+            s.latest_oauth_status(&bundle_id),
+            Some(OAuthStatus::AuthorizationPending)
+        );
+
+        let mut shutdown_rx = s.subscribe();
+        s.enter_shutdown();
+        assert_eq!(
+            shutdown_rx.recv().await.unwrap(),
+            ComputerEvent::LifecycleChanged {
+                state: LifecycleState::Shutdown,
+            }
+        );
+        s.update_oauth_status(
+            bundle_id,
+            OAuthStatus::Error {
+                message: "must be gated".into(),
+            },
+        );
+        assert!(matches!(
+            shutdown_rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
     }

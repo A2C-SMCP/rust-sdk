@@ -37,6 +37,12 @@ storage. See [the OAuth architecture decision][oauth-architecture].
 For browser/callback ownership, failure mapping, and local/cloud flow-driver requirements, follow
 the normative [OAuth host integration contract](docs/oauth-host-integration.md).
 
+`OAuthOptions.resource` may override the HTTP MCP URL when the RFC 8707 canonical resource differs
+from the transport endpoint; omitting it preserves the endpoint default. Hosts can observe
+deduplicated `ComputerEvent::OAuthStatusChanged { bundle_id, status }` events through
+`Computer::subscribe_events()` and use `Computer::oauth_status()` to resynchronize after a bounded
+broadcast receiver reports lag.
+
 [oauth-architecture]: https://github.com/A2C-SMCP/rust-sdk/blob/main/docs/computer/rmcp-oauth-decision.md
 
 ## 架构设计 / Architecture
