@@ -1437,6 +1437,13 @@ impl<S: Session> Computer<S> {
                         "reconcile_governance: remount skipped (bundle_id conflicts with an existing server, existing wins)");
                     continue;
                 }
+                // #169：安全层 Gate 1-3——所有 bundled server（不论 origin）必经（协议指南 §2.3）。
+                // policy deny/allow/disabledMcpjson → 拒绝（不挂载、不入 pending）。
+                if crate::settings::mcp_config::security_layer_check(bid.as_str(), declared) {
+                    warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id,
+                        "reconcile_governance: bundled server disabled by security layer (policy deny/allow/disabledMcpjson) — not mounted");
+                    continue;
+                }
                 // #165 Option B：project-origin bundled server 回落审批门（协议 §5 item 10 条件化 / 指南 §2.2）。
                 // 仅 project scope 供给的 `enabledPlugins=true` → PENDING；受信 scope（user/local/flag/policy）免批准。
                 // 再过 `mcp_server_status`（F8① 签名未变，bundle_id 作 name 传入）：落 PENDING 才不挂载——
@@ -3180,12 +3187,13 @@ impl<S: Session> Computer<S> {
         crate::settings::recovery::collect_enabled_bundled_servers(&home, env, declared)
             .into_iter()
             .filter(|rec| {
-                plugin_enabled_origin(scope_layers, &rec.plugin_id) == Some(SettingsScope::Project)
-                    && mcp_server_status(
-                        crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config).as_str(),
-                        declared,
-                        false,
-                    ) == McpApprovalStatus::Pending
+                let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
+                // #169：安全层 Gate 1-3 → Disabled 的 server 不入 pending 列表。
+                !crate::settings::mcp_config::security_layer_check(bid.as_str(), declared)
+                    && plugin_enabled_origin(scope_layers, &rec.plugin_id)
+                        == Some(SettingsScope::Project)
+                    && mcp_server_status(bid.as_str(), declared, false)
+                        == McpApprovalStatus::Pending
             })
             .collect()
     }
@@ -5394,6 +5402,165 @@ mod tests {
         assert!(
             r2.pending_bundled_servers.is_empty(),
             "approved plugin exits pending list"
+        );
+    }
+
+    // ── #169：安全层（Gate 1-3）对 plugin baseline 强制生效（protocol D#42）───────────────
+
+    /// 测试用 helper：返回 audit-mcp server 的 bundle_id（与 `cold_start_setup95` 同源 config）。
+    fn audit_mcp_bundle_id() -> String {
+        let config: MCPServerConfig = serde_json::from_str(
+            r#"{"type":"stdio","name":"audit-mcp","server_parameters":{"command":"node"}}"#,
+        )
+        .unwrap();
+        crate::mcp_clients::bundle_id::resolve_bundle_id(&config).to_string()
+    }
+
+    /// #169：policy `deniedMcpServers` 拒绝 → trusted origin（user scope）bundled server **不挂载**、
+    /// 不入 `pending_bundled_servers`（安全层对所有 server 强制生效）。
+    #[tokio::test]
+    async fn security_layer_denied_blocks_trusted_origin_bundled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+
+        let mut declared = declared_audit_enabled();
+        declared.insert(
+            "deniedMcpServers".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(bid.clone())]),
+        );
+
+        let comp = Computer::new("d", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-d"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared))
+            .await;
+
+        assert!(
+            report.remounted_servers.is_empty(),
+            "deniedMcpServers MUST block bundled server mount (trusted origin)"
+        );
+        assert!(
+            report.pending_bundled_servers.is_empty(),
+            "deniedMcpServers MUST NOT produce pending bundled (security layer rejected)"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "deniedMcpServers MUST NOT register denied server"
+        );
+    }
+
+    /// #169：policy `allowedMcpServers` 白名单不含该 bundle_id → project origin bundled server
+    /// **不挂载**、不入 `pending_bundled_servers`。
+    #[tokio::test]
+    async fn security_layer_allowed_blocks_project_origin_bundled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+        // 显式验证 bundle_id 不出现在白名单中（若非 Gate 2 拒绝则测试是假绿）
+        assert_ne!(bid, "other-server", "precondition: bundle_id must differ from allowed list");
+
+        // project scope enabledPlugins=true（入 git）+ policy 白名单不含 audit-mcp
+        let mut declared = declared_audit_enabled();
+        declared.insert(
+            "allowedMcpServers".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("other-server".to_string())]),
+        );
+
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            serde_json::json!({"enabledPlugins": {"audit@acme": true}}).to_string(),
+        )
+        .unwrap();
+
+        let comp = Computer::new("a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-a"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared))
+            .await;
+
+        assert!(
+            report.remounted_servers.is_empty(),
+            "allowedMcpServers (non-matching) MUST block bundled server mount"
+        );
+        assert!(
+            report.pending_bundled_servers.is_empty(),
+            "allowedMcpServers (non-matching) MUST NOT produce pending bundled"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "allowedMcpServers (non-matching) MUST NOT register denied server"
+        );
+    }
+
+    /// #169：`disabledMcpjsonServers`（Gate 3, fail-safe）→ bundled server **不挂载**。
+    #[tokio::test]
+    async fn security_layer_disabled_mcpjson_blocks_bundled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+
+        let mut declared = declared_audit_enabled();
+        declared.insert(
+            "disabledMcpjsonServers".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(bid.clone())]),
+        );
+
+        let comp = Computer::new("m", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-m"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared))
+            .await;
+
+        assert!(
+            report.remounted_servers.is_empty(),
+            "disabledMcpjsonServers MUST block bundled server mount"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "disabledMcpjsonServers MUST NOT register disabled server"
+        );
+    }
+
+    /// #169：`list_pending_bundled_approvals` MUST NOT 包含安全层 Disabled server。
+    #[tokio::test]
+    async fn list_pending_bundled_approvals_excludes_security_layer_disabled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+
+        // project scope enabledPlugins=true → 本应 PENDING，但 policy deny 先拦截
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        // `disabledMcpjsonServers` 是 fail-safe 字段（任意 scope 可供给）→ 经 project
+        // settings.json 写入可被 `resolve_settings` 保留（`deniedMcpServers` 为 POLICY_ONLY，
+        // project scope 供给会被过滤，不适用于此测试）。
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            serde_json::json!({"enabledPlugins": {"audit@acme": true}, "disabledMcpjsonServers": [&bid]}).to_string(),
+        )
+        .unwrap();
+
+        let comp = Computer::new("l", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-l"));
+        let pending = comp.list_pending_bundled_approvals();
+
+        assert!(
+            pending.is_empty(),
+            "list_pending_bundled_approvals MUST exclude security-layer Disabled servers"
         );
     }
 

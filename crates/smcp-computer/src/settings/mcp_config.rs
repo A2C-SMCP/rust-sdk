@@ -646,6 +646,29 @@ fn str_list<'a>(settings: &'a Map<String, Value>, key: &str) -> Vec<&'a str> {
         .unwrap_or_default()
 }
 
+/// #169：安全层判定（Gate 1-3）——所有 server（含 plugin baseline）必经（协议指南 §2.3）。
+///
+/// 与 [`mcp_server_status`] 共享 Gate 1-3 逻辑，但本函数是纯安全层判定——
+/// 只回答「policy/disable 是否拒绝该 server」，不涉及信任/批准面。
+/// 返回 `true` 表示被拒绝（等效 `Disabled`）；`false` 表示通过安全层。
+///
+/// 优先级（先到先决）：① `deniedMcpServers` → 拒绝；② `allowedMcpServers` 非空且不在其中 → 拒绝；
+/// ③ `disabledMcpjsonServers` → 拒绝；④ 否则 → 通过。
+#[must_use]
+pub(crate) fn security_layer_check(name: &str, settings: &Map<String, Value>) -> bool {
+    if str_list(settings, FIELD_DENIED_MCP_SERVERS).contains(&name) {
+        return true;
+    }
+    let allowed = str_list(settings, FIELD_ALLOWED_MCP_SERVERS);
+    if !allowed.is_empty() && !allowed.contains(&name) {
+        return true;
+    }
+    if str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS).contains(&name) {
+        return true;
+    }
+    false
+}
+
 /// 判定单个 MCP server 的批准状态（**顺序即优先级**）/ Decide one server's approval status。
 ///
 /// 协议依据：[审批门对齐指南][guide] §2 档位表（SDK 非规范性共同对齐锚点，双 SDK MUST 行为一致）。
@@ -665,6 +688,10 @@ fn str_list<'a>(settings: &'a Map<String, Value>, key: &str) -> Vec<&'a str> {
 /// → Enabled；⑤ `enabledMcpjsonServers` → Enabled；⑥ `enableAllProjectMcpServers == true` → Enabled；
 /// ⑦ 否则 → Pending。
 ///
+/// 安全层（Gate 1-3）抽至 [`security_layer_check`]，本函数首步调用它——对声明 server 行为不变（纯重构）。
+/// 对 plugin bundled server，reconcile 阶段二以 [`security_layer_check`] 独立判定（见
+/// `computer.rs` `reconcile_governance`）。安全层 Disabled ⇏ 挂载、⇏ `pending_bundled_servers`。
+///
 /// # 「bundled 名免批准」档位已删除，MUST NOT 以任何形状复活（#131 · 指南 §2 danger）
 ///
 /// 本函数**只**判定 `mcp.json` 各 scope **声明的** server；plugin 声明依赖的 server **MUST NOT 进入本门迭代**
@@ -683,14 +710,7 @@ pub fn mcp_server_status(
     settings: &Map<String, Value>,
     trusted_origin: bool,
 ) -> McpApprovalStatus {
-    if str_list(settings, FIELD_DENIED_MCP_SERVERS).contains(&name) {
-        return McpApprovalStatus::Disabled;
-    }
-    let allowed = str_list(settings, FIELD_ALLOWED_MCP_SERVERS);
-    if !allowed.is_empty() && !allowed.contains(&name) {
-        return McpApprovalStatus::Disabled;
-    }
-    if str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS).contains(&name) {
+    if security_layer_check(name, settings) {
         return McpApprovalStatus::Disabled;
     }
     if trusted_origin {
