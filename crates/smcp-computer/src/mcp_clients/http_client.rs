@@ -14,9 +14,9 @@ use super::stdio_client::A2cClientHandler;
 use super::{ResourceCache, SubscriptionManager};
 use crate::inputs::SecretValueResolver;
 use crate::oauth::{
-    clear_stored_oauth_credentials, InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback,
-    OAuthCancellation, OAuthCoordinator, OAuthCoordinatorContext, OAuthCredentialStore, OAuthError,
-    OAuthFlowOutcome, OAuthLaunch, OAuthOptions, OAuthRequestGuard, OAuthStatus,
+    clear_stored_oauth_credentials, locally_stored_oauth_status, InMemoryOAuthCredentialStore,
+    OAuthBeginRequest, OAuthCoordinator, OAuthCoordinatorContext, OAuthCredentialStore, OAuthError,
+    OAuthFlow, OAuthFlowOutcome, OAuthOptions, OAuthRequestGuard, OAuthStatus,
 };
 use crate::status::RuntimeStatus;
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use rmcp::service::{PeerRequestOptions, RequestHandle, RunningService, ServiceEx
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::RoleClient;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
@@ -61,6 +61,7 @@ pub struct HttpMCPClient {
     oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     oauth_events: Option<Arc<RuntimeStatus>>,
     oauth: OnceCell<Arc<OAuthCoordinator>>,
+    oauth_flow: StdMutex<Option<OAuthFlow>>,
 }
 
 impl std::fmt::Debug for HttpMCPClient {
@@ -92,6 +93,7 @@ impl HttpMCPClient {
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             oauth_events: None,
             oauth: OnceCell::new(),
+            oauth_flow: StdMutex::new(None),
         }
     }
 
@@ -221,13 +223,26 @@ impl HttpMCPClient {
     }
 
     pub(crate) async fn oauth_status(&self) -> Result<OAuthStatus, OAuthError> {
+        let cancelling = self
+            .oauth_flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|flow| flow.is_cancelling() && !flow.is_terminal())
+            .cloned();
+        if let Some(flow) = cancelling {
+            return match flow.wait_terminal().await? {
+                OAuthFlowOutcome::Authorized { scopes } => Ok(OAuthStatus::Authorized { scopes }),
+                OAuthFlowOutcome::Terminated { status, .. } => Ok(status),
+            };
+        }
         Ok(self.oauth().await?.status().await)
     }
 
-    pub(crate) async fn begin_oauth(
-        &self,
+    pub(crate) async fn create_oauth_flow(
+        self: &Arc<Self>,
         request: OAuthBeginRequest,
-    ) -> Result<OAuthLaunch, OAuthError> {
+    ) -> Result<OAuthFlow, OAuthError> {
         let Some(options) = self.oauth_options.as_ref() else {
             return Err(OAuthError::NotConfigured);
         };
@@ -237,24 +252,123 @@ impl HttpMCPClient {
         ) {
             return Err(OAuthError::UnsupportedTransport);
         }
-        self.oauth().await?.begin(request).await
+        let (flow, mut driver) = crate::oauth::OAuthFlow::new(request.clone());
+        {
+            let mut active = self
+                .oauth_flow
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(existing) = active.as_ref().filter(|flow| !flow.is_terminal()) {
+                return if existing.request() == &request {
+                    Ok(existing.clone())
+                } else {
+                    Err(OAuthError::AuthorizationAlreadyPending)
+                };
+            }
+            *active = Some(flow.clone());
+        }
+
+        let weak = Arc::downgrade(self);
+        let flow_id = flow.id();
+        tokio::spawn(async move {
+            let Some(client) = weak.upgrade() else {
+                driver.finish(Err(OAuthError::AuthorizationExpired));
+                return;
+            };
+            let cancellation = driver.cancellation();
+            let coordinator = tokio::select! {
+                biased;
+                result = client.oauth() => result.cloned(),
+                _ = cancellation.cancelled() => {
+                    let status = client.baseline_oauth_status().await;
+                    driver.finish(Ok(OAuthFlowOutcome::Terminated {
+                        reason: driver.host_cancellation_reason(),
+                        status,
+                    }));
+                    client.remove_oauth_flow(flow_id);
+                    return;
+                }
+            };
+            match coordinator {
+                Ok(coordinator) => coordinator.drive_flow(driver).await,
+                Err(_error) if cancellation.is_cancelled() => {
+                    driver.finish(Ok(OAuthFlowOutcome::Terminated {
+                        reason: driver.host_cancellation_reason(),
+                        status: client.baseline_oauth_status().await,
+                    }));
+                }
+                Err(error) => driver.finish(Err(error)),
+            }
+            client.remove_oauth_flow(flow_id);
+        });
+        Ok(flow)
     }
 
-    pub(crate) async fn complete_oauth(
-        &self,
-        callback: OAuthCallback,
-    ) -> Result<OAuthFlowOutcome, OAuthError> {
-        self.oauth().await?.complete(callback).await
+    pub(crate) async fn cancel_and_drain_oauth_flow(&self) -> Result<(), OAuthError> {
+        let flow = self
+            .oauth_flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(flow) = flow.filter(|flow| !flow.is_terminal()) {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                flow.cancel(crate::oauth::OAuthCancellationReason::Cancelled),
+            )
+            .await
+            .map_err(|_| OAuthError::DrainTimeout)??;
+        }
+        Ok(())
     }
 
-    pub(crate) async fn cancel_oauth(
-        &self,
-        cancellation: OAuthCancellation,
-    ) -> Result<OAuthFlowOutcome, OAuthError> {
-        self.oauth().await?.cancel(cancellation).await
+    pub(crate) fn active_oauth_flow(&self) -> Result<OAuthFlow, OAuthError> {
+        self.oauth_flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|flow| !flow.is_terminal())
+            .cloned()
+            .ok_or(OAuthError::StateMismatch)
+    }
+
+    fn remove_oauth_flow(&self, id: uuid::Uuid) {
+        let mut active = self
+            .oauth_flow
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active.as_ref().is_some_and(|flow| flow.id() == id) {
+            *active = None;
+        }
+    }
+
+    async fn baseline_oauth_status(&self) -> OAuthStatus {
+        if let Some(status) = self
+            .oauth_events
+            .as_ref()
+            .and_then(|events| events.latest_oauth_status(&self.oauth_bundle_id))
+        {
+            return status;
+        }
+        let Some(options) = self.oauth_options.as_ref() else {
+            return OAuthStatus::Unauthorized;
+        };
+        let Ok(resource) = options.effective_resource(&self.base.params.url) else {
+            return OAuthStatus::Unauthorized;
+        };
+        locally_stored_oauth_status(
+            self.oauth_bundle_id.clone(),
+            resource,
+            options,
+            Arc::clone(&self.oauth_credential_store),
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(OAuthStatus::Unauthorized)
     }
 
     pub(crate) async fn clear_oauth(&self) -> Result<(), OAuthError> {
+        self.cancel_and_drain_oauth_flow().await?;
         if self.oauth_options.is_none() {
             return Err(OAuthError::NotConfigured);
         }
