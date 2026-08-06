@@ -3563,16 +3563,32 @@ impl<S: Session> Computer<S> {
     }
 
     /// Begin Authorization Code + PKCE. The embedding app opens the returned URL.
+    ///
+    /// This compatibility facade waits for provider discovery. New hosts should use
+    /// [`create_oauth_flow`](Self::create_oauth_flow), whose returned handle can be cancelled
+    /// before discovery or dynamic registration completes.
     pub async fn begin_oauth(
         &self,
         bundle_id: &BundleId,
         request: crate::oauth::OAuthBeginRequest,
     ) -> Result<crate::oauth::OAuthLaunch, crate::oauth::OAuthError> {
+        self.create_oauth_flow(bundle_id, request)
+            .await?
+            .launch()
+            .await
+    }
+
+    /// Create and register a cancellable interactive OAuth flow before provider I/O begins.
+    pub async fn create_oauth_flow(
+        &self,
+        bundle_id: &BundleId,
+        request: crate::oauth::OAuthBeginRequest,
+    ) -> Result<crate::oauth::OAuthFlow, crate::oauth::OAuthError> {
         let manager = self.mcp_manager.read().await;
         let manager = manager
             .as_ref()
             .ok_or(crate::oauth::OAuthError::NotConfigured)?;
-        manager.begin_oauth(bundle_id, request).await
+        manager.create_oauth_flow(bundle_id, request).await
     }
 
     /// Complete the browser callback without starting an SDK-owned listener.
@@ -3584,11 +3600,14 @@ impl<S: Session> Computer<S> {
         bundle_id: &BundleId,
         callback: crate::oauth::OAuthCallback,
     ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
-        let manager = self.mcp_manager.read().await;
-        let manager = manager
-            .as_ref()
-            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
-        manager.complete_oauth(bundle_id, callback).await
+        let flow = {
+            let manager = self.mcp_manager.read().await;
+            let manager = manager
+                .as_ref()
+                .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            manager.oauth_flow_for_callback(bundle_id).await?
+        };
+        flow.complete(callback).await
     }
 
     /// Cancel a pending browser flow, delete its PKCE/CSRF state, and return the resulting status.
@@ -3597,11 +3616,14 @@ impl<S: Session> Computer<S> {
         bundle_id: &BundleId,
         cancellation: crate::oauth::OAuthCancellation,
     ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
-        let manager = self.mcp_manager.read().await;
-        let manager = manager
-            .as_ref()
-            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
-        manager.cancel_oauth(bundle_id, cancellation).await
+        let flow = {
+            let manager = self.mcp_manager.read().await;
+            let manager = manager
+                .as_ref()
+                .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            manager.oauth_flow_for_callback(bundle_id).await?
+        };
+        flow.cancel_compat(cancellation).await
     }
 
     /// Clear persisted tokens and pending authorization state.
@@ -3878,7 +3900,7 @@ impl<S: Session> Computer<S> {
 
         let mut manager_guard = self.mcp_manager.write().await;
         if let Some(manager) = manager_guard.take() {
-            manager.stop_all().await?;
+            manager.close().await?;
         }
 
         info!("Computer {} shutdown successfully", self.name);
@@ -5460,7 +5482,10 @@ mod tests {
         let home = cold_start_setup95(&tmp).await;
         let bid = audit_mcp_bundle_id();
         // 显式验证 bundle_id 不出现在白名单中（若非 Gate 2 拒绝则测试是假绿）
-        assert_ne!(bid, "other-server", "precondition: bundle_id must differ from allowed list");
+        assert_ne!(
+            bid, "other-server",
+            "precondition: bundle_id must differ from allowed list"
+        );
 
         // project scope enabledPlugins=true（入 git）+ policy 白名单不含 audit-mcp
         let mut declared = declared_audit_enabled();

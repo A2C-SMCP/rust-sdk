@@ -39,6 +39,10 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #167 separates the canonical RFC 8707 OAuth resource from the HTTP MCP endpoint and
   publishes deduplicated, bundle-aware OAuth status changes through the shared Computer event
   stream, including refresh failure and 401/403 background transitions.
+- *(computer)* #170 adds `Computer::create_oauth_flow` and the cloneable `OAuthFlow` handle, making
+  discovery, DCR, callback exchange, server replacement/removal, and shutdown cancellation
+  bounded without provider-timeout waits. Interactive reauthorization now stages candidate
+  credentials and commits them only after completion wins the terminal race.
 
 ### Bug Fixes
 
@@ -70,6 +74,12 @@ All notable changes to this project will be documented in this file.
   to resynchronize OAuth UI state.
 - Match `OAuthError::Protocol(OAuthProtocolError::...)` for stable control flow. Raw
   rmcp/provider errors are no longer available through the public error value.
+- New hosts should retain the `OAuthFlow` returned by `create_oauth_flow`, await `flow.launch()`,
+  and drive `flow.complete`, `flow.cancel_callback`, or `flow.cancel`. Existing
+  `begin_oauth`/`complete_oauth`/`cancel_oauth` methods remain available with their existing
+  signatures, but cannot cancel the pre-launch interval because they do not expose a handle before
+  state generation. The exhaustive public `OAuthError` enum adds lifecycle-specific variants, so
+  downstream exhaustive matches must add corresponding arms.
 
 ## [0.3.1] - 2026-07-27
 

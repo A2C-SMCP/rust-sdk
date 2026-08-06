@@ -88,11 +88,21 @@ enum CredentialStoreOperation {
 struct RecordingOAuthCredentialStore {
     entries: Mutex<HashMap<OAuthCredentialKey, String>>,
     operations: Mutex<Vec<CredentialStoreOperation>>,
+    fail_next_credential_save: AtomicBool,
 }
 
 impl RecordingOAuthCredentialStore {
     async fn operations(&self) -> Vec<CredentialStoreOperation> {
         self.operations.lock().await.clone()
+    }
+
+    async fn credential_entries(&self) -> HashMap<OAuthCredentialKey, String> {
+        self.entries
+            .lock()
+            .await
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 }
 
@@ -118,6 +128,11 @@ impl OAuthCredentialStore for RecordingOAuthCredentialStore {
             .lock()
             .await
             .push(CredentialStoreOperation::Save(key.clone()));
+        if key.record_kind == OAuthCredentialRecordKind::IssuerIndex
+            && self.fail_next_credential_save.swap(false, Ordering::SeqCst)
+        {
+            return Err(OAuthCredentialStoreError::OperationFailed);
+        }
         self.entries
             .lock()
             .await
@@ -184,6 +199,16 @@ async fn bind_random() -> (TcpListener, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     (listener, port)
+}
+
+async fn wait_for_count(counter: &AtomicUsize, minimum: usize, message: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while counter.load(Ordering::SeqCst) < minimum {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{message}"));
 }
 
 // ============================================================
@@ -397,8 +422,17 @@ struct OAuthMockState {
     mode: OAuthFixtureMode,
     mcp_response_sse: bool,
     token_expires_in: u64,
+    discovery_response_delay_ms: AtomicU64,
+    registration_response_delay_ms: AtomicU64,
     token_response_delay_ms: AtomicU64,
+    block_next_mcp_response: AtomicBool,
+    discovery_started: Notify,
+    registration_started: Notify,
+    token_started: Notify,
+    mcp_response_started: Notify,
+    release_mcp_response: Notify,
     total_requests: AtomicUsize,
+    discovery_requests: AtomicUsize,
     token_requests: AtomicUsize,
     registration_requests: AtomicUsize,
     authorized_mcp_requests: AtomicUsize,
@@ -423,6 +457,15 @@ impl OAuthMockState {
             .resource
             .lock()
             .expect("OAuth fixture resource lock poisoned") = resource;
+    }
+}
+
+async fn delay_oauth_discovery(state: &OAuthMockState) {
+    state.discovery_requests.fetch_add(1, Ordering::SeqCst);
+    state.discovery_started.notify_one();
+    let delay_ms = state.discovery_response_delay_ms.load(Ordering::SeqCst);
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
@@ -459,6 +502,7 @@ async fn oauth_http_mock_handler(
     let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
 
     if method == Method::GET && path == "/.well-known/oauth-protected-resource/mcp" {
+        delay_oauth_discovery(&state).await;
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
@@ -472,6 +516,7 @@ async fn oauth_http_mock_handler(
             .unwrap());
     }
     if method == Method::GET && path == "/.well-known/oauth-protected-resource" {
+        delay_oauth_discovery(&state).await;
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
@@ -491,6 +536,7 @@ async fn oauth_http_mock_handler(
                 | "/.well-known/oauth-authorization-server/mcp"
         )
     {
+        delay_oauth_discovery(&state).await;
         if state.mode == OAuthFixtureMode::PreregisteredPublicOidc {
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -540,6 +586,11 @@ async fn oauth_http_mock_handler(
     }
     if method == Method::POST && path == "/register" {
         state.registration_requests.fetch_add(1, Ordering::SeqCst);
+        state.registration_started.notify_one();
+        let delay_ms = state.registration_response_delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         if body["token_endpoint_auth_method"] != "none"
             || body["response_types"] != serde_json::json!(["code"])
@@ -615,6 +666,7 @@ async fn oauth_http_mock_handler(
                 .unwrap());
         }
         let request_index = state.token_requests.fetch_add(1, Ordering::SeqCst);
+        state.token_started.notify_one();
         if state
             .reject_token_remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -722,6 +774,10 @@ async fn oauth_http_mock_handler(
             .body(empty_body())
             .unwrap());
     }
+    if state.block_next_mcp_response.swap(false, Ordering::SeqCst) {
+        state.mcp_response_started.notify_one();
+        state.release_mcp_response.notified().await;
+    }
     let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
     let result = match rpc_method {
         "initialize" => initialize_result(),
@@ -791,8 +847,17 @@ async fn spawn_oauth_http_mock_with_options(
         mode,
         mcp_response_sse,
         token_expires_in,
+        discovery_response_delay_ms: AtomicU64::new(0),
+        registration_response_delay_ms: AtomicU64::new(0),
         token_response_delay_ms: AtomicU64::new(0),
+        block_next_mcp_response: AtomicBool::new(false),
+        discovery_started: Notify::new(),
+        registration_started: Notify::new(),
+        token_started: Notify::new(),
+        mcp_response_started: Notify::new(),
+        release_mcp_response: Notify::new(),
         total_requests: AtomicUsize::new(0),
+        discovery_requests: AtomicUsize::new(0),
         token_requests: AtomicUsize::new(0),
         registration_requests: AtomicUsize::new(0),
         authorized_mcp_requests: AtomicUsize::new(0),
@@ -845,6 +910,50 @@ impl SecretValueResolver for CountingOAuthTestSecretResolver {
         def: &MCPServerInput,
     ) -> Result<Option<String>, InputResolutionError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok((def.id() == "oauth-e2e-secret-input").then(|| "oauth-e2e-secret".to_string()))
+    }
+}
+
+struct FailOnCallOAuthTestSecretResolver {
+    calls: AtomicUsize,
+    fail_on_call: usize,
+}
+
+struct BlockingOnCallOAuthTestSecretResolver {
+    calls: AtomicUsize,
+    block_on_call: usize,
+    started: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl SecretValueResolver for BlockingOnCallOAuthTestSecretResolver {
+    async fn resolve_secret(
+        &self,
+        def: &MCPServerInput,
+    ) -> Result<Option<String>, InputResolutionError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.block_on_call {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok((def.id() == "oauth-e2e-secret-input").then(|| "oauth-e2e-secret".to_string()))
+    }
+}
+
+#[async_trait]
+impl SecretValueResolver for FailOnCallOAuthTestSecretResolver {
+    async fn resolve_secret(
+        &self,
+        def: &MCPServerInput,
+    ) -> Result<Option<String>, InputResolutionError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on_call {
+            return Err(InputResolutionError::ResolverFailed {
+                id: def.id().to_string(),
+                reason: "injected OAuth resolver failure".to_string(),
+            });
+        }
         Ok((def.id() == "oauth-e2e-secret-input").then(|| "oauth-e2e-secret".to_string()))
     }
 }
@@ -2636,6 +2745,1033 @@ async fn test_authorization_code_cancellation_validates_callback_and_cleans_pend
 }
 
 #[tokio::test]
+async fn test_oauth_flow_cancels_before_delayed_discovery_returns() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    state
+        .discovery_response_delay_ms
+        .store(5_000, Ordering::SeqCst);
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    wait_for_count(
+        &state.discovery_requests,
+        1,
+        "real discovery request must be in flight",
+    )
+    .await;
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        flow.cancel(OAuthCancellationReason::Cancelled),
+    )
+    .await
+    .expect("cancellation must not wait for provider timeout")
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Cancelled,
+            status: OAuthStatus::Unauthorized,
+        }
+    );
+    assert!(matches!(
+        flow.launch().await,
+        Err(OAuthError::AuthorizationCancelled)
+    ));
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_oauth_flow_cancels_delayed_dynamic_registration() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::Dynamic, false).await;
+    state
+        .registration_response_delay_ms
+        .store(5_000, Ordering::SeqCst);
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    wait_for_count(
+        &state.registration_requests,
+        1,
+        "real DCR request must be in flight",
+    )
+    .await;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        flow.cancel(OAuthCancellationReason::Timeout),
+    )
+    .await
+    .expect("DCR cancellation must be bounded")
+    .unwrap();
+    assert_eq!(
+        outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            status: OAuthStatus::Unauthorized,
+        }
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cancel_wins_delayed_exchange_and_preserves_authorized_scopes() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    let initial = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: initial.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 1);
+
+    state.token_response_delay_ms.store(5_000, Ordering::SeqCst);
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: Some("tools.write".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    let completing = {
+        let flow = flow.clone();
+        let issuer = state.base_url.clone();
+        tokio::spawn(async move {
+            flow.complete(OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(issuer),
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while state.token_requests.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement token exchange must start");
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        flow.cancel(OAuthCancellationReason::Timeout),
+    )
+    .await
+    .expect("exchange cancellation must not wait for provider timeout")
+    .unwrap();
+    assert_eq!(
+        outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            status: OAuthStatus::Authorized {
+                scopes: vec!["tools.read".to_string()],
+            },
+        }
+    );
+    assert_eq!(completing.await.unwrap().unwrap(), outcome);
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized {
+            scopes: vec!["tools.read".to_string()],
+        }
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_compat_cancel_oauth_preempts_delayed_complete_oauth() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    state.token_response_delay_ms.store(5_000, Ordering::SeqCst);
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let manager = Arc::new(manager);
+    let completing = {
+        let manager = Arc::clone(&manager);
+        let bundle_id = bundle_id.clone();
+        let callback_state = launch.state.clone();
+        let issuer = state.base_url.clone();
+        tokio::spawn(async move {
+            manager
+                .complete_oauth(
+                    &bundle_id,
+                    OAuthCallback {
+                        code: "authorization-code".to_string(),
+                        state: callback_state,
+                        issuer: Some(issuer),
+                    },
+                )
+                .await
+        })
+    };
+    state.token_started.notified().await;
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: launch.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Timeout,
+            },
+        ),
+    )
+    .await
+    .expect("compat cancellation must not queue behind token exchange")
+    .unwrap();
+    assert_eq!(
+        cancelled,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            status: OAuthStatus::Unauthorized,
+        }
+    );
+    assert_eq!(completing.await.unwrap().unwrap(), cancelled);
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_failed_candidate_commit_preserves_previous_credential_and_scopes() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-commit-rollback").unwrap();
+    let store = Arc::new(RecordingOAuthCredentialStore::default());
+    let manager = configure_authorization_code_manager(
+        &format!("http://127.0.0.1:{port}"),
+        bundle_id.clone(),
+        store.clone(),
+    )
+    .await;
+
+    let initial = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: initial.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let credentials_before = store.credential_entries().await;
+    store
+        .fail_next_credential_save
+        .store(true, Ordering::SeqCst);
+
+    let upgrade = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: Some("tools.write".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: upgrade.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .is_err());
+
+    assert_eq!(store.credential_entries().await, credentials_before);
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized {
+            scopes: vec!["tools.read".to_string()],
+        }
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_failed_candidate_manager_preparation_never_mutates_durable_credential() {
+    let (_port, state) =
+        spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredConfidential, 0).await;
+    let bundle_id = BundleId::try_from("oauth-prepare-rollback").unwrap();
+    let store = Arc::new(RecordingOAuthCredentialStore::default());
+    let manager = MCPServerManager::with_oauth_credential_store(store.clone());
+    manager
+        .set_secret_resolver(Some(Arc::new(FailOnCallOAuthTestSecretResolver {
+            calls: AtomicUsize::new(0),
+            fail_on_call: 4,
+        })))
+        .await;
+    let mut config = match authorization_code_server_config(&state.base_url, bundle_id.clone()) {
+        MCPServerConfig::Http(config) => config,
+        _ => unreachable!(),
+    };
+    config.oauth = Some(authorization_code_options(
+        OAuthFixtureMode::PreregisteredConfidential,
+    ));
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    let initial = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: initial.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let credentials_before = store.credential_entries().await;
+
+    let upgrade = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: Some("tools.write".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: upgrade.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .is_err());
+    assert_eq!(store.credential_entries().await, credentials_before);
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized {
+            scopes: vec!["tools.read".to_string()],
+        }
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cancel_during_candidate_preparation_prevents_durable_commit() {
+    let (_port, state) =
+        spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredConfidential, 0).await;
+    let bundle_id = BundleId::try_from("oauth-prepare-cancel").unwrap();
+    let store = Arc::new(RecordingOAuthCredentialStore::default());
+    let resolver = Arc::new(BlockingOnCallOAuthTestSecretResolver {
+        calls: AtomicUsize::new(0),
+        block_on_call: 4,
+        started: Notify::new(),
+        release: Notify::new(),
+    });
+    let manager = MCPServerManager::with_oauth_credential_store(store.clone());
+    manager.set_secret_resolver(Some(resolver.clone())).await;
+    let mut config = match authorization_code_server_config(&state.base_url, bundle_id.clone()) {
+        MCPServerConfig::Http(config) => config,
+        _ => unreachable!(),
+    };
+    config.oauth = Some(authorization_code_options(
+        OAuthFixtureMode::PreregisteredConfidential,
+    ));
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+    let initial = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: initial.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let before = store.credential_entries().await;
+
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: Some("tools.write".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    let completing = {
+        let flow = flow.clone();
+        let issuer = state.base_url.clone();
+        tokio::spawn(async move {
+            flow.complete(OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(issuer),
+            })
+            .await
+        })
+    };
+    resolver.started.notified().await;
+    let outcome = flow.cancel(OAuthCancellationReason::Timeout).await.unwrap();
+    resolver.release.notify_one();
+    assert_eq!(completing.await.unwrap().unwrap(), outcome);
+    assert_eq!(store.credential_entries().await, before);
+    assert_eq!(
+        outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            status: OAuthStatus::Authorized {
+                scopes: vec!["tools.read".to_string()],
+            },
+        }
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cold_start_prelaunch_cancel_restores_persisted_authorized_status() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-cold-cancel").unwrap();
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(RecordingOAuthCredentialStore::default());
+    let first = configure_authorization_code_manager(
+        &format!("http://127.0.0.1:{port}"),
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    let initial = first
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    first
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: initial.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    first.close().await.unwrap();
+
+    let second = configure_authorization_code_manager(
+        &format!("http://127.0.0.1:{port}"),
+        bundle_id.clone(),
+        store,
+    )
+    .await;
+    let discovery_before = state.discovery_requests.load(Ordering::SeqCst);
+    state
+        .discovery_response_delay_ms
+        .store(5_000, Ordering::SeqCst);
+    let flow = second
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: Some("tools.write".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_count(
+        &state.discovery_requests,
+        discovery_before + 1,
+        "cold-start discovery must be in flight",
+    )
+    .await;
+    let outcome = flow
+        .cancel(OAuthCancellationReason::Cancelled)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Cancelled,
+            status: OAuthStatus::Authorized {
+                scopes: vec!["tools.read".to_string()],
+            },
+        }
+    );
+    state.discovery_response_delay_ms.store(0, Ordering::SeqCst);
+    assert_eq!(
+        second.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized {
+            scopes: vec!["tools.read".to_string()],
+        }
+    );
+    second.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_concurrent_terminal_commands_converge_and_terminal_flow_is_not_reused() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    let request = OAuthBeginRequest {
+        redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+        required_scope: None,
+    };
+    let flow = manager
+        .create_oauth_flow(&bundle_id, request.clone())
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    let callback = OAuthCallback {
+        code: "authorization-code".to_string(),
+        state: launch.state.clone(),
+        issuer: Some(state.base_url.clone()),
+    };
+    let first_flow = flow.clone();
+    let second_flow = flow.clone();
+    let (first, second) = tokio::join!(
+        first_flow.complete(callback.clone()),
+        second_flow.complete(callback)
+    );
+    assert_eq!(first, second);
+    assert!(matches!(first, Ok(OAuthFlowOutcome::Authorized { .. })));
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 1);
+
+    let next = manager
+        .create_oauth_flow(&bundle_id, request)
+        .await
+        .unwrap();
+    let next_launch = next.launch().await.unwrap();
+    assert_ne!(next_launch.state, launch.state);
+    next.cancel(OAuthCancellationReason::Cancelled)
+        .await
+        .unwrap();
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_complete_and_provider_cancellation_clones_share_one_terminal_outcome() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    let completing_flow = flow.clone();
+    let cancelling_flow = flow.clone();
+    let (completed, cancelled) = tokio::join!(
+        completing_flow.complete(OAuthCallback {
+            code: "authorization-code".to_string(),
+            state: launch.state.clone(),
+            issuer: Some(state.base_url.clone()),
+        }),
+        cancelling_flow.cancel_callback(OAuthCancellation {
+            state: launch.state,
+            issuer: Some(state.base_url.clone()),
+            reason: OAuthCancellationReason::AccessDenied,
+        })
+    );
+    assert_eq!(completed, cancelled);
+    assert!(matches!(
+        completed,
+        Ok(OAuthFlowOutcome::Authorized { .. })
+            | Ok(OAuthFlowOutcome::Terminated {
+                reason: OAuthCancellationReason::AccessDenied,
+                ..
+            })
+    ));
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_server_replacement_and_removal_cancel_and_drain_oauth_flows() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-lifecycle-drain").unwrap();
+    let manager = configure_authorization_code_manager(
+        &format!("http://127.0.0.1:{port}"),
+        bundle_id.clone(),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+    )
+    .await;
+    state
+        .discovery_response_delay_ms
+        .store(5_000, Ordering::SeqCst);
+
+    let first = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_count(
+        &state.discovery_requests,
+        1,
+        "replacement discovery must start",
+    )
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.add_or_update_server(authorization_code_server_config(
+            &state.base_url,
+            bundle_id.clone(),
+        )),
+    )
+    .await
+    .expect("replacement must drain without provider timeout")
+    .unwrap();
+    assert!(matches!(
+        first.cancel(OAuthCancellationReason::Cancelled).await,
+        Ok(OAuthFlowOutcome::Terminated { .. })
+    ));
+
+    let second = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_count(&state.discovery_requests, 2, "removal discovery must start").await;
+    assert!(tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.remove_server_by_id(&bundle_id),
+    )
+    .await
+    .expect("removal must drain without provider timeout")
+    .unwrap());
+    assert!(matches!(
+        second.cancel(OAuthCancellationReason::Cancelled).await,
+        Ok(OAuthFlowOutcome::Terminated { .. })
+    ));
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_server_replacement_reports_oauth_drain_timeout() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-lifecycle-drain-timeout").unwrap();
+    let store = Arc::new(DelayedLoadOAuthCredentialStore::default());
+    let manager = Arc::new(
+        configure_authorization_code_manager(
+            &format!("http://127.0.0.1:{port}"),
+            bundle_id.clone(),
+            store.clone(),
+        )
+        .await,
+    );
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    flow.launch().await.unwrap();
+
+    store.delay_next_load.store(true, Ordering::SeqCst);
+    let replacement = {
+        let manager = Arc::clone(&manager);
+        let config = authorization_code_server_config(&state.base_url, bundle_id.clone());
+        tokio::spawn(async move { manager.add_or_update_server(config).await })
+    };
+    store.load_started.notified().await;
+
+    let error = tokio::time::timeout(Duration::from_secs(3), replacement)
+        .await
+        .expect("replacement must return after the OAuth drain deadline")
+        .unwrap()
+        .expect_err("a timed-out OAuth drain must not report replacement success");
+    assert!(error
+        .to_string()
+        .contains("OAuth authorization flow did not drain"));
+
+    store.release_load.notify_one();
+    assert!(matches!(
+        flow.cancel(OAuthCancellationReason::Cancelled).await,
+        Ok(OAuthFlowOutcome::Terminated { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_flow_cancel_bypasses_long_running_oauth_request_gate() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
+    let manager = Arc::new(manager);
+    authorize_manager(&manager, &bundle_id, &state, None).await;
+    manager.start_client_by_id(&bundle_id).await.unwrap();
+
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: Some("tools.write".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+
+    state.block_next_mcp_response.store(true, Ordering::SeqCst);
+    let request = {
+        let manager = Arc::clone(&manager);
+        let bundle_id = bundle_id.clone();
+        tokio::spawn(async move {
+            manager
+                .call_tool(
+                    bundle_id.as_str(),
+                    "echo",
+                    serde_json::json!({"message": "hold request gate"}),
+                    None,
+                )
+                .await
+        })
+    };
+    state.mcp_response_started.notified().await;
+
+    let completing = {
+        let flow = flow.clone();
+        let issuer = state.base_url.clone();
+        tokio::spawn(async move {
+            flow.complete(OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(issuer),
+            })
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(1),
+        flow.cancel(OAuthCancellationReason::Timeout),
+    )
+    .await
+    .expect("direct flow cancellation must not wait for the OAuth request gate");
+    assert!(matches!(
+        cancelled,
+        Ok(OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            ..
+        })
+    ));
+    assert_eq!(completing.await.unwrap(), cancelled);
+
+    state.release_mcp_response.notify_one();
+    request.await.unwrap().unwrap();
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_replacement_blocks_late_facade_without_recreating_retired_oauth_client() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-replacement-race").unwrap();
+    let store = Arc::new(DelayedLoadOAuthCredentialStore::default());
+    let manager = Arc::new(
+        configure_authorization_code_manager(
+            &format!("http://127.0.0.1:{port}"),
+            bundle_id.clone(),
+            store.clone(),
+        )
+        .await,
+    );
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+
+    store.delay_next_load.store(true, Ordering::SeqCst);
+    let replacing = {
+        let manager = Arc::clone(&manager);
+        let config = authorization_code_server_config(&state.base_url, bundle_id.clone());
+        tokio::spawn(async move { manager.add_or_update_server(config).await })
+    };
+    store.load_started.notified().await;
+    let late_callback = {
+        let manager = Arc::clone(&manager);
+        let bundle_id = bundle_id.clone();
+        let issuer = state.base_url.clone();
+        tokio::spawn(async move {
+            manager
+                .complete_oauth(
+                    &bundle_id,
+                    OAuthCallback {
+                        code: "authorization-code".to_string(),
+                        state: launch.state,
+                        issuer: Some(issuer),
+                    },
+                )
+                .await
+        })
+    };
+    store.release_load.notify_one();
+
+    replacing.await.unwrap().unwrap();
+    assert!(matches!(
+        late_callback.await.unwrap(),
+        Err(OAuthError::StateMismatch)
+    ));
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        flow.cancel(OAuthCancellationReason::Cancelled).await,
+        Ok(OAuthFlowOutcome::Terminated { .. })
+    ));
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_computer_shutdown_cancels_and_drains_oauth_flow() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-shutdown-drain").unwrap();
+    let (computer, _temp_dir) = configure_authorization_code_computer(
+        &format!("http://127.0.0.1:{port}"),
+        std::slice::from_ref(&bundle_id),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+    )
+    .await;
+    state
+        .discovery_response_delay_ms
+        .store(5_000, Ordering::SeqCst);
+    let flow = computer
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_count(
+        &state.discovery_requests,
+        1,
+        "shutdown discovery must start",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), computer.shutdown())
+        .await
+        .expect("Computer shutdown must not retain OAuth provider timeout")
+        .unwrap();
+    assert!(matches!(
+        flow.cancel(OAuthCancellationReason::Cancelled).await,
+        Ok(OAuthFlowOutcome::Terminated { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_computer_shutdown_preempts_compat_begin_during_discovery() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-shutdown-compat-begin").unwrap();
+    let (computer, _temp_dir) = configure_authorization_code_computer(
+        &format!("http://127.0.0.1:{port}"),
+        std::slice::from_ref(&bundle_id),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+    )
+    .await;
+    let computer = Arc::new(computer);
+    state
+        .discovery_response_delay_ms
+        .store(5_000, Ordering::SeqCst);
+    let beginning = {
+        let computer = Arc::clone(&computer);
+        let bundle_id = bundle_id.clone();
+        tokio::spawn(async move {
+            computer
+                .begin_oauth(
+                    &bundle_id,
+                    OAuthBeginRequest {
+                        redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                        required_scope: None,
+                    },
+                )
+                .await
+        })
+    };
+    state.discovery_started.notified().await;
+
+    tokio::time::timeout(Duration::from_secs(1), computer.shutdown())
+        .await
+        .expect("shutdown must not wait for compat begin provider I/O")
+        .unwrap();
+    assert!(matches!(
+        beginning.await.unwrap(),
+        Err(OAuthError::AuthorizationCancelled)
+    ));
+}
+
+#[tokio::test]
+async fn test_computer_shutdown_preempts_compat_complete_during_exchange() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-shutdown-compat-complete").unwrap();
+    let (computer, _temp_dir) = configure_authorization_code_computer(
+        &format!("http://127.0.0.1:{port}"),
+        std::slice::from_ref(&bundle_id),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+    )
+    .await;
+    let computer = Arc::new(computer);
+    state.token_response_delay_ms.store(5_000, Ordering::SeqCst);
+    let launch = computer
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let completing = {
+        let computer = Arc::clone(&computer);
+        let bundle_id = bundle_id.clone();
+        let callback_state = launch.state;
+        let issuer = state.base_url.clone();
+        tokio::spawn(async move {
+            computer
+                .complete_oauth(
+                    &bundle_id,
+                    OAuthCallback {
+                        code: "authorization-code".to_string(),
+                        state: callback_state,
+                        issuer: Some(issuer),
+                    },
+                )
+                .await
+        })
+    };
+    state.token_started.notified().await;
+
+    tokio::time::timeout(Duration::from_secs(1), computer.shutdown())
+        .await
+        .expect("shutdown must not wait for compat complete provider I/O")
+        .unwrap();
+    assert!(matches!(
+        completing.await.unwrap(),
+        Ok(OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Cancelled,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn test_required_callback_issuer_failure_does_not_consume_pending_flow() {
     let (manager, bundle_id, state) =
         authorization_code_manager(OAuthFixtureMode::PreregisteredPublic, false).await;
@@ -2733,6 +3869,61 @@ async fn test_aborted_complete_oauth_still_reaches_a_terminal_authorized_status(
         .expect("detached terminal task must release the lifecycle gate")
         .unwrap();
     assert!(matches!(status, OAuthStatus::Authorized { .. }));
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cancel_wins_while_failed_completion_restores_baseline() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let store = Arc::new(DelayedLoadOAuthCredentialStore::default());
+    let bundle_id = BundleId::try_from("oauth-cancel-failed-completion").unwrap();
+    let manager = Arc::new(
+        configure_authorization_code_manager(&state.base_url, bundle_id.clone(), store.clone())
+            .await,
+    );
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    state.reject_token_remaining.store(1, Ordering::SeqCst);
+    store.delay_next_load.store(true, Ordering::SeqCst);
+    let completing = {
+        let flow = flow.clone();
+        let issuer = state.base_url.clone();
+        tokio::spawn(async move {
+            flow.complete(OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(issuer),
+            })
+            .await
+        })
+    };
+    store.load_started.notified().await;
+
+    let cancelling = {
+        let flow = flow.clone();
+        tokio::spawn(async move { flow.cancel(OAuthCancellationReason::Timeout).await })
+    };
+    tokio::task::yield_now().await;
+    store.release_load.notify_one();
+
+    let cancelled = cancelling.await.unwrap().unwrap();
+    assert_eq!(
+        cancelled,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Timeout,
+            status: OAuthStatus::Unauthorized,
+        }
+    );
+    assert_eq!(completing.await.unwrap().unwrap(), cancelled);
     manager.close().await.unwrap();
 }
 
@@ -2984,7 +4175,7 @@ async fn test_computer_injected_oauth_store_routes_all_bundles_and_restores_afte
                 operation,
                 CredentialStoreOperation::Save(key)
                     if key.bundle_id == *bundle_id
-                        && key.record_kind == OAuthCredentialRecordKind::Credentials
+                        && key.record_kind == OAuthCredentialRecordKind::IssuerIndex
             )),
             "the host store must receive credentials for {bundle_id}"
         );

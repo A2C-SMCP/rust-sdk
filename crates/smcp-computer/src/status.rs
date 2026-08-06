@@ -332,8 +332,7 @@ impl RuntimeStatus {
         }
     }
 
-    #[cfg(test)]
-    fn latest_oauth_status(&self, bundle_id: &BundleId) -> Option<OAuthStatus> {
+    pub(crate) fn latest_oauth_status(&self, bundle_id: &BundleId) -> Option<OAuthStatus> {
         self.oauth_statuses
             .read()
             .expect("OAuth status cache poisoned")

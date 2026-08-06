@@ -688,8 +688,8 @@ pub(crate) fn security_layer_check(name: &str, settings: &Map<String, Value>) ->
 /// → Enabled；⑤ `enabledMcpjsonServers` → Enabled；⑥ `enableAllProjectMcpServers == true` → Enabled；
 /// ⑦ 否则 → Pending。
 ///
-/// 安全层（Gate 1-3）抽至 [`security_layer_check`]，本函数首步调用它——对声明 server 行为不变（纯重构）。
-/// 对 plugin bundled server，reconcile 阶段二以 [`security_layer_check`] 独立判定（见
+/// 安全层（Gate 1-3）抽至 `security_layer_check`，本函数首步调用它——对声明 server 行为不变（纯重构）。
+/// 对 plugin bundled server，reconcile 阶段二以 `security_layer_check` 独立判定（见
 /// `computer.rs` `reconcile_governance`）。安全层 Disabled ⇏ 挂载、⇏ `pending_bundled_servers`。
 ///
 /// # 「bundled 名免批准」档位已删除，MUST NOT 以任何形状复活（#131 · 指南 §2 danger）

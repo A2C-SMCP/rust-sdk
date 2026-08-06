@@ -1,5 +1,10 @@
 #![doc = include_str!("../docs/oauth-host-integration.md")]
 
+mod flow;
+
+pub use flow::OAuthFlow;
+pub(crate) use flow::{OAuthFlowCommand, OAuthFlowDriver, OAuthFlowTerminal};
+
 use crate::inputs::SecretValueResolver;
 use crate::mcp_clients::bundle_id::BundleId;
 use crate::mcp_clients::model::{MCPServerInput, PromptStringInput};
@@ -27,7 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{oneshot, Mutex, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
 use url::Url;
 
@@ -46,7 +52,10 @@ const DISCOVERY_PROTOCOL_VERSION: &str = "2024-11-05";
 pub enum OAuthCredentialRecordKind {
     /// Serialized OAuth client registration and token credentials.
     Credentials,
-    /// Core-owned issuer index used to clear every credential slot without network discovery.
+    /// Core-owned issuer index and encrypted active-credential snapshot.
+    ///
+    /// Keeping the active snapshot in this single record lets hosts atomically replace the
+    /// credential set while retaining the issuer list needed for network-free cleanup.
     IssuerIndex,
 }
 
@@ -116,6 +125,11 @@ pub enum OAuthCredentialStoreError {
 /// Pending PKCE/CSRF state and host callback routing are separate concerns: this trait only stores
 /// credentials after authorization. Returning an error fails the OAuth operation; the SDK does not
 /// silently fall back to memory after a host store has been injected.
+///
+/// [`save`](Self::save) must replace one key atomically: when it returns an error, any value that
+/// existed for that key before the call must remain readable. The coordinator relies on this
+/// single-key guarantee to keep a previously authorized credential intact when a reauthorization
+/// commit fails.
 #[async_trait]
 pub trait OAuthCredentialStore: Send + Sync {
     async fn load(
@@ -159,6 +173,32 @@ impl OAuthCredentialStore for InMemoryOAuthCredentialStore {
 
     async fn delete(&self, key: &OAuthCredentialKey) -> Result<(), OAuthCredentialStoreError> {
         self.entries.write().await.remove(key);
+        Ok(())
+    }
+}
+
+/// Candidate-only rmcp credential store used until an interactive flow wins the terminal race.
+///
+/// Token exchange and DCR may mutate this store freely; the host store is touched only by the
+/// coordinator's serialized commit step.
+#[derive(Clone, Default)]
+struct StagedCredentialStore {
+    credentials: Arc<RwLock<Option<StoredCredentials>>>,
+}
+
+#[async_trait]
+impl CredentialStore for StagedCredentialStore {
+    async fn load(&self) -> Result<Option<StoredCredentials>, RmcpAuthError> {
+        Ok(self.credentials.read().await.clone())
+    }
+
+    async fn save(&self, credentials: StoredCredentials) -> Result<(), RmcpAuthError> {
+        *self.credentials.write().await = Some(credentials);
+        Ok(())
+    }
+
+    async fn clear(&self) -> Result<(), RmcpAuthError> {
+        *self.credentials.write().await = None;
         Ok(())
     }
 }
@@ -552,6 +592,35 @@ impl OAuthHttpClient for DiscoveryCleanupOAuthHttpClient {
     }
 }
 
+/// Event-driven cancellation decorator for provider operations owned by one interactive flow.
+struct CancellableOAuthHttpClient {
+    inner: Arc<dyn OAuthHttpClient>,
+    cancellation: CancellationToken,
+}
+
+impl CancellableOAuthHttpClient {
+    fn new(inner: Arc<dyn OAuthHttpClient>, cancellation: CancellationToken) -> Self {
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+}
+
+impl OAuthHttpClient for CancellableOAuthHttpClient {
+    fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                result = self.inner.execute(request) => result,
+                _ = self.cancellation.cancelled() => {
+                    Err(OAuthHttpClientError::new("OAuth flow cancelled"))
+                }
+            }
+        })
+    }
+}
+
 fn same_origin(left: &Url, right: &Url) -> bool {
     left.scheme() == right.scheme()
         && left.host_str() == right.host_str()
@@ -820,6 +889,18 @@ pub enum OAuthFlowOutcome {
     },
 }
 
+fn normalize_host_cancellation(
+    result: Result<OAuthFlowOutcome, OAuthError>,
+    reason: Option<OAuthCancellationReason>,
+) -> Result<OAuthFlowOutcome, OAuthError> {
+    match (result, reason) {
+        (Ok(OAuthFlowOutcome::Terminated { status, .. }), Some(reason)) => {
+            Ok(OAuthFlowOutcome::Terminated { reason, status })
+        }
+        (result, _) => result,
+    }
+}
+
 /// Stable, non-sensitive category for failures reported by the underlying OAuth protocol stack.
 ///
 /// Provider response bodies, URLs, tokens, client identifiers, and upstream error strings are
@@ -899,7 +980,7 @@ impl From<RmcpAuthError> for OAuthProtocolError {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum OAuthError {
     #[error("server does not have OAuth configured")]
     NotConfigured,
@@ -911,8 +992,14 @@ pub enum OAuthError {
     IssuerMismatch,
     #[error("OAuth authorization request has expired")]
     AuthorizationExpired,
+    #[error("OAuth authorization flow was cancelled")]
+    AuthorizationCancelled,
+    #[error("OAuth authorization flow did not drain before the lifecycle deadline")]
+    DrainTimeout,
     #[error("a different OAuth authorization request is already pending")]
     AuthorizationAlreadyPending,
+    #[error("provider cancellation reasons require state and issuer validation")]
+    InvalidCancellationReason,
     #[error("OAuth secret input '{0}' was not provided")]
     MissingSecret(String),
     #[error("unsupported JWT signing algorithm '{0}'")]
@@ -936,11 +1023,15 @@ struct PendingAuthorization {
     request: OAuthBeginRequest,
     requested_scopes: Vec<String>,
     generation: u64,
+    candidate: SensitiveAuthClient,
+    staged_store: StagedCredentialStore,
+    metadata: AuthorizationMetadata,
+    issuer: String,
 }
 
 enum AuthorizationFlowState {
     Idle,
-    Pending(PendingAuthorization),
+    Pending(Box<PendingAuthorization>),
     /// Retains only the opaque identity needed to classify one late callback.
     ///
     /// Expired flows are terminal and must not participate in active-flow gates for subsequent
@@ -973,6 +1064,14 @@ struct StoredCredentialEnvelope {
 struct StoredCredentialIndex {
     version: u8,
     issuers: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active: Option<StoredActiveCredential>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredActiveCredential {
+    issuer: Option<String>,
+    credentials: StoredCredentials,
 }
 
 impl ScopedCredentialStore {
@@ -996,12 +1095,13 @@ impl ScopedCredentialStore {
     }
 
     async fn set_issuer(&self, issuer: Option<String>) -> Result<(), RmcpAuthError> {
+        self.persist_issuer_index_with(issuer.clone()).await?;
         self.known_issuers
             .lock()
-            .expect("OAuth issuer registry poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .insert(issuer.clone());
         *self.issuer.write().await = issuer;
-        self.persist_issuer_index().await
+        Ok(())
     }
 
     fn key_for_issuer(&self, issuer: Option<String>) -> OAuthCredentialKey {
@@ -1032,14 +1132,18 @@ impl ScopedCredentialStore {
         RmcpAuthError::InternalError("OAuth credential store operation failed".to_string())
     }
 
-    async fn persisted_issuers(&self) -> Result<HashSet<Option<String>>, RmcpAuthError> {
+    async fn persisted_index(&self) -> Result<StoredCredentialIndex, RmcpAuthError> {
         let encoded = self
             .backend
             .load(&self.index_key())
             .await
             .map_err(Self::backend_error)?;
         let Some(encoded) = encoded else {
-            return Ok(HashSet::new());
+            return Ok(StoredCredentialIndex {
+                version: 1,
+                issuers: Vec::new(),
+                active: None,
+            });
         };
         let index = serde_json::from_str::<StoredCredentialIndex>(&encoded)
             .map_err(|_| RmcpAuthError::InternalError("OAuth issuer index is invalid".into()))?;
@@ -1048,29 +1152,83 @@ impl ScopedCredentialStore {
                 "OAuth issuer index version is unsupported".into(),
             ));
         }
-        Ok(index.issuers.into_iter().collect())
+        Ok(index)
     }
 
-    async fn persist_issuer_index(&self) -> Result<(), RmcpAuthError> {
-        let mut issuers = self.persisted_issuers().await?;
+    async fn persisted_issuers(&self) -> Result<HashSet<Option<String>>, RmcpAuthError> {
+        Ok(self.persisted_index().await?.issuers.into_iter().collect())
+    }
+
+    async fn persist_issuer_index_with(
+        &self,
+        additional: Option<String>,
+    ) -> Result<(), RmcpAuthError> {
+        let mut index = self.persisted_index().await?;
+        let mut issuers: HashSet<Option<String>> = index.issuers.drain(..).collect();
         issuers.extend(
             self.known_issuers
                 .lock()
-                .expect("OAuth issuer registry poisoned")
+                .unwrap_or_else(|error| error.into_inner())
                 .iter()
                 .cloned(),
         );
+        issuers.insert(additional);
         let mut issuers: Vec<Option<String>> = issuers.into_iter().collect();
         issuers.sort();
         let encoded = serde_json::to_string(&StoredCredentialIndex {
             version: 1,
             issuers,
+            active: index.active,
         })
         .map_err(|_| RmcpAuthError::InternalError("OAuth issuer index encoding failed".into()))?;
         self.backend
             .save(&self.index_key(), &encoded)
             .await
             .map_err(Self::backend_error)
+    }
+
+    /// Commit a fully prepared candidate credential to the durable slot.
+    ///
+    /// The issuer index may safely contain an unused issuer if the credential write fails. The
+    /// active issuer and generation move only after the backend has atomically replaced the
+    /// credential key, so a failed scope upgrade continues to address the old credential.
+    async fn commit_candidate(
+        &self,
+        issuer: String,
+        credentials: StoredCredentials,
+    ) -> Result<(), RmcpAuthError> {
+        let mut index = self.persisted_index().await?;
+        let mut issuers: HashSet<Option<String>> = index.issuers.drain(..).collect();
+        issuers.extend(
+            self.known_issuers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .cloned(),
+        );
+        issuers.insert(Some(issuer.clone()));
+        let mut issuers: Vec<_> = issuers.into_iter().collect();
+        issuers.sort();
+        let encoded = serde_json::to_string(&StoredCredentialIndex {
+            version: 1,
+            issuers,
+            active: Some(StoredActiveCredential {
+                issuer: Some(issuer.clone()),
+                credentials,
+            }),
+        })
+        .map_err(|_| RmcpAuthError::InternalError("OAuth issuer index encoding failed".into()))?;
+        self.backend
+            .save(&self.index_key(), &encoded)
+            .await
+            .map_err(Self::backend_error)?;
+        self.known_issuers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(Some(issuer.clone()));
+        *self.issuer.write().await = Some(issuer);
+        self.lifecycle.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 
     async fn overwrite_granted_scopes(&self, scopes: Vec<String>) -> Result<(), RmcpAuthError> {
@@ -1080,11 +1238,79 @@ impl ScopedCredentialStore {
         }
         Ok(())
     }
+
+    async fn locally_authorized_status(
+        &self,
+        options: &OAuthOptions,
+    ) -> Result<Option<OAuthStatus>, RmcpAuthError> {
+        let index = self.persisted_index().await?;
+        let mut candidates = Vec::new();
+        if let Some(active) = index.active {
+            candidates.push(active.credentials);
+        } else {
+            for issuer in index.issuers {
+                let Some(encoded) = self
+                    .backend
+                    .load(&self.key_for_issuer(issuer))
+                    .await
+                    .map_err(Self::backend_error)?
+                else {
+                    continue;
+                };
+                if let Ok(envelope) = serde_json::from_str::<StoredCredentialEnvelope>(&encoded) {
+                    if envelope.version == 1 && envelope.mode_fingerprint == self.mode_fingerprint {
+                        candidates.push(envelope.credentials);
+                    }
+                }
+            }
+        }
+        let mut authorized = candidates.into_iter().filter(|credentials| {
+            credentials.token_response.is_some()
+                && stored_client_matches(options, &credentials.client_id)
+        });
+        let Some(credentials) = authorized.next() else {
+            return Ok(None);
+        };
+        if authorized.next().is_some() {
+            return Ok(None);
+        }
+        let scopes = if credentials.granted_scopes.is_empty() {
+            options.scopes.clone()
+        } else {
+            credentials.granted_scopes
+        };
+        Ok(Some(OAuthStatus::Authorized { scopes }))
+    }
+}
+
+pub(crate) async fn locally_stored_oauth_status(
+    bundle_id: BundleId,
+    resource: String,
+    options: &OAuthOptions,
+    backend: Arc<dyn OAuthCredentialStore>,
+) -> Result<Option<OAuthStatus>, OAuthError> {
+    let store = ScopedCredentialStore::new(
+        bundle_id,
+        canonical_resource_identity(&resource)?,
+        oauth_mode_fingerprint(options),
+        backend,
+    );
+    store
+        .locally_authorized_status(options)
+        .await
+        .map_err(OAuthError::from)
 }
 
 #[async_trait]
 impl CredentialStore for ScopedCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, RmcpAuthError> {
+        let issuer = self.issuer.read().await.clone();
+        let index = self.persisted_index().await?;
+        if let Some(active) = index.active {
+            if active.issuer == issuer {
+                return Ok(Some(active.credentials));
+            }
+        }
         let key = self.key().await;
         let encoded = self.backend.load(&key).await.map_err(Self::backend_error)?;
         let Some(encoded) = encoded else {
@@ -1117,16 +1343,23 @@ impl CredentialStore for ScopedCredentialStore {
                 credentials.granted_scopes = existing.granted_scopes;
             }
         }
-        let encoded = serde_json::to_string(&StoredCredentialEnvelope {
+        let issuer = self.issuer.read().await.clone();
+        let mut index = self.persisted_index().await?;
+        let mut issuers: HashSet<Option<String>> = index.issuers.drain(..).collect();
+        issuers.insert(issuer.clone());
+        let mut issuers: Vec<_> = issuers.into_iter().collect();
+        issuers.sort();
+        let encoded = serde_json::to_string(&StoredCredentialIndex {
             version: 1,
-            mode_fingerprint: self.mode_fingerprint.clone(),
-            credentials: credentials.clone(),
+            issuers,
+            active: Some(StoredActiveCredential {
+                issuer,
+                credentials,
+            }),
         })
-        .map_err(|_| RmcpAuthError::InternalError("OAuth credential encoding failed".into()))?;
-        let key = self.key().await;
-        self.persist_issuer_index().await?;
+        .map_err(|_| RmcpAuthError::InternalError("OAuth issuer index encoding failed".into()))?;
         self.backend
-            .save(&key, &encoded)
+            .save(&self.index_key(), &encoded)
             .await
             .map_err(Self::backend_error)?;
         self.lifecycle.generation.fetch_add(1, Ordering::AcqRel);
@@ -1189,6 +1422,7 @@ pub(crate) struct OAuthCoordinator {
     request_gate: Arc<RwLock<()>>,
     state_store: ExpiringStateStore,
     oauth_http_client: Arc<dyn OAuthHttpClient>,
+    transport_http_client: reqwest::Client,
 }
 
 pub(crate) struct OAuthCoordinatorContext {
@@ -1381,7 +1615,7 @@ impl OAuthCoordinator {
         } else {
             OAuthStatus::Unauthorized
         };
-        let client = SensitiveAuthClient::new(AuthClient::new(http_client, manager));
+        let client = SensitiveAuthClient::new(AuthClient::new(http_client.clone(), manager));
         drop(initialization_guard);
         let status = OAuthStatusState::new(bundle_id, initial_status, events);
         Ok(Self {
@@ -1398,6 +1632,7 @@ impl OAuthCoordinator {
             request_gate,
             state_store,
             oauth_http_client,
+            transport_http_client: http_client,
         })
     }
 
@@ -1407,6 +1642,119 @@ impl OAuthCoordinator {
 
     pub(crate) fn credential_generation(&self) -> u64 {
         self.store.lifecycle.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn drive_flow(self: Arc<Self>, mut driver: OAuthFlowDriver) {
+        let cancellation = driver.cancellation();
+        let terminal = driver.terminal();
+        let request = driver.request().clone();
+        let begin = self.begin_with_cancellation(request, cancellation.clone());
+        tokio::pin!(begin);
+        let begin_result = tokio::select! {
+            biased;
+            result = &mut begin => Some(result),
+            _ = cancellation.cancelled() => None,
+        };
+
+        let launch = match begin_result {
+            Some(Ok(launch)) if !cancellation.is_cancelled() => launch,
+            Some(Err(error)) if !cancellation.is_cancelled() => {
+                let result = self
+                    .finalize_non_retryable_result(Err(error), &terminal)
+                    .await;
+                driver.finish(result);
+                return;
+            }
+            _ => {
+                let result = self
+                    .finish_claimed_cancellation(driver.host_cancellation_reason())
+                    .await;
+                driver.finish(result);
+                return;
+            }
+        };
+        let expected_issuer = match self.state_store.load(&launch.state).await {
+            Ok(Some(state)) => state.expected_issuer,
+            Ok(None) => {
+                driver.finish(Err(OAuthError::AuthorizationExpired));
+                return;
+            }
+            Err(error) => {
+                driver.finish(Err(error.into()));
+                return;
+            }
+        };
+        if !driver.publish_launch(Ok(launch.clone()), expected_issuer) {
+            let result = self
+                .finish_claimed_cancellation(driver.host_cancellation_reason())
+                .await;
+            driver.finish(result);
+            return;
+        }
+
+        let result = loop {
+            tokio::select! {
+                biased;
+                command = driver.next_command() => {
+                    match command {
+                        Some(OAuthFlowCommand::Complete { callback, response }) => {
+                            let result = self
+                                .complete_with_cancellation(
+                                    callback,
+                                    cancellation.clone(),
+                                    Some(terminal.clone()),
+                                )
+                                .await;
+                            let retryable = matches!(
+                                result,
+                                Err(OAuthError::StateMismatch | OAuthError::IssuerMismatch)
+                            );
+                            if retryable {
+                                let _ = response.send(result);
+                                continue;
+                            }
+                            let result = self
+                                .finalize_non_retryable_result(result, &terminal)
+                                .await;
+                            driver.finish(result.clone());
+                            let _ = response.send(result.clone());
+                            break result;
+                        }
+                        Some(OAuthFlowCommand::CancelCallback { cancellation, response }) => {
+                            let result = self
+                                .cancel_with_terminal(cancellation, Some(terminal.clone()))
+                                .await;
+                            let retryable = matches!(
+                                result,
+                                Err(OAuthError::StateMismatch | OAuthError::IssuerMismatch)
+                            );
+                            if retryable {
+                                let _ = response.send(result);
+                                continue;
+                            }
+                            driver.finish(result.clone());
+                            let _ = response.send(result.clone());
+                            break result;
+                        }
+                        None => {
+                            break Err(OAuthError::AuthorizationExpired);
+                        }
+                    }
+                }
+                _ = cancellation.cancelled() => {
+                    let reason = driver.host_cancellation_reason();
+                    let result = self
+                        .cancel_with_terminal(OAuthCancellation {
+                            state: launch.state.clone(),
+                            issuer: None,
+                            reason,
+                        }, Some(terminal.clone()))
+                        .await;
+                    break normalize_host_cancellation(result, Some(reason));
+                }
+            }
+        };
+        driver.finish(result);
     }
 
     pub(crate) async fn prepare_request(&self) -> Result<OAuthRequestGuard, OAuthError> {
@@ -1487,22 +1835,6 @@ impl OAuthCoordinator {
 
     async fn resolve_secret(&self, id: &str) -> Result<String, OAuthError> {
         resolve_secret_from(self.resolver.as_ref(), id).await
-    }
-
-    async fn discover(
-        &self,
-        manager: &mut AuthorizationManager,
-    ) -> Result<AuthorizationMetadata, OAuthError> {
-        let metadata = manager.discover_metadata().await?;
-        validate_authorization_metadata(
-            &metadata,
-            matches!(self.options.mode, OAuthClientMode::AuthorizationCode { .. }),
-        )?;
-        self.store
-            .set_issuer(Some(authorization_server_credential_identity(&metadata)?))
-            .await?;
-        manager.set_metadata(metadata.clone());
-        Ok(metadata)
     }
 
     /// Configure and exchange a client-credentials grant when that mode is selected.
@@ -1666,9 +1998,19 @@ impl OAuthCoordinator {
         self.status.set(reauthorization).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin(
         &self,
         request: OAuthBeginRequest,
+    ) -> Result<OAuthLaunch, OAuthError> {
+        self.begin_with_cancellation(request, CancellationToken::new())
+            .await
+    }
+
+    async fn begin_with_cancellation(
+        &self,
+        request: OAuthBeginRequest,
+        cancellation: CancellationToken,
     ) -> Result<OAuthLaunch, OAuthError> {
         let OAuthClientMode::AuthorizationCode { registration } = &self.options.mode else {
             return Err(OAuthError::UnsupportedTransport);
@@ -1685,8 +2027,23 @@ impl OAuthCoordinator {
                 Err(OAuthError::AuthorizationAlreadyPending)
             };
         }
-        let mut manager = self.client.inner.auth_manager.lock().await;
-        let metadata = self.discover(&mut manager).await?;
+        let staged_store = StagedCredentialStore::default();
+        let cancellable_http_client: Arc<dyn OAuthHttpClient> =
+            Arc::new(CancellableOAuthHttpClient::new(
+                Arc::clone(&self.oauth_http_client),
+                cancellation.clone(),
+            ));
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            &self.resource,
+            cancellable_http_client,
+        )
+        .await?;
+        manager.set_credential_store(staged_store.clone());
+        manager.set_state_store(self.state_store.clone());
+        let metadata = manager.discover_metadata().await?;
+        validate_authorization_metadata(&metadata, true)?;
+        let issuer = authorization_server_credential_identity(&metadata)?;
+        manager.set_metadata(metadata.clone());
         let scopes: Vec<&str> = self.options.scopes.iter().map(String::as_str).collect();
         match registration {
             OAuthClientRegistration::Dynamic => {
@@ -1770,13 +2127,28 @@ impl OAuthCoordinator {
             .generation
             .fetch_add(1, Ordering::AcqRel)
             + 1;
-        *authorization_flow = AuthorizationFlowState::Pending(PendingAuthorization {
+        *authorization_flow = AuthorizationFlowState::Pending(Box::new(PendingAuthorization {
             launch: launch.clone(),
             request,
             requested_scopes,
             generation,
-        });
+            candidate: SensitiveAuthClient::new(AuthClient::new(
+                self.transport_http_client.clone(),
+                manager,
+            )),
+            staged_store,
+            metadata,
+            issuer,
+        }));
         self.status.set(OAuthStatus::AuthorizationPending).await;
+        if cancellation.is_cancelled() {
+            let state = launch.state.clone();
+            *authorization_flow = AuthorizationFlowState::Idle;
+            drop(authorization_flow);
+            self.state_store.delete(&state).await?;
+            self.restore_status_after_termination().await?;
+            return Err(OAuthError::AuthorizationCancelled);
+        }
         Ok(launch)
     }
 
@@ -1833,14 +2205,104 @@ impl OAuthCoordinator {
         .await
     }
 
+    async fn restore_after_failed_authorization(&self, state: &str) -> Result<(), OAuthError> {
+        self.state_store.delete(state).await?;
+        let restored = self.restore_status_after_termination().await?;
+        if !matches!(restored, OAuthStatus::Authorized { .. }) {
+            self.status
+                .set(OAuthStatus::Error {
+                    message: "OAuth authorization code exchange failed".to_string(),
+                })
+                .await;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn complete(
         &self,
         callback: OAuthCallback,
     ) -> Result<OAuthFlowOutcome, OAuthError> {
-        let request_guard = Arc::clone(&self.request_gate).write_owned().await;
-        let credential_guard = Arc::clone(&self.machine_scope_upgrade_gate)
-            .lock_owned()
-            .await;
+        self.complete_with_cancellation(callback, CancellationToken::new(), None)
+            .await
+    }
+
+    async fn finish_claimed_cancellation(
+        &self,
+        reason: OAuthCancellationReason,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
+        let state = {
+            let mut flow = self.authorization_flow.lock().await;
+            let state = match &*flow {
+                AuthorizationFlowState::Pending(active) => Some(active.launch.state.clone()),
+                AuthorizationFlowState::Expired { state } => Some(state.clone()),
+                AuthorizationFlowState::Idle => None,
+            };
+            *flow = AuthorizationFlowState::Idle;
+            state
+        };
+        let mut cleanup_failed = false;
+        if let Some(state) = state {
+            cleanup_failed = self.state_store.delete(&state).await.is_err();
+        }
+        let status = match self.restore_status_after_termination().await {
+            Ok(status) if !cleanup_failed => status,
+            Ok(_) | Err(_) => {
+                let status = OAuthStatus::Error {
+                    message: "OAuth cancellation cleanup failed".to_string(),
+                };
+                self.status.set(status.clone()).await;
+                status
+            }
+        };
+        Ok(OAuthFlowOutcome::Terminated { reason, status })
+    }
+
+    async fn finalize_non_retryable_result(
+        &self,
+        result: Result<OAuthFlowOutcome, OAuthError>,
+        terminal: &OAuthFlowTerminal,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
+        if let Some(reason) = terminal.claim_non_cancellation_or_reason() {
+            self.finish_claimed_cancellation(reason).await
+        } else {
+            result
+        }
+    }
+
+    async fn complete_with_cancellation(
+        &self,
+        callback: OAuthCallback,
+        cancellation: CancellationToken,
+        terminal: Option<OAuthFlowTerminal>,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
+        let request_guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return self.finish_claimed_cancellation(OAuthCancellationReason::Cancelled).await;
+            }
+            guard = Arc::clone(&self.request_gate).write_owned() => guard,
+        };
+        let credential_guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                drop(request_guard);
+                return self.finish_claimed_cancellation(OAuthCancellationReason::Cancelled).await;
+            }
+            guard = Arc::clone(&self.machine_scope_upgrade_gate).lock_owned() => guard,
+        };
+        let _request_guard = request_guard;
+        let _credential_guard = credential_guard;
+        self.complete_after_gates(callback, cancellation, terminal)
+            .await
+    }
+
+    async fn complete_after_gates(
+        &self,
+        callback: OAuthCallback,
+        cancellation: CancellationToken,
+        terminal: Option<OAuthFlowTerminal>,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
         let mut authorization_flow = self.authorization_flow.lock().await;
         if let AuthorizationFlowState::Expired { state } = &*authorization_flow {
             if state != &callback.state {
@@ -1882,73 +2344,165 @@ impl OAuthCoordinator {
         }
         let requested_scopes = active.requested_scopes.clone();
         let callback_state = callback.state.clone();
+        let candidate = active.candidate.clone();
+        let staged_store = active.staged_store.clone();
+        let metadata = active.metadata.clone();
+        let issuer = active.issuer.clone();
         drop(authorization_flow);
 
-        let client = self.client.clone();
-        let store = self.store.clone();
-        let state_store = self.state_store.clone();
-        let status = self.status.clone();
-        let granted_scopes = Arc::clone(&self.granted_scopes);
-        let authorization_flow = Arc::clone(&self.authorization_flow);
-        let (result_tx, result_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let _request_guard = request_guard;
-            let _credential_guard = credential_guard;
-            let result = match spawn_code_exchange(client, callback).await {
-                Ok(mut scopes) => {
-                    if scopes.is_empty() {
-                        scopes = requested_scopes;
-                    }
-                    if let Err(error) = store.overwrite_granted_scopes(scopes.clone()).await {
-                        status
-                            .set(OAuthStatus::Error {
-                                message: "OAuth credential storage failed".to_string(),
-                            })
-                            .await;
-                        Err(error.into())
-                    } else {
-                        *granted_scopes.write().await = scopes.clone();
-                        status
-                            .set(OAuthStatus::Authorized {
-                                scopes: scopes.clone(),
-                            })
-                            .await;
-                        Ok(OAuthFlowOutcome::Authorized { scopes })
-                    }
-                }
-                Err(error) => {
-                    let result = state_store.delete(&callback_state).await;
-                    status
-                        .set(OAuthStatus::Error {
-                            message: "OAuth authorization code exchange failed".to_string(),
-                        })
-                        .await;
-                    match result {
-                        Ok(()) => Err(error),
-                        Err(delete_error) => Err(delete_error.into()),
-                    }
-                }
+        let result = async {
+            let exchange = spawn_code_exchange(candidate, callback);
+            tokio::pin!(exchange);
+            let exchange_result = tokio::select! {
+                biased;
+                result = &mut exchange => Some(result),
+                _ = cancellation.cancelled() => None,
             };
-            *authorization_flow.lock().await = AuthorizationFlowState::Idle;
-            let _ = result_tx.send(result);
-        });
-        result_rx
-            .await
-            .map_err(|_| OAuthError::Protocol(OAuthProtocolError::Internal))?
+
+            match (exchange_result, cancellation.is_cancelled()) {
+                (_, true) | (None, false) => {
+                    self.state_store.delete(&callback_state).await?;
+                    let status = self.restore_status_after_termination().await?;
+                    Ok(OAuthFlowOutcome::Terminated {
+                        reason: OAuthCancellationReason::Cancelled,
+                        status,
+                    })
+                }
+                (Some(exchange_result), false) => match exchange_result {
+                    Ok(mut scopes) => {
+                        if scopes.is_empty() {
+                            scopes = requested_scopes;
+                        }
+                        let mut credentials = staged_store
+                            .load()
+                            .await?
+                            .ok_or(OAuthError::Protocol(OAuthProtocolError::Internal))?;
+                        if credentials.granted_scopes.is_empty() {
+                            credentials.granted_scopes = scopes.clone();
+                        }
+
+                        let prepared_scopes = scopes.clone();
+                        let prepared_client_id = credentials.client_id.clone();
+                        let prepared = {
+                            let prepare = async {
+                                let mut manager = AuthorizationManager::new_with_oauth_http_client(
+                                    &self.resource,
+                                    Arc::clone(&self.oauth_http_client),
+                                )
+                                .await?;
+                                manager.set_credential_store(staged_store.clone());
+                                manager.set_state_store(self.state_store.clone());
+                                manager.set_metadata(metadata);
+                                manager.initialize_from_store().await?;
+                                configure_restored_authorization_client(
+                                    &mut manager,
+                                    &self.resource,
+                                    &self.options,
+                                    &prepared_scopes,
+                                    &prepared_client_id,
+                                    self.resolver.as_ref(),
+                                )
+                                .await?;
+
+                                // Refreshes after installation must persist to the durable store.
+                                // This setter cannot fail and all fallible manager preparation is
+                                // complete.
+                                manager.set_credential_store(self.store.clone());
+                                Ok::<_, OAuthError>(manager)
+                            };
+                            tokio::pin!(prepare);
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => {
+                                    return self
+                                        .finish_claimed_cancellation(
+                                            OAuthCancellationReason::Cancelled,
+                                        )
+                                        .await;
+                                }
+                                result = &mut prepare => result,
+                            }
+                        };
+
+                        match prepared {
+                            Ok(manager) => {
+                                let completion_won = terminal
+                                    .as_ref()
+                                    .is_none_or(OAuthFlowTerminal::try_claim_completion);
+                                if !completion_won {
+                                    return self
+                                        .finish_claimed_cancellation(
+                                            OAuthCancellationReason::Cancelled,
+                                        )
+                                        .await;
+                                }
+                                // This is the single durable commit point. The credential backend's
+                                // per-key atomic-save contract keeps the old value intact on error;
+                                // after success only infallible in-memory publication remains.
+                                if let Err(error) = self
+                                    .store
+                                    .commit_candidate(issuer, credentials)
+                                    .await
+                                    .map_err(OAuthError::from)
+                                {
+                                    self.restore_after_failed_authorization(&callback_state)
+                                        .await?;
+                                    Err(error)
+                                } else {
+                                    *self.client.inner.auth_manager.lock().await = manager;
+                                    *self.granted_scopes.write().await = scopes.clone();
+                                    self.status
+                                        .set(OAuthStatus::Authorized {
+                                            scopes: scopes.clone(),
+                                        })
+                                        .await;
+                                    Ok(OAuthFlowOutcome::Authorized { scopes })
+                                }
+                            }
+                            Err(error) => {
+                                self.restore_after_failed_authorization(&callback_state)
+                                    .await?;
+                                Err(error)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.restore_after_failed_authorization(&callback_state)
+                            .await?;
+                        Err(error)
+                    }
+                },
+            }
+        }
+        .await;
+        *self.authorization_flow.lock().await = AuthorizationFlowState::Idle;
+        result
     }
 
+    #[cfg(test)]
     pub(crate) async fn cancel(
         &self,
         cancellation: OAuthCancellation,
     ) -> Result<OAuthFlowOutcome, OAuthError> {
-        let request_guard = Arc::clone(&self.request_gate).write_owned().await;
-        let credential_guard = Arc::clone(&self.machine_scope_upgrade_gate)
-            .lock_owned()
-            .await;
+        self.cancel_with_terminal(cancellation, None).await
+    }
+
+    async fn cancel_with_terminal(
+        &self,
+        cancellation: OAuthCancellation,
+        terminal: Option<OAuthFlowTerminal>,
+    ) -> Result<OAuthFlowOutcome, OAuthError> {
         let mut authorization_flow = self.authorization_flow.lock().await;
+        let claimed_reason = terminal
+            .as_ref()
+            .and_then(OAuthFlowTerminal::cancellation_reason);
         if let AuthorizationFlowState::Expired { state } = &*authorization_flow {
             if state != &cancellation.state {
                 return Err(OAuthError::StateMismatch);
+            }
+            if let Some(reason) = claimed_reason {
+                drop(authorization_flow);
+                return self.finish_claimed_cancellation(reason).await;
             }
             *authorization_flow = AuthorizationFlowState::Idle;
             return Err(OAuthError::AuthorizationExpired);
@@ -1961,6 +2515,10 @@ impl OAuthCoordinator {
         }
         let stored_state = self.state_store.load(&cancellation.state).await?;
         if active.generation != self.credential_generation() || stored_state.is_none() {
+            if let Some(reason) = claimed_reason {
+                drop(authorization_flow);
+                return self.finish_claimed_cancellation(reason).await;
+            }
             *authorization_flow = AuthorizationFlowState::Idle;
             drop(authorization_flow);
             self.state_store.delete(&cancellation.state).await?;
@@ -1978,34 +2536,16 @@ impl OAuthCoordinator {
             cancellation.issuer.as_deref(),
             provider_callback,
         )?;
-
+        let reason = if let Some(terminal) = terminal {
+            terminal.claim_cancellation(cancellation.reason);
+            terminal
+                .cancellation_reason()
+                .ok_or(OAuthError::AuthorizationExpired)?
+        } else {
+            cancellation.reason
+        };
         drop(authorization_flow);
-        let state_store = self.state_store.clone();
-        let store = self.store.clone();
-        let fallback_scopes = self.options.scopes.clone();
-        let status = self.status.clone();
-        let granted_scopes = Arc::clone(&self.granted_scopes);
-        let authorization_flow = Arc::clone(&self.authorization_flow);
-        let cancellation_state = cancellation.state;
-        let reason = cancellation.reason;
-        let (result_tx, result_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let _request_guard = request_guard;
-            let _credential_guard = credential_guard;
-            let result = match state_store.delete(&cancellation_state).await {
-                Ok(()) => {
-                    restore_authorization_status(&store, &fallback_scopes, &granted_scopes, &status)
-                        .await
-                        .map(|status| OAuthFlowOutcome::Terminated { reason, status })
-                }
-                Err(error) => Err(error.into()),
-            };
-            *authorization_flow.lock().await = AuthorizationFlowState::Idle;
-            let _ = result_tx.send(result);
-        });
-        result_rx
-            .await
-            .map_err(|_| OAuthError::Protocol(OAuthProtocolError::Internal))?
+        self.finish_claimed_cancellation(reason).await
     }
 
     pub(crate) async fn clear(&self) -> Result<(), OAuthError> {

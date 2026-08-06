@@ -17,7 +17,7 @@ use crate::errors::ComputerError;
 use crate::inputs::SecretValueResolver;
 use crate::oauth::{
     InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
-    OAuthCredentialStore, OAuthError, OAuthFlowOutcome, OAuthLaunch, OAuthStatus,
+    OAuthCredentialStore, OAuthError, OAuthFlow, OAuthFlowOutcome, OAuthLaunch, OAuthStatus,
 };
 use crate::skills::{McpResource, SkillResourceManager, SkillStagingError};
 use crate::status::RuntimeStatus;
@@ -309,7 +309,7 @@ impl MCPServerManager {
         self.stop_all().await?;
 
         // 清空所有状态 / Clear all state
-        self.clear_all().await;
+        self.clear_all().await?;
 
         // 添加新配置（按 bundle_id 去重，first-wins + 诊断）/ Add configs, deduped by bundle_id (first-wins)。
         {
@@ -369,11 +369,24 @@ impl MCPServerManager {
                     bundle_id
                 )));
             }
+        }
+
+        // Atomically retire the old OAuth capability before any fallible MCP stop. Callback
+        // facades can no longer reacquire or recreate this client while replacement is in flight.
+        let replaced_oauth = self.oauth_clients.write().await.remove(&bundle_id);
+        if let Some(client) = replaced_oauth {
+            client
+                .cancel_and_drain_oauth_flow()
+                .await
+                .map_err(|error| {
+                    ComputerError::ConnectionError(format!("failed to drain OAuth flow: {error}"))
+                })?;
+        }
+        if is_active {
             self.stop_client_by_id_inner(&bundle_id).await?;
         }
 
         // 更新配置（原地更新：同 bundle_id 覆盖）/ Update configuration (update-in-place by bundle_id)
-        self.oauth_clients.write().await.remove(&bundle_id);
         {
             let mut configs = self.servers_config.write().await;
             configs.insert(bundle_id.clone(), config);
@@ -407,6 +420,17 @@ impl MCPServerManager {
             return Ok(false);
         }
 
+        // Retire OAuth before a fallible transport stop so removal always cancels a pending flow.
+        let removed_oauth = self.oauth_clients.write().await.remove(bundle_id);
+        if let Some(client) = removed_oauth {
+            client
+                .cancel_and_drain_oauth_flow()
+                .await
+                .map_err(|error| {
+                    ComputerError::ConnectionError(format!("failed to drain OAuth flow: {error}"))
+                })?;
+        }
+
         // 停止客户端（按 bundle_id）/ Stop client (by bundle_id)
         self.stop_client_by_id_inner(bundle_id).await?;
 
@@ -415,8 +439,6 @@ impl MCPServerManager {
             let mut configs = self.servers_config.write().await;
             configs.remove(bundle_id);
         }
-        self.oauth_clients.write().await.remove(bundle_id);
-
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
 
@@ -633,12 +655,29 @@ impl MCPServerManager {
     }
 
     /// 清空所有状态 / Clear all state
-    async fn clear_all(&self) {
+    async fn clear_all(&self) -> Result<(), ComputerError> {
         self.servers_config.write().await.clear();
         self.active_clients.write().await.clear();
         self.tool_routes.write().await.clear();
         self.disabled_tools.write().await.clear();
-        self.oauth_clients.write().await.clear();
+        let oauth_clients = {
+            let mut clients = self.oauth_clients.write().await;
+            clients
+                .drain()
+                .map(|(_, client)| client)
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        for client in oauth_clients {
+            if let Err(error) = client.cancel_and_drain_oauth_flow().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), |error| {
+            Err(ComputerError::ConnectionError(format!(
+                "failed to drain OAuth flow: {error}"
+            )))
+        })
     }
 
     /// 已注册（routed）工具数——读**已缓存**的 `tool_routes`，**不发** `tools/list` RPC（#114 S7 status 用）。
@@ -653,9 +692,13 @@ impl MCPServerManager {
 
     /// 关闭管理器 / Close manager
     pub async fn close(&self) -> Result<(), ComputerError> {
-        self.stop_all().await?;
-        self.clear_all().await;
+        let stop_result = self.stop_all().await;
+        // OAuth cleanup is unconditional: a transport disconnect failure must not leave browser
+        // authorization running until the provider timeout.
+        let clear_result = self.clear_all().await;
         self.update_state(ManagerState::Uninitialized).await;
+        stop_result?;
+        clear_result?;
         info!("Manager closed successfully");
         Ok(())
     }
@@ -1990,15 +2033,27 @@ impl MCPServerManager {
     }
 
     /// Start Authorization Code + PKCE. The caller opens the returned URL.
+    pub async fn create_oauth_flow(
+        &self,
+        bundle_id: &BundleId,
+        request: OAuthBeginRequest,
+    ) -> Result<OAuthFlow, OAuthError> {
+        let lifecycle = self.lifecycle_lock(bundle_id);
+        let _lifecycle_guard = lifecycle.lock().await;
+        let client = self.oauth_client_for(bundle_id).await?;
+        client.create_oauth_flow(request).await
+    }
+
+    /// Compatibility facade that waits for [`OAuthFlow::launch`].
     pub async fn begin_oauth(
         &self,
         bundle_id: &BundleId,
         request: OAuthBeginRequest,
     ) -> Result<OAuthLaunch, OAuthError> {
-        let lifecycle = self.lifecycle_lock(bundle_id);
-        let _lifecycle_guard = lifecycle.lock().await;
-        let client = self.oauth_client_for(bundle_id).await?;
-        client.begin_oauth(request).await
+        self.create_oauth_flow(bundle_id, request)
+            .await?
+            .launch()
+            .await
     }
 
     /// Complete an authorization callback and return its structured outcome.
@@ -2007,10 +2062,10 @@ impl MCPServerManager {
         bundle_id: &BundleId,
         callback: OAuthCallback,
     ) -> Result<OAuthFlowOutcome, OAuthError> {
-        let lifecycle = self.lifecycle_lock(bundle_id);
-        let _lifecycle_guard = lifecycle.lock().await;
-        let client = self.oauth_client_for(bundle_id).await?;
-        client.complete_oauth(callback).await
+        self.oauth_flow_for_callback(bundle_id)
+            .await?
+            .complete(callback)
+            .await
     }
 
     /// Terminate a pending browser flow, delete its PKCE/CSRF state, and return the resulting status.
@@ -2019,10 +2074,22 @@ impl MCPServerManager {
         bundle_id: &BundleId,
         cancellation: OAuthCancellation,
     ) -> Result<OAuthFlowOutcome, OAuthError> {
-        let lifecycle = self.lifecycle_lock(bundle_id);
-        let _lifecycle_guard = lifecycle.lock().await;
-        let client = self.oauth_client_for(bundle_id).await?;
-        client.cancel_oauth(cancellation).await
+        self.oauth_flow_for_callback(bundle_id)
+            .await?
+            .cancel_compat(cancellation)
+            .await
+    }
+
+    pub(crate) async fn oauth_flow_for_callback(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<OAuthFlow, OAuthError> {
+        let client = {
+            let lifecycle = self.lifecycle_lock(bundle_id);
+            let _lifecycle_guard = lifecycle.lock().await;
+            self.oauth_client_for_callback(bundle_id).await?
+        };
+        client.active_oauth_flow()
     }
 
     /// Remove stored tokens and pending authorization state.
@@ -2065,6 +2132,32 @@ impl MCPServerManager {
             .entry(bundle_id.clone())
             .or_insert(client)
             .clone())
+    }
+
+    async fn oauth_client_for_callback(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<Arc<HttpMCPClient>, OAuthError> {
+        if let Some(client) = self.oauth_clients.read().await.get(bundle_id).cloned() {
+            return Ok(client);
+        }
+
+        // Preserve the facade's distinction between an unknown/non-OAuth server and a callback
+        // for which no live flow exists, without recreating a retired client from stale config.
+        let config = self
+            .servers_config
+            .read()
+            .await
+            .get(bundle_id)
+            .cloned()
+            .ok_or(OAuthError::NotConfigured)?;
+        let MCPServerConfig::Http(http) = config else {
+            return Err(OAuthError::UnsupportedTransport);
+        };
+        if http.oauth.is_none() {
+            return Err(OAuthError::NotConfigured);
+        }
+        Err(OAuthError::StateMismatch)
     }
 }
 
@@ -2737,6 +2830,77 @@ mod tests {
         let manager = MCPServerManager::new();
         let status = manager.get_server_status().await;
         assert!(status.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_drains_oauth_even_when_active_client_disconnect_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let accepted_by_server = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accepted_by_server.notify_one();
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        });
+
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("oauth-close-error");
+        let client = Arc::new(
+            HttpMCPClient::new(HttpServerParameters {
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                headers: HashMap::new(),
+            })
+            .with_oauth_context(
+                bundle_id.clone(),
+                Arc::clone(&manager.oauth_credential_store),
+                None,
+            )
+            .with_oauth(
+                crate::oauth::OAuthOptions {
+                    resource: None,
+                    scopes: vec!["tools.read".to_string()],
+                    client_name: Some("A2C Computer".to_string()),
+                    mode: crate::oauth::OAuthClientMode::AuthorizationCode {
+                        registration: crate::oauth::OAuthClientRegistration::Preregistered {
+                            client_id: "oauth-client".to_string(),
+                            client_secret_input: None,
+                        },
+                    },
+                },
+                None,
+            ),
+        );
+        manager
+            .oauth_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), Arc::clone(&client));
+        let active: StdArc<dyn MCPClientProtocol> = client.clone();
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id, active);
+        let flow = client
+            .create_oauth_flow(OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            })
+            .await
+            .unwrap();
+        accepted.notified().await;
+
+        assert!(manager.close().await.is_err());
+        let terminal = tokio::time::timeout(
+            Duration::from_secs(1),
+            flow.cancel(crate::oauth::OAuthCancellationReason::Cancelled),
+        )
+        .await
+        .expect("close must drain OAuth despite the disconnect error")
+        .unwrap();
+        assert!(matches!(terminal, OAuthFlowOutcome::Terminated { .. }));
     }
 
     #[tokio::test]

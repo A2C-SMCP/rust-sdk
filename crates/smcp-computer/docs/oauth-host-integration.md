@@ -6,8 +6,9 @@ servers. The same SDK protocol core supports local Desktop/CLI and headless clou
 selects and implements the flow driver.
 
 The SDK never opens a browser, binds a callback port, starts a Web server, connects to a host
-Socket, or waits for a callback. `begin_oauth` returns as soon as discovery, client setup, PKCE,
-CSRF state, and the authorization URL are ready.
+Socket, or waits for a callback. `create_oauth_flow` registers a cancellable flow before provider
+I/O begins; [`OAuthFlow::launch`] waits for discovery, client setup, PKCE, CSRF state, and the
+authorization URL.
 
 ## Canonical resource configuration
 
@@ -38,7 +39,7 @@ explicit or inherited from the endpoint.
 | Protected-resource and authorization-server discovery | Owns | Does not reimplement | Publishes metadata |
 | Client setup, CIMD, DCR, and pre-registered clients | Owns | Supplies runtime configuration and secrets | Registers or recognizes the client |
 | PKCE verifier, CSRF state, generation, and pending TTL | Owns | Treats returned state as opaque | Returns the state unchanged |
-| Redirect URI | Validates and sends the exact host value | Prepares the callback entry before `begin_oauth` | Redirects to the registered URI |
+| Redirect URI | Validates and sends the exact host value | Prepares the callback entry before `create_oauth_flow` | Redirects to the registered URI |
 | Authorization URL | Generates and returns [`OAuthLaunch`] | Delivers only to the intended user; never logs or persists it | Presents authentication and consent |
 | Browser/UI | No dependency or abstraction | Opens the browser or renders the user entry point | Presents its own pages |
 | Callback listener/gateway | No dependency or abstraction | Owns listener, HTTPS route, deadline, response page, and shutdown | Sends success or OAuth error parameters |
@@ -65,7 +66,7 @@ credentials if the host injected persistent credential storage.
 
 ## Starting a flow
 
-Prepare the callback entry before calling `begin_oauth`. The redirect URI is a runtime value and
+Prepare the callback entry before calling `create_oauth_flow`. The redirect URI is a runtime value and
 must not be copied into persistent MCP configuration.
 
 ```rust,no_run
@@ -77,8 +78,8 @@ must not be copied into persistent MCP configuration.
 #     bundle_id: &BundleId,
 #     redirect_uri: String,
 # ) -> Result<(), OAuthError> {
-let launch = computer
-    .begin_oauth(
+let flow = computer
+    .create_oauth_flow(
         bundle_id,
         OAuthBeginRequest {
             redirect_uri,
@@ -86,6 +87,7 @@ let launch = computer
         },
     )
     .await?;
+let launch = flow.launch().await?;
 
 // A cloud host must make callback routing reachable before the user can authorize.
 // A local or mobile host has already prepared its listener/link handler.
@@ -98,9 +100,28 @@ deliver_authorization_url_to_target_user(&launch.authorization_url);
 # fn register_opaque_callback_route(_: &str) -> Result<(), OAuthError> { Ok(()) }
 ```
 
-An identical concurrent `begin_oauth` request returns the active [`OAuthLaunch`]. A conflicting
-request returns [`OAuthError::AuthorizationAlreadyPending`]. A host must not start a second
-listener or route for the reused launch.
+An identical concurrent `create_oauth_flow` request returns a clone of the active [`OAuthFlow`]. A
+conflicting request returns [`OAuthError::AuthorizationAlreadyPending`]. A host must not start a
+second listener or route for the reused flow.
+
+The handle exists before discovery or DCR returns. Browser-open failure, user cancellation, host
+deadline, server replacement/removal, and Computer shutdown therefore cancel through
+[`OAuthFlow::cancel`] without waiting for the provider's HTTP timeout:
+
+```rust,no_run
+# use smcp_computer::{OAuthCancellationReason, OAuthError, OAuthFlow};
+# async fn cancel(flow: &OAuthFlow) -> Result<(), OAuthError> {
+let outcome = flow.cancel(OAuthCancellationReason::Timeout).await?;
+# let _ = outcome;
+# Ok(())
+# }
+```
+
+`Computer::begin_oauth`, `complete_oauth`, and `cancel_oauth` remain compatibility facades. They
+preserve the previous signatures and post-launch behavior, but only the handle API can express
+cancellation before an OAuth state exists. After launch, compatibility `cancel_oauth` calls with
+`Cancelled` or `Timeout` also use the immediate host-cancellation path and do not queue behind an
+in-flight token exchange.
 
 For a cloud host, route registration must succeed before the authorization URL is delivered. If
 registration fails, do not send the URL; cancel the pending SDK flow or retry route registration
@@ -112,27 +133,31 @@ The host parses the callback query before calling the SDK:
 
 | Callback shape | Host action |
 |---|---|
-| Exactly one `code`, one `state`, optional one `iss`, and no `error` | Call `complete_oauth` with [`OAuthCallback`] |
-| Exactly one `error=access_denied`, one `state`, optional one `iss`, and no `code` | Call `cancel_oauth` with [`OAuthCancellationReason::AccessDenied`] |
-| Any other OAuth `error`, one `state`, optional one `iss`, and no `code` | Call `cancel_oauth` with [`OAuthCancellationReason::AuthorizationError`] |
-| User closes/cancels the host flow before a callback | Call `cancel_oauth` with [`OAuthCancellationReason::Cancelled`] |
-| The host's total callback deadline expires | Call `cancel_oauth` with [`OAuthCancellationReason::Timeout`] |
+| Exactly one `code`, one `state`, optional one `iss`, and no `error` | Call `flow.complete` with [`OAuthCallback`] |
+| Exactly one `error=access_denied`, one `state`, optional one `iss`, and no `code` | Call `flow.cancel_callback` with [`OAuthCancellationReason::AccessDenied`] |
+| Any other OAuth `error`, one `state`, optional one `iss`, and no `code` | Call `flow.cancel_callback` with [`OAuthCancellationReason::AuthorizationError`] |
+| User closes/cancels the host flow before a callback | Call `flow.cancel` with [`OAuthCancellationReason::Cancelled`] |
+| The host's total callback deadline expires | Call `flow.cancel` with [`OAuthCancellationReason::Timeout`] |
 | Duplicate `code`, `state`, `iss`, or `error`; both `code` and `error`; missing state | Reject as malformed and keep waiting within the same total deadline |
 
 `error_description` is untrusted display text. Do not place it in an SDK input, exception, log,
 metric label, or user-visible page. If a product chooses to show provider text, it must apply its
 own escaping and disclosure policy outside the SDK.
 
-`complete_oauth` and `cancel_oauth` return [`OAuthFlowOutcome`]:
+[`OAuthFlow::complete`], [`OAuthFlow::cancel_callback`], and the compatibility facades return
+[`OAuthFlowOutcome`]:
 
 - [`OAuthFlowOutcome::Authorized`] contains the non-secret granted scopes.
 - [`OAuthFlowOutcome::Terminated`] contains the normalized termination reason and the resulting
   [`OAuthStatus`]. A cancelled scope upgrade can therefore report that earlier credentials remain
   authorized.
 
-After either call accepts the active state and issuer, the SDK owns the terminal transition.
+After a call accepts the active state and issuer, the SDK owns the terminal transition.
 Dropping or aborting the caller future does not cancel that transition; a subsequent `oauth_status`
-waits for the exchange or cancellation cleanup and returns the converged status.
+waits for the exchange or cancellation cleanup and returns the converged status. Complete/cancel
+races have one terminal winner. A candidate token and client registration remain isolated until
+completion wins the serialized commit, so cancellation or failed scope step-up preserves the
+previous credential and scopes.
 
 Protocol failures remain typed errors:
 
@@ -163,15 +188,16 @@ a polling loop as a substitute for the event stream.
 ## Local loopback flow driver
 
 Use loopback HTTP only for a listener bound to a loopback address. Bind first so the exact,
-ephemeral port can be supplied to `begin_oauth`.
+ephemeral port can be supplied to `create_oauth_flow`.
 
 ```text
 bind 127.0.0.1:<ephemeral>
-  -> begin_oauth(redirect_uri=http://127.0.0.1:<ephemeral>/callback)
+  -> create_oauth_flow(redirect_uri=http://127.0.0.1:<ephemeral>/callback)
+  -> flow.launch()
   -> open the returned authorization URL
   -> authorization server redirects to loopback
   -> host validates method, path, cardinality, and callback shape
-  -> complete_oauth or cancel_oauth
+  -> flow.complete or flow.cancel_callback
   -> render a non-sensitive result page
   -> close listener
 ```
@@ -179,7 +205,7 @@ bind 127.0.0.1:<ephemeral>
 Use one total deadline for the flow. Requests for `/favicon.ico`, the wrong path or method, missing
 parameters, duplicate parameters, and a wrong state are invalid probes; respond safely and keep
 the listener alive without extending the deadline. Accept only the first well-formed callback for
-the active state. At the deadline, call `cancel_oauth(... Timeout)` and close the listener.
+the active state. At the deadline, call `flow.cancel(Timeout)` and close the listener.
 
 Do not log request URIs: they can contain authorization code, state, issuer, and provider error
 text. Pass the authorization URL to the OS browser command as one argument, never through a shell.
@@ -193,7 +219,7 @@ reverse-domain labels, the URI has no authority/host, and it uses a non-root sin
 Generic schemes such as `custom:/callback`, `file:` URIs, and authority-bearing
 `com.example.app://host/callback` values are rejected.
 
-Register the link handler with the operating system before `begin_oauth`, deliver the returned URL
+Register the link handler with the operating system before `create_oauth_flow`, deliver the returned URL
 to the intended user, and pass the received `code/state/iss` or normalized OAuth error through the
 same callback contract. A replacement app process cannot complete a flow whose process-local PKCE
 state was lost; it must begin a fresh flow.
@@ -205,13 +231,14 @@ callback target. Use a stable HTTPS Callback Gateway URI registered for the OAut
 
 ```text
 prepare stable HTTPS callback route
-  -> CLI calls begin_oauth(redirect_uri=https://gateway.example/oauth/callback)
+  -> CLI calls create_oauth_flow(redirect_uri=https://gateway.example/oauth/callback)
+  -> flow.launch()
   -> register one-time opaque state route for authenticated tenant/CLI/Computer/bundle
   -> send authorization URL through a private event to the target user only
   -> authorization server calls the HTTPS Gateway
   -> Gateway consumes the route by state only
   -> send code/state/iss or normalized OAuth error to the original CLI only
-  -> original live CLI calls complete_oauth or cancel_oauth
+  -> original live CLI calls flow.complete or flow.cancel_callback
   -> send sanitized OAuthStatus to the target user
 ```
 
@@ -221,7 +248,7 @@ enter a UI broadcast, shared room, durable event stream, analytics event, or cal
 
 Route lookup and consumption should be atomic. Unknown, replayed, and expired state must not be
 delivered to another coordinator. When a route expires while the originating coordinator is still
-alive, the host calls `cancel_oauth(... Timeout)` so the SDK pending state terminates immediately.
+alive, the host calls `flow.cancel(Timeout)` so the SDK pending state terminates immediately.
 
 If the initiating CLI exits, remove its route. Its process-local PKCE verifier is gone, so an old
 callback cannot be completed by a replacement CLI or another coordinator. The replacement starts a
@@ -253,13 +280,13 @@ representations and error chain never contain the provider response body or upst
 
 ## Host completion checklist
 
-- Callback entry exists before `begin_oauth`.
+- Callback entry exists before `create_oauth_flow`.
 - Local mode uses loopback HTTP; remote mode uses stable HTTPS.
 - Authorization URL reaches only the intended user.
 - Callback routes only by opaque state and is consumed once.
 - Code reaches only the original live coordinator.
 - Invalid probes do not extend the total deadline.
-- Denial, host cancellation, and timeout call `cancel_oauth`.
+- Denial calls `flow.cancel_callback`; host cancellation and timeout call `flow.cancel`.
 - Route expiry and process exit terminate the old flow; retry starts a new flow.
 - Browser, listener, Gateway, Socket, result page, and retries remain outside the SDK.
 - Logs and `Debug` output follow the redaction rules above.
