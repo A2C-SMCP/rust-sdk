@@ -263,23 +263,26 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// #141/R4：人机面 `token`（name 或 bundle_id）→ `BundleId` 解析（**只在人机面**，库层永不 name 寻址）。
+    /// #141/R4 + #171/Candidate B：人机面 `token`（name 或 bundle_id）→ `BundleId` 解析（**只在人机面**，库层
+    /// 永不 name 寻址）。
     ///
-    /// **步骤序严格按协议 §5.1（`sdk-api-guidance.md` 行 127-145），与 python `cli/resolve.py:183-192` 逐行
-    /// 同构——顺序有意义，勿重排**：
+    /// **步骤序严格按协议 §5.1（`sdk-api-guidance.md` 行 127-145），与 python `cli/resolve.py` 逐行同构——
+    /// 顺序有意义，勿重排**：
     ///
     /// 1. token 按 **display name** 反查，**唯一命中** → 其 bundle_id；
-    /// 2. **多命中** → 报错并列出候选（bundle_id + name + 归属），要求改用 bundle_id 重试；
-    /// 3. **0 命中** ∧ token 是**合法且已注册**的 bundle_id → token 本身；
-    /// 4. 其余 → 报错「未找到」。
+    /// 2. **多命中**，且 token 精确等于其中某候选的 bundle_id → 按该 bundle_id 执行（#171 Candidate B：
+    ///    用户已显式表达身份意图，bundle_id 全局唯一，不构成真实二义性）；
+    /// 3. **多命中**，且 token 不等于任何候选的 bundle_id → 报错并列出候选（bundle_id + name + 归属），
+    ///    要求改用 bundle_id 重试（禁字典序最小：把不确定的错变成确定的错）；
+    /// 4. **0 命中** ∧ token 是**合法且已注册**的 bundle_id → token 本身；
+    /// 5. 其余 → 报错「未找到」。
     ///
-    /// 🔴 两条曾被写反、经隔离复审在真二进制上复现（本 doc 即订正记录）：
+    /// 🔴 订正记录（#141 复审发现，保留以警示未来维护者）：
     ///
     /// - **name 必须先于 bundle_id 查**。反过来会让 `server rm foo` 在「A(name=foo, id=foo_1) + B(name=bar,
     ///   id=foo)」时删掉 **B**——用户敲的是自己看得见的名字，回执里的 bundle_id 他分辨不出是别人的。
     /// - **语法合法 ≠ 存在**。放行未注册的合法 id 会让拼错的 token 一路走到底层幂等 no-op ⇒ 假成功复活
-    ///   （协议步骤 2 明文「仍无 → 报错「未找到」」、步骤 5「未命中 MUST 报错，MUST NOT 静默成功」）。
-    ///   此前注释宣称「R4 必须放行」——**协议、issue 正文、python 三处均无此说，系凭空杜撰**。
+    ///   （协议步骤 5「未命中 MUST 报错，MUST NOT 静默成功」）。
     async fn resolve_target(&self, token: &str) -> Result<BundleId, CommandError> {
         let servers = self.candidates().await;
         let name_hits: Vec<&McpServerWithMetadata> =
@@ -292,8 +295,15 @@ impl CommandHandler {
             });
         }
 
-        // ② 多命中 → 列候选报错（禁字典序最小：把不确定的错变成确定的错）。
+        // ② 多命中：先精确 bundle_id 匹配（Candidate B / §5.1 步骤 2），再报错。
         if name_hits.len() > 1 {
+            // token 精确等于某候选的 bundle_id → 执行用户显式表达的身份意图。
+            if let Ok(id) = BundleId::try_from(token) {
+                if name_hits.iter().any(|s| s.bundle_id == token) {
+                    return Ok(id);
+                }
+            }
+            // 仍不匹配 → 列候选报错（禁字典序最小：把不确定的错变成确定的错）。
             let candidates = name_hits
                 .iter()
                 .map(|s| {
@@ -1101,6 +1111,43 @@ mod tests {
             handler.resolve_target("dup-b").await.unwrap().as_str(),
             "dup-b"
         );
+    }
+
+    /// #171 Candidate B：bundle_id 精确等于冲突名时 MUST 命中，不应报「请用 bundle_id 重试」。
+    ///
+    /// 死锁场景：A(name="foo", bundle_id="foo") + B(name="foo", bundle_id="bundle_x") 同时存在时，
+    /// 步骤②多命中直接报错，而步骤③ bundle_id 匹配被「0 name hits」门阻断 ⇒ A 永远不可寻址。
+    /// Candidate B 在步骤②多命中分支内先做精确 bundle_id 匹配，匹配到则直接返回。
+    #[tokio::test]
+    async fn resolve_target_deadlock_bundle_id_equals_collision_name_171() {
+        let computer = create_test_computer().await;
+        // A: name="foo", bundle_id="foo"（缺省派生——与冲突名完全重合的死锁场景）
+        mount(&computer, "foo", None).await;
+        // B: name="foo", bundle_id="bundle_x"（plugin 贡献的同名 server）
+        mount(&computer, "foo", Some("bundle_x")).await;
+        let handler = create_test_handler(computer);
+
+        // 核心断言：token 精确等于 A 的 bundle_id → MUST 命中 A
+        assert_eq!(
+            handler.resolve_target("foo").await.unwrap().as_str(),
+            "foo",
+            "bundle_id 精确等于冲突名时，MUST 命中该 server 而非报错"
+        );
+        // B 仍通过自己的 bundle_id 可达（步骤③ 0 name hit 路径）
+        assert_eq!(
+            handler.resolve_target("bundle_x").await.unwrap().as_str(),
+            "bundle_x"
+        );
+        // 即使再加第三个同名 server（C: name="foo", bundle_id="foo_2"），
+        // token "foo" 仍精确命中 A 的 bundle_id → 不报歧义。
+        mount(&handler.computer, "foo", Some("foo_2")).await;
+        assert_eq!(
+            handler.resolve_target("foo").await.unwrap().as_str(),
+            "foo",
+            "新增同名 server 后，精确 bundle_id 匹配仍优先"
+        );
+        // 同名无精确匹配 → 仍报歧义（现有 resolve_target_ambiguous_lists_candidates_141 已覆盖：
+        // dup-a/dup-b 同时存在，token="dup" 不匹配任何 bundle_id → 报错列候选）。
     }
 
     #[tokio::test]
