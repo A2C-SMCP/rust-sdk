@@ -49,10 +49,15 @@ use crate::settings::lifecycle::{
     AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceRefreshRow,
     MarketplaceRemoveOutcome, RemoveMarketplaceParams,
 };
-use crate::settings::mcp_config::canonicalize_persist_body;
+use crate::settings::mcp_config::{
+    canonicalize_persist_body, mcp_server_status, McpApprovalStatus,
+};
 use crate::settings::policy::resolve_policy_settings;
 use crate::settings::reconciler::InstalledPluginRecord;
-use crate::settings::recovery::{BundledServerRecord, GovernanceRecoveryReport};
+use crate::settings::recovery::{
+    plugin_enabled_origin, BundledServerRecord, GovernanceRecoveryReport,
+};
+use crate::settings::schema::SettingsScope;
 use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
@@ -1356,18 +1361,38 @@ impl<S: Session> Computer<S> {
         // `declared` 覆盖：CLI 参考接线传 **flag-aware** 合并视图（`--settings` scope 生效，对齐 Python
         // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（user + 进程 cwd 的 project/local +
         // policy，**无** `--settings` flag scope；跨重启可靠 disable 请写 user scope）。cwd=None（进程态）。
+        //
+        // #165 Option B：`scope_layers`（per-scope 原始层）用于 project-origin 检测——与 `declared` **解耦**。
+        // `declared==None` 时与 declared 同源解析；`declared==Some(flag-aware)` 时单独解析。二者均锚定**本实例
+        // `config_dir`**（#113：override > 进程 cwd；与 governance_snapshot 等同源，且令测试 hermetic）——project scope
+        // 必在此解析内，故门在所有挂载路径（含 CLI `run_governance_remount`）生效（Python #182 在 declared=Some
+        // 路径 per_scope_layers=None ⇒ 门不触发，本实现显式收紧）。flag 层受信（免批准）不参与 origin 判定，其缺席
+        // 仅影响罕见 flag+project 重叠（过度提示，安全）。
+        let config_dir = self.config_dir();
         let resolved_declared;
+        let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)>;
         let declared: &serde_json::Map<String, serde_json::Value> = match declared {
-            Some(d) => d,
-            None => {
+            Some(d) => {
                 let policy = resolve_policy_settings(None, None, None);
-                resolved_declared = resolve_settings(ResolveSettingsArgs {
-                    cwd: None,
+                scope_layers = resolve_settings(ResolveSettingsArgs {
+                    cwd: Some(&config_dir),
                     env,
                     flag_settings_path: None,
                     policy_settings: Some(&policy),
                 })
-                .settings;
+                .scope_layers;
+                d
+            }
+            None => {
+                let policy = resolve_policy_settings(None, None, None);
+                let resolved = resolve_settings(ResolveSettingsArgs {
+                    cwd: Some(&config_dir),
+                    env,
+                    flag_settings_path: None,
+                    policy_settings: Some(&policy),
+                });
+                resolved_declared = resolved.settings;
+                scope_layers = resolved.scope_layers;
                 &resolved_declared
             }
         };
@@ -1410,6 +1435,21 @@ impl<S: Session> Computer<S> {
                 if existing.contains(&bid) {
                     warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id,
                         "reconcile_governance: remount skipped (bundle_id conflicts with an existing server, existing wins)");
+                    continue;
+                }
+                // #165 Option B：project-origin bundled server 回落审批门（协议 §5 item 10 条件化 / 指南 §2.2）。
+                // 仅 project scope 供给的 `enabledPlugins=true` → PENDING；受信 scope（user/local/flag/policy）免批准。
+                // 再过 `mcp_server_status`（F8① 签名未变，bundle_id 作 name 传入）：落 PENDING 才不挂载——
+                // 用户手动加入 `enabledMcpjsonServers` → ENABLED 仍挂载；policy `deniedMcpServers` → DISABLED 亦落
+                // 既有路径。兑现「作为未决 server 自然落档⑦」（非「进门后改判」，不复活 #131 档④）。
+                if plugin_enabled_origin(&scope_layers, &rec.plugin_id)
+                    == Some(SettingsScope::Project)
+                    && mcp_server_status(bid.as_str(), declared, false)
+                        == McpApprovalStatus::Pending
+                {
+                    info!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id,
+                        "reconcile_governance: bundled server enabled by project scope — PENDING approval, not auto-mounted");
+                    report.pending_bundled_servers.push(rec);
                     continue;
                 }
                 // 每 plugin 根注入一次 inputs；注入失败 → 隔离该 server（roots 不入集，同根后续 server 会重试）。
@@ -3111,6 +3151,43 @@ impl<S: Session> Computer<S> {
     pub async fn list_mcp_servers(&self) -> Vec<MCPServerConfig> {
         let servers = self.mcp_servers.read().await;
         servers.values().cloned().collect()
+    }
+
+    /// #165 Option B：当前**回落审批门 PENDING**（project-origin 激活）的 bundled server 列表 / pending bundled.
+    ///
+    /// 供 CLI boot 批准框 / 下游 client（如 tfrobot-client 审批 UI）查询「哪些 plugin bundled server 待批准」。
+    /// project scope `enabledPlugins=true` 激活、且 [`mcp_server_status`] 判 [`McpApprovalStatus::Pending`] 的
+    /// bundled server（受信 scope 激活的不在此列——免批准直挂）。TOFU：经
+    /// [`approve_bundled_plugin`](crate::settings::mcp_config::approve_bundled_plugin) 批准 → 写 local scope →
+    /// 下次 [`reconcile_governance`](Self::reconcile_governance) origin 变 local（受信）→ 直挂、退出此列表。
+    ///
+    /// 现算（lock-free 纯读）：resolve settings →
+    /// [`collect_enabled_bundled_servers`](crate::settings::recovery::collect_enabled_bundled_servers) → 过滤
+    /// project-origin ∧ PENDING。与 reconcile 阶段二**同源同判据**（origin + `mcp_server_status`）。
+    #[must_use]
+    pub fn list_pending_bundled_approvals(&self) -> Vec<BundledServerRecord> {
+        let home = self.skill_home();
+        let env = self.config_env();
+        let config_dir = self.config_dir();
+        let resolved = resolve_settings(ResolveSettingsArgs {
+            cwd: Some(&config_dir),
+            env,
+            flag_settings_path: None,
+            policy_settings: Some(&resolve_policy_settings(None, None, None)),
+        });
+        let declared = &resolved.settings;
+        let scope_layers = &resolved.scope_layers;
+        crate::settings::recovery::collect_enabled_bundled_servers(&home, env, declared)
+            .into_iter()
+            .filter(|rec| {
+                plugin_enabled_origin(scope_layers, &rec.plugin_id) == Some(SettingsScope::Project)
+                    && mcp_server_status(
+                        crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config).as_str(),
+                        declared,
+                        false,
+                    ) == McpApprovalStatus::Pending
+            })
+            .collect()
     }
 
     /// 本实例 enabled-bundled 归属集（intent ∧ `enabledPlugins==true` 门控）/ enabled bundled ownership set。
@@ -5173,6 +5250,151 @@ mod tests {
             .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
             .await;
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
+    }
+
+    /// #165 Option B（变异验证判据）：project-scope `enabledPlugins=true`（入 git、随仓库分发）激活的 plugin
+    /// bundled server **MUST 回落审批门 PENDING**——不自动挂载、入 `pending_bundled_servers`。删去 project-scope
+    /// enable（origin 变 None / 非 Project）→ 恢复免批准直挂（回归守护）。镜像协议 §5 item 10 条件化 / 指南 §2.2。
+    #[tokio::test]
+    async fn reconcile_governance_project_origin_bundled_server_is_pending_165() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        // project-scope（入 git）enable：模拟攻击者 `<cwd>/.tfrobot/settings.json`。
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            serde_json::json!({ "enabledPlugins": { "audit@acme": true } }).to_string(),
+        )
+        .unwrap();
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+
+        // project-origin → PENDING：不挂载、入 pending 列表、hooks 未注册。
+        assert!(
+            report.remounted_servers.is_empty(),
+            "project-origin bundled server MUST NOT auto-mount (must go PENDING)"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "project-origin bundled server MUST NOT be registered"
+        );
+        assert_eq!(
+            report.pending_bundled_servers.len(),
+            1,
+            "project-origin bundled server lands in pending list"
+        );
+        assert_eq!(report.pending_bundled_servers[0].plugin_id, "audit@acme");
+        assert_eq!(report.pending_bundled_servers[0].config.name(), "audit-mcp");
+
+        // 回归守护（变异）：删去 project-scope enable → origin=None（非 Project）→ 免批准直挂。
+        std::fs::remove_file(tfrobot.join("settings.json")).unwrap();
+        let hooks2 = RecordingRemountHooks::new();
+        let report2 = comp_b
+            .reconcile_governance(Some(&hooks2), Some(&declared_audit_enabled()))
+            .await;
+        assert_eq!(
+            report2.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "non-project-origin bundled server mounts approval-free (regression guard)"
+        );
+        assert!(report2.pending_bundled_servers.is_empty());
+    }
+
+    /// #165：local-scope（受信）覆盖 project-scope enable → origin=Local → 免批准直挂（**非** PENDING）。
+    ///
+    /// issue #165 正文曾误把 Local 归 PENDING；协议 §2.2 + Python #182 一致：`user/local/flag/policy` 受信。
+    /// 此测试同时堵变异：若门判据误写 `origin.is_some()`（而非 `== Some(Project)`），origin=Some(Local) 会错误落
+    /// PENDING ⇒ 本测试断言「直挂」失败。
+    #[tokio::test]
+    async fn reconcile_governance_local_scope_overrides_project_to_approval_free_165() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        // project-scope enable（入 git）+ local-scope enable（个人、受信）：
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tfrobot.join("settings.local.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+
+        let comp = Computer::new("l", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-l"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+
+        // local（受信）覆盖 project → origin=Local → 免批准直挂、不入 pending。
+        assert_eq!(
+            report.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "local-origin (trusted) bundled server mounts approval-free"
+        );
+        assert!(report.pending_bundled_servers.is_empty());
+    }
+
+    /// #165 TOFU 闭环：project-origin PENDING → `approve_bundled_plugin` 写 local → 下次 reconcile origin 变
+    /// local（受信）→ 免批准直挂、退出 pending 列表。
+    #[tokio::test]
+    async fn approve_bundled_plugin_promotes_pending_to_mounted_on_next_reconcile_165() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+
+        let comp = Computer::new("t", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-t"));
+
+        // 1) project-origin → PENDING（不挂载）。
+        let hooks = RecordingRemountHooks::new();
+        let r1 = comp
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+        assert!(r1.remounted_servers.is_empty());
+        assert_eq!(r1.pending_bundled_servers.len(), 1);
+
+        // 2) TOFU：approve 写 local[audit@acme]=true → 下次 reconcile origin=Local（受信）→ 直挂、退出 pending。
+        crate::settings::mcp_config::approve_bundled_plugin("audit@acme", Some(&wd)).unwrap();
+        let hooks2 = RecordingRemountHooks::new();
+        let r2 = comp
+            .reconcile_governance(Some(&hooks2), Some(&declared_audit_enabled()))
+            .await;
+        assert_eq!(
+            r2.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "approved plugin mounts on next reconcile"
+        );
+        assert!(
+            r2.pending_bundled_servers.is_empty(),
+            "approved plugin exits pending list"
+        );
     }
 
     /// #152：cold-start 治理恢复重挂 enabled bundled MCP server 后，应**启动**达 running（协议 #11「enable

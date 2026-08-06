@@ -298,6 +298,13 @@ pub struct ResolvedSettings {
     pub settings: Map<String, Value>,
     /// 去重后的字段级校验错误 / deduped field-level validation errors。
     pub errors: Vec<SettingsValidationError>,
+    /// 五层原始分层（低→高优先级：user / project / local / flag / policy）/ raw per-scope layers, low→high.
+    ///
+    /// #165 Option B（协议 §5 item 10 条件化 / 指南 §2.2）：合并视图丢失 per-scope 线索，而 `enabledPlugins`
+    /// 的**激活来源 scope** 决定 plugin bundled server 是否免批准（仅 `project` → 回落审批门 PENDING）。本字段供
+    /// [`plugin_enabled_origin`](crate::settings::recovery::plugin_enabled_origin) 逐层推回 origin，不落盘、
+    /// 纯派生（与 Python `ResolvedSettings.per_scope_layers` 同构）。空层（文件缺失 / `None` 注入）为空 `Map`。
+    pub scope_layers: Vec<(SettingsScope, Map<String, Value>)>,
 }
 
 /// 按出现顺序去重错误 / Order-preserving dedup。
@@ -401,6 +408,15 @@ pub fn resolve_settings(args: ResolveSettingsArgs) -> ResolvedSettings {
     );
     errors.extend(policy_errors);
 
+    // #165：capture 原始分层副本（merge_layers 的 `&[a,b,…]` 会把各层 move 进临时数组、merge 后丢弃，
+    // 故此处先 clone 一份留作 per-scope origin 推回；settings 文件小、boot 期调用，clone 成本可忽略）。
+    let scope_layers = vec![
+        (SettingsScope::User, user_layer.clone()),
+        (SettingsScope::Project, project_layer.clone()),
+        (SettingsScope::Local, local_layer.clone()),
+        (SettingsScope::Flag, flag_layer.clone()),
+        (SettingsScope::Policy, policy_layer.clone()),
+    ];
     let merged = merge_layers(&[
         user_layer,
         project_layer,
@@ -412,6 +428,7 @@ pub fn resolve_settings(args: ResolveSettingsArgs) -> ResolvedSettings {
     ResolvedSettings {
         settings: merged,
         errors: dedup_errors(errors),
+        scope_layers,
     }
 }
 

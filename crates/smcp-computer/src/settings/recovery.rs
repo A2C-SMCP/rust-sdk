@@ -66,6 +66,7 @@ use serde_json::{Map, Value};
 use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig};
 use crate::settings::installer::materialize_plugin_record;
+use crate::settings::schema::SettingsScope;
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
     load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
@@ -105,6 +106,18 @@ pub struct GovernanceRecoveryReport {
     pub rematerialized_plugins: Vec<String>,
     /// 账本缺记录但**重物化失败**（源不可达等）的 enabled plugin id（降级、未阻断其余）/ degraded rematerialize。
     pub failed_rematerialize: Vec<String>,
+    /// #165 Option B：project-origin `enabledPlugins=true` 激活、回落审批门 PENDING 故**未挂载**的 bundled
+    /// server（编排方第二阶段填充）/ project-enabled bundled servers held PENDING (not auto-mounted).
+    ///
+    /// 仅 `enabledPlugins` **来源 scope = `Project`**（入 git、随仓库分发）的 bundled server 落此（协议 §5 item 10
+    /// 条件化 / 指南 §2.2）；受信 scope（user/local/flag/policy）激活的保持免批准直挂。TOFU：用户批准一次 →
+    /// 写 local scope → 下次 reconcile origin 变 local（受信）→ 直挂、不再入此列表。
+    ///
+    /// ⚠️ 仅 `reconcile_governance(Some(hooks), _)` 路径填充（阶段二执行）；boot_up（`hooks=None`）阶段二整段
+    /// 跳过 → 此字段恒空。查询待批准列表请用
+    /// [`Computer::list_pending_bundled_approvals`](crate::computer::Computer::list_pending_bundled_approvals)
+    /// （独立现算）。
+    pub pending_bundled_servers: Vec<BundledServerRecord>,
 }
 
 // ===========================================================================
@@ -130,6 +143,35 @@ fn plugin_enabled(declared: &Map<String, Value>, pid: &str) -> bool {
             .and_then(|plugins| plugins.get(pid)),
         Some(Value::Bool(true))
     )
+}
+
+/// #165 Option B：激活该 plugin 的最高 scope（按优先级），用于 bundled server 审批门分叉 / enable origin scope.
+///
+/// `enabledPlugins` 三态合并（协议 §2.4）：absent=无意见、true=启用、false=显式禁用。逐 scope（低→高）
+/// 检查**原始层**：遇 `false` → 被显式禁用 → 重置 origin=`None`；遇 `true` → 该 scope 是当前激活来源 → 继续
+/// 查更高 scope 覆盖。返回**最后一个 `true` 的 scope**（即最高激活 scope）；全 absent / 最高非-absent 为 `false`
+/// → `None`。镜像 Python `_plugin_enable_origin`（双端逐字一致）。
+///
+/// **审批门分叉**（协议 §5 item 10 条件化 / 指南 §2.2）：`Some(Project)` → bundled server 回落审批门 PENDING；
+/// 受信 scope（`User`/`Local`/`Flag`/`Policy`）→ 免批准。**不读账本名集**（#131 F8 判据②）——判据纯来自
+/// `enabledPlugins` 的 per-scope 原始层。
+#[must_use]
+pub fn plugin_enabled_origin(
+    scope_layers: &[(SettingsScope, Map<String, Value>)],
+    pid: &str,
+) -> Option<SettingsScope> {
+    let mut origin: Option<SettingsScope> = None;
+    for (scope, layer) in scope_layers {
+        let Some(enabled) = layer.get("enabledPlugins").and_then(Value::as_object) else {
+            continue;
+        };
+        match enabled.get(pid) {
+            Some(Value::Bool(false)) => origin = None, // 显式禁用覆盖一切（更高 scope 的 true 也会被再后的 false 清）
+            Some(Value::Bool(true)) => origin = Some(*scope),
+            _ => {} // absent / 非 bool → 无意见，保留当前 origin
+        }
+    }
+    origin
 }
 
 // ===========================================================================
@@ -569,6 +611,84 @@ mod tests {
         assert_eq!(rec.plugin_id, "audit@acme");
         assert_eq!(rec.plugin, "audit");
         assert_eq!(rec.marketplace, "acme");
+    }
+
+    // ---- #165 Option B：plugin_enabled_origin（激活来源 scope 推回）------------------
+    #[test]
+    fn plugin_enabled_origin_picks_highest_activating_scope() {
+        // 构造 per-scope 原始层（vec 序 = 低→高优先级 user<project<local<flag<policy）。
+        fn layers(spec: &[(&str, &str)]) -> Vec<(SettingsScope, Map<String, Value>)> {
+            spec.iter()
+                .map(|(s, raw)| {
+                    let mut m = Map::new();
+                    m.insert(
+                        "enabledPlugins".to_string(),
+                        serde_json::from_str(raw).unwrap(),
+                    );
+                    (parse_scope(s), m)
+                })
+                .collect()
+        }
+        fn parse_scope(s: &str) -> SettingsScope {
+            match s {
+                "user" => SettingsScope::User,
+                "project" => SettingsScope::Project,
+                "local" => SettingsScope::Local,
+                "flag" => SettingsScope::Flag,
+                "policy" => SettingsScope::Policy,
+                _ => unreachable!(),
+            }
+        }
+
+        // 仅 project 启用 → Project（→ bundled 回落审批门 PENDING）。
+        assert_eq!(
+            plugin_enabled_origin(
+                &layers(&[("project", r#"{"audit@acme":true}"#)]),
+                "audit@acme"
+            ),
+            Some(SettingsScope::Project)
+        );
+        // user 启用 → User（受信，免批准）。
+        assert_eq!(
+            plugin_enabled_origin(&layers(&[("user", r#"{"audit@acme":true}"#)]), "audit@acme"),
+            Some(SettingsScope::User)
+        );
+        // project=true 且更高 local=true 覆盖 → Local（受信，免批准）。
+        // ⚠️ issue #165 正文曾误把 Local 归 PENDING——协议 §2.2 + Python #182 一致：Local 受信。以协议为准。
+        assert_eq!(
+            plugin_enabled_origin(
+                &layers(&[
+                    ("project", r#"{"audit@acme":true}"#),
+                    ("local", r#"{"audit@acme":true}"#)
+                ]),
+                "audit@acme"
+            ),
+            Some(SettingsScope::Local)
+        );
+        // project=true 但更高 policy=false → None（显式禁用覆盖一切，plugin 不活跃）。
+        assert_eq!(
+            plugin_enabled_origin(
+                &layers(&[
+                    ("project", r#"{"audit@acme":true}"#),
+                    ("policy", r#"{"audit@acme":false}"#)
+                ]),
+                "audit@acme"
+            ),
+            None
+        );
+        // project=false（显式禁用）→ None。
+        assert_eq!(
+            plugin_enabled_origin(
+                &layers(&[("project", r#"{"audit@acme":false}"#)]),
+                "audit@acme"
+            ),
+            None
+        );
+        // 全 absent → None（未启用）。
+        assert_eq!(
+            plugin_enabled_origin(&layers(&[("user", "{}")]), "audit@acme"),
+            None
+        );
     }
 
     // ---- §63：账本删除后从 installedPlugins 意图重建 bundled server（#104）----------

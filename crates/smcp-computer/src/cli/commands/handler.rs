@@ -150,6 +150,25 @@ impl CommandHandler {
             println!("  Available Tools: 0");
         }
 
+        // #165 Option B：pending bundled server（project-origin 激活、待批准）/ pending bundled approvals.
+        let pending = self.computer.list_pending_bundled_approvals();
+        if !pending.is_empty() {
+            println!(
+                "  Pending Bundled (project-origin, awaiting approval): {}",
+                pending.len()
+            );
+            for rec in &pending {
+                let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
+                println!(
+                    "    - {} [bundle_id={}] (plugin {}) — approve: settings.local.json enabledPlugins[\"{}\"]=true",
+                    rec.config.name(),
+                    bid.as_str(),
+                    rec.plugin_id,
+                    rec.plugin_id
+                );
+            }
+        }
+
         Ok(())
     }
 

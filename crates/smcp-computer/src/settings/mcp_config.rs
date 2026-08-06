@@ -845,6 +845,55 @@ pub fn approve_all_project_mcp(cwd: Option<&Path>) -> Result<(), McpConfigError>
     Ok(())
 }
 
+/// 写 `enabledPlugins[<pid>] = value` 到 local scope（#165 Option B 的 TOFU 批准/拒绝写）/ Write enabledPlugins[pid].
+///
+/// project-origin bundled server 的 TOFU：`approve` 写 `true`（local 覆盖 project → origin 变受信 → 下次
+/// reconcile 免批准直挂）；`reject` 写 `false`（**整 plugin 禁用**，协议半态禁令——不可只禁单个 bundled server）。
+/// 复用 store 旁车锁 + 原子写 + [`apply_write`]（嵌套对象写：仅改该 pid，不毁兄弟 `enabledPlugins` 条目）。
+fn write_local_enabled_plugin(
+    pid: &str,
+    value: bool,
+    cwd: Option<&Path>,
+) -> Result<(), McpConfigError> {
+    let path = local_settings_write_path(cwd)?;
+    store::with_settings_lock(&path, || -> io::Result<()> {
+        let (existing, _errors) = load_settings_file(&path, SettingsScope::Local);
+        let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
+        inner.insert(pid.to_string(), WriteValue::Set(Value::Bool(value)));
+        let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
+        updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
+        let updated = apply_write(&existing, &updates);
+        store::atomic_write_settings_json(&path, &Value::Object(updated))
+    })??;
+    Ok(())
+}
+
+/// #165：批准 project-origin bundled server 所属 plugin → 写 `enabledPlugins[pid]=true` 到 local scope / Approve.
+///
+/// TOFU（协议指南 §2.2）：local 覆盖 project，origin 变受信（local）→ 下次 [`reconcile_governance`](crate::computer::Computer::reconcile_governance)
+/// 该 bundled server 免批准直挂（不再 PENDING）。镜像 [`approve_mcp_server`] 的「写 local」模式，但写
+/// `enabledPlugins`（plugin 维度）而非 `enabledMcpjsonServers`（server 维度）——bundled server 的可信性由
+/// install ∧ enable 门保证（runtime-contract §5 item 10）。
+///
+/// #98：写锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
+///
+/// # Errors
+/// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
+pub fn approve_bundled_plugin(pid: &str, cwd: Option<&Path>) -> Result<(), McpConfigError> {
+    write_local_enabled_plugin(pid, true, cwd)
+}
+
+/// #165：拒绝 project-origin bundled server 所属 plugin → 写 `enabledPlugins[pid]=false` 到 local scope / Reject.
+///
+/// **整 plugin 禁用**（协议半态禁令：不可只禁单个 bundled server；与档③ `disabledMcpjsonServers`「DENY 方向
+/// 任意 scope、fail-safe 永远更安全」同姿）。project 的 `false` 同样 fail-safe 有效（指南 §2.2 方向性）。
+///
+/// # Errors
+/// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
+pub fn reject_bundled_plugin(pid: &str, cwd: Option<&Path>) -> Result<(), McpConfigError> {
+    write_local_enabled_plugin(pid, false, cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,6 +908,32 @@ mod tests {
 
     fn settings_with(arrays: Value) -> Map<String, Value> {
         arrays.as_object().cloned().unwrap()
+    }
+
+    // ---- #165：approve_bundled_plugin / reject_bundled_plugin（写 local scope）--------
+    #[test]
+    fn approve_reject_bundled_plugin_writes_local_enabled_plugins_165() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("wd");
+        fs::create_dir_all(cwd.join(".tfrobot")).unwrap();
+        let local_path = cwd.join(".tfrobot").join("settings.local.json");
+
+        // approve → enabledPlugins[pid]=true 写 local scope（TOFU：local 覆盖 project → origin 受信）。
+        approve_bundled_plugin("audit@acme", Some(&cwd)).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["audit@acme"], Value::Bool(true));
+
+        // reject → enabledPlugins[pid]=false（整 plugin 禁用，半态禁令）。
+        reject_bundled_plugin("audit@acme", Some(&cwd)).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["audit@acme"], Value::Bool(false));
+
+        // 嵌套对象写不毁兄弟：先 approve 另一 plugin、再 reject audit@acme → 前者保留。
+        approve_bundled_plugin("other@mp", Some(&cwd)).unwrap();
+        reject_bundled_plugin("audit@acme", Some(&cwd)).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["audit@acme"], Value::Bool(false));
+        assert_eq!(v["enabledPlugins"]["other@mp"], Value::Bool(true));
     }
 
     // ---- load_mcp_config_file ----------------------------------------------

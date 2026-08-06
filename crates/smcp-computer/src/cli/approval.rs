@@ -30,12 +30,14 @@ use serde_json::Value;
 
 use super::commands::{
     format_settings_errors, msg_dim, msg_err, msg_ok, msg_warn, resolved_settings_with_errors,
+    CliMcpHooks,
 };
 use crate::computer::{Computer, Session};
 use crate::mcp_clients::model::MCPServerConfig;
 use crate::settings::mcp_config::{
-    approve_all_project_mcp, approve_mcp_server, deny_mcp_server, gate_mcp_servers,
-    resolve_mcp_config, McpApprovalStatus, ResolveMcpConfigArgs, ResolvedMcpServer,
+    approve_all_project_mcp, approve_bundled_plugin, approve_mcp_server, deny_mcp_server,
+    gate_mcp_servers, reject_bundled_plugin, resolve_mcp_config, McpApprovalStatus,
+    ResolveMcpConfigArgs, ResolvedMcpServer,
 };
 
 /// 合并 resolved server 的 `config`（含占位符）+ `ext`（剥离的 envFile 等）为挂载用 config。
@@ -176,6 +178,77 @@ pub async fn run_mcp_approval<S: Session>(
                     }
                 }
             }
+        }
+    }
+
+    // #165 Option B：project-origin bundled server 回落审批门 PENDING → 弹 y/n（镜像 mcp.json PENDING 形态）。
+    // 仅 project scope 激活的 plugin bundled server 落此（受信 scope 免批准直挂、不弹）。批准写 local scope
+    // `enabledPlugins[pid]=true`（origin 变 local 受信）；拒绝写 `false`（整 plugin 禁用，半态禁令）。`--approve-all-mcp`
+    // 仅作用于 mcp.json（bulk-approve bundled 会一次性启用多 plugin，过重）——bundled 仍逐个提示。
+    let pending_bundled = comp.list_pending_bundled_approvals();
+    let mut bundled_changed = false;
+    for rec in &pending_bundled {
+        let bname = rec.config.name().to_string();
+        let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
+        if !interactive {
+            msg_warn(&format!(
+                "⚠ skipped pending bundled MCP server {bname:?} (plugin {}, project-origin, no TTY); approve via settings.local.json enabledPlugins",
+                rec.plugin_id
+            ));
+            continue;
+        }
+        let ans = prompt_line(&format!(
+            "⚠ Unapproved bundled MCP server '{bname}' (plugin={})\n  bundle_id: {}\n  [y]es approve & mount  ·  [n]o deny (disable plugin): ",
+            rec.plugin_id,
+            bid.as_str()
+        ));
+        match ans.as_str() {
+            "y" | "yes" => match approve_bundled_plugin(&rec.plugin_id, cwd.as_deref()) {
+                Ok(()) => {
+                    bundled_changed = true;
+                    msg_ok(&format!(
+                        "approved bundled plugin {} (written to local scope; mounting next)",
+                        rec.plugin_id
+                    ));
+                }
+                Err(e) => msg_err(&format!(
+                    "failed to approve bundled plugin {}: {e}",
+                    rec.plugin_id
+                )),
+            },
+            _ => match reject_bundled_plugin(&rec.plugin_id, cwd.as_deref()) {
+                Ok(()) => {
+                    bundled_changed = true;
+                    msg_dim(&format!(
+                        "· denied bundled plugin {} (disabled in local scope)",
+                        rec.plugin_id
+                    ));
+                }
+                Err(e) => msg_err(&format!(
+                    "failed to reject bundled plugin {}: {e}",
+                    rec.plugin_id
+                )),
+            },
+        }
+    }
+
+    // 即时挂载本次新批准 / 拒绝的 bundled server：re-resolve（含刚写的 local）→ reconcile（canonical 路径，
+    // 含 inputs 注入）。approved server 的 origin 现为 local（受信）→ 免批准直挂；denied（local=false）→ 不采集。
+    if bundled_changed {
+        let fresh = resolved_settings_with_errors(cwd.as_deref(), None, flag_settings);
+        let hooks = CliMcpHooks::new_remount(comp, &fresh.settings).await;
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&fresh.settings))
+            .await;
+        for rec in &report.remounted_servers {
+            msg_ok(&format!("mounted approved bundled MCP server {rec:?}"));
+        }
+        for rec in &report.pending_bundled_servers {
+            msg_dim(&format!(
+                "· bundled MCP server {:?} (plugin {}) still pending",
+                rec.config.name(),
+                rec.plugin_id
+            ));
         }
     }
 }
