@@ -2201,7 +2201,28 @@ impl OAuthCoordinator {
         validate_authorization_metadata(&metadata, true)?;
         let issuer = authorization_server_credential_identity(&metadata)?;
         manager.set_metadata(metadata.clone());
-        let scopes: Vec<&str> = self.options.scopes.iter().map(String::as_str).collect();
+        // Issue #176: when no explicit scopes are configured, adopt the discovered scope set
+        // via rmcp's MCP-aligned selection (401 WWW-Authenticate → PRM scopes_supported → AS
+        // scopes_supported). rmcp may append `offline_access` when the AS advertises it; this
+        // is intentional for MCP refresh-token flows and only applies to the auto-derived path
+        // (explicitly configured scopes are respected as-is). `select_scopes` also includes the
+        // AS-metadata tier, which MCP 2026-07-28 strictly excludes — accepted here because rmcp
+        // keeps its PRM-derived scope fields private and the AS tier is safer than requesting no
+        // scope at all (the bug). Must run after `set_metadata` so the AS tier is visible.
+        let effective_scopes: Vec<String> = if self.options.scopes.is_empty() {
+            manager.select_scopes(None, &[])
+        } else {
+            self.options.scopes.clone()
+        };
+        let effective_scope_refs: Vec<&str> =
+            effective_scopes.iter().map(String::as_str).collect();
+        if effective_scopes.is_empty() {
+            tracing::warn!(
+                "OAuth authorization will request no scope: configuration omitted scopes and \
+                 discovery found none in the 401 challenge, protected resource metadata, or \
+                 authorization server metadata; business tools may return 401 scope errors"
+            );
+        }
         match registration {
             OAuthClientRegistration::Dynamic => {
                 manager
@@ -2211,7 +2232,7 @@ impl OAuthCoordinator {
                             .as_deref()
                             .unwrap_or("A2C Computer"),
                         &request.redirect_uri,
-                        &scopes,
+                        &effective_scope_refs,
                     )
                     .await
                     .map_err(|_| OAuthError::Protocol(OAuthProtocolError::RegistrationFailed))?;
@@ -2221,7 +2242,7 @@ impl OAuthCoordinator {
                 client_secret_input,
             } => {
                 let mut config = OAuthClientConfig::new(client_id, &request.redirect_uri)
-                    .with_scopes(self.options.scopes.clone());
+                    .with_scopes(effective_scopes.clone());
                 if let Some(input) = client_secret_input {
                     config = config.with_client_secret(self.resolve_secret(input).await?);
                 }
@@ -2244,7 +2265,7 @@ impl OAuthCoordinator {
                 }
                 manager.configure_client(
                     OAuthClientConfig::new(url, &request.redirect_uri)
-                        .with_scopes(self.options.scopes.clone()),
+                        .with_scopes(effective_scopes.clone()),
                 )?;
             }
         }
@@ -2262,7 +2283,7 @@ impl OAuthCoordinator {
             }
             upgraded
         } else {
-            self.options.scopes.clone()
+            effective_scopes.clone()
         };
         let requested_scope_refs: Vec<&str> = requested_scopes.iter().map(String::as_str).collect();
         let authorization_url = manager.get_authorization_url(&requested_scope_refs).await?;

@@ -1949,6 +1949,81 @@ async fn test_machine_insufficient_scope_retries_are_bounded_end_to_end() {
     manager.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn test_empty_scopes_adopt_prm_scopes_supported_for_initial_authorization() {
+    // Issue #176: when OAuthOptions.scopes is empty, the initial authorization-code flow must
+    // adopt the scope published via Protected Resource Metadata (RFC 9728) instead of requesting
+    // no scope at all. Without this, providers that publish scopes via PRM (e.g. Atlassian's 22
+    // scopes) grant a token lacking business scopes, so business tools return
+    // `401 scope does not match` while basic tools still work.
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-empty-scopes").unwrap();
+    let manager = MCPServerManager::new();
+    manager
+        .set_secret_resolver(Some(Arc::new(OAuthTestSecretResolver)))
+        .await;
+    let mut config = HttpServerConfig::new(
+        "oauth-empty-scopes",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.oauth = Some(OAuthOptions {
+        resource: None,
+        scopes: vec![], // the bug condition: no explicit scopes
+        client_name: Some("A2C Computer".to_string()),
+        mode: OAuthClientMode::AuthorizationCode {
+            registration: OAuthClientRegistration::Dynamic,
+        },
+    });
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // The authorization URL must request the PRM-published scope. Under the bug, the `scope`
+    // query parameter is absent entirely because `self.options.scopes` (empty) was used directly.
+    let authorization_url = url::Url::parse(&launch.authorization_url).unwrap();
+    let query: HashMap<String, String> = authorization_url.query_pairs().into_owned().collect();
+    assert_eq!(
+        query.get("scope").map(String::as_str),
+        Some("tools.read"),
+        "empty scope config must adopt the PRM-published scope, not request no scope"
+    );
+
+    let outcome = manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let OAuthFlowOutcome::Authorized { scopes } = outcome else {
+        panic!("expected authorized outcome, got {outcome:?}");
+    };
+    assert!(
+        scopes.iter().any(|scope| scope == "tools.read"),
+        "granted scopes must include the PRM-published scope: {scopes:?}"
+    );
+}
+
 fn authorization_code_options(mode: OAuthFixtureMode) -> OAuthOptions {
     let registration = match mode {
         OAuthFixtureMode::PreregisteredPublic | OAuthFixtureMode::PreregisteredPublicOidc => {
