@@ -168,6 +168,7 @@ mod tests {
             default_tool_meta: None,
             vrl: None,
             oauth: None,
+            auth_policy: None,
             server_parameters: HttpServerParameters {
                 url: "http://localhost:8080".to_string(),
                 headers: HashMap::new(),

@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing_subscriber::fmt::MakeWriter;
 
 use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::errors::ComputerError;
 use smcp_computer::inputs::{InputResolutionError, SecretValueResolver};
 use smcp_computer::mcp_clients::http_client::HttpMCPClient;
 use smcp_computer::mcp_clients::model::*;
@@ -405,6 +406,100 @@ async fn spawn_http_mock(use_sse_response: bool) -> (u16, Arc<MockHttpState>) {
     (port, state)
 }
 
+#[derive(Clone, Copy)]
+enum AuthGateMode {
+    BareUnauthorized,
+    Basic,
+    BearerWithoutMetadata,
+    BearerWithInvalidMetadata,
+    Forbidden,
+    StaticBearerRejected,
+}
+
+struct AuthGateState {
+    mode: AuthGateMode,
+    base_url: String,
+    mcp_requests: AtomicUsize,
+    metadata_requests: AtomicUsize,
+    saw_static_authorization: AtomicBool,
+}
+
+async fn auth_gate_handler(
+    request: Request<hyper::body::Incoming>,
+    state: Arc<AuthGateState>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let path = request.uri().path().to_string();
+    if path.starts_with("/.well-known/") {
+        state.metadata_requests.fetch_add(1, Ordering::SeqCst);
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(empty_body())
+            .unwrap());
+    }
+    if path != "/mcp" || request.method() != Method::POST {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(empty_body())
+            .unwrap());
+    }
+    state.mcp_requests.fetch_add(1, Ordering::SeqCst);
+    if request
+        .headers()
+        .get("authorization")
+        .is_some_and(|value| value == "Bearer static-token")
+    {
+        state.saw_static_authorization.store(true, Ordering::SeqCst);
+    }
+    let response = match state.mode {
+        AuthGateMode::BareUnauthorized => Response::builder().status(StatusCode::UNAUTHORIZED),
+        AuthGateMode::Basic => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", r#"Basic realm="legacy""#),
+        AuthGateMode::BearerWithoutMetadata => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", r#"Bearer realm="mcp""#),
+        AuthGateMode::BearerWithInvalidMetadata | AuthGateMode::StaticBearerRejected => {
+            Response::builder().status(StatusCode::UNAUTHORIZED).header(
+                "WWW-Authenticate",
+                format!(
+                    "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
+                    state.base_url
+                ),
+            )
+        }
+        AuthGateMode::Forbidden => Response::builder().status(StatusCode::FORBIDDEN),
+    };
+    Ok(response.body(empty_body()).unwrap())
+}
+
+async fn spawn_auth_gate(mode: AuthGateMode) -> (u16, Arc<AuthGateState>) {
+    let (listener, port) = bind_random().await;
+    let state = Arc::new(AuthGateState {
+        mode,
+        base_url: format!("http://127.0.0.1:{port}"),
+        mcp_requests: AtomicUsize::new(0),
+        metadata_requests: AtomicUsize::new(0),
+        saw_static_authorization: AtomicBool::new(false),
+    });
+    let server_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let state = Arc::clone(&server_state);
+            tokio::spawn(async move {
+                let service =
+                    service_fn(move |request| auth_gate_handler(request, Arc::clone(&state)));
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (port, state)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OAuthFixtureMode {
     ClientCredentials,
@@ -425,6 +520,7 @@ struct OAuthMockState {
     discovery_response_delay_ms: AtomicU64,
     registration_response_delay_ms: AtomicU64,
     token_response_delay_ms: AtomicU64,
+    disable_authorization_metadata: AtomicBool,
     block_next_mcp_response: AtomicBool,
     discovery_started: Notify,
     registration_started: Notify,
@@ -537,6 +633,12 @@ async fn oauth_http_mock_handler(
         )
     {
         delay_oauth_discovery(&state).await;
+        if state.disable_authorization_metadata.load(Ordering::SeqCst) {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(empty_body())
+                .unwrap());
+        }
         if state.mode == OAuthFixtureMode::PreregisteredPublicOidc {
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -568,6 +670,12 @@ async fn oauth_http_mock_handler(
             .unwrap());
     }
     if method == Method::GET && path.ends_with("/.well-known/openid-configuration") {
+        if state.disable_authorization_metadata.load(Ordering::SeqCst) {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(empty_body())
+                .unwrap());
+        }
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
@@ -850,6 +958,7 @@ async fn spawn_oauth_http_mock_with_options(
         discovery_response_delay_ms: AtomicU64::new(0),
         registration_response_delay_ms: AtomicU64::new(0),
         token_response_delay_ms: AtomicU64::new(0),
+        disable_authorization_metadata: AtomicBool::new(false),
         block_next_mcp_response: AtomicBool::new(false),
         discovery_started: Notify::new(),
         registration_started: Notify::new(),
@@ -1149,6 +1258,75 @@ async fn test_http_happy_path_json() {
     assert_eq!(client.state(), ClientState::Disconnected);
 }
 
+async fn assert_oauth_callback_not_configured(manager: &MCPServerManager, bundle_id: &BundleId) {
+    assert!(matches!(
+        manager
+            .complete_oauth(
+                bundle_id,
+                OAuthCallback {
+                    code: "unexpected-code".to_string(),
+                    state: "unexpected-state".to_string(),
+                    issuer: None,
+                },
+            )
+            .await,
+        Err(OAuthError::NotConfigured)
+    ));
+    assert!(matches!(
+        manager
+            .cancel_oauth(
+                bundle_id,
+                OAuthCancellation {
+                    state: "unexpected-state".to_string(),
+                    issuer: None,
+                    reason: OAuthCancellationReason::Cancelled,
+                },
+            )
+            .await,
+        Err(OAuthError::NotConfigured)
+    ));
+}
+
+#[tokio::test]
+async fn test_public_http_manager_connects_without_creating_oauth_state() {
+    let (port, _state) = spawn_http_mock(false).await;
+    let bundle_id = BundleId::try_from("public-http-auto").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "public-http-auto",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert_oauth_callback_not_configured(&manager, &bundle_id).await;
+    manager.start_client_by_id(&bundle_id).await.unwrap();
+    assert_oauth_callback_not_configured(&manager, &bundle_id).await;
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await,
+        Err(OAuthError::NotConfigured)
+    ));
+    assert!(matches!(
+        manager
+            .create_oauth_flow(
+                &bundle_id,
+                OAuthBeginRequest {
+                    redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                    required_scope: None,
+                }
+            )
+            .await,
+        Err(OAuthError::NotConfigured)
+    ));
+    manager.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_streamable_http_static_authorization_header_reaches_every_http_method() {
     let (port, state) = spawn_http_mock(false).await;
@@ -1176,6 +1354,306 @@ async fn test_streamable_http_static_authorization_header_reaches_every_http_met
             "expected a real {method} request, got {requests:?}"
         );
     }
+}
+
+async fn auto_auth_gate_result(
+    mode: AuthGateMode,
+    static_authorization: bool,
+) -> (HttpAuthenticationError, Arc<AuthGateState>) {
+    let (port, state) = spawn_auth_gate(mode).await;
+    let bundle_id = BundleId::try_from(format!("auto-auth-{port}")).unwrap();
+    let headers = if static_authorization {
+        HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer static-token".to_string(),
+        )])
+    } else {
+        HashMap::new()
+    };
+    let mut config = HttpServerConfig::new(
+        "auto-auth-gate",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers,
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    let manager = MCPServerManager::new();
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+    let error = manager.start_client_by_id(&bundle_id).await.unwrap_err();
+    assert_oauth_callback_not_configured(&manager, &bundle_id).await;
+    let ComputerError::HttpAuthentication(error) = error else {
+        panic!("expected structured HTTP authentication error, got {error:?}");
+    };
+    (error, state)
+}
+
+#[tokio::test]
+async fn test_disabled_oauth_callbacks_remain_not_configured_after_connect() {
+    let (port, _state) = spawn_http_mock(false).await;
+    let bundle_id = BundleId::try_from("public-http-disabled").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "public-http-disabled",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.auth_policy = Some(HttpAuthPolicy::Disabled);
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    manager.start_client_by_id(&bundle_id).await.unwrap();
+    assert_oauth_callback_not_configured(&manager, &bundle_id).await;
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_http_auth_distinguishes_non_oauth_failures() {
+    let cases = [
+        (
+            AuthGateMode::BareUnauthorized,
+            HttpAuthenticationError::Unauthorized,
+        ),
+        (
+            AuthGateMode::Basic,
+            HttpAuthenticationError::UnsupportedChallenge,
+        ),
+        (
+            AuthGateMode::BearerWithoutMetadata,
+            HttpAuthenticationError::OAuthDiscoveryFailed,
+        ),
+        (AuthGateMode::Forbidden, HttpAuthenticationError::Forbidden),
+    ];
+    for (mode, expected) in cases {
+        let (actual, state) = auto_auth_gate_result(mode, false).await;
+        assert_eq!(actual, expected);
+        assert_eq!(state.metadata_requests.load(Ordering::SeqCst), 0);
+    }
+
+    let (error, state) =
+        auto_auth_gate_result(AuthGateMode::BearerWithInvalidMetadata, false).await;
+    assert_eq!(error, HttpAuthenticationError::OAuthDiscoveryFailed);
+    assert!(state.metadata_requests.load(Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn test_static_authorization_rejection_never_falls_back_to_oauth() {
+    let (error, state) = auto_auth_gate_result(AuthGateMode::StaticBearerRejected, true).await;
+    assert_eq!(error, HttpAuthenticationError::StaticCredentialsRejected);
+    assert!(state.saw_static_authorization.load(Ordering::SeqCst));
+    assert_eq!(state.metadata_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_auto_oauth_admits_only_after_validated_discovery_and_reuses_cancellation() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-auto-discovery").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-auto-discovery",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await,
+        Err(OAuthError::NotConfigured)
+    ));
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+    assert_eq!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    assert!(state.discovery_requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 1);
+    let outcome = manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: launch.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        OAuthFlowOutcome::Terminated {
+            reason: OAuthCancellationReason::Cancelled,
+            status: OAuthStatus::Unauthorized
+        }
+    ));
+    manager.clear_oauth(&bundle_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_oauth_preserves_preregistered_options_as_discovery_overrides() {
+    let mode = OAuthFixtureMode::PreregisteredPublic;
+    let (port, state) = spawn_oauth_http_mock(mode, 0).await;
+    let bundle_id = BundleId::try_from("oauth-auto-overrides").unwrap();
+    let manager = MCPServerManager::new();
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    let mut options = authorization_code_options(mode);
+    options.resource = Some(endpoint.clone());
+    let mut config = HttpServerConfig::new(
+        "oauth-auto-overrides",
+        HttpServerParameters {
+            url: endpoint,
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.auth_policy = Some(HttpAuthPolicy::Auto);
+    config.oauth = Some(options);
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let _launch = flow.launch().await.unwrap();
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+    flow.cancel(OAuthCancellationReason::Cancelled)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_oauth_rejects_cross_resource_override_before_discovery() {
+    let mode = OAuthFixtureMode::PreregisteredPublic;
+    let (port, state) = spawn_oauth_http_mock(mode, 0).await;
+    let bundle_id = BundleId::try_from("oauth-auto-cross-resource").unwrap();
+    let manager = MCPServerManager::new();
+    let mut options = authorization_code_options(mode);
+    options.resource = Some("https://unrelated-resource.example/mcp".to_string());
+    let mut config = HttpServerConfig::new(
+        "oauth-auto-cross-resource",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.auth_policy = Some(HttpAuthPolicy::Auto);
+    config.oauth = Some(options);
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthDiscoveryFailed
+        ))
+    ));
+    assert_eq!(state.discovery_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await,
+        Err(OAuthError::NotConfigured)
+    ));
+}
+
+#[tokio::test]
+async fn test_auto_client_credentials_rejects_legacy_metadata_fallback() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::ClientCredentials, 0).await;
+    state
+        .disable_authorization_metadata
+        .store(true, Ordering::SeqCst);
+    let bundle_id = BundleId::try_from("oauth-auto-no-as-metadata").unwrap();
+    let manager = MCPServerManager::new();
+    manager
+        .set_secret_resolver(Some(Arc::new(OAuthTestSecretResolver)))
+        .await;
+    let mut config = HttpServerConfig::new(
+        "oauth-auto-no-as-metadata",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.auth_policy = Some(HttpAuthPolicy::Auto);
+    config.oauth = Some(OAuthOptions {
+        resource: None,
+        scopes: vec!["tools.read".to_string()],
+        client_name: None,
+        mode: OAuthClientMode::ClientCredentialsSecret {
+            client_id: "oauth-e2e-client".to_string(),
+            client_secret_input: "oauth-e2e-secret-input".to_string(),
+        },
+    });
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthDiscoveryFailed
+        ))
+    ));
+    assert!(state.discovery_requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await,
+        Err(OAuthError::NotConfigured)
+    ));
 }
 
 #[tokio::test]
@@ -1469,6 +1947,81 @@ async fn test_machine_insufficient_scope_retries_are_bounded_end_to_end() {
         "a successful protected request must not bypass the retry bound"
     );
     manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_empty_scopes_adopt_prm_scopes_supported_for_initial_authorization() {
+    // Issue #176: when OAuthOptions.scopes is empty, the initial authorization-code flow must
+    // adopt the scope published via Protected Resource Metadata (RFC 9728) instead of requesting
+    // no scope at all. Without this, providers that publish scopes via PRM (e.g. Atlassian's 22
+    // scopes) grant a token lacking business scopes, so business tools return
+    // `401 scope does not match` while basic tools still work.
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-empty-scopes").unwrap();
+    let manager = MCPServerManager::new();
+    manager
+        .set_secret_resolver(Some(Arc::new(OAuthTestSecretResolver)))
+        .await;
+    let mut config = HttpServerConfig::new(
+        "oauth-empty-scopes",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    config.oauth = Some(OAuthOptions {
+        resource: None,
+        scopes: vec![], // the bug condition: no explicit scopes
+        client_name: Some("A2C Computer".to_string()),
+        mode: OAuthClientMode::AuthorizationCode {
+            registration: OAuthClientRegistration::Dynamic,
+        },
+    });
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    let launch = manager
+        .begin_oauth(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // The authorization URL must request the PRM-published scope. Under the bug, the `scope`
+    // query parameter is absent entirely because `self.options.scopes` (empty) was used directly.
+    let authorization_url = url::Url::parse(&launch.authorization_url).unwrap();
+    let query: HashMap<String, String> = authorization_url.query_pairs().into_owned().collect();
+    assert_eq!(
+        query.get("scope").map(String::as_str),
+        Some("tools.read"),
+        "empty scope config must adopt the PRM-published scope, not request no scope"
+    );
+
+    let outcome = manager
+        .complete_oauth(
+            &bundle_id,
+            OAuthCallback {
+                code: "authorization-code".to_string(),
+                state: launch.state,
+                issuer: Some(state.base_url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let OAuthFlowOutcome::Authorized { scopes } = outcome else {
+        panic!("expected authorized outcome, got {outcome:?}");
+    };
+    assert!(
+        scopes.iter().any(|scope| scope == "tools.read"),
+        "granted scopes must include the PRM-published scope: {scopes:?}"
+    );
 }
 
 fn authorization_code_options(mode: OAuthFixtureMode) -> OAuthOptions {

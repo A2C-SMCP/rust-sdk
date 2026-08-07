@@ -509,12 +509,13 @@ impl MCPServerManager {
         // 创建客户端（注入通知上报接缝，用 **bundle_id** 打来源标签——消费侧定向重挂按身份寻址，#106/#127）。
         let notify = self.notify_ctx_for(bundle_id).await;
         let client: StdArc<dyn MCPClientProtocol> = match config.clone() {
-            MCPServerConfig::Http(http) if http.oauth.is_some() => {
+            MCPServerConfig::Http(http) => {
                 let existing = { self.oauth_clients.read().await.get(bundle_id).cloned() };
                 let concrete = if let Some(existing) = existing {
                     existing.set_notify(notify);
                     existing
                 } else {
+                    let resolver = self.secret_resolver.read().await.clone();
                     let candidate = Arc::new(
                         HttpMCPClient::new(http.server_parameters)
                             .with_oauth_context(
@@ -522,10 +523,10 @@ impl MCPServerManager {
                                 Arc::clone(&self.oauth_credential_store),
                                 self.oauth_events.clone(),
                             )
-                            .with_oauth(
-                                http.oauth.expect("guarded by is_some"),
-                                self.secret_resolver.read().await.clone(),
-                            )
+                            .with_auth_policy(http.auth_policy, http.oauth, resolver)
+                            .map_err(|error| {
+                                ComputerError::InvalidConfiguration(error.to_string())
+                            })?
                             .with_notify(notify.clone()),
                     );
                     let mut oauth_clients = self.oauth_clients.write().await;
@@ -543,8 +544,12 @@ impl MCPServerManager {
         };
 
         // 连接服务器 / Connect to server
-        client.connect().await.map_err(|e| {
-            ComputerError::ConnectionError(format!("Failed to connect to {}: {}", server_name, e))
+        client.connect().await.map_err(|error| match error {
+            MCPClientError::HttpAuthentication(error) => ComputerError::HttpAuthentication(error),
+            error => ComputerError::ConnectionError(format!(
+                "Failed to connect to {}: {}",
+                server_name, error
+            )),
         })?;
 
         // 添加到活动客户端（按 bundle_id）/ Add to active clients (by bundle_id)
@@ -2117,7 +2122,9 @@ impl MCPServerManager {
         let MCPServerConfig::Http(http) = config else {
             return Err(OAuthError::UnsupportedTransport);
         };
-        let options = http.oauth.ok_or(OAuthError::NotConfigured)?;
+        if http.auth_policy == Some(HttpAuthPolicy::Disabled) {
+            return Err(OAuthError::NotConfigured);
+        }
         let client = Arc::new(
             HttpMCPClient::new(http.server_parameters)
                 .with_oauth_context(
@@ -2125,7 +2132,11 @@ impl MCPServerManager {
                     Arc::clone(&self.oauth_credential_store),
                     self.oauth_events.clone(),
                 )
-                .with_oauth(options, self.secret_resolver.read().await.clone()),
+                .with_auth_policy(
+                    http.auth_policy,
+                    http.oauth,
+                    self.secret_resolver.read().await.clone(),
+                )?,
         );
         let mut oauth_clients = self.oauth_clients.write().await;
         Ok(oauth_clients
@@ -2139,7 +2150,9 @@ impl MCPServerManager {
         bundle_id: &BundleId,
     ) -> Result<Arc<HttpMCPClient>, OAuthError> {
         if let Some(client) = self.oauth_clients.read().await.get(bundle_id).cloned() {
-            return Ok(client);
+            if client.oauth_callback_configured() {
+                return Ok(client);
+            }
         }
 
         // Preserve the facade's distinction between an unknown/non-OAuth server and a callback
@@ -2154,7 +2167,10 @@ impl MCPServerManager {
         let MCPServerConfig::Http(http) = config else {
             return Err(OAuthError::UnsupportedTransport);
         };
-        if http.oauth.is_none() {
+        if http.auth_policy == Some(HttpAuthPolicy::Disabled)
+            || (http.auth_policy.is_none() && http.oauth.is_none())
+            || http.auth_policy == Some(HttpAuthPolicy::Auto)
+        {
             return Err(OAuthError::NotConfigured);
         }
         Err(OAuthError::StateMismatch)
@@ -2937,6 +2953,7 @@ mod tests {
                 default_tool_meta: None,
                 vrl: None,
                 oauth: None,
+                auth_policy: None,
                 server_parameters: HttpServerParameters {
                     url: "http://localhost:8080".to_string(),
                     headers: HashMap::new(),

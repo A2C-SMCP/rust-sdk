@@ -360,8 +360,34 @@ pub struct HttpServerConfig {
     /// OAuth configuration for protected Streamable HTTP servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<crate::oauth::OAuthOptions>,
+    /// HTTP authentication negotiation policy.
+    ///
+    /// When omitted, existing serialized configurations retain their intent: an `oauth` block
+    /// selects proactive OAuth, while a configuration without one uses anonymous-first automatic
+    /// discovery. `Auto` makes an optional `oauth` block act as discovery overrides instead.
+    #[serde(
+        default,
+        rename = "authPolicy",
+        alias = "auth_policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_policy: Option<HttpAuthPolicy>,
     /// HTTP服务器参数 / HTTP server parameters
     pub server_parameters: HttpServerParameters,
+}
+
+/// Authentication negotiation policy for a Streamable HTTP MCP server.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum HttpAuthPolicy {
+    /// Connect anonymously first and admit OAuth only after a validated Bearer challenge.
+    Auto,
+    /// Initialize OAuth proactively. An `oauth` options block is required.
+    #[serde(rename = "oauth")]
+    OAuth,
+    /// Never negotiate OAuth. Static request headers, when present, are still sent.
+    Disabled,
 }
 
 impl StdioServerConfig {
@@ -414,6 +440,7 @@ impl HttpServerConfig {
             vrl: None,
             env_file: None,
             oauth: None,
+            auth_policy: None,
             server_parameters,
         }
     }
@@ -836,6 +863,9 @@ pub enum MCPClientError {
     /// 连接错误 / Connection error
     #[error("Connection error: {0}")]
     ConnectionError(String),
+    /// Structured HTTP authentication negotiation result.
+    #[error("HTTP authentication error: {0}")]
+    HttpAuthentication(#[from] HttpAuthenticationError),
     /// 协议错误 / Protocol error
     #[error("Protocol error: {0}")]
     ProtocolError(String),
@@ -864,6 +894,33 @@ pub enum MCPClientError {
     /// 其他错误 / Other error
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// Stable result categories for HTTP authentication negotiation.
+///
+/// Challenge values and provider response bodies are intentionally not retained so credentials
+/// and provider diagnostics cannot leak through `Debug` or `Display`.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HttpAuthenticationError {
+    /// A valid OAuth protected-resource and authorization-server relationship was discovered.
+    #[error("OAuth authorization is required")]
+    OAuthRequired,
+    /// A configured static Authorization header was rejected.
+    #[error("static Authorization credentials were rejected")]
+    StaticCredentialsRejected,
+    /// The server requested Basic, Digest, or another unsupported authentication scheme.
+    #[error("the server requested an unsupported HTTP authentication scheme")]
+    UnsupportedChallenge,
+    /// A Bearer challenge was present but OAuth metadata discovery or validation failed.
+    #[error("OAuth metadata discovery failed")]
+    OAuthDiscoveryFailed,
+    /// The server returned 401 without a usable authentication challenge.
+    #[error("the server rejected the anonymous request without a usable authentication challenge")]
+    Unauthorized,
+    /// The server denied the request without a valid OAuth insufficient-scope challenge.
+    #[error("the server denied the HTTP MCP request")]
+    Forbidden,
 }
 
 /// 便捷函数：创建 Resource / Convenience: create a Resource
@@ -950,6 +1007,47 @@ impl GetSkillRet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_auth_policy_is_additive_and_round_trips_camel_case() {
+        let legacy = serde_json::json!({
+            "name": "remote",
+            "disabled": false,
+            "forbidden_tools": [],
+            "tool_meta": {},
+            "default_tool_meta": null,
+            "vrl": null,
+            "server_parameters": {
+                "url": "https://mcp.example/mcp",
+                "headers": {}
+            }
+        });
+        let legacy: HttpServerConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.auth_policy, None);
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("authPolicy")
+            .is_none());
+
+        let mut automatic = legacy;
+        automatic.auth_policy = Some(HttpAuthPolicy::Auto);
+        let encoded = serde_json::to_value(&automatic).unwrap();
+        assert_eq!(encoded["authPolicy"], serde_json::json!("auto"));
+        assert_eq!(
+            serde_json::from_value::<HttpServerConfig>(encoded)
+                .unwrap()
+                .auth_policy,
+            Some(HttpAuthPolicy::Auto)
+        );
+        assert_eq!(
+            serde_json::to_value(HttpAuthPolicy::OAuth).unwrap(),
+            serde_json::json!("oauth")
+        );
+        assert_eq!(
+            serde_json::to_value(HttpAuthPolicy::Disabled).unwrap(),
+            serde_json::json!("disabled")
+        );
+    }
 
     #[test]
     fn test_is_call_tool_error() {

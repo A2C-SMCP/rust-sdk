@@ -19,6 +19,15 @@ Rust版本的A2C-SMCP Computer模块实现，提供MCP服务器连接管理和�
 
 ### OAuth Credential Storage
 
+Streamable HTTP MCP connections are anonymous-first by default. A connection becomes actionable
+OAuth only after a Bearer `WWW-Authenticate` challenge with `resource_metadata` leads to validated
+RFC 9728 protected-resource and issuer-bearing RFC 8414/OIDC authorization-server metadata; rmcp's
+derived legacy endpoints are not sufficient for automatic admission. Basic, Digest, bare
+401/403, failed discovery, and rejected static `Authorization` credentials remain distinct
+`HttpAuthenticationError` results and never enable the OAuth UI. Set `HttpAuthPolicy::Disabled` to
+disable negotiation, or keep an existing `oauth` block for proactive OAuth; `authPolicy: auto`
+allows the same block to act only as discovery overrides.
+
 OAuth HTTP MCP credentials are keyed by bundle, canonical resource, authorization server, and
 grant/client identity. `Computer` uses a private `InMemoryOAuthCredentialStore` by default and
 never probes the OS Keychain. Hosts that need persistence inject one shared store:
@@ -37,8 +46,11 @@ storage. See [the OAuth architecture decision][oauth-architecture].
 For browser/callback ownership, failure mapping, and local/cloud flow-driver requirements, follow
 the normative [OAuth host integration contract](docs/oauth-host-integration.md).
 
-`OAuthOptions.resource` may override the HTTP MCP URL when the RFC 8707 canonical resource differs
-from the transport endpoint; omitting it preserves the endpoint default. Hosts can observe
+`OAuthOptions.resource` may override the HTTP MCP URL for proactive OAuth when the RFC 8707
+canonical resource differs from the transport endpoint; omitting it preserves the endpoint
+default. Automatic negotiation requires the effective resource to match the MCP endpoint so the
+challenged `resource_metadata` document cannot authorize a different resource. Use
+`authPolicy: oauth` for an intentional cross-resource setup. Hosts can observe
 deduplicated `ComputerEvent::OAuthStatusChanged { bundle_id, status }` events through
 `Computer::subscribe_events()` and use `Computer::oauth_status()` to resynchronize after a bounded
 broadcast receiver reports lag.

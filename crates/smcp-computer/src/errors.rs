@@ -74,6 +74,10 @@ pub enum ComputerError {
     /// 连接错误 / Connection error
     ConnectionError(String),
 
+    #[error("HTTP authentication error: {0}")]
+    /// Structured HTTP authentication negotiation result.
+    HttpAuthentication(#[from] crate::mcp_clients::HttpAuthenticationError),
+
     #[error("Protocol version mismatch: {0}")]
     /// 协议版本握手不匹配 / Protocol-version handshake mismatch (HS-02 #22)。
     ///
@@ -170,8 +174,16 @@ impl ComputerError {
 
             // 连接错误 / Connection errors
             ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR
-            ComputerError::TransportError(_) => 500,  // INTERNAL_ERROR
-            ComputerError::SocketIoError(_) => 500,   // INTERNAL_ERROR
+            ComputerError::HttpAuthentication(error) => match error {
+                crate::mcp_clients::HttpAuthenticationError::Forbidden => 403,
+                crate::mcp_clients::HttpAuthenticationError::OAuthRequired
+                | crate::mcp_clients::HttpAuthenticationError::StaticCredentialsRejected
+                | crate::mcp_clients::HttpAuthenticationError::UnsupportedChallenge
+                | crate::mcp_clients::HttpAuthenticationError::OAuthDiscoveryFailed
+                | crate::mcp_clients::HttpAuthenticationError::Unauthorized => 401,
+            },
+            ComputerError::TransportError(_) => 500, // INTERNAL_ERROR
+            ComputerError::SocketIoError(_) => 500,  // INTERNAL_ERROR
 
             // 协议版本握手不匹配 / Protocol version mismatch (4008)
             ComputerError::ProtocolVersionMismatch(_) => {

@@ -27,7 +27,7 @@ use rmcp::model::{
 };
 use rmcp::service::{PeerRequestOptions, RequestHandle, RunningService, ServiceExt};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::{streamable_http_client::StreamableHttpError, StreamableHttpClientTransport};
 use rmcp::RoleClient;
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
@@ -37,6 +37,20 @@ use tracing::{debug, error, info, warn};
 
 /// HTTP 客户端连接超时时间（秒）/ Connect timeout for HTTP client (seconds)
 const CONNECT_TIMEOUT_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthNegotiation {
+    Auto,
+    Explicit,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChallengeAdmission {
+    BearerWithMetadata(String),
+    BearerWithoutMetadata,
+    Unsupported,
+}
 
 /// HTTP MCP客户端 / HTTP MCP client
 ///
@@ -56,6 +70,7 @@ pub struct HttpMCPClient {
     /// 运行期变化通知上报接缝（#106，None=不转发）/ runtime change-notification seam。
     notify: StdRwLock<Option<ClientNotifyCtx>>,
     oauth_options: Option<OAuthOptions>,
+    oauth_negotiation: OAuthNegotiation,
     secret_resolver: Option<Arc<dyn SecretValueResolver>>,
     oauth_bundle_id: BundleId,
     oauth_credential_store: Arc<dyn OAuthCredentialStore>,
@@ -86,7 +101,8 @@ impl HttpMCPClient {
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
             notify: StdRwLock::new(None),
-            oauth_options: None,
+            oauth_options: Some(OAuthOptions::default()),
+            oauth_negotiation: OAuthNegotiation::Auto,
             secret_resolver: None,
             oauth_bundle_id: BundleId::try_from("standalone-http-oauth")
                 .expect("static standalone OAuth bundle ID must be valid"),
@@ -132,6 +148,10 @@ impl HttpMCPClient {
         *self.notify.write().expect("HTTP notify lock poisoned") = notify;
     }
 
+    pub(crate) fn oauth_callback_configured(&self) -> bool {
+        self.oauth_negotiation == OAuthNegotiation::Explicit || self.oauth.get().is_some()
+    }
+
     /// Configure OAuth for this remote MCP client.
     pub fn with_oauth(
         mut self,
@@ -139,14 +159,67 @@ impl HttpMCPClient {
         resolver: Option<Arc<dyn SecretValueResolver>>,
     ) -> Self {
         self.oauth_options = Some(options);
+        self.oauth_negotiation = OAuthNegotiation::Explicit;
         self.secret_resolver = resolver;
         self
+    }
+
+    /// Enable anonymous-first OAuth discovery with optional host overrides.
+    pub fn with_auto_oauth(
+        mut self,
+        options: Option<OAuthOptions>,
+        resolver: Option<Arc<dyn SecretValueResolver>>,
+    ) -> Self {
+        self.oauth_options = Some(options.unwrap_or_default());
+        self.oauth_negotiation = OAuthNegotiation::Auto;
+        self.secret_resolver = resolver;
+        self
+    }
+
+    /// Disable OAuth negotiation for this remote MCP client.
+    pub fn with_oauth_disabled(mut self) -> Self {
+        self.oauth_options = None;
+        self.oauth_negotiation = OAuthNegotiation::Disabled;
+        self.secret_resolver = None;
+        self
+    }
+
+    pub(crate) fn with_auth_policy(
+        self,
+        policy: Option<HttpAuthPolicy>,
+        options: Option<OAuthOptions>,
+        resolver: Option<Arc<dyn SecretValueResolver>>,
+    ) -> Result<Self, OAuthError> {
+        match (policy, options) {
+            (None, Some(options)) | (Some(HttpAuthPolicy::OAuth), Some(options)) => {
+                Ok(self.with_oauth(options, resolver))
+            }
+            (None, None) | (Some(HttpAuthPolicy::Auto), None) => {
+                Ok(self.with_auto_oauth(None, resolver))
+            }
+            (Some(HttpAuthPolicy::Auto), Some(options)) => {
+                Ok(self.with_auto_oauth(Some(options), resolver))
+            }
+            (Some(HttpAuthPolicy::Disabled), None) => Ok(self.with_oauth_disabled()),
+            (Some(HttpAuthPolicy::OAuth), None) => Err(OAuthError::ExplicitPolicyRequiresOptions),
+            (Some(HttpAuthPolicy::Disabled), Some(_)) => Err(OAuthError::DisabledPolicyWithOptions),
+        }
+    }
+
+    fn has_static_authorization(&self) -> bool {
+        self.base
+            .params
+            .headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("authorization"))
     }
 
     fn build_http_headers(&self) -> Result<HeaderMap, OAuthError> {
         let mut header_map = HeaderMap::new();
         for (key, value) in &self.base.params.headers {
-            if key.eq_ignore_ascii_case("authorization") && self.oauth_options.is_some() {
+            if key.eq_ignore_ascii_case("authorization")
+                && self.oauth_negotiation == OAuthNegotiation::Explicit
+            {
                 return Err(OAuthError::ConflictingAuthorizationHeader);
             }
             match (
@@ -168,7 +241,7 @@ impl HttpMCPClient {
     ) -> Result<reqwest::Client, OAuthError> {
         let mut builder =
             reqwest::Client::builder().timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
-        if self.oauth_options.is_some() {
+        if self.oauth_negotiation != OAuthNegotiation::Disabled {
             builder = builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
                 let same_origin = attempt.previous().last().is_some_and(|previous| {
                     previous.scheme() == attempt.url().scheme()
@@ -194,7 +267,10 @@ impl HttpMCPClient {
         self.build_http_client_with_headers(self.build_http_headers()?)
     }
 
-    async fn oauth(&self) -> Result<&Arc<OAuthCoordinator>, OAuthError> {
+    async fn initialize_oauth(
+        &self,
+        admitted_resource_metadata_url: Option<url::Url>,
+    ) -> Result<&Arc<OAuthCoordinator>, OAuthError> {
         let options = self
             .oauth_options
             .clone()
@@ -208,7 +284,8 @@ impl HttpMCPClient {
                         self.oauth_bundle_id.clone(),
                         Arc::clone(&self.oauth_credential_store),
                         self.oauth_events.clone(),
-                    ),
+                    )
+                    .with_admitted_resource_metadata_url(admitted_resource_metadata_url),
                     &self.base.params.url,
                     &resource,
                     options,
@@ -220,6 +297,139 @@ impl HttpMCPClient {
                 .map(Arc::new)
             })
             .await
+    }
+
+    async fn oauth(&self) -> Result<&Arc<OAuthCoordinator>, OAuthError> {
+        if self.oauth_negotiation == OAuthNegotiation::Auto {
+            return self.oauth.get().ok_or(OAuthError::NotConfigured);
+        }
+        self.initialize_oauth(None).await
+    }
+
+    fn classify_challenge(header: &str) -> ChallengeAdmission {
+        let Ok(challenges) = http_auth::parse_challenges(header) else {
+            return ChallengeAdmission::Unsupported;
+        };
+        let mut saw_bearer = false;
+        for challenge in challenges {
+            if !challenge.scheme.eq_ignore_ascii_case("bearer") {
+                continue;
+            }
+            saw_bearer = true;
+            if challenge.params.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("resource_metadata")
+                    && !value.to_unescaped().trim().is_empty()
+            }) {
+                let resource_metadata = challenge
+                    .params
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("resource_metadata"))
+                    .map(|(_, value)| value.to_unescaped())
+                    .expect("resource_metadata was checked above");
+                return ChallengeAdmission::BearerWithMetadata(resource_metadata);
+            }
+        }
+        if saw_bearer {
+            ChallengeAdmission::BearerWithoutMetadata
+        } else {
+            ChallengeAdmission::Unsupported
+        }
+    }
+
+    fn admitted_resource_metadata_url(&self, value: &str) -> Option<url::Url> {
+        let endpoint = url::Url::parse(&self.base.params.url).ok()?;
+        let metadata = url::Url::parse(value)
+            .or_else(|_| endpoint.join(value))
+            .ok()?;
+        let same_origin = endpoint.scheme() == metadata.scheme()
+            && endpoint.host_str() == metadata.host_str()
+            && endpoint.port_or_known_default() == metadata.port_or_known_default();
+        if !same_origin || metadata.fragment().is_some() {
+            return None;
+        }
+
+        // rmcp 2.2 couples discovery to its resource base URL. Until that API accepts a caller-
+        // supplied PRM URL independently, Auto must not validate metadata for one resource and
+        // send the resulting token to another endpoint. Cross-resource overrides remain available
+        // through proactive OAuth.
+        let options = self.oauth_options.as_ref()?;
+        let effective_resource = options.effective_resource(&self.base.params.url).ok()?;
+        let endpoint_resource = OAuthOptions::default()
+            .effective_resource(&self.base.params.url)
+            .ok()?;
+        (effective_resource == endpoint_resource).then_some(metadata)
+    }
+
+    fn initialize_streamable_error(
+        error: &rmcp::service::ClientInitializeError,
+    ) -> Option<&StreamableHttpError<reqwest::Error>> {
+        let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
+            return None;
+        };
+        error
+            .error
+            .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+    }
+
+    async fn classify_anonymous_initialize_error(
+        &self,
+        error: &rmcp::service::ClientInitializeError,
+    ) -> Option<HttpAuthenticationError> {
+        let streamable = Self::initialize_streamable_error(error)?;
+        if self.has_static_authorization() {
+            return match streamable {
+                StreamableHttpError::AuthRequired(_)
+                | StreamableHttpError::InsufficientScope(_) => {
+                    Some(HttpAuthenticationError::StaticCredentialsRejected)
+                }
+                StreamableHttpError::UnexpectedServerResponse(message)
+                    if message.starts_with("HTTP 401 ") || message.starts_with("HTTP 403 ") =>
+                {
+                    Some(HttpAuthenticationError::StaticCredentialsRejected)
+                }
+                _ => None,
+            };
+        }
+        match streamable {
+            StreamableHttpError::AuthRequired(required) => {
+                match Self::classify_challenge(&required.www_authenticate_header) {
+                    ChallengeAdmission::BearerWithMetadata(resource_metadata)
+                        if self.oauth_negotiation == OAuthNegotiation::Auto =>
+                    {
+                        let Some(metadata_url) =
+                            self.admitted_resource_metadata_url(&resource_metadata)
+                        else {
+                            return Some(HttpAuthenticationError::OAuthDiscoveryFailed);
+                        };
+                        match self.initialize_oauth(Some(metadata_url)).await {
+                            Ok(_) => Some(HttpAuthenticationError::OAuthRequired),
+                            Err(_) => Some(HttpAuthenticationError::OAuthDiscoveryFailed),
+                        }
+                    }
+                    ChallengeAdmission::BearerWithMetadata(_)
+                    | ChallengeAdmission::BearerWithoutMetadata => {
+                        Some(HttpAuthenticationError::OAuthDiscoveryFailed)
+                    }
+                    ChallengeAdmission::Unsupported => {
+                        Some(HttpAuthenticationError::UnsupportedChallenge)
+                    }
+                }
+            }
+            StreamableHttpError::InsufficientScope(_) => Some(HttpAuthenticationError::Forbidden),
+            // rmcp 2.2 preserves challenged 401/403 structurally, but represents an unchallenged
+            // status in this stable message form. Keep the compatibility mapping isolated here.
+            StreamableHttpError::UnexpectedServerResponse(message)
+                if message.starts_with("HTTP 401 ") =>
+            {
+                Some(HttpAuthenticationError::Unauthorized)
+            }
+            StreamableHttpError::UnexpectedServerResponse(message)
+                if message.starts_with("HTTP 403 ") =>
+            {
+                Some(HttpAuthenticationError::Forbidden)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) async fn oauth_status(&self) -> Result<OAuthStatus, OAuthError> {
@@ -243,6 +453,9 @@ impl HttpMCPClient {
         self: &Arc<Self>,
         request: OAuthBeginRequest,
     ) -> Result<OAuthFlow, OAuthError> {
+        if self.oauth_negotiation == OAuthNegotiation::Auto && self.oauth.get().is_none() {
+            return Err(OAuthError::NotConfigured);
+        }
         let Some(options) = self.oauth_options.as_ref() else {
             return Err(OAuthError::NotConfigured);
         };
@@ -369,6 +582,9 @@ impl HttpMCPClient {
 
     pub(crate) async fn clear_oauth(&self) -> Result<(), OAuthError> {
         self.cancel_and_drain_oauth_flow().await?;
+        if self.oauth_negotiation == OAuthNegotiation::Auto && self.oauth.get().is_none() {
+            return Err(OAuthError::NotConfigured);
+        }
         if self.oauth_options.is_none() {
             return Err(OAuthError::NotConfigured);
         }
@@ -397,7 +613,7 @@ impl HttpMCPClient {
     }
 
     async fn prepare_oauth_request(&self) -> Result<Option<OAuthRequestGuard>, MCPClientError> {
-        if self.oauth_options.is_none() {
+        if self.oauth_negotiation != OAuthNegotiation::Explicit && self.oauth.get().is_none() {
             return Ok(None);
         }
         let oauth = self.oauth().await.map_err(|error| {
@@ -536,7 +752,9 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         let config = StreamableHttpClientTransportConfig::with_uri(self.base.params.url.clone());
-        let (service, oauth_request) = if self.oauth_options.is_some() {
+        let use_oauth =
+            self.oauth_negotiation == OAuthNegotiation::Explicit || self.oauth.get().is_some();
+        let (service, oauth_request) = if use_oauth {
             let oauth = self.oauth().await.map_err(|e| {
                 MCPClientError::ConnectionError(format!("OAuth initialization failed: {e}"))
             })?;
@@ -602,6 +820,10 @@ impl MCPClientProtocol for HttpMCPClient {
                             .await;
                     }
                 }
+            }
+        } else if let Err(error) = &service {
+            if let Some(auth_error) = self.classify_anonymous_initialize_error(error).await {
+                return Err(MCPClientError::HttpAuthentication(auth_error));
             }
         }
         let service = service
@@ -934,6 +1156,78 @@ mod tests {
     // `send_request` / `session_id` / `capabilities_resources` / `initialize_session`）。该层已随 HTTP 客户端
     // 迁移到 rmcp `StreamableHttpClientTransport` 删除，相关测试一并移除；真实的连接/工具/资源行为改由真链路
     // e2e（真 Streamable HTTP server + 真 rmcp 传输）覆盖。此处保留与传输无关的状态门控/构造/Debug 单测。
+
+    #[test]
+    fn challenge_admission_requires_bearer_resource_metadata() {
+        assert_eq!(
+            HttpMCPClient::classify_challenge(
+                r#"Bearer realm="mcp", resource_metadata="https://mcp.example/.well-known/oauth-protected-resource""#,
+            ),
+            ChallengeAdmission::BearerWithMetadata(
+                "https://mcp.example/.well-known/oauth-protected-resource".to_string()
+            )
+        );
+        assert_eq!(
+            HttpMCPClient::classify_challenge(r#"Basic realm="legacy""#),
+            ChallengeAdmission::Unsupported
+        );
+        assert_eq!(
+            HttpMCPClient::classify_challenge(r#"Digest realm="legacy", Bearer realm="mcp""#),
+            ChallengeAdmission::BearerWithoutMetadata
+        );
+        assert_eq!(
+            HttpMCPClient::classify_challenge(
+                r#"Basic realm="legacy", Bearer resource_metadata="https://mcp.example/prm""#,
+            ),
+            ChallengeAdmission::BearerWithMetadata("https://mcp.example/prm".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_challenge_is_never_admitted() {
+        assert_eq!(
+            HttpMCPClient::classify_challenge("Bearer resource_metadata=\""),
+            ChallengeAdmission::Unsupported
+        );
+        assert_eq!(
+            HttpMCPClient::classify_challenge(""),
+            ChallengeAdmission::Unsupported
+        );
+    }
+
+    #[test]
+    fn auth_policy_preserves_legacy_explicit_oauth_and_allows_auto_overrides() {
+        let params = || HttpServerParameters {
+            url: "https://mcp.example/mcp".to_string(),
+            headers: HashMap::new(),
+        };
+        let legacy = HttpMCPClient::new(params())
+            .with_auth_policy(None, Some(OAuthOptions::default()), None)
+            .unwrap();
+        assert_eq!(legacy.oauth_negotiation, OAuthNegotiation::Explicit);
+
+        let automatic = HttpMCPClient::new(params())
+            .with_auth_policy(
+                Some(HttpAuthPolicy::Auto),
+                Some(OAuthOptions::default()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(automatic.oauth_negotiation, OAuthNegotiation::Auto);
+
+        assert!(matches!(
+            HttpMCPClient::new(params()).with_auth_policy(Some(HttpAuthPolicy::OAuth), None, None),
+            Err(OAuthError::ExplicitPolicyRequiresOptions)
+        ));
+        assert!(matches!(
+            HttpMCPClient::new(params()).with_auth_policy(
+                Some(HttpAuthPolicy::Disabled),
+                Some(OAuthOptions::default()),
+                None
+            ),
+            Err(OAuthError::DisabledPolicyWithOptions)
+        ));
+    }
 
     #[tokio::test]
     async fn test_http_client_creation() {

@@ -382,7 +382,7 @@ impl CommandHandler {
 
     /// 启动客户端（`<target>|all`，target = name 或 bundle_id）/ start（#141：经 `resolve_target`；#175：挂载态守卫）。
     ///
-    /// #175：非 `all` 分支经 [`start_client_line`](Self::start_client_line) 做挂载态检查——已声明但未挂载
+    /// #175：非 `all` 分支经 `start_client_line` 做挂载态检查——已声明但未挂载
     /// 的 server 收到诚实诊断而非库层内部错误（`Unknown server bundle_id` 泄露）。
     pub async fn start_client(&self, target: &str) -> Result<(), CommandError> {
         if target == "all" {
@@ -502,7 +502,7 @@ impl CommandHandler {
     ///
     /// 兑现 [`Computer::restart_mcp_client`] 的公开面——此前该 API 无任何调用点、doc 却已声称供 CLI 使用。
     ///
-    /// #175：经 [`restart_client_line`](Self::restart_client_line) 做挂载态守卫。
+    /// #175：经 `restart_client_line` 做挂载态守卫。
     pub async fn restart_client(&self, target: &str) -> Result<(), CommandError> {
         match self.restart_client_line(target).await? {
             Ok(line) => println!("{line}"),
