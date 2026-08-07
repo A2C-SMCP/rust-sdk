@@ -419,12 +419,20 @@ impl<S: Session> Computer<S> {
 
 ### 配置模型
 
-在 `HttpServerConfig` 增加向后兼容的：
+`HttpServerConfig` exposes OAuth options separately from negotiation policy:
 
 ```rust
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub oauth: Option<OAuthOptions>
+
+#[serde(default, rename = "authPolicy", skip_serializing_if = "Option::is_none")]
+pub auth_policy: Option<HttpAuthPolicy>
 ```
+
+An omitted policy is compatibility-aware: an existing `oauth` block remains proactive OAuth;
+without that block the client is anonymous-first and performs automatic discovery. `authPolicy:
+auto` makes `oauth` an optional override block, `oauth` selects proactive OAuth explicitly, and
+`disabled` prevents OAuth negotiation.
 
 实际序列化形态（camelCase）：
 
@@ -476,15 +484,29 @@ oauth:
 `OAuthOptions.resource` 缺省时取 `HttpServerParameters.url`，保持旧配置兼容；显式值必须是绝对 URI
 且不得包含 fragment。HTTP endpoint 继续承载 MCP 请求，effective resource 则统一进入
 authorization request、token request 与 `OAuthCredentialKey`。两者跨 origin 时，endpoint 自定义 header
-不得泄漏到 canonical resource origin。
+不得泄漏到 canonical resource origin。自动协商要求 effective resource 与 HTTP MCP endpoint 规范化后
+一致，并把准入绑定到 challenge 中的精确 `resource_metadata` URL 及其声明的 endpoint；有意的
+cross-resource 配置必须使用 proactive `authPolicy: oauth`，避免 endpoint A 的 challenge 错误准入
+resource B 的授权元数据和 token。
 
 ### static headers 与 OAuth 优先级
 
-1. 配置显式 `oauth`：走 OAuth，禁止同时提供手写 `Authorization` header。
-2. 未配置 OAuth、但存在 `Authorization` header：保持现有静态鉴权，不做自动 OAuth。
-3. 两者都没有：允许连接探测；收到规范 401 时返回 `AuthorizationRequired`。调用
-   `begin_oauth` 前必须先为该 HTTP server 提供 `OAuthOptions`；SDK 不从 401 自动推断或持久化 OAuth 配置。
-4. 非 Authorization 自定义 headers 可与 OAuth 共存，但必须验证 redirect 不会跨 origin 泄漏。
+1. 显式 proactive OAuth 禁止同时提供手写 `Authorization` header。
+2. 存在静态 `Authorization` header 时保持静态鉴权；401/403 返回
+   `StaticCredentialsRejected`，绝不静默回退 OAuth。
+3. 没有静态凭据时匿名优先。只有合法 Bearer challenge 携带 `resource_metadata`，且 RFC 9728
+   PRM 的精确 URL 已获取、其 resource 与当前 MCP endpoint 匹配，并且 RFC 8414/OIDC 授权服务器
+   元数据包含合法 issuer 并通过校验，才创建 OAuth coordinator 并返回 `OAuthRequired`；rmcp 的
+   legacy endpoint 推导不能作为自动准入证据。此后 `oauth_status` 与交互 flow 才可用。
+4. Basic、Digest、未知 challenge、Bearer 缺 metadata、裸 401 和普通 403 分别返回稳定的
+   `HttpAuthenticationError` 类别，不进入 OAuth。`403 insufficient_scope` 仅在已有 OAuth
+   上下文中触发 step-up。
+5. `authPolicy: disabled` 禁止自动协商；非 Authorization 自定义 headers 可与 OAuth 共存，
+   但跨 origin redirect 不得携带这些 headers。
+
+rmcp 2.2 的 Streamable HTTP 初始化错误当前只保留第一条独立 `WWW-Authenticate` header；若服务端
+分别发送 Basic 与 Bearer 且 Basic 在前，SDK 无法恢复已丢失的 Bearer 字段。组合在同一 header 中的
+多 challenge 可正确解析；独立多 header 需等待 rmcp 改用 `headers().get_all()` 后升级。
 
 ### 凭据存储
 

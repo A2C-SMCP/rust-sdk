@@ -52,6 +52,7 @@ rmcp.workspace = true
 # HTTP客户端 / HTTP Client
 reqwest.workspace = true
 http.workspace = true
+http-auth = { version = "0.1.10", default-features = false }
 
 # SSE客户端 / SSE Client
 eventsource-client.workspace = true

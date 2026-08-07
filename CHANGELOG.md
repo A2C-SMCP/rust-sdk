@@ -23,6 +23,12 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- *(computer)* #174 makes Streamable HTTP authentication anonymous-first by default and admits
+  OAuth only after a Bearer challenge plus validated RFC 9728/RFC 8414 metadata. Hosts receive
+  structured results for OAuth-required, unsupported challenge, discovery failure, ordinary
+  401/403, and rejected static credentials; automatic flows reuse the existing credential store,
+  status events, refresh, scope step-up, and cancellation lifecycle.
+
 - *(computer)* #157 adds OAuth status, begin, callback completion, and credential
   clearing APIs for Streamable HTTP servers. Supported grants include Authorization
   Code + PKCE (pre-registered, CIMD, or DCR clients) and Client Credentials
@@ -53,6 +59,14 @@ All notable changes to this project will be documented in this file.
   failing concurrent local MCP connections and their prompt error handling.
 
 ### Migration Notes
+
+- HTTP configurations may set `authPolicy` to `auto`, `oauth`, or `disabled`. An omitted policy
+  preserves proactive behavior for existing `oauth` blocks and otherwise enables anonymous-first
+  discovery. Static `Authorization` headers always remain static-only and never fall back to OAuth.
+  Automatic negotiation binds admission to the challenged protected-resource metadata and requires
+  its effective resource to match the MCP endpoint plus issuer-bearing RFC 8414/OIDC metadata;
+  derived legacy endpoints are not admitted. Intentional cross-resource configurations must use
+  proactive `authPolicy: oauth`.
 
 - Add the optional `oauth` object to an HTTP server configuration and provide secret
   values through `SecretValueResolver` input IDs. Do not combine OAuth with a static

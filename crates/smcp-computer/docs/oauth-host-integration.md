@@ -19,6 +19,12 @@ without a fragment and uses the normalized value consistently for authorization 
 token requests, and [`OAuthCredentialKey`] isolation. The MCP transport still connects to the
 configured HTTP endpoint; endpoint headers are not copied to a different resource origin.
 
+In automatic (`authPolicy: auto`) negotiation, `resource` must be omitted or normalize to the MCP
+endpoint. The SDK binds admission to the exact `resource_metadata` URL from the Bearer challenge
+and verifies that document describes the challenged endpoint. An intentional canonical resource
+that differs from the transport endpoint therefore requires proactive `authPolicy: oauth`; this
+keeps a challenge for endpoint A from admitting tokens discovered for unrelated resource B.
+
 ```yaml
 oauth:
   resource: https://resource.example/canonical-mcp
@@ -29,8 +35,34 @@ oauth:
     clientId: desktop-client
 ```
 
-OAuth remains mutually exclusive with a static `Authorization` header, whether `resource` is
-explicit or inherited from the endpoint.
+Proactive OAuth remains mutually exclusive with a static `Authorization` header, whether
+`resource` is explicit or inherited from the endpoint. Under automatic negotiation, a static
+header always selects static-only authentication; rejection is surfaced as
+`HttpAuthenticationError::StaticCredentialsRejected` and never falls back to OAuth.
+
+## Automatic OAuth admission
+
+Streamable HTTP is anonymous-first when no legacy proactive `oauth` block or explicit policy says
+otherwise. A host must expose an authorization action only after connection returns
+`HttpAuthenticationError::OAuthRequired`. That result means all of the following succeeded:
+
+1. the server returned a syntactically valid Bearer challenge containing `resource_metadata`;
+2. that exact RFC 9728 protected-resource metadata URL was fetched and validated for the
+   challenged MCP endpoint;
+3. issuer-bearing RFC 8414 or OIDC authorization-server metadata was discovered and validated;
+   endpoints derived by rmcp's legacy fallback are not accepted for automatic admission.
+
+Before admission, `oauth_status` and `create_oauth_flow` return `OAuthError::NotConfigured` and do
+not perform discovery, registration, or token requests. Basic, Digest, unknown challenges, Bearer
+without metadata, failed discovery, bare 401, and ordinary 403 are separate
+`HttpAuthenticationError` values. A valid `403 insufficient_scope` can request step-up only when a
+validated OAuth coordinator already exists.
+
+rmcp 2.2 currently exposes only the first value when a server sends multiple independent
+`WWW-Authenticate` header fields. Consequently, `Basic` in the first field and `Bearer` in a later
+field is classified from the first field only. A combined field containing both challenges works.
+Fixing separate-field handling requires rmcp to preserve `headers().get_all()`; hosts should track
+that upstream limitation when integrating servers that advertise multiple schemes.
 
 ## Responsibility matrix
 

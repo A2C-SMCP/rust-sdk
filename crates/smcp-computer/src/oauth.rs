@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -345,27 +345,49 @@ struct DiscoveryCleanupOAuthHttpClient {
     protected_resource: Option<Url>,
     protected_resource_headers: HeaderMap,
     protected_resource_metadata_urls: StdRwLock<HashSet<String>>,
+    admitted_resource_metadata: Option<AdmittedResourceMetadata>,
+}
+
+#[derive(Clone)]
+struct AdmittedResourceMetadata {
+    url: Url,
+    resource: String,
+    validated: Arc<AtomicBool>,
+}
+
+#[derive(Deserialize)]
+struct AdmittedResourceMetadataDocument {
+    resource: Option<String>,
+    authorization_server: Option<String>,
+    authorization_servers: Option<Vec<String>>,
+    scopes_supported: Option<Vec<String>>,
 }
 
 impl DiscoveryCleanupOAuthHttpClient {
     #[cfg(test)]
     fn new() -> Result<Self, RmcpAuthError> {
-        Self::new_for_protected_resource(None, HeaderMap::new())
+        Self::new_for_protected_resource(None, HeaderMap::new(), None)
     }
 
     fn with_protected_resource_headers(
         resource: &str,
         mut protected_resource_headers: HeaderMap,
+        admitted_resource_metadata: Option<AdmittedResourceMetadata>,
     ) -> Result<Self, RmcpAuthError> {
         protected_resource_headers.remove(http::header::AUTHORIZATION);
         let resource = Url::parse(resource)
             .map_err(|error| RmcpAuthError::InternalError(error.to_string()))?;
-        Self::new_for_protected_resource(Some(resource), protected_resource_headers)
+        Self::new_for_protected_resource(
+            Some(resource),
+            protected_resource_headers,
+            admitted_resource_metadata,
+        )
     }
 
     fn new_for_protected_resource(
         protected_resource: Option<Url>,
         protected_resource_headers: HeaderMap,
+        admitted_resource_metadata: Option<AdmittedResourceMetadata>,
     ) -> Result<Self, RmcpAuthError> {
         let follow_redirects = reqwest::Client::builder()
             .timeout(OAUTH_HTTP_TIMEOUT)
@@ -404,7 +426,47 @@ impl DiscoveryCleanupOAuthHttpClient {
             protected_resource,
             protected_resource_headers,
             protected_resource_metadata_urls: StdRwLock::new(HashSet::new()),
+            admitted_resource_metadata,
         })
+    }
+
+    fn admitted_resource_matches(expected: &str, actual: &str) -> bool {
+        let (Ok(expected), Ok(actual)) = (Url::parse(expected), Url::parse(actual)) else {
+            return false;
+        };
+        expected == actual
+    }
+
+    fn observe_admitted_resource_metadata(
+        &self,
+        request_url: &Url,
+        status: reqwest::StatusCode,
+        body: &[u8],
+    ) {
+        let Some(expected) = self
+            .admitted_resource_metadata
+            .as_ref()
+            .filter(|expected| &expected.url == request_url && status.is_success())
+        else {
+            return;
+        };
+        let valid = serde_json::from_slice::<AdmittedResourceMetadataDocument>(body)
+            .ok()
+            .and_then(|metadata| {
+                // Reading every rmcp-recognized PRM field keeps this admission proof aligned with
+                // rmcp's typed document rather than accepting a body whose resource happens to
+                // parse while another known field has the wrong JSON type.
+                let _known_fields = (
+                    metadata.authorization_server,
+                    metadata.authorization_servers,
+                    metadata.scopes_supported,
+                );
+                metadata.resource
+            })
+            .is_some_and(|resource| Self::admitted_resource_matches(&expected.resource, &resource));
+        if valid {
+            expected.validated.store(true, Ordering::Release);
+        }
     }
 
     fn is_protected_resource_request(&self, request_url: &Url) -> bool {
@@ -532,6 +594,7 @@ impl OAuthHttpClient for DiscoveryCleanupOAuthHttpClient {
                 .execute(request)
                 .await
                 .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            let response_status = response.status();
             if is_protected_resource {
                 self.remember_resource_metadata_url(&request_url, response.headers());
             }
@@ -584,6 +647,7 @@ impl OAuthHttpClient for DiscoveryCleanupOAuthHttpClient {
                 let _ = cleanup_task.await;
             }
             let body = body_result?;
+            self.observe_admitted_resource_metadata(&request_url, response_status, &body);
 
             builder
                 .body(body)
@@ -709,6 +773,19 @@ pub struct OAuthOptions {
     pub mode: OAuthClientMode,
 }
 
+impl Default for OAuthOptions {
+    fn default() -> Self {
+        Self {
+            resource: None,
+            scopes: Vec::new(),
+            client_name: None,
+            mode: OAuthClientMode::AuthorizationCode {
+                registration: OAuthClientRegistration::Dynamic,
+            },
+        }
+    }
+}
+
 impl OAuthOptions {
     pub(crate) fn effective_resource(&self, mcp_endpoint: &str) -> Result<String, OAuthError> {
         canonical_resource_identity(self.resource.as_deref().unwrap_or(mcp_endpoint))
@@ -743,6 +820,26 @@ pub enum OAuthClientMode {
 
 fn default_jwt_algorithm() -> String {
     "RS256".to_string()
+}
+
+fn bearer_insufficient_scope(header: &str) -> Option<String> {
+    let challenges = http_auth::parse_challenges(header).ok()?;
+    challenges.into_iter().find_map(|challenge| {
+        if !challenge.scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        let mut insufficient_scope = false;
+        let mut scope = None;
+        for (name, value) in challenge.params {
+            let value = value.to_unescaped();
+            if name.eq_ignore_ascii_case("error") && value == "insufficient_scope" {
+                insufficient_scope = true;
+            } else if name.eq_ignore_ascii_case("scope") && !value.trim().is_empty() {
+                scope = Some(value);
+            }
+        }
+        insufficient_scope.then_some(scope).flatten()
+    })
 }
 
 /// How an authorization-code client is identified.
@@ -1008,6 +1105,10 @@ pub enum OAuthError {
     InvalidRedirectUri(String),
     #[error("OAuth cannot be combined with a static Authorization header")]
     ConflictingAuthorizationHeader,
+    #[error("the explicit OAuth policy requires OAuth options")]
+    ExplicitPolicyRequiresOptions,
+    #[error("the disabled authentication policy cannot contain OAuth options")]
+    DisabledPolicyWithOptions,
     #[error("OAuth protocol error: {0}")]
     Protocol(#[from] OAuthProtocolError),
 }
@@ -1429,6 +1530,7 @@ pub(crate) struct OAuthCoordinatorContext {
     bundle_id: BundleId,
     credential_store: Arc<dyn OAuthCredentialStore>,
     events: Option<Arc<RuntimeStatus>>,
+    admitted_resource_metadata_url: Option<Url>,
 }
 
 impl OAuthCoordinatorContext {
@@ -1441,7 +1543,13 @@ impl OAuthCoordinatorContext {
             bundle_id,
             credential_store,
             events,
+            admitted_resource_metadata_url: None,
         }
+    }
+
+    pub(crate) fn with_admitted_resource_metadata_url(mut self, url: Option<Url>) -> Self {
+        self.admitted_resource_metadata_url = url;
+        self
     }
 }
 
@@ -1503,23 +1611,41 @@ impl OAuthCoordinator {
         http_client: reqwest::Client,
         protected_resource_headers: HeaderMap,
     ) -> Result<Self, OAuthError> {
+        let admitted_resource_metadata =
+            context.admitted_resource_metadata_url.clone().map(|url| {
+                let validated = Arc::new(AtomicBool::new(false));
+                (
+                    AdmittedResourceMetadata {
+                        url,
+                        resource: resource.to_string(),
+                        validated: Arc::clone(&validated),
+                    },
+                    validated,
+                )
+            });
+        let admitted_resource_metadata_validated = admitted_resource_metadata
+            .as_ref()
+            .map(|(_, validated)| Arc::clone(validated));
         let oauth_http_client = Arc::new(
             DiscoveryCleanupOAuthHttpClient::with_protected_resource_headers(
                 mcp_endpoint,
                 protected_resource_headers,
+                admitted_resource_metadata.map(|(metadata, _)| metadata),
             )?,
         );
-        Self::new_with_oauth_http_client(
+        Self::new_with_oauth_http_client_and_admission(
             context,
             resource,
             options,
             resolver,
             http_client,
             oauth_http_client,
+            admitted_resource_metadata_validated,
         )
         .await
     }
 
+    #[cfg(test)]
     async fn new_with_oauth_http_client(
         context: OAuthCoordinatorContext,
         resource: &str,
@@ -1528,10 +1654,32 @@ impl OAuthCoordinator {
         http_client: reqwest::Client,
         oauth_http_client: Arc<dyn OAuthHttpClient>,
     ) -> Result<Self, OAuthError> {
+        Self::new_with_oauth_http_client_and_admission(
+            context,
+            resource,
+            options,
+            resolver,
+            http_client,
+            oauth_http_client,
+            None,
+        )
+        .await
+    }
+
+    async fn new_with_oauth_http_client_and_admission(
+        context: OAuthCoordinatorContext,
+        resource: &str,
+        options: OAuthOptions,
+        resolver: Option<Arc<dyn SecretValueResolver>>,
+        http_client: reqwest::Client,
+        oauth_http_client: Arc<dyn OAuthHttpClient>,
+        admitted_resource_metadata_validated: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, OAuthError> {
         let OAuthCoordinatorContext {
             bundle_id,
             credential_store,
             events,
+            admitted_resource_metadata_url: _,
         } = context;
         let resource = canonical_resource_identity(resource)?;
         let store = ScopedCredentialStore::new(
@@ -1551,6 +1699,15 @@ impl OAuthCoordinator {
         let state_store = ExpiringStateStore::new(AUTHORIZATION_STATE_TTL);
         manager.set_state_store(state_store.clone());
         let metadata = manager.discover_metadata().await?;
+        if let Some(validated) = admitted_resource_metadata_validated.as_ref() {
+            // rmcp 2.2 intentionally falls back to derived legacy endpoints when RFC 8414/OIDC
+            // discovery fails. That is useful for proactive compatibility but is not evidence
+            // strong enough to admit Auto OAuth. Both standardized discovery documents must have
+            // succeeded, and RFC 8414/OIDC metadata requires an issuer.
+            if !validated.load(Ordering::Acquire) || metadata.issuer.is_none() {
+                return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
+            }
+        }
         validate_authorization_metadata(
             &metadata,
             matches!(options.mode, OAuthClientMode::AuthorizationCode { .. }),
@@ -2661,11 +2818,12 @@ impl OAuthCoordinator {
             rmcp::transport::streamable_http_client::StreamableHttpError::InsufficientScope(
                 insufficient,
             ) => {
-                self.handle_insufficient_scope(
-                    insufficient.required_scope.clone().unwrap_or_default(),
-                    expected_generation,
-                )
-                .await;
+                if let Some(required_scope) =
+                    bearer_insufficient_scope(&insufficient.www_authenticate_header)
+                {
+                    self.handle_insufficient_scope(required_scope, expected_generation)
+                        .await;
+                }
             }
             rmcp::transport::streamable_http_client::StreamableHttpError::AuthRequired(_) => {
                 let _ = self.invalidate_credentials(Some(expected_generation)).await;
@@ -3093,6 +3251,53 @@ mod tests {
 
     fn memory_credential_store() -> Arc<dyn OAuthCredentialStore> {
         Arc::new(InMemoryOAuthCredentialStore::default())
+    }
+
+    #[test]
+    fn scope_step_up_requires_valid_bearer_insufficient_scope_challenge() {
+        assert_eq!(
+            bearer_insufficient_scope(r#"Bearer error="insufficient_scope", scope="tools.write""#),
+            Some("tools.write".to_string())
+        );
+        assert_eq!(
+            bearer_insufficient_scope(r#"Basic error="insufficient_scope", scope="tools.write""#),
+            None
+        );
+        assert_eq!(
+            bearer_insufficient_scope(r#"Bearer scope="tools.write""#),
+            None
+        );
+        assert_eq!(
+            bearer_insufficient_scope(r#"Bearer error="insufficient_scope""#),
+            None
+        );
+        assert_eq!(
+            bearer_insufficient_scope(r#"Bearer error="INSUFFICIENT_SCOPE", scope="tools.write""#),
+            None
+        );
+    }
+
+    #[test]
+    fn automatic_admission_requires_the_metadata_resource_to_match_the_endpoint() {
+        assert!(DiscoveryCleanupOAuthHttpClient::admitted_resource_matches(
+            "https://mcp.example/mcp",
+            "https://MCP.EXAMPLE:443/mcp"
+        ));
+        assert!(!DiscoveryCleanupOAuthHttpClient::admitted_resource_matches(
+            "https://mcp.example/mcp",
+            "https://mcp.example/"
+        ));
+        assert!(!DiscoveryCleanupOAuthHttpClient::admitted_resource_matches(
+            "https://mcp.example/mcp",
+            "https://other.example/mcp"
+        ));
+        assert!(
+            serde_json::from_value::<AdmittedResourceMetadataDocument>(serde_json::json!({
+                "resource": "https://mcp.example/mcp",
+                "authorization_servers": "https://auth.example"
+            }))
+            .is_err()
+        );
     }
 
     fn test_coordinator_context(
@@ -4090,8 +4295,10 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
         let mut headers = HeaderMap::new();
         headers.insert("x-tenant-id", HeaderValue::from_static("tenant-157"));
         let client = Arc::new(
-            DiscoveryCleanupOAuthHttpClient::with_protected_resource_headers(&resource, headers)
-                .unwrap(),
+            DiscoveryCleanupOAuthHttpClient::with_protected_resource_headers(
+                &resource, headers, None,
+            )
+            .unwrap(),
         );
         let manager = AuthorizationManager::new_with_oauth_http_client(&resource, client)
             .await
