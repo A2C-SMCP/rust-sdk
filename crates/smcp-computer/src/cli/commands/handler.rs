@@ -380,9 +380,13 @@ impl CommandHandler {
         Ok(remove_receipt(&id, removed))
     }
 
-    /// 启动客户端（`<target>|all`，target = name 或 bundle_id）/ start（#141：经 `resolve_target`）。
+    /// 启动客户端（`<target>|all`，target = name 或 bundle_id）/ start（#141：经 `resolve_target`；#175：挂载态守卫）。
+    ///
+    /// #175：非 `all` 分支经 [`start_client_line`](Self::start_client_line) 做挂载态检查——已声明但未挂载
+    /// 的 server 收到诚实诊断而非库层内部错误（`Unknown server bundle_id` 泄露）。
     pub async fn start_client(&self, target: &str) -> Result<(), CommandError> {
         if target == "all" {
+            // `all` 分支只迭代已挂载 server（不遍历声明面），故不受 #175 挂载态守卫影响。
             return match self.computer.start_all_mcp_clients().await {
                 Ok(()) => {
                     println!("✅ 所有服务器启动完成 / All servers started");
@@ -394,9 +398,8 @@ impl CommandHandler {
                 }
             };
         }
-        let id = self.resolve_target(target).await?;
-        match self.computer.start_mcp_client(&id).await {
-            Ok(()) => println!("✅ 服务器 [bundle_id={id}] 启动完成 / Server started"),
+        match self.start_client_line(target).await? {
+            Ok(line) => println!("{line}"),
             Err(e) => println!("❌ 启动服务器失败: {e}"),
         }
         Ok(())
@@ -448,13 +451,61 @@ impl CommandHandler {
             .map(|stopped| stop_receipt(&id, stopped)))
     }
 
+    /// [`start_client`](Self::start_client) 的**可断言内核**（非 `all` 分支）：返回回执行而非直接 `println!`。
+    ///
+    /// #175：`resolve_target` 查找空间 ∪ 声明面后，对「已声明但未挂载」的目标做挂载态检查，
+    /// 诚实陈述而非透传库层内部错误（如 `Unknown server bundle_id`）。外层 `Result` = resolve 失败，
+    /// 内层 = 库层启动失败；未挂载走 `Ok(Ok(…))` 返回诚实诊断。
+    ///
+    /// 见 [`stop_client_line`](Self::stop_client_line) 里同一条理由。
+    pub(crate) async fn start_client_line(
+        &self,
+        target: &str,
+    ) -> Result<Result<String, ComputerError>, CommandError> {
+        let id = self.resolve_target(target).await?;
+        if !self.is_mounted(&id).await {
+            return Ok(Ok(start_not_mounted_receipt(&id)));
+        }
+        Ok(self
+            .computer
+            .start_mcp_client(&id)
+            .await
+            .map(|()| format!("✅ 服务器 [bundle_id={id}] 启动完成 / Server started")))
+    }
+
+    /// [`restart_client`](Self::restart_client) 的**可断言内核**：同 [`start_client_line`](Self::start_client_line) 模式。
+    pub(crate) async fn restart_client_line(
+        &self,
+        target: &str,
+    ) -> Result<Result<String, ComputerError>, CommandError> {
+        let id = self.resolve_target(target).await?;
+        if !self.is_mounted(&id).await {
+            return Ok(Ok(start_not_mounted_receipt(&id)));
+        }
+        Ok(self
+            .computer
+            .restart_mcp_client(&id)
+            .await
+            .map(|()| format!("✅ 服务器 [bundle_id={id}] 重启完成 / Server restarted")))
+    }
+
+    /// #175 helper：查询 `bundle_id` 是否在活跃配置集（mounted set）中。
+    async fn is_mounted(&self, id: &BundleId) -> bool {
+        self.computer
+            .list_mcp_servers_with_metadata()
+            .await
+            .iter()
+            .any(|s| s.bundle_id.as_str() == id.as_str())
+    }
+
     /// 重启客户端（`<target>`，target = name 或 bundle_id；不收 `all`）/ restart（#141）。
     ///
     /// 兑现 [`Computer::restart_mcp_client`] 的公开面——此前该 API 无任何调用点、doc 却已声称供 CLI 使用。
+    ///
+    /// #175：经 [`restart_client_line`](Self::restart_client_line) 做挂载态守卫。
     pub async fn restart_client(&self, target: &str) -> Result<(), CommandError> {
-        let id = self.resolve_target(target).await?;
-        match self.computer.restart_mcp_client(&id).await {
-            Ok(()) => println!("✅ 服务器 [bundle_id={id}] 重启完成 / Server restarted"),
+        match self.restart_client_line(target).await? {
+            Ok(line) => println!("{line}"),
             Err(e) => println!("❌ 重启服务器失败: {e}"),
         }
         Ok(())
@@ -866,6 +917,19 @@ fn stop_receipt(id: &BundleId, stopped: bool) -> String {
     } else {
         format!("ℹ️ 服务器 [bundle_id={id}] 尚未挂载，无需停止 / not mounted, nothing to stop")
     }
+}
+
+/// `start <target>` 对「已声明但未挂载」的诚实诊断 / honest diagnostic for declared-but-not-mounted.
+///
+/// 协议 §5.1 生命周期动词规范行为：`start <已声明未挂载>` MUST 诚实陈述
+/// "declared but not mounted; it may be pending the approval gate"，MUST NOT 透传库层内部错误
+/// （如 `Unknown server bundle_id`——内部概念泄露给用户）。
+///
+/// 同 [`stop_receipt`]：纯函数、可断言——回执文案正是本 issue 的交付物本身。
+fn start_not_mounted_receipt(id: &BundleId) -> String {
+    format!(
+        "ℹ️ 服务器 [bundle_id={id}] 已声明但尚未挂载，无法启动（可能等待审批）/ declared but not mounted; it may be pending the approval gate"
+    )
 }
 
 /// `server rm <target>` 的用户可见回执 / user-facing receipt for `server rm`。
@@ -1416,5 +1480,131 @@ mod tests {
                 assert!(result.is_err(), "Should fail: {}", description);
             }
         }
+    }
+
+    // ── #175 helpers ──────────────────────────────────────────────
+    /// 创建带**仅声明面** server 的 Computer（直写 project mcp.json，不挂载到 mcp_servers）。
+    ///
+    /// `config_dir()` 为 private——故本 helper 自管 TempDir 生命周期（`forget` 保留至进程退出）。
+    async fn computer_with_declared_only_server(name: &str) -> Computer<SilentSession> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let tfrobot = config_dir.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        let content = serde_json::json!({
+            "servers": {
+                name: {
+                    "type": "stdio",
+                    "name": name,
+                    "server_parameters": {
+                        "command": "echo",
+                        "args": ["hello"],
+                        "env": {}
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            tfrobot.join("mcp.json"),
+            serde_json::to_string_pretty(&content).unwrap(),
+        )
+        .unwrap();
+        Computer::new(
+            "test_computer",
+            SilentSession::new("test_session"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .with_config_dir(config_dir)
+    }
+
+    /// #175：`start <已声明未挂载>` MUST 诚实陈述，MUST NOT 透传库层内部错误。
+    ///
+    /// 对仅在声明面（mcp.json 落盘）但未挂载的 server 调 `start_client_line`：
+    /// - `resolve_target` 须成功（查找空间 = 活跃集 ∪ 声明面）
+    /// - 回执须含「已声明但尚未挂载」，不含 `Unknown server` 或 `❌`
+    #[tokio::test]
+    async fn start_declared_but_unmounted_returns_honest_diagnostic_175() {
+        let computer = computer_with_declared_only_server("declared_srv").await;
+        let handler = create_test_handler(computer);
+
+        // ① resolve 能查到（声明面兜底）。
+        let id = handler
+            .resolve_target("declared_srv")
+            .await
+            .expect("已声明的 server 按 display 名 MUST 可寻址（即便未挂载）");
+        assert_eq!(id.as_str(), "declared_srv");
+
+        // ② start_client_line：诚实诊断，不泄漏内部错误。
+        let line = handler
+            .start_client_line("declared_srv")
+            .await
+            .expect("resolve 通过")
+            .expect("不是库层错误");
+        assert!(
+            !line.contains("Unknown server"),
+            "MUST NOT leak internal error: {line}"
+        );
+        assert!(!line.contains('❌'), "MUST NOT show error marker: {line}");
+        assert!(
+            line.contains("已声明但尚未挂载") || line.contains("declared but not mounted"),
+            "回执须诚实陈述「未挂载」, got: {line}"
+        );
+    }
+
+    /// #175：`restart <已声明未挂载>` 同受挂载态守卫——经 `restart_client_line` 内核断言真实调用链。
+    #[tokio::test]
+    async fn restart_declared_but_unmounted_honest_diagnostic_175() {
+        let computer = computer_with_declared_only_server("restart_srv").await;
+        let handler = create_test_handler(computer);
+
+        let id = handler
+            .resolve_target("restart_srv")
+            .await
+            .expect("已声明的 server MUST 可寻址");
+        assert_eq!(id.as_str(), "restart_srv");
+
+        // 走 `restart_client_line` 内核断言回执——不依赖 `println!`。
+        let line = handler
+            .restart_client_line("restart_srv")
+            .await
+            .expect("resolve 通过")
+            .expect("不是库层错误");
+        assert!(
+            !line.contains("Unknown server"),
+            "MUST NOT leak internal error: {line}"
+        );
+        assert!(!line.contains('❌'), "MUST NOT show error marker: {line}");
+        assert!(
+            line.contains("已声明但尚未挂载") || line.contains("declared but not mounted"),
+            "回执须诚实陈述「未挂载」, got: {line}"
+        );
+    }
+
+    /// #175：`rm <已声明未挂载>` 行为不变——resolve_target 守卫仅用于 start/restart，不波及 rm。
+    #[tokio::test]
+    async fn remove_declared_but_unmounted_still_works_175() {
+        let computer = computer_with_declared_only_server("rm_me").await;
+        let handler = create_test_handler(computer);
+
+        // rm 仍可解析已声明未挂载的目标（双空间语义）。
+        let id = handler.resolve_target("rm_me").await.unwrap();
+        assert_eq!(id.as_str(), "rm_me");
+    }
+
+    /// #175：`start_user_not_mounted_receipt` 纯函数可断言——文案不含内部错误措辞。
+    #[test]
+    fn start_not_mounted_receipt_is_honest_175() {
+        let id = BundleId::try_from("my_srv".to_string()).unwrap();
+        let receipt = start_not_mounted_receipt(&id);
+        assert!(
+            receipt.contains("已声明但尚未挂载") || receipt.contains("declared but not mounted")
+        );
+        assert!(!receipt.contains("Unknown server"));
+        assert!(!receipt.contains('❌'));
+        assert!(receipt.contains("my_srv"), "receipt must include bundle_id");
     }
 }
