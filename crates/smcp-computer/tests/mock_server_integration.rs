@@ -531,6 +531,8 @@ struct OAuthMockState {
     discovery_requests: AtomicUsize,
     token_requests: AtomicUsize,
     registration_requests: AtomicUsize,
+    anonymous_initialize_requests: AtomicUsize,
+    authorized_initialize_requests: AtomicUsize,
     authorized_mcp_requests: AtomicUsize,
     challenge_tools_write_remaining: AtomicUsize,
     reject_authorized_remaining: AtomicUsize,
@@ -596,6 +598,27 @@ async fn oauth_http_mock_handler(
         .get("authorization")
         .is_some_and(|value| value == "Basic b2F1dGgtZTJlLWNsaWVudDpvYXV0aC1lMmUtc2VjcmV0");
     let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
+
+    if method == Method::POST && path == "/mcp" {
+        let rpc_method = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|body| {
+                body.get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        if rpc_method.as_deref() == Some("initialize") {
+            if authorized {
+                state
+                    .authorized_initialize_requests
+                    .fetch_add(1, Ordering::SeqCst);
+            } else {
+                state
+                    .anonymous_initialize_requests
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 
     if method == Method::GET && path == "/.well-known/oauth-protected-resource/mcp" {
         delay_oauth_discovery(&state).await;
@@ -969,6 +992,8 @@ async fn spawn_oauth_http_mock_with_options(
         discovery_requests: AtomicUsize::new(0),
         token_requests: AtomicUsize::new(0),
         registration_requests: AtomicUsize::new(0),
+        anonymous_initialize_requests: AtomicUsize::new(0),
+        authorized_initialize_requests: AtomicUsize::new(0),
         authorized_mcp_requests: AtomicUsize::new(0),
         challenge_tools_write_remaining: AtomicUsize::new(challenge_tools_write_count),
         reject_authorized_remaining: AtomicUsize::new(0),
@@ -1391,6 +1416,33 @@ async fn auto_auth_gate_result(
     (error, state)
 }
 
+async fn configure_auto_oauth_manager(
+    base_url: &str,
+    bundle_id: BundleId,
+    store: Arc<dyn OAuthCredentialStore>,
+    options: OAuthOptions,
+) -> MCPServerManager {
+    let manager = MCPServerManager::with_oauth_credential_store(store);
+    manager
+        .set_secret_resolver(Some(Arc::new(OAuthTestSecretResolver)))
+        .await;
+    let mut config = HttpServerConfig::new(
+        bundle_id.as_str(),
+        HttpServerParameters {
+            url: format!("{base_url}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id);
+    config.auth_policy = Some(HttpAuthPolicy::Auto);
+    config.oauth = Some(options);
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+    manager
+}
+
 #[tokio::test]
 async fn test_disabled_oauth_callbacks_remain_not_configured_after_connect() {
     let (port, _state) = spawn_http_mock(false).await;
@@ -1487,6 +1539,21 @@ async fn test_auto_oauth_admits_only_after_validated_discovery_and_reuses_cancel
     assert!(state.discovery_requests.load(Ordering::SeqCst) > 0);
     assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
     assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.authorized_mcp_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state.anonymous_initialize_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        state.authorized_initialize_requests.load(Ordering::SeqCst),
+        0
+    );
+    let runtime = manager.get_server_status().await;
+    assert_eq!(runtime.len(), 1);
+    assert!(
+        !runtime[0].2,
+        "OAuthRequired must leave the MCP runtime stopped"
+    );
 
     let flow = manager
         .create_oauth_flow(
@@ -1519,6 +1586,293 @@ async fn test_auto_oauth_admits_only_after_validated_discovery_and_reuses_cancel
         }
     ));
     manager.clear_oauth(&bundle_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_authorization_code_restores_and_starts_in_one_call_after_manager_rebuild() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(InMemoryOAuthCredentialStore::default());
+    let bundle_id = BundleId::try_from("oauth-auto-persistent-rebuild").unwrap();
+    let first = configure_authorization_code_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    authorize_manager(&first, &bundle_id, &state, None).await;
+    first.close().await.unwrap();
+    drop(first);
+
+    let anonymous_initializes_before_start =
+        state.anonymous_initialize_requests.load(Ordering::SeqCst);
+    let authorized_initializes_before_start =
+        state.authorized_initialize_requests.load(Ordering::SeqCst);
+    let authorized_requests_before_start = state.authorized_mcp_requests.load(Ordering::SeqCst);
+    let restored = configure_auto_oauth_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        store,
+        authorization_code_options(OAuthFixtureMode::PreregisteredPublic),
+    )
+    .await;
+    restored.start_client_by_id(&bundle_id).await.unwrap();
+
+    assert!(matches!(
+        restored.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+    let runtime = restored.get_server_status().await;
+    assert_eq!(runtime.len(), 1);
+    assert!(
+        runtime[0].2,
+        "the single start call must activate the runtime"
+    );
+    assert!(
+        state.authorized_mcp_requests.load(Ordering::SeqCst) > authorized_requests_before_start,
+        "the rebuilt manager must initialize over authenticated HTTP in the same start call"
+    );
+    assert_eq!(
+        state.anonymous_initialize_requests.load(Ordering::SeqCst),
+        anonymous_initializes_before_start + 1
+    );
+    assert_eq!(
+        state.authorized_initialize_requests.load(Ordering::SeqCst),
+        authorized_initializes_before_start + 1
+    );
+    restored.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_rejected_persisted_authorization_returns_oauth_required_in_one_start() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(InMemoryOAuthCredentialStore::default());
+    let bundle_id = BundleId::try_from("oauth-auto-rejected-persisted").unwrap();
+    let first = configure_authorization_code_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    authorize_manager(&first, &bundle_id, &state, None).await;
+    first.close().await.unwrap();
+    drop(first);
+
+    let anonymous_initializes_before_start =
+        state.anonymous_initialize_requests.load(Ordering::SeqCst);
+    let authorized_initializes_before_start =
+        state.authorized_initialize_requests.load(Ordering::SeqCst);
+    state.reject_authorized_remaining.store(1, Ordering::SeqCst);
+    let restored = configure_auto_oauth_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        store,
+        authorization_code_options(OAuthFixtureMode::PreregisteredPublic),
+    )
+    .await;
+
+    assert!(matches!(
+        restored.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+    assert_eq!(
+        restored.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    let runtime = restored.get_server_status().await;
+    assert_eq!(runtime.len(), 1);
+    assert!(!runtime[0].2);
+    assert_eq!(
+        state.anonymous_initialize_requests.load(Ordering::SeqCst),
+        anonymous_initializes_before_start + 1
+    );
+    assert_eq!(
+        state.authorized_initialize_requests.load(Ordering::SeqCst),
+        authorized_initializes_before_start + 1
+    );
+    restored.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_credential_store_failure_is_not_reported_as_discovery_failure() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let recording_store = Arc::new(RecordingOAuthCredentialStore::default());
+    recording_store
+        .fail_next_credential_save
+        .store(true, Ordering::SeqCst);
+    let store: Arc<dyn OAuthCredentialStore> = recording_store;
+    let bundle_id = BundleId::try_from("oauth-auto-store-failure").unwrap();
+    let manager = configure_auto_oauth_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        store,
+        authorization_code_options(OAuthFixtureMode::PreregisteredPublic),
+    )
+    .await;
+
+    let error = manager.start_client_by_id(&bundle_id).await.unwrap_err();
+    assert!(matches!(
+        error,
+        ComputerError::ConnectionError(ref message)
+            if message.contains("OAuth initialization failed")
+                && !message.contains("metadata discovery")
+    ));
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await,
+        Err(OAuthError::NotConfigured)
+    ));
+    assert_eq!(
+        state.anonymous_initialize_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        state.authorized_initialize_requests.load(Ordering::SeqCst),
+        0
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_corrupt_credential_index_is_not_reported_as_discovery_failure() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let recording_store = Arc::new(RecordingOAuthCredentialStore::default());
+    let store: Arc<dyn OAuthCredentialStore> = recording_store.clone();
+    let bundle_id = BundleId::try_from("oauth-auto-corrupt-index").unwrap();
+    let first = configure_authorization_code_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    authorize_manager(&first, &bundle_id, &state, None).await;
+    first.close().await.unwrap();
+    drop(first);
+    for (key, value) in recording_store.entries.lock().await.iter_mut() {
+        if key.record_kind == OAuthCredentialRecordKind::IssuerIndex {
+            *value = "{".to_string();
+        }
+    }
+
+    let anonymous_initializes_before_start =
+        state.anonymous_initialize_requests.load(Ordering::SeqCst);
+    let authorized_initializes_before_start =
+        state.authorized_initialize_requests.load(Ordering::SeqCst);
+    let manager = configure_auto_oauth_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        store,
+        authorization_code_options(OAuthFixtureMode::PreregisteredPublic),
+    )
+    .await;
+    let error = manager.start_client_by_id(&bundle_id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ComputerError::ConnectionError(ref message)
+            if message.contains("OAuth initialization failed")
+                && !message.contains("metadata discovery")
+    ));
+    assert_eq!(
+        state.anonymous_initialize_requests.load(Ordering::SeqCst),
+        anonymous_initializes_before_start + 1
+    );
+    assert_eq!(
+        state.authorized_initialize_requests.load(Ordering::SeqCst),
+        authorized_initializes_before_start,
+        "the corrupt index must fail before an authenticated initialize"
+    );
+    let runtime = manager.get_server_status().await;
+    assert_eq!(runtime.len(), 1);
+    assert!(!runtime[0].2);
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_client_credentials_secret_starts_in_one_call() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::ClientCredentials, 0).await;
+    let bundle_id = BundleId::try_from("oauth-auto-machine-secret").unwrap();
+    let manager = configure_auto_oauth_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+        OAuthOptions {
+            resource: None,
+            scopes: vec!["tools.read".to_string()],
+            client_name: None,
+            mode: OAuthClientMode::ClientCredentialsSecret {
+                client_id: "oauth-e2e-client".to_string(),
+                client_secret_input: "oauth-e2e-secret-input".to_string(),
+            },
+        },
+    )
+    .await;
+
+    manager.start_client_by_id(&bundle_id).await.unwrap();
+
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 1);
+    assert!(state.authorized_mcp_requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        state.anonymous_initialize_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        state.authorized_initialize_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert!(matches!(
+        manager.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+    let runtime = manager.get_server_status().await;
+    assert_eq!(runtime.len(), 1);
+    assert!(
+        runtime[0].2,
+        "the single start call must activate the runtime"
+    );
+    manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_auto_persisted_credentials_can_be_cleared_before_first_reconnect() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::PreregisteredPublic, 0).await;
+    let store: Arc<dyn OAuthCredentialStore> = Arc::new(InMemoryOAuthCredentialStore::default());
+    let bundle_id = BundleId::try_from("oauth-auto-clear-before-reconnect").unwrap();
+    let first = configure_authorization_code_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+    )
+    .await;
+    authorize_manager(&first, &bundle_id, &state, None).await;
+    first.close().await.unwrap();
+    drop(first);
+
+    let restored = configure_auto_oauth_manager(
+        &state.base_url,
+        bundle_id.clone(),
+        Arc::clone(&store),
+        authorization_code_options(OAuthFixtureMode::PreregisteredPublic),
+    )
+    .await;
+    assert!(matches!(
+        restored.oauth_status(&bundle_id).await,
+        Err(OAuthError::NotConfigured)
+    ));
+    restored.clear_oauth(&bundle_id).await.unwrap();
+    restored.close().await.unwrap();
+    drop(restored);
+
+    let verifier =
+        configure_authorization_code_manager(&state.base_url, bundle_id.clone(), store).await;
+    assert_eq!(
+        verifier.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    let runtime = verifier.get_server_status().await;
+    assert_eq!(runtime.len(), 1);
+    assert!(!runtime[0].2);
+    verifier.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -26,7 +26,10 @@ derived legacy endpoints are not sufficient for automatic admission. Basic, Dige
 401/403, failed discovery, and rejected static `Authorization` credentials remain distinct
 `HttpAuthenticationError` results and never enable the OAuth UI. Set `HttpAuthPolicy::Disabled` to
 disable negotiation, or keep an existing `oauth` block for proactive OAuth; `authPolicy: auto`
-allows the same block to act only as discovery overrides.
+allows the same block to act only as discovery overrides. After admission, one `connect` call
+restores usable persisted Authorization Code credentials or exchanges configured machine
+credentials and completes one authenticated initialize; `OAuthRequired` is returned only when
+interactive user authorization is actually needed.
 
 OAuth HTTP MCP credentials are keyed by bundle, canonical resource, authorization server, and
 grant/client identity. `Computer` uses a private `InMemoryOAuthCredentialStore` by default and

@@ -496,8 +496,11 @@ resource B 的授权元数据和 token。
    `StaticCredentialsRejected`，绝不静默回退 OAuth。
 3. 没有静态凭据时匿名优先。只有合法 Bearer challenge 携带 `resource_metadata`，且 RFC 9728
    PRM 的精确 URL 已获取、其 resource 与当前 MCP endpoint 匹配，并且 RFC 8414/OIDC 授权服务器
-   元数据包含合法 issuer 并通过校验，才创建 OAuth coordinator 并返回 `OAuthRequired`；rmcp 的
-   legacy endpoint 推导不能作为自动准入证据。此后 `oauth_status` 与交互 flow 才可用。
+   元数据包含合法 issuer 并通过校验，才创建 OAuth coordinator；rmcp 的 legacy endpoint 推导不能
+   作为自动准入证据。准入后同一次启动事务最多执行一次带 OAuth 的 initialize：可用持久化凭据会
+   直接恢复，机器凭据会先换取 token，确实缺少用户授权时才返回 `OAuthRequired`。此后
+   `oauth_status` 与交互 flow 才可用；OAuth 状态与 MCP runtime 状态保持独立，调用方不得通过状态
+   组合补发 start 或轮询恢复。
 4. Basic、Digest、未知 challenge、Bearer 缺 metadata、裸 401 和普通 403 分别返回稳定的
    `HttpAuthenticationError` 类别，不进入 OAuth。`403 insufficient_scope` 仅在已有 OAuth
    上下文中触发 step-up。

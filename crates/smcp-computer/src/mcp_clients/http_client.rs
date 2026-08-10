@@ -16,7 +16,7 @@ use crate::inputs::SecretValueResolver;
 use crate::oauth::{
     clear_stored_oauth_credentials, locally_stored_oauth_status, InMemoryOAuthCredentialStore,
     OAuthBeginRequest, OAuthCoordinator, OAuthCoordinatorContext, OAuthCredentialStore, OAuthError,
-    OAuthFlow, OAuthFlowOutcome, OAuthOptions, OAuthRequestGuard, OAuthStatus,
+    OAuthFlow, OAuthFlowOutcome, OAuthOptions, OAuthProtocolError, OAuthRequestGuard, OAuthStatus,
 };
 use crate::status::RuntimeStatus;
 use async_trait::async_trait;
@@ -52,6 +52,13 @@ enum ChallengeAdmission {
     Unsupported,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnonymousInitializeDisposition {
+    RetryWithOAuth,
+    Fail(HttpAuthenticationError),
+    OAuthInitializationFailed(OAuthError),
+}
+
 /// HTTP MCP客户端 / HTTP MCP client
 ///
 /// #106：改用 rmcp 官方 [`StreamableHttpClientTransport`] + [`RunningService`]，与 stdio 客户端共享同一
@@ -77,6 +84,8 @@ pub struct HttpMCPClient {
     oauth_events: Option<Arc<RuntimeStatus>>,
     oauth: OnceCell<Arc<OAuthCoordinator>>,
     oauth_flow: StdMutex<Option<OAuthFlow>>,
+    #[cfg(test)]
+    test_root_certificates: Vec<reqwest::Certificate>,
 }
 
 impl std::fmt::Debug for HttpMCPClient {
@@ -110,6 +119,8 @@ impl HttpMCPClient {
             oauth_events: None,
             oauth: OnceCell::new(),
             oauth_flow: StdMutex::new(None),
+            #[cfg(test)]
+            test_root_certificates: Vec::new(),
         }
     }
 
@@ -146,6 +157,15 @@ impl HttpMCPClient {
 
     pub(crate) fn set_notify(&self, notify: Option<ClientNotifyCtx>) {
         *self.notify.write().expect("HTTP notify lock poisoned") = notify;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_root_certificates(
+        mut self,
+        certificates: Vec<reqwest::Certificate>,
+    ) -> Self {
+        self.test_root_certificates = certificates;
+        self
     }
 
     pub(crate) fn oauth_callback_configured(&self) -> bool {
@@ -257,6 +277,10 @@ impl HttpMCPClient {
                 }
             }));
         }
+        #[cfg(test)]
+        if !self.test_root_certificates.is_empty() {
+            builder = builder.tls_certs_only(self.test_root_certificates.clone());
+        }
         builder
             .default_headers(header_map)
             .build()
@@ -279,13 +303,17 @@ impl HttpMCPClient {
             .get_or_try_init(|| async {
                 let protected_resource_headers = self.build_http_headers()?;
                 let resource = options.effective_resource(&self.base.params.url)?;
+                let context = OAuthCoordinatorContext::new(
+                    self.oauth_bundle_id.clone(),
+                    Arc::clone(&self.oauth_credential_store),
+                    self.oauth_events.clone(),
+                )
+                .with_admitted_resource_metadata_url(admitted_resource_metadata_url);
+                #[cfg(test)]
+                let context =
+                    context.with_test_root_certificates(self.test_root_certificates.clone());
                 OAuthCoordinator::new(
-                    OAuthCoordinatorContext::new(
-                        self.oauth_bundle_id.clone(),
-                        Arc::clone(&self.oauth_credential_store),
-                        self.oauth_events.clone(),
-                    )
-                    .with_admitted_resource_metadata_url(admitted_resource_metadata_url),
+                    context,
                     &self.base.params.url,
                     &resource,
                     options,
@@ -371,21 +399,66 @@ impl HttpMCPClient {
             .downcast_ref::<StreamableHttpError<reqwest::Error>>()
     }
 
+    fn auto_authorization_code(&self) -> bool {
+        self.oauth_negotiation == OAuthNegotiation::Auto
+            && self.oauth_options.as_ref().is_some_and(|options| {
+                matches!(
+                    options.mode,
+                    crate::oauth::OAuthClientMode::AuthorizationCode { .. }
+                )
+            })
+    }
+
+    fn oauth_discovery_failed(error: &OAuthError) -> bool {
+        matches!(
+            error,
+            OAuthError::Protocol(
+                OAuthProtocolError::Http
+                    | OAuthProtocolError::Provider
+                    | OAuthProtocolError::Metadata
+                    | OAuthProtocolError::PkceUnsupported
+                    | OAuthProtocolError::InvalidUrl
+                    | OAuthProtocolError::NoAuthorizationSupport
+                    | OAuthProtocolError::IssuerMismatch
+            )
+        )
+    }
+
+    fn initialize_requires_user_authorization(
+        error: &rmcp::service::ClientInitializeError,
+    ) -> bool {
+        matches!(
+            Self::initialize_streamable_error(error),
+            Some(
+                StreamableHttpError::AuthRequired(_)
+                    | StreamableHttpError::Auth(
+                        rmcp::transport::auth::AuthError::AuthorizationRequired
+                            | rmcp::transport::auth::AuthError::TokenRefreshFailed(_)
+                            | rmcp::transport::auth::AuthError::TokenExpired
+                    )
+            )
+        )
+    }
+
     async fn classify_anonymous_initialize_error(
         &self,
         error: &rmcp::service::ClientInitializeError,
-    ) -> Option<HttpAuthenticationError> {
+    ) -> Option<AnonymousInitializeDisposition> {
         let streamable = Self::initialize_streamable_error(error)?;
         if self.has_static_authorization() {
             return match streamable {
                 StreamableHttpError::AuthRequired(_)
                 | StreamableHttpError::InsufficientScope(_) => {
-                    Some(HttpAuthenticationError::StaticCredentialsRejected)
+                    Some(AnonymousInitializeDisposition::Fail(
+                        HttpAuthenticationError::StaticCredentialsRejected,
+                    ))
                 }
                 StreamableHttpError::UnexpectedServerResponse(message)
                     if message.starts_with("HTTP 401 ") || message.starts_with("HTTP 403 ") =>
                 {
-                    Some(HttpAuthenticationError::StaticCredentialsRejected)
+                    Some(AnonymousInitializeDisposition::Fail(
+                        HttpAuthenticationError::StaticCredentialsRejected,
+                    ))
                 }
                 _ => None,
             };
@@ -399,36 +472,171 @@ impl HttpMCPClient {
                         let Some(metadata_url) =
                             self.admitted_resource_metadata_url(&resource_metadata)
                         else {
-                            return Some(HttpAuthenticationError::OAuthDiscoveryFailed);
+                            return Some(AnonymousInitializeDisposition::Fail(
+                                HttpAuthenticationError::OAuthDiscoveryFailed,
+                            ));
                         };
                         match self.initialize_oauth(Some(metadata_url)).await {
-                            Ok(_) => Some(HttpAuthenticationError::OAuthRequired),
-                            Err(_) => Some(HttpAuthenticationError::OAuthDiscoveryFailed),
+                            Ok(_) => Some(AnonymousInitializeDisposition::RetryWithOAuth),
+                            Err(error) if Self::oauth_discovery_failed(&error) => {
+                                Some(AnonymousInitializeDisposition::Fail(
+                                    HttpAuthenticationError::OAuthDiscoveryFailed,
+                                ))
+                            }
+                            Err(error) => Some(
+                                AnonymousInitializeDisposition::OAuthInitializationFailed(error),
+                            ),
                         }
                     }
                     ChallengeAdmission::BearerWithMetadata(_)
                     | ChallengeAdmission::BearerWithoutMetadata => {
-                        Some(HttpAuthenticationError::OAuthDiscoveryFailed)
+                        Some(AnonymousInitializeDisposition::Fail(
+                            HttpAuthenticationError::OAuthDiscoveryFailed,
+                        ))
                     }
-                    ChallengeAdmission::Unsupported => {
-                        Some(HttpAuthenticationError::UnsupportedChallenge)
-                    }
+                    ChallengeAdmission::Unsupported => Some(AnonymousInitializeDisposition::Fail(
+                        HttpAuthenticationError::UnsupportedChallenge,
+                    )),
                 }
             }
-            StreamableHttpError::InsufficientScope(_) => Some(HttpAuthenticationError::Forbidden),
+            StreamableHttpError::InsufficientScope(_) => Some(
+                AnonymousInitializeDisposition::Fail(HttpAuthenticationError::Forbidden),
+            ),
             // rmcp 2.2 preserves challenged 401/403 structurally, but represents an unchallenged
             // status in this stable message form. Keep the compatibility mapping isolated here.
             StreamableHttpError::UnexpectedServerResponse(message)
                 if message.starts_with("HTTP 401 ") =>
             {
-                Some(HttpAuthenticationError::Unauthorized)
+                Some(AnonymousInitializeDisposition::Fail(
+                    HttpAuthenticationError::Unauthorized,
+                ))
             }
             StreamableHttpError::UnexpectedServerResponse(message)
                 if message.starts_with("HTTP 403 ") =>
             {
-                Some(HttpAuthenticationError::Forbidden)
+                Some(AnonymousInitializeDisposition::Fail(
+                    HttpAuthenticationError::Forbidden,
+                ))
             }
             _ => None,
+        }
+    }
+
+    async fn serve_with_oauth(
+        &self,
+    ) -> Result<RunningService<RoleClient, A2cClientHandler>, MCPClientError> {
+        let oauth = self.oauth().await.map_err(|e| {
+            MCPClientError::ConnectionError(format!("OAuth initialization failed: {e}"))
+        })?;
+        oauth.ensure_machine_authorized().await.map_err(|e| {
+            MCPClientError::ConnectionError(format!("OAuth authorization failed: {e}"))
+        })?;
+        let oauth_request = match oauth.prepare_request().await {
+            Ok(request) => request,
+            Err(error) => {
+                let interactive_authorization_required = self.auto_authorization_code()
+                    && matches!(
+                        oauth.status().await,
+                        OAuthStatus::Unauthorized
+                            | OAuthStatus::AuthorizationPending
+                            | OAuthStatus::ReauthorizationRequired { .. }
+                    );
+                if interactive_authorization_required {
+                    return Err(MCPClientError::HttpAuthentication(
+                        HttpAuthenticationError::OAuthRequired,
+                    ));
+                }
+                return Err(MCPClientError::ConnectionError(format!(
+                    "OAuth request preparation failed: {error}"
+                )));
+            }
+        };
+        let oauth_generation = oauth_request.generation();
+        let config = StreamableHttpClientTransportConfig::with_uri(self.base.params.url.clone());
+        let transport = StreamableHttpClientTransport::with_client(oauth.http_client(), config);
+        let handler = A2cClientHandler::new(
+            self.notify
+                .read()
+                .expect("HTTP notify lock poisoned")
+                .clone(),
+        );
+        let service = tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            handler.serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            MCPClientError::TimeoutError(format!(
+                "HTTP connect timed out after {}s",
+                CONNECT_TIMEOUT_SECS
+            ))
+        })?;
+        drop(oauth_request);
+        match &service {
+            Ok(_) => oauth.observe_service_success(oauth_generation).await,
+            Err(error) => {
+                let authorization_rejected = self.auto_authorization_code()
+                    && Self::initialize_requires_user_authorization(error);
+                oauth
+                    .observe_initialize_error(error, oauth_generation)
+                    .await;
+                if authorization_rejected
+                    && matches!(oauth.status().await, OAuthStatus::Unauthorized)
+                {
+                    return Err(MCPClientError::HttpAuthentication(
+                        HttpAuthenticationError::OAuthRequired,
+                    ));
+                }
+            }
+        }
+        service.map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {e}")))
+    }
+
+    async fn serve_anonymously(
+        &self,
+    ) -> Result<RunningService<RoleClient, A2cClientHandler>, MCPClientError> {
+        let config = StreamableHttpClientTransportConfig::with_uri(self.base.params.url.clone());
+        let transport = StreamableHttpClientTransport::with_client(
+            self.build_http_client().map_err(|e| {
+                MCPClientError::ConnectionError(format!("HTTP client build failed: {e}"))
+            })?,
+            config,
+        );
+        let handler = A2cClientHandler::new(
+            self.notify
+                .read()
+                .expect("HTTP notify lock poisoned")
+                .clone(),
+        );
+        let service = tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            handler.serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            MCPClientError::TimeoutError(format!(
+                "HTTP connect timed out after {}s",
+                CONNECT_TIMEOUT_SECS
+            ))
+        })?;
+        match service {
+            Ok(service) => Ok(service),
+            Err(error) => match self.classify_anonymous_initialize_error(&error).await {
+                Some(AnonymousInitializeDisposition::RetryWithOAuth) => {
+                    self.serve_with_oauth().await
+                }
+                Some(AnonymousInitializeDisposition::Fail(error)) => {
+                    Err(MCPClientError::HttpAuthentication(error))
+                }
+                Some(AnonymousInitializeDisposition::OAuthInitializationFailed(error)) => {
+                    Err(MCPClientError::ConnectionError(format!(
+                        "OAuth initialization failed: {error}"
+                    )))
+                }
+                None => Err(MCPClientError::ConnectionError(format!(
+                    "Initialize failed: {error}"
+                ))),
+            },
         }
     }
 
@@ -582,9 +790,6 @@ impl HttpMCPClient {
 
     pub(crate) async fn clear_oauth(&self) -> Result<(), OAuthError> {
         self.cancel_and_drain_oauth_flow().await?;
-        if self.oauth_negotiation == OAuthNegotiation::Auto && self.oauth.get().is_none() {
-            return Err(OAuthError::NotConfigured);
-        }
         if self.oauth_options.is_none() {
             return Err(OAuthError::NotConfigured);
         }
@@ -751,83 +956,13 @@ impl MCPClientProtocol for HttpMCPClient {
             )));
         }
 
-        let config = StreamableHttpClientTransportConfig::with_uri(self.base.params.url.clone());
         let use_oauth =
             self.oauth_negotiation == OAuthNegotiation::Explicit || self.oauth.get().is_some();
-        let (service, oauth_request) = if use_oauth {
-            let oauth = self.oauth().await.map_err(|e| {
-                MCPClientError::ConnectionError(format!("OAuth initialization failed: {e}"))
-            })?;
-            oauth.ensure_machine_authorized().await.map_err(|e| {
-                MCPClientError::ConnectionError(format!("OAuth authorization failed: {e}"))
-            })?;
-            let oauth_request = oauth.prepare_request().await.map_err(|e| {
-                MCPClientError::ConnectionError(format!("OAuth request preparation failed: {e}"))
-            })?;
-            let transport = StreamableHttpClientTransport::with_client(oauth.http_client(), config);
-            let handler = A2cClientHandler::new(
-                self.notify
-                    .read()
-                    .expect("HTTP notify lock poisoned")
-                    .clone(),
-            );
-            (
-                tokio::time::timeout(
-                    Duration::from_secs(CONNECT_TIMEOUT_SECS),
-                    handler.serve(transport),
-                )
-                .await,
-                Some(oauth_request),
-            )
+        let service = if use_oauth {
+            self.serve_with_oauth().await?
         } else {
-            let transport = StreamableHttpClientTransport::with_client(
-                self.build_http_client().map_err(|e| {
-                    MCPClientError::ConnectionError(format!("HTTP client build failed: {e}"))
-                })?,
-                config,
-            );
-            let handler = A2cClientHandler::new(
-                self.notify
-                    .read()
-                    .expect("HTTP notify lock poisoned")
-                    .clone(),
-            );
-            (
-                tokio::time::timeout(
-                    Duration::from_secs(CONNECT_TIMEOUT_SECS),
-                    handler.serve(transport),
-                )
-                .await,
-                None,
-            )
+            self.serve_anonymously().await?
         };
-
-        let service = service.map_err(|_| {
-            MCPClientError::TimeoutError(format!(
-                "HTTP connect timed out after {}s",
-                CONNECT_TIMEOUT_SECS
-            ))
-        })?;
-        let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        drop(oauth_request);
-        if let Some(oauth_generation) = oauth_generation {
-            if let Ok(oauth) = self.oauth().await {
-                match &service {
-                    Ok(_) => oauth.observe_service_success(oauth_generation).await,
-                    Err(error) => {
-                        oauth
-                            .observe_initialize_error(error, oauth_generation)
-                            .await;
-                    }
-                }
-            }
-        } else if let Err(error) = &service {
-            if let Some(auth_error) = self.classify_anonymous_initialize_error(error).await {
-                return Err(MCPClientError::HttpAuthentication(auth_error));
-            }
-        }
-        let service = service
-            .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
 
         *self.running_service.lock().await = Some(service);
         self.base.update_state(ClientState::Connected).await;

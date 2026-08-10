@@ -43,8 +43,11 @@ header always selects static-only authentication; rejection is surfaced as
 ## Automatic OAuth admission
 
 Streamable HTTP is anonymous-first when no legacy proactive `oauth` block or explicit policy says
-otherwise. A host must expose an authorization action only after connection returns
-`HttpAuthenticationError::OAuthRequired`. That result means all of the following succeeded:
+otherwise. After automatic admission, the same connection attempt restores usable persisted
+Authorization Code credentials or exchanges configured machine credentials and performs one
+authenticated initialize. A host must expose an authorization action only when that bounded
+startup transaction returns `HttpAuthenticationError::OAuthRequired`; this means interactive user
+authorization is still required and all of the following admission checks succeeded:
 
 1. the server returned a syntactically valid Bearer challenge containing `resource_metadata`;
 2. that exact RFC 9728 protected-resource metadata URL was fetched and validated for the
@@ -56,7 +59,9 @@ Before admission, `oauth_status` and `create_oauth_flow` return `OAuthError::Not
 not perform discovery, registration, or token requests. Basic, Digest, unknown challenges, Bearer
 without metadata, failed discovery, bare 401, and ordinary 403 are separate
 `HttpAuthenticationError` values. A valid `403 insufficient_scope` can request step-up only when a
-validated OAuth coordinator already exists.
+validated OAuth coordinator already exists. Automatic startup never polls or infers runtime state
+from OAuth status: it performs at most one anonymous initialize and one challenge-triggered OAuth
+initialize, while OAuth status and MCP runtime status remain independent.
 
 rmcp 2.2 currently exposes only the first value when a server sends multiple independent
 `WWW-Authenticate` header fields. Consequently, `Basic` in the first field and `Bearer` in a later

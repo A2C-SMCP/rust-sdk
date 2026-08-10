@@ -122,6 +122,8 @@ pub struct MCPServerManager {
     /// Optional Computer-owned event sink for OAuth status transitions.
     oauth_events: Option<Arc<RuntimeStatus>>,
     secret_resolver: Arc<RwLock<Option<Arc<dyn SecretValueResolver>>>>,
+    #[cfg(test)]
+    test_http_root_certificates: Arc<RwLock<Vec<reqwest::Certificate>>>,
     /// Serialize start/stop/update for each server identity without blocking unrelated servers.
     lifecycle_locks: Arc<WeakRegistry<BundleId, Mutex<()>>>,
 }
@@ -172,6 +174,8 @@ impl MCPServerManager {
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             oauth_events: None,
             secret_resolver: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            test_http_root_certificates: Arc::new(RwLock::new(Vec::new())),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
         }
     }
@@ -201,6 +205,8 @@ impl MCPServerManager {
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             oauth_events: None,
             secret_resolver: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            test_http_root_certificates: Arc::new(RwLock::new(Vec::new())),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
         }
     }
@@ -244,6 +250,11 @@ impl MCPServerManager {
 
     pub async fn set_secret_resolver(&self, resolver: Option<Arc<dyn SecretValueResolver>>) {
         *self.secret_resolver.write().await = resolver;
+    }
+
+    #[cfg(test)]
+    async fn set_test_http_root_certificates(&self, certificates: Vec<reqwest::Certificate>) {
+        *self.test_http_root_certificates.write().await = certificates;
     }
 
     /// 按 config + 通知接缝创建客户端：override 优先，否则真实 [`client_factory`]（#152）/ make a client.
@@ -516,19 +527,20 @@ impl MCPServerManager {
                     existing
                 } else {
                     let resolver = self.secret_resolver.read().await.clone();
-                    let candidate = Arc::new(
-                        HttpMCPClient::new(http.server_parameters)
-                            .with_oauth_context(
-                                bundle_id.clone(),
-                                Arc::clone(&self.oauth_credential_store),
-                                self.oauth_events.clone(),
-                            )
-                            .with_auth_policy(http.auth_policy, http.oauth, resolver)
-                            .map_err(|error| {
-                                ComputerError::InvalidConfiguration(error.to_string())
-                            })?
-                            .with_notify(notify.clone()),
+                    let candidate = HttpMCPClient::new(http.server_parameters)
+                        .with_oauth_context(
+                            bundle_id.clone(),
+                            Arc::clone(&self.oauth_credential_store),
+                            self.oauth_events.clone(),
+                        )
+                        .with_auth_policy(http.auth_policy, http.oauth, resolver)
+                        .map_err(|error| ComputerError::InvalidConfiguration(error.to_string()))?
+                        .with_notify(notify.clone());
+                    #[cfg(test)]
+                    let candidate = candidate.with_test_root_certificates(
+                        self.test_http_root_certificates.read().await.clone(),
                     );
+                    let candidate = Arc::new(candidate);
                     let mut oauth_clients = self.oauth_clients.write().await;
                     if let Some(existing) = oauth_clients.get(bundle_id).cloned() {
                         existing.set_notify(notify);
@@ -2675,6 +2687,10 @@ pub(crate) mod test_support {
         calls
     }
 }
+
+#[cfg(test)]
+#[path = "manager_auto_oauth_private_key_jwt_tests.rs"]
+mod manager_auto_oauth_private_key_jwt_tests;
 
 #[cfg(test)]
 mod tests {

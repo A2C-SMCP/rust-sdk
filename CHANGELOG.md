@@ -52,6 +52,10 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- *(computer)* #179 makes automatic OAuth startup a bounded transaction: persisted Authorization
+  Code credentials and both Client Credentials modes connect in one `start_client_by_id` call,
+  while truly missing user authorization still returns `OAuthRequired`. Persisted automatic OAuth
+  credentials can also be cleared before the first reconnect.
 - *(computer)* Bound process-local OAuth and MCP lifecycle registries by retaining only
   weak references and reclaiming dead slots during server/configuration churn.
 - *(computer)* Keep plain-HTTP SSE clients from initializing the platform TLS
