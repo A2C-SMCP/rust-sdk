@@ -2214,8 +2214,7 @@ impl OAuthCoordinator {
         } else {
             self.options.scopes.clone()
         };
-        let effective_scope_refs: Vec<&str> =
-            effective_scopes.iter().map(String::as_str).collect();
+        let effective_scope_refs: Vec<&str> = effective_scopes.iter().map(String::as_str).collect();
         if effective_scopes.is_empty() {
             tracing::warn!(
                 "OAuth authorization will request no scope: configuration omitted scopes and \
