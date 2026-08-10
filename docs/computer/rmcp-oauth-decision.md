@@ -1,6 +1,7 @@
 # Computer 远程 MCP OAuth 与 rmcp 升级决策
 
 - 日期：2026-07-27
+- 自动协商修订：2026-08-10（rust-sdk#180；取代本文原有的可配置授权模式方案）
 - 分支：`explore/smcp-oauth`
 - 结论：**Go（分阶段）**
 - 当前实施目标：升级到精确锁定的 `rmcp = 2.2.0`，实现面向 MCP `2025-11-25` 的完整 OAuth 客户端能力
@@ -14,16 +15,11 @@ Computer 应当具备连接受 OAuth 保护的远程 Streamable HTTP MCP Server 
 本次建议：
 
 1. 立即离开 `rmcp 0.11.0`。该版本落在多个 OAuth 高危漏洞的受影响范围内。
-2. 生产实现基于 `rmcp 2.2.0`，同时开启 `auth` 与 `auth-client-credentials-jwt`。
-3. 支持 rmcp 2.2 当前提供的全部 OAuth 方式：
-   - Authorization Code + PKCE S256；
-   - 预注册 public/confidential client；
-   - Client ID Metadata Documents（CIMD）；
-   - Dynamic Client Registration（DCR）；
-   - Client Credentials：client secret；
-   - Client Credentials：`private_key_jwt`；
-   - token refresh、refresh token rotation；
-   - `403 insufficient_scope` step-up authorization。
+2. 生产实现基于 `rmcp 2.2.0` 的 `auth` 能力。
+3. Streamable HTTP OAuth 只开放自动协商：匿名首连经合规 Bearer challenge 准入后，使用
+   Authorization Code + PKCE S256、协议元数据推导的 scope/resource/authorization server、DCR、
+   token refresh 与 `403 insufficient_scope` step-up。预注册/CIMD/Client Credentials 等 rmcp
+   底层能力不形成 SDK 公共配置入口。
 4. 在 SDK 中增加稳定的 OAuth facade，不将 rmcp 的 `OAuthState` 或 token 类型直接暴露给 Desktop/CLI。
 5. `2026-07-28` 完整协议支持等待 rmcp 3 stable。当前 beta 只允许进入实验性 feature，不作为默认生产依赖。
 6. 发布前必须解决或规避 rmcp OAuth discovery 的 synthetic `initialize` POST 可能产生孤儿 session 的问题。
@@ -37,12 +33,12 @@ Computer 应当具备连接受 OAuth 保护的远程 Streamable HTTP MCP Server 
 ### 必须满足
 
 - OAuth 只作用于远程 Streamable HTTP MCP Client，不影响 stdio。
-- SDK 可查询授权状态并主动发起授权。
+- SDK 在服务端挑战完成自动准入后可查询授权状态并发起交互授权。
 - SDK 返回授权 URL 和结构化状态；SDK 本身不打开浏览器。
 - token、refresh token、client secret、private key 不进入 `mcp.json`、日志或普通 Debug 输出。
 - 已有静态 HTTP headers 鉴权继续可用。
 - 已有 4006/4007 错误分类不能回退。
-- 覆盖 rmcp 当前支持的全部交互式和机器身份授权方式。
+- OAuth resource、scope、客户端注册方式和 secret 不进入用户/插件配置。
 
 ### 非目标
 
@@ -272,7 +268,7 @@ beta 相对 2.2 的源码增量很大：
 - 满足当前 Computer OAuth 目标；
 - 通过 2025-11-25 client conformance 修复；
 - 已修复当前 0.11 的关键安全漏洞；
-- 支持要求中的所有授权方式；
+- 支持自动 Authorization Code + PKCE/DCR 交付路径；
 - 相对 beta 保留更好的 legacy AS 兼容性；
 - 避免把 2026 全协议迁移绑进 OAuth 项目。
 
@@ -323,7 +319,7 @@ Desktop / CLI / cloud host Flow Driver
               ▼
 Computer public OAuth API
   - oauth_status
-  - begin_oauth
+  - create_oauth_flow / begin_oauth
   - complete_oauth / cancel_oauth
   - clear_oauth
               │
@@ -386,6 +382,12 @@ impl<S: Session> Computer<S> {
         request: OAuthBeginRequest,
     ) -> Result<OAuthLaunch, OAuthError>;
 
+    pub async fn create_oauth_flow(
+        &self,
+        bundle_id: &BundleId,
+        request: OAuthBeginRequest,
+    ) -> Result<OAuthFlow, OAuthError>;
+
     pub async fn complete_oauth(
         &self,
         bundle_id: &BundleId,
@@ -405,8 +407,10 @@ impl<S: Session> Computer<S> {
 语义：
 
 - `connect()` 可恢复 token 并自动刷新；
-- 首次需要用户参与时，返回 typed `AuthorizationRequired`；
-- `begin_oauth()` 是 SDK 主动触发协议流程的入口；
+- 匿名首连完成合规 OAuth 准入后返回 typed `HttpAuthenticationError::OAuthRequired`；
+- 准入前 `oauth_status()`、`create_oauth_flow()` 和 `begin_oauth()` 返回
+  `OAuthError::NotConfigured`，且不主动发现或注册；
+- `create_oauth_flow()` 是新宿主的交互入口，`begin_oauth()` 保留为兼容 facade；
 - `complete_oauth()` 成功返回 `OAuthFlowOutcome::Authorized`；
 - `cancel_oauth()` 返回带规范化原因及最终 `OAuthStatus` 的
   `OAuthFlowOutcome::Terminated`；
@@ -419,36 +423,13 @@ impl<S: Session> Computer<S> {
 
 ### 配置模型
 
-`HttpServerConfig` exposes OAuth options separately from negotiation policy:
+`HttpServerConfig` 不公开 OAuth 配置。`oauth`、`authPolicy` 和 `auth_policy` 已从序列化模型
+移除；包含这些字段的旧配置会得到明确校验错误，迁移方式是直接删除字段。
 
-```rust
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub oauth: Option<OAuthOptions>
-
-#[serde(default, rename = "authPolicy", skip_serializing_if = "Option::is_none")]
-pub auth_policy: Option<HttpAuthPolicy>
-```
-
-An omitted policy is compatibility-aware: an existing `oauth` block remains proactive OAuth;
-without that block the client is anonymous-first and performs automatic discovery. `authPolicy:
-auto` makes `oauth` an optional override block, `oauth` selects proactive OAuth explicitly, and
-`disabled` prevents OAuth negotiation.
-
-实际序列化形态（camelCase）：
-
-```yaml
-oauth:
-  # 可选；缺省为 HTTP MCP URL。仅当 canonical RFC 8707 resource 与传输 endpoint 不同时设置。
-  resource: https://resource.example/canonical-mcp
-  scopes: [files:read]
-  mode:
-    type: authorizationCode
-    registration: preregistered
-    clientId: my-client
-```
-
-`registration: dynamic` 表示 DCR；CIMD 使用
-`registration: clientMetadataDocument` 并提供 `url`。
+没有静态 `Authorization` header 时，Streamable HTTP 固定匿名首连。SDK 只在服务端返回带
+`resource_metadata` 的合规 Bearer challenge，且 RFC 9728 PRM 与 issuer-bearing RFC 8414/OIDC
+元数据验证通过后，才准入 OAuth coordinator 并返回 `OAuthRequired`。resource、scope、授权服务器
+和 DCR 客户端信息全部从协议元数据推导，不能由插件或用户覆盖。
 
 `redirect_uri` 不属于可序列化配置。宿主先绑定 callback listener，再把精确地址作为
 `OAuthBeginRequest` 的运行期参数：
@@ -467,45 +448,25 @@ let launch = computer
     .await?;
 ```
 
-M2M `private_key_jwt`：
-
-```yaml
-oauth:
-  scopes: [files:read]
-  mode:
-    type: clientCredentialsPrivateKeyJwt
-    clientId: my-service
-    privateKeyInput: oauth_private_key
-    algorithm: RS256
-```
-
-所有 secret 字段必须通过现有 `SecretValueResolver`/input 引用解析，不能直接序列化明文。
-
-`OAuthOptions.resource` 缺省时取 `HttpServerParameters.url`，保持旧配置兼容；显式值必须是绝对 URI
-且不得包含 fragment。HTTP endpoint 继续承载 MCP 请求，effective resource 则统一进入
-authorization request、token request 与 `OAuthCredentialKey`。两者跨 origin 时，endpoint 自定义 header
-不得泄漏到 canonical resource origin。自动协商要求 effective resource 与 HTTP MCP endpoint 规范化后
-一致，并把准入绑定到 challenge 中的精确 `resource_metadata` URL 及其声明的 endpoint；有意的
-cross-resource 配置必须使用 proactive `authPolicy: oauth`，避免 endpoint A 的 challenge 错误准入
-resource B 的授权元数据和 token。
+HTTP endpoint 既是传输地址也是预期 canonical resource。自动协商把准入绑定到 challenge 中的精确
+`resource_metadata` URL，并验证 PRM 声明的 resource 与当前 MCP endpoint 一致，避免 endpoint A 的
+challenge 错误准入 resource B 的授权元数据和 token。
 
 ### static headers 与 OAuth 优先级
 
-1. 显式 proactive OAuth 禁止同时提供手写 `Authorization` header。
-2. 存在静态 `Authorization` header 时保持静态鉴权；401/403 返回
+1. 存在静态 `Authorization` header 时保持静态鉴权；401/403 返回
    `StaticCredentialsRejected`，绝不静默回退 OAuth。
-3. 没有静态凭据时匿名优先。只有合法 Bearer challenge 携带 `resource_metadata`，且 RFC 9728
+2. 没有静态凭据时匿名优先。只有合法 Bearer challenge 携带 `resource_metadata`，且 RFC 9728
    PRM 的精确 URL 已获取、其 resource 与当前 MCP endpoint 匹配，并且 RFC 8414/OIDC 授权服务器
    元数据包含合法 issuer 并通过校验，才创建 OAuth coordinator；rmcp 的 legacy endpoint 推导不能
    作为自动准入证据。准入后同一次启动事务最多执行一次带 OAuth 的 initialize：可用持久化凭据会
-   直接恢复，机器凭据会先换取 token，确实缺少用户授权时才返回 `OAuthRequired`。此后
+   直接恢复，确实缺少用户授权时才返回 `OAuthRequired`。此后
    `oauth_status` 与交互 flow 才可用；OAuth 状态与 MCP runtime 状态保持独立，调用方不得通过状态
    组合补发 start 或轮询恢复。
-4. Basic、Digest、未知 challenge、Bearer 缺 metadata、裸 401 和普通 403 分别返回稳定的
+3. Basic、Digest、未知 challenge、Bearer 缺 metadata、裸 401 和普通 403 分别返回稳定的
    `HttpAuthenticationError` 类别，不进入 OAuth。`403 insufficient_scope` 仅在已有 OAuth
    上下文中触发 step-up。
-5. `authPolicy: disabled` 禁止自动协商；非 Authorization 自定义 headers 可与 OAuth 共存，
-   但跨 origin redirect 不得携带这些 headers。
+4. 非 Authorization 自定义 headers 可与 OAuth 共存，但跨 origin redirect 不得携带这些 headers。
 
 rmcp 2.2 的 Streamable HTTP 初始化错误当前只保留第一条独立 `WWW-Authenticate` header；若服务端
 分别发送 Basic 与 Bearer 且 Basic 在前，SDK 无法恢复已丢失的 Bearer 字段。组合在同一 header 中的
@@ -630,8 +591,8 @@ issuer-index:
 
 范围：
 
-- `OAuthOptions`、`AuthorizationStatus`、`AuthorizationLaunch`；
-- `OAuthCoordinator`；
+- `OAuthStatus`、`OAuthBeginRequest`、`OAuthLaunch` 与 `OAuthFlowOutcome`；
+- 内部 `OAuthCoordinator`；
 - Computer 查询、开始、完成、清除 API；
 - typed events；
 - callback state/issuer 校验；
@@ -644,7 +605,7 @@ issuer-index:
 - callback 重放和错误 state 被拒绝；
 - SDK 核心无浏览器依赖。
 
-### PR 3：凭据与 secret
+### PR 3：凭据存储
 
 范围：
 
@@ -653,7 +614,6 @@ issuer-index:
 - OAuth namespace/envelope；
 - in-memory TTL `StateStore`；
 - token refresh、rotation、clear；
-- client secret/private key 接入 `SecretValueResolver`。
 
 验收：
 
@@ -662,18 +622,14 @@ issuer-index:
 - 未注入持久 store 时行为明确为 session-only，持久 store 不可用时返回 typed error、不得静默误报恢复；
 - 配置、Debug、tracing 不出现 secret。
 
-### PR 4：全部 OAuth 方式
+### PR 4：自动 OAuth 协商
 
 范围：
 
-- authorization code：
-  - auto priority；
-  - preregistered public/confidential；
-  - CIMD；
-  - DCR；
-- client credentials：
-  - client_secret_post/basic；
-  - `private_key_jwt`；
+- anonymous-first Bearer challenge admission；
+- Authorization Code + PKCE；
+- standards-derived resource、scope 与 authorization server；
+- DCR；
 - refresh；
 - insufficient_scope step-up。
 
@@ -685,14 +641,9 @@ issuer-index:
 | PRM via `WWW-Authenticate` | 是 |
 | RFC8414 discovery | 是 |
 | OIDC discovery | 是 |
-| preregistered public | 是 |
-| preregistered confidential | 是 |
-| CIMD | 是 |
 | DCR | 是 |
 | PKCE S256 | 是 |
 | callback state/issuer | 是 |
-| client secret post/basic | 是 |
-| private_key_jwt + local TLS fixture | 是 |
 | refresh + rotation | 是 |
 | 403 scope accumulation | 是 |
 | credential restart restore | 是 |
@@ -742,7 +693,6 @@ issuer-index:
 - 不再依赖受影响的 rmcp 0.11；
 - OAuth acceptance matrix 100% 通过；
 - full workspace tests 通过；
-- 真实 HTTPS IdP 或 TLS fixture 至少验证一次 `private_key_jwt`；
 - 没有明文 token/secret 日志；
 - 默认 session-only 与 host-injected persistent store 的行为、失败语义明确；
 - discovery probe 不产生孤儿 session；
@@ -751,8 +701,8 @@ issuer-index:
 
 ## 11. 回滚方案
 
-- OAuth 通过 Cargo feature 和 `HttpServerParameters.oauth` 双重门控。
-- static headers 路径保持原实现，可在 OAuth 故障时按 Server 配置回退。
+- OAuth 自动协商可通过回滚 HTTP 客户端集成变更整体关闭，不保留配置开关。
+- static headers 路径保持独立，服务端拒绝时不回退 OAuth。
 - rmcp 精确版本锁定，禁止自动漂移到 3 beta。
 - OAuth credential envelope 带版本号；回滚时可以保留或显式清除，不读取未知 schema。
 - PR 按兼容层、状态机、存储、flows、集成拆分，可逐层回滚。

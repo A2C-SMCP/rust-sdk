@@ -8,14 +8,15 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use smcp_computer::errors::ComputerError;
 use smcp_computer::mcp_clients::bundle_id::BundleId;
 use smcp_computer::mcp_clients::{
-    HttpServerConfig, HttpServerParameters, MCPServerConfig, MCPServerManager,
+    HttpAuthenticationError, HttpServerConfig, HttpServerParameters, MCPServerConfig,
+    MCPServerManager,
 };
 use smcp_computer::{
     InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
-    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialStore,
-    OAuthFlowOutcome, OAuthOptions, OAuthStatus,
+    OAuthCancellationReason, OAuthCredentialStore, OAuthFlowOutcome, OAuthStatus,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -31,9 +32,9 @@ use url::Url;
 const RESOURCE_URL: &str = "https://mcp.atlassian.com/v1/mcp/authv2";
 const BUNDLE_ID: &str = "oauth-atlassian-uat";
 const READ_ONLY_TOOL: &str = "getAccessibleAtlassianResources";
-// Atlassian's DCR consent UI needs a product scope to render the workspace
-// selection step. Keep the product permission read-only: this UAT never calls
-// a Jira content tool.
+// Guard the scopes derived from Atlassian's protected-resource metadata. Keep
+// the accepted product permissions read-only: this UAT never calls a Jira
+// content tool.
 const OAUTH_SCOPES: &[&str] = &[
     "read:me",
     "read:account",
@@ -242,6 +243,18 @@ fn validate_cancellation_outcome(
 async fn configured_manager(
     store: Arc<dyn OAuthCredentialStore>,
 ) -> UatResult<(MCPServerManager, BundleId)> {
+    let (manager, bundle_id) = manager_with_server(store).await?;
+    match manager.start_client_by_id(&bundle_id).await {
+        Ok(()) | Err(ComputerError::HttpAuthentication(HttpAuthenticationError::OAuthRequired)) => {
+        }
+        Err(_) => return Err("automatic-oauth-admission"),
+    }
+    Ok((manager, bundle_id))
+}
+
+async fn manager_with_server(
+    store: Arc<dyn OAuthCredentialStore>,
+) -> UatResult<(MCPServerManager, BundleId)> {
     let bundle_id = BundleId::try_from(BUNDLE_ID).map_err(|_| "bundle-id")?;
     let manager = MCPServerManager::with_oauth_credential_store(store);
     let mut config = HttpServerConfig::new(
@@ -252,17 +265,6 @@ async fn configured_manager(
         },
     );
     config.bundle_id = Some(bundle_id.clone());
-    config.oauth = Some(OAuthOptions {
-        resource: None,
-        scopes: OAUTH_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_string())
-            .collect(),
-        client_name: Some("A2C SMCP Rust SDK UAT".to_string()),
-        mode: OAuthClientMode::AuthorizationCode {
-            registration: OAuthClientRegistration::Dynamic,
-        },
-    });
     manager
         .add_or_update_server(MCPServerConfig::Http(config))
         .await
@@ -863,7 +865,7 @@ mod tests {
         let store: Arc<dyn OAuthCredentialStore> = fake.clone();
 
         let (probe_manager, probe_bundle_id) =
-            configured_manager(Arc::clone(&store)).await.unwrap();
+            manager_with_server(Arc::clone(&store)).await.unwrap();
         probe_manager.clear_oauth(&probe_bundle_id).await.unwrap();
         probe_manager.close().await.unwrap();
         let credential_key = fake
@@ -874,7 +876,7 @@ mod tests {
         fake.insert(credential_key);
         fake.clear_deleted();
 
-        let (manager, bundle_id) = configured_manager(store).await.unwrap();
+        let (manager, bundle_id) = manager_with_server(store).await.unwrap();
         let outcome = OAuthFlowOutcome::Authorized {
             scopes: OAUTH_SCOPES
                 .iter()

@@ -158,22 +158,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_factory_http() {
-        let config = MCPServerConfig::Http(HttpServerConfig {
-            env_file: None,
-            name: "test_http".to_string(),
-            bundle_id: None,
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            oauth: None,
-            auth_policy: None,
-            server_parameters: HttpServerParameters {
+        let config = MCPServerConfig::Http(HttpServerConfig::new(
+            "test_http",
+            HttpServerParameters {
                 url: "http://localhost:8080".to_string(),
                 headers: HashMap::new(),
             },
-        });
+        ));
 
         let client = client_factory(config, None);
         assert_eq!(client.state(), ClientState::Initialized);
