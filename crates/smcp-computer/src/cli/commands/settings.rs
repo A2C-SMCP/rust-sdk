@@ -31,7 +31,9 @@ use crate::settings::scope::{
     workdir_project_settings_path, EnvMap, WriteValue,
 };
 use crate::settings::store::{atomic_write_settings_json, with_settings_lock};
-use crate::settings::{resolve_policy_settings, SettingsScope, SettingsValidationError};
+use crate::settings::{
+    resolve_policy_settings, validate_settings, SettingsScope, SettingsValidationError,
+};
 
 // 可读 scope（show/get）/ readable scopes；可写 scope（set/edit）/ writable scopes。
 const READABLE: [&str; 6] = ["user", "project", "local", "flag", "policy", "merged"];
@@ -122,7 +124,15 @@ fn read_scope_with_errors(
             Some(fp) => Some(load_settings_file(fp, SettingsScope::Flag)),
             None => Some((Map::new(), Vec::new())),
         },
-        "policy" => Some((resolve_policy_settings(env, None, None), Vec::new())),
+        // #166：policy 层经 validate_settings 做字段级容错校验（类型错等），与 merged 路径
+        // resolve_settings 对 policy 层的处理同构（scope.rs L401-408）。
+        // 对拍 python-sdk#161。
+        "policy" => {
+            let raw = resolve_policy_settings(env, None, None);
+            let (cleaned, errors) =
+                validate_settings(&Value::Object(raw), SettingsScope::Policy, None);
+            Some((cleaned, errors))
+        }
         _ => None,
     }
 }
@@ -504,5 +514,56 @@ mod tests {
         let path = user_settings_path(Some(&env));
         assert!(path.exists());
         assert!(std::fs::read_to_string(&path).unwrap().contains('{'));
+    }
+
+    // ── #166: policy scope validate ──────────────────────────────────────────
+
+    /// #166：`validate_settings` + Policy scope 对类型错字段检测并过滤，与 merged 路径（scope.rs L401-408）同构。
+    #[test]
+    fn policy_scope_detects_type_errors() {
+        let raw = json!({"allowedMcpServers": "not-a-list", "trustedMarketplaces": ["mp"]});
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::Policy, None);
+        // allowedMcpServers 应为 array，给 string → 被过滤
+        assert!(!cleaned.contains_key("allowedMcpServers"));
+        // 同 dict 中合法字段照常保留
+        assert_eq!(cleaned.get("trustedMarketplaces"), Some(&json!(["mp"])));
+        // errors 包含 allowedMcpServers 类型错
+        assert!(errors.iter().any(|e| e.field == "allowedMcpServers"));
+        assert!(errors.iter().any(|e| e.reason.contains("expected array")));
+    }
+
+    /// #166：经 `resolve_policy_settings`（注入 source）+ `validate_settings` 的**实际代码路径**组合，
+    /// 验证 `read_scope_with_errors("policy", ...)` 修复不会被回退。
+    #[test]
+    fn policy_scope_resolve_then_validate_composition() {
+        use crate::settings::PolicySource;
+
+        let bad = json!({"allowedMcpServers": "not-a-list", "trustedMarketplaces": ["mp"]});
+        let source = PolicySource {
+            name: "test".into(),
+            priority: 1,
+            loader: Box::new(move || match &bad {
+                Value::Object(m) => Some(m.clone()),
+                _ => None,
+            }),
+        };
+        let raw = resolve_policy_settings(None, None, Some(vec![source]));
+        // 注入的 source 返回类型错 dict → raw 必非空
+        assert!(!raw.is_empty());
+        let (cleaned, errors) = validate_settings(&Value::Object(raw), SettingsScope::Policy, None);
+        // allowedMcpServers 类型错被过滤
+        assert!(!cleaned.contains_key("allowedMcpServers"));
+        assert_eq!(cleaned.get("trustedMarketplaces"), Some(&json!(["mp"])));
+        assert!(errors.iter().any(|e| e.field == "allowedMcpServers"));
+    }
+
+    /// #166：policy 全字段合法 → 无错误，全部保留。
+    #[test]
+    fn policy_scope_valid_fields_no_errors() {
+        let raw = json!({"allowedMcpServers": ["a"], "trustedMarketplaces": ["mp"]});
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::Policy, None);
+        assert_eq!(cleaned.get("allowedMcpServers"), Some(&json!(["a"])));
+        assert_eq!(cleaned.get("trustedMarketplaces"), Some(&json!(["mp"])));
+        assert!(errors.is_empty());
     }
 }
