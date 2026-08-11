@@ -14,7 +14,6 @@ use super::model::*;
 use super::utils::client_factory;
 use super::vrl_runtime::VrlRuntime;
 use crate::errors::ComputerError;
-use crate::inputs::SecretValueResolver;
 use crate::oauth::{
     InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
     OAuthCredentialStore, OAuthError, OAuthFlow, OAuthFlowOutcome, OAuthLaunch, OAuthStatus,
@@ -121,7 +120,6 @@ pub struct MCPServerManager {
     oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     /// Optional Computer-owned event sink for OAuth status transitions.
     oauth_events: Option<Arc<RuntimeStatus>>,
-    secret_resolver: Arc<RwLock<Option<Arc<dyn SecretValueResolver>>>>,
     #[cfg(test)]
     test_http_root_certificates: Arc<RwLock<Vec<reqwest::Certificate>>>,
     /// Serialize start/stop/update for each server identity without blocking unrelated servers.
@@ -173,7 +171,6 @@ impl MCPServerManager {
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             oauth_events: None,
-            secret_resolver: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             test_http_root_certificates: Arc::new(RwLock::new(Vec::new())),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
@@ -204,7 +201,6 @@ impl MCPServerManager {
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             oauth_events: None,
-            secret_resolver: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             test_http_root_certificates: Arc::new(RwLock::new(Vec::new())),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
@@ -246,15 +242,6 @@ impl MCPServerManager {
     /// `start_client_by_id` / `start_all` **之前**调用（已激活客户端不追溯）。详见 [`ClientFactory`]。
     pub async fn set_client_factory(&self, factory: Option<ClientFactory>) {
         *self.client_factory_override.write().await = factory;
-    }
-
-    pub async fn set_secret_resolver(&self, resolver: Option<Arc<dyn SecretValueResolver>>) {
-        *self.secret_resolver.write().await = resolver;
-    }
-
-    #[cfg(test)]
-    async fn set_test_http_root_certificates(&self, certificates: Vec<reqwest::Certificate>) {
-        *self.test_http_root_certificates.write().await = certificates;
     }
 
     /// 按 config + 通知接缝创建客户端：override 优先，否则真实 [`client_factory`]（#152）/ make a client.
@@ -526,15 +513,12 @@ impl MCPServerManager {
                     existing.set_notify(notify);
                     existing
                 } else {
-                    let resolver = self.secret_resolver.read().await.clone();
                     let candidate = HttpMCPClient::new(http.server_parameters)
                         .with_oauth_context(
                             bundle_id.clone(),
                             Arc::clone(&self.oauth_credential_store),
                             self.oauth_events.clone(),
                         )
-                        .with_auth_policy(http.auth_policy, http.oauth, resolver)
-                        .map_err(|error| ComputerError::InvalidConfiguration(error.to_string()))?
                         .with_notify(notify.clone());
                     #[cfg(test)]
                     let candidate = candidate.with_test_root_certificates(
@@ -2134,21 +2118,12 @@ impl MCPServerManager {
         let MCPServerConfig::Http(http) = config else {
             return Err(OAuthError::UnsupportedTransport);
         };
-        if http.auth_policy == Some(HttpAuthPolicy::Disabled) {
-            return Err(OAuthError::NotConfigured);
-        }
         let client = Arc::new(
-            HttpMCPClient::new(http.server_parameters)
-                .with_oauth_context(
-                    bundle_id.clone(),
-                    Arc::clone(&self.oauth_credential_store),
-                    self.oauth_events.clone(),
-                )
-                .with_auth_policy(
-                    http.auth_policy,
-                    http.oauth,
-                    self.secret_resolver.read().await.clone(),
-                )?,
+            HttpMCPClient::new(http.server_parameters).with_oauth_context(
+                bundle_id.clone(),
+                Arc::clone(&self.oauth_credential_store),
+                self.oauth_events.clone(),
+            ),
         );
         let mut oauth_clients = self.oauth_clients.write().await;
         Ok(oauth_clients
@@ -2176,16 +2151,10 @@ impl MCPServerManager {
             .get(bundle_id)
             .cloned()
             .ok_or(OAuthError::NotConfigured)?;
-        let MCPServerConfig::Http(http) = config else {
+        let MCPServerConfig::Http(_http) = config else {
             return Err(OAuthError::UnsupportedTransport);
         };
-        if http.auth_policy == Some(HttpAuthPolicy::Disabled)
-            || (http.auth_policy.is_none() && http.oauth.is_none())
-            || http.auth_policy == Some(HttpAuthPolicy::Auto)
-        {
-            return Err(OAuthError::NotConfigured);
-        }
-        Err(OAuthError::StateMismatch)
+        Err(OAuthError::NotConfigured)
     }
 }
 
@@ -2689,10 +2658,6 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
-#[path = "manager_auto_oauth_private_key_jwt_tests.rs"]
-mod manager_auto_oauth_private_key_jwt_tests;
-
-#[cfg(test)]
 mod tests {
     use super::test_support::{bid, stdio_cfg_with_bundle};
     use super::*;
@@ -2865,79 +2830,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_drains_oauth_even_when_active_client_disconnect_fails() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let accepted = Arc::new(tokio::sync::Notify::new());
-        let accepted_by_server = Arc::clone(&accepted);
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            accepted_by_server.notify_one();
-            let _stream = stream;
-            std::future::pending::<()>().await;
-        });
-
-        let manager = MCPServerManager::new();
-        let bundle_id = bid("oauth-close-error");
-        let client = Arc::new(
-            HttpMCPClient::new(HttpServerParameters {
-                url: format!("http://127.0.0.1:{port}/mcp"),
-                headers: HashMap::new(),
-            })
-            .with_oauth_context(
-                bundle_id.clone(),
-                Arc::clone(&manager.oauth_credential_store),
-                None,
-            )
-            .with_oauth(
-                crate::oauth::OAuthOptions {
-                    resource: None,
-                    scopes: vec!["tools.read".to_string()],
-                    client_name: Some("A2C Computer".to_string()),
-                    mode: crate::oauth::OAuthClientMode::AuthorizationCode {
-                        registration: crate::oauth::OAuthClientRegistration::Preregistered {
-                            client_id: "oauth-client".to_string(),
-                            client_secret_input: None,
-                        },
-                    },
-                },
-                None,
-            ),
-        );
-        manager
-            .oauth_clients
-            .write()
-            .await
-            .insert(bundle_id.clone(), Arc::clone(&client));
-        let active: StdArc<dyn MCPClientProtocol> = client.clone();
-        manager
-            .active_clients
-            .write()
-            .await
-            .insert(bundle_id, active);
-        let flow = client
-            .create_oauth_flow(OAuthBeginRequest {
-                redirect_uri: "http://127.0.0.1:9876/callback".to_string(),
-                required_scope: None,
-            })
-            .await
-            .unwrap();
-        accepted.notified().await;
-
-        assert!(manager.close().await.is_err());
-        let terminal = tokio::time::timeout(
-            Duration::from_secs(1),
-            flow.cancel(crate::oauth::OAuthCancellationReason::Cancelled),
-        )
-        .await
-        .expect("close must drain OAuth despite the disconnect error")
-        .unwrap();
-        assert!(matches!(terminal, OAuthFlowOutcome::Terminated { .. }));
-    }
-
-    #[tokio::test]
     async fn test_manager_initialization() {
         let manager = MCPServerManager::new();
+        let mut http_config = HttpServerConfig::new(
+            "test_http",
+            HttpServerParameters {
+                url: "http://localhost:8080".to_string(),
+                headers: HashMap::new(),
+            },
+        );
+        http_config.disabled = true;
 
         // 创建服务器配置 / Create server configurations
         let configs = vec![
@@ -2959,22 +2861,7 @@ mod tests {
                 },
             }),
             // HTTP服务器配置 / HTTP server configuration
-            MCPServerConfig::Http(HttpServerConfig {
-                env_file: None,
-                bundle_id: None,
-                name: "test_http".to_string(),
-                disabled: true, // 禁用此服务器 / Disable this server
-                forbidden_tools: vec![],
-                tool_meta: HashMap::new(),
-                default_tool_meta: None,
-                vrl: None,
-                oauth: None,
-                auth_policy: None,
-                server_parameters: HttpServerParameters {
-                    url: "http://localhost:8080".to_string(),
-                    headers: HashMap::new(),
-                },
-            }),
+            MCPServerConfig::Http(http_config),
         ];
 
         // 初始化管理器 / Initialize manager

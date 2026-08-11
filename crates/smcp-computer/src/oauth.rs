@@ -781,10 +781,10 @@ impl StreamableHttpClient for SensitiveAuthClient {
     }
 }
 
-/// OAuth configuration attached to an HTTP MCP server.
+/// Internal defaults for standards-derived OAuth negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct OAuthOptions {
+pub(crate) struct OAuthOptions {
     /// Canonical RFC 8707 resource indicator.
     ///
     /// When omitted, the Streamable HTTP MCP endpoint is used for backward compatibility.
@@ -823,7 +823,7 @@ impl OAuthOptions {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
-pub enum OAuthClientMode {
+pub(crate) enum OAuthClientMode {
     AuthorizationCode {
         #[serde(flatten)]
         registration: OAuthClientRegistration,
@@ -873,7 +873,7 @@ fn bearer_insufficient_scope(header: &str) -> Option<String> {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
-pub enum OAuthClientRegistration {
+pub(crate) enum OAuthClientRegistration {
     Dynamic,
     Preregistered {
         client_id: String,
@@ -1103,7 +1103,7 @@ impl From<RmcpAuthError> for OAuthProtocolError {
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum OAuthError {
-    #[error("server does not have OAuth configured")]
+    #[error("OAuth has not been admitted for this server")]
     NotConfigured,
     #[error("OAuth is not supported for this transport")]
     UnsupportedTransport,
@@ -1127,12 +1127,6 @@ pub enum OAuthError {
     UnsupportedSigningAlgorithm(String),
     #[error("invalid OAuth redirect URI: {0}")]
     InvalidRedirectUri(String),
-    #[error("OAuth cannot be combined with a static Authorization header")]
-    ConflictingAuthorizationHeader,
-    #[error("the explicit OAuth policy requires OAuth options")]
-    ExplicitPolicyRequiresOptions,
-    #[error("the disabled authentication policy cannot contain OAuth options")]
-    DisabledPolicyWithOptions,
     #[error("OAuth protocol error: {0}")]
     Protocol(#[from] OAuthProtocolError),
 }
@@ -1548,6 +1542,8 @@ pub(crate) struct OAuthCoordinator {
     state_store: ExpiringStateStore,
     oauth_http_client: Arc<dyn OAuthHttpClient>,
     transport_http_client: reqwest::Client,
+    admitted_resource_metadata_validated: Option<Arc<AtomicBool>>,
+    admitted_authorization_server_identity: Option<String>,
 }
 
 pub(crate) struct OAuthCoordinatorContext {
@@ -1742,6 +1738,7 @@ impl OAuthCoordinator {
         let state_store = ExpiringStateStore::new(AUTHORIZATION_STATE_TTL);
         manager.set_state_store(state_store.clone());
         let metadata = manager.discover_metadata().await?;
+        let automatic_admission = admitted_resource_metadata_validated.is_some();
         if let Some(validated) = admitted_resource_metadata_validated.as_ref() {
             // rmcp 2.2 intentionally falls back to derived legacy endpoints when RFC 8414/OIDC
             // discovery fails. That is useful for proactive compatibility but is not evidence
@@ -1755,8 +1752,9 @@ impl OAuthCoordinator {
             &metadata,
             matches!(options.mode, OAuthClientMode::AuthorizationCode { .. }),
         )?;
+        let authorization_server_identity = authorization_server_credential_identity(&metadata)?;
         store
-            .set_issuer(Some(authorization_server_credential_identity(&metadata)?))
+            .set_issuer(Some(authorization_server_identity.clone()))
             .await?;
         manager.set_metadata(metadata);
         let mut stored = store.load().await?;
@@ -1833,6 +1831,9 @@ impl OAuthCoordinator {
             state_store,
             oauth_http_client,
             transport_http_client: http_client,
+            admitted_resource_metadata_validated,
+            admitted_authorization_server_identity: automatic_admission
+                .then_some(authorization_server_identity),
         })
     }
 
@@ -2240,9 +2241,27 @@ impl OAuthCoordinator {
         .await?;
         manager.set_credential_store(staged_store.clone());
         manager.set_state_store(self.state_store.clone());
+        if let Some(validated) = self.admitted_resource_metadata_validated.as_ref() {
+            // Each interactive flow must reproduce the same standards-backed admission evidence;
+            // a successful anonymous connection is not a permanent trust grant for mutable
+            // metadata served later by the resource or authorization server.
+            validated.store(false, Ordering::Release);
+        }
         let metadata = manager.discover_metadata().await?;
+        if let Some(validated) = self.admitted_resource_metadata_validated.as_ref() {
+            if !validated.load(Ordering::Acquire) || metadata.issuer.is_none() {
+                return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
+            }
+        }
         validate_authorization_metadata(&metadata, true)?;
         let issuer = authorization_server_credential_identity(&metadata)?;
+        if self
+            .admitted_authorization_server_identity
+            .as_ref()
+            .is_some_and(|admitted| admitted != &issuer)
+        {
+            return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
+        }
         manager.set_metadata(metadata.clone());
         // Issue #176: when no explicit scopes are configured, adopt the discovered scope set
         // via rmcp's MCP-aligned selection (401 WWW-Authenticate → PRM scopes_supported → AS

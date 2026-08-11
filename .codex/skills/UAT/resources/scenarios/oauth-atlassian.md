@@ -110,7 +110,7 @@ export A2C_OAUTH_UAT_PORT=43334
 浏览器工具内部定位 consent 页后，必须依次执行以下守卫；只输出 PASS/FAIL 布尔结论，不输出
 完整 URL、query、账号标识、workspace ID 或权限响应原文：
 
-1. 页面显示的客户端名称是 `A2C SMCP Rust SDK UAT`。
+1. 页面显示的客户端名称是自动 DCR 使用的 `A2C Computer`。
 2. 页面显示的 callback 与当前端口对应，且 scheme/host/path 严格为
    `http://127.0.0.1:<port>/callback`。
 3. 页面存在可见的站点 `combobox` 和权限审阅入口，**接受**不是 disabled。
@@ -136,8 +136,8 @@ cargo test -p smcp-computer --test mock_server_integration
 cargo test -p smcp-computer --example oauth_atlassian_uat
 ```
 
-覆盖范围包括 PKCE、预注册/CIMD/DCR、Client Credentials secret/`private_key_jwt`、
-刷新、共享内存 store 的 manager 重建恢复与清除、401、403 `insufficient_scope`、并发 begin、过期 callback、
+覆盖范围包括 anonymous-first 准入、PKCE、DCR、刷新、共享内存 store 的 manager 重建恢复与清除、
+401、403 `insufficient_scope`、并发 begin、过期 callback、
 state/issuer 校验、重复 callback 参数拒绝、deny/cancel/timeout 清理、bundle/resource/issuer
 隔离、默认内存 store、真实 HTTP/SSE 边界及敏感 tracing/Debug 守护；
 云端 harness 另覆盖稳定 HTTPS redirect URI、一次性 opaque state 路由、原 CLI coordinator

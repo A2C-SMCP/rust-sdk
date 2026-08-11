@@ -7,7 +7,8 @@
 * 依赖: serde, async-trait
 * 描述: MCP客户端相关的数据模型定义
 */
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, IgnoredAny};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
@@ -326,6 +327,12 @@ pub struct SseServerConfig {
 /// HTTP服务器配置 / HTTP server configuration
 ///
 /// `#[non_exhaustive]`：跨 crate 须经 [`HttpServerConfig::new`]（见 [`StdioServerConfig`]，rust-sdk#117）。
+///
+/// Without a static `Authorization` header, connections are anonymous-first and OAuth is admitted
+/// only after a standards-compliant Bearer challenge and validated metadata. OAuth resource,
+/// scopes, authorization server, and dynamic client registration are protocol-derived. The
+/// removed `oauth`, `authPolicy`, and `auth_policy` serialized fields are rejected with a migration
+/// diagnostic.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HttpServerConfig {
@@ -357,37 +364,46 @@ pub struct HttpServerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub env_file: Option<String>,
-    /// OAuth configuration for protected Streamable HTTP servers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth: Option<crate::oauth::OAuthOptions>,
-    /// HTTP authentication negotiation policy.
-    ///
-    /// When omitted, existing serialized configurations retain their intent: an `oauth` block
-    /// selects proactive OAuth, while a configuration without one uses anonymous-first automatic
-    /// discovery. `Auto` makes an optional `oauth` block act as discovery overrides instead.
+    // Removed OAuth configuration keys remain represented only as private deserialization guards.
+    // This preserves the model's intentional tolerance for unrelated extension keys while making
+    // these security-sensitive legacy keys fail loudly instead of being ignored by serde.
+    #[serde(
+        default,
+        rename = "oauth",
+        skip_serializing,
+        deserialize_with = "reject_removed_oauth_config"
+    )]
+    _removed_oauth: (),
     #[serde(
         default,
         rename = "authPolicy",
         alias = "auth_policy",
-        skip_serializing_if = "Option::is_none"
+        skip_serializing,
+        deserialize_with = "reject_removed_auth_policy"
     )]
-    pub auth_policy: Option<HttpAuthPolicy>,
+    _removed_auth_policy: (),
     /// HTTP服务器参数 / HTTP server parameters
     pub server_parameters: HttpServerParameters,
 }
 
-/// Authentication negotiation policy for a Streamable HTTP MCP server.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub enum HttpAuthPolicy {
-    /// Connect anonymously first and admit OAuth only after a validated Bearer challenge.
-    Auto,
-    /// Initialize OAuth proactively. An `oauth` options block is required.
-    #[serde(rename = "oauth")]
-    OAuth,
-    /// Never negotiate OAuth. Static request headers, when present, are still sent.
-    Disabled,
+fn reject_removed_oauth_config<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let _ = IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(
+        "the 'oauth' HTTP server configuration field is no longer supported; remove it to use automatic OAuth negotiation",
+    ))
+}
+
+fn reject_removed_auth_policy<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let _ = IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(
+        "the 'authPolicy'/'auth_policy' HTTP server configuration field is no longer supported; remove it to use automatic OAuth negotiation",
+    ))
 }
 
 impl StdioServerConfig {
@@ -439,8 +455,8 @@ impl HttpServerConfig {
             default_tool_meta: None,
             vrl: None,
             env_file: None,
-            oauth: None,
-            auth_policy: None,
+            _removed_oauth: (),
+            _removed_auth_policy: (),
             server_parameters,
         }
     }
@@ -1009,8 +1025,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_auth_policy_is_additive_and_round_trips_camel_case() {
-        let legacy = serde_json::json!({
+    fn http_oauth_configuration_is_automatic_only() {
+        let automatic = serde_json::json!({
             "name": "remote",
             "disabled": false,
             "forbidden_tools": [],
@@ -1022,31 +1038,25 @@ mod tests {
                 "headers": {}
             }
         });
-        let legacy: HttpServerConfig = serde_json::from_value(legacy).unwrap();
-        assert_eq!(legacy.auth_policy, None);
-        assert!(serde_json::to_value(&legacy)
-            .unwrap()
-            .get("authPolicy")
-            .is_none());
-
-        let mut automatic = legacy;
-        automatic.auth_policy = Some(HttpAuthPolicy::Auto);
+        let automatic: HttpServerConfig = serde_json::from_value(automatic).unwrap();
         let encoded = serde_json::to_value(&automatic).unwrap();
-        assert_eq!(encoded["authPolicy"], serde_json::json!("auto"));
-        assert_eq!(
-            serde_json::from_value::<HttpServerConfig>(encoded)
-                .unwrap()
-                .auth_policy,
-            Some(HttpAuthPolicy::Auto)
-        );
-        assert_eq!(
-            serde_json::to_value(HttpAuthPolicy::OAuth).unwrap(),
-            serde_json::json!("oauth")
-        );
-        assert_eq!(
-            serde_json::to_value(HttpAuthPolicy::Disabled).unwrap(),
-            serde_json::json!("disabled")
-        );
+        assert!(encoded.get("authPolicy").is_none());
+        assert!(encoded.get("auth_policy").is_none());
+        assert!(encoded.get("oauth").is_none());
+
+        for (field, value) in [
+            ("authPolicy", serde_json::json!("auto")),
+            ("auth_policy", serde_json::json!("auto")),
+            ("oauth", serde_json::json!({})),
+        ] {
+            let mut rejected = encoded.clone();
+            rejected[field] = value;
+            let error = serde_json::from_value::<HttpServerConfig>(rejected).unwrap_err();
+            assert!(
+                error.to_string().contains("no longer supported"),
+                "unexpected error for {field}: {error}"
+            );
+        }
     }
 
     #[test]

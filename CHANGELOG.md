@@ -16,9 +16,14 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #160 changes interactive `complete_oauth` and `cancel_oauth` to return
   `OAuthFlowOutcome`. Expired and issuer-mismatched callbacks now use dedicated
   `OAuthError` variants instead of a generic protocol error.
-- *(computer)* #167 adds `OAuthOptions::resource` and
-  `ComputerEvent::OAuthStatusChanged`. Rust struct literals must initialize `resource` (usually
-  `None`), exhaustive event matches need the new variant, and `ComputerEvent` is no longer `Copy`.
+- *(computer)* #167 adds `ComputerEvent::OAuthStatusChanged`. Exhaustive event matches need the
+  new variant, and `ComputerEvent` is no longer `Copy`.
+- *(computer)* #180 removes the public `HttpServerConfig.oauth`, `authPolicy`/`auth_policy`,
+  `OAuthOptions`, `OAuthClientMode`, and `OAuthClientRegistration` configuration surface. HTTP
+  OAuth is now automatic-only; serialized configurations containing removed fields fail
+  validation with a migration diagnostic. The configuration-only `OAuthError` variants
+  `ConflictingAuthorizationHeader`, `ExplicitPolicyRequiresOptions`, and
+  `DisabledPolicyWithOptions` are also removed.
 - *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
 
 ### Features
@@ -30,9 +35,8 @@ All notable changes to this project will be documented in this file.
   status events, refresh, scope step-up, and cancellation lifecycle.
 
 - *(computer)* #157 adds OAuth status, begin, callback completion, and credential
-  clearing APIs for Streamable HTTP servers. Supported grants include Authorization
-  Code + PKCE (pre-registered, CIMD, or DCR clients) and Client Credentials
-  (`client_secret` or `private_key_jwt`), with refresh and bounded
+  clearing APIs for Streamable HTTP servers. Automatic negotiation uses Authorization
+  Code + PKCE with standards-derived metadata and dynamic client registration, with refresh and bounded
   `insufficient_scope` step-up.
 - *(computer)* #159 makes OAuth credential policy host-injectable through
   `Computer::with_oauth_credential_store`; credentials are isolated by bundle ID, canonical protected resource,
@@ -42,9 +46,9 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #160 defines one browser/callback host contract for local loopback and
   headless HTTPS Gateway flow drivers, with structured completion/termination outcomes,
   one-time opaque-state routing, deterministic expiry, and rustdoc-integrated guidance.
-- *(computer)* #167 separates the canonical RFC 8707 OAuth resource from the HTTP MCP endpoint and
-  publishes deduplicated, bundle-aware OAuth status changes through the shared Computer event
-  stream, including refresh failure and 401/403 background transitions.
+- *(computer)* #167 isolates the canonical RFC 8707 OAuth resource discovered for an HTTP MCP
+  endpoint and publishes deduplicated, bundle-aware OAuth status changes through the shared
+  Computer event stream, including refresh failure and 401/403 background transitions.
 - *(computer)* #170 adds `Computer::create_oauth_flow` and the cloneable `OAuthFlow` handle, making
   discovery, DCR, callback exchange, server replacement/removal, and shutdown cancellation
   bounded without provider-timeout waits. Interactive reauthorization now stages candidate
@@ -64,17 +68,13 @@ All notable changes to this project will be documented in this file.
 
 ### Migration Notes
 
-- HTTP configurations may set `authPolicy` to `auto`, `oauth`, or `disabled`. An omitted policy
-  preserves proactive behavior for existing `oauth` blocks and otherwise enables anonymous-first
-  discovery. Static `Authorization` headers always remain static-only and never fall back to OAuth.
+- Remove `oauth`, `authPolicy`, and `auth_policy` from every HTTP server configuration; they now
+  produce a validation error. Without static credentials, Streamable HTTP always connects
+  anonymously first and admits OAuth only after a standards-compliant Bearer challenge. Static
+  `Authorization` headers always remain static-only and never fall back to OAuth.
   Automatic negotiation binds admission to the challenged protected-resource metadata and requires
   its effective resource to match the MCP endpoint plus issuer-bearing RFC 8414/OIDC metadata;
-  derived legacy endpoints are not admitted. Intentional cross-resource configurations must use
-  proactive `authPolicy: oauth`.
-
-- Add the optional `oauth` object to an HTTP server configuration and provide secret
-  values through `SecretValueResolver` input IDs. Do not combine OAuth with a static
-  `Authorization` header.
+  derived legacy endpoints and cross-resource configuration are not admitted.
 - The embedding Desktop/CLI must open `OAuthLaunch.authorization_url`, receive the
   loopback/HTTPS callback, and pass its `code`, `state`, and optional `issuer` to
   `complete_oauth`. Map `access_denied` and other OAuth errors to the corresponding
@@ -83,13 +83,12 @@ All notable changes to this project will be documented in this file.
 - Persistent OAuth is now host policy: Desktop applications may inject a Keychain-backed
   `OAuthCredentialStore`, while multi-tenant services should bind their injected store to
   tenant/principal runtime context. Without injection, credentials are lost on process exit.
-- OAuth configuration and status fields serialize as camelCase. Existing non-OAuth
+- OAuth status fields serialize as camelCase. Existing non-OAuth
   HTTP servers retain normal redirect behavior; OAuth requests only follow
   same-origin redirects.
-- Existing OAuth configuration may omit `resource`; the HTTP MCP URL remains the default. Set an
-  explicit absolute, fragment-free resource URI only when the authorization audience differs from
-  the transport endpoint. After `subscribe_events()` reports lag, call `oauth_status(bundle_id)`
-  to resynchronize OAuth UI state.
+- Resource, scopes, authorization server, and client registration are no longer configurable;
+  they are derived from validated metadata. After `subscribe_events()` reports lag, call
+  `oauth_status(bundle_id)` to resynchronize OAuth UI state.
 - Match `OAuthError::Protocol(OAuthProtocolError::...)` for stable control flow. Raw
   rmcp/provider errors are no longer available through the public error value.
 - New hosts should retain the `OAuthFlow` returned by `create_oauth_flow`, await `flow.launch()`,
