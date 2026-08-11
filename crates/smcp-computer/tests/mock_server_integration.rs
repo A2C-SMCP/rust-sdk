@@ -1521,7 +1521,31 @@ async fn test_automatic_oauth_rejected_persisted_token_requires_user_in_one_star
         restored.oauth_status(&bundle_id).await.unwrap(),
         OAuthStatus::Unauthorized
     );
-    assert!(!restored.get_server_status().await[0].2);
+    let runtime = restored.get_server_runtime_statuses().await;
+    assert_eq!(runtime.len(), 1);
+    assert_eq!(
+        runtime[0].activation,
+        MCPServerActivationState::Started,
+        "an accepted start must survive the OAuth challenge"
+    );
+    assert_eq!(
+        runtime[0].connection,
+        MCPServerConnectionState::AuthorizationRequired
+    );
+    assert!(restored.get_server_status().await[0].2);
+    assert_eq!(
+        restored.get_server_status().await[0].3,
+        "authorization_required"
+    );
+
+    assert!(restored.stop_client_by_id(&bundle_id).await.unwrap());
+    let stopped = restored.get_server_runtime_statuses().await;
+    assert_eq!(stopped[0].activation, MCPServerActivationState::Stopped);
+    assert_eq!(
+        stopped[0].connection,
+        MCPServerConnectionState::Disconnected
+    );
+    assert!(!restored.stop_client_by_id(&bundle_id).await.unwrap());
     restored.close().await.unwrap();
 }
 
@@ -2479,9 +2503,16 @@ async fn test_authorization_code_clear_is_bundle_scoped_and_401_never_reuses_old
         .unwrap();
 
     manager.clear_oauth(&bundle_id).await.unwrap();
+    let runtime = manager.get_server_runtime_statuses().await;
+    assert_eq!(runtime[0].activation, MCPServerActivationState::Started);
+    assert_eq!(
+        runtime[0].connection,
+        MCPServerConnectionState::AuthorizationRequired
+    );
     assert_tool_call_is_blocked_before_http(&manager, &bundle_id, &state).await;
 
     authorize_manager(&manager, &bundle_id, &state, None).await;
+    manager.start_client_by_id(&bundle_id).await.unwrap();
     let peer_manager = MCPServerManager::new();
     let peer_bundle_id = BundleId::try_from("oauth-code-peer").unwrap();
     let mut peer_config = HttpServerConfig::new(
@@ -3144,6 +3175,13 @@ async fn test_server_replacement_and_removal_cancel_and_drain_oauth_flows() {
     .await
     .expect("replacement must drain without provider timeout")
     .unwrap();
+    let replaced = manager.get_server_runtime_statuses().await;
+    assert_eq!(replaced[0].activation, MCPServerActivationState::Started);
+    assert_eq!(
+        replaced[0].connection,
+        MCPServerConnectionState::Disconnected,
+        "replacement retires the old OAuth data plane without losing activation intent"
+    );
     assert!(matches!(
         first.cancel(OAuthCancellationReason::Cancelled).await,
         Ok(OAuthFlowOutcome::Terminated { .. })

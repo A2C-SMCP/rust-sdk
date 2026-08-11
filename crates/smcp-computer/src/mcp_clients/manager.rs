@@ -84,6 +84,10 @@ pub struct MCPServerManager {
     servers_config: Arc<RwLock<HashMap<BundleId, MCPServerConfig>>>,
     /// 活动客户端映射（键 = `bundle_id`）/ Active client mapping keyed by bundle_id。
     active_clients: Arc<RwLock<HashMap<BundleId, StdArc<dyn MCPClientProtocol>>>>,
+    /// 已接受的启动意图；不因 OAuth 尚未授权或连接失败而丢失。
+    activation_intents: Arc<RwLock<HashSet<BundleId>>>,
+    /// 最近一次数据面连接状态；与 `activation_intents` 正交。
+    connection_states: Arc<RwLock<HashMap<BundleId, MCPServerConnectionState>>>,
     /// 聚合工具路由表：`exposed_tool_name -> ExposedToolRoute`（get_tools 与 tool_call 共享，单射整键查表）。
     tool_routes: Arc<RwLock<HashMap<ExposedToolName, ExposedToolRoute>>>,
     /// 禁用工具集合（键 = `exposed_tool_name`）/ Disabled tools set keyed by exposed_tool_name。
@@ -157,6 +161,8 @@ impl MCPServerManager {
         Self {
             servers_config: Arc::new(RwLock::new(HashMap::new())),
             active_clients: Arc::new(RwLock::new(HashMap::new())),
+            activation_intents: Arc::new(RwLock::new(HashSet::new())),
+            connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
             auto_reconnect: Arc::new(RwLock::new(true)),
@@ -187,6 +193,8 @@ impl MCPServerManager {
         Self {
             servers_config: Arc::new(RwLock::new(HashMap::new())),
             active_clients: Arc::new(RwLock::new(HashMap::new())),
+            activation_intents: Arc::new(RwLock::new(HashSet::new())),
+            connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
             auto_reconnect: Arc::new(RwLock::new(reconnect_policy.enabled)),
@@ -352,17 +360,15 @@ impl MCPServerManager {
         let lifecycle = self.lifecycle_lock(&bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
 
-        // 检查是否已激活（按 bundle_id）/ Check if already active (by bundle_id)
-        let is_active = {
-            let clients = self.active_clients.read().await;
-            clients.contains_key(&bundle_id)
-        };
+        // 配置更新应保留控制面的启动意图，即使数据面正等待 OAuth。
+        let was_started = self.activation_intents.read().await.contains(&bundle_id);
+        let was_connected = self.active_clients.read().await.contains_key(&bundle_id);
 
-        if is_active {
+        if was_connected {
             let auto_reconnect = *self.auto_reconnect.read().await;
             if !auto_reconnect {
                 return Err(ComputerError::InvalidConfiguration(format!(
-                    "Server {} (bundle_id={}) is active. Stop it before updating config",
+                    "Server {} (bundle_id={}) is started. Stop it before updating config",
                     config.name(),
                     bundle_id
                 )));
@@ -380,8 +386,12 @@ impl MCPServerManager {
                     ComputerError::ConnectionError(format!("failed to drain OAuth flow: {error}"))
                 })?;
         }
-        if is_active {
-            self.stop_client_by_id_inner(&bundle_id).await?;
+        if was_connected {
+            self.disconnect_client_by_id_inner(&bundle_id).await?;
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
 
         // 更新配置（原地更新：同 bundle_id 覆盖）/ Update configuration (update-in-place by bundle_id)
@@ -392,8 +402,16 @@ impl MCPServerManager {
 
         // 检查是否需要自动连接 / Check if need auto connect
         let auto_connect = *self.auto_connect.read().await;
-        if is_active || auto_connect {
+        if was_connected || auto_connect {
             self.start_client_by_id_inner(&bundle_id).await?;
+        } else if was_started {
+            // Replacing an authorization-blocked server must retire the old OAuth capability
+            // without synchronously starting another provider transaction. Activation remains
+            // explicit and observable, while the new config has no live data-plane connection.
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
 
         // 刷新工具路由 / Refresh tool routes
@@ -437,6 +455,7 @@ impl MCPServerManager {
             let mut configs = self.servers_config.write().await;
             configs.remove(bundle_id);
         }
+        self.connection_states.write().await.remove(bundle_id);
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
 
@@ -496,13 +515,29 @@ impl MCPServerManager {
             )));
         }
 
-        // 检查是否已启动 / Check if already started
+        // `start` first records the accepted control-plane intent. A subsequent OAuth challenge
+        // or transport error changes only the orthogonal connection state.
+        self.activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+
+        // 检查是否已连接 / Check if already connected
         {
             let clients = self.active_clients.read().await;
             if clients.contains_key(bundle_id) {
+                self.connection_states
+                    .write()
+                    .await
+                    .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
                 return Ok(()); // 已经启动 / Already started
             }
         }
+
+        self.connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connecting);
 
         // 创建客户端（注入通知上报接缝，用 **bundle_id** 打来源标签——消费侧定向重挂按身份寻址，#106/#127）。
         let notify = self.notify_ctx_for(bundle_id).await;
@@ -540,19 +575,39 @@ impl MCPServerManager {
         };
 
         // 连接服务器 / Connect to server
-        client.connect().await.map_err(|error| match error {
-            MCPClientError::HttpAuthentication(error) => ComputerError::HttpAuthentication(error),
-            error => ComputerError::ConnectionError(format!(
-                "Failed to connect to {}: {}",
-                server_name, error
-            )),
-        })?;
+        if let Err(error) = client.connect().await {
+            let connection = if matches!(
+                &error,
+                MCPClientError::HttpAuthentication(HttpAuthenticationError::OAuthRequired)
+            ) {
+                MCPServerConnectionState::AuthorizationRequired
+            } else {
+                MCPServerConnectionState::Error
+            };
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), connection);
+            return Err(match error {
+                MCPClientError::HttpAuthentication(error) => {
+                    ComputerError::HttpAuthentication(error)
+                }
+                error => ComputerError::ConnectionError(format!(
+                    "Failed to connect to {}: {}",
+                    server_name, error
+                )),
+            });
+        }
 
         // 添加到活动客户端（按 bundle_id）/ Add to active clients (by bundle_id)
         {
             let mut clients = self.active_clients.write().await;
             clients.insert(bundle_id.clone(), client);
         }
+        self.connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
 
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
@@ -571,7 +626,7 @@ impl MCPServerManager {
     /// 🔴 **返回 `bool` 是假回执的根治点**：库层对缺席键保持**幂等**（无可停、非错误），但把「有没有停到东西」
     /// **如实上报**给调用方——否则 CLI 无从分辨「真停了」与「压根没这个活跃客户端」，只能一律打 ✅，那正是
     /// 本 Issue 要消灭的谎报（拼错的 server 名恰好是合法 bundle_id 字面量时尤甚）。
-    /// `Ok(true)` = 确有活跃客户端被摘除并断连；`Ok(false)` = 该身份键无活跃客户端，未做任何事。
+    /// `Ok(true)` = 确有启动意图或活跃连接被停止；`Ok(false)` = 该身份键既未启动也未连接。
     pub async fn stop_client_by_id(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
@@ -579,6 +634,25 @@ impl MCPServerManager {
     }
 
     async fn stop_client_by_id_inner(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
+        let was_started = self.activation_intents.write().await.remove(bundle_id);
+        let was_connected = self.disconnect_client_by_id_inner(bundle_id).await?;
+
+        if was_started || was_connected {
+            info!("Client (bundle_id={}) stopped successfully", bundle_id);
+        } else {
+            debug!(
+                "Server bundle_id={} was neither started nor connected — nothing to stop (idempotent)",
+                bundle_id
+            );
+        }
+        Ok(was_started || was_connected)
+    }
+
+    /// Retire only the data-plane client while preserving the control-plane activation intent.
+    async fn disconnect_client_by_id_inner(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<bool, ComputerError> {
         // 移除客户端 / Remove client
         let mut client = {
             let mut clients = self.active_clients.write().await;
@@ -599,14 +673,6 @@ impl MCPServerManager {
         // 刷新工具路由（幂等，无论是否停到都保持路由一致）/ Refresh tool routes
         self.refresh_tool_routes().await?;
 
-        if was_active {
-            info!("Client (bundle_id={}) stopped successfully", bundle_id);
-        } else {
-            debug!(
-                "No active client for bundle_id={} — nothing to stop (idempotent)",
-                bundle_id
-            );
-        }
         Ok(was_active)
     }
 
@@ -639,10 +705,11 @@ impl MCPServerManager {
 
     /// 停止所有客户端 / Stop all clients
     pub async fn stop_all(&self) -> Result<(), ComputerError> {
-        let bundle_ids: Vec<BundleId> = {
+        let mut bundle_ids: HashSet<BundleId> = {
             let clients = self.active_clients.read().await;
             clients.keys().cloned().collect()
         };
+        bundle_ids.extend(self.activation_intents.read().await.iter().cloned());
 
         for bundle_id in bundle_ids {
             self.stop_client_by_id(&bundle_id).await?;
@@ -659,6 +726,8 @@ impl MCPServerManager {
     async fn clear_all(&self) -> Result<(), ComputerError> {
         self.servers_config.write().await.clear();
         self.active_clients.write().await.clear();
+        self.activation_intents.write().await.clear();
+        self.connection_states.write().await.clear();
         self.tool_routes.write().await.clear();
         self.disabled_tools.write().await.clear();
         let oauth_clients = {
@@ -1096,33 +1165,80 @@ impl MCPServerManager {
             .await
     }
 
+    /// 获取正交的服务器运行时状态 / Get orthogonal server runtime statuses.
+    pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
+        let configs: Vec<(BundleId, ServerName)> = self
+            .servers_config
+            .read()
+            .await
+            .iter()
+            .map(|(bundle_id, config)| (bundle_id.clone(), config.name().to_string()))
+            .collect();
+        let activation_intents = self.activation_intents.read().await.clone();
+        let remembered_connections = self.connection_states.read().await.clone();
+        let live_connections: HashMap<BundleId, ClientState> = self
+            .active_clients
+            .read()
+            .await
+            .iter()
+            .map(|(bundle_id, client)| (bundle_id.clone(), client.state()))
+            .collect();
+
+        configs
+            .into_iter()
+            .map(|(bundle_id, name)| {
+                let activation = if activation_intents.contains(&bundle_id) {
+                    MCPServerActivationState::Started
+                } else {
+                    MCPServerActivationState::Stopped
+                };
+                let remembered = remembered_connections.get(&bundle_id).copied();
+                let connection = if activation == MCPServerActivationState::Stopped {
+                    MCPServerConnectionState::Disconnected
+                } else if remembered == Some(MCPServerConnectionState::AuthorizationRequired) {
+                    // This terminal user-action boundary is committed before the unusable live
+                    // client is retired, so prefer it over a concurrently sampled client state.
+                    MCPServerConnectionState::AuthorizationRequired
+                } else if let Some(state) = live_connections.get(&bundle_id) {
+                    match state {
+                        ClientState::Initialized => MCPServerConnectionState::Connecting,
+                        ClientState::Connected => MCPServerConnectionState::Connected,
+                        ClientState::Disconnected => MCPServerConnectionState::Disconnected,
+                        ClientState::Error => MCPServerConnectionState::Error,
+                    }
+                } else {
+                    remembered.unwrap_or(MCPServerConnectionState::Disconnected)
+                };
+                MCPServerRuntimeStatus {
+                    bundle_id,
+                    name,
+                    activation,
+                    connection,
+                }
+            })
+            .collect()
+    }
+
     /// 获取服务器状态列表 `(bundle_id, name, is_active, state)` / Get server status list。
     ///
     /// **每行自带身份键（#127）**：`.0` = `bundle_id`（唯一身份、寻址键），`.1` = display 名（人类可读、
     /// 可碰撞、非身份）。此前只出 name，调用方（CLI `status`）须再按 name 去 join 一张 name-keyed 的
     /// bundle_id 映射——同名 server 在那张映射里折叠，导致两行打印**同一个** `bundle_id`、用户按
     /// `server rm <bundle_id>` 删错对象。同源直出即消除该 join。
+    ///
+    /// 兼容 tuple 中 `is_active` 现在投影控制面 `is_started`；`state` 投影数据面连接状态。新代码应优先使用
+    /// [`Self::get_server_runtime_statuses`]，避免再次把两个维度耦合。
     pub async fn get_server_status(&self) -> Vec<(BundleId, ServerName, bool, String)> {
-        let configs = self.servers_config.read().await;
-        let clients = self.active_clients.read().await;
-
-        configs
-            .iter()
-            .map(|(bundle_id, config)| {
-                let is_active = clients.contains_key(bundle_id);
-                let state = if is_active {
-                    clients
-                        .get(bundle_id)
-                        .map(|c| c.state().to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                } else {
-                    "pending".to_string()
-                };
+        self.get_server_runtime_statuses()
+            .await
+            .into_iter()
+            .map(|status| {
+                let is_started = status.is_started();
                 (
-                    bundle_id.clone(),
-                    config.name().to_string(),
-                    is_active,
-                    state,
+                    status.bundle_id,
+                    status.name,
+                    is_started,
+                    status.connection.to_string(),
                 )
             })
             .collect()
@@ -1135,21 +1251,23 @@ impl MCPServerManager {
     /// 额外带 `name`（纯 display，key 不再人类可读，故须显式暴露展示名）。
     /// Returns format: `{ bundle_id: { name, type, status, disabled, ... } }`。
     pub async fn get_server_configs(&self) -> serde_json::Value {
+        let runtime_statuses: HashMap<BundleId, MCPServerRuntimeStatus> = self
+            .get_server_runtime_statuses()
+            .await
+            .into_iter()
+            .map(|status| (status.bundle_id.clone(), status))
+            .collect();
         let configs = self.servers_config.read().await;
-        let clients = self.active_clients.read().await;
 
         let mut result = serde_json::Map::new();
 
         for (bundle_id, config) in configs.iter() {
-            let is_active = clients.contains_key(bundle_id);
-            let state = if is_active {
-                clients
-                    .get(bundle_id)
-                    .map(|c| c.state().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            } else {
-                "pending".to_string()
-            };
+            let runtime = runtime_statuses.get(bundle_id);
+            let is_active = runtime.is_some_and(MCPServerRuntimeStatus::is_started);
+            let is_connected = runtime.is_some_and(MCPServerRuntimeStatus::is_connected);
+            let state = runtime
+                .map(|status| status.connection.to_string())
+                .unwrap_or_else(|| MCPServerConnectionState::Disconnected.to_string());
 
             // 构建服务器配置信息 / Build server config info
             let mut server_info = serde_json::Map::new();
@@ -1174,6 +1292,10 @@ impl MCPServerManager {
             // 添加状态信息 / Add status info
             server_info.insert("status".to_string(), serde_json::Value::String(state));
             server_info.insert("is_active".to_string(), serde_json::Value::Bool(is_active));
+            server_info.insert(
+                "is_connected".to_string(),
+                serde_json::Value::Bool(is_connected),
+            );
             server_info.insert(
                 "disabled".to_string(),
                 serde_json::Value::Bool(config.disabled()),
@@ -1731,6 +1853,9 @@ impl MCPServerManager {
         let retry_counts = self.retry_counts.clone();
         let auto_reconnect = self.auto_reconnect.clone();
         let lifecycle_locks = self.lifecycle_locks.clone();
+        let connection_states = self.connection_states.clone();
+        let tool_routes = self.tool_routes.clone();
+        let disabled_tools = self.disabled_tools.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1813,6 +1938,11 @@ impl MCPServerManager {
                                 continue;
                             }
 
+                            connection_states
+                                .write()
+                                .await
+                                .insert(bundle_id.clone(), MCPServerConnectionState::Connecting);
+
                             // 尝试断开并重新连接 / Try disconnect and reconnect
                             if let Err(e) = client.disconnect().await {
                                 warn!(bundle_id = %bundle_id, error = %e, "Failed to disconnect MCP server");
@@ -1821,15 +1951,56 @@ impl MCPServerManager {
                             match client.connect().await {
                                 Ok(_) => {
                                     info!(bundle_id = %bundle_id, "Successfully reconnected to MCP server");
+                                    connection_states.write().await.insert(
+                                        bundle_id.clone(),
+                                        MCPServerConnectionState::Connected,
+                                    );
                                     // 重置重试计数 / Reset retry count
                                     retry_counts.write().await.remove(&bundle_id);
                                 }
                                 Err(e) => {
                                     error!(bundle_id = %bundle_id, error = %e, "Failed to reconnect to MCP server");
-                                    retry_counts
-                                        .write()
-                                        .await
-                                        .insert(bundle_id.clone(), retry_count + 1);
+                                    if matches!(
+                                        &e,
+                                        MCPClientError::HttpAuthentication(
+                                            HttpAuthenticationError::OAuthRequired
+                                        )
+                                    ) {
+                                        // Authorization is a user-action boundary, not a transient
+                                        // health failure. Retire the unusable data plane and its
+                                        // routes, retain activation, and stop automatic retries.
+                                        connection_states.write().await.insert(
+                                            bundle_id.clone(),
+                                            MCPServerConnectionState::AuthorizationRequired,
+                                        );
+                                        let mut clients = active_clients.write().await;
+                                        if clients
+                                            .get(&bundle_id)
+                                            .is_some_and(|current| StdArc::ptr_eq(current, &client))
+                                        {
+                                            clients.remove(&bundle_id);
+                                        }
+                                        drop(clients);
+                                        tool_routes
+                                            .write()
+                                            .await
+                                            .retain(|_, route| route.bundle_id != bundle_id);
+                                        let exposed_prefix = format!("{}__", bundle_id.as_str());
+                                        disabled_tools
+                                            .write()
+                                            .await
+                                            .retain(|tool| !tool.starts_with(&exposed_prefix));
+                                        retry_counts.write().await.remove(&bundle_id);
+                                    } else {
+                                        connection_states.write().await.insert(
+                                            bundle_id.clone(),
+                                            MCPServerConnectionState::Error,
+                                        );
+                                        retry_counts
+                                            .write()
+                                            .await
+                                            .insert(bundle_id.clone(), retry_count + 1);
+                                    }
                                 }
                             }
                         } else {
@@ -2098,7 +2269,33 @@ impl MCPServerManager {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
         let client = self.oauth_client_for(bundle_id).await?;
-        client.clear_oauth().await
+        client.clear_oauth().await?;
+
+        let is_started = self.activation_intents.read().await.contains(bundle_id);
+        self.connection_states.write().await.insert(
+            bundle_id.clone(),
+            if is_started {
+                MCPServerConnectionState::AuthorizationRequired
+            } else {
+                MCPServerConnectionState::Disconnected
+            },
+        );
+        let mut connected = self.active_clients.write().await.remove(bundle_id);
+        if let Some(ref mut connected) = connected {
+            if let Err(error) = connected.disconnect().await {
+                warn!(
+                    "OAuth credentials cleared for bundle_id={}, but transport disconnect failed: {}",
+                    bundle_id, error
+                );
+            }
+        }
+        if let Err(error) = self.refresh_tool_routes().await {
+            warn!(
+                "OAuth credentials cleared for bundle_id={}, but tool-route refresh failed: {}",
+                bundle_id, error
+            );
+        }
+        Ok(())
     }
 
     async fn oauth_client_for(
@@ -2720,6 +2917,7 @@ mod tests {
         release_health: tokio::sync::Notify,
         connect_calls: AtomicUsize,
         disconnect_calls: AtomicUsize,
+        oauth_required_on_connect: bool,
     }
 
     #[async_trait::async_trait]
@@ -2729,7 +2927,13 @@ mod tests {
         }
         async fn connect(&self) -> Result<(), MCPClientError> {
             self.connect_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.oauth_required_on_connect {
+                Err(MCPClientError::HttpAuthentication(
+                    HttpAuthenticationError::OAuthRequired,
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn disconnect(&self) -> Result<(), MCPClientError> {
             self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
@@ -3551,6 +3755,7 @@ mod tests {
             release_health: tokio::sync::Notify::new(),
             connect_calls: AtomicUsize::new(0),
             disconnect_calls: AtomicUsize::new(0),
+            oauth_required_on_connect: false,
         });
         manager
             .active_clients
@@ -3591,6 +3796,137 @@ mod tests {
             "a stale health snapshot must not reconnect a removed client"
         );
         assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
+    }
+
+    #[tokio::test]
+    async fn health_reconnect_oauth_required_retires_data_plane_and_routes() {
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("health-oauth");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("health-oauth", Some("health-oauth")),
+        );
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        let client = Arc::new(HealthRaceClient {
+            health_started: tokio::sync::Notify::new(),
+            release_health: tokio::sync::Notify::new(),
+            connect_calls: AtomicUsize::new(0),
+            disconnect_calls: AtomicUsize::new(0),
+            oauth_required_on_connect: true,
+        });
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), client.clone());
+        manager.tool_routes.write().await.insert(
+            "health-oauth__echo".to_string(),
+            ExposedToolRoute {
+                bundle_id: bundle_id.clone(),
+                server_name: "health-oauth".to_string(),
+                original_tool_name: "echo".to_string(),
+                alias: None,
+            },
+        );
+        manager
+            .disabled_tools
+            .write()
+            .await
+            .insert("health-oauth__disabled".to_string());
+        manager
+            .set_health_check_config(HealthCheckConfig {
+                interval_secs: 3600,
+                timeout_secs: 5,
+                enabled: true,
+            })
+            .await;
+        manager
+            .set_reconnect_policy(ReconnectPolicy {
+                enabled: true,
+                max_retries: 3,
+                initial_delay_ms: 0,
+                max_delay_ms: 0,
+                backoff_factor: 1.0,
+            })
+            .await;
+
+        let health_started = client.health_started.notified();
+        manager.start_health_monitor().await;
+        tokio::time::timeout(Duration::from_secs(2), health_started)
+            .await
+            .expect("health monitor did not inspect the client");
+        client.release_health.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !manager.active_clients.read().await.contains_key(&bundle_id) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("OAuth-blocked health reconnect did not retire the client");
+        manager.stop_health_monitor().await;
+
+        let runtime = manager.get_server_runtime_statuses().await;
+        assert_eq!(runtime[0].activation, MCPServerActivationState::Started);
+        assert_eq!(
+            runtime[0].connection,
+            MCPServerConnectionState::AuthorizationRequired
+        );
+        assert!(manager
+            .tool_routes
+            .read()
+            .await
+            .values()
+            .all(|route| route.bundle_id != bundle_id));
+        assert!(manager
+            .disabled_tools
+            .read()
+            .await
+            .iter()
+            .all(|tool| !tool.starts_with("health-oauth__")));
+        assert!(!manager.retry_counts.read().await.contains_key(&bundle_id));
+        assert_eq!(client.connect_calls.load(Ordering::SeqCst), 1);
+        manager.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_all_clears_activation_without_a_connected_client() {
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("activation-only");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("activation-only", Some("activation-only")),
+        );
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id, MCPServerConnectionState::AuthorizationRequired);
+
+        manager.stop_all().await.unwrap();
+
+        let runtime = manager.get_server_runtime_statuses().await;
+        assert_eq!(runtime[0].activation, MCPServerActivationState::Stopped);
+        assert_eq!(
+            runtime[0].connection,
+            MCPServerConnectionState::Disconnected
+        );
     }
 
     #[tokio::test]

@@ -873,6 +873,81 @@ impl fmt::Display for ClientState {
     }
 }
 
+/// 用户对 MCP Server 的启动意图 / User-requested MCP server activation state.
+///
+/// 该状态与传输连接正交：OAuth 授权尚未完成时，Server 仍可保持 `Started`，但连接状态为
+/// [`MCPServerConnectionState::AuthorizationRequired`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MCPServerActivationState {
+    /// 未启动或已被显式停止 / Not started or explicitly stopped.
+    Stopped,
+    /// 已接受启动请求 / Start request has been accepted.
+    Started,
+}
+
+impl fmt::Display for MCPServerActivationState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped => write!(f, "stopped"),
+            Self::Started => write!(f, "started"),
+        }
+    }
+}
+
+/// MCP Server 的数据面连接状态 / MCP server data-plane connection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MCPServerConnectionState {
+    /// 当前没有连接 / No current connection.
+    Disconnected,
+    /// 正在建立连接 / Establishing a connection.
+    Connecting,
+    /// 已连接，可提供 MCP 能力 / Connected and able to provide MCP capabilities.
+    Connected,
+    /// 连接被 OAuth 授权前置条件阻塞 / Connection is blocked on OAuth authorization.
+    AuthorizationRequired,
+    /// 最近一次连接尝试失败 / The latest connection attempt failed.
+    Error,
+}
+
+impl fmt::Display for MCPServerConnectionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disconnected => write!(f, "disconnected"),
+            Self::Connecting => write!(f, "connecting"),
+            Self::Connected => write!(f, "connected"),
+            Self::AuthorizationRequired => write!(f, "authorization_required"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// MCP Server 的正交运行时状态 / Orthogonal MCP server runtime status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MCPServerRuntimeStatus {
+    /// 稳定身份键 / Stable identity key.
+    pub bundle_id: BundleId,
+    /// 展示名称 / Display name.
+    pub name: ServerName,
+    /// 控制面启动意图 / Control-plane activation intent.
+    pub activation: MCPServerActivationState,
+    /// 数据面连接状态 / Data-plane connection state.
+    pub connection: MCPServerConnectionState,
+}
+
+impl MCPServerRuntimeStatus {
+    /// 是否已接受启动请求 / Whether activation has been requested and retained.
+    pub fn is_started(&self) -> bool {
+        self.activation == MCPServerActivationState::Started
+    }
+
+    /// 是否已连接并可提供 MCP 能力 / Whether the data plane is connected.
+    pub fn is_connected(&self) -> bool {
+        self.connection == MCPServerConnectionState::Connected
+    }
+}
+
 /// MCP客户端错误 / MCP client error
 #[derive(Debug, Error)]
 pub enum MCPClientError {
