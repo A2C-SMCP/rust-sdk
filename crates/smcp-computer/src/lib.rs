@@ -31,9 +31,9 @@ pub use errors::{ComputerError, ComputerResult};
 
 pub use oauth::{
     InMemoryOAuthCredentialStore, OAuthBeginRequest, OAuthCallback, OAuthCancellation,
-    OAuthCancellationReason, OAuthClientMode, OAuthClientRegistration, OAuthCredentialKey,
-    OAuthCredentialRecordKind, OAuthCredentialStore, OAuthCredentialStoreError, OAuthError,
-    OAuthFlow, OAuthFlowOutcome, OAuthLaunch, OAuthOptions, OAuthProtocolError, OAuthStatus,
+    OAuthCancellationReason, OAuthCredentialKey, OAuthCredentialRecordKind, OAuthCredentialStore,
+    OAuthCredentialStoreError, OAuthError, OAuthFlow, OAuthFlowOutcome, OAuthLaunch,
+    OAuthProtocolError, OAuthStatus,
 };
 /// #107 S7（#114）：runtime status / 事件公开面 re-export / runtime status surface re-export。
 pub use status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};

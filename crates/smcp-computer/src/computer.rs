@@ -772,7 +772,7 @@ impl<S: Session> Computer<S> {
     /// unchanged.
     ///
     /// Multi-tenant hosts should bind trusted tenant/principal context when constructing `store`;
-    /// that context does not belong in serializable OAuth configuration. An explicitly injected
+    /// that context does not belong in serializable server configuration. An explicitly injected
     /// store is authoritative: backend failures are returned and never trigger a silent in-memory
     /// fallback.
     #[must_use]
@@ -3541,9 +3541,6 @@ impl<S: Session> Computer<S> {
         let manager =
             MCPServerManager::with_oauth_credential_store(Arc::clone(&self.oauth_credential_store))
                 .with_oauth_events(Arc::clone(&self.status));
-        manager
-            .set_secret_resolver(self.secret_resolver.clone())
-            .await;
         if let Some(factory) = self.client_factory_override.clone() {
             manager.set_client_factory(Some(factory)).await;
         }

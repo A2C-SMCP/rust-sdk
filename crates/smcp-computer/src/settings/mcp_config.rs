@@ -1882,6 +1882,34 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn removed_http_oauth_fields_are_rejected_with_actionable_diagnostics() {
+        for field in ["authPolicy", "auth_policy", "oauth"] {
+            let mut sdef = json!({
+                "type": "streamable",
+                "server_parameters": {
+                    "url": "https://mcp.example/mcp",
+                    "headers": {}
+                }
+            });
+            sdef[field] = if field == "oauth" {
+                json!({})
+            } else {
+                json!("auto")
+            };
+
+            let (server, errors) = validate_server("remote", &sdef, SettingsScope::User, None);
+            assert!(server.is_none(), "{field} must invalidate the server");
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].field, "servers.remote");
+            assert!(
+                errors[0].reason.contains("no longer supported"),
+                "unexpected diagnostic for {field}: {}",
+                errors[0].reason
+            );
+        }
+    }
+
     // ---- 🟡1：resolve 层补测（对标 Python test_mcp_config 集成层）----------------
     /// 用不存在的 managed 路径，隔离真实系统 managed-mcp.json。
     fn no_managed(tmp: &TempDir) -> PathBuf {

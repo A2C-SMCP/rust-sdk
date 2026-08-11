@@ -10,41 +10,26 @@ Socket, or waits for a callback. `create_oauth_flow` registers a cancellable flo
 I/O begins; [`OAuthFlow::launch`] waits for discovery, client setup, PKCE, CSRF state, and the
 authorization URL.
 
-## Canonical resource configuration
+## Standards-derived OAuth context
 
-[`OAuthOptions::resource`] is the optional RFC 8707 canonical resource indicator. When it is
-omitted, the Streamable HTTP MCP endpoint remains the effective resource, so existing serialized
-configuration needs no migration. When it is present, the SDK validates it as an absolute URI
-without a fragment and uses the normalized value consistently for authorization requests,
-token requests, and [`OAuthCredentialKey`] isolation. The MCP transport still connects to the
-configured HTTP endpoint; endpoint headers are not copied to a different resource origin.
+OAuth has no public server-configuration fields. The canonical RFC 8707 resource, authorization
+server, scopes, and dynamic client registration are derived from the challenged MCP endpoint and
+validated RFC 9728/RFC 8414 or OIDC metadata. The SDK binds admission to the exact
+`resource_metadata` URL from the Bearer challenge and verifies that the document describes the
+challenged endpoint. It does not support proactive or cross-resource configuration.
 
-In automatic (`authPolicy: auto`) negotiation, `resource` must be omitted or normalize to the MCP
-endpoint. The SDK binds admission to the exact `resource_metadata` URL from the Bearer challenge
-and verifies that document describes the challenged endpoint. An intentional canonical resource
-that differs from the transport endpoint therefore requires proactive `authPolicy: oauth`; this
-keeps a challenge for endpoint A from admitting tokens discovered for unrelated resource B.
-
-```yaml
-oauth:
-  resource: https://resource.example/canonical-mcp
-  scopes: [tools.read]
-  mode:
-    type: authorizationCode
-    registration: preregistered
-    clientId: desktop-client
-```
-
-Proactive OAuth remains mutually exclusive with a static `Authorization` header, whether
-`resource` is explicit or inherited from the endpoint. Under automatic negotiation, a static
-header always selects static-only authentication; rejection is surfaced as
+The removed `oauth`, `authPolicy`, and `auth_policy` fields are rejected with an actionable
+configuration validation error instead of being ignored. A static `Authorization` header selects
+static-only authentication; rejection is surfaced as
 `HttpAuthenticationError::StaticCredentialsRejected` and never falls back to OAuth.
 
 ## Automatic OAuth admission
 
-Streamable HTTP is anonymous-first when no legacy proactive `oauth` block or explicit policy says
-otherwise. A host must expose an authorization action only after connection returns
-`HttpAuthenticationError::OAuthRequired`. That result means all of the following succeeded:
+Streamable HTTP without a static `Authorization` header is always anonymous-first. After automatic
+admission, the same connection attempt restores usable persisted Authorization Code credentials
+and performs one authenticated initialize. A host must expose an authorization action only when
+that bounded startup transaction returns `HttpAuthenticationError::OAuthRequired`; this means
+interactive user authorization is still required and all of the following checks succeeded:
 
 1. the server returned a syntactically valid Bearer challenge containing `resource_metadata`;
 2. that exact RFC 9728 protected-resource metadata URL was fetched and validated for the
@@ -56,7 +41,9 @@ Before admission, `oauth_status` and `create_oauth_flow` return `OAuthError::Not
 not perform discovery, registration, or token requests. Basic, Digest, unknown challenges, Bearer
 without metadata, failed discovery, bare 401, and ordinary 403 are separate
 `HttpAuthenticationError` values. A valid `403 insufficient_scope` can request step-up only when a
-validated OAuth coordinator already exists.
+validated OAuth coordinator already exists. Automatic startup never polls or infers runtime state
+from OAuth status: it performs at most one anonymous initialize and one challenge-triggered OAuth
+initialize, while OAuth status and MCP runtime status remain independent.
 
 rmcp 2.2 currently exposes only the first value when a server sends multiple independent
 `WWW-Authenticate` header fields. Consequently, `Basic` in the first field and `Bearer` in a later
@@ -69,7 +56,7 @@ that upstream limitation when integrating servers that advertise multiple scheme
 | Capability | `smcp-computer` OAuth core | Host flow driver | Authorization server |
 |---|---|---|---|
 | Protected-resource and authorization-server discovery | Owns | Does not reimplement | Publishes metadata |
-| Client setup, CIMD, DCR, and pre-registered clients | Owns | Supplies runtime configuration and secrets | Registers or recognizes the client |
+| Dynamic client registration | Owns | Does not configure client identity or secrets | Registers the client |
 | PKCE verifier, CSRF state, generation, and pending TTL | Owns | Treats returned state as opaque | Returns the state unchanged |
 | Redirect URI | Validates and sends the exact host value | Prepares the callback entry before `create_oauth_flow` | Redirects to the registered URI |
 | Authorization URL | Generates and returns [`OAuthLaunch`] | Delivers only to the intended user; never logs or persists it | Presents authentication and consent |

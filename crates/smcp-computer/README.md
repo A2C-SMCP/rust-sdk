@@ -24,9 +24,12 @@ OAuth only after a Bearer `WWW-Authenticate` challenge with `resource_metadata` 
 RFC 9728 protected-resource and issuer-bearing RFC 8414/OIDC authorization-server metadata; rmcp's
 derived legacy endpoints are not sufficient for automatic admission. Basic, Digest, bare
 401/403, failed discovery, and rejected static `Authorization` credentials remain distinct
-`HttpAuthenticationError` results and never enable the OAuth UI. Set `HttpAuthPolicy::Disabled` to
-disable negotiation, or keep an existing `oauth` block for proactive OAuth; `authPolicy: auto`
-allows the same block to act only as discovery overrides.
+`HttpAuthenticationError` results and never enable the OAuth UI. OAuth negotiation has no public
+configuration: `oauth`, `authPolicy`, and `auth_policy` are rejected with an actionable validation
+error. A static `Authorization` header always selects static-only authentication and never falls
+back to OAuth when rejected. After admission, the same `connect` call restores usable persisted
+Authorization Code credentials and completes one authenticated initialize; `OAuthRequired` is
+returned only when interactive user authorization is actually needed.
 
 OAuth HTTP MCP credentials are keyed by bundle, canonical resource, authorization server, and
 grant/client identity. `Computer` uses a private `InMemoryOAuthCredentialStore` by default and
@@ -40,17 +43,14 @@ let computer = Computer::new(name, session, inputs, servers, false, false)
 
 Desktop hosts may implement the trait with an OS Keychain backend. Cloud hosts should bind trusted
 tenant/principal context when constructing a DB/Vault-backed store. The injected backend must
-encrypt values at rest and must not log them. Client secrets and private keys remain
-`SecretValueResolver` inputs; pending PKCE state and callback routing are separate from credential
-storage. See [the OAuth architecture decision][oauth-architecture].
+encrypt values at rest and must not log them. Pending PKCE state and callback routing are separate
+from credential storage. See [the OAuth architecture decision][oauth-architecture].
 For browser/callback ownership, failure mapping, and local/cloud flow-driver requirements, follow
 the normative [OAuth host integration contract](docs/oauth-host-integration.md).
 
-`OAuthOptions.resource` may override the HTTP MCP URL for proactive OAuth when the RFC 8707
-canonical resource differs from the transport endpoint; omitting it preserves the endpoint
-default. Automatic negotiation requires the effective resource to match the MCP endpoint so the
-challenged `resource_metadata` document cannot authorize a different resource. Use
-`authPolicy: oauth` for an intentional cross-resource setup. Hosts can observe
+The canonical RFC 8707 resource, authorization server, scopes, and client registration are derived
+from the challenged endpoint and validated metadata; hosts cannot override them in server
+configuration. Hosts can observe
 deduplicated `ComputerEvent::OAuthStatusChanged { bundle_id, status }` events through
 `Computer::subscribe_events()` and use `Computer::oauth_status()` to resynchronize after a bounded
 broadcast receiver reports lag.
