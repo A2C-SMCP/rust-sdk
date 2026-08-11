@@ -11,7 +11,9 @@
 use crate::computer::{Computer, ConnectOptions, SilentSession};
 use crate::errors::ComputerError;
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
-use crate::mcp_clients::model::{BundleId, MCPServerConfig, MCPServerInput};
+use crate::mcp_clients::model::{
+    BundleId, MCPServerActivationState, MCPServerConfig, MCPServerConnectionState, MCPServerInput,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -116,27 +118,42 @@ impl CommandHandler {
 
         // 获取 MCP Manager 状态
         if self.computer.is_mcp_manager_initialized().await {
-            // 获取服务器状态列表
-            let server_status = self.computer.get_server_status().await;
+            // 获取正交的启动与连接状态，避免把等待 OAuth 的 server 显示成 Running。
+            let server_status = self.computer.get_server_runtime_statuses().await;
             let active_count = server_status
                 .iter()
-                .filter(|(_, _, active, _)| *active)
+                .filter(|status| status.is_started())
+                .count();
+            let connected_count = server_status
+                .iter()
+                .filter(|status| status.is_connected())
                 .count();
 
             println!("  MCP Manager: 已初始化 / Initialized");
             println!("  Active Servers: {}", active_count);
+            println!("  Connected Servers: {}", connected_count);
 
             // #121 B：一并展示 bundle_id（软件唯一身份）——`server rm` 按 bundle_id 寻址。
-            // #127：`bundle_id` 随 `get_server_status` 每行同源直出，**不再**按 name join 另一张映射——
+            // #127：`bundle_id` 随 runtime status 每行同源直出，**不再**按 name join 另一张映射——
             // 那张映射是 name-keyed 的，同名 server 会折叠，导致两行打印同一个 bundle_id、用户按提示
             // `server rm <bundle_id>` 删错对象且另一条从 CLI 完全无法寻址。
-            for (bundle_id, name, active, state) in server_status {
-                let status = if active {
-                    "运行中 / Running"
-                } else {
-                    "已停止 / Stopped"
+            for server in server_status {
+                let status = match (server.activation, server.connection) {
+                    (MCPServerActivationState::Stopped, _) => "已停止 / Stopped",
+                    (_, MCPServerConnectionState::Connected) => "运行中 / Running",
+                    (_, MCPServerConnectionState::Connecting) => "连接中 / Connecting",
+                    (_, MCPServerConnectionState::AuthorizationRequired) => {
+                        "等待授权 / Authorization required"
+                    }
+                    (_, MCPServerConnectionState::Error) => "连接错误 / Connection error",
+                    (_, MCPServerConnectionState::Disconnected) => {
+                        "已启动但未连接 / Started, disconnected"
+                    }
                 };
-                println!("    - {name} [bundle_id={bundle_id}]: {status} ({state})");
+                println!(
+                    "    - {} [bundle_id={}]: {} ({})",
+                    server.name, server.bundle_id, status, server.connection
+                );
             }
 
             // 获取可用工具数量

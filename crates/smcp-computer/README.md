@@ -422,12 +422,16 @@ cargo test -- --nocapture
 use tracing_subscriber;
 tracing_subscriber::fmt::init();
 
-// 监控服务器状态 / Monitor server status
-// 每行 = (bundle_id, name, is_active, state)：bundle_id 是唯一身份/寻址键，name 仅供展示（可碰撞）。
-let status = manager.get_server_status().await;
-for (bundle_id, name, active, state) in status {
-    println!("Server {} [{}]: active={}, state={}", name, bundle_id, active, state);
+// 监控正交的启动与连接状态 / Monitor orthogonal activation and connection states.
+let statuses = manager.get_server_runtime_statuses().await;
+for status in statuses {
+    println!(
+        "Server {} [{}]: activation={}, connection={}",
+        status.name, status.bundle_id, status.activation, status.connection
+    );
 }
+
+// 兼容接口 get_server_status() 仍可用；其中 is_active 表示“已启动”，state 表示连接状态。
 
 // 检查工具映射 / Check tool mapping
 let tools = manager.list_available_tools().await;
