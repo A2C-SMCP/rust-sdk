@@ -80,8 +80,8 @@ use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{
         content_as_text, is_call_tool_error, BundleId, CallToolResult, CancellableCallOutcome,
-        Content, MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification,
-        ReadResourceResult, Resource, ServerName, Tool,
+        Content, MCPServerConfig, MCPServerInput, MCPServerRuntimeStatus, McpChangeKind,
+        McpServerNotification, ReadResourceResult, Resource, ServerName, Tool,
     },
     ConfigRender, RenderError,
 };
@@ -3064,12 +3064,21 @@ impl<S: Session> Computer<S> {
         Ok(history.clone())
     }
 
-    /// 获取服务器状态列表 `(bundle_id, name, is_active, state)` / Get server status list。
+    /// 获取正交的 MCP Server 启动与连接状态 / Get orthogonal activation and connection states.
     ///
-    /// 每行**自带身份键** `bundle_id`（#127）——`remove_server` 按 bundle_id 寻址（协议 §身份：`name` 非
-    /// 身份键），故 client / CLI 直接从本列表拿到寻址键，**无需**再按 name 去 join 另一张映射（旧的
-    /// `materialized_server_bundle_ids` 即为此 join 而设，其 name-keyed map 在同名场景下会折叠身份，
-    /// 令 CLI 给两行打印同一个 bundle_id → `server rm` 删错对象；该 API 随本次修复移除）。
+    /// 每项自带唯一身份键 `bundle_id`；`name` 仅供展示且允许碰撞。
+    pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
+        let manager_guard = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager_guard {
+            manager.get_server_runtime_statuses().await
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 兼容 tuple 状态接口 `(bundle_id, name, is_active, state)`；`is_active` 表示已启动，
+    /// `state` 表示当前连接状态。
+    /// 新代码应优先使用 [`Self::get_server_runtime_statuses`]。
     pub async fn get_server_status(&self) -> Vec<(BundleId, ServerName, bool, String)> {
         let manager_guard = self.mcp_manager.read().await;
         if let Some(ref manager) = *manager_guard {
@@ -3099,10 +3108,10 @@ impl<S: Session> Computer<S> {
             let manager_guard = self.mcp_manager.read().await;
             if let Some(ref manager) = *manager_guard {
                 let active = manager
-                    .get_server_status()
+                    .get_server_runtime_statuses()
                     .await
                     .into_iter()
-                    .filter(|(_, _, active, _)| *active)
+                    .filter(MCPServerRuntimeStatus::is_connected)
                     .count();
                 // 廉价：读已缓存 tool_mapping 长度，不发 tools/list RPC（🟡 修复：status 不因 MCP server 挂起而阻塞）。
                 let tools = manager.tool_count().await;
@@ -3625,11 +3634,20 @@ impl<S: Session> Computer<S> {
 
     /// Clear persisted tokens and pending authorization state.
     pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), crate::oauth::OAuthError> {
-        let manager = self.mcp_manager.read().await;
-        let manager = manager
-            .as_ref()
-            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
-        manager.clear_oauth(bundle_id).await
+        let outcome = {
+            let manager = self.mcp_manager.read().await;
+            let manager = manager
+                .as_ref()
+                .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            manager.clear_oauth_with_outcome(bundle_id).await?
+        };
+
+        // The manager commits connection/client/route state before returning. Release its guard
+        // before publishing the revision so event consumers always re-query the final projection.
+        if outcome.capability_changed {
+            self.on_capability_changed().await;
+        }
+        Ok(())
     }
 
     /// #148：MCP 起停**真有变更**后：bump capability revision（§12 R2：改变 Agent-facing 工具投影）

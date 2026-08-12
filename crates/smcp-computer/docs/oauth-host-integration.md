@@ -45,6 +45,21 @@ validated OAuth coordinator already exists. Automatic startup never polls or inf
 from OAuth status: it performs at most one anonymous initialize and one challenge-triggered OAuth
 initialize, while OAuth status and MCP runtime status remain independent.
 
+An accepted `start_client_by_id` is retained as
+`MCPServerActivationState::Started` even when that call returns
+`HttpAuthenticationError::OAuthRequired`; the orthogonal connection state is then
+`MCPServerConnectionState::AuthorizationRequired`. Only an explicit stop clears activation.
+Clearing OAuth credentials retires the connected data plane while retaining activation, producing
+the same `Started + AuthorizationRequired` lifecycle as a cold start that needs authorization.
+After connection, client authority, and cached tool routes have been withdrawn, a successful clear
+that changed capability bumps `capability_revision`, publishes `CapabilityRevisionBumped`, and—if
+the Computer has joined an Office—emits `server:update_tool_list`. Office peers receive the
+corresponding `notify:update_tool_list` invalidation and should pull the authoritative tool list;
+the notification does not carry tools itself. Repeating an already-effective clear does not bump
+or notify again. Hosts should use `get_server_runtime_statuses` for the lifecycle distinction. The
+legacy tuple returned by `get_server_status` projects `is_active` from activation and `state` from
+connection state.
+
 rmcp 2.2 currently exposes only the first value when a server sends multiple independent
 `WWW-Authenticate` header fields. Consequently, `Basic` in the first field and `Bearer` in a later
 field is classified from the first field only. A combined field containing both challenges works.

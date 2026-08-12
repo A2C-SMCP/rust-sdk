@@ -53,6 +53,47 @@ pub struct ExposedToolRoute {
     pub alias: Option<String>,
 }
 
+/// Internal result of clearing one server's OAuth state.
+///
+/// The public manager and [`crate::computer::Computer`] facades retain their existing `Result<()>`
+/// signatures. The Computer facade consumes this richer result so it can invalidate Agent-facing
+/// capability caches only when the clear actually withdrew a live data plane or stale routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OAuthClearOutcome {
+    pub(crate) capability_changed: bool,
+}
+
+fn bump_active_client_generation(generations: &mut HashMap<BundleId, u64>, bundle_id: &BundleId) {
+    let generation = generations.entry(bundle_id.clone()).or_default();
+    *generation = generation.wrapping_add(1);
+}
+
+/// Deterministically withdraw one server's cached tool projection without contacting any MCP.
+///
+/// This is the fail-closed primitive shared by explicit OAuth clearing and the health monitor's
+/// OAuth-required boundary. A full [`MCPServerManager::refresh_tool_routes`] would issue
+/// `tools/list` against unrelated servers and could delay local authority revocation.
+async fn withdraw_bundle_tool_routes(
+    tool_routes: &RwLock<HashMap<ExposedToolName, ExposedToolRoute>>,
+    disabled_tools: &RwLock<HashSet<ExposedToolName>>,
+    bundle_id: &BundleId,
+) -> bool {
+    let routes_changed = {
+        let mut routes = tool_routes.write().await;
+        let before = routes.len();
+        routes.retain(|_, route| route.bundle_id != *bundle_id);
+        routes.len() != before
+    };
+    let disabled_changed = {
+        let exposed_prefix = format!("{}__", bundle_id.as_str());
+        let mut disabled = disabled_tools.write().await;
+        let before = disabled.len();
+        disabled.retain(|tool| !tool.starts_with(&exposed_prefix));
+        disabled.len() != before
+    };
+    routes_changed || disabled_changed
+}
+
 /// client factory 类型（#152 测试接缝）/ client factory type（test seam）。
 ///
 /// [`MCPServerManager::start_client_by_id`] 默认用自由函数 [`client_factory`]
@@ -84,10 +125,18 @@ pub struct MCPServerManager {
     servers_config: Arc<RwLock<HashMap<BundleId, MCPServerConfig>>>,
     /// 活动客户端映射（键 = `bundle_id`）/ Active client mapping keyed by bundle_id。
     active_clients: Arc<RwLock<HashMap<BundleId, StdArc<dyn MCPClientProtocol>>>>,
+    /// Per-bundle epochs for active-client mutations, including same-Arc remove/reinsert (ABA).
+    active_client_generations: Arc<RwLock<HashMap<BundleId, u64>>>,
+    /// 已接受的启动意图；不因 OAuth 尚未授权或连接失败而丢失。
+    activation_intents: Arc<RwLock<HashSet<BundleId>>>,
+    /// 最近一次数据面连接状态；与 `activation_intents` 正交。
+    connection_states: Arc<RwLock<HashMap<BundleId, MCPServerConnectionState>>>,
     /// 聚合工具路由表：`exposed_tool_name -> ExposedToolRoute`（get_tools 与 tool_call 共享，单射整键查表）。
     tool_routes: Arc<RwLock<HashMap<ExposedToolName, ExposedToolRoute>>>,
     /// 禁用工具集合（键 = `exposed_tool_name`）/ Disabled tools set keyed by exposed_tool_name。
     disabled_tools: Arc<RwLock<HashSet<ExposedToolName>>>,
+    /// Serialize full projection rebuilds; lifecycle revocation never takes this lock.
+    tool_route_refresh_lock: Arc<Mutex<()>>,
     /// 自动重连标志 / Auto reconnect flag
     auto_reconnect: Arc<RwLock<bool>>,
     /// 自动连接标志 / Auto connect flag
@@ -157,8 +206,12 @@ impl MCPServerManager {
         Self {
             servers_config: Arc::new(RwLock::new(HashMap::new())),
             active_clients: Arc::new(RwLock::new(HashMap::new())),
+            active_client_generations: Arc::new(RwLock::new(HashMap::new())),
+            activation_intents: Arc::new(RwLock::new(HashSet::new())),
+            connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
+            tool_route_refresh_lock: Arc::new(Mutex::new(())),
             auto_reconnect: Arc::new(RwLock::new(true)),
             auto_connect: Arc::new(RwLock::new(false)),
             state_notifier: state_tx,
@@ -187,8 +240,12 @@ impl MCPServerManager {
         Self {
             servers_config: Arc::new(RwLock::new(HashMap::new())),
             active_clients: Arc::new(RwLock::new(HashMap::new())),
+            active_client_generations: Arc::new(RwLock::new(HashMap::new())),
+            activation_intents: Arc::new(RwLock::new(HashSet::new())),
+            connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
+            tool_route_refresh_lock: Arc::new(Mutex::new(())),
             auto_reconnect: Arc::new(RwLock::new(reconnect_policy.enabled)),
             auto_connect: Arc::new(RwLock::new(false)),
             state_notifier: state_tx,
@@ -352,17 +409,15 @@ impl MCPServerManager {
         let lifecycle = self.lifecycle_lock(&bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
 
-        // 检查是否已激活（按 bundle_id）/ Check if already active (by bundle_id)
-        let is_active = {
-            let clients = self.active_clients.read().await;
-            clients.contains_key(&bundle_id)
-        };
+        // 配置更新应保留控制面的启动意图，即使数据面正等待 OAuth。
+        let was_started = self.activation_intents.read().await.contains(&bundle_id);
+        let was_connected = self.active_clients.read().await.contains_key(&bundle_id);
 
-        if is_active {
+        if was_connected {
             let auto_reconnect = *self.auto_reconnect.read().await;
             if !auto_reconnect {
                 return Err(ComputerError::InvalidConfiguration(format!(
-                    "Server {} (bundle_id={}) is active. Stop it before updating config",
+                    "Server {} (bundle_id={}) is started. Stop it before updating config",
                     config.name(),
                     bundle_id
                 )));
@@ -380,8 +435,12 @@ impl MCPServerManager {
                     ComputerError::ConnectionError(format!("failed to drain OAuth flow: {error}"))
                 })?;
         }
-        if is_active {
-            self.stop_client_by_id_inner(&bundle_id).await?;
+        if was_connected {
+            self.disconnect_client_by_id_inner(&bundle_id).await?;
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
 
         // 更新配置（原地更新：同 bundle_id 覆盖）/ Update configuration (update-in-place by bundle_id)
@@ -392,8 +451,16 @@ impl MCPServerManager {
 
         // 检查是否需要自动连接 / Check if need auto connect
         let auto_connect = *self.auto_connect.read().await;
-        if is_active || auto_connect {
+        if was_connected || auto_connect {
             self.start_client_by_id_inner(&bundle_id).await?;
+        } else if was_started {
+            // Replacing an authorization-blocked server must retire the old OAuth capability
+            // without synchronously starting another provider transaction. Activation remains
+            // explicit and observable, while the new config has no live data-plane connection.
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
 
         // 刷新工具路由 / Refresh tool routes
@@ -437,6 +504,7 @@ impl MCPServerManager {
             let mut configs = self.servers_config.write().await;
             configs.remove(bundle_id);
         }
+        self.connection_states.write().await.remove(bundle_id);
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
 
@@ -496,13 +564,29 @@ impl MCPServerManager {
             )));
         }
 
-        // 检查是否已启动 / Check if already started
+        // `start` first records the accepted control-plane intent. A subsequent OAuth challenge
+        // or transport error changes only the orthogonal connection state.
+        self.activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+
+        // 检查是否已连接 / Check if already connected
         {
             let clients = self.active_clients.read().await;
             if clients.contains_key(bundle_id) {
+                self.connection_states
+                    .write()
+                    .await
+                    .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
                 return Ok(()); // 已经启动 / Already started
             }
         }
+
+        self.connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connecting);
 
         // 创建客户端（注入通知上报接缝，用 **bundle_id** 打来源标签——消费侧定向重挂按身份寻址，#106/#127）。
         let notify = self.notify_ctx_for(bundle_id).await;
@@ -540,19 +624,41 @@ impl MCPServerManager {
         };
 
         // 连接服务器 / Connect to server
-        client.connect().await.map_err(|error| match error {
-            MCPClientError::HttpAuthentication(error) => ComputerError::HttpAuthentication(error),
-            error => ComputerError::ConnectionError(format!(
-                "Failed to connect to {}: {}",
-                server_name, error
-            )),
-        })?;
+        if let Err(error) = client.connect().await {
+            let connection = if matches!(
+                &error,
+                MCPClientError::HttpAuthentication(HttpAuthenticationError::OAuthRequired)
+            ) {
+                MCPServerConnectionState::AuthorizationRequired
+            } else {
+                MCPServerConnectionState::Error
+            };
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), connection);
+            return Err(match error {
+                MCPClientError::HttpAuthentication(error) => {
+                    ComputerError::HttpAuthentication(error)
+                }
+                error => ComputerError::ConnectionError(format!(
+                    "Failed to connect to {}: {}",
+                    server_name, error
+                )),
+            });
+        }
 
         // 添加到活动客户端（按 bundle_id）/ Add to active clients (by bundle_id)
         {
             let mut clients = self.active_clients.write().await;
             clients.insert(bundle_id.clone(), client);
+            let mut generations = self.active_client_generations.write().await;
+            bump_active_client_generation(&mut generations, bundle_id);
         }
+        self.connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
 
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
@@ -571,7 +677,7 @@ impl MCPServerManager {
     /// 🔴 **返回 `bool` 是假回执的根治点**：库层对缺席键保持**幂等**（无可停、非错误），但把「有没有停到东西」
     /// **如实上报**给调用方——否则 CLI 无从分辨「真停了」与「压根没这个活跃客户端」，只能一律打 ✅，那正是
     /// 本 Issue 要消灭的谎报（拼错的 server 名恰好是合法 bundle_id 字面量时尤甚）。
-    /// `Ok(true)` = 确有活跃客户端被摘除并断连；`Ok(false)` = 该身份键无活跃客户端，未做任何事。
+    /// `Ok(true)` = 确有启动意图或活跃连接被停止；`Ok(false)` = 该身份键既未启动也未连接。
     pub async fn stop_client_by_id(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
@@ -579,10 +685,34 @@ impl MCPServerManager {
     }
 
     async fn stop_client_by_id_inner(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
+        let was_started = self.activation_intents.write().await.remove(bundle_id);
+        let was_connected = self.disconnect_client_by_id_inner(bundle_id).await?;
+
+        if was_started || was_connected {
+            info!("Client (bundle_id={}) stopped successfully", bundle_id);
+        } else {
+            debug!(
+                "Server bundle_id={} was neither started nor connected — nothing to stop (idempotent)",
+                bundle_id
+            );
+        }
+        Ok(was_started || was_connected)
+    }
+
+    /// Retire only the data-plane client while preserving the control-plane activation intent.
+    async fn disconnect_client_by_id_inner(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<bool, ComputerError> {
         // 移除客户端 / Remove client
         let mut client = {
             let mut clients = self.active_clients.write().await;
-            clients.remove(bundle_id)
+            let client = clients.remove(bundle_id);
+            if client.is_some() {
+                let mut generations = self.active_client_generations.write().await;
+                bump_active_client_generation(&mut generations, bundle_id);
+            }
+            client
         };
         let was_active = client.is_some();
 
@@ -599,14 +729,6 @@ impl MCPServerManager {
         // 刷新工具路由（幂等，无论是否停到都保持路由一致）/ Refresh tool routes
         self.refresh_tool_routes().await?;
 
-        if was_active {
-            info!("Client (bundle_id={}) stopped successfully", bundle_id);
-        } else {
-            debug!(
-                "No active client for bundle_id={} — nothing to stop (idempotent)",
-                bundle_id
-            );
-        }
         Ok(was_active)
     }
 
@@ -639,10 +761,11 @@ impl MCPServerManager {
 
     /// 停止所有客户端 / Stop all clients
     pub async fn stop_all(&self) -> Result<(), ComputerError> {
-        let bundle_ids: Vec<BundleId> = {
+        let mut bundle_ids: HashSet<BundleId> = {
             let clients = self.active_clients.read().await;
             clients.keys().cloned().collect()
         };
+        bundle_ids.extend(self.activation_intents.read().await.iter().cloned());
 
         for bundle_id in bundle_ids {
             self.stop_client_by_id(&bundle_id).await?;
@@ -658,7 +781,19 @@ impl MCPServerManager {
     /// 清空所有状态 / Clear all state
     async fn clear_all(&self) -> Result<(), ComputerError> {
         self.servers_config.write().await.clear();
-        self.active_clients.write().await.clear();
+        {
+            let mut clients = self.active_clients.write().await;
+            if !clients.is_empty() {
+                let removed = clients.keys().cloned().collect::<Vec<_>>();
+                clients.clear();
+                let mut generations = self.active_client_generations.write().await;
+                for bundle_id in removed {
+                    bump_active_client_generation(&mut generations, &bundle_id);
+                }
+            }
+        }
+        self.activation_intents.write().await.clear();
+        self.connection_states.write().await.clear();
         self.tool_routes.write().await.clear();
         self.disabled_tools.write().await.clear();
         let oauth_clients = {
@@ -721,108 +856,169 @@ impl MCPServerManager {
     /// #106：运行期 `tools/list_changed` 到达时须在 `emit_update_tool_list` **之前**调用，否则新增工具不进路由
     /// → `list_available_tools` 漏掉 → Agent 回拉看不到（"坑 1"）。消费者任务在 event-loop 外调用，无重入风险。
     pub async fn refresh_tool_routes(&self) -> Result<(), ComputerError> {
-        let mut routes: HashMap<ExposedToolName, ExposedToolRoute> = HashMap::new();
-        let mut disabled: HashSet<ExposedToolName> = HashSet::new();
+        let _refresh_guard = self.tool_route_refresh_lock.lock().await;
 
-        // 收集所有活动服务器的工具 / Collect tools from all active servers
-        let clients = self.active_clients.read().await;
-        let configs = self.servers_config.read().await;
+        loop {
+            let mut routes: HashMap<ExposedToolName, ExposedToolRoute> = HashMap::new();
+            // Keep the owner alongside each disabled name until commit so stale snapshots can be
+            // filtered without reverse-parsing the exposed name.
+            let mut disabled: HashMap<ExposedToolName, BundleId> = HashMap::new();
 
-        for (bundle_id, client) in clients.iter() {
-            let config = match configs.get(bundle_id) {
-                Some(c) => c,
-                None => continue,
+            // Snapshot clients/configs, then release both global locks before any tools/list RPC.
+            // In particular, OAuth clear must be able to revoke a client while an upstream list
+            // call is blocked. Keep the complete active snapshot (including entries without a
+            // config) so commit can detect additions/removals/replacements and retry instead of
+            // overwriting a newer projection with an older full-table rebuild.
+            let (snapshot_generations, snapshot_clients, entries) = {
+                let clients = self.active_clients.read().await;
+                let configs = self.servers_config.read().await;
+                let generations = self.active_client_generations.read().await;
+                let snapshot_generations = clients
+                    .keys()
+                    .map(|bundle_id| {
+                        (
+                            bundle_id.clone(),
+                            generations.get(bundle_id).copied().unwrap_or_default(),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                let snapshot_clients = clients
+                    .iter()
+                    .map(|(bundle_id, client)| (bundle_id.clone(), StdArc::clone(client)))
+                    .collect::<HashMap<_, _>>();
+                let entries = clients
+                    .iter()
+                    .filter_map(|(bundle_id, client)| {
+                        configs
+                            .get(bundle_id)
+                            .cloned()
+                            .map(|config| (bundle_id.clone(), StdArc::clone(client), config))
+                    })
+                    .collect::<Vec<_>>();
+                (snapshot_generations, snapshot_clients, entries)
             };
-            let server_name = config.name().to_string();
 
-            // #134：`default_tool_meta.alias` 天生 per-tool、放 default 位无合理用例（无法把 N 个工具改成
-            // 同一名）。merged_tool_meta 已不再继承它；此处每 server 每次 refresh 打一次配置诊断，把「静默
-            // 忽略」变响亮（不静默丢 + 配置诊断姿态）。空串按未设处理，与 python 真值判定逐行同构。
-            if config
-                .default_tool_meta()
-                .and_then(|d| d.alias.as_deref())
-                .is_some_and(|a| !a.is_empty())
-            {
-                warn!(
-                    bundle_id = %bundle_id,
-                    server_name = %server_name,
-                    "default_tool_meta.alias is ignored (aliases are per-tool; a default alias would \
-                     collapse all tools of this server into one exposed name). Rename via per-tool \
-                     tool_meta.<tool>.alias instead (config diagnostic)"
-                );
-            }
+            for (bundle_id, client, config) in &entries {
+                let server_name = config.name().to_string();
 
-            // 获取工具列表 / Get tool list
-            match client.list_tools().await {
-                Ok(tools) => {
-                    for tool in tools {
-                        let original_tool_name = tool.name.to_string();
+                // #134：`default_tool_meta.alias` 天生 per-tool、放 default 位无合理用例（无法把 N 个工具改成
+                // 同一名）。merged_tool_meta 已不再继承它；此处每 server 每次 refresh 打一次配置诊断，把「静默
+                // 忽略」变响亮（不静默丢 + 配置诊断姿态）。空串按未设处理，与 python 真值判定逐行同构。
+                if config
+                    .default_tool_meta()
+                    .and_then(|d| d.alias.as_deref())
+                    .is_some_and(|a| !a.is_empty())
+                {
+                    warn!(
+                        bundle_id = %bundle_id,
+                        server_name = %server_name,
+                        "default_tool_meta.alias is ignored (aliases are per-tool; a default alias would \
+                         collapse all tools of this server into one exposed name). Rename via per-tool \
+                         tool_meta.<tool>.alias instead (config diagnostic)"
+                    );
+                }
 
-                        // 合并工具元数据取 alias（仅替换工具名部分）/ merged alias (replaces the tool-name part)。
-                        let tool_meta = self.merged_tool_meta(config, &original_tool_name);
-                        let alias = tool_meta.and_then(|meta| meta.alias);
+                // 获取工具列表 / Get tool list
+                match client.list_tools().await {
+                    Ok(tools) => {
+                        for tool in tools {
+                            let original_tool_name = tool.name.to_string();
 
-                        // exposed 名 = {bundle_id}__{alias ?? original}，恒带前缀、跨 bundle 唯一。
-                        let exposed = bundle_id::exposed_tool_name(
-                            bundle_id,
-                            alias.as_deref(),
-                            &original_tool_name,
-                        );
+                            // 合并工具元数据取 alias（仅替换工具名部分）/ merged alias (replaces the tool-name part)。
+                            let tool_meta = self.merged_tool_meta(config, &original_tool_name);
+                            let alias = tool_meta.and_then(|meta| meta.alias);
 
-                        // forbidden_tools 按 original 或 exposed 命中 → 不暴露、不路由（记入 disabled 供 4001 前
-                        // 更明确的 PermissionError）。The forbidden check precedes routing so a disabled tool
-                        // is neither exposed nor routed.
-                        let forbidden_tools = config.forbidden_tools();
-                        if forbidden_tools
-                            .iter()
-                            .any(|f| f == &original_tool_name || f == &exposed)
-                        {
-                            disabled.insert(exposed);
-                            continue;
-                        }
-
-                        // 同一 bundle_id 内 alias 撞出相同 exposed 名：本地配置诊断，first-wins（跨 bundle 不会撞）。
-                        if let Some(existing) = routes.get(&exposed) {
-                            warn!(
-                                bundle_id = %bundle_id,
-                                exposed = %exposed,
-                                kept = %existing.original_tool_name,
-                                dropped = %original_tool_name,
-                                "duplicate exposed_tool_name within one bundle_id (alias collision); \
-                                 keeping first (config diagnostic)"
+                            // exposed 名 = {bundle_id}__{alias ?? original}，恒带前缀、跨 bundle 唯一。
+                            let exposed = bundle_id::exposed_tool_name(
+                                bundle_id,
+                                alias.as_deref(),
+                                &original_tool_name,
                             );
-                            continue;
-                        }
 
-                        routes.insert(
-                            exposed,
-                            ExposedToolRoute {
-                                bundle_id: bundle_id.clone(),
-                                server_name: server_name.clone(),
-                                original_tool_name,
-                                alias,
-                            },
+                            // forbidden_tools 按 original 或 exposed 命中 → 不暴露、不路由（记入 disabled 供 4001 前
+                            // 更明确的 PermissionError）。The forbidden check precedes routing so a disabled tool
+                            // is neither exposed nor routed.
+                            let forbidden_tools = config.forbidden_tools();
+                            if forbidden_tools
+                                .iter()
+                                .any(|f| f == &original_tool_name || f == &exposed)
+                            {
+                                disabled.insert(exposed, bundle_id.clone());
+                                continue;
+                            }
+
+                            // 同一 bundle_id 内 alias 撞出相同 exposed 名：本地配置诊断，first-wins（跨 bundle 不会撞）。
+                            if let Some(existing) = routes.get(&exposed) {
+                                warn!(
+                                    bundle_id = %bundle_id,
+                                    exposed = %exposed,
+                                    kept = %existing.original_tool_name,
+                                    dropped = %original_tool_name,
+                                    "duplicate exposed_tool_name within one bundle_id (alias collision); \
+                                     keeping first (config diagnostic)"
+                                );
+                                continue;
+                            }
+
+                            routes.insert(
+                                exposed,
+                                ExposedToolRoute {
+                                    bundle_id: bundle_id.clone(),
+                                    server_name: server_name.clone(),
+                                    original_tool_name,
+                                    alias,
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Error listing tools for {} (bundle_id={}): {}",
+                            server_name, bundle_id, e
                         );
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Error listing tools for {} (bundle_id={}): {}",
-                        server_name, bundle_id, e
-                    );
-                }
             }
+
+            // Validate the complete active snapshot at commit. Take projection locks before the
+            // active-client guard so readers never encounter an ABBA lock order. A changed set or
+            // identity means this full-table result is stale; retry under the refresh mutex.
+            let mut tool_routes = self.tool_routes.write().await;
+            let mut disabled_tools = self.disabled_tools.write().await;
+            let active_clients = self.active_clients.read().await;
+            let active_generations = self.active_client_generations.read().await;
+            let snapshot_is_current = active_clients.len() == snapshot_clients.len()
+                && snapshot_clients.iter().all(|(bundle_id, snapshot)| {
+                    active_clients
+                        .get(bundle_id)
+                        .is_some_and(|current| StdArc::ptr_eq(snapshot, current))
+                        && active_generations
+                            .get(bundle_id)
+                            .copied()
+                            .unwrap_or_default()
+                            == snapshot_generations
+                                .get(bundle_id)
+                                .copied()
+                                .unwrap_or_default()
+                });
+            if !snapshot_is_current {
+                drop(active_generations);
+                drop(active_clients);
+                drop(disabled_tools);
+                drop(tool_routes);
+                continue;
+            }
+            let disabled: HashSet<ExposedToolName> = disabled.into_keys().collect();
+
+            // 原子换出（单表读侧只见旧或新整表）/ swap in the freshly built tables.
+            *tool_routes = routes;
+            *disabled_tools = disabled;
+            drop(active_generations);
+            drop(active_clients);
+
+            debug!("Tool routes refreshed successfully");
+            return Ok(());
         }
-
-        drop(clients);
-        drop(configs);
-
-        // 原子换出（读侧只见旧或新整表）/ atomically swap in the freshly built tables。
-        *self.tool_routes.write().await = routes;
-        *self.disabled_tools.write().await = disabled;
-
-        debug!("Tool routes refreshed successfully");
-        Ok(())
     }
 
     /// 验证工具调用并路由 / Validate a tool call and route it（协议 0.3.0 BundleID 模型）。
@@ -1096,33 +1292,80 @@ impl MCPServerManager {
             .await
     }
 
+    /// 获取正交的服务器运行时状态 / Get orthogonal server runtime statuses.
+    pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
+        let configs: Vec<(BundleId, ServerName)> = self
+            .servers_config
+            .read()
+            .await
+            .iter()
+            .map(|(bundle_id, config)| (bundle_id.clone(), config.name().to_string()))
+            .collect();
+        let activation_intents = self.activation_intents.read().await.clone();
+        let remembered_connections = self.connection_states.read().await.clone();
+        let live_connections: HashMap<BundleId, ClientState> = self
+            .active_clients
+            .read()
+            .await
+            .iter()
+            .map(|(bundle_id, client)| (bundle_id.clone(), client.state()))
+            .collect();
+
+        configs
+            .into_iter()
+            .map(|(bundle_id, name)| {
+                let activation = if activation_intents.contains(&bundle_id) {
+                    MCPServerActivationState::Started
+                } else {
+                    MCPServerActivationState::Stopped
+                };
+                let remembered = remembered_connections.get(&bundle_id).copied();
+                let connection = if activation == MCPServerActivationState::Stopped {
+                    MCPServerConnectionState::Disconnected
+                } else if remembered == Some(MCPServerConnectionState::AuthorizationRequired) {
+                    // This terminal user-action boundary is committed before the unusable live
+                    // client is retired, so prefer it over a concurrently sampled client state.
+                    MCPServerConnectionState::AuthorizationRequired
+                } else if let Some(state) = live_connections.get(&bundle_id) {
+                    match state {
+                        ClientState::Initialized => MCPServerConnectionState::Connecting,
+                        ClientState::Connected => MCPServerConnectionState::Connected,
+                        ClientState::Disconnected => MCPServerConnectionState::Disconnected,
+                        ClientState::Error => MCPServerConnectionState::Error,
+                    }
+                } else {
+                    remembered.unwrap_or(MCPServerConnectionState::Disconnected)
+                };
+                MCPServerRuntimeStatus {
+                    bundle_id,
+                    name,
+                    activation,
+                    connection,
+                }
+            })
+            .collect()
+    }
+
     /// 获取服务器状态列表 `(bundle_id, name, is_active, state)` / Get server status list。
     ///
     /// **每行自带身份键（#127）**：`.0` = `bundle_id`（唯一身份、寻址键），`.1` = display 名（人类可读、
     /// 可碰撞、非身份）。此前只出 name，调用方（CLI `status`）须再按 name 去 join 一张 name-keyed 的
     /// bundle_id 映射——同名 server 在那张映射里折叠，导致两行打印**同一个** `bundle_id`、用户按
     /// `server rm <bundle_id>` 删错对象。同源直出即消除该 join。
+    ///
+    /// 兼容 tuple 中 `is_active` 现在投影控制面 `is_started`；`state` 投影数据面连接状态。新代码应优先使用
+    /// [`Self::get_server_runtime_statuses`]，避免再次把两个维度耦合。
     pub async fn get_server_status(&self) -> Vec<(BundleId, ServerName, bool, String)> {
-        let configs = self.servers_config.read().await;
-        let clients = self.active_clients.read().await;
-
-        configs
-            .iter()
-            .map(|(bundle_id, config)| {
-                let is_active = clients.contains_key(bundle_id);
-                let state = if is_active {
-                    clients
-                        .get(bundle_id)
-                        .map(|c| c.state().to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                } else {
-                    "pending".to_string()
-                };
+        self.get_server_runtime_statuses()
+            .await
+            .into_iter()
+            .map(|status| {
+                let is_started = status.is_started();
                 (
-                    bundle_id.clone(),
-                    config.name().to_string(),
-                    is_active,
-                    state,
+                    status.bundle_id,
+                    status.name,
+                    is_started,
+                    status.connection.to_string(),
                 )
             })
             .collect()
@@ -1135,21 +1378,23 @@ impl MCPServerManager {
     /// 额外带 `name`（纯 display，key 不再人类可读，故须显式暴露展示名）。
     /// Returns format: `{ bundle_id: { name, type, status, disabled, ... } }`。
     pub async fn get_server_configs(&self) -> serde_json::Value {
+        let runtime_statuses: HashMap<BundleId, MCPServerRuntimeStatus> = self
+            .get_server_runtime_statuses()
+            .await
+            .into_iter()
+            .map(|status| (status.bundle_id.clone(), status))
+            .collect();
         let configs = self.servers_config.read().await;
-        let clients = self.active_clients.read().await;
 
         let mut result = serde_json::Map::new();
 
         for (bundle_id, config) in configs.iter() {
-            let is_active = clients.contains_key(bundle_id);
-            let state = if is_active {
-                clients
-                    .get(bundle_id)
-                    .map(|c| c.state().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            } else {
-                "pending".to_string()
-            };
+            let runtime = runtime_statuses.get(bundle_id);
+            let is_active = runtime.is_some_and(MCPServerRuntimeStatus::is_started);
+            let is_connected = runtime.is_some_and(MCPServerRuntimeStatus::is_connected);
+            let state = runtime
+                .map(|status| status.connection.to_string())
+                .unwrap_or_else(|| MCPServerConnectionState::Disconnected.to_string());
 
             // 构建服务器配置信息 / Build server config info
             let mut server_info = serde_json::Map::new();
@@ -1174,6 +1419,10 @@ impl MCPServerManager {
             // 添加状态信息 / Add status info
             server_info.insert("status".to_string(), serde_json::Value::String(state));
             server_info.insert("is_active".to_string(), serde_json::Value::Bool(is_active));
+            server_info.insert(
+                "is_connected".to_string(),
+                serde_json::Value::Bool(is_connected),
+            );
             server_info.insert(
                 "disabled".to_string(),
                 serde_json::Value::Bool(config.disabled()),
@@ -1262,21 +1511,44 @@ impl MCPServerManager {
     /// 归属回具体 server，**MUST NOT** 切分 exposed name 的 `__` 前缀反推——故 bundle_id 只从 `route` 取，
     /// 与 `name`（exposed 名）在同一循环内配对，无二次解析。
     pub(crate) async fn list_available_tools_with_bundle_id(&self) -> Vec<(BundleId, Tool)> {
-        let mut tools = Vec::new();
-        let routes = self.tool_routes.read().await;
+        // Snapshot local projection/authority/config only. No global guard may cross tools/list:
+        // OAuth clear must be able to remove the active client and withdraw routes even when an
+        // upstream server never answers this Agent pull.
+        let snapshots = {
+            let routes = self.tool_routes.read().await;
+            let clients = self.active_clients.read().await;
+            let configs = self.servers_config.read().await;
+            let generations = self.active_client_generations.read().await;
+            routes
+                .iter()
+                .filter_map(|(exposed_name, route)| {
+                    let client = clients.get(&route.bundle_id)?.clone();
+                    let generation = generations
+                        .get(&route.bundle_id)
+                        .copied()
+                        .unwrap_or_default();
+                    let tool_meta = configs.get(&route.bundle_id).and_then(|config| {
+                        self.merged_tool_meta(config, &route.original_tool_name)
+                    });
+                    Some((
+                        exposed_name.clone(),
+                        route.clone(),
+                        client,
+                        generation,
+                        tool_meta,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut candidates = Vec::new();
 
         // 每 bundle_id 仅拉一次 tools/list，跨该 server 的多个 routed tool 复用（对齐 Python `available_tools`
         // 的 `servers_cached_tools`；修 #91：此前每 tool 都调 list_tools → N 工具 = N 次冗余往返）。「每 server
         // 一次」仅在 list_tools **成功**时成立：持续报错则不写缓存、后续 routed tool 会重试（吞错、跳过、不 panic）。
         let mut server_tools_cache: HashMap<BundleId, Vec<Tool>> = HashMap::new();
 
-        for (exposed_name, route) in routes.iter() {
+        for (exposed_name, route, client, generation, tool_meta) in snapshots {
             let bundle_id = &route.bundle_id;
-            let client = {
-                let clients = self.active_clients.read().await;
-                clients.get(bundle_id).cloned()
-            };
-            let Some(client) = client else { continue };
 
             // 该 server 首见 → 拉一次并缓存；拉取失败 → 跳过（保留吞错、跳过语义）。
             if !server_tools_cache.contains_key(bundle_id) {
@@ -1301,29 +1573,46 @@ impl MCPServerManager {
                 display_tool.name = exposed_name.clone().into();
 
                 // 合并工具元数据 / Merge tool metadata
-                let config = {
-                    let configs = self.servers_config.read().await;
-                    configs.get(bundle_id).cloned()
-                };
-                if let Some(config) = config {
-                    if let Some(tool_meta) = self.merged_tool_meta(&config, original_name) {
-                        if display_tool.meta.is_none() {
-                            display_tool.meta = Some(rmcp::model::Meta::new());
-                        }
-                        if let Some(ref mut meta) = display_tool.meta {
-                            meta.insert(
-                                A2C_TOOL_META.to_string(),
-                                serde_json::to_value(tool_meta).unwrap(),
-                            );
-                        }
+                if let Some(tool_meta) = tool_meta {
+                    if display_tool.meta.is_none() {
+                        display_tool.meta = Some(rmcp::model::Meta::new());
+                    }
+                    if let Some(ref mut meta) = display_tool.meta {
+                        meta.insert(
+                            A2C_TOOL_META.to_string(),
+                            serde_json::to_value(tool_meta).unwrap(),
+                        );
                     }
                 }
 
-                tools.push((bundle_id.clone(), display_tool));
+                candidates.push((exposed_name, route, client, generation, display_tool));
             }
         }
 
-        tools
+        // Revalidate both authority identity and route identity immediately before publishing the
+        // pull result. The guards are held only for local filtering, so clear either follows this
+        // completed pull or wins first and removes every stale candidate.
+        let routes = self.tool_routes.read().await;
+        let clients = self.active_clients.read().await;
+        let generations = self.active_client_generations.read().await;
+        candidates
+            .into_iter()
+            .filter_map(
+                |(exposed_name, route, snapshot_client, snapshot_generation, tool)| {
+                    let route_is_current = routes.get(&exposed_name) == Some(&route);
+                    let client_is_current = clients
+                        .get(&route.bundle_id)
+                        .is_some_and(|current| StdArc::ptr_eq(current, &snapshot_client));
+                    let generation_is_current = generations
+                        .get(&route.bundle_id)
+                        .copied()
+                        .unwrap_or_default()
+                        == snapshot_generation;
+                    (generation_is_current && route_is_current && client_is_current)
+                        .then_some((route.bundle_id, tool))
+                },
+            )
+            .collect()
     }
 
     /// 活动客户端快照，附各 server **人类可读名**（`active_clients` 键为 `bundle_id`）/ snapshot tagged with names。
@@ -1727,10 +2016,14 @@ impl MCPServerManager {
         let health_config = self.health_check_config.clone();
         let reconnect_policy = self.reconnect_policy.clone();
         let active_clients = self.active_clients.clone();
+        let active_client_generations = self.active_client_generations.clone();
         let _servers_config = self.servers_config.clone();
         let retry_counts = self.retry_counts.clone();
         let auto_reconnect = self.auto_reconnect.clone();
         let lifecycle_locks = self.lifecycle_locks.clone();
+        let connection_states = self.connection_states.clone();
+        let tool_routes = self.tool_routes.clone();
+        let disabled_tools = self.disabled_tools.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1813,6 +2106,11 @@ impl MCPServerManager {
                                 continue;
                             }
 
+                            connection_states
+                                .write()
+                                .await
+                                .insert(bundle_id.clone(), MCPServerConnectionState::Connecting);
+
                             // 尝试断开并重新连接 / Try disconnect and reconnect
                             if let Err(e) = client.disconnect().await {
                                 warn!(bundle_id = %bundle_id, error = %e, "Failed to disconnect MCP server");
@@ -1821,15 +2119,59 @@ impl MCPServerManager {
                             match client.connect().await {
                                 Ok(_) => {
                                     info!(bundle_id = %bundle_id, "Successfully reconnected to MCP server");
+                                    connection_states.write().await.insert(
+                                        bundle_id.clone(),
+                                        MCPServerConnectionState::Connected,
+                                    );
                                     // 重置重试计数 / Reset retry count
                                     retry_counts.write().await.remove(&bundle_id);
                                 }
                                 Err(e) => {
                                     error!(bundle_id = %bundle_id, error = %e, "Failed to reconnect to MCP server");
-                                    retry_counts
-                                        .write()
-                                        .await
-                                        .insert(bundle_id.clone(), retry_count + 1);
+                                    if matches!(
+                                        &e,
+                                        MCPClientError::HttpAuthentication(
+                                            HttpAuthenticationError::OAuthRequired
+                                        )
+                                    ) {
+                                        // Authorization is a user-action boundary, not a transient
+                                        // health failure. Retire the unusable data plane and its
+                                        // routes, retain activation, and stop automatic retries.
+                                        connection_states.write().await.insert(
+                                            bundle_id.clone(),
+                                            MCPServerConnectionState::AuthorizationRequired,
+                                        );
+                                        let mut clients = active_clients.write().await;
+                                        if clients
+                                            .get(&bundle_id)
+                                            .is_some_and(|current| StdArc::ptr_eq(current, &client))
+                                        {
+                                            clients.remove(&bundle_id);
+                                            let mut generations =
+                                                active_client_generations.write().await;
+                                            bump_active_client_generation(
+                                                &mut generations,
+                                                &bundle_id,
+                                            );
+                                        }
+                                        drop(clients);
+                                        withdraw_bundle_tool_routes(
+                                            &tool_routes,
+                                            &disabled_tools,
+                                            &bundle_id,
+                                        )
+                                        .await;
+                                        retry_counts.write().await.remove(&bundle_id);
+                                    } else {
+                                        connection_states.write().await.insert(
+                                            bundle_id.clone(),
+                                            MCPServerConnectionState::Error,
+                                        );
+                                        retry_counts
+                                            .write()
+                                            .await
+                                            .insert(bundle_id.clone(), retry_count + 1);
+                                    }
                                 }
                             }
                         } else {
@@ -2095,10 +2437,53 @@ impl MCPServerManager {
 
     /// Remove stored tokens and pending authorization state.
     pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), OAuthError> {
+        self.clear_oauth_with_outcome(bundle_id).await.map(|_| ())
+    }
+
+    /// Remove stored OAuth state and report whether Agent-facing capability was withdrawn.
+    pub(crate) async fn clear_oauth_with_outcome(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<OAuthClearOutcome, OAuthError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
         let client = self.oauth_client_for(bundle_id).await?;
-        client.clear_oauth().await
+        client.clear_oauth().await?;
+
+        let is_started = self.activation_intents.read().await.contains(bundle_id);
+        self.connection_states.write().await.insert(
+            bundle_id.clone(),
+            if is_started {
+                MCPServerConnectionState::AuthorizationRequired
+            } else {
+                MCPServerConnectionState::Disconnected
+            },
+        );
+        let mut connected = {
+            let mut clients = self.active_clients.write().await;
+            let connected = clients.remove(bundle_id);
+            if connected.is_some() {
+                let mut generations = self.active_client_generations.write().await;
+                bump_active_client_generation(&mut generations, bundle_id);
+            }
+            connected
+        };
+        let had_connected_client = connected.is_some();
+        // Revoke cached invocation authority before awaiting a fallible transport disconnect.
+        // Readers can no longer enumerate or route this bundle once this await completes.
+        let routes_withdrawn =
+            withdraw_bundle_tool_routes(&self.tool_routes, &self.disabled_tools, bundle_id).await;
+        if let Some(ref mut connected) = connected {
+            if let Err(error) = connected.disconnect().await {
+                warn!(
+                    "OAuth credentials cleared for bundle_id={}, but transport disconnect failed: {}",
+                    bundle_id, error
+                );
+            }
+        }
+        Ok(OAuthClearOutcome {
+            capability_changed: had_connected_client || routes_withdrawn,
+        })
     }
 
     async fn oauth_client_for(
@@ -2669,6 +3054,7 @@ mod tests {
     /// 余方法 trivial。Minimal fake whose `call_tool` returns an injected transport error.
     struct AuthErrClient {
         msg: String,
+        disconnect_error: bool,
     }
 
     #[async_trait::async_trait]
@@ -2680,7 +3066,13 @@ mod tests {
             Ok(())
         }
         async fn disconnect(&self) -> Result<(), MCPClientError> {
-            Ok(())
+            if self.disconnect_error {
+                Err(MCPClientError::ConnectionError(
+                    "forced disconnect failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
             Ok(vec![])
@@ -2715,11 +3107,68 @@ mod tests {
         }
     }
 
+    /// A tools/list client controlled by the test so clear can race an in-flight route refresh.
+    struct BlockingToolsClient {
+        list_started: tokio::sync::Notify,
+        release_list: tokio::sync::Notify,
+        block_next_list: std::sync::atomic::AtomicBool,
+        tool_name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for BlockingToolsClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            if self.block_next_list.swap(false, Ordering::SeqCst) {
+                self.list_started.notify_one();
+                self.release_list.notified().await;
+            }
+            Ok(vec![tool_named(&self.tool_name)])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult::new(vec![]))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
     struct HealthRaceClient {
         health_started: tokio::sync::Notify,
         release_health: tokio::sync::Notify,
         connect_calls: AtomicUsize,
         disconnect_calls: AtomicUsize,
+        oauth_required_on_connect: bool,
     }
 
     #[async_trait::async_trait]
@@ -2729,7 +3178,13 @@ mod tests {
         }
         async fn connect(&self) -> Result<(), MCPClientError> {
             self.connect_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.oauth_required_on_connect {
+                Err(MCPClientError::HttpAuthentication(
+                    HttpAuthenticationError::OAuthRequired,
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn disconnect(&self) -> Result<(), MCPClientError> {
             self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
@@ -2784,8 +3239,389 @@ mod tests {
             bid(name),
             StdArc::new(AuthErrClient {
                 msg: msg.to_string(),
+                disconnect_error: false,
             }),
         );
+    }
+
+    #[tokio::test]
+    async fn clear_oauth_outcome_is_fail_closed_and_idempotent_when_disconnect_fails() {
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("oauth-clear-outcome");
+        let mut config = HttpServerConfig::new(
+            "OAuth clear outcome",
+            HttpServerParameters {
+                url: "https://mcp.example.test/mcp".to_string(),
+                headers: HashMap::new(),
+            },
+        );
+        config.bundle_id = Some(bundle_id.clone());
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConfig::Http(config));
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        manager.active_clients.write().await.insert(
+            bundle_id.clone(),
+            StdArc::new(AuthErrClient {
+                msg: "unused".into(),
+                disconnect_error: true,
+            }),
+        );
+        manager.tool_routes.write().await.insert(
+            "oauth-clear-outcome__protected".to_string(),
+            ExposedToolRoute {
+                bundle_id: bundle_id.clone(),
+                server_name: "OAuth clear outcome".to_string(),
+                original_tool_name: "protected".to_string(),
+                alias: None,
+            },
+        );
+        manager
+            .disabled_tools
+            .write()
+            .await
+            .insert("oauth-clear-outcome__disabled".to_string());
+
+        let first = manager.clear_oauth_with_outcome(&bundle_id).await.unwrap();
+        assert!(first.capability_changed);
+        assert!(manager.activation_intents.read().await.contains(&bundle_id));
+        assert_eq!(
+            manager.connection_states.read().await.get(&bundle_id),
+            Some(&MCPServerConnectionState::AuthorizationRequired)
+        );
+        assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
+        assert!(manager
+            .tool_routes
+            .read()
+            .await
+            .values()
+            .all(|route| route.bundle_id != bundle_id));
+        assert!(manager
+            .disabled_tools
+            .read()
+            .await
+            .iter()
+            .all(|tool| !tool.starts_with("oauth-clear-outcome__")));
+
+        let second = manager.clear_oauth_with_outcome(&bundle_id).await.unwrap();
+        assert!(!second.capability_changed);
+    }
+
+    #[tokio::test]
+    async fn clear_oauth_wins_against_inflight_tool_route_refresh() {
+        let manager = Arc::new(MCPServerManager::new());
+        let bundle_id = bid("oauth-clear-refresh-race");
+        let mut config = HttpServerConfig::new(
+            "OAuth clear refresh race",
+            HttpServerParameters {
+                url: "https://mcp.example.test/mcp".to_string(),
+                headers: HashMap::new(),
+            },
+        );
+        config.bundle_id = Some(bundle_id.clone());
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConfig::Http(config));
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        let client = Arc::new(BlockingToolsClient {
+            list_started: tokio::sync::Notify::new(),
+            release_list: tokio::sync::Notify::new(),
+            block_next_list: std::sync::atomic::AtomicBool::new(true),
+            tool_name: "protected".into(),
+        });
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), client.clone());
+
+        let refresh_manager = manager.clone();
+        let refresh = tokio::spawn(async move { refresh_manager.refresh_tool_routes().await });
+        client.list_started.notified().await;
+
+        let clear_manager = manager.clone();
+        let clear_bundle_id = bundle_id.clone();
+        let clear = tokio::spawn(async move {
+            clear_manager
+                .clear_oauth_with_outcome(&clear_bundle_id)
+                .await
+        });
+        let clear_result = tokio::time::timeout(Duration::from_secs(1), clear).await;
+        // Always release the refresh task, including when the timeout assertion below fails.
+        client.release_list.notify_one();
+        let outcome = clear_result
+            .expect("clear must not wait for an in-flight tools/list RPC")
+            .expect("clear task must not panic")
+            .expect("OAuth clear must succeed");
+        assert!(outcome.capability_changed);
+
+        refresh
+            .await
+            .expect("refresh task must not panic")
+            .expect("route refresh must succeed");
+        assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
+        assert!(manager
+            .tool_routes
+            .read()
+            .await
+            .values()
+            .all(|route| route.bundle_id != bundle_id));
+        assert!(manager
+            .disabled_tools
+            .read()
+            .await
+            .iter()
+            .all(|tool| !tool.starts_with("oauth-clear-refresh-race__")));
+
+        let second = manager.clear_oauth_with_outcome(&bundle_id).await.unwrap();
+        assert!(!second.capability_changed);
+    }
+
+    #[tokio::test]
+    async fn clear_oauth_wins_against_inflight_agent_tool_pull() {
+        let manager = Arc::new(MCPServerManager::new());
+        let bundle_id = bid("oauth-clear-agent-pull-race");
+        let mut config = HttpServerConfig::new(
+            "OAuth clear Agent pull race",
+            HttpServerParameters {
+                url: "https://mcp.example.test/mcp".to_string(),
+                headers: HashMap::new(),
+            },
+        );
+        config.bundle_id = Some(bundle_id.clone());
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConfig::Http(config));
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        let client = Arc::new(BlockingToolsClient {
+            list_started: tokio::sync::Notify::new(),
+            release_list: tokio::sync::Notify::new(),
+            block_next_list: std::sync::atomic::AtomicBool::new(true),
+            tool_name: "protected".into(),
+        });
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), client.clone());
+        manager.tool_routes.write().await.insert(
+            "oauth-clear-agent-pull-race__protected".to_string(),
+            ExposedToolRoute {
+                bundle_id: bundle_id.clone(),
+                server_name: "OAuth clear Agent pull race".to_string(),
+                original_tool_name: "protected".to_string(),
+                alias: None,
+            },
+        );
+
+        let pull_manager = manager.clone();
+        let pull =
+            tokio::spawn(async move { pull_manager.list_available_tools_with_bundle_id().await });
+        client.list_started.notified().await;
+
+        let clear_manager = manager.clone();
+        let clear_bundle_id = bundle_id.clone();
+        let clear = tokio::spawn(async move {
+            clear_manager
+                .clear_oauth_with_outcome(&clear_bundle_id)
+                .await
+        });
+        let clear_result = tokio::time::timeout(Duration::from_secs(1), clear).await;
+        // Always release the Agent pull, including when the timeout assertion below fails.
+        client.release_list.notify_one();
+        let outcome = clear_result
+            .expect("clear must not wait for an Agent tools/list RPC")
+            .expect("clear task must not panic")
+            .expect("OAuth clear must succeed");
+        assert!(outcome.capability_changed);
+
+        let pulled_tools = pull.await.expect("Agent pull task must not panic");
+        assert!(
+            pulled_tools.is_empty(),
+            "an Agent pull that finishes after clear must not publish stale tools"
+        );
+        let second = manager.clear_oauth_with_outcome(&bundle_id).await.unwrap();
+        assert!(!second.capability_changed);
+    }
+
+    #[tokio::test]
+    async fn agent_tool_pull_preserves_stable_bundle_when_another_bundle_is_cleared() {
+        let manager = Arc::new(MCPServerManager::new());
+        let stable_bundle = bid("stable-agent-tools");
+        let cleared_bundle = bid("cleared-unrelated-bundle");
+        manager.servers_config.write().await.insert(
+            stable_bundle.clone(),
+            stdio_cfg("stable-agent-tools", vec![], HashMap::new()),
+        );
+        let mut cleared_config = HttpServerConfig::new(
+            "Cleared unrelated bundle",
+            HttpServerParameters {
+                url: "https://mcp.example.test/mcp".to_string(),
+                headers: HashMap::new(),
+            },
+        );
+        cleared_config.bundle_id = Some(cleared_bundle.clone());
+        manager.servers_config.write().await.insert(
+            cleared_bundle.clone(),
+            MCPServerConfig::Http(cleared_config),
+        );
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(cleared_bundle.clone());
+
+        let stable_client = Arc::new(BlockingToolsClient {
+            list_started: tokio::sync::Notify::new(),
+            release_list: tokio::sync::Notify::new(),
+            block_next_list: std::sync::atomic::AtomicBool::new(true),
+            tool_name: "stable".into(),
+        });
+        let mut active_clients = manager.active_clients.write().await;
+        active_clients.insert(stable_bundle.clone(), stable_client.clone());
+        active_clients.insert(
+            cleared_bundle.clone(),
+            Arc::new(AuthErrClient {
+                msg: "unused".into(),
+                disconnect_error: false,
+            }),
+        );
+        drop(active_clients);
+        manager.tool_routes.write().await.insert(
+            "stable-agent-tools__stable".to_string(),
+            ExposedToolRoute {
+                bundle_id: stable_bundle.clone(),
+                server_name: "stable-agent-tools".to_string(),
+                original_tool_name: "stable".to_string(),
+                alias: None,
+            },
+        );
+
+        let pull_manager = manager.clone();
+        let pull =
+            tokio::spawn(async move { pull_manager.list_available_tools_with_bundle_id().await });
+        stable_client.list_started.notified().await;
+
+        let outcome = manager
+            .clear_oauth_with_outcome(&cleared_bundle)
+            .await
+            .unwrap();
+        assert!(outcome.capability_changed);
+        stable_client.release_list.notify_one();
+
+        let pulled_tools = pull.await.expect("Agent pull task must not panic");
+        assert_eq!(pulled_tools.len(), 1);
+        assert_eq!(pulled_tools[0].0, stable_bundle);
+        assert_eq!(
+            pulled_tools[0].1.name.as_ref(),
+            "stable-agent-tools__stable"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_refresh_retries_when_active_client_set_changes_midflight() {
+        let manager = Arc::new(MCPServerManager::new());
+        let first_bundle = bid("refresh-old-snapshot");
+        let second_bundle = bid("refresh-new-client");
+        manager.servers_config.write().await.insert(
+            first_bundle.clone(),
+            stdio_cfg("refresh-old-snapshot", vec![], HashMap::new()),
+        );
+        let first_client = Arc::new(BlockingToolsClient {
+            list_started: tokio::sync::Notify::new(),
+            release_list: tokio::sync::Notify::new(),
+            block_next_list: std::sync::atomic::AtomicBool::new(true),
+            tool_name: "old_tool".into(),
+        });
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(first_bundle.clone(), first_client.clone());
+
+        let first_manager = manager.clone();
+        let mut first_refresh =
+            tokio::spawn(async move { first_manager.refresh_tool_routes().await });
+        first_client.list_started.notified().await;
+
+        manager.servers_config.write().await.insert(
+            second_bundle.clone(),
+            stdio_cfg("refresh-new-client", vec![], HashMap::new()),
+        );
+        let second_client = Arc::new(BlockingToolsClient {
+            list_started: tokio::sync::Notify::new(),
+            release_list: tokio::sync::Notify::new(),
+            block_next_list: std::sync::atomic::AtomicBool::new(true),
+            tool_name: "new_tool".into(),
+        });
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(second_bundle.clone(), second_client.clone());
+        let second_manager = manager.clone();
+        let second_refresh =
+            tokio::spawn(async move { second_manager.refresh_tool_routes().await });
+
+        first_client.release_list.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            second_client.list_started.notified(),
+        )
+        .await
+        .expect("the first refresh must retry the expanded active-client snapshot");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut first_refresh)
+                .await
+                .is_err(),
+            "the stale full-table refresh must not commit before listing the new client"
+        );
+        second_client.release_list.notify_one();
+
+        first_refresh
+            .await
+            .expect("first refresh task must not panic")
+            .expect("first refresh must succeed");
+        second_refresh
+            .await
+            .expect("second refresh task must not panic")
+            .expect("second refresh must succeed");
+        let routes = manager.tool_routes.read().await;
+        assert!(routes.contains_key("refresh-old-snapshot__old_tool"));
+        assert!(routes.contains_key("refresh-new-client__new_tool"));
     }
 
     #[tokio::test]
@@ -3551,6 +4387,7 @@ mod tests {
             release_health: tokio::sync::Notify::new(),
             connect_calls: AtomicUsize::new(0),
             disconnect_calls: AtomicUsize::new(0),
+            oauth_required_on_connect: false,
         });
         manager
             .active_clients
@@ -3591,6 +4428,137 @@ mod tests {
             "a stale health snapshot must not reconnect a removed client"
         );
         assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
+    }
+
+    #[tokio::test]
+    async fn health_reconnect_oauth_required_retires_data_plane_and_routes() {
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("health-oauth");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("health-oauth", Some("health-oauth")),
+        );
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        let client = Arc::new(HealthRaceClient {
+            health_started: tokio::sync::Notify::new(),
+            release_health: tokio::sync::Notify::new(),
+            connect_calls: AtomicUsize::new(0),
+            disconnect_calls: AtomicUsize::new(0),
+            oauth_required_on_connect: true,
+        });
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), client.clone());
+        manager.tool_routes.write().await.insert(
+            "health-oauth__echo".to_string(),
+            ExposedToolRoute {
+                bundle_id: bundle_id.clone(),
+                server_name: "health-oauth".to_string(),
+                original_tool_name: "echo".to_string(),
+                alias: None,
+            },
+        );
+        manager
+            .disabled_tools
+            .write()
+            .await
+            .insert("health-oauth__disabled".to_string());
+        manager
+            .set_health_check_config(HealthCheckConfig {
+                interval_secs: 3600,
+                timeout_secs: 5,
+                enabled: true,
+            })
+            .await;
+        manager
+            .set_reconnect_policy(ReconnectPolicy {
+                enabled: true,
+                max_retries: 3,
+                initial_delay_ms: 0,
+                max_delay_ms: 0,
+                backoff_factor: 1.0,
+            })
+            .await;
+
+        let health_started = client.health_started.notified();
+        manager.start_health_monitor().await;
+        tokio::time::timeout(Duration::from_secs(2), health_started)
+            .await
+            .expect("health monitor did not inspect the client");
+        client.release_health.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !manager.active_clients.read().await.contains_key(&bundle_id) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("OAuth-blocked health reconnect did not retire the client");
+        manager.stop_health_monitor().await;
+
+        let runtime = manager.get_server_runtime_statuses().await;
+        assert_eq!(runtime[0].activation, MCPServerActivationState::Started);
+        assert_eq!(
+            runtime[0].connection,
+            MCPServerConnectionState::AuthorizationRequired
+        );
+        assert!(manager
+            .tool_routes
+            .read()
+            .await
+            .values()
+            .all(|route| route.bundle_id != bundle_id));
+        assert!(manager
+            .disabled_tools
+            .read()
+            .await
+            .iter()
+            .all(|tool| !tool.starts_with("health-oauth__")));
+        assert!(!manager.retry_counts.read().await.contains_key(&bundle_id));
+        assert_eq!(client.connect_calls.load(Ordering::SeqCst), 1);
+        manager.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_all_clears_activation_without_a_connected_client() {
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("activation-only");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("activation-only", Some("activation-only")),
+        );
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id, MCPServerConnectionState::AuthorizationRequired);
+
+        manager.stop_all().await.unwrap();
+
+        let runtime = manager.get_server_runtime_statuses().await;
+        assert_eq!(runtime[0].activation, MCPServerActivationState::Stopped);
+        assert_eq!(
+            runtime[0].connection,
+            MCPServerConnectionState::Disconnected
+        );
     }
 
     #[tokio::test]
