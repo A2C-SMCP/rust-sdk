@@ -51,8 +51,14 @@ An accepted `start_client_by_id` is retained as
 `MCPServerConnectionState::AuthorizationRequired`. Only an explicit stop clears activation.
 Clearing OAuth credentials retires the connected data plane while retaining activation, producing
 the same `Started + AuthorizationRequired` lifecycle as a cold start that needs authorization.
-Hosts should use `get_server_runtime_statuses` for this distinction. The legacy tuple returned by
-`get_server_status` projects `is_active` from activation and `state` from connection state.
+After connection, client authority, and cached tool routes have been withdrawn, a successful clear
+that changed capability bumps `capability_revision`, publishes `CapabilityRevisionBumped`, and—if
+the Computer has joined an Office—emits `server:update_tool_list`. Office peers receive the
+corresponding `notify:update_tool_list` invalidation and should pull the authoritative tool list;
+the notification does not carry tools itself. Repeating an already-effective clear does not bump
+or notify again. Hosts should use `get_server_runtime_statuses` for the lifecycle distinction. The
+legacy tuple returned by `get_server_status` projects `is_active` from activation and `state` from
+connection state.
 
 rmcp 2.2 currently exposes only the first value when a server sends multiple independent
 `WWW-Authenticate` header fields. Consequently, `Basic` in the first field and `Bearer` in a later

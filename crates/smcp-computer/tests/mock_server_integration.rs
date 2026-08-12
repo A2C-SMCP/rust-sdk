@@ -20,11 +20,15 @@ use hyper::body::{Bytes, Frame};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use serde_json::Value;
+use socketioxide::extract::{AckSender, Data, SocketRef};
+use socketioxide::SocketIo;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify};
+use tower::Layer;
 use tracing_subscriber::fmt::MakeWriter;
 
-use smcp_computer::computer::{Computer, SilentSession};
+use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use smcp_computer::errors::ComputerError;
 use smcp_computer::mcp_clients::http_client::HttpMCPClient;
 use smcp_computer::mcp_clients::model::*;
@@ -88,6 +92,7 @@ struct RecordingOAuthCredentialStore {
     entries: Mutex<HashMap<OAuthCredentialKey, String>>,
     operations: Mutex<Vec<CredentialStoreOperation>>,
     fail_next_credential_save: AtomicBool,
+    fail_next_credential_delete: AtomicBool,
 }
 
 impl RecordingOAuthCredentialStore {
@@ -144,6 +149,12 @@ impl OAuthCredentialStore for RecordingOAuthCredentialStore {
             .lock()
             .await
             .push(CredentialStoreOperation::Delete(key.clone()));
+        if self
+            .fail_next_credential_delete
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(OAuthCredentialStoreError::OperationFailed);
+        }
         self.entries.lock().await.remove(key);
         Ok(())
     }
@@ -189,6 +200,59 @@ fn full_body(s: impl Into<Bytes>) -> BoxBody {
 
 fn empty_body() -> BoxBody {
     full_body(Bytes::new())
+}
+
+async fn spawn_tool_list_recording_relay(
+    updates: Arc<AtomicUsize>,
+) -> (String, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (layer, io) = SocketIo::new_layer();
+    io.ns("/smcp", move |socket: SocketRef| {
+        let updates = Arc::clone(&updates);
+        async move {
+            socket.on(
+                "server:join_office",
+                |_socket: SocketRef, _data: Data<Value>, ack: AckSender| async move {
+                    let _ = ack.send(&(true, None::<String>));
+                },
+            );
+            socket.on(
+                "server:update_tool_list",
+                move |_socket: SocketRef, _data: Data<Value>| {
+                    let updates = Arc::clone(&updates);
+                    async move {
+                        updates.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            );
+        }
+    });
+
+    let fallback = tower::service_fn(|_request: Request<hyper::body::Incoming>| async move {
+        Ok::<_, Infallible>(Response::new(Full::<Bytes>::new(Bytes::new())))
+    });
+    let service = layer.layer(fallback);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break };
+                    let service = hyper_util::service::TowerToHyperService::new(service.clone());
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .with_upgrades()
+                            .await;
+                    });
+                }
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    (format!("http://{address}"), shutdown_tx)
 }
 
 // ============================================================
@@ -2554,6 +2618,160 @@ async fn test_authorization_code_clear_is_bundle_scoped_and_401_never_reuses_old
         .await;
     assert_tool_call_is_blocked_before_http(&manager, &bundle_id, &state).await;
     manager.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_computer_clear_oauth_commits_capability_event_and_joined_tool_list_update_once() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-clear-capability").unwrap();
+    let (computer, _temp_dir) = configure_authorization_code_computer(
+        &state.base_url,
+        std::slice::from_ref(&bundle_id),
+        Arc::new(InMemoryOAuthCredentialStore::default()),
+    )
+    .await;
+    authorize_computer(&computer, &bundle_id, &state).await;
+    computer.start_mcp_client(&bundle_id).await.unwrap();
+    let tools_before = computer.get_available_tools().await.unwrap();
+    assert!(tools_before
+        .iter()
+        .any(|tool| tool.name.ends_with("__echo")));
+
+    let tool_list_updates = Arc::new(AtomicUsize::new(0));
+    let (relay_url, relay_shutdown) =
+        spawn_tool_list_recording_relay(Arc::clone(&tool_list_updates)).await;
+    computer
+        .connect_socketio(&relay_url, ConnectOptions::default())
+        .await
+        .unwrap();
+    computer
+        .join_office("oauth-clear-office", "oauth-store-computer")
+        .await
+        .unwrap();
+
+    let mut events = computer.subscribe_events();
+    let revision_before = computer.capability_revision();
+    computer.clear_oauth(&bundle_id).await.unwrap();
+
+    assert_eq!(
+        events.recv().await.unwrap(),
+        ComputerEvent::OAuthStatusChanged {
+            bundle_id: bundle_id.clone(),
+            status: OAuthStatus::Unauthorized,
+        }
+    );
+    let capability_event = events.recv().await.unwrap();
+    assert!(matches!(
+        capability_event,
+        ComputerEvent::CapabilityRevisionBumped { revision }
+            if revision == revision_before + 1
+    ));
+    assert_eq!(computer.capability_revision(), revision_before + 1);
+    let runtime = computer.get_server_runtime_statuses().await;
+    let runtime = runtime
+        .iter()
+        .find(|status| status.bundle_id == bundle_id)
+        .unwrap();
+    assert_eq!(runtime.activation, MCPServerActivationState::Started);
+    assert_eq!(
+        runtime.connection,
+        MCPServerConnectionState::AuthorizationRequired
+    );
+    assert_eq!(
+        computer.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Unauthorized
+    );
+    assert!(computer.get_available_tools().await.unwrap().is_empty());
+    assert!(matches!(
+        computer.get_resources(bundle_id.as_str(), None).await,
+        Err(ComputerError::McpServerNotFound(ref id)) if id == bundle_id.as_str()
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while tool_list_updates.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("clear_oauth did not emit server:update_tool_list");
+
+    let revision_after_first = computer.capability_revision();
+    computer.clear_oauth(&bundle_id).await.unwrap();
+    assert_eq!(computer.capability_revision(), revision_after_first);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(tool_list_updates.load(Ordering::SeqCst), 1);
+
+    assert!(computer.stop_mcp_client(&bundle_id).await.unwrap());
+    let runtime = computer.get_server_runtime_statuses().await;
+    let runtime = runtime
+        .iter()
+        .find(|status| status.bundle_id == bundle_id)
+        .unwrap();
+    assert_eq!(runtime.activation, MCPServerActivationState::Stopped);
+    assert_eq!(runtime.connection, MCPServerConnectionState::Disconnected);
+
+    computer.shutdown().await.unwrap();
+    let _ = relay_shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_computer_clear_oauth_store_failure_does_not_publish_capability_change() {
+    let (_port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    let bundle_id = BundleId::try_from("oauth-clear-store-failure").unwrap();
+    let store = Arc::new(RecordingOAuthCredentialStore::default());
+    let (computer, _temp_dir) = configure_authorization_code_computer(
+        &state.base_url,
+        std::slice::from_ref(&bundle_id),
+        store.clone(),
+    )
+    .await;
+    authorize_computer(&computer, &bundle_id, &state).await;
+    computer.start_mcp_client(&bundle_id).await.unwrap();
+    let tool_list_updates = Arc::new(AtomicUsize::new(0));
+    let (relay_url, relay_shutdown) =
+        spawn_tool_list_recording_relay(Arc::clone(&tool_list_updates)).await;
+    computer
+        .connect_socketio(&relay_url, ConnectOptions::default())
+        .await
+        .unwrap();
+    computer
+        .join_office("oauth-clear-failure-office", "oauth-store-computer")
+        .await
+        .unwrap();
+    let mut events = computer.subscribe_events();
+    let revision_before = computer.capability_revision();
+    store
+        .fail_next_credential_delete
+        .store(true, Ordering::SeqCst);
+
+    assert!(computer.clear_oauth(&bundle_id).await.is_err());
+    assert_eq!(computer.capability_revision(), revision_before);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(tool_list_updates.load(Ordering::SeqCst), 0);
+    let runtime = computer.get_server_runtime_statuses().await;
+    let runtime = runtime
+        .iter()
+        .find(|status| status.bundle_id == bundle_id)
+        .unwrap();
+    assert_eq!(runtime.activation, MCPServerActivationState::Started);
+    assert_eq!(runtime.connection, MCPServerConnectionState::Connected);
+    assert!(matches!(
+        computer.oauth_status(&bundle_id).await.unwrap(),
+        OAuthStatus::Authorized { .. }
+    ));
+    assert!(!computer.get_available_tools().await.unwrap().is_empty());
+
+    computer.shutdown().await.unwrap();
+    let _ = relay_shutdown.send(());
 }
 
 #[tokio::test]
