@@ -3634,11 +3634,20 @@ impl<S: Session> Computer<S> {
 
     /// Clear persisted tokens and pending authorization state.
     pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), crate::oauth::OAuthError> {
-        let manager = self.mcp_manager.read().await;
-        let manager = manager
-            .as_ref()
-            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
-        manager.clear_oauth(bundle_id).await
+        let outcome = {
+            let manager = self.mcp_manager.read().await;
+            let manager = manager
+                .as_ref()
+                .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            manager.clear_oauth_with_outcome(bundle_id).await?
+        };
+
+        // The manager commits connection/client/route state before returning. Release its guard
+        // before publishing the revision so event consumers always re-query the final projection.
+        if outcome.capability_changed {
+            self.on_capability_changed().await;
+        }
+        Ok(())
     }
 
     /// #148：MCP 起停**真有变更**后：bump capability revision（§12 R2：改变 Agent-facing 工具投影）
