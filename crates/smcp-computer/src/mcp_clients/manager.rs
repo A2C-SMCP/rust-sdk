@@ -23,6 +23,7 @@ use crate::status::RuntimeStatus;
 use crate::weak_registry::WeakRegistry;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc as StdArc;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
@@ -104,6 +105,15 @@ pub type ClientFactory = StdArc<
     dyn Fn(MCPServerConfig, Option<ClientNotifyCtx>) -> StdArc<dyn MCPClientProtocol> + Send + Sync,
 >;
 
+#[derive(Debug, Clone)]
+struct ServerDeclaration {
+    name: ServerName,
+    /// `true` when the desired config is owned by `Computer` and must be freshly rendered for
+    /// every actual start/restart. Public Manager lifecycle APIs must never reuse the cached
+    /// process config for these declarations.
+    requires_computer_materialization: bool,
+}
+
 /// MCP服务器管理器 / MCP server manager
 ///
 /// **身份键 = `bundle_id`（协议 0.3.0，rust-sdk#117）**：`servers_config` / `active_clients` / `retry_counts`
@@ -121,8 +131,11 @@ pub type ClientFactory = StdArc<
 /// `bundle_id` 标注——协议 §身份正交性规定 `name` 是纯 display、允许碰撞、永不做键。唯一仍与 `bundle_id`
 /// **正交**的是 `window://` / `skill://` URI 里的 **host** 段：它由 MCP Server 自选，A2C 透传不解释。
 pub struct MCPServerManager {
-    /// 服务器配置映射（键 = `bundle_id`）/ Server configuration mapping keyed by bundle_id。
+    /// Current materialized process configurations. Raw `${input:*}` declarations are owned by
+    /// `Computer` and never enter this map.
     servers_config: Arc<RwLock<HashMap<BundleId, MCPServerConfig>>>,
+    /// Minimal desired-state metadata used for status/removal before the first materialization.
+    server_declarations: Arc<RwLock<HashMap<BundleId, ServerDeclaration>>>,
     /// 活动客户端映射（键 = `bundle_id`）/ Active client mapping keyed by bundle_id。
     active_clients: Arc<RwLock<HashMap<BundleId, StdArc<dyn MCPClientProtocol>>>>,
     /// Per-bundle epochs for active-client mutations, including same-Arc remove/reinsert (ABA).
@@ -199,12 +212,17 @@ impl MCPServerManager {
         self.lifecycle_locks.len()
     }
 
+    pub(crate) async fn is_client_active(&self, bundle_id: &BundleId) -> bool {
+        self.active_clients.read().await.contains_key(bundle_id)
+    }
+
     /// 创建新的管理器 / Create new manager
     pub fn new() -> Self {
         let (state_tx, _) = watch::channel(ManagerState::Uninitialized);
 
         Self {
             servers_config: Arc::new(RwLock::new(HashMap::new())),
+            server_declarations: Arc::new(RwLock::new(HashMap::new())),
             active_clients: Arc::new(RwLock::new(HashMap::new())),
             active_client_generations: Arc::new(RwLock::new(HashMap::new())),
             activation_intents: Arc::new(RwLock::new(HashSet::new())),
@@ -239,6 +257,7 @@ impl MCPServerManager {
 
         Self {
             servers_config: Arc::new(RwLock::new(HashMap::new())),
+            server_declarations: Arc::new(RwLock::new(HashMap::new())),
             active_clients: Arc::new(RwLock::new(HashMap::new())),
             active_client_generations: Arc::new(RwLock::new(HashMap::new())),
             activation_intents: Arc::new(RwLock::new(HashSet::new())),
@@ -350,7 +369,11 @@ impl MCPServerManager {
     // `bundle_id`（消歧的字典序最小 + 碰撞路由是同名歧义的根源）。人机面 name→身份的解析归 CLI `resolve_target`
     // （源 `list_mcp_servers_with_metadata`，多命中列候选、0 命中且合法 id 当 id、否则报错），不再进库层。
 
-    /// 初始化管理器 / Initialize manager
+    /// 初始化管理器 / Initialize manager.
+    ///
+    /// Configs passed directly to the standalone manager are treated as already materialized. A
+    /// `Computer` initializes an empty manager and registers only declaration metadata; its raw
+    /// configs remain outside this layer until an actual start/restart.
     ///
     /// **no-double-open（加载期 first-wins）**：按传入顺序解析每个 server 的 `bundle_id`，重复 `bundle_id`
     /// （无论 connection config 是否相同）仅保留**第一个**，其余作 **Computer 本地配置诊断**（结构化 WARN，
@@ -386,6 +409,19 @@ impl MCPServerManager {
                     }
                 }
             }
+        }
+        {
+            let configs = self.servers_config.read().await;
+            let mut declarations = self.server_declarations.write().await;
+            declarations.extend(configs.iter().map(|(bundle_id, config)| {
+                (
+                    bundle_id.clone(),
+                    ServerDeclaration {
+                        name: config.name().to_string(),
+                        requires_computer_materialization: false,
+                    },
+                )
+            }));
         }
 
         // 刷新工具路由 / Refresh tool routes
@@ -446,8 +482,15 @@ impl MCPServerManager {
         // 更新配置（原地更新：同 bundle_id 覆盖）/ Update configuration (update-in-place by bundle_id)
         {
             let mut configs = self.servers_config.write().await;
-            configs.insert(bundle_id.clone(), config);
+            configs.insert(bundle_id.clone(), config.clone());
         }
+        self.server_declarations.write().await.insert(
+            bundle_id.clone(),
+            ServerDeclaration {
+                name: config.name().to_string(),
+                requires_computer_materialization: false,
+            },
+        );
 
         // 检查是否需要自动连接 / Check if need auto connect
         let auto_connect = *self.auto_connect.read().await;
@@ -479,7 +522,12 @@ impl MCPServerManager {
     pub async fn remove_server_by_id(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
-        let exists = { self.servers_config.read().await.contains_key(bundle_id) };
+        let exists = self
+            .server_declarations
+            .read()
+            .await
+            .contains_key(bundle_id)
+            || self.servers_config.read().await.contains_key(bundle_id);
         if !exists {
             self.refresh_tool_routes().await?;
             return Ok(false);
@@ -504,6 +552,7 @@ impl MCPServerManager {
             let mut configs = self.servers_config.write().await;
             configs.remove(bundle_id);
         }
+        self.server_declarations.write().await.remove(bundle_id);
         self.connection_states.write().await.remove(bundle_id);
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
@@ -541,7 +590,110 @@ impl MCPServerManager {
     pub async fn start_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
+        self.ensure_public_lifecycle_allowed(bundle_id, "start")
+            .await?;
         self.start_client_by_id_inner(bundle_id).await
+    }
+
+    async fn ensure_public_lifecycle_allowed(
+        &self,
+        bundle_id: &BundleId,
+        operation: &str,
+    ) -> Result<(), ComputerError> {
+        let requires_computer_materialization = self
+            .server_declarations
+            .read()
+            .await
+            .get(bundle_id)
+            .is_some_and(|declaration| declaration.requires_computer_materialization);
+        if requires_computer_materialization {
+            return Err(ComputerError::InvalidConfiguration(format!(
+                "Server bundle_id {bundle_id} is Computer-owned; {operation} it through Computer for fresh materialization"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Start from a freshly materialized configuration while preserving idempotent-start semantics.
+    ///
+    /// The per-server lifecycle lock is held before deciding whether materialization is needed, so
+    /// concurrent starts cannot invoke an input resolver more than once for the same actual start.
+    pub(crate) async fn start_client_by_id_materialized<F, Fut>(
+        &self,
+        bundle_id: &BundleId,
+        disabled: bool,
+        materialize: F,
+    ) -> Result<bool, ComputerError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<MCPServerConfig, ComputerError>>,
+    {
+        let lifecycle = self.lifecycle_lock(bundle_id);
+        let _lifecycle_guard = lifecycle.lock().await;
+
+        if !self
+            .server_declarations
+            .read()
+            .await
+            .contains_key(bundle_id)
+            && !self.servers_config.read().await.contains_key(bundle_id)
+        {
+            return Err(ComputerError::InvalidConfiguration(format!(
+                "Unknown server bundle_id: {bundle_id}"
+            )));
+        }
+        if self.active_clients.read().await.contains_key(bundle_id) {
+            return Ok(false);
+        }
+        if disabled {
+            return Err(ComputerError::InvalidConfiguration(format!(
+                "Cannot start disabled server: {bundle_id}"
+            )));
+        }
+
+        let config = materialize().await?;
+        self.retire_oauth_client(bundle_id).await?;
+        self.replace_materialized_config(bundle_id, config).await?;
+        self.start_client_by_id_inner(bundle_id).await?;
+        Ok(true)
+    }
+
+    async fn replace_materialized_config(
+        &self,
+        bundle_id: &BundleId,
+        config: MCPServerConfig,
+    ) -> Result<(), ComputerError> {
+        let resolved = Self::resolve_key(&config);
+        if &resolved != bundle_id {
+            return Err(ComputerError::InvalidConfiguration(format!(
+                "materialized config identity changed from {bundle_id} to {resolved}"
+            )));
+        }
+        self.servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), config.clone());
+        let mut declarations = self.server_declarations.write().await;
+        declarations
+            .entry(bundle_id.clone())
+            .and_modify(|declaration| declaration.name = config.name().to_string())
+            .or_insert_with(|| ServerDeclaration {
+                name: config.name().to_string(),
+                requires_computer_materialization: true,
+            });
+        Ok(())
+    }
+
+    async fn retire_oauth_client(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
+        if let Some(client) = self.oauth_clients.write().await.remove(bundle_id) {
+            client
+                .cancel_and_drain_oauth_flow()
+                .await
+                .map_err(|error| {
+                    ComputerError::ConnectionError(format!("failed to drain OAuth flow: {error}"))
+                })?;
+        }
+        Ok(())
     }
 
     async fn start_client_by_id_inner(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
@@ -551,9 +703,23 @@ impl MCPServerManager {
             configs.get(bundle_id).cloned()
         };
 
-        let config = config.ok_or_else(|| {
-            ComputerError::InvalidConfiguration(format!("Unknown server bundle_id: {}", bundle_id))
-        })?;
+        let config = match config {
+            Some(config) => config,
+            None if self
+                .server_declarations
+                .read()
+                .await
+                .contains_key(bundle_id) => {
+                return Err(ComputerError::InvalidConfiguration(format!(
+                    "Server bundle_id {bundle_id} has no materialized config; start it through Computer"
+                )))
+            }
+            None => {
+                return Err(ComputerError::InvalidConfiguration(format!(
+                    "Unknown server bundle_id: {bundle_id}"
+                )))
+            }
+        };
 
         let server_name = config.name().to_string();
 
@@ -736,17 +902,32 @@ impl MCPServerManager {
     pub async fn restart_client_by_id(&self, bundle_id: &BundleId) -> Result<(), ComputerError> {
         let lifecycle = self.lifecycle_lock(bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
+        self.ensure_public_lifecycle_allowed(bundle_id, "restart")
+            .await?;
         // #141：**先查声明再动手**。此前用 `unwrap_or(false)` 兜底，未知 bundle_id 走成
         // 「stop 幂等 no-op + enabled=false 不 start」⇒ 静默 `Ok(())` ——与被根治的 `stop` 假回执同形。
         // restart 语义蕴含「事后应在跑」，故对不存在的声明必须报错（与 `start_client_by_id` 一致）；
         // 声明存在但 `disabled` 则停而不起，仍是 `Ok`（尊重停用意图，非假成功）。
+        let is_declared = self
+            .server_declarations
+            .read()
+            .await
+            .contains_key(bundle_id);
         let enabled = {
             let configs = self.servers_config.read().await;
-            let config = configs.get(bundle_id).ok_or_else(|| {
-                ComputerError::InvalidConfiguration(format!(
-                    "Unknown server bundle_id: {bundle_id}"
-                ))
-            })?;
+            let config = match configs.get(bundle_id) {
+                Some(config) => config,
+                None if is_declared => {
+                    return Err(ComputerError::InvalidConfiguration(format!(
+                        "Server bundle_id {bundle_id} has no materialized config; restart it through Computer"
+                    )))
+                }
+                None => {
+                    return Err(ComputerError::InvalidConfiguration(format!(
+                        "Unknown server bundle_id: {bundle_id}"
+                    )))
+                }
+            };
             !config.disabled()
         };
 
@@ -756,6 +937,86 @@ impl MCPServerManager {
             self.start_client_by_id_inner(bundle_id).await?;
         }
 
+        Ok(())
+    }
+
+    /// Restart from a freshly materialized config. Materialization completes before the old client
+    /// is stopped, so input/command failures leave a running process untouched.
+    pub(crate) async fn restart_client_by_id_materialized<F, Fut>(
+        &self,
+        bundle_id: &BundleId,
+        disabled: bool,
+        materialize: F,
+    ) -> Result<(), ComputerError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<MCPServerConfig, ComputerError>>,
+    {
+        let lifecycle = self.lifecycle_lock(bundle_id);
+        let _lifecycle_guard = lifecycle.lock().await;
+        if !self
+            .server_declarations
+            .read()
+            .await
+            .contains_key(bundle_id)
+            && !self.servers_config.read().await.contains_key(bundle_id)
+        {
+            return Err(ComputerError::InvalidConfiguration(format!(
+                "Unknown server bundle_id: {bundle_id}"
+            )));
+        }
+
+        if disabled {
+            self.retire_oauth_client(bundle_id).await?;
+            self.stop_client_by_id_inner(bundle_id).await?;
+            self.servers_config.write().await.remove(bundle_id);
+            return Ok(());
+        }
+
+        let config = materialize().await?;
+        let enabled = !config.disabled();
+        let resolved = Self::resolve_key(&config);
+        if &resolved != bundle_id {
+            return Err(ComputerError::InvalidConfiguration(format!(
+                "materialized config identity changed from {bundle_id} to {resolved}"
+            )));
+        }
+
+        self.retire_oauth_client(bundle_id).await?;
+        self.stop_client_by_id_inner(bundle_id).await?;
+        self.servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), config.clone());
+        let mut declarations = self.server_declarations.write().await;
+        declarations
+            .entry(bundle_id.clone())
+            .and_modify(|declaration| declaration.name = config.name().to_string())
+            .or_insert_with(|| ServerDeclaration {
+                name: config.name().to_string(),
+                requires_computer_materialization: true,
+            });
+        if enabled {
+            self.start_client_by_id_inner(bundle_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Register only declaration metadata. Raw config remains exclusively Computer-owned.
+    pub(crate) async fn register_raw_server(
+        &self,
+        config: MCPServerConfig,
+    ) -> Result<(), ComputerError> {
+        let bundle_id = Self::resolve_key(&config);
+        let lifecycle = self.lifecycle_lock(&bundle_id);
+        let _lifecycle_guard = lifecycle.lock().await;
+        self.server_declarations.write().await.insert(
+            bundle_id,
+            ServerDeclaration {
+                name: config.name().to_string(),
+                requires_computer_materialization: true,
+            },
+        );
         Ok(())
     }
 
@@ -781,6 +1042,7 @@ impl MCPServerManager {
     /// 清空所有状态 / Clear all state
     async fn clear_all(&self) -> Result<(), ComputerError> {
         self.servers_config.write().await.clear();
+        self.server_declarations.write().await.clear();
         {
             let mut clients = self.active_clients.write().await;
             if !clients.is_empty() {
@@ -1294,13 +1556,23 @@ impl MCPServerManager {
 
     /// 获取正交的服务器运行时状态 / Get orthogonal server runtime statuses.
     pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
-        let configs: Vec<(BundleId, ServerName)> = self
-            .servers_config
+        let mut declared_names: HashMap<BundleId, ServerName> = self
+            .server_declarations
             .read()
             .await
             .iter()
-            .map(|(bundle_id, config)| (bundle_id.clone(), config.name().to_string()))
+            .map(|(bundle_id, declaration)| (bundle_id.clone(), declaration.name.clone()))
             .collect();
+        // Keep direct test/standalone injections observable, while preferring the current rendered
+        // process name whenever a materialized config exists.
+        declared_names.extend(
+            self.servers_config
+                .read()
+                .await
+                .iter()
+                .map(|(bundle_id, config)| (bundle_id.clone(), config.name().to_string())),
+        );
+        let configs: Vec<(BundleId, ServerName)> = declared_names.into_iter().collect();
         let activation_intents = self.activation_intents.read().await.clone();
         let remembered_connections = self.connection_states.read().await.clone();
         let live_connections: HashMap<BundleId, ClientState> = self
@@ -1378,13 +1650,22 @@ impl MCPServerManager {
     /// 额外带 `name`（纯 display，key 不再人类可读，故须显式暴露展示名）。
     /// Returns format: `{ bundle_id: { name, type, status, disabled, ... } }`。
     pub async fn get_server_configs(&self) -> serde_json::Value {
+        let configs = self.servers_config.read().await.clone();
+        self.get_server_configs_for(&configs).await
+    }
+
+    /// Project caller-owned configs with this Manager's runtime status. `Computer` uses this with
+    /// raw desired declarations so control-plane responses never expose rendered input values.
+    pub(crate) async fn get_server_configs_for(
+        &self,
+        configs: &HashMap<BundleId, MCPServerConfig>,
+    ) -> serde_json::Value {
         let runtime_statuses: HashMap<BundleId, MCPServerRuntimeStatus> = self
             .get_server_runtime_statuses()
             .await
             .into_iter()
             .map(|status| (status.bundle_id.clone(), status))
             .collect();
-        let configs = self.servers_config.read().await;
 
         let mut result = serde_json::Map::new();
 
@@ -2631,6 +2912,64 @@ pub(crate) mod test_support {
         async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
             Ok(())
         }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// Client whose connection deterministically fails, for restart commit-boundary tests.
+    pub(crate) struct ConnectFailClient;
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for ConnectFailClient {
+        fn state(&self) -> ClientState {
+            ClientState::Error
+        }
+
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Err(MCPClientError::ConnectionError(
+                "injected connect failure".into(),
+            ))
+        }
+
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+
         async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
             Ok(())
         }

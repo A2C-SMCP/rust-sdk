@@ -312,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_invalid_pick_string_definitions() {
+        let doc = ProjectConfigDoc {
+            mcp: Some(
+                serde_json::json!({
+                    "inputs": [{
+                        "id": "region",
+                        "type": "PickString",
+                        "description": "Region",
+                        "options": [{"label": "China", "value": "cn"}],
+                        "default": "eu"
+                    }]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ..Default::default()
+        };
+        let report = validate_config(&doc);
+        assert!(!report.is_valid());
+        assert!(report.errors.iter().any(|error| {
+            error.field == "inputs.region" && error.reason.contains("must match")
+        }));
+    }
+
+    #[test]
     fn validate_settings_scope_tagging_local_vs_project() {
         // 同一 policy-only 字段：project 层报错、local 层报错，各带对应 scope + 文件名。
         let doc = ProjectConfigDoc {

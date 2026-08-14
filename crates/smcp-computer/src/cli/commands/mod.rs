@@ -468,9 +468,9 @@ mod tests {
     #[tokio::test]
     async fn cli_hooks_register_with_input_scope_threads_scope_into_render() {
         // §5.11 wiring（#155）：register_server_with_input_scope(Some(plugin_id)) 经 CliMcpHooks override →
-        // mount_server_with_scope → render 按 plugin scope 解析裸 `${input:}`。池里仅 scoped def（无值/默认/resolver）
-        // → Missing(scoped) 上抛。证明 scope 透传：若 wiring 断了（退化为无 scope 的 register_server），裸 "token"
-        // 查不到 scoped 池条目 → 占位符字面保留 → Ok，本测试会失败。
+        // mount_server_with_scope 保存 raw config，实际 start 时按 plugin scope 解析裸 `${input:}`。池里仅
+        // scoped def（无值/默认/resolver）→ start 上抛 Missing(scoped)。若 wiring 断了（退化为无
+        // scope 的 register_server），裸 "token" 查不到 scoped 池条目 → 占位符字面保留 → start Ok。
         use crate::mcp_clients::model::{
             MCPServerConfig, MCPServerInput, PromptStringInput, StdioServerConfig,
             StdioServerParameters,
@@ -487,6 +487,7 @@ mod tests {
                 password: Some(false),
             }),
         );
+        let td = tempfile::TempDir::new().unwrap();
         let comp = Computer::new(
             "wiring",
             SilentSession::new("t"),
@@ -494,7 +495,10 @@ mod tests {
             None,
             false,
             false,
-        );
+        )
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"));
+        comp.boot_up().await.unwrap();
         let hooks = CliMcpHooks::new(&comp, Some("figma".into()), Some("acme".into())).await;
         let cfg = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
@@ -512,15 +516,21 @@ mod tests {
                 cwd: None,
             },
         });
-        let err = hooks
+        let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg);
+        hooks
             .register_server_with_input_scope(cfg, Some("figma@acme"))
             .await
-            .unwrap_err();
-        let McpHookError(msg) = err;
+            .expect("mount only records the raw declaration");
+        let msg = comp
+            .start_mcp_client(&bundle_id)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             msg.contains("figma@acme/token"),
             "scoped id should surface in error, got: {msg}"
         );
+        comp.shutdown().await.unwrap();
     }
 
     /// #100 item1：`new_remount` 从 ledger 建 `install_path → 归属` 索引；`inject_inputs` **按记录归属**
