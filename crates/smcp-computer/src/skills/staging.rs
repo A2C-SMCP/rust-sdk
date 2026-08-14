@@ -1153,6 +1153,62 @@ fn uri_leaf(uri: &str) -> &str {
     path.split('/').next().unwrap_or("")
 }
 
+/// 真前缀归属：`uri` 位于 `root_uri` 之下（以 `root_uri + "/"` 为界，全 URI 串口径）。
+/// 覆盖判定与 resources 子资源过滤共用同一谓词（#188，与 Python `_is_under` 同构）。
+fn is_under(uri: &str, root_uri: &str) -> bool {
+    uri.strip_prefix(root_uri)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// 把单 server 全量 skill:// 资源切分为「根」与「被覆盖者」（#188：URI 前缀归属优先于 `_meta.source`）。
+///
+/// 带 `_meta.source` ∈ [`MCP_SOURCE_MODES`] 者先全量收集为候选；候选间按真前缀 [`is_under`]
+/// （与 resources 子资源过滤同一谓词）判定覆盖——被覆盖者从根集合排除：其 meta 是 provider 在
+/// 非根资源上的多余声明，物化 / 注册一律跳过，日志降级由调用方负责。最长前缀 = 立即父
+/// （嵌套链经逐条 DEBUG 可重建）。覆盖者须为有效根（[`uri_leaf`] 非空）：leaf-less 候选自身走
+/// 调用方既有 ERROR 分支，不得静默吞其名下的合法根。无 `source` 的资源不是候选、不覆盖别人、
+/// 也不被排除（仍由覆盖者按 resources 模式作为普通子资源物化）。保持 candidates 原相对顺序
+/// （`seen_this_run` 先到者语义依赖此序）。
+///
+/// 返回 `(roots, covered)`——根列表（保序）与被覆盖映射 `{被覆盖 URI: 覆盖者 URI}`（插入序，
+/// 同键后写覆盖与 Python dict 语义一致）。
+fn partition_roots(
+    resources: &[McpResource],
+) -> (Vec<McpResource>, indexmap::IndexMap<String, String>) {
+    let candidates: Vec<&McpResource> = resources
+        .iter()
+        .filter(|res| {
+            res.meta
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|mode| MCP_SOURCE_MODES.contains(&mode))
+        })
+        .collect();
+    let mut covered: indexmap::IndexMap<String, String> = indexmap::IndexMap::new();
+    for res in &candidates {
+        let uri = res.uri.as_str();
+        let mut coverer: Option<&str> = None;
+        for other in &candidates {
+            let other_uri = other.uri.as_str();
+            if other_uri == uri || uri_leaf(other_uri).is_empty() {
+                continue; // 自身 / leaf-less 候选不得作覆盖者
+            }
+            if is_under(uri, other_uri) && coverer.is_none_or(|c| other_uri.len() > c.len()) {
+                coverer = Some(other_uri);
+            }
+        }
+        if let Some(c) = coverer {
+            covered.insert(uri.to_string(), c.to_string());
+        }
+    }
+    let roots = candidates
+        .into_iter()
+        .filter(|res| !covered.contains_key(res.uri.as_str()))
+        .cloned()
+        .collect();
+    (roots, covered)
+}
+
 /// mounted：复制 `_meta.mount_dir` 本地目录树进 staging（自包含，不留符号链接）/ mounted materialization。
 fn materialize_mounted(meta: &Map<String, Value>, dest: &Path) -> Result<(), SkillStagingError> {
     let mount_dir = meta
@@ -1397,11 +1453,24 @@ pub async fn stage_mcp_skills(
     let mut registered = Vec::new();
     let mut seen_this_run: HashSet<String> = HashSet::new();
     for (bid, resources) in &by_server {
-        for res in resources {
-            let mode = res.meta.get("source").and_then(Value::as_str).unwrap_or("");
-            if !MCP_SOURCE_MODES.contains(&mode) {
-                continue; // 非 SKILL 根
+        // #188：先按 URI 前缀归属切分——被其他根覆盖的资源（provider 在非根资源上多声明了
+        // `_meta.source`）不再走根物化路径，日志降级（归属判断优先于 meta 判断）。
+        let (roots, covered) = partition_roots(resources);
+        if !covered.is_empty() {
+            tracing::warn!(
+                bundle = %bid, count = covered.len(),
+                "skill:// resource(s) declared as SKILL roots are covered by other roots \
+                 (provider-declared _meta.source on non-root resources); root materialization skipped"
+            );
+            for (uri, coverer) in &covered {
+                tracing::debug!(
+                    bundle = %bid, uri = %uri, coverer = %coverer,
+                    "skill resource covered by skill resource (immediate parent); skipping"
+                );
             }
+        }
+        for res in &roots {
+            let mode = res.meta.get("source").and_then(Value::as_str).unwrap_or(""); // partition_roots 已保证 ∈ MCP_SOURCE_MODES
             let root_uri = res.uri.as_str();
             let leaf = uri_leaf(root_uri);
             if leaf.is_empty() {
@@ -1419,7 +1488,7 @@ pub async fn stage_mcp_skills(
                 _ => {
                     let subs: Vec<McpResource> = resources
                         .iter()
-                        .filter(|r| r.uri.starts_with(&format!("{root_uri}/")))
+                        .filter(|r| is_under(&r.uri, root_uri))
                         .cloned()
                         .collect();
                     materialize_resources(manager, bid, root_uri, &subs, &staged).await
@@ -2114,6 +2183,60 @@ mod tests {
             .unwrap();
         assert!(names.is_empty());
         assert_eq!(reg.read().await.len(), 0);
+    }
+
+    /// #188 纯函数：leaf-less 候选不得覆盖别人；未被覆盖的 leaf-less 保留在 roots（ERROR 分支可达）；保序。
+    #[test]
+    fn test_partition_roots_leafless_guard_and_order() {
+        let leafless = mcp_res("skill://h", source_meta("resources"));
+        let a = mcp_res("skill://h/a", source_meta("resources"));
+        let sub_a = mcp_res("skill://h/a/SKILL.md", source_meta("resources")); // 被 a 覆盖
+        let plain = McpResource {
+            uri: "skill://h/a/notes.md".to_string(),
+            meta: Map::new(), // 无 source：非候选、不覆盖、不被排除
+        };
+
+        let (roots, covered) = partition_roots(&[leafless, a, sub_a, plain]);
+
+        let root_uris: Vec<&str> = roots.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(root_uris, vec!["skill://h", "skill://h/a"]); // 保序；leafless 未被覆盖
+        assert_eq!(
+            covered
+                .iter()
+                .map(|(u, c)| (u.as_str(), c.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("skill://h/a/SKILL.md", "skill://h/a")]
+        );
+    }
+
+    /// #188 纯函数：嵌套 A>B>C 记立即父（B→A、C→B）；重复 URI 不自覆盖（去重属范围外，保持现状）；
+    /// sibling 边界 `x` 与 `xy` 互不覆盖（真前缀以 `/` 为界）。
+    #[test]
+    fn test_partition_roots_nested_chain_duplicate_and_sibling_boundary() {
+        let a = mcp_res("skill://h/a", source_meta("resources"));
+        let b = mcp_res("skill://h/a/b", source_meta("resources"));
+        let c = mcp_res("skill://h/a/b/c", source_meta("resources"));
+        let dup = mcp_res("skill://h/a", source_meta("resources"));
+        let x = mcp_res("skill://h/x", source_meta("resources"));
+        let xy = mcp_res("skill://h/xy", source_meta("resources"));
+
+        let (roots, covered) = partition_roots(&[a, b, c, dup, x, xy]);
+
+        let root_uris: Vec<&str> = roots.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(
+            root_uris,
+            vec!["skill://h/a", "skill://h/a", "skill://h/x", "skill://h/xy"]
+        ); // 重复副本都留在 roots；sibling 不互覆盖
+        assert_eq!(
+            covered
+                .iter()
+                .map(|(u, c)| (u.as_str(), c.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("skill://h/a/b", "skill://h/a"),
+                ("skill://h/a/b/c", "skill://h/a/b")
+            ]
+        );
     }
 
     // ---- #77：写锁不跨 materialize 网络 fetch（archive 模式回归守卫）----
