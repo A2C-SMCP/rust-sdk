@@ -1453,6 +1453,7 @@ pub async fn stage_mcp_skills(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -1912,6 +1913,207 @@ mod tests {
         assert_eq!(r.version.as_deref(), Some("2.1"));
         assert!(r.path.ends_with("mcp/tfrobot-tools/real-name"));
         assert!(Path::new(&r.path).join("SKILL.md").is_file());
+    }
+
+    // ---- #188：URI 前缀归属优先于 _meta.source（镜像 python-sdk#188）----
+    /// 可配置 stub：全量回放 `(bundle_id, resource)` 清单 + `uri → bytes` 读取映射。
+    struct StubManager {
+        resources: Vec<(String, McpResource)>,
+        reads: HashMap<String, Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SkillResourceManager for StubManager {
+        async fn list_skill_resources(
+            &self,
+            bundle_id: Option<&str>,
+        ) -> Result<Vec<(String, McpResource)>, SkillStagingError> {
+            Ok(self
+                .resources
+                .iter()
+                .filter(|(bid, _)| bundle_id.is_none_or(|f| f == bid))
+                .cloned()
+                .collect())
+        }
+
+        async fn read_resource(
+            &self,
+            _bundle_id: &str,
+            uri: &str,
+        ) -> Result<Vec<u8>, SkillStagingError> {
+            self.reads
+                .get(uri)
+                .cloned()
+                .ok_or_else(|| SkillStagingError::new(format!("no read for {uri}")))
+        }
+    }
+
+    fn mcp_res(uri: &str, meta: Map<String, Value>) -> McpResource {
+        McpResource {
+            uri: uri.to_string(),
+            meta,
+        }
+    }
+
+    fn source_meta(source: &str) -> Map<String, Value> {
+        let mut meta = Map::new();
+        meta.insert("source".into(), Value::String(source.into()));
+        meta
+    }
+
+    /// 日志断言用 subscriber：捕获全部级别（含 DEBUG），无时间戳/目标噪声。
+    fn capture_subscriber(logs: CapturedLogs) -> impl tracing::Subscriber {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs)
+            .finish()
+    }
+
+    /// 建一个 mounted SKILL 源目录（含 SKILL.md），返回其 `_meta` 与目录路径。
+    fn make_mount(tmp: &Path, name: &str) -> (Map<String, Value>, PathBuf) {
+        let dir = tmp.join(format!("mount_{name}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: mounted {name}\n---\nbody"),
+        )
+        .unwrap();
+        let mut meta = source_meta("mounted");
+        meta.insert(
+            "mount_dir".into(),
+            Value::String(dir.to_string_lossy().into_owned()),
+        );
+        (meta, dir)
+    }
+
+    /// #188 规则 1+2：provider 给根+子资源全部打 `_meta.source` → 被根前缀覆盖的子资源
+    /// 不再当独立根物化（无 ERROR 刷屏、无 staging 目录抖动）——归属判断优先于 meta 判断。
+    /// pre-fix 症状：被覆盖子资源 materialize 时 `reset_dir` 抹掉真根已落盘内容 + ERROR 刷屏。
+    #[tokio::test]
+    async fn test_stage_mcp_resources_covered_child_with_source_meta_not_materialized_as_root() {
+        let root_uri = "skill://h/my-skill";
+        let sub1_uri = "skill://h/my-skill/SKILL.md";
+        let sub2_uri = "skill://h/my-skill/assets/logo.bin";
+        let root = mcp_res(root_uri, source_meta("resources"));
+        let sub1 = mcp_res(sub1_uri, source_meta("resources")); // 不合规：子资源携带 source
+        let sub2 = mcp_res(sub2_uri, source_meta("resources"));
+        let mut reads = HashMap::new();
+        reads.insert(
+            sub1_uri.to_string(),
+            b"---\nname: my-skill\ndescription: covered skill\n---\nbody".to_vec(),
+        );
+        reads.insert(sub2_uri.to_string(), b"\x00\x01\x02".to_vec());
+        let manager = StubManager {
+            resources: vec![
+                ("srv".to_string(), root),
+                ("srv".to_string(), sub1),
+                ("srv".to_string(), sub2),
+            ],
+            reads,
+        };
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let logs = CapturedLogs::default();
+        let subscriber = capture_subscriber(logs.clone());
+        let reg = RwLock::new(SkillRegistry::new());
+        let names = stage_mcp_skills(&manager, &reg, &home, None, None)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        assert_eq!(names, vec!["mcp:srv:my-skill".to_string()]); // 仅真根注册一次
+        assert_eq!(reg.read().await.len(), 1);
+        let r = reg.read().await.resolve("mcp:srv:my-skill").unwrap();
+        let path = Path::new(&r.path);
+        assert!(path.join("SKILL.md").is_file());
+        assert_eq!(fs::read(path.join("assets/logo.bin")).unwrap(), b"\x00\x01\x02");
+        // 被覆盖资源：每 bundle 一条汇总 WARNING + 逐条 DEBUG；不得出现任何 ERROR（pre-fix 是 ERROR 刷屏）
+        let rendered = logs.contents();
+        assert!(!rendered.contains("ERROR"), "{rendered}");
+        assert_eq!(
+            rendered.matches("covered by other roots").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(rendered.contains("(immediate parent)"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("uri={sub1_uri} coverer={root_uri}")),
+            "{rendered}"
+        );
+        assert!(rendered.contains(sub2_uri), "{rendered}");
+    }
+
+    /// #188 嵌套链 A>B>C（均 mounted）：B、C 均被排除（覆盖判定不看覆盖者自身是否被覆盖），
+    /// 仅 A 注册；DEBUG 记立即父（B→A、C→B 最长前缀覆盖者）。mounted 无子资源枚举，链式覆盖可干净表达。
+    #[tokio::test]
+    async fn test_stage_mcp_nested_covered_roots_mounted_only_a_registered() {
+        let tmp = TempDir::new().unwrap();
+        let (meta_a, _) = make_mount(tmp.path(), "a");
+        let (meta_b, _) = make_mount(tmp.path(), "b");
+        let (meta_c, _) = make_mount(tmp.path(), "c");
+        let manager = StubManager {
+            resources: vec![
+                ("srv".to_string(), mcp_res("skill://h/a", meta_a)),
+                ("srv".to_string(), mcp_res("skill://h/a/b", meta_b)),
+                ("srv".to_string(), mcp_res("skill://h/a/b/c", meta_c)),
+            ],
+            reads: HashMap::new(),
+        };
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let logs = CapturedLogs::default();
+        let subscriber = capture_subscriber(logs.clone());
+        let reg = RwLock::new(SkillRegistry::new());
+        let names = stage_mcp_skills(&manager, &reg, &home, None, None)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        assert_eq!(names, vec!["mcp:srv:a".to_string()]); // 仅最外层根注册
+        assert_eq!(reg.read().await.len(), 1);
+        let rendered = logs.contents();
+        assert!(!rendered.contains("ERROR"), "{rendered}");
+        assert_eq!(
+            rendered.matches("covered by other roots").count(),
+            1,
+            "{rendered}"
+        );
+        // 立即父语义：B→A、C→B（最长前缀覆盖者）
+        assert!(
+            rendered.contains("uri=skill://h/a/b coverer=skill://h/a\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("uri=skill://h/a/b/c coverer=skill://h/a/b\n"),
+            "{rendered}"
+        );
+    }
+
+    /// 无 `_meta.source` 的 skill:// 资源（子资源 / 未声明）→ 非 SKILL 根 → 跳过。
+    /// 守护循环头重构：skip 逻辑从 `continue` 移入根归属切分后语义不变。
+    #[tokio::test]
+    async fn test_stage_mcp_resource_without_source_meta_skipped() {
+        let plain = McpResource {
+            uri: "skill://h/not-a-root".to_string(),
+            meta: Map::new(),
+        };
+        let manager = StubManager {
+            resources: vec![("srv".to_string(), plain)],
+            reads: HashMap::new(),
+        };
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let reg = RwLock::new(SkillRegistry::new());
+        let names = stage_mcp_skills(&manager, &reg, &home, None, None)
+            .await
+            .unwrap();
+        assert!(names.is_empty());
+        assert_eq!(reg.read().await.len(), 0);
     }
 
     // ---- #77：写锁不跨 materialize 网络 fetch（archive 模式回归守卫）----
