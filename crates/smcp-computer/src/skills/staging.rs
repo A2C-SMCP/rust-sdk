@@ -2099,7 +2099,10 @@ mod tests {
         let r = reg.read().await.resolve("mcp:srv:my-skill").unwrap();
         let path = Path::new(&r.path);
         assert!(path.join("SKILL.md").is_file());
-        assert_eq!(fs::read(path.join("assets/logo.bin")).unwrap(), b"\x00\x01\x02");
+        assert_eq!(
+            fs::read(path.join("assets/logo.bin")).unwrap(),
+            b"\x00\x01\x02"
+        );
         // 被覆盖资源：每 bundle 一条汇总 WARNING + 逐条 DEBUG；不得出现任何 ERROR（pre-fix 是 ERROR 刷屏）
         let rendered = logs.contents();
         assert!(!rendered.contains("ERROR"), "{rendered}");
