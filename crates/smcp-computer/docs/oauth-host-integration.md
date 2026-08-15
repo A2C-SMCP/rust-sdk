@@ -14,9 +14,12 @@ authorization URL.
 
 OAuth has no public server-configuration fields. The canonical RFC 8707 resource, authorization
 server, scopes, and dynamic client registration are derived from the challenged MCP endpoint and
-validated RFC 9728/RFC 8414 or OIDC metadata. The SDK binds admission to the exact
-`resource_metadata` URL from the Bearer challenge and verifies that the document describes the
-challenged endpoint. It does not support proactive or cross-resource configuration.
+validated RFC 9728/RFC 8414 or OIDC metadata. When the Bearer challenge carries `resource_metadata`,
+the SDK binds admission to that exact URL and verifies that the document describes the challenged
+endpoint; when the challenge omits it (a bare Bearer challenge), the SDK falls back to well-known
+discovery as MCP 2026-07-28 requires (protected-resource path insertion and root, then RFC 8414/OIDC
+authorization-server metadata at the endpoint origin). It does not support proactive or
+cross-resource configuration.
 
 The removed `oauth`, `authPolicy`, and `auth_policy` fields are rejected with an actionable
 configuration validation error instead of being ignored. A static `Authorization` header selects
@@ -31,17 +34,23 @@ and performs one authenticated initialize. A host must expose an authorization a
 that bounded startup transaction returns `HttpAuthenticationError::OAuthRequired`; this means
 interactive user authorization is still required and all of the following checks succeeded:
 
-1. the server returned a syntactically valid Bearer challenge containing `resource_metadata`;
-2. that exact RFC 9728 protected-resource metadata URL was fetched and validated for the
-   challenged MCP endpoint;
+1. the server returned a syntactically valid Bearer challenge — its `resource_metadata` was used
+   when present, otherwise discovery fell back to the well-known URIs (MCP 2026-07-28);
+2. if a `resource_metadata` URL was present, that exact RFC 9728 protected-resource metadata URL
+   was fetched and validated for the challenged MCP endpoint;
 3. issuer-bearing RFC 8414 or OIDC authorization-server metadata was discovered and validated;
-   endpoints derived by rmcp's legacy fallback are not accepted for automatic admission.
+   endpoints derived by rmcp's legacy fallback (no issuer) are not accepted for automatic admission.
+   Authorization servers nominated by a protected-resource metadata document are additionally
+   validated for issuer consistency (RFC 8414 §3.3); authorization servers discovered through the
+   endpoint origin's well-known chain are exempt (providers whose issuer domain differs from the
+   resource origin, such as Atlassian's `cf.mcp.atlassian.com`).
 
 Before admission, `oauth_status` and `create_oauth_flow` return `OAuthError::NotConfigured` and do
-not perform discovery, registration, or token requests. Basic, Digest, unknown challenges, Bearer
-without metadata, failed discovery, bare 401, and ordinary 403 are separate
-`HttpAuthenticationError` values. A valid `403 insufficient_scope` can request step-up only when a
-validated OAuth coordinator already exists. Automatic startup never polls or infers runtime state
+not perform discovery, registration, or token requests. Basic, Digest, unknown challenges, failed
+discovery (including a bare Bearer challenge with no discoverable authorization-server metadata),
+bare 401, and ordinary 403 are separate `HttpAuthenticationError` values. A valid
+`403 insufficient_scope` can request step-up only when a validated OAuth coordinator already
+exists. Automatic startup never polls or infers runtime state
 from OAuth status: it performs at most one anonymous initialize and one challenge-triggered OAuth
 initialize, while OAuth status and MCP runtime status remain independent.
 

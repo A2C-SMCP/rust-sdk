@@ -574,7 +574,9 @@ impl DiscoveryCleanupOAuthHttpClient {
                     .write()
                     .expect("PRM authorization server observation lock poisoned");
                 for candidate in candidates {
-                    let Ok(absolute) = request_url.join(candidate) else {
+                    // rmcp trims candidates before accepting them (auth.rs discovery loop);
+                    // trim here too so a padded nomination is not silently unrecorded.
+                    let Ok(absolute) = request_url.join(candidate.trim()) else {
                         continue;
                     };
                     let Some(canonical) = canonical_authorization_identifier(absolute.as_str())
@@ -3201,8 +3203,9 @@ fn canonical_authorization_identifier(value: &str) -> Option<String> {
 /// - `{origin}/{rest}/.well-known/oauth-authorization-server` → `{origin}/{rest}`
 ///
 /// URLs that match no construction shape (custom direct-fetch paths, redirect
-/// targets) yield `None`; the caller falls back to comparing the URL itself
-/// against the PRM-nominated set.
+/// targets) yield `None`; the caller also compares the URL itself against the
+/// PRM-nominated set, which covers direct-fetch nominations of full discovery
+/// URLs.
 fn derive_issuer_identifier(asm_url: &Url) -> Option<String> {
     let origin = canonical_authorization_identifier(&format!(
         "{}://{}{}",
@@ -3278,10 +3281,18 @@ fn validate_observed_issuer_consistency(
         let Ok(url) = Url::parse(raw) else {
             continue;
         };
-        let candidates = derive_issuer_identifier(&url)
-            .map(|derived| vec![derived])
-            .or_else(|| canonical_authorization_identifier(raw).map(|canonical| vec![canonical]))
-            .unwrap_or_default();
+        // Compare against both key spaces: the issuer identifier that constructed a
+        // well-known URL, and the URL itself. PRM can nominate a full discovery URL
+        // (rmcp direct-fetches candidates whose path contains `/.well-known/`), so
+        // the raw canonical URL must be checked alongside the derived identifier —
+        // they never match the same PRM entries.
+        let mut candidates = Vec::new();
+        if let Some(canonical) = canonical_authorization_identifier(raw) {
+            candidates.push(canonical);
+        }
+        if let Some(derived) = derive_issuer_identifier(&url) {
+            candidates.push(derived);
+        }
         for candidate in candidates {
             if prm_authorization_servers.contains(&candidate) && candidate != issuer {
                 return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
@@ -3774,6 +3785,40 @@ mod tests {
         // No issuer (legacy hardcoded fallback) has nothing to compare.
         let no_issuer = metadata_with(None);
         assert!(validate_observed_issuer_consistency(&observation, &no_issuer).is_ok());
+    }
+
+    #[test]
+    fn observed_issuer_consistency_covers_prm_direct_fetch_nominations() {
+        // PRM can nominate a full discovery URL (rmcp direct-fetches candidates
+        // whose path contains `/.well-known/`). The nominated URL itself must be
+        // compared against the fetched document's issuer.
+        let observation = AuthorizationServerObservation::default();
+        let direct_fetch = "https://idp.example/realms/app/.well-known/openid-configuration";
+        observation
+            .prm_authorization_servers
+            .write()
+            .expect("observation lock poisoned")
+            .push(direct_fetch.to_string());
+        observation
+            .asm_metadata_urls
+            .write()
+            .expect("observation lock poisoned")
+            .push(direct_fetch.to_string());
+        let metadata_with = |issuer: Option<&str>| {
+            serde_json::from_value::<AuthorizationMetadata>(serde_json::json!({
+                "authorization_endpoint": "https://idp.example/authorize",
+                "token_endpoint": "https://idp.example/token",
+                "issuer": issuer,
+            }))
+            .expect("test metadata must deserialize")
+        };
+        let mismatched = metadata_with(Some("https://attacker.example"));
+        assert!(matches!(
+            validate_observed_issuer_consistency(&observation, &mismatched),
+            Err(OAuthError::Protocol(OAuthProtocolError::Metadata))
+        ));
+        let matching = metadata_with(Some(direct_fetch));
+        assert!(validate_observed_issuer_consistency(&observation, &matching).is_ok());
     }
 
     #[test]

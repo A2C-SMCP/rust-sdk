@@ -580,6 +580,7 @@ struct OAuthMockState {
     omit_authorization_issuer: AtomicBool,
     bare_bearer_challenge: AtomicBool,
     authorization_issuer_override: StdMutex<Option<String>>,
+    prm_authorization_servers_override: StdMutex<Option<Vec<String>>>,
     block_next_mcp_response: AtomicBool,
     discovery_started: Notify,
     registration_started: Notify,
@@ -686,12 +687,18 @@ async fn oauth_http_mock_handler(
                 .body(empty_body())
                 .unwrap());
         }
+        let authorization_servers = state
+            .prm_authorization_servers_override
+            .lock()
+            .expect("PRM override lock poisoned")
+            .clone()
+            .unwrap_or_else(|| vec![state.base_url.clone()]);
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
                 serde_json::json!({
                     "resource": state.resource(),
-                    "authorization_servers": [&state.base_url],
+                    "authorization_servers": authorization_servers,
                     "scopes_supported": ["tools.read"],
                 })
                 .to_string(),
@@ -709,12 +716,18 @@ async fn oauth_http_mock_handler(
                 .body(empty_body())
                 .unwrap());
         }
+        let authorization_servers = state
+            .prm_authorization_servers_override
+            .lock()
+            .expect("PRM override lock poisoned")
+            .clone()
+            .unwrap_or_else(|| vec![state.base_url.clone()]);
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
                 serde_json::json!({
                     "resource": state.resource(),
-                    "authorization_servers": [&state.base_url],
+                    "authorization_servers": authorization_servers,
                     "scopes_supported": ["tools.read"],
                 })
                 .to_string(),
@@ -1024,6 +1037,7 @@ async fn spawn_oauth_http_mock_with_options(
         omit_authorization_issuer: AtomicBool::new(false),
         bare_bearer_challenge: AtomicBool::new(false),
         authorization_issuer_override: StdMutex::new(None),
+        prm_authorization_servers_override: StdMutex::new(None),
         block_next_mcp_response: AtomicBool::new(false),
         discovery_started: Notify::new(),
         registration_started: Notify::new(),
@@ -1610,11 +1624,8 @@ async fn test_bare_bearer_legacy_discovery_exempts_issuer_consistency() {
 
 #[tokio::test]
 async fn test_interactive_flow_rejects_issuer_mismatch_on_rediscovery() {
-    let (manager, bundle_id, state) = authorization_code_manager(
-        OAuthFixtureMode::Dynamic,
-        false,
-    )
-    .await;
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::Dynamic, false).await;
     *state
         .authorization_issuer_override
         .lock()
@@ -1635,6 +1646,73 @@ async fn test_interactive_flow_rejects_issuer_mismatch_on_rediscovery() {
         Err(OAuthError::Protocol(OAuthProtocolError::Metadata))
     ));
     assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_interactive_rediscovery_discards_stale_observation_evidence() {
+    // Bare-bearer admission observes PRM nomination A (consistent), then the
+    // interactive flow observes nomination B (consistent). Stale admission
+    // evidence must not leak into the interactive gate: the A-chain well-known
+    // URL would derive A, match the stale PRM set, and falsely reject the
+    // B-issuer metadata. The reset before interactive rediscovery is what this
+    // test anchors.
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    state.bare_bearer_challenge.store(true, Ordering::SeqCst);
+    let bundle_id = BundleId::try_from("oauth-bare-stale-evidence").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-bare-stale-evidence",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+
+    // Switch the served nomination and issuer to a different, still consistent pair.
+    *state
+        .prm_authorization_servers_override
+        .lock()
+        .expect("PRM override lock poisoned") = Some(vec![format!("{}/mcp", state.base_url)]);
+    *state
+        .authorization_issuer_override
+        .lock()
+        .expect("issuer override lock poisoned") = Some(format!("{}/mcp", state.base_url));
+
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 1);
+    manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: launch.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    manager.clear_oauth(&bundle_id).await.unwrap();
 }
 
 #[tokio::test]
