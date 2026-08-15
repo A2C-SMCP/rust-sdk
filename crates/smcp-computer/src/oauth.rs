@@ -346,6 +346,7 @@ struct DiscoveryCleanupOAuthHttpClient {
     protected_resource_headers: HeaderMap,
     protected_resource_metadata_urls: StdRwLock<HashSet<String>>,
     admitted_resource_metadata: Option<AdmittedResourceMetadata>,
+    observation: Arc<AuthorizationServerObservation>,
 }
 
 #[derive(Clone)]
@@ -363,16 +364,55 @@ struct AdmittedResourceMetadataDocument {
     scopes_supported: Option<Vec<String>>,
 }
 
+/// Discovery evidence observed on the OAuth HTTP choke point, used to enforce
+/// RFC 8414 §3.3 issuer consistency: an authorization server metadata document's
+/// `issuer` must match the issuer identifier used to construct the well-known
+/// URL it was fetched from. Only authorization servers **nominated by a
+/// protected resource metadata document** are held to this rule; authorization
+/// servers discovered through the endpoint origin's well-known chain are exempt
+/// (the legacy discovery form used by providers such as Atlassian, whose issuer
+/// domain differs from the resource origin).
+#[derive(Default)]
+struct AuthorizationServerObservation {
+    /// Canonicalized absolute URLs of authorization servers nominated by
+    /// observed protected resource metadata documents.
+    prm_authorization_servers: StdRwLock<Vec<String>>,
+    /// Canonicalized URLs of well-known fetches whose bodies parsed as
+    /// authorization server metadata carrying an issuer (rmcp's acceptance
+    /// shape: HTTP 200 + `AuthorizationMetadata` + issuer present).
+    asm_metadata_urls: StdRwLock<Vec<String>>,
+}
+
+impl AuthorizationServerObservation {
+    fn reset(&self) {
+        self.prm_authorization_servers
+            .write()
+            .expect("PRM authorization server observation lock poisoned")
+            .clear();
+        self.asm_metadata_urls
+            .write()
+            .expect("ASM metadata URL observation lock poisoned")
+            .clear();
+    }
+}
+
 impl DiscoveryCleanupOAuthHttpClient {
     #[cfg(test)]
     fn new() -> Result<Self, RmcpAuthError> {
-        Self::new_for_protected_resource(None, HeaderMap::new(), None, Vec::new())
+        Self::new_for_protected_resource(
+            None,
+            HeaderMap::new(),
+            None,
+            Arc::new(AuthorizationServerObservation::default()),
+            Vec::new(),
+        )
     }
 
     fn with_protected_resource_headers(
         resource: &str,
         mut protected_resource_headers: HeaderMap,
         admitted_resource_metadata: Option<AdmittedResourceMetadata>,
+        observation: Arc<AuthorizationServerObservation>,
         #[cfg(test)] test_root_certificates: Vec<reqwest::Certificate>,
     ) -> Result<Self, RmcpAuthError> {
         protected_resource_headers.remove(http::header::AUTHORIZATION);
@@ -382,6 +422,7 @@ impl DiscoveryCleanupOAuthHttpClient {
             Some(resource),
             protected_resource_headers,
             admitted_resource_metadata,
+            observation,
             #[cfg(test)]
             test_root_certificates,
         )
@@ -391,6 +432,7 @@ impl DiscoveryCleanupOAuthHttpClient {
         protected_resource: Option<Url>,
         protected_resource_headers: HeaderMap,
         admitted_resource_metadata: Option<AdmittedResourceMetadata>,
+        observation: Arc<AuthorizationServerObservation>,
         #[cfg(test)] test_root_certificates: Vec<reqwest::Certificate>,
     ) -> Result<Self, RmcpAuthError> {
         let follow_redirects = reqwest::Client::builder().timeout(OAUTH_HTTP_TIMEOUT);
@@ -451,6 +493,7 @@ impl DiscoveryCleanupOAuthHttpClient {
             protected_resource_headers,
             protected_resource_metadata_urls: StdRwLock::new(HashSet::new()),
             admitted_resource_metadata,
+            observation,
         })
     }
 
@@ -490,6 +533,82 @@ impl DiscoveryCleanupOAuthHttpClient {
             .is_some_and(|resource| Self::admitted_resource_matches(&expected.resource, &resource));
         if valid {
             expected.validated.store(true, Ordering::Release);
+        }
+    }
+
+    /// Record RFC 8414 §3.3 enforcement evidence from one response body: the
+    /// authorization servers nominated by protected resource metadata documents,
+    /// and the well-known URLs whose documents rmcp actually accepted.
+    fn observe_authorization_server_evidence(
+        &self,
+        request_url: &Url,
+        status: reqwest::StatusCode,
+        body: &[u8],
+    ) {
+        if !status.is_success() {
+            return;
+        }
+        // (a) PRM-nominated authorization server candidates. `is_protected_resource_request`
+        // misses a challenge-nominated same-origin PRM path outside the well-known namespace,
+        // so the admitted metadata URL is also accepted as PRM evidence.
+        let is_prm_fetch = self.is_protected_resource_request(request_url)
+            || self
+                .admitted_resource_metadata
+                .as_ref()
+                .is_some_and(|admitted| &admitted.url == request_url);
+        if is_prm_fetch {
+            if let Ok(document) = serde_json::from_slice::<AdmittedResourceMetadataDocument>(body) {
+                let mut candidates: Vec<&str> = document
+                    .authorization_servers
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                if let Some(single) = document.authorization_server.as_deref() {
+                    candidates.push(single);
+                }
+                let mut recorded = self
+                    .observation
+                    .prm_authorization_servers
+                    .write()
+                    .expect("PRM authorization server observation lock poisoned");
+                for candidate in candidates {
+                    let Ok(absolute) = request_url.join(candidate) else {
+                        continue;
+                    };
+                    let Some(canonical) = canonical_authorization_identifier(absolute.as_str())
+                    else {
+                        continue;
+                    };
+                    if !recorded.contains(&canonical) {
+                        recorded.push(canonical);
+                    }
+                }
+            }
+        }
+        // (b) Accepted authorization server metadata documents. Aligned with rmcp's acceptance
+        // shape: HTTP 200, parses as `AuthorizationMetadata`, and carries an issuer — recording
+        // looser documents would hold the coordinator to evidence rmcp itself rejected.
+        if status != reqwest::StatusCode::OK {
+            return;
+        }
+        let Ok(metadata) = serde_json::from_slice::<AuthorizationMetadata>(body) else {
+            return;
+        };
+        if metadata.issuer.is_none() {
+            return;
+        }
+        let Some(canonical) = canonical_authorization_identifier(request_url.as_str()) else {
+            return;
+        };
+        let mut recorded = self
+            .observation
+            .asm_metadata_urls
+            .write()
+            .expect("ASM metadata URL observation lock poisoned");
+        if !recorded.contains(&canonical) {
+            recorded.push(canonical);
         }
     }
 
@@ -672,6 +791,7 @@ impl OAuthHttpClient for DiscoveryCleanupOAuthHttpClient {
             }
             let body = body_result?;
             self.observe_admitted_resource_metadata(&request_url, response_status, &body);
+            self.observe_authorization_server_evidence(&request_url, response_status, &body);
 
             builder
                 .body(body)
@@ -1544,6 +1664,7 @@ pub(crate) struct OAuthCoordinator {
     transport_http_client: reqwest::Client,
     admitted_resource_metadata_validated: Option<Arc<AtomicBool>>,
     admitted_authorization_server_identity: Option<String>,
+    authorization_server_observation: Arc<AuthorizationServerObservation>,
 }
 
 pub(crate) struct OAuthCoordinatorContext {
@@ -1661,11 +1782,13 @@ impl OAuthCoordinator {
         let admitted_resource_metadata_validated = admitted_resource_metadata
             .as_ref()
             .map(|(_, validated)| Arc::clone(validated));
+        let observation = Arc::new(AuthorizationServerObservation::default());
         let oauth_http_client = Arc::new(
             DiscoveryCleanupOAuthHttpClient::with_protected_resource_headers(
                 mcp_endpoint,
                 protected_resource_headers,
                 admitted_resource_metadata.map(|(metadata, _)| metadata),
+                Arc::clone(&observation),
                 #[cfg(test)]
                 test_root_certificates,
             )?,
@@ -1678,6 +1801,7 @@ impl OAuthCoordinator {
             http_client,
             oauth_http_client,
             admitted_resource_metadata_validated,
+            observation,
         )
         .await
     }
@@ -1699,10 +1823,15 @@ impl OAuthCoordinator {
             http_client,
             oauth_http_client,
             None,
+            Arc::new(AuthorizationServerObservation::default()),
         )
         .await
     }
 
+    // The two admission-evidence handles (`validated`, `observation`) are construction-time
+    // state handed to the discovery client; bundling them into one parameter would obscure
+    // which producer owns each piece of evidence.
+    #[allow(clippy::too_many_arguments)]
     async fn new_with_oauth_http_client_and_admission(
         context: OAuthCoordinatorContext,
         resource: &str,
@@ -1711,6 +1840,7 @@ impl OAuthCoordinator {
         http_client: reqwest::Client,
         oauth_http_client: Arc<dyn OAuthHttpClient>,
         admitted_resource_metadata_validated: Option<Arc<AtomicBool>>,
+        observation: Arc<AuthorizationServerObservation>,
     ) -> Result<Self, OAuthError> {
         let OAuthCoordinatorContext {
             bundle_id,
@@ -1747,7 +1877,14 @@ impl OAuthCoordinator {
             if !validated.load(Ordering::Acquire) || metadata.issuer.is_none() {
                 return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
             }
+        } else if metadata.issuer.is_none() {
+            // Bare-bearer admission (no PRM URL, #189): the well-known fallback chain must have
+            // found a real authorization server metadata document. rmcp's legacy hardcoded
+            // `/authorize`-style fallback produces metadata without an issuer and is not enough
+            // evidence to admit automatic OAuth.
+            return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
         }
+        validate_observed_issuer_consistency(&observation, &metadata)?;
         validate_authorization_metadata(
             &metadata,
             matches!(options.mode, OAuthClientMode::AuthorizationCode { .. }),
@@ -1834,6 +1971,7 @@ impl OAuthCoordinator {
             admitted_resource_metadata_validated,
             admitted_authorization_server_identity: automatic_admission
                 .then_some(authorization_server_identity),
+            authorization_server_observation: observation,
         })
     }
 
@@ -2247,12 +2385,20 @@ impl OAuthCoordinator {
             // metadata served later by the resource or authorization server.
             validated.store(false, Ordering::Release);
         }
+        // Discovery evidence from previous flows must not leak into this one.
+        self.authorization_server_observation.reset();
         let metadata = manager.discover_metadata().await?;
         if let Some(validated) = self.admitted_resource_metadata_validated.as_ref() {
             if !validated.load(Ordering::Acquire) || metadata.issuer.is_none() {
                 return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
             }
+        } else if metadata.issuer.is_none() {
+            // Bare-bearer flow (#189): interactive rediscovery that ends on rmcp's legacy
+            // hardcoded-endpoint fallback (no issuer) found no discoverable authorization
+            // server and must not drive an authorization attempt.
+            return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
         }
+        validate_observed_issuer_consistency(&self.authorization_server_observation, &metadata)?;
         validate_authorization_metadata(&metadata, true)?;
         let issuer = authorization_server_credential_identity(&metadata)?;
         if self
@@ -3027,6 +3173,124 @@ fn canonical_resource_identity(value: &str) -> Result<String, OAuthError> {
     Ok(resource.to_string())
 }
 
+/// Normalize an authorization server identifier for RFC 8414 §3.3 comparison:
+/// scheme + host + port + path, without query/fragment and without a trailing
+/// slash (mirrors the python-sdk `_normalize_issuer`).
+fn canonical_authorization_identifier(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let path = url.path().trim_end_matches('/');
+    Some(format!(
+        "{}://{}{}{}",
+        url.scheme(),
+        url.host_str()?,
+        url.port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default(),
+        path,
+    ))
+}
+
+/// Reverse rmcp's well-known URL construction: recover the issuer identifier
+/// that was used to construct a well-known authorization server metadata URL
+/// (RFC 8414 §3.3). Covers rmcp's `generate_discovery_urls` shapes and the
+/// trailing direct-fetch shape used for PRM-nominated candidates:
+///
+/// - `{origin}/.well-known/oauth-authorization-server[/{rest}]` → `{origin}[/{rest}]`
+/// - `{origin}/.well-known/openid-configuration[/{rest}]` → `{origin}[/{rest}]`
+/// - `{origin}/{rest}/.well-known/openid-configuration` → `{origin}/{rest}`
+/// - `{origin}/{rest}/.well-known/oauth-authorization-server` → `{origin}/{rest}`
+///
+/// URLs that match no construction shape (custom direct-fetch paths, redirect
+/// targets) yield `None`; the caller falls back to comparing the URL itself
+/// against the PRM-nominated set.
+fn derive_issuer_identifier(asm_url: &Url) -> Option<String> {
+    let origin = canonical_authorization_identifier(&format!(
+        "{}://{}{}",
+        asm_url.scheme(),
+        asm_url.host_str()?,
+        asm_url
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default(),
+    ))?;
+    let path = asm_url.path().trim_end_matches('/');
+    for suffix in [
+        ".well-known/oauth-authorization-server",
+        ".well-known/openid-configuration",
+    ] {
+        if path == format!("/{suffix}") {
+            return Some(origin.clone());
+        }
+        if let Some(rest) = path.strip_prefix(&format!("/{suffix}/")) {
+            let rest = rest.trim_end_matches('/');
+            return Some(if rest.is_empty() {
+                origin
+            } else {
+                format!("{origin}/{rest}")
+            });
+        }
+        if let Some(rest) = path.strip_suffix(&format!("/{suffix}")) {
+            let rest = rest.trim_matches('/');
+            return Some(if rest.is_empty() {
+                origin
+            } else {
+                format!("{origin}/{rest}")
+            });
+        }
+    }
+    None
+}
+
+/// Enforce RFC 8414 §3.3 on observed discovery evidence: for every well-known
+/// fetch whose document rmcp accepted (HTTP 200, parses, carries an issuer),
+/// if the issuer identifier derived from that URL was nominated by a protected
+/// resource metadata document, the document's issuer must match it.
+///
+/// Authorization servers discovered through the endpoint origin's own
+/// well-known chain (no PRM nomination) are exempt — the legacy discovery form
+/// used by providers whose issuer domain differs from the resource origin
+/// (e.g. Atlassian's `cf.mcp.atlassian.com`). Known, deliberate exemptions
+/// where the python-sdk is stricter: a PRM-nominated chain that falls back to
+/// the canonical root well-known URL, and a PRM context whose candidates all
+/// fail and falls back to the endpoint origin chain.
+fn validate_observed_issuer_consistency(
+    observation: &AuthorizationServerObservation,
+    metadata: &AuthorizationMetadata,
+) -> Result<(), OAuthError> {
+    let Some(issuer) = metadata
+        .issuer
+        .as_deref()
+        .and_then(canonical_authorization_identifier)
+    else {
+        // Missing issuer is rejected by the standardized-discovery gates; a
+        // legacy-only result has no issuer to compare.
+        return Ok(());
+    };
+    let prm_authorization_servers = observation
+        .prm_authorization_servers
+        .read()
+        .expect("PRM authorization server observation lock poisoned");
+    let asm_metadata_urls = observation
+        .asm_metadata_urls
+        .read()
+        .expect("ASM metadata URL observation lock poisoned");
+    for raw in asm_metadata_urls.iter() {
+        let Ok(url) = Url::parse(raw) else {
+            continue;
+        };
+        let candidates = derive_issuer_identifier(&url)
+            .map(|derived| vec![derived])
+            .or_else(|| canonical_authorization_identifier(raw).map(|canonical| vec![canonical]))
+            .unwrap_or_default();
+        for candidate in candidates {
+            if prm_authorization_servers.contains(&candidate) && candidate != issuer {
+                return Err(OAuthError::Protocol(OAuthProtocolError::Metadata));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_authorization_metadata(
     metadata: &AuthorizationMetadata,
     require_pkce: bool,
@@ -3386,6 +3650,156 @@ mod tests {
         credential_store: Arc<dyn OAuthCredentialStore>,
     ) -> OAuthCoordinatorContext {
         OAuthCoordinatorContext::new(test_bundle_id(), credential_store, None)
+    }
+
+    #[test]
+    fn derive_issuer_identifier_covers_rmcp_well_known_shapes() {
+        let cases = [
+            // Root OAuth form.
+            (
+                "https://auth.example/.well-known/oauth-authorization-server",
+                Some("https://auth.example"),
+            ),
+            // Root OpenID form.
+            (
+                "https://auth.example/.well-known/openid-configuration",
+                Some("https://auth.example"),
+            ),
+            // Path insertion, OAuth.
+            (
+                "https://auth.example/.well-known/oauth-authorization-server/tenant1",
+                Some("https://auth.example/tenant1"),
+            ),
+            // Path insertion, OpenID.
+            (
+                "https://auth.example/.well-known/openid-configuration/tenant1",
+                Some("https://auth.example/tenant1"),
+            ),
+            // Path appending, OpenID.
+            (
+                "https://auth.example/tenant1/.well-known/openid-configuration",
+                Some("https://auth.example/tenant1"),
+            ),
+            // Trailing direct-fetch form (PRM candidate containing .well-known).
+            (
+                "https://auth.example/xyz/.well-known/oauth-authorization-server",
+                Some("https://auth.example/xyz"),
+            ),
+            // Protected resource metadata probes never count as ASM URLs.
+            (
+                "https://mcp.example/v1/.well-known/oauth-protected-resource",
+                None,
+            ),
+            // Arbitrary paths without a well-known shape.
+            ("https://auth.example/tenant1", None),
+        ];
+        for (raw, expected) in cases {
+            let url = Url::parse(raw).unwrap();
+            assert_eq!(
+                derive_issuer_identifier(&url).as_deref(),
+                expected,
+                "for {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_authorization_identifier_normalizes_urls() {
+        assert_eq!(
+            canonical_authorization_identifier("https://MCP.EXAMPLE:443/mcp/").as_deref(),
+            Some("https://mcp.example/mcp")
+        );
+        assert_eq!(
+            canonical_authorization_identifier("https://mcp.example/mcp?x=1#frag").as_deref(),
+            Some("https://mcp.example/mcp")
+        );
+        assert_eq!(
+            canonical_authorization_identifier("http://127.0.0.1:8080").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(canonical_authorization_identifier("not a url"), None);
+    }
+
+    #[test]
+    fn observed_issuer_consistency_enforces_only_prm_nominated_servers() {
+        let prm_authorization_server = "https://auth.example/tenant1";
+        let observation = AuthorizationServerObservation::default();
+        observation
+            .prm_authorization_servers
+            .write()
+            .expect("observation lock poisoned")
+            .push(prm_authorization_server.to_string());
+
+        let metadata_with = |issuer: Option<&str>| {
+            serde_json::from_value::<AuthorizationMetadata>(serde_json::json!({
+                "authorization_endpoint": "https://auth.example/authorize",
+                "token_endpoint": "https://auth.example/token",
+                "issuer": issuer,
+            }))
+            .expect("test metadata must deserialize")
+        };
+
+        // PRM-nominated fetch with a mismatched issuer → rejected.
+        observation
+            .asm_metadata_urls
+            .write()
+            .expect("observation lock poisoned")
+            .push(
+                "https://auth.example/.well-known/oauth-authorization-server/tenant1".to_string(),
+            );
+        let mismatched = metadata_with(Some("https://evil.example/tenant1"));
+        assert!(matches!(
+            validate_observed_issuer_consistency(&observation, &mismatched),
+            Err(OAuthError::Protocol(OAuthProtocolError::Metadata))
+        ));
+        // Matching issuer passes.
+        let matching = metadata_with(Some("https://auth.example/tenant1/"));
+        assert!(validate_observed_issuer_consistency(&observation, &matching).is_ok());
+
+        // A base-origin chain fetch (not PRM-nominated) is exempt, even with a
+        // different issuer domain (Atlassian cf-domain form).
+        observation
+            .asm_metadata_urls
+            .write()
+            .expect("observation lock poisoned")
+            .clear();
+        observation
+            .asm_metadata_urls
+            .write()
+            .expect("observation lock poisoned")
+            .push("https://mcp.example/.well-known/oauth-authorization-server".to_string());
+        let legacy = metadata_with(Some("https://cf.mcp.example"));
+        assert!(validate_observed_issuer_consistency(&observation, &legacy).is_ok());
+
+        // No issuer (legacy hardcoded fallback) has nothing to compare.
+        let no_issuer = metadata_with(None);
+        assert!(validate_observed_issuer_consistency(&observation, &no_issuer).is_ok());
+    }
+
+    #[test]
+    fn observation_reset_clears_evidence() {
+        let observation = AuthorizationServerObservation::default();
+        observation
+            .prm_authorization_servers
+            .write()
+            .expect("observation lock poisoned")
+            .push("https://auth.example".to_string());
+        observation
+            .asm_metadata_urls
+            .write()
+            .expect("observation lock poisoned")
+            .push("https://auth.example/.well-known/oauth-authorization-server".to_string());
+        observation.reset();
+        assert!(observation
+            .prm_authorization_servers
+            .read()
+            .expect("observation lock poisoned")
+            .is_empty());
+        assert!(observation
+            .asm_metadata_urls
+            .read()
+            .expect("observation lock poisoned")
+            .is_empty());
     }
 
     const TEST_EC_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -4381,6 +4795,7 @@ hSEGx6f7gFfatuW4qJ/SM6W4Yt7BxI4gJ30LDd0WPiDGALXZQYff2g7l
                 &resource,
                 headers,
                 None,
+                Arc::new(AuthorizationServerObservation::default()),
                 Vec::new(),
             )
             .unwrap(),

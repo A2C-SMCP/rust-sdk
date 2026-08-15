@@ -389,9 +389,22 @@ impl HttpMCPClient {
                         }
                     }
                     ChallengeAdmission::BearerWithoutMetadata => {
-                        Some(AnonymousInitializeDisposition::Fail(
-                            HttpAuthenticationError::OAuthDiscoveryFailed,
-                        ))
+                        // MCP 2026-07-28: a challenge without `resource_metadata` MUST fall back
+                        // to well-known discovery. Admit without a protected resource metadata
+                        // URL and let rmcp's discovery chain (PRM well-known → RFC 8414/OIDC at
+                        // the endpoint origin) run; the coordinator rejects metadata that only
+                        // the legacy hardcoded-endpoint fallback could produce (no issuer).
+                        match self.initialize_oauth(None).await {
+                            Ok(_) => Some(AnonymousInitializeDisposition::RetryWithOAuth),
+                            Err(error) if Self::oauth_discovery_failed(&error) => {
+                                Some(AnonymousInitializeDisposition::Fail(
+                                    HttpAuthenticationError::OAuthDiscoveryFailed,
+                                ))
+                            }
+                            Err(error) => Some(
+                                AnonymousInitializeDisposition::OAuthInitializationFailed(error),
+                            ),
+                        }
                     }
                     ChallengeAdmission::Unsupported => Some(AnonymousInitializeDisposition::Fail(
                         HttpAuthenticationError::UnsupportedChallenge,
