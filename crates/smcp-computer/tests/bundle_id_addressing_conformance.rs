@@ -141,10 +141,12 @@ async fn manager_on_mock() -> MCPServerManager {
 /// 改按 name 为键），两条塌陷 ⇒ `len == 2` 与 bundle_id 集合断言双双转红（已实测）。
 #[tokio::test]
 async fn get_config_keys_by_bundle_id_same_name_distinct_ids_coexist_f7() {
-    // F7：构造期 server 集合**为空**（`mcp_servers = None`）。不拉起真实子进程靠的是
-    // `MCPServerManager::new()` 自身默认 `auto_connect=false`（`manager.rs:121`）——注意 `mount_rendered`
-    // 建 manager 时用的是裸 `MCPServerManager::new()`，**不**传播 Computer 的 `auto_connect` 入参。
-    let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+    // F7：构造期 server 集合**为空**（`mcp_servers = None`）。Preboot mount 只登记 raw desired
+    // state；boot 才建立 Manager 投影。`auto_connect=false` 保证不会拉起真实子进程。
+    let td = TempDir::new().unwrap();
+    let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"));
 
     // 运行期挂载两条：同 display 名、显式异 bundle_id（transient，不落盘）。
     computer
@@ -155,6 +157,7 @@ async fn get_config_keys_by_bundle_id_same_name_distinct_ids_coexist_f7() {
         .mount_server(stdio_cfg(DUP_NAME, "/bin/cat", Some(DUP_BID_B)))
         .await
         .unwrap();
+    computer.boot_up().await.unwrap();
 
     let status = computer.get_server_status().await;
 
@@ -179,6 +182,7 @@ async fn get_config_keys_by_bundle_id_same_name_distinct_ids_coexist_f7() {
         status.iter().all(|(_, n, _, _)| n == DUP_NAME),
         "display 名碰撞合法且 MUST 原样保留（非身份）"
     );
+    computer.shutdown().await.unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

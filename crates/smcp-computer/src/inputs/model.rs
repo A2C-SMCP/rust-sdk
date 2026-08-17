@@ -11,6 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 
+use crate::mcp_clients::model::PickStringOption;
+
+/// Shared PickString membership predicate used by every runtime input boundary.
+pub(crate) fn is_valid_pick_string_value(options: &[PickStringOption], value: &str) -> bool {
+    options.iter().any(|option| option.value == value)
+}
+
 /// 输入值 / Input value
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -107,7 +114,7 @@ pub enum InputType {
     /// 选择输入 / Pick string input
     PickString {
         /// 选项列表 / Options list
-        options: Vec<String>,
+        options: Vec<PickStringOption>,
         /// 是否允许多选 / Allow multiple selection
         #[serde(default)]
         multiple: bool,

@@ -985,7 +985,9 @@ mod tests {
             false,
             false,
         )
-        .with_config_dir(config_dir)
+        .with_config_dir(config_dir.clone())
+        .with_skill_home(config_dir.join("skills"))
+        .with_blob_cache_root(config_dir.join("blob"))
     }
 
     /// 创建测试用的 CommandHandler 实例 / Create test CommandHandler instance
@@ -1119,6 +1121,7 @@ mod tests {
     async fn cli_receipts_are_honest_through_real_call_chain_141() {
         let computer = create_test_computer().await;
         mount(&computer, "everything", None).await;
+        computer.boot_up().await.unwrap();
         let handler = create_test_handler(computer);
 
         // ① 拼错的 target：止步于 resolve，**根本打不出回执**（第一道防线）。
@@ -1153,6 +1156,7 @@ mod tests {
         );
         // 再删一次：此时既无声明也无实例 ⇒ MUST 报「未做任何操作」，且该 target 已不可寻址。
         assert!(handler.remove_server_line("everything").await.is_err());
+        handler.computer.shutdown().await.unwrap();
     }
 
     /// #141/R4：同名多 server → **列候选（bundle_id + name + 归属）报错，禁字典序最小**。

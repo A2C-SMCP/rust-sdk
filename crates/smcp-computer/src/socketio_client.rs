@@ -340,6 +340,7 @@ impl SmcpComputerClient {
                 CLIENT_GET_CONFIG => {
                     let manager = manager_clone.clone();
                     let computer_name = computer_name_clone.clone();
+                    let ops = computer_ops_clone.clone();
                     let office_id = office_id_clone.clone();
                     let client_clone = client.clone();
                     let inputs = inputs_clone.clone();
@@ -349,6 +350,7 @@ impl SmcpComputerClient {
                             payload,
                             manager,
                             computer_name,
+                            ops,
                             office_id,
                             client_clone,
                             inputs,
@@ -932,6 +934,7 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
         _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
         inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
@@ -948,14 +951,14 @@ impl SmcpComputerClient {
         }
 
         // 获取配置 / Get config
-        let servers = {
+        let servers = if let Some(ops) = ops {
+            ops.get_computer_config_servers().await?
+        } else {
+            // Standalone client compatibility: without Computer operations, the Manager owns the
+            // full configurations supplied by its caller.
             let manager_guard = manager.read().await;
             match manager_guard.as_ref() {
-                Some(mgr) => {
-                    // 获取完整服务器配置（不只是状态）
-                    // Get complete server configurations (not just status)
-                    mgr.get_server_configs().await
-                }
+                Some(mgr) => mgr.get_server_configs().await,
                 None => {
                     return Err(ComputerError::InvalidState(
                         "MCP Manager not initialized".to_string(),

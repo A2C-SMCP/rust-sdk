@@ -173,7 +173,7 @@ impl InputHandler {
     }
 
     /// 获取缓存值 / Get cached value
-    async fn get_cached_value(&self, key: &str) -> Option<InputValue> {
+    pub(crate) async fn get_cached_value(&self, key: &str) -> Option<InputValue> {
         let cache = self.cache.read().await;
         cache.get(key).cloned()
     }

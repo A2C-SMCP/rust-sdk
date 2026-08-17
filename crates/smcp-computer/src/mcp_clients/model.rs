@@ -8,7 +8,7 @@
 * 描述: MCP客户端相关的数据模型定义
 */
 use serde::de::{Error as _, IgnoredAny};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
@@ -555,6 +555,14 @@ impl MCPServerInput {
             }
         }
     }
+
+    /// Validate invariants that cannot be expressed by the enum's wire shape alone.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            MCPServerInput::PickString(input) => input.validate(),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// 字符串输入类型 / String input type
@@ -573,18 +581,93 @@ pub struct PromptStringInput {
 }
 
 /// 选择输入类型 / Pick string input type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickStringInput {
     /// 输入ID / Input ID
     pub id: String,
     /// 描述 / Description
     pub description: String,
     /// 选项 / Options
-    #[serde(default)]
-    pub options: Vec<String>,
+    pub options: Vec<PickStringOption>,
     /// 默认值 / Default value
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+}
+
+impl PickStringInput {
+    /// Validate the PickString definition while deliberately allowing duplicate labels and values.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.options.is_empty() {
+            return Err("PickString options must contain at least one item".to_string());
+        }
+        for (index, option) in self.options.iter().enumerate() {
+            if option.label.is_empty() {
+                return Err(format!("PickString option {index} label must not be empty"));
+            }
+            if option.value.is_empty() {
+                return Err(format!("PickString option {index} value must not be empty"));
+            }
+        }
+        if let Some(default) = &self.default {
+            if !self.options.iter().any(|option| option.value == *default) {
+                return Err(format!(
+                    "PickString default {default:?} must match at least one option value"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PickStringInputWire {
+    id: String,
+    description: String,
+    #[serde(default)]
+    options: Vec<PickStringOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<String>,
+}
+
+impl Serialize for PickStringInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        PickStringInputWire {
+            id: self.id.clone(),
+            description: self.description.clone(),
+            options: self.options.clone(),
+            default: self.default.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PickStringInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PickStringInputWire::deserialize(deserializer)?;
+        let input = Self {
+            id: wire.id,
+            description: wire.description,
+            options: wire.options,
+            default: wire.default,
+        };
+        input.validate().map_err(serde::de::Error::custom)?;
+        Ok(input)
+    }
+}
+
+/// A PickString choice with an independent display label and runtime value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PickStringOption {
+    /// Human-readable label shown by clients.
+    pub label: String,
+    /// Stable value inserted into the rendered MCP server configuration.
+    pub value: String,
 }
 
 /// 命令输入类型 / Command input type
@@ -1098,6 +1181,51 @@ impl GetSkillRet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_string_label_value_round_trip_and_duplicates_are_valid() {
+        let raw = serde_json::json!({
+            "id": "region",
+            "type": "PickString",
+            "description": "Region",
+            "options": [
+                {"label": "China", "value": "cn"},
+                {"label": "China", "value": "cn"}
+            ],
+            "default": "cn"
+        });
+        let input: MCPServerInput = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(input).unwrap(), raw);
+    }
+
+    #[test]
+    fn pick_string_rejects_legacy_and_invalid_definitions() {
+        let cases = [
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": ["cn"], "default": "cn"
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": []
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": [{"label": "", "value": "cn"}]
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": [{"label": "China", "value": ""}]
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": [{"label": "China", "value": "cn"}], "default": "eu"
+            }),
+        ];
+        for raw in cases {
+            assert!(serde_json::from_value::<MCPServerInput>(raw).is_err());
+        }
+    }
 
     #[test]
     fn http_oauth_configuration_is_automatic_only() {

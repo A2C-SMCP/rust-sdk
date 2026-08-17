@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::mcp_clients::model::MCPServerInput;
 
+use super::model::is_valid_pick_string_value;
 use super::resolver::env_var_name;
 use super::secret_store::SecretStore;
 
@@ -85,6 +86,14 @@ pub enum InputResolutionError {
         /// 失败原因 / failure reason。
         reason: String,
     },
+    /// A stored/runtime PickString value no longer matches any current option value.
+    #[error("invalid selection for input '{id}': {value:?} does not match any option value")]
+    InvalidSelection {
+        /// Input id whose current definition rejected the value.
+        id: String,
+        /// Rejected runtime value. PickString values are non-secret by definition.
+        value: String,
+    },
 }
 
 impl InputResolutionError {
@@ -101,6 +110,41 @@ impl InputResolutionError {
             id: id.into(),
             reason: reason.into(),
         }
+    }
+
+    /// Construct an [`InputResolutionError::InvalidSelection`].
+    pub fn invalid_selection(id: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::InvalidSelection {
+            id: id.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// Validate a resolved value against the current input definition.
+///
+/// PickString validation happens at every source boundary (client resolver, env, session) so an
+/// obsolete stored value can never silently fall through to the default or first option.
+pub(crate) fn validate_resolved_value(
+    input: &MCPServerInput,
+    value: Value,
+) -> Result<Value, InputResolutionError> {
+    let MCPServerInput::PickString(pick) = input else {
+        return Ok(value);
+    };
+    let Some(candidate) = value.as_str() else {
+        return Err(InputResolutionError::invalid_selection(
+            input.id(),
+            value.to_string(),
+        ));
+    };
+    if is_valid_pick_string_value(&pick.options, candidate) {
+        Ok(value)
+    } else {
+        Err(InputResolutionError::invalid_selection(
+            input.id(),
+            candidate,
+        ))
     }
 }
 
@@ -173,7 +217,7 @@ impl SecretValueResolver for KeyringSecretResolver {
 mod tests {
     use super::*;
     use crate::inputs::secret_store::{KeyringBackend, SecretStore, SERVICE_NAME};
-    use crate::mcp_clients::model::PromptStringInput;
+    use crate::mcp_clients::model::{PickStringInput, PickStringOption, PromptStringInput};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -243,6 +287,40 @@ mod tests {
         assert!(msg.contains("figma_token"));
         assert!(msg.contains("secret"));
         assert!(msg.contains("A2C_SMCP_figma_token"));
+    }
+
+    #[test]
+    fn pick_string_value_must_match_an_option_value() {
+        let input = MCPServerInput::PickString(PickStringInput {
+            id: "region".to_string(),
+            description: "Region".to_string(),
+            options: vec![
+                PickStringOption {
+                    label: "China".to_string(),
+                    value: "cn".to_string(),
+                },
+                PickStringOption {
+                    label: "Boolean text".to_string(),
+                    value: "true".to_string(),
+                },
+            ],
+            default: Some("cn".to_string()),
+        });
+        assert_eq!(
+            validate_resolved_value(&input, serde_json::json!("cn")).unwrap(),
+            serde_json::json!("cn")
+        );
+        match validate_resolved_value(&input, serde_json::json!("eu")) {
+            Err(InputResolutionError::InvalidSelection { id, value }) => {
+                assert_eq!(id, "region");
+                assert_eq!(value, "eu");
+            }
+            other => panic!("expected InvalidSelection, got {other:?}"),
+        }
+        assert!(matches!(
+            validate_resolved_value(&input, serde_json::json!(true)),
+            Err(InputResolutionError::InvalidSelection { value, .. }) if value == "true"
+        ));
     }
 
     #[tokio::test]

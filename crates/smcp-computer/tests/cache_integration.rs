@@ -9,7 +9,7 @@
 */
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::mcp_clients::model::{
-    CommandInput, MCPServerInput, PickStringInput, PromptStringInput,
+    CommandInput, MCPServerInput, PickStringInput, PickStringOption, PromptStringInput,
 };
 use tokio::time::{timeout, Duration};
 
@@ -29,7 +29,16 @@ async fn test_cache_with_multiple_inputs() {
         MCPServerInput::PickString(PickStringInput {
             id: "pick1".to_string(),
             description: "Pick input 1".to_string(),
-            options: vec!["opt1".to_string(), "opt2".to_string()],
+            options: vec![
+                PickStringOption {
+                    label: "Option 1".to_string(),
+                    value: "opt1".to_string(),
+                },
+                PickStringOption {
+                    label: "Option 2".to_string(),
+                    value: "opt2".to_string(),
+                },
+            ],
             default: Some("opt1".to_string()),
         }),
         MCPServerInput::Command(CommandInput {
