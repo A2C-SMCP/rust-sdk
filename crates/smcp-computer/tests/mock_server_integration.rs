@@ -576,7 +576,11 @@ struct OAuthMockState {
     registration_response_delay_ms: AtomicU64,
     token_response_delay_ms: AtomicU64,
     disable_authorization_metadata: AtomicBool,
+    disable_protected_resource_metadata: AtomicBool,
     omit_authorization_issuer: AtomicBool,
+    bare_bearer_challenge: AtomicBool,
+    authorization_issuer_override: StdMutex<Option<String>>,
+    prm_authorization_servers_override: StdMutex<Option<Vec<String>>>,
     block_next_mcp_response: AtomicBool,
     discovery_started: Notify,
     registration_started: Notify,
@@ -674,12 +678,27 @@ async fn oauth_http_mock_handler(
 
     if method == Method::GET && path == "/.well-known/oauth-protected-resource/mcp" {
         delay_oauth_discovery(&state).await;
+        if state
+            .disable_protected_resource_metadata
+            .load(Ordering::SeqCst)
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(empty_body())
+                .unwrap());
+        }
+        let authorization_servers = state
+            .prm_authorization_servers_override
+            .lock()
+            .expect("PRM override lock poisoned")
+            .clone()
+            .unwrap_or_else(|| vec![state.base_url.clone()]);
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
                 serde_json::json!({
                     "resource": state.resource(),
-                    "authorization_servers": [&state.base_url],
+                    "authorization_servers": authorization_servers,
                     "scopes_supported": ["tools.read"],
                 })
                 .to_string(),
@@ -688,12 +707,27 @@ async fn oauth_http_mock_handler(
     }
     if method == Method::GET && path == "/.well-known/oauth-protected-resource" {
         delay_oauth_discovery(&state).await;
+        if state
+            .disable_protected_resource_metadata
+            .load(Ordering::SeqCst)
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(empty_body())
+                .unwrap());
+        }
+        let authorization_servers = state
+            .prm_authorization_servers_override
+            .lock()
+            .expect("PRM override lock poisoned")
+            .clone()
+            .unwrap_or_else(|| vec![state.base_url.clone()]);
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
                 serde_json::json!({
                     "resource": state.resource(),
-                    "authorization_servers": [&state.base_url],
+                    "authorization_servers": authorization_servers,
                     "scopes_supported": ["tools.read"],
                 })
                 .to_string(),
@@ -726,7 +760,13 @@ async fn oauth_http_mock_handler(
             "authorization_response_iss_parameter_supported": true,
         });
         if !state.omit_authorization_issuer.load(Ordering::SeqCst) {
-            metadata["issuer"] = serde_json::json!(state.base_url);
+            let issuer = state
+                .authorization_issuer_override
+                .lock()
+                .expect("OAuth fixture issuer override lock poisoned")
+                .clone()
+                .unwrap_or_else(|| state.base_url.clone());
+            metadata["issuer"] = serde_json::json!(issuer);
         }
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
@@ -740,11 +780,17 @@ async fn oauth_http_mock_handler(
                 .body(empty_body())
                 .unwrap());
         }
+        let issuer = state
+            .authorization_issuer_override
+            .lock()
+            .expect("OAuth fixture issuer override lock poisoned")
+            .clone()
+            .unwrap_or_else(|| state.base_url.clone());
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
             .body(full_body(
                 serde_json::json!({
-                    "issuer": state.base_url,
+                    "issuer": issuer,
                     "authorization_endpoint": format!("{}/authorize", state.base_url),
                     "token_endpoint": format!("{}/token", state.base_url),
                     "response_types_supported": ["code"],
@@ -852,15 +898,17 @@ async fn oauth_http_mock_handler(
             })
             .is_ok();
     if path == "/mcp" && (!authorized || reject_authorized) {
+        let challenge = if state.bare_bearer_challenge.load(Ordering::SeqCst) {
+            r#"Bearer realm="mcp""#.to_string()
+        } else {
+            format!(
+                "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
+                state.base_url
+            )
+        };
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
-            .header(
-                "WWW-Authenticate",
-                format!(
-                    "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
-                    state.base_url
-                ),
-            )
+            .header("WWW-Authenticate", challenge)
             .body(empty_body())
             .unwrap());
     }
@@ -985,7 +1033,11 @@ async fn spawn_oauth_http_mock_with_options(
         registration_response_delay_ms: AtomicU64::new(0),
         token_response_delay_ms: AtomicU64::new(0),
         disable_authorization_metadata: AtomicBool::new(false),
+        disable_protected_resource_metadata: AtomicBool::new(false),
         omit_authorization_issuer: AtomicBool::new(false),
+        bare_bearer_challenge: AtomicBool::new(false),
+        authorization_issuer_override: StdMutex::new(None),
+        prm_authorization_servers_override: StdMutex::new(None),
         block_next_mcp_response: AtomicBool::new(false),
         discovery_started: Notify::new(),
         registration_started: Notify::new(),
@@ -1360,10 +1412,6 @@ async fn test_auto_http_auth_distinguishes_non_oauth_failures() {
             AuthGateMode::Basic,
             HttpAuthenticationError::UnsupportedChallenge,
         ),
-        (
-            AuthGateMode::BearerWithoutMetadata,
-            HttpAuthenticationError::OAuthDiscoveryFailed,
-        ),
         (AuthGateMode::Forbidden, HttpAuthenticationError::Forbidden),
     ];
     for (mode, expected) in cases {
@@ -1372,10 +1420,299 @@ async fn test_auto_http_auth_distinguishes_non_oauth_failures() {
         assert_eq!(state.metadata_requests.load(Ordering::SeqCst), 0);
     }
 
+    // A bare Bearer challenge now triggers well-known discovery before failing:
+    // the auth gate has no discovery endpoints, so admission ends with
+    // OAuthDiscoveryFailed, but only after the fallback chain was probed.
+    let (error, state) = auto_auth_gate_result(AuthGateMode::BearerWithoutMetadata, false).await;
+    assert_eq!(error, HttpAuthenticationError::OAuthDiscoveryFailed);
+    assert!(state.metadata_requests.load(Ordering::SeqCst) > 0);
+
     let (error, state) =
         auto_auth_gate_result(AuthGateMode::BearerWithInvalidMetadata, false).await;
     assert_eq!(error, HttpAuthenticationError::OAuthDiscoveryFailed);
     assert!(state.metadata_requests.load(Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn test_bare_bearer_challenge_discovers_oauth_and_returns_oauth_required() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    state.bare_bearer_challenge.store(true, Ordering::SeqCst);
+    let bundle_id = BundleId::try_from("oauth-bare-bearer").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-bare-bearer",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+    assert!(state.discovery_requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state.anonymous_initialize_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        state.authorized_initialize_requests.load(Ordering::SeqCst),
+        0
+    );
+
+    // The coordinator is now configured: the interactive entry point is
+    // unlocked and can drive a full authorization flow.
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 1);
+    manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: launch.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    manager.clear_oauth(&bundle_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_prm_admission_rejects_authorization_metadata_issuer_mismatch() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    *state
+        .authorization_issuer_override
+        .lock()
+        .expect("issuer override lock poisoned") = Some(format!("{}/impostor", state.base_url));
+    let bundle_id = BundleId::try_from("oauth-issuer-mismatch").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-issuer-mismatch",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthDiscoveryFailed
+        ))
+    ));
+    assert!(state.discovery_requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(state.token_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_interactive_bare_bearer_flow_rejects_legacy_only_discovery() {
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    state.bare_bearer_challenge.store(true, Ordering::SeqCst);
+    let bundle_id = BundleId::try_from("oauth-bare-legacy-only").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-bare-legacy-only",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+
+    // Interactive rediscovery now finds nothing: rmcp falls back to legacy
+    // hardcoded endpoints (no issuer), which must not satisfy the flow.
+    state
+        .disable_protected_resource_metadata
+        .store(true, Ordering::SeqCst);
+    state
+        .disable_authorization_metadata
+        .store(true, Ordering::SeqCst);
+
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        flow.launch().await,
+        Err(OAuthError::Protocol(OAuthProtocolError::Metadata))
+    ));
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_bare_bearer_legacy_discovery_exempts_issuer_consistency() {
+    // Atlassian cf-domain form: no protected resource metadata anywhere; the
+    // authorization server metadata served from the server origin's well-known
+    // chain claims a different issuer domain. RFC 8414 §3.3 consistency is
+    // only enforced for authorization servers nominated by a PRM document, so
+    // this legacy discovery path must still be admitted.
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    state.bare_bearer_challenge.store(true, Ordering::SeqCst);
+    state
+        .disable_protected_resource_metadata
+        .store(true, Ordering::SeqCst);
+    *state
+        .authorization_issuer_override
+        .lock()
+        .expect("issuer override lock poisoned") = Some("https://cf.as.example.com".to_string());
+    let bundle_id = BundleId::try_from("oauth-bare-legacy-exempt").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-bare-legacy-exempt",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+    assert!(state.discovery_requests.load(Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn test_interactive_flow_rejects_issuer_mismatch_on_rediscovery() {
+    let (manager, bundle_id, state) =
+        authorization_code_manager(OAuthFixtureMode::Dynamic, false).await;
+    *state
+        .authorization_issuer_override
+        .lock()
+        .expect("issuer override lock poisoned") = Some(format!("{}/impostor", state.base_url));
+
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        flow.launch().await,
+        Err(OAuthError::Protocol(OAuthProtocolError::Metadata))
+    ));
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_interactive_rediscovery_discards_stale_observation_evidence() {
+    // Bare-bearer admission observes PRM nomination A (consistent), then the
+    // interactive flow observes nomination B (consistent). Stale admission
+    // evidence must not leak into the interactive gate: the A-chain well-known
+    // URL would derive A, match the stale PRM set, and falsely reject the
+    // B-issuer metadata. The reset before interactive rediscovery is what this
+    // test anchors.
+    let (port, state) = spawn_oauth_http_mock(OAuthFixtureMode::Dynamic, 0).await;
+    state.bare_bearer_challenge.store(true, Ordering::SeqCst);
+    let bundle_id = BundleId::try_from("oauth-bare-stale-evidence").unwrap();
+    let manager = MCPServerManager::new();
+    let mut config = HttpServerConfig::new(
+        "oauth-bare-stale-evidence",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        },
+    );
+    config.bundle_id = Some(bundle_id.clone());
+    manager
+        .add_or_update_server(MCPServerConfig::Http(config))
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.start_client_by_id(&bundle_id).await,
+        Err(ComputerError::HttpAuthentication(
+            HttpAuthenticationError::OAuthRequired
+        ))
+    ));
+
+    // Switch the served nomination and issuer to a different, still consistent pair.
+    *state
+        .prm_authorization_servers_override
+        .lock()
+        .expect("PRM override lock poisoned") = Some(vec![format!("{}/mcp", state.base_url)]);
+    *state
+        .authorization_issuer_override
+        .lock()
+        .expect("issuer override lock poisoned") = Some(format!("{}/mcp", state.base_url));
+
+    let flow = manager
+        .create_oauth_flow(
+            &bundle_id,
+            OAuthBeginRequest {
+                redirect_uri: "https://callback.example.test/oauth/callback".to_string(),
+                required_scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let launch = flow.launch().await.unwrap();
+    assert_eq!(state.registration_requests.load(Ordering::SeqCst), 1);
+    manager
+        .cancel_oauth(
+            &bundle_id,
+            OAuthCancellation {
+                state: launch.state,
+                issuer: None,
+                reason: OAuthCancellationReason::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    manager.clear_oauth(&bundle_id).await.unwrap();
 }
 
 #[tokio::test]
