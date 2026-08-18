@@ -2007,7 +2007,7 @@ impl<S: Session> Computer<S> {
 
     /// D1（#112 S5）运行期解析单个 input：SDK 不落盘明文值/secret，缺失且无默认值 → 结构化错误（**非仅日志**）。
     ///
-    /// 解析序：**显式内存 cache** → **client resolver**（`secret_resolver` / `input_resolver`）→ **env**
+    /// 解析序：**client resolver**（`secret_resolver` / `input_resolver`）→ **显式内存 cache** → **env**
     /// `A2C_SMCP_<ENV_SEGMENT(id)>`（编排注入）→ **session**（自定义交互 Session 给真值 /
     /// `SilentSession` 给 default-or-empty；Command 经此执行）→ **定义默认值** →
     /// [`InputResolutionError::Missing`]。每个已存在候选都先校验；非法 PickString 必须直接返回
@@ -2024,18 +2024,9 @@ impl<S: Session> Computer<S> {
 
         let kind = InputKind::of(input);
 
-        // 1. Explicit Computer cache. A present-but-stale selection is an error, never absence.
-        if let Some(value) = self
-            .input_handler
-            .read()
-            .await
-            .get_cached_value(input.id())
-            .await
-        {
-            return Ok(validate_resolved_value(input, input_value_to_json(value))?);
-        }
-
-        // 2. client resolver（D1 权威源；keyring 亦作为一种 secret resolver 由 client opt-in 注入）。
+        // 1. client resolver（D1 权威源；keyring 亦作为一种 secret resolver 由 client opt-in 注入）。
+        //    resolver 必须先于 SDK legacy cache：client-owned InputEntry / Keychain 是实际值的决策入口，旧 cache
+        //    不得绕过 client 的查询、确认或取消。`Ok(None)` 才表示 client 主动不参与，允许继续既有 fallback。
         if matches!(kind, InputKind::Secret) {
             if let Some(resolver) = &self.secret_resolver {
                 if let Some(secret) = resolver.resolve_secret(input).await? {
@@ -2046,6 +2037,18 @@ impl<S: Session> Computer<S> {
             if let Some(value) = resolver.resolve_input(input).await? {
                 return Ok(validate_resolved_value(input, value)?);
             }
+        }
+
+        // 2. Explicit Computer cache（legacy compatibility fallback）。A present-but-stale selection is an
+        //    error, never absence. No resolver, or an explicit resolver `Ok(None)`, preserves existing callers.
+        if let Some(value) = self
+            .input_handler
+            .read()
+            .await
+            .get_cached_value(input.id())
+            .await
+        {
+            return Ok(validate_resolved_value(input, input_value_to_json(value))?);
         }
 
         // 3. 环境变量 A2C_SMCP_<ENV_SEGMENT(id)>（编排层注入）。
@@ -7237,6 +7240,22 @@ mod tests {
         }
     }
 
+    struct RecordingInputResolver {
+        values: HashMap<String, serde_json::Value>,
+        seen: Arc<StdMutex<Vec<MCPServerInput>>>,
+    }
+
+    #[async_trait]
+    impl crate::inputs::runtime_resolver::InputValueResolver for RecordingInputResolver {
+        async fn resolve_input(
+            &self,
+            def: &MCPServerInput,
+        ) -> Result<Option<serde_json::Value>, InputResolutionError> {
+            self.seen.lock().unwrap().push(def.clone());
+            Ok(self.values.get(def.id()).cloned())
+        }
+    }
+
     /// 测试用 map-backed secret resolver / test double。
     struct MapSecretResolver(HashMap<String, String>);
     #[async_trait]
@@ -8126,6 +8145,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_resolver_value_overrides_sdk_cache() {
+        let mut inputs = HashMap::new();
+        inputs.insert("region".to_string(), region_pick_def());
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(HashMap::from([(
+                "region".to_string(),
+                serde_json::json!("eu"),
+            )]))));
+        computer
+            .set_input_value("region", serde_json::json!("cn"))
+            .await
+            .unwrap();
+
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:region}"))
+            .await
+            .unwrap();
+
+        assert_eq!(rendered_arg0(rendered), "eu");
+    }
+
+    #[tokio::test]
+    async fn client_resolver_none_falls_back_to_sdk_cache() {
+        let mut inputs = HashMap::new();
+        inputs.insert("region".to_string(), region_pick_def());
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(RecordingInputResolver {
+                values: HashMap::new(),
+                seen: Arc::clone(&seen),
+            }));
+        computer
+            .set_input_value("region", serde_json::json!("eu"))
+            .await
+            .unwrap();
+
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:region}"))
+            .await
+            .unwrap();
+
+        assert_eq!(rendered_arg0(rendered), "eu");
+        assert_eq!(seen.lock().unwrap().as_slice(), &[region_pick_def()]);
+    }
+
+    #[tokio::test]
+    async fn client_resolver_receives_complete_existing_input_definitions() {
+        let prompt = MCPServerInput::PromptString(PromptStringInput {
+            id: "account".to_string(),
+            description: "Account name".to_string(),
+            default: Some("alice".to_string()),
+            password: Some(false),
+        });
+        let pick = region_pick_def();
+        let inputs = HashMap::from([
+            ("account".to_string(), prompt.clone()),
+            ("region".to_string(), pick.clone()),
+        ]);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(RecordingInputResolver {
+                values: HashMap::from([
+                    ("account".to_string(), serde_json::json!("confirmed")),
+                    ("region".to_string(), serde_json::json!("eu")),
+                ]),
+                seen: Arc::clone(&seen),
+            }));
+        let mut raw = stdio_with_arg("${input:account}");
+        let MCPServerConfig::Stdio(config) = &mut raw else {
+            unreachable!();
+        };
+        config
+            .server_parameters
+            .args
+            .push("${input:region}".to_string());
+
+        computer.render_server_config(&raw).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&prompt));
+        assert!(seen.contains(&pick));
+    }
+
+    #[tokio::test]
     async fn render_resolves_secret_via_injected_secret_resolver() {
         // D1：password:true input 经 client secret_resolver 取值（SDK 不落盘 secret 明文）。
         let mut inputs = HashMap::new();
@@ -8134,6 +8238,10 @@ mod tests {
         m.insert("s5_key".to_string(), "sk-injected".to_string());
         let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
             .with_secret_resolver(Arc::new(MapSecretResolver(m)));
+        computer
+            .set_input_value("s5_key", serde_json::json!("cached-secret"))
+            .await
+            .unwrap();
         let rendered = computer
             .render_server_config(&stdio_with_arg("${input:s5_key}"))
             .await
@@ -8178,9 +8286,16 @@ mod tests {
     async fn render_propagates_resolver_hard_failure() {
         // resolver 侧硬失败（Err）→ 引用取用时 propagate（区别于「未提供」的 Ok(None) 回退）。
         let mut inputs = HashMap::new();
-        inputs.insert("s5_fail".to_string(), prompt_def("s5_fail", None, false));
+        inputs.insert(
+            "s5_fail".to_string(),
+            prompt_def("s5_fail", Some("default"), false),
+        );
         let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
             .with_input_resolver(Arc::new(FailingInputResolver));
+        computer
+            .set_input_value("s5_fail", serde_json::json!("cached"))
+            .await
+            .unwrap();
         let err = computer
             .render_server_config(&stdio_with_arg("${input:s5_fail}"))
             .await
