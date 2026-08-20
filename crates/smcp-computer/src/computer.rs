@@ -83,6 +83,7 @@ use crate::mcp_clients::{
         content_as_text, is_call_tool_error, BundleId, CallToolResult, CancellableCallOutcome,
         Content, MCPServerConfig, MCPServerInput, MCPServerRuntimeStatus, McpChangeKind,
         McpServerNotification, ReadResourceResult, Resource, ServerName, Tool,
+        WindowEnumerationReport,
     },
     ConfigRender, RenderError,
 };
@@ -2878,6 +2879,26 @@ impl<S: Session> Computer<S> {
         let manager = self.mcp_manager.read().await;
         if let Some(ref manager) = *manager {
             Ok(manager.list_windows_with_identity(window_uri).await)
+        } else {
+            Err(ComputerError::InvalidState(
+                "Computer not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// #161：结构化窗口枚举——携带逐 server 诊断，可区分「成功空集 / capability 缺失 / 全部失败 /
+    /// 部分成功」（[`WindowEnumerationReport::status`]）。
+    ///
+    /// 与 [`list_windows_with_identity`](Self::list_windows_with_identity) 同为**零 read** 枚举
+    /// （只 `resources/list`，从不 `resources/read`）；后者即本结果 `windows` 字段的投影。
+    /// 逐 server 失败不中断其余 server（部分成功语义），诊断以 `bundle_id` 标识（展示名仅随附）。
+    pub async fn list_windows_with_diagnostics(
+        &self,
+        window_uri: Option<&str>,
+    ) -> ComputerResult<WindowEnumerationReport> {
+        let manager = self.mcp_manager.read().await;
+        if let Some(ref manager) = *manager {
+            Ok(manager.list_windows_with_diagnostics(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
                 "Computer not initialized".to_string(),
@@ -9098,6 +9119,71 @@ mod tests {
         let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
         let err = computer.get_resources("srv", None).await.unwrap_err();
         assert!(matches!(err, ComputerError::InvalidState(_)));
+    }
+
+    /// #161：Computer 门面 `list_windows_with_diagnostics` 转发 manager 结构化枚举结果
+    /// （部分成功语义 + 逐 server 诊断完整穿透）；未 boot（manager 为 None）→ InvalidState。
+    #[tokio::test]
+    async fn computer_list_windows_with_diagnostics_forwards_161() {
+        use crate::mcp_clients::manager::test_support::{
+            bid, inject_config, inject_window_enum, stdio_cfg_with_bundle, WindowEnumClient,
+            WindowListOutcome,
+        };
+        use crate::mcp_clients::model::{
+            make_resource, WindowEnumerationErrorCategory, WindowEnumerationStatus,
+        };
+
+        // 未 boot → InvalidState（对齐 get_resources 先例）。
+        let bare = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let err = bare.list_windows_with_diagnostics(None).await.unwrap_err();
+        assert!(matches!(err, ComputerError::InvalidState(_)));
+
+        // 注入 manager + 2 server（1 成功带窗、1 能力缺失）→ PartialSuccess 经门面完整穿透。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let manager = MCPServerManager::new();
+        for (id, outcome) in [
+            (
+                "id_ok",
+                WindowListOutcome::Ok(vec![make_resource(
+                    "window://ok.example.com/w",
+                    "w",
+                    None,
+                    None,
+                )]),
+            ),
+            ("id_cap", WindowListOutcome::CapabilityMissing),
+        ] {
+            inject_config(
+                &manager,
+                &bid(id),
+                stdio_cfg_with_bundle(&format!("srv-{id}"), Some(id)),
+            )
+            .await;
+            inject_window_enum(
+                &manager,
+                &bid(id),
+                WindowEnumClient {
+                    outcome,
+                    detail_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+            )
+            .await;
+        }
+        *computer.mcp_manager.write().await = Some(manager);
+
+        let report = computer
+            .list_windows_with_diagnostics(None)
+            .await
+            .expect("boot 后枚举须成功");
+        assert_eq!(report.status(), WindowEnumerationStatus::PartialSuccess);
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].0.as_str(), "id_ok");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bundle_id.as_str(), "id_cap");
+        assert_eq!(
+            report.failures[0].category,
+            WindowEnumerationErrorCategory::MissingResourcesCapability
+        );
     }
 
     /// #127 扫漏（根因）：`Computer` 的运行期投影 `mcp_servers` 按 **bundle_id** 键，非 display 名。

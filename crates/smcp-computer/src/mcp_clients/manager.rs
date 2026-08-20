@@ -1896,31 +1896,11 @@ impl MCPServerManager {
             .collect()
     }
 
-    /// 活动客户端快照，附各 server **人类可读名**（`active_clients` 键为 `bundle_id`）/ snapshot tagged with names。
-    ///
-    /// 仅供**需要展示名**的场合（如 `get_windows_details` 的 `.1`、诊断日志）——身份/分组/寻址一律用
-    /// `bundle_id`，**勿**用本 helper 的名做键（协议 §身份正交性：`name` 允许碰撞）。
-    /// 极端情况下（config 已移除但 client 尚存）回退用 `bundle_id` 作名。
-    async fn active_clients_by_name(&self) -> Vec<(ServerName, StdArc<dyn MCPClientProtocol>)> {
-        let clients = self.active_clients.read().await;
-        let configs = self.servers_config.read().await;
-        clients
-            .iter()
-            .map(|(bundle_id, client)| {
-                let name = configs
-                    .get(bundle_id)
-                    .map(|cfg| cfg.name().to_string())
-                    .unwrap_or_else(|| bundle_id.to_string());
-                (name, client.clone())
-            })
-            .collect()
-    }
-
     /// 活动客户端快照，附 `bundle_id`（身份键）+ 展示名。供需要身份的窗口枚举路径共用。
     ///
-    /// 与 [`active_clients_by_name`](Self::active_clients_by_name) 的区别：保留 `bundle_id`（server 唯一身份），
-    /// 仅把展示名作为 `.1` 附带——身份/分组/寻址一律用 `bundle_id`（协议 §身份正交性：`name` 允许碰撞）。
-    /// 极端情况下（config 已移除但 client 尚存）展示名回退用 `bundle_id` 作名。
+    /// 身份/分组/寻址一律用 `.0` 的 `bundle_id`（协议 §身份正交性：`name` 允许碰撞）；展示名
+    /// （`.1`）仅供**展示**场合（诊断、日志）。极端情况下（config 已移除但 client 尚存）展示名
+    /// 回退用 `bundle_id` 作名。
     async fn active_clients_with_identity(
         &self,
     ) -> Vec<(BundleId, ServerName, StdArc<dyn MCPClientProtocol>)> {
@@ -1941,31 +1921,16 @@ impl MCPServerManager {
     /// 列出所有窗口资源 / List all window resources
     /// 聚合所有活动客户端的 window:// 资源，可选按 URI 完全匹配过滤
     /// Aggregates window:// resources from all active clients, optionally filtered by exact URI match
+    ///
+    /// #161 起为 [`list_windows_with_diagnostics`](Self::list_windows_with_diagnostics) 的丢身份投影
+    /// （仅保留展示名）——失败 server 同样 warn+skip，聚合循环不再重复实现。
     pub async fn list_all_windows(&self, window_uri: Option<&str>) -> Vec<(ServerName, Resource)> {
-        let clients = self.active_clients_by_name().await;
-
-        let mut results = Vec::new();
-        for (server_name, client) in clients {
-            match client.list_windows().await {
-                Ok(windows) => {
-                    for resource in windows {
-                        if let Some(uri_filter) = window_uri {
-                            if resource.uri.as_str() != uri_filter {
-                                continue;
-                            }
-                        }
-                        results.push((server_name.clone(), resource));
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to list windows from server '{}': {}",
-                        server_name, e
-                    );
-                }
-            }
-        }
-        results
+        self.list_windows_with_diagnostics(window_uri)
+            .await
+            .windows
+            .into_iter()
+            .map(|(_, server_name, resource)| (server_name, resource))
+            .collect()
     }
 
     /// 枚举所有窗口资源，携带**稳定身份 `bundle_id`** + 展示名，**不读取窗口内容**。
@@ -1982,33 +1947,83 @@ impl MCPServerManager {
     ///
     /// `window://` host 属 MCP 自选、透传不解释（正交）。`window_uri` 为 `Some` 时按 URI 完全匹配过滤。
     /// 需读取单个窗口详情请用 [`get_window_detail`](Self::get_window_detail)。
+    ///
+    /// #161 起为 [`list_windows_with_diagnostics`](Self::list_windows_with_diagnostics) 的 `.windows`
+    /// 投影（逐 server 失败诊断在结构化结果中，本签名保持向后兼容）。
     pub async fn list_windows_with_identity(
         &self,
         window_uri: Option<&str>,
     ) -> Vec<(BundleId, ServerName, Resource)> {
+        self.list_windows_with_diagnostics(window_uri).await.windows
+    }
+
+    /// #161：结构化窗口枚举——携带逐 server 诊断，可区分「成功空集 / capability 缺失 / 全部失败 /
+    /// 部分成功」（下游 TFRC-75 需分别展示；`list_windows_with_identity` 只保留其 `.windows` 投影）。
+    ///
+    /// Structured window enumeration with per-server diagnostics, distinguishing success-empty /
+    /// missing-capability / all-failed / partial-success (see [`WindowEnumerationReport::status`]).
+    ///
+    /// 与 [`list_windows_with_identity`](Self::list_windows_with_identity) 同源的契约：
+    /// - 只调 [`list_windows`](MCPClientProtocol::list_windows)（resources/list），**从不调用**
+    ///   [`get_window_detail`](MCPClientProtocol::get_window_detail)（resources/read）。
+    /// - 逐 server 失败 **不中断其余 server**：成功窗口全保留（`windows`），失败进 `failures`
+    ///   （以 `bundle_id` 标识——协议 §身份正交性，展示名仅随附）。
+    /// - capability 缺失的区分依赖 client 层能力门（`list_windows` 未声明 `resources` →
+    ///   `CapabilityNotSupported`，三传输统一，INT-04 #78 同款）。
+    ///
+    /// `servers_with_resources_capability` 为「通过能力门」的近似计数（连接失败先于能力检查，
+    /// 详见 [`WindowEnumerationReport`] 字段文档）。`window_uri` 为 `Some` 时按 URI 完全匹配过滤
+    /// （只作用于 `windows`，不影响 `servers_attempted`/`failures`/能力计数）。
+    pub async fn list_windows_with_diagnostics(
+        &self,
+        window_uri: Option<&str>,
+    ) -> WindowEnumerationReport {
         let entries = self.active_clients_with_identity().await;
-        let mut results = Vec::new();
+        let servers_attempted = entries.len();
+
+        let mut windows = Vec::new();
+        let mut failures = Vec::new();
         for (bundle_id, server_name, client) in entries {
-            let windows = match client.list_windows().await {
+            let enumerated = match client.list_windows().await {
                 Ok(w) => w,
                 Err(e) => {
                     warn!(
                         "Failed to list windows from server '{}': {}",
                         server_name, e
                     );
+                    failures.push(WindowEnumerationFailure {
+                        bundle_id,
+                        server_name,
+                        category: WindowEnumerationErrorCategory::from(&e),
+                        message: e.to_string(),
+                    });
                     continue;
                 }
             };
-            for resource in windows {
+            for resource in enumerated {
                 if let Some(uri_filter) = window_uri {
                     if resource.uri.as_str() != uri_filter {
                         continue;
                     }
                 }
-                results.push((bundle_id.clone(), server_name.clone(), resource));
+                windows.push((bundle_id.clone(), server_name.clone(), resource));
             }
         }
-        results
+
+        let servers_with_resources_capability = servers_attempted
+            - failures
+                .iter()
+                .filter(|f| {
+                    f.category == WindowEnumerationErrorCategory::MissingResourcesCapability
+                })
+                .count();
+
+        WindowEnumerationReport {
+            windows,
+            servers_attempted,
+            servers_with_resources_capability,
+            failures,
+        }
     }
 
     /// 枚举活跃 MCP Server 的 `skill://` 资源（附 server 归属），**完整消费 cursor 翻页直至末尾**。
@@ -3249,6 +3264,99 @@ pub(crate) mod test_support {
         }
     }
 
+    /// [`WindowEnumClient::list_windows`] 的可注入结果。`MCPClientError` 非 `Clone`（含
+    /// `rmcp::ServiceError`），不能预存 `Result` 值——存小枚举、调用时**现造**对应错误。
+    /// Injectable `list_windows` outcome; errors are minted on call (`MCPClientError` isn't `Clone`).
+    pub(crate) enum WindowListOutcome {
+        /// 枚举成功，返回给定资源集（空 `Vec` = 成功空集）。
+        Ok(Vec<Resource>),
+        /// → `CapabilityNotSupported("resources")`（未声明 resources capability，4015 语义）。
+        CapabilityMissing,
+        /// → `ConnectionError`。
+        ConnectionFailed,
+        /// → `ProtocolError`。
+        ProtocolFailed,
+    }
+
+    /// #161：`list_windows` 结果可注入的假 client，供 `list_windows_with_diagnostics` 的
+    /// 四态/诊断测试。`detail_calls` 计 `get_window_detail` 调用次数，供「枚举零 read」
+    /// 契约断言（仿 [`WindowMockClient`] 的 #153 手法）。
+    pub(crate) struct WindowEnumClient {
+        pub(crate) outcome: WindowListOutcome,
+        pub(crate) detail_calls: StdArc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for WindowEnumClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            match &self.outcome {
+                WindowListOutcome::Ok(resources) => Ok(resources.clone()),
+                WindowListOutcome::CapabilityMissing => Err(
+                    MCPClientError::CapabilityNotSupported("resources".to_string()),
+                ),
+                WindowListOutcome::ConnectionFailed => Err(MCPClientError::ConnectionError(
+                    "forced connection failure".into(),
+                )),
+                WindowListOutcome::ProtocolFailed => Err(MCPClientError::ProtocolError(
+                    "forced protocol failure".into(),
+                )),
+            }
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            self.detail_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ReadResourceResult::new(vec![]))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// 把 [`WindowEnumClient`] 注入 `manager.active_clients`（#161 诊断测试夹具；展示名配套由
+    /// 调用方经 [`inject_config`] 写入 `servers_config`）。
+    pub(crate) async fn inject_window_enum(
+        manager: &MCPServerManager,
+        bundle_id: &BundleId,
+        client: WindowEnumClient,
+    ) {
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), StdArc::new(client));
+    }
+
     /// 用给定工具集构造 [`MockToolsClient`] 并注入 `active_clients`；配套 `ServerConfig` 由调用方写入
     /// `servers_config`（`refresh_tool_mapping` 同时读两者）。Inject a `MockToolsClient` into `active_clients`.
     pub(crate) async fn inject_tools(
@@ -3383,7 +3491,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{bid, stdio_cfg_with_bundle};
+    use super::test_support::{
+        bid, inject_window_enum, stdio_cfg_with_bundle, WindowEnumClient, WindowListOutcome,
+    };
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4535,6 +4645,355 @@ mod tests {
             detail_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "对照：get_windows_details 应触发 resources/read（证明计数器接线 + 新方法确未读取）"
         );
+    }
+
+    /// #161 夹具：注入一个给定 `list_windows` 结果与展示名的 server（bundle_id = `id`）。
+    async fn inject_enum_server(
+        manager: &MCPServerManager,
+        id: &str,
+        display: &str,
+        outcome: WindowListOutcome,
+        detail_calls: StdArc<std::sync::atomic::AtomicUsize>,
+    ) {
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bid(id), stdio_cfg_with_bundle(display, Some(id)));
+        inject_window_enum(
+            manager,
+            &bid(id),
+            WindowEnumClient {
+                outcome,
+                detail_calls,
+            },
+        )
+        .await;
+    }
+
+    /// #161：两个 server 均未声明 `resources` capability → `AllServersMissingCapability`，
+    /// 与「成功空集」「其它失败」可区分（验收②）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_missing_capability_161() {
+        let manager = MCPServerManager::new();
+        for (id, display) in [("id_a", "srv-a"), ("id_b", "srv-b")] {
+            inject_enum_server(
+                &manager,
+                id,
+                display,
+                WindowListOutcome::CapabilityMissing,
+                StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+            )
+            .await;
+        }
+
+        let report = manager.list_windows_with_diagnostics(None).await;
+        assert!(report.windows.is_empty(), "无 capability 不产出窗口");
+        assert_eq!(report.servers_attempted, 2);
+        assert_eq!(
+            report.servers_with_resources_capability, 0,
+            "两 server 均未过能力门"
+        );
+        assert_eq!(report.failures.len(), 2, "每 server 恰一条诊断");
+        let mut by_bid: std::collections::BTreeMap<&str, &super::WindowEnumerationFailure> = report
+            .failures
+            .iter()
+            .map(|f| (f.bundle_id.as_str(), f))
+            .collect();
+        assert_eq!(by_bid.len(), 2);
+        let fa = by_bid.remove("id_a").expect("id_a 失败诊断在列");
+        assert_eq!(fa.server_name, "srv-a", "诊断携带展示名（仅展示用）");
+        assert_eq!(
+            fa.category,
+            WindowEnumerationErrorCategory::MissingResourcesCapability
+        );
+        assert!(
+            !fa.message.is_empty(),
+            "安全消息非空（MCPClientError Display）"
+        );
+        let fb = by_bid.remove("id_b").expect("id_b 失败诊断在列");
+        assert_eq!(
+            fb.category,
+            WindowEnumerationErrorCategory::MissingResourcesCapability
+        );
+        assert_eq!(
+            report.status(),
+            WindowEnumerationStatus::AllServersMissingCapability
+        );
+    }
+
+    /// #161：声明 capability 且枚举成功但零窗口 → `SuccessEmpty`（与 capability 缺失/失败可区分）；
+    /// 且 `list_windows_with_identity` == `report.windows`（投影契约）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_success_empty_161() {
+        let manager = MCPServerManager::new();
+        inject_enum_server(
+            &manager,
+            "id_ok",
+            "srv-ok",
+            WindowListOutcome::Ok(vec![]),
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+
+        let report = manager.list_windows_with_diagnostics(None).await;
+        assert!(report.windows.is_empty());
+        assert!(report.failures.is_empty());
+        assert_eq!(report.servers_attempted, 1);
+        assert_eq!(report.servers_with_resources_capability, 1);
+        assert_eq!(report.status(), WindowEnumerationStatus::SuccessEmpty);
+
+        // 投影契约：with_identity 是 report.windows 的投影（issue：现有 API 可保留并投影）。
+        let projected = manager.list_windows_with_identity(None).await;
+        assert_eq!(projected.len(), report.windows.len());
+    }
+
+    /// #161：所有 server 枚举失败（非能力缺失类）→ `AllServersFailed`；category 按
+    /// `MCPClientError` 变体映射（Connection/Protocol）。`servers_with_resources_capability`
+    /// 语义 = attempted − 能力缺失失败数（连接失败先于能力检查，按「未过门」计——锁死 doc 语义）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_all_failed_161() {
+        let manager = MCPServerManager::new();
+        inject_enum_server(
+            &manager,
+            "id_conn",
+            "srv-conn",
+            WindowListOutcome::ConnectionFailed,
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+        inject_enum_server(
+            &manager,
+            "id_proto",
+            "srv-proto",
+            WindowListOutcome::ProtocolFailed,
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+
+        let report = manager.list_windows_with_diagnostics(None).await;
+        assert!(report.windows.is_empty());
+        assert_eq!(report.servers_attempted, 2);
+        assert_eq!(report.failures.len(), 2);
+        let conn = report
+            .failures
+            .iter()
+            .find(|f| f.bundle_id.as_str() == "id_conn")
+            .expect("id_conn 诊断在列");
+        assert_eq!(conn.category, WindowEnumerationErrorCategory::Connection);
+        let proto = report
+            .failures
+            .iter()
+            .find(|f| f.bundle_id.as_str() == "id_proto")
+            .expect("id_proto 诊断在列");
+        assert_eq!(proto.category, WindowEnumerationErrorCategory::Protocol);
+        // 近似语义：无能力缺失失败 → with_capability = attempted = 2（连接失败不扣减）。
+        assert_eq!(report.servers_with_resources_capability, 2);
+        assert_eq!(report.status(), WindowEnumerationStatus::AllServersFailed);
+    }
+
+    /// #161：部分失败——3 个 server 中 1 成功（1 窗口）、1 能力缺失、1 协议失败 →
+    /// `PartialSuccess`，成功 server 的窗口**不丢**（验收③）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_partial_success_161() {
+        let manager = MCPServerManager::new();
+        inject_enum_server(
+            &manager,
+            "id_ok",
+            "srv-ok",
+            WindowListOutcome::Ok(vec![make_resource(
+                "window://ok.example.com/w",
+                "w",
+                None,
+                None,
+            )]),
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+        inject_enum_server(
+            &manager,
+            "id_cap",
+            "srv-cap",
+            WindowListOutcome::CapabilityMissing,
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+        inject_enum_server(
+            &manager,
+            "id_bad",
+            "srv-bad",
+            WindowListOutcome::ProtocolFailed,
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+
+        let report = manager.list_windows_with_diagnostics(None).await;
+        assert_eq!(report.windows.len(), 1, "部分失败不丢成功 server 的窗口");
+        assert_eq!(report.windows[0].0.as_str(), "id_ok");
+        assert_eq!(
+            report.windows[0].2.uri.as_str(),
+            "window://ok.example.com/w"
+        );
+        assert_eq!(report.failures.len(), 2);
+        assert_eq!(report.servers_attempted, 3);
+        assert_eq!(
+            report.servers_with_resources_capability, 2,
+            "attempted(3) − 能力缺失(1)"
+        );
+        assert_eq!(report.status(), WindowEnumerationStatus::PartialSuccess);
+    }
+
+    /// #161：两个 server 共用展示名、bundle_id 各异（协议：name 允许碰撞），其一失败 →
+    /// 诊断以 **bundle_id** 标识失败者、窗口以 bundle_id 归属成功者（验收④：不以展示名寻址）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_same_display_name_161() {
+        let manager = MCPServerManager::new();
+        inject_enum_server(
+            &manager,
+            "id_good",
+            "dup.disp",
+            WindowListOutcome::Ok(vec![make_resource(
+                "window://good.example.com/w",
+                "w",
+                None,
+                None,
+            )]),
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+        inject_enum_server(
+            &manager,
+            "id_bad",
+            "dup.disp",
+            WindowListOutcome::CapabilityMissing,
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+
+        let report = manager.list_windows_with_diagnostics(None).await;
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].bundle_id.as_str(),
+            "id_bad",
+            "诊断以 bundle_id 标识（展示名碰撞不可寻址）"
+        );
+        assert_eq!(report.failures[0].server_name, "dup.disp");
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(
+            report.windows[0].0.as_str(),
+            "id_good",
+            "窗口归属成功 server 的 bundle_id"
+        );
+        assert_eq!(report.status(), WindowEnumerationStatus::PartialSuccess);
+    }
+
+    /// #161：枚举零 read——`list_windows_with_diagnostics` 只调 `resources/list`（验收①），
+    /// 共享计数器断言 `detail_calls == 0`；对照调 `get_windows_details` 后 `> 0`
+    /// （双向断言防「计数器恒 0」假绿，仿 #153 手法）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_zero_reads_161() {
+        let manager = MCPServerManager::new();
+        let detail_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        inject_enum_server(
+            &manager,
+            "id_x",
+            "srv-x",
+            WindowListOutcome::Ok(vec![make_resource(
+                "window://x.example.com/w",
+                "w",
+                None,
+                None,
+            )]),
+            detail_calls.clone(),
+        )
+        .await;
+
+        let report = manager.list_windows_with_diagnostics(None).await;
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(
+            report.status(),
+            WindowEnumerationStatus::Success,
+            "全成功且有窗 → Success（审查 🟡1：五态中此态也须锚定，防 is_empty 突变假绿）"
+        );
+        assert_eq!(
+            detail_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "枚举不应调用 get_window_detail（resources/read）"
+        );
+
+        // 对照：eager-read 路径会触发计数（证明计数器接线 + 枚举确未读取）。
+        let _details = manager.get_windows_details(None).await;
+        assert!(
+            detail_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "对照：get_windows_details 应触发 resources/read"
+        );
+    }
+
+    /// #161：零活跃 server → `SuccessEmpty`（`servers_attempted == 0` 供消费方细分）；
+    /// `list_all_windows` 投影路径同步回归（空）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_empty_manager_161() {
+        let manager = MCPServerManager::new();
+        let report = manager.list_windows_with_diagnostics(None).await;
+        assert_eq!(report.servers_attempted, 0);
+        assert!(report.failures.is_empty());
+        assert!(report.windows.is_empty());
+        assert_eq!(report.status(), WindowEnumerationStatus::SuccessEmpty);
+
+        assert!(manager.list_all_windows(None).await.is_empty());
+    }
+
+    /// #161：`window_uri = Some(_)` 过滤只作用于 `windows`（命中保留、未命中剔除），**不影响**
+    /// `servers_attempted` / `failures` / `servers_with_resources_capability`（doc 承诺的锚定——
+    /// 审查 🟡2：过滤代码自旧循环搬入，防搬运中反转匹配条件无人察觉）。
+    #[tokio::test]
+    async fn list_windows_with_diagnostics_uri_filter_keeps_counters_161() {
+        let manager = MCPServerManager::new();
+        inject_enum_server(
+            &manager,
+            "id_hit",
+            "srv-hit",
+            WindowListOutcome::Ok(vec![
+                make_resource("window://hit.example.com/want", "w1", None, None),
+                make_resource("window://hit.example.com/skip", "w2", None, None),
+            ]),
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+        inject_enum_server(
+            &manager,
+            "id_cap",
+            "srv-cap",
+            WindowListOutcome::CapabilityMissing,
+            StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+
+        let unfiltered = manager.list_windows_with_diagnostics(None).await;
+        assert_eq!(unfiltered.windows.len(), 2, "不加过滤时两窗均在");
+
+        let filtered = manager
+            .list_windows_with_diagnostics(Some("window://hit.example.com/want"))
+            .await;
+        assert_eq!(filtered.windows.len(), 1, "仅 URI 完全匹配的窗口保留");
+        assert_eq!(
+            filtered.windows[0].2.uri.as_str(),
+            "window://hit.example.com/want"
+        );
+        // 过滤不影响诊断/计数（含失败 server 的 failures 照常出现）。
+        assert_eq!(filtered.servers_attempted, 2);
+        assert_eq!(filtered.failures.len(), 1);
+        assert_eq!(filtered.failures[0].bundle_id.as_str(), "id_cap");
+        assert_eq!(filtered.servers_with_resources_capability, 1);
+        assert_eq!(filtered.status(), WindowEnumerationStatus::PartialSuccess);
+
+        // 未命中任何 URI → windows 空，但 failures/计数不变（非「成功空集」混淆源——server 仍枚举过）。
+        let none_hit = manager
+            .list_windows_with_diagnostics(Some("window://nowhere"))
+            .await;
+        assert!(none_hit.windows.is_empty());
+        assert_eq!(none_hit.failures.len(), 1);
+        assert_eq!(none_hit.servers_attempted, 2);
     }
 
     /// #127：`list_skill_resources` 的 `.0` = **bundle_id**（`active_clients` 键），非 display 名。

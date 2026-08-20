@@ -1070,6 +1070,124 @@ pub enum MCPClientError {
     Other(String),
 }
 
+/// #161：逐 server 窗口枚举失败的**稳定错误类别**（小闭集，从 [`MCPClientError`] 投影）。
+///
+/// 供下游（如 tfrobot-client TFRC-75）在不解析错误文案的前提下区分「capability 缺失」「认证过期
+/// （可引导用户重新授权）」「传输失败」等可操作状态。**进程内诊断类别，非 wire 错误码**——与
+/// `smcp::ErrorCode::McpCapabilityNotSupported`（4015）语义对应但不绑数值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WindowEnumerationErrorCategory {
+    /// Server 未声明 `resources` capability（`CapabilityNotSupported` → 4015 语义，INT-04 #78
+    /// 三传输统一）。与「成功空集」的区别即窗口枚举诊断的核心分叉。
+    MissingResourcesCapability,
+    /// 连接态/传输断开（枚举前 state 检查或传输失败）。
+    Connection,
+    /// HTTP 认证协商失败（OAuth 过期等——下游唯一「可引导用户操作恢复」的失败类）。
+    Authentication,
+    /// Server 返回协议错误/畸形响应。
+    Protocol,
+    /// 超时。
+    Timeout,
+    /// 其余（IO / JSON / 工具调用类等）。
+    Other,
+}
+
+impl From<&MCPClientError> for WindowEnumerationErrorCategory {
+    fn from(e: &MCPClientError) -> Self {
+        match e {
+            MCPClientError::CapabilityNotSupported(_) => Self::MissingResourcesCapability,
+            MCPClientError::ConnectionError(_) => Self::Connection,
+            MCPClientError::HttpAuthentication(_) => Self::Authentication,
+            MCPClientError::ProtocolError(_) => Self::Protocol,
+            MCPClientError::TimeoutError(_) => Self::Timeout,
+            // `list_windows` 路径不产生 ToolCallError；Io/Json/Other 归 Other。
+            MCPClientError::ToolCallError(_)
+            | MCPClientError::IoError(_)
+            | MCPClientError::JsonError(_)
+            | MCPClientError::Other(_) => Self::Other,
+        }
+    }
+}
+
+/// #161：单个 server 的枚举失败诊断。**身份键 = `bundle_id`**（寻址/去重一律用它——协议
+/// §身份正交性：`name` 允许碰撞）；`server_name` 仅展示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowEnumerationFailure {
+    pub bundle_id: BundleId,
+    pub server_name: ServerName,
+    pub category: WindowEnumerationErrorCategory,
+    /// 安全消息 = [`MCPClientError`] 的 `Display`（该错误族不携带凭据——参见
+    /// `HttpAuthenticationError` 的保安全设计注释）。
+    pub message: String,
+}
+
+/// #161：结构化窗口枚举结果——进程内 SDK API 的返回体（**不上 wire、不持久化、无 UI/Robot/
+/// Manager 字段**，验收⑥）。由 `MCPServerManager::list_windows_with_diagnostics` 产出，供下游
+/// 区分「成功空集 / capability 缺失 / 全部失败 / 部分成功」四态（经 [`status`](Self::status)）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowEnumerationReport {
+    /// 枚举成功的窗口：`(bundle_id, 展示名, resource)`，与 manager 的
+    /// `list_windows_with_identity` 同形（后者即本字段的投影）。
+    /// 部分失败**不丢**其余 server 的窗口。
+    pub windows: Vec<(BundleId, ServerName, Resource)>,
+    /// 本次尝试枚举的活跃 server 总数（= `active_clients` 快照长度）。
+    pub servers_attempted: usize,
+    /// **通过 resources 能力门的 server 数** = `servers_attempted` − `failures` 中 category 为
+    /// [`MissingResourcesCapability`](WindowEnumerationErrorCategory::MissingResourcesCapability)
+    /// 的条数。近似语义：client 层连接检查先于能力检查，连接失败的 server 其能力声明不可确知，
+    /// 按「未因能力缺失被排除」计（不扣减）。
+    pub servers_with_resources_capability: usize,
+    /// 逐 server 失败（每 server 至多一条；成功 server 不出现）。
+    pub failures: Vec<WindowEnumerationFailure>,
+}
+
+/// #161：枚举结果四态（+正常成功）推导，规则全序且全覆盖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WindowEnumerationStatus {
+    /// 全部成功且有窗口。
+    Success,
+    /// 全部成功但窗口为空（**含 `servers_attempted == 0`**：零活跃 server；消费方可再查
+    /// `servers_attempted` 细分「没有 server」与「有 server 但零窗口」）。
+    SuccessEmpty,
+    /// 所有 server 均未声明 `resources` capability（失败非空且全为能力缺失）。
+    AllServersMissingCapability,
+    /// 全部失败（零成功且非纯能力缺失——含混合失败类别）。
+    AllServersFailed,
+    /// 部分成功（≥1 server 成功 且 ≥1 失败）；其余 server 的窗口保留在 `windows`。
+    PartialSuccess,
+}
+
+impl WindowEnumerationReport {
+    /// 四态推导。成功 server 数 = `servers_attempted` − `failures.len()`（每 server 至多一条
+    /// 失败，恒 ≥ 0）：failures 空 → `Success`/`SuccessEmpty`（按 `windows` 是否为空）；零成功
+    /// 且失败全为能力缺失 → `AllServersMissingCapability`；零成功其余 → `AllServersFailed`；
+    /// 有成功有失败 → `PartialSuccess`。
+    pub fn status(&self) -> WindowEnumerationStatus {
+        let succeeded = self.servers_attempted.saturating_sub(self.failures.len());
+        if self.failures.is_empty() {
+            return if self.windows.is_empty() {
+                WindowEnumerationStatus::SuccessEmpty
+            } else {
+                WindowEnumerationStatus::Success
+            };
+        }
+        if succeeded == 0 {
+            let all_missing = self
+                .failures
+                .iter()
+                .all(|f| f.category == WindowEnumerationErrorCategory::MissingResourcesCapability);
+            return if all_missing {
+                WindowEnumerationStatus::AllServersMissingCapability
+            } else {
+                WindowEnumerationStatus::AllServersFailed
+            };
+        }
+        WindowEnumerationStatus::PartialSuccess
+    }
+}
+
 /// Stable result categories for HTTP authentication negotiation.
 ///
 /// Challenge values and provider response bodies are intentionally not retained so credentials

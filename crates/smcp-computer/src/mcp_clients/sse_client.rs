@@ -684,6 +684,17 @@ impl MCPClientProtocol for SseMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
+        // 4015 能力预检：server 未声明 `resources` → CapabilityNotSupported（上层映射 4015），
+        // 与下方 `list_resources_page` 共用同一能力门（INT-04 #78 三传输统一）。
+        // #161：窗口枚举聚合层（manager `list_windows_with_diagnostics`）依赖此信号区分
+        // 「capability 缺失」与「成功空集」。
+        // Capability gate mirroring list_resources_page: undeclared `resources` ⇒ 4015.
+        if !self.supports_resources().await {
+            return Err(MCPClientError::CapabilityNotSupported(
+                "resources".to_string(),
+            ));
+        }
+
         // SSE 客户端目前不支持分页，直接获取所有资源
         let response = self
             .send_request("resources/list", Some(serde_json::json!({})))
