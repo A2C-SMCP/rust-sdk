@@ -64,6 +64,16 @@ pub(crate) struct OAuthClearOutcome {
     pub(crate) capability_changed: bool,
 }
 
+/// Result of rebuilding the Agent-facing tool projection.
+///
+/// Public refresh APIs intentionally retain their historical `Result<()>` shape. The Computer's
+/// runtime notification reactor consumes this richer crate-local outcome so duplicate MCP
+/// `tools/list_changed` hints do not publish false capability revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolProjectionRefreshOutcome {
+    pub(crate) projection_changed: bool,
+}
+
 fn bump_active_client_generation(generations: &mut HashMap<BundleId, u64>, bundle_id: &BundleId) {
     let generation = generations.entry(bundle_id.clone()).or_default();
     *generation = generation.wrapping_add(1);
@@ -77,6 +87,7 @@ fn bump_active_client_generation(generations: &mut HashMap<BundleId, u64>, bundl
 async fn withdraw_bundle_tool_routes(
     tool_routes: &RwLock<HashMap<ExposedToolName, ExposedToolRoute>>,
     disabled_tools: &RwLock<HashSet<ExposedToolName>>,
+    tool_projection: &RwLock<HashMap<ExposedToolName, Value>>,
     bundle_id: &BundleId,
 ) -> bool {
     let routes_changed = {
@@ -92,7 +103,14 @@ async fn withdraw_bundle_tool_routes(
         disabled.retain(|tool| !tool.starts_with(&exposed_prefix));
         disabled.len() != before
     };
-    routes_changed || disabled_changed
+    let projection_changed = {
+        let exposed_prefix = format!("{}__", bundle_id.as_str());
+        let mut projection = tool_projection.write().await;
+        let before = projection.len();
+        projection.retain(|name, _| !name.starts_with(&exposed_prefix));
+        projection.len() != before
+    };
+    routes_changed || disabled_changed || projection_changed
 }
 
 /// client factory 类型（#152 测试接缝）/ client factory type（test seam）。
@@ -146,6 +164,12 @@ pub struct MCPServerManager {
     connection_states: Arc<RwLock<HashMap<BundleId, MCPServerConnectionState>>>,
     /// 聚合工具路由表：`exposed_tool_name -> ExposedToolRoute`（get_tools 与 tool_call 共享，单射整键查表）。
     tool_routes: Arc<RwLock<HashMap<ExposedToolName, ExposedToolRoute>>>,
+    /// Last committed Agent-facing tool definitions, keyed by exposed name.
+    ///
+    /// This is a change-detection snapshot, not the serving source: `list_available_tools` still
+    /// obtains fresh definitions from each active MCP server. Keeping the complete serialized Tool
+    /// catches schema/description/meta changes that route-name or count comparisons miss.
+    tool_projection: Arc<RwLock<HashMap<ExposedToolName, Value>>>,
     /// 禁用工具集合（键 = `exposed_tool_name`）/ Disabled tools set keyed by exposed_tool_name。
     disabled_tools: Arc<RwLock<HashSet<ExposedToolName>>>,
     /// Serialize full projection rebuilds; lifecycle revocation never takes this lock.
@@ -228,6 +252,7 @@ impl MCPServerManager {
             activation_intents: Arc::new(RwLock::new(HashSet::new())),
             connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
+            tool_projection: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
             tool_route_refresh_lock: Arc::new(Mutex::new(())),
             auto_reconnect: Arc::new(RwLock::new(true)),
@@ -263,6 +288,7 @@ impl MCPServerManager {
             activation_intents: Arc::new(RwLock::new(HashSet::new())),
             connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
+            tool_projection: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
             tool_route_refresh_lock: Arc::new(Mutex::new(())),
             auto_reconnect: Arc::new(RwLock::new(reconnect_policy.enabled)),
@@ -1108,6 +1134,16 @@ impl MCPServerManager {
         self.refresh_tool_routes().await
     }
 
+    /// Rebuild routes and report whether the complete Agent-facing tool projection changed.
+    ///
+    /// Crate-local by design: external callers retain the stable `Result<()>` compatibility API,
+    /// while the Computer notification reactor uses the outcome to suppress duplicate revisions.
+    pub(crate) async fn refresh_tool_mapping_with_outcome(
+        &self,
+    ) -> Result<ToolProjectionRefreshOutcome, ComputerError> {
+        self.refresh_tool_routes_with_outcome().await
+    }
+
     /// 重建聚合工具路由表 `tool_routes`（`exposed_tool_name -> ExposedToolRoute`，协议 0.3.0 BundleID 模型）。
     ///
     /// exposed 名 = `{bundle_id}__{alias ?? 原始工具名}`（[`bundle_id::exposed_tool_name`]），跨 Server / bundle
@@ -1118,10 +1154,17 @@ impl MCPServerManager {
     /// #106：运行期 `tools/list_changed` 到达时须在 `emit_update_tool_list` **之前**调用，否则新增工具不进路由
     /// → `list_available_tools` 漏掉 → Agent 回拉看不到（"坑 1"）。消费者任务在 event-loop 外调用，无重入风险。
     pub async fn refresh_tool_routes(&self) -> Result<(), ComputerError> {
+        self.refresh_tool_routes_with_outcome().await.map(|_| ())
+    }
+
+    async fn refresh_tool_routes_with_outcome(
+        &self,
+    ) -> Result<ToolProjectionRefreshOutcome, ComputerError> {
         let _refresh_guard = self.tool_route_refresh_lock.lock().await;
 
         loop {
             let mut routes: HashMap<ExposedToolName, ExposedToolRoute> = HashMap::new();
+            let mut projection: HashMap<ExposedToolName, Value> = HashMap::new();
             // Keep the owner alongside each disabled name until commit so stale snapshots can be
             // filtered without reverse-parsing the exposed name.
             let mut disabled: HashMap<ExposedToolName, BundleId> = HashMap::new();
@@ -1188,7 +1231,7 @@ impl MCPServerManager {
 
                             // 合并工具元数据取 alias（仅替换工具名部分）/ merged alias (replaces the tool-name part)。
                             let tool_meta = self.merged_tool_meta(config, &original_tool_name);
-                            let alias = tool_meta.and_then(|meta| meta.alias);
+                            let alias = tool_meta.as_ref().and_then(|meta| meta.alias.clone());
 
                             // exposed 名 = {bundle_id}__{alias ?? original}，恒带前缀、跨 bundle 唯一。
                             let exposed = bundle_id::exposed_tool_name(
@@ -1222,6 +1265,8 @@ impl MCPServerManager {
                                 continue;
                             }
 
+                            let display_tool = Self::agent_facing_tool(tool, &exposed, tool_meta)?;
+                            projection.insert(exposed.clone(), serde_json::to_value(display_tool)?);
                             routes.insert(
                                 exposed,
                                 ExposedToolRoute {
@@ -1238,6 +1283,14 @@ impl MCPServerManager {
                             "Error listing tools for {} (bundle_id={}): {}",
                             server_name, bundle_id, e
                         );
+                        // A failed invalidation refresh is not an empty tools/list response. Keep
+                        // the last committed routes/disabled/projection transaction intact so a
+                        // transient transport error cannot masquerade as a real tool removal or
+                        // publish a false capability revision.
+                        return Err(ComputerError::ConnectionError(format!(
+                            "failed to refresh tools for server '{server_name}' \
+                             (bundle_id={bundle_id}): {e}"
+                        )));
                     }
                 }
             }
@@ -1247,6 +1300,7 @@ impl MCPServerManager {
             // identity means this full-table result is stale; retry under the refresh mutex.
             let mut tool_routes = self.tool_routes.write().await;
             let mut disabled_tools = self.disabled_tools.write().await;
+            let mut committed_projection = self.tool_projection.write().await;
             let active_clients = self.active_clients.read().await;
             let active_generations = self.active_client_generations.read().await;
             let snapshot_is_current = active_clients.len() == snapshot_clients.len()
@@ -1266,20 +1320,28 @@ impl MCPServerManager {
             if !snapshot_is_current {
                 drop(active_generations);
                 drop(active_clients);
+                drop(committed_projection);
                 drop(disabled_tools);
                 drop(tool_routes);
                 continue;
             }
             let disabled: HashSet<ExposedToolName> = disabled.into_keys().collect();
+            let projection_changed = *committed_projection != projection;
 
-            // 原子换出（单表读侧只见旧或新整表）/ swap in the freshly built tables.
+            // Commit routes, disabled set, and the comparison snapshot from the same tools/list
+            // generation. Readers of each table see either its old or new whole value; the
+            // refresh mutex serializes competing full rebuilds.
             *tool_routes = routes;
             *disabled_tools = disabled;
+            *committed_projection = projection;
             drop(active_generations);
             drop(active_clients);
 
-            debug!("Tool routes refreshed successfully");
-            return Ok(());
+            debug!(
+                projection_changed,
+                "Tool routes and Agent-facing projection refreshed successfully"
+            );
+            return Ok(ToolProjectionRefreshOutcome { projection_changed });
         }
     }
 
@@ -1850,21 +1912,8 @@ impl MCPServerManager {
                 .iter()
                 .find(|t| t.name.as_ref() == original_name.as_str())
             {
-                let mut display_tool = tool.clone();
-                display_tool.name = exposed_name.clone().into();
-
-                // 合并工具元数据 / Merge tool metadata
-                if let Some(tool_meta) = tool_meta {
-                    if display_tool.meta.is_none() {
-                        display_tool.meta = Some(rmcp::model::Meta::new());
-                    }
-                    if let Some(ref mut meta) = display_tool.meta {
-                        meta.insert(
-                            A2C_TOOL_META.to_string(),
-                            serde_json::to_value(tool_meta).unwrap(),
-                        );
-                    }
-                }
+                let display_tool = Self::agent_facing_tool(tool.clone(), &exposed_name, tool_meta)
+                    .expect("Tool and ToolMeta serialization is infallible");
 
                 candidates.push((exposed_name, route, client, generation, display_tool));
             }
@@ -2247,6 +2296,28 @@ impl MCPServerManager {
         }
     }
 
+    /// Apply the exact local projection that Agent-facing enumeration exposes.
+    ///
+    /// Route refresh uses the serialized result for semantic change detection, while
+    /// `list_available_tools_with_bundle_id` returns the Tool itself. Keeping the transformation in
+    /// one helper prevents revision detection from drifting away from the served projection.
+    fn agent_facing_tool(
+        mut tool: Tool,
+        exposed_name: &str,
+        tool_meta: Option<ToolMeta>,
+    ) -> Result<Tool, serde_json::Error> {
+        tool.name = exposed_name.to_string().into();
+        if let Some(tool_meta) = tool_meta {
+            if tool.meta.is_none() {
+                tool.meta = Some(rmcp::model::Meta::new());
+            }
+            if let Some(ref mut meta) = tool.meta {
+                meta.insert(A2C_TOOL_META.to_string(), serde_json::to_value(tool_meta)?);
+            }
+        }
+        Ok(tool)
+    }
+
     /// 启用自动连接 / Enable auto connect
     pub async fn enable_auto_connect(&self) {
         *self.auto_connect.write().await = true;
@@ -2304,6 +2375,7 @@ impl MCPServerManager {
         let lifecycle_locks = self.lifecycle_locks.clone();
         let connection_states = self.connection_states.clone();
         let tool_routes = self.tool_routes.clone();
+        let tool_projection = self.tool_projection.clone();
         let disabled_tools = self.disabled_tools.clone();
 
         let handle = tokio::spawn(async move {
@@ -2439,6 +2511,7 @@ impl MCPServerManager {
                                         withdraw_bundle_tool_routes(
                                             &tool_routes,
                                             &disabled_tools,
+                                            &tool_projection,
                                             &bundle_id,
                                         )
                                         .await;
@@ -2752,8 +2825,13 @@ impl MCPServerManager {
         let had_connected_client = connected.is_some();
         // Revoke cached invocation authority before awaiting a fallible transport disconnect.
         // Readers can no longer enumerate or route this bundle once this await completes.
-        let routes_withdrawn =
-            withdraw_bundle_tool_routes(&self.tool_routes, &self.disabled_tools, bundle_id).await;
+        let routes_withdrawn = withdraw_bundle_tool_routes(
+            &self.tool_routes,
+            &self.disabled_tools,
+            &self.tool_projection,
+            bundle_id,
+        )
+        .await;
         if let Some(ref mut connected) = connected {
             if let Err(error) = connected.disconnect().await {
                 warn!(
@@ -3261,6 +3339,15 @@ pub(crate) mod test_support {
             .write()
             .await
             .insert(bundle_id.clone(), StdArc::new(MockToolsClient { tools }));
+    }
+
+    /// Replace one active client with a deterministic `tools/list` failure.
+    pub(crate) async fn inject_err_tools(manager: &MCPServerManager, bundle_id: &BundleId) {
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), StdArc::new(ErrToolsClient));
     }
 
     /// 计数版 [`MockToolsClient`]：`list_tools` 每次调用 `calls += 1`，供 #91「每 server 仅拉一次
@@ -5384,6 +5471,17 @@ mod tests {
         Tool::new(name.to_string(), "t", StdArc::new(input_schema))
     }
 
+    fn tool_with_property(name: &str, property: &str) -> Tool {
+        let input_schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": { (property): { "type": "string" } },
+                "required": [property]
+            }))
+            .unwrap();
+        Tool::new(name.to_string(), "t", StdArc::new(input_schema))
+    }
+
     /// Stdio ServerConfig 构造器（forbidden_tools / tool_meta 可定制），server_parameters 占位。
     fn stdio_cfg(
         name: &str,
@@ -5421,6 +5519,116 @@ mod tests {
             manager.servers_config.write().await.insert(bid, cfg);
         }
         manager.refresh_tool_routes().await
+    }
+
+    #[tokio::test]
+    async fn refresh_outcome_compares_complete_agent_facing_projection() {
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("srv");
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), stdio_cfg("srv", vec![], HashMap::new()));
+
+        inject_tools(
+            &manager,
+            &bundle_id,
+            vec![tool_with_property("dynamic", "x")],
+        )
+        .await;
+        assert!(
+            manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .expect("initial refresh")
+                .projection_changed,
+            "empty → one tool must be a projection change"
+        );
+        assert!(
+            !manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .expect("duplicate refresh")
+                .projection_changed,
+            "an identical tools/list result must not report a change"
+        );
+
+        inject_tools(
+            &manager,
+            &bundle_id,
+            vec![tool_with_property("dynamic", "y")],
+        )
+        .await;
+        assert!(
+            manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .expect("schema refresh")
+                .projection_changed,
+            "schema-only change with the same route and count must be detected"
+        );
+        assert!(
+            !manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .expect("duplicate schema refresh")
+                .projection_changed,
+            "repeating the same changed schema must settle to unchanged"
+        );
+
+        inject_tools(&manager, &bundle_id, vec![]).await;
+        assert!(
+            manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .expect("removal refresh")
+                .projection_changed,
+            "tool removal must be a projection change"
+        );
+        assert!(
+            !manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .expect("duplicate empty refresh")
+                .projection_changed,
+            "an unchanged empty projection must not report a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_error_preserves_last_committed_projection() {
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("srv");
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), stdio_cfg("srv", vec![], HashMap::new()));
+        inject_tools(&manager, &bundle_id, vec![tool_named("stable")]).await;
+        manager
+            .refresh_tool_mapping_with_outcome()
+            .await
+            .expect("initial refresh");
+
+        let routes_before = manager.tool_routes.read().await.clone();
+        let disabled_before = manager.disabled_tools.read().await.clone();
+        let projection_before = manager.tool_projection.read().await.clone();
+
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id, StdArc::new(ErrToolsClient));
+        let error = manager
+            .refresh_tool_mapping_with_outcome()
+            .await
+            .expect_err("tools/list failure must abort the refresh transaction");
+
+        assert!(matches!(error, ComputerError::ConnectionError(_)));
+        assert_eq!(*manager.tool_routes.read().await, routes_before);
+        assert_eq!(*manager.disabled_tools.read().await, disabled_before);
+        assert_eq!(*manager.tool_projection.read().await, projection_before);
     }
 
     fn meta_with_alias(original: &str, alias: &str) -> HashMap<String, ToolMeta> {

@@ -14,10 +14,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, McpChangeKind, McpServerNotification, StdioServerConfig, StdioServerParameters,
 };
 use smcp_computer::mcp_clients::MCPServerManager;
+use smcp_computer::ComputerEvent;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -82,18 +84,19 @@ async fn tools_list_changed_forwarded_and_refresh_reveals_new_tool() {
 
     // 初始（phase 0）：仅 set_phase，无 dyn_tool。
     let names0 = tool_names(&manager.list_available_tools().await);
+    let set_phase = names0
+        .iter()
+        .find(|name| name.ends_with("__set_phase"))
+        .expect("初始应有 BundleID 前缀化的 set_phase")
+        .clone();
     assert!(
-        names0.contains(&"set_phase".to_string()),
-        "初始应有 set_phase"
-    );
-    assert!(
-        !names0.contains(&"dyn_tool".to_string()),
+        !names0.iter().any(|name| name.ends_with("__dyn_tool")),
         "phase 0 不应有 dyn_tool，实得 {names0:?}"
     );
 
     // 运行期切到 phase 1：server 新增 dyn_tool 并主动发 tools/list_changed + resources/list_changed。
     manager
-        .execute_tool("set_phase", serde_json::json!({ "phase": 1 }), None)
+        .execute_tool(&set_phase, serde_json::json!({ "phase": 1 }), None)
         .await
         .expect("set_phase call failed");
 
@@ -111,7 +114,7 @@ async fn tools_list_changed_forwarded_and_refresh_reveals_new_tool() {
     // 坑1 复现：未刷新 tool_mapping 前，运行期新增的 dyn_tool 在 list_available_tools 不可见。
     let names_before = tool_names(&manager.list_available_tools().await);
     assert!(
-        !names_before.contains(&"dyn_tool".to_string()),
+        !names_before.iter().any(|name| name.ends_with("__dyn_tool")),
         "未刷新前 dyn_tool 不应可见（复现坑1），实得 {names_before:?}"
     );
 
@@ -122,9 +125,160 @@ async fn tools_list_changed_forwarded_and_refresh_reveals_new_tool() {
         .expect("refresh_tool_mapping failed");
     let names_after = tool_names(&manager.list_available_tools().await);
     assert!(
-        names_after.contains(&"dyn_tool".to_string()),
+        names_after.iter().any(|name| name.ends_with("__dyn_tool")),
         "刷新后 dyn_tool 应可见（坑1 修复），实得 {names_after:?}"
     );
 
     let _ = manager.stop_all().await;
+}
+
+fn projection_has_property(
+    tools: &[smcp_computer::mcp_clients::model::Tool],
+    tool_suffix: &str,
+    property: &str,
+) -> bool {
+    tools.iter().any(|tool| {
+        tool.name.as_ref().ends_with(tool_suffix)
+            && serde_json::to_value(tool)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer(&format!("/inputSchema/properties/{property}"))
+                        .cloned()
+                })
+                .is_some()
+    })
+}
+
+async fn next_capability_revision(
+    events: &mut tokio::sync::broadcast::Receiver<ComputerEvent>,
+) -> u64 {
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("timed out waiting for runtime event")
+        .expect("runtime event channel closed");
+    match event {
+        ComputerEvent::CapabilityRevisionBumped { revision } => revision,
+        other => panic!("expected CapabilityRevisionBumped, got {other:?}"),
+    }
+}
+
+/// #196：真实 stdio `tools/list_changed` 必须在工具投影真实变化后推进本地 runtime revision/event；
+/// schema-only 变化同样属于能力变化，重复相同投影则不得误报。
+#[tokio::test]
+#[ignore] // 需要 Node.js 运行时
+async fn tools_list_changed_bumps_runtime_only_when_projection_changes() {
+    let temp = tempfile::TempDir::new().expect("temporary isolation root");
+    let mut servers = HashMap::new();
+    servers.insert("mutable".to_string(), stdio_config("mutable"));
+    let env: HashMap<String, String> = std::iter::once((
+        "XDG_CONFIG_HOME".to_string(),
+        temp.path().join("xdg").to_string_lossy().into_owned(),
+    ))
+    .collect();
+    let computer = Computer::new(
+        "issue-196",
+        SilentSession::new("test"),
+        None,
+        Some(servers),
+        false,
+        false,
+    )
+    .with_skill_home(temp.path().join("skills"))
+    .with_blob_cache_root(temp.path().join("blob"))
+    .with_config_dir(temp.path().join("project"))
+    .with_config_env(env)
+    .with_confirm_callback(|_, _, _, _| true);
+
+    computer.boot_up().await.expect("boot");
+    computer
+        .start_all_mcp_clients()
+        .await
+        .expect("start mutable MCP server");
+    let initial = computer.status().await;
+    assert_eq!(initial.tools, 1);
+    let set_phase = computer
+        .get_available_tools()
+        .await
+        .expect("initial tools")
+        .into_iter()
+        .find(|tool| tool.name.as_ref().ends_with("__set_phase"))
+        .expect("set_phase tool")
+        .name
+        .to_string();
+    let mut events = computer.subscribe_events();
+
+    computer
+        .execute_tool(
+            "add",
+            &set_phase,
+            serde_json::json!({"phase": 1}),
+            Some(5.0),
+        )
+        .await
+        .expect("set phase 1");
+    let add_revision = next_capability_revision(&mut events).await;
+    let after_add = computer.status().await;
+    assert_eq!(add_revision, initial.capability_revision + 1);
+    assert_eq!(after_add.capability_revision, add_revision);
+    assert_eq!(after_add.tools, 2, "event must follow route commit");
+    assert!(projection_has_property(
+        &computer.get_available_tools().await.expect("phase 1 tools"),
+        "__dyn_tool",
+        "x"
+    ));
+
+    computer
+        .execute_tool(
+            "schema",
+            &set_phase,
+            serde_json::json!({"phase": 2}),
+            Some(5.0),
+        )
+        .await
+        .expect("set phase 2");
+    let schema_revision = next_capability_revision(&mut events).await;
+    let after_schema = computer.status().await;
+    assert_eq!(schema_revision, add_revision + 1);
+    assert_eq!(after_schema.capability_revision, schema_revision);
+    assert_eq!(after_schema.tools, 2, "schema-only change keeps tool count");
+    assert!(projection_has_property(
+        &computer.get_available_tools().await.expect("phase 2 tools"),
+        "__dyn_tool",
+        "y"
+    ));
+
+    computer
+        .execute_tool(
+            "same",
+            &set_phase,
+            serde_json::json!({"phase": 2}),
+            Some(5.0),
+        )
+        .await
+        .expect("repeat phase 2");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), events.recv())
+            .await
+            .is_err(),
+        "identical projection must not publish a capability event"
+    );
+    assert_eq!(computer.capability_revision(), schema_revision);
+
+    computer
+        .execute_tool(
+            "remove",
+            &set_phase,
+            serde_json::json!({"phase": 3}),
+            Some(5.0),
+        )
+        .await
+        .expect("set phase 3");
+    let remove_revision = next_capability_revision(&mut events).await;
+    let after_remove = computer.status().await;
+    assert_eq!(remove_revision, schema_revision + 1);
+    assert_eq!(after_remove.capability_revision, remove_revision);
+    assert_eq!(after_remove.tools, 1, "event must expose removed route");
+
+    computer.shutdown().await.expect("shutdown");
 }

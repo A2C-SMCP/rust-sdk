@@ -1693,6 +1693,7 @@ impl<S: Session> Computer<S> {
     fn mcp_change_reactor(&self) -> McpChangeReactor {
         McpChangeReactor {
             manager: Arc::downgrade(&self.mcp_manager),
+            status: Arc::clone(&self.status),
             socketio_client: Arc::clone(&self.socketio_client),
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
@@ -3248,7 +3249,8 @@ impl<S: Session> Computer<S> {
         self.status.config_revision()
     }
 
-    /// 当前 capability revision（Agent-facing 能力投影单调计数）/ current capability revision。
+    /// 当前 capability revision（Agent-facing 能力投影单调计数；含运行期 MCP 工具定义变化）/
+    /// current capability revision。
     #[must_use]
     pub fn capability_revision(&self) -> u64 {
         self.status.capability_revision()
@@ -4344,6 +4346,9 @@ async fn broadcast_tool_list_update(slot: &Arc<RwLock<Option<Arc<SmcpComputerCli
 struct McpChangeReactor {
     /// `Weak` 管理器 cell（断开 sender 自持环，见类型注释）。
     manager: Weak<RwLock<Option<MCPServerManager>>>,
+    /// Shared runtime event/revision holder. It contains no MCP notification sender, so retaining
+    /// it in the reactor does not recreate the manager/channel ownership cycle described above.
+    status: Arc<RuntimeStatus>,
     socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
     skill_registry: Arc<RwLock<SkillRegistry>>,
     skill_home: Arc<StdRwLock<Option<PathBuf>>>,
@@ -4353,7 +4358,7 @@ struct McpChangeReactor {
 
 impl McpChangeReactor {
     /// 反应一条 MCP 变化通知。协议映射（events.md §server:update_* / desktop.md / skill.md §8）：
-    /// - `tools/list_changed` → 刷新 tool_mapping 后 emit `server:update_tool_list`；
+    /// - `tools/list_changed` → 刷新完整工具投影，真实变化后 bump capability + emit tool list；
     /// - `resources/list_changed` → desktop 集合去抖 emit + MCP 源 skill 重挂（去抖 emit_update_skills）；
     /// - `resources/updated{uri}` → `window://` 直接刷桌面 / `skill://` 重挂该源 / 其它忽略。
     async fn handle(&self, notif: McpServerNotification) {
@@ -4374,17 +4379,33 @@ impl McpChangeReactor {
     }
 
     async fn on_tool_list_changed(&self) {
-        // 先刷新 tool_mapping 再 emit：保证 Agent 回拉 get_tools 时 mapping 已含运行期新增工具（修"坑 1"），
-        // 并顺带修 execute_tool 路由校验对新工具的可见性。消费者任务不在 rmcp event loop 内，调用安全无死锁。
-        if let Some(mgr_cell) = self.manager.upgrade() {
+        // Commit the refreshed route/definition projection before publishing the revision. Event
+        // consumers can therefore call Computer::status/get_available_tools immediately and see
+        // the new state. MCP list_changed is only an invalidation hint: duplicate hints with an
+        // identical projection must not advance the monotonic capability revision or reload Office.
+        let projection_changed = if let Some(mgr_cell) = self.manager.upgrade() {
             let guard = mgr_cell.read().await;
             if let Some(mgr) = guard.as_ref() {
-                if let Err(e) = mgr.refresh_tool_mapping().await {
-                    warn!(error = %e, "refresh_tool_mapping on tools/list_changed failed");
+                match mgr.refresh_tool_mapping_with_outcome().await {
+                    Ok(outcome) => outcome.projection_changed,
+                    Err(e) => {
+                        warn!(error = %e, "refresh_tool_mapping on tools/list_changed failed");
+                        return;
+                    }
                 }
+            } else {
+                return;
             }
+        } else {
+            return;
+        };
+
+        if projection_changed {
+            self.status.bump_capability();
+            self.emit_tool_list().await;
+        } else {
+            debug!("Agent-facing tool projection unchanged, skip capability revision and emit");
         }
-        self.emit_tool_list().await;
     }
 
     async fn on_desktop_maybe_changed(&self) {
@@ -4472,7 +4493,7 @@ impl McpChangeReactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_clients::manager::test_support::bid;
+    use crate::mcp_clients::manager::test_support::{bid, inject_err_tools, inject_tools};
     use crate::mcp_clients::model::{
         CommandInput, MCPServerConfig, MCPServerInput, PickStringInput, PickStringOption,
         PromptStringInput, StdioServerConfig, StdioServerParameters,
@@ -4515,6 +4536,55 @@ mod tests {
         assert_eq!(snap.capability_revision, 0);
         assert!(snap.last_error.is_none());
         assert!(snap.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_list_refresh_error_preserves_revision_event_and_routes() {
+        let bundle_id = bid("srv");
+        let manager = MCPServerManager::new();
+        manager
+            .initialize(vec![user_stdio_server97("srv")])
+            .await
+            .expect("initialize manager");
+        let input_schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"type": "object"})).unwrap();
+        inject_tools(
+            &manager,
+            &bundle_id,
+            vec![rmcp::model::Tool::new(
+                "stable".to_string(),
+                "stable tool",
+                std::sync::Arc::new(input_schema),
+            )],
+        )
+        .await;
+        manager
+            .refresh_tool_mapping()
+            .await
+            .expect("initial route refresh");
+        inject_err_tools(&manager, &bundle_id).await;
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        *computer.mcp_manager.write().await = Some(manager);
+        let before = computer.status().await;
+        assert_eq!(before.tools, 1);
+        let mut events = computer.subscribe_events();
+
+        computer
+            .handle_mcp_notification(McpServerNotification {
+                server: bundle_id,
+                kind: McpChangeKind::ToolListChanged,
+            })
+            .await;
+
+        assert_eq!(computer.capability_revision(), before.capability_revision);
+        assert_eq!(computer.status().await.tools, 1, "old routes must survive");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "failed refresh must not publish a capability event"
+        );
     }
 
     /// #147/#139：`Clone` / `clone_for_handlers` MUST 保留 frozen embed 声明快照——否则克隆出的 Computer 上
