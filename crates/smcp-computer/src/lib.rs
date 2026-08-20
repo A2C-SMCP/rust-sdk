@@ -11,6 +11,7 @@
 pub mod blob;
 pub mod computer;
 pub mod desktop;
+pub mod diagnostics;
 pub mod errors;
 pub mod governance;
 pub mod inputs;
@@ -37,6 +38,12 @@ pub use oauth::{
 };
 /// #107 S7（#114）：runtime status / 事件公开面 re-export / runtime status surface re-export。
 pub use status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
+
+/// #162：结构化 Runtime diagnostics 公开面 re-export / structured runtime diagnostics re-export。
+pub use diagnostics::{
+    DiagnosticCode, DiagnosticKey, DiagnosticOperation, DiagnosticSeverity, DiagnosticSource,
+    DiagnosticTarget, RuntimeDiagnostic,
+};
 
 /// #124：高层 governance snapshot/inventory 公开面 re-export（SDK-facing，consumer 仅经此 + `Computer`）。
 pub use governance::{

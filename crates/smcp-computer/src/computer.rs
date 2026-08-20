@@ -68,6 +68,11 @@ use smcp::utils::env_truthy;
 use smcp::A2CSkillRef;
 
 use crate::errors::{ComputerError, ComputerResult};
+// #162：结构化 Runtime diagnostics 词汇（记录 / 清除接线全走 `RuntimeStatus` 的键控集）。
+use crate::diagnostics::{
+    classify_recovery, DiagnosticCode, DiagnosticOperation, DiagnosticSeverity, DiagnosticSource,
+    DiagnosticTarget, RuntimeDiagnostic,
+};
 use crate::inputs::handler::InputHandler;
 use crate::inputs::load_env_file;
 use crate::inputs::model::InputValue;
@@ -1437,6 +1442,10 @@ impl<S: Session> Computer<S> {
         };
 
         // 阶段一：重挂 marketplace skills（持 `skill_registry` 写锁；stage 含 git await，boot 期无并发故安全）。
+        // #162：代际重算——开场清上一轮 Governance 源诊断，本轮结果随后重记：上轮失败的 marketplace 本轮
+        // 恢复即自然清除（运行期恢复路径，boot 与运行期统一语义）。
+        self.status
+            .clear_diagnostics_where(|d| d.source == DiagnosticSource::Governance);
         let mut report = {
             let mut reg = self.skill_registry.write().await;
             crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, env, declared)
@@ -1454,6 +1463,28 @@ impl<S: Session> Computer<S> {
             &mut report,
         )
         .await;
+
+        // #162：治理降级进结构化诊断（Degraded 级 + Governance 源；marketplace 键 / plugin 键）。
+        for mp in &report.failed_marketplaces {
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::MarketplaceSyncFailed,
+                DiagnosticSeverity::Degraded,
+                DiagnosticSource::Governance,
+                DiagnosticOperation::MarketplaceSync,
+                DiagnosticTarget::Marketplace(mp.clone()),
+                format!("marketplace source failed to sync: {mp}"),
+            ));
+        }
+        for pid in &report.failed_rematerialize {
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::LedgerRematerializeFailed,
+                DiagnosticSeverity::Degraded,
+                DiagnosticSource::Governance,
+                DiagnosticOperation::LedgerRematerialize,
+                DiagnosticTarget::Plugin(pid.clone()),
+                format!("ledger rematerialize failed for enabled plugin: {pid}"),
+            ));
+        }
 
         // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
         // 严格镜像 Python `computer.py::reconcile_governance` remount 臂（PR #119 / #100 设计 Y）：
@@ -1527,6 +1558,17 @@ impl<S: Session> Computer<S> {
                     Err(e) => {
                         warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id, error = %e,
                             "reconcile_governance: remount register_server failed (non-blocking)");
+                        // #162：重挂失败进结构化诊断（Degraded + Bundle 键——start 失败由
+                        // `start_mcp_client` 自身记录，此处只记 register 臂；`McpHookError` 非
+                        // `ComputerError`，恢复属性走缺省 false）。
+                        self.status.record_diagnostic(RuntimeDiagnostic::new(
+                            DiagnosticCode::BundledRemountFailed,
+                            DiagnosticSeverity::Degraded,
+                            DiagnosticSource::Governance,
+                            DiagnosticOperation::RemountBundledServer,
+                            DiagnosticTarget::Bundle(bid.clone()),
+                            format!("reconcile remount register failed: {e}"),
+                        ));
                     }
                 }
             }
@@ -1535,6 +1577,12 @@ impl<S: Session> Computer<S> {
         // 派生注册表已变更才标脏（交去抖器 emit `server:update_skills`；boot 期 socketio 未连 → no-op）。
         if !report.restored_skills.is_empty() {
             self.mark_skills_dirty();
+        }
+        // #162：窄域恢复迁移——上一轮降级（`Degraded`）且本轮诊断集已无 Degraded 级条目（开场代际清除 +
+        // 本轮无新失败）→ 恢复 `Started`。**仅出 Degraded**：运行期治理失败只进诊断集、绝不从
+        // `Connected`/`JoinedOffice` 迁入 Degraded（运行期降级由诊断集承载，lifecycle 状态机不被打穿）。
+        if self.status.state() == LifecycleState::Degraded && !self.status.has_degraded() {
+            self.status.transition(LifecycleState::Started);
         }
         report
     }
@@ -1851,7 +1899,10 @@ impl<S: Session> Computer<S> {
         self.mcp_operations_open
             .store(false, std::sync::atomic::Ordering::Release);
         // #114 S7：进入 Starting（加载 config / 解析本地状态 / 启动 MCP 资源，契约 §3）。
+        // #162：boot 代际开启——清上一轮 Boot 源残留诊断（重启语义，等价升级自 `set_last_error(None)`）。
         self.status.transition(LifecycleState::Starting);
+        self.status
+            .clear_diagnostics_where(|d| d.source == DiagnosticSource::Boot);
 
         // 创建MCP服务器管理器 / Create MCP server manager（#152：经 new_manager 应用 client factory override 接缝）
         let manager = self.new_manager().await;
@@ -1870,22 +1921,36 @@ impl<S: Session> Computer<S> {
 
         // 初始化管理器 / Initialize manager
         // #114 S7：boot 的硬失败点之一（另一为上方 #144 render 阶段的 InputResolution）。失败 → 落 `Error` 状态 +
-        // 公开诊断（不含 secret，仅错误类别串），使观测面反映「boot 失败」而非卡在 `Starting`（契约 §3 `error` 语义）。
-        // 诊断用 `error_code` + 简述，避免透传可能含渲染细节的 Display 全文。
+        // 结构化诊断（#162：Error 级 + Boot 源；不含 secret，仅错误类别码），使观测面反映「boot 失败」而非卡在
+        // `Starting`（契约 §3 `error` 语义）。诊断用 `error_code` + 简述，避免透传可能含渲染细节的 Display 全文。
         if let Err(e) = manager.initialize(Vec::new()).await {
-            self.status.set_last_error(Some(format!(
-                "boot failed to initialize MCP manager (code {})",
-                e.error_code()
-            )));
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::BootManagerInitFailed,
+                DiagnosticSeverity::Error,
+                DiagnosticSource::Boot,
+                DiagnosticOperation::InitializeManager,
+                DiagnosticTarget::Runtime,
+                format!(
+                    "boot failed to initialize MCP manager (code {})",
+                    e.error_code()
+                ),
+            ));
             self.status.transition(LifecycleState::Error);
             return Err(e);
         }
         for raw in raw_servers {
             if let Err(e) = manager.register_raw_server(raw).await {
-                self.status.set_last_error(Some(format!(
-                    "boot failed to register MCP declaration (code {})",
-                    e.error_code()
-                )));
+                self.status.record_diagnostic(RuntimeDiagnostic::new(
+                    DiagnosticCode::BootDeclarationRejected,
+                    DiagnosticSeverity::Error,
+                    DiagnosticSource::Boot,
+                    DiagnosticOperation::RegisterDeclaration,
+                    DiagnosticTarget::Runtime,
+                    format!(
+                        "boot failed to register MCP declaration (code {})",
+                        e.error_code()
+                    ),
+                ));
                 self.status.transition(LifecycleState::Error);
                 return Err(e);
             }
@@ -1937,6 +2002,15 @@ impl<S: Session> Computer<S> {
             Err(e) => {
                 error!(error = %e, cache_root = %cache_root.display(),
                     "toolspool blob store init failed (non-blocking); blob disabled this session");
+                // #162：非阻断失败进结构化诊断（Degraded：本会话 blob 禁用 = 部分能力受限）。
+                self.status.record_diagnostic(RuntimeDiagnostic::new(
+                    DiagnosticCode::BlobStoreInitFailed,
+                    DiagnosticSeverity::Degraded,
+                    DiagnosticSource::Boot,
+                    DiagnosticOperation::InitBlobStore,
+                    DiagnosticTarget::Runtime,
+                    format!("toolspool blob store init failed; blob disabled this session: {e}"),
+                ));
             }
         }
 
@@ -1983,20 +2057,15 @@ impl<S: Session> Computer<S> {
         self.start_skill_watcher().await;
 
         // #114 S7：本地 runtime 已初始化 → 能力投影首次就绪，bump capability revision（能力变化计数，§12 R2）。
-        // marketplace 源部分失败 → Degraded + 公开诊断（契约 §3/§5.2「其它 sources 可继续」），否则 Started。
-        // boot 成功完成 → 清除上一轮可能残留的 boot `last_error`（重启语义）。
+        // #162：marketplace 源部分失败 → Degraded + 结构化诊断（契约 §3/§5.2「其它 sources 可继续」），否则
+        // Started。降级判定 = 诊断集存在 Degraded 级条目（含 marketplace 同步 / 账本重物化 / blob 初始化失败，
+        // 均由上方各接线点经 `reconcile_governance` / blob 块写入 Boot/Governance 源）——上一轮残留已在
+        // boot 开场代际清除，此处无须再显式清。
         self.status.bump_capability();
-        self.status.set_last_error(None);
-        if recovery.failed_marketplaces.is_empty() {
-            self.status.set_degraded_reason(None);
-            self.status.transition(LifecycleState::Started);
-        } else {
-            self.status.set_degraded_reason(Some(format!(
-                "{} marketplace source(s) failed to sync: {}",
-                recovery.failed_marketplaces.len(),
-                recovery.failed_marketplaces.join(", ")
-            )));
+        if self.status.has_degraded() {
             self.status.transition(LifecycleState::Degraded);
+        } else {
+            self.status.transition(LifecycleState::Started);
         }
 
         self.mcp_operations_open
@@ -2450,6 +2519,9 @@ impl<S: Session> Computer<S> {
         // 仅**真摘到**才是工具投影变化 → 才 bump capability + 通知（§12 R2；no-op 不是能力变化）。
         if removed {
             self.status.bump_capability();
+            // #162：server 移除 → 其诊断一并清除（否则移除的 server 诊断永久滞留——「消亡也是恢复」）。
+            self.status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone()));
             let _ = self.emit_update_config().await;
         }
 
@@ -3275,6 +3347,17 @@ impl<S: Session> Computer<S> {
         self.status.capability_revision()
     }
 
+    /// 当前诊断集 revision（#162；单调，事件 [`ComputerEvent::DiagnosticsChanged`] 携同值）/
+    /// current diagnostics revision。
+    ///
+    /// 诊断本体经 [`status`](Self::status) 快照的 `diagnostics` 字段读取——**只读透传**：
+    /// 记录 / 清除由生命周期（boot / reconcile / MCP 起停 / 移除）驱动，不公开主动清除
+    /// （防消费方抹错正在生效的诊断）。
+    #[must_use]
+    pub fn diagnostics_revision(&self) -> u64 {
+        self.status.diagnostics_revision()
+    }
+
     /// 当前生命周期状态 / current lifecycle state。
     #[must_use]
     pub fn lifecycle_state(&self) -> LifecycleState {
@@ -3631,6 +3714,29 @@ impl<S: Session> Computer<S> {
         if matches!(result, Ok(true)) {
             self.on_capability_changed().await;
         }
+        // #162：任一 start 成功（真启动或幂等已运行）= 该 bundle 恢复 → 清其全部诊断；
+        // 真实操作失败（manager 侧错，非前置 InvalidState 误用）→ 记 Degraded 结构化诊断
+        // （部分能力受限；retryable/transient 由启发式补充）。
+        match &result {
+            Ok(_) => self
+                .status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone())),
+            Err(e) if !matches!(e, ComputerError::InvalidState(_)) => {
+                let (retryable, transient) = classify_recovery(e);
+                self.status.record_diagnostic(
+                    RuntimeDiagnostic::new(
+                        DiagnosticCode::McpStartFailed,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Mcp,
+                        DiagnosticOperation::StartClient,
+                        DiagnosticTarget::Bundle(id.clone()),
+                        format!("{e}"),
+                    )
+                    .with_recovery(retryable, transient),
+                );
+            }
+            Err(_) => {}
+        }
         result.map(|_| ())
     }
 
@@ -3657,6 +3763,33 @@ impl<S: Session> Computer<S> {
         // 只有**真停了**才改变工具投影 → 仅此时同步能力（未停到不是能力变化，不广播）。
         if matches!(result, Ok(true)) {
             self.on_capability_changed().await;
+        }
+        // #162：停成功（真停或幂等无活跃）→ 清该 bundle 的 McpStopFailed（「停止问题」已解决——含
+        // 对侧已代停的自愈场景）；真停到还额外清全部（server 有意消停，残留 start/restart 失败均失效）。
+        // 真实操作失败 → 记 McpStopFailed（Degraded：能力仍在、到不了 desired 态）。
+        match &result {
+            Ok(true) => self
+                .status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone())),
+            Ok(false) => self.status.clear_diagnostics_where(|d| {
+                d.target == DiagnosticTarget::Bundle(id.clone())
+                    && d.code == DiagnosticCode::McpStopFailed
+            }),
+            Err(e) if !matches!(e, ComputerError::InvalidState(_)) => {
+                let (retryable, transient) = classify_recovery(e);
+                self.status.record_diagnostic(
+                    RuntimeDiagnostic::new(
+                        DiagnosticCode::McpStopFailed,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Mcp,
+                        DiagnosticOperation::StopClient,
+                        DiagnosticTarget::Bundle(id.clone()),
+                        format!("{e}"),
+                    )
+                    .with_recovery(retryable, transient),
+                );
+            }
+            Err(_) => {}
         }
         result
     }
@@ -3703,6 +3836,27 @@ impl<S: Session> Computer<S> {
         };
         if capability_changed {
             self.on_capability_changed().await;
+        }
+        // #162：restart 成功 = 该 bundle 恢复 → 清其全部诊断；失败 → 记 McpRestartFailed（Degraded）。
+        match &result {
+            Ok(()) => self
+                .status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone())),
+            Err(e) if !matches!(e, ComputerError::InvalidState(_)) => {
+                let (retryable, transient) = classify_recovery(e);
+                self.status.record_diagnostic(
+                    RuntimeDiagnostic::new(
+                        DiagnosticCode::McpRestartFailed,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Mcp,
+                        DiagnosticOperation::RestartClient,
+                        DiagnosticTarget::Bundle(id.clone()),
+                        format!("{e}"),
+                    )
+                    .with_recovery(retryable, transient),
+                );
+            }
+            Err(_) => {}
         }
         result
     }
@@ -4536,6 +4690,49 @@ mod tests {
         assert_eq!(snap.capability_revision, 0);
         assert!(snap.last_error.is_none());
         assert!(snap.degraded_reason.is_none());
+    }
+
+    /// #162：boot 代际清除——Boot 源残留诊断在**下一次** boot 开场被清（重启语义从裸字符串
+    /// `set_last_error(None)` 等价升级为按键控源清除）。
+    #[tokio::test]
+    async fn boot_up_clears_stale_boot_diagnostics() {
+        use crate::diagnostics::{
+            DiagnosticCode, DiagnosticOperation, DiagnosticSeverity, DiagnosticSource,
+            DiagnosticTarget, RuntimeDiagnostic,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_config_dir(tmp.path().join("config"))
+            .with_config_env(EnvMap::new());
+        // 预埋一条上一轮的 Boot 源诊断（模拟 boot 失败后的重试场景）。
+        computer.status.record_diagnostic(RuntimeDiagnostic::new(
+            DiagnosticCode::BootManagerInitFailed,
+            DiagnosticSeverity::Error,
+            DiagnosticSource::Boot,
+            DiagnosticOperation::InitializeManager,
+            DiagnosticTarget::Runtime,
+            "previous boot failed",
+        ));
+        assert_eq!(
+            computer.status().await.last_error.as_deref(),
+            Some("previous boot failed")
+        );
+
+        computer.boot_up().await.unwrap();
+
+        let snap = computer.status().await;
+        assert!(
+            snap.diagnostics
+                .iter()
+                .all(|d| d.source != DiagnosticSource::Boot),
+            "boot 开场清 Boot 源残留：{:?}",
+            snap.diagnostics
+        );
+        assert!(snap.last_error.is_none(), "Error 级残留投影随之消失");
+        assert_eq!(snap.lifecycle, LifecycleState::Started);
     }
 
     /// #147/#139：`Clone` / `clone_for_handlers` MUST 保留 frozen embed 声明快照——否则克隆出的 Computer 上

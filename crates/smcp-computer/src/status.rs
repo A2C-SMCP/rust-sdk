@@ -26,10 +26,11 @@
 //! shutdown 时发的那一条终态 [`ComputerEvent::LifecycleChanged`]`(Shutdown)` 外，不再发出任何 stale 事件，
 //! 后续 revision bump 亦降为 no-op（既有计数不回退，保单调）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::RwLock as StdRwLock;
 
+use crate::diagnostics::{DiagnosticKey, DiagnosticSeverity, RuntimeDiagnostic};
 use crate::mcp_clients::BundleId;
 use crate::oauth::OAuthStatus;
 use serde::{Deserialize, Serialize};
@@ -151,10 +152,21 @@ pub struct ComputerStatusSnapshot {
     pub tools: usize,
     /// 当前活跃 SKILL 数（排除孤儿）/ active SKILL count。
     pub skills: usize,
-    /// 最近一次公开错误（不含 secret）/ last public error (secret-free)。
+    /// 最近一次公开错误（**投影**，不含 secret）：`severity == Error` 条目中 `occurred_at` 最大者的
+    /// message（#162 从裸存储升级为派生，兼容保留）/ last public error (derived projection, secret-free)。
     pub last_error: Option<String>,
-    /// degraded 诊断原因（`lifecycle == Degraded` 时通常非空）/ degraded reason。
+    /// degraded 诊断原因（**投影**）：`severity == Degraded` 条目中 `occurred_at` 最大者的 message
+    /// （`lifecycle == Degraded` 时通常非空，非硬不变量）/ degraded reason (derived projection)。
     pub degraded_reason: Option<String>,
+    /// 诊断集单调 revision（与 config/capability 分离——「健康度」不进内容 revision，#128 先例）/
+    /// monotonic diagnostics revision.
+    #[serde(default)]
+    pub diagnostics_revision: u64,
+    /// 当前活跃诊断（BTreeMap 键序 = 确定性稳定序）/ active diagnostics (stable key order)。
+    ///
+    /// 空集不序列化（#128 兼容姿势：干净快照字节不变）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 /// runtime 观测事件（[`Computer::subscribe_events`](crate::computer::Computer::subscribe_events) 广播）/ runtime event。
@@ -185,23 +197,28 @@ pub enum ComputerEvent {
         /// Complete, non-secret status after the transition.
         status: OAuthStatus,
     },
+    /// 诊断集变化（新增 / 替代 / 清除，#162）/ diagnostics set changed.
+    ///
+    /// **轻量增量**：仅携单调 revision；订阅方（含 `Lagged` 后）经
+    /// [`Computer::status`](crate::computer::Computer::status) 拉全量快照重建——事件丢失安全
+    /// （同 [`ComputerEvent::OAuthStatusChanged`] 的重同步姿势）。
+    DiagnosticsChanged {
+        /// 新 revision / the new revision.
+        revision: u64,
+    },
 }
 
 // ===========================================================================
 // RuntimeStatus 持有者 / holder
 // ===========================================================================
 
-/// 公开诊断（last error / degraded reason）/ public diagnostics。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Diagnostics {
-    last_error: Option<String>,
-    degraded_reason: Option<String>,
-}
+/// 公开诊断集（键控：同键替代、异键并存，#162）/ the keyed diagnostics set。
+type DiagnosticsMap = BTreeMap<DiagnosticKey, RuntimeDiagnostic>;
 
 /// runtime 观测状态持有者（`Computer` 持 `Arc<RuntimeStatus>`，跨 clone 共享同一视图）/ runtime status holder。
 ///
-/// 锁纪律：状态 / revision / shutdown 闸门为原子无锁存取（cheap，`status()` 不阻塞）；诊断字符串走
-/// [`std::sync::RwLock`]（临界区仅 clone 短串、**不跨 await**）。事件用 [`tokio::sync::broadcast`]。
+/// 锁纪律：状态 / revision / shutdown 闸门为原子无锁存取（cheap，`status()` 不阻塞）；诊断集走
+/// [`std::sync::RwLock`]（临界区仅 clone / retain，**不跨 await**）。事件用 [`tokio::sync::broadcast`]。
 pub struct RuntimeStatus {
     /// 生命周期状态（[`LifecycleState`] as u8）/ lifecycle state。
     state: AtomicU8,
@@ -209,10 +226,12 @@ pub struct RuntimeStatus {
     config_revision: AtomicU64,
     /// capability revision 单调计数 / monotonic capability revision。
     capability_revision: AtomicU64,
+    /// diagnostics revision 单调计数（第三轴，健康度 ⊥ 内容，#162/#128）/ monotonic diagnostics revision。
+    diagnostics_revision: AtomicU64,
     /// shutdown 闸门：`true` 后事件闸断、bump 降 no-op（§4.7）/ shutdown gate。
     shutdown: AtomicBool,
-    /// 公开诊断 / diagnostics。
-    diagnostics: StdRwLock<Diagnostics>,
+    /// 公开诊断集（键控）/ the keyed diagnostics set。
+    diagnostics: StdRwLock<DiagnosticsMap>,
     /// Last published OAuth status per bundle, used to suppress duplicate events.
     oauth_statuses: StdRwLock<HashMap<BundleId, OAuthStatus>>,
     /// 事件广播发送端（订阅方经 `subscribe` 取 Receiver）/ event broadcast sender。
@@ -227,8 +246,9 @@ impl RuntimeStatus {
             state: AtomicU8::new(LifecycleState::Created as u8),
             config_revision: AtomicU64::new(0),
             capability_revision: AtomicU64::new(0),
+            diagnostics_revision: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
-            diagnostics: StdRwLock::new(Diagnostics::default()),
+            diagnostics: StdRwLock::new(BTreeMap::new()),
             oauth_statuses: StdRwLock::new(HashMap::new()),
             events,
         }
@@ -340,20 +360,71 @@ impl RuntimeStatus {
             .cloned()
     }
 
-    /// 记 / 清最近公开错误（`None` 清除）/ set-or-clear the last public error。
-    pub fn set_last_error(&self, err: Option<String>) {
-        self.diagnostics
-            .write()
-            .expect("diagnostics poisoned")
-            .last_error = err;
+    /// 诊断集变更的统一底座：`f` 在写锁内变更 map 并**如实返回是否真变**；真变才 bump
+    /// [`diagnostics_revision`](Self::diagnostics_revision) 并广播 [`ComputerEvent::DiagnosticsChanged`]。
+    /// shutdown 先行闸断（§4.7：描述的 runtime 已不存在 → map 冻结、不 bump、不发事件）。
+    fn apply_diagnostics_change<F>(&self, f: F)
+    where
+        F: FnOnce(&mut DiagnosticsMap) -> bool,
+    {
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let changed = {
+            let mut map = self.diagnostics.write().expect("diagnostics poisoned");
+            f(&mut map)
+        };
+        if changed {
+            let new = self.diagnostics_revision.fetch_add(1, Ordering::AcqRel) + 1;
+            self.emit(ComputerEvent::DiagnosticsChanged { revision: new });
+        }
     }
 
-    /// 记 / 清 degraded 原因（`None` 清除）/ set-or-clear the degraded reason。
-    pub fn set_degraded_reason(&self, reason: Option<String>) {
+    /// 记录一条诊断（#162）：同键（`code`+`target`）后写**替代**先写、异键**并存**；全等
+    /// （除 `occurred_at`）重复记录去重（不 bump——防双接线风暴，对齐 `update_oauth_status` 先例）。
+    /// shutdown 后整段 no-op（map 冻结）。
+    pub fn record_diagnostic(&self, diag: RuntimeDiagnostic) {
+        let key = DiagnosticKey {
+            code: diag.code,
+            target: diag.target.clone(),
+        };
+        self.apply_diagnostics_change(|map| match map.get(&key) {
+            Some(existing) if existing.same_problem(&diag) => false,
+            _ => {
+                map.insert(key, diag);
+                true
+            }
+        });
+    }
+
+    /// 按谓词清除诊断（恢复路径专用，#162）：仅实际移除 ≥1 条才 bump + 广播（空清除不计数，
+    /// §12 R2「真变化才计数」同款）。典型用法：boot 开场清 `source == Boot`、reconcile 开场清
+    /// `source == Governance`、MCP 恢复 / 移除按 `target` 精确清。
+    pub fn clear_diagnostics_where(&self, pred: impl Fn(&RuntimeDiagnostic) -> bool) {
+        self.apply_diagnostics_change(|map| {
+            let before = map.len();
+            map.retain(|_, d| !pred(d));
+            map.len() != before
+        });
+    }
+
+    /// 是否存在 `severity == Degraded` 条目（boot 收尾 / reconcile 窄域恢复的 lifecycle 判定）。
+    pub fn has_degraded(&self) -> bool {
         self.diagnostics
-            .write()
+            .read()
             .expect("diagnostics poisoned")
-            .degraded_reason = reason;
+            .values()
+            .any(|d| d.severity == DiagnosticSeverity::Degraded)
+    }
+
+    /// 当前诊断集（BTreeMap 键序 = 稳定序）/ current diagnostics (stable key order).
+    pub fn diagnostics(&self) -> Vec<RuntimeDiagnostic> {
+        self.diagnostics
+            .read()
+            .expect("diagnostics poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// 当前生命周期状态 / current lifecycle state。
@@ -371,12 +442,20 @@ impl RuntimeStatus {
         self.capability_revision.load(Ordering::Acquire)
     }
 
+    /// 当前 diagnostics revision / current diagnostics revision。
+    pub fn diagnostics_revision(&self) -> u64 {
+        self.diagnostics_revision.load(Ordering::Acquire)
+    }
+
     /// 是否已 shutdown / whether shutdown has been entered。
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
 
     /// 用给定汇总计数组装完整快照（状态 / revision / 诊断取自本 holder）/ assemble a full snapshot。
+    ///
+    /// `last_error` / `degraded_reason` 为**派生投影**（#162）：同一把读锁内按 severity 过滤、取
+    /// `occurred_at` 最大条目的 message（平手按键序，确定性）——空集 → 双 `None`。
     pub fn snapshot(
         &self,
         mcp_servers: usize,
@@ -384,11 +463,20 @@ impl RuntimeStatus {
         tools: usize,
         skills: usize,
     ) -> ComputerStatusSnapshot {
-        let diag = self
-            .diagnostics
-            .read()
-            .expect("diagnostics poisoned")
-            .clone();
+        let (last_error, degraded_reason, diagnostics) = {
+            let map = self.diagnostics.read().expect("diagnostics poisoned");
+            let latest = |severity: DiagnosticSeverity| {
+                map.iter()
+                    .filter(|(_, d)| d.severity == severity)
+                    .max_by(|(k1, d1), (k2, d2)| (d1.occurred_at, *k1).cmp(&(d2.occurred_at, *k2)))
+                    .map(|(_, d)| d.message.clone())
+            };
+            (
+                latest(DiagnosticSeverity::Error),
+                latest(DiagnosticSeverity::Degraded),
+                map.values().cloned().collect(),
+            )
+        };
         ComputerStatusSnapshot {
             lifecycle: self.state(),
             config_revision: self.config_revision(),
@@ -397,8 +485,10 @@ impl RuntimeStatus {
             active_mcp_servers,
             tools,
             skills,
-            last_error: diag.last_error,
-            degraded_reason: diag.degraded_reason,
+            last_error,
+            degraded_reason,
+            diagnostics_revision: self.diagnostics_revision(),
+            diagnostics,
         }
     }
 }
@@ -569,12 +659,208 @@ mod tests {
         ));
     }
 
+    // ── #162：结构化 diagnostics（键控集 + 第三 revision 轴 + 事件 + 投影）─────────
+
+    use crate::diagnostics::{
+        DiagnosticCode, DiagnosticOperation, DiagnosticSeverity, DiagnosticSource,
+        DiagnosticTarget, RuntimeDiagnostic,
+    };
+    use chrono::{TimeZone, Utc};
+
+    /// 测试用构造器：显式 occurred_at（绕过 `new` 的 `Utc::now()`，保推导测试确定性）。
+    fn diag_at(
+        code: DiagnosticCode,
+        severity: DiagnosticSeverity,
+        target: DiagnosticTarget,
+        message: &str,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> RuntimeDiagnostic {
+        RuntimeDiagnostic {
+            code,
+            severity,
+            source: DiagnosticSource::Mcp,
+            operation: DiagnosticOperation::StartClient,
+            target,
+            message: message.to_string(),
+            occurred_at,
+            retryable: false,
+            transient: false,
+        }
+    }
+
+    fn bundle(id: &str) -> DiagnosticTarget {
+        DiagnosticTarget::Bundle(BundleId::try_from(id).unwrap())
+    }
+
     #[test]
-    fn diagnostics_set_and_clear_flow_into_snapshot() {
+    fn diagnostics_revision_independent_and_monotonic() {
+        // 验收③：diagnostics revision 与 config/capability 分离（#128「健康度不进内容 revision」）且单调。
+        let s = RuntimeStatus::new();
+        assert_eq!(s.diagnostics_revision(), 0);
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "x",
+            Utc::now(),
+        ));
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStopFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "y",
+            Utc::now(),
+        ));
+        assert_eq!(s.diagnostics_revision(), 2, "每次真变化 +1");
+        assert_eq!(s.config_revision(), 0, "不动 config revision");
+        assert_eq!(s.capability_revision(), 0, "不动 capability revision");
+    }
+
+    #[tokio::test]
+    async fn record_diagnostic_inserts_bumps_and_emits() {
+        let s = RuntimeStatus::new();
+        let mut rx = s.subscribe();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("srv"),
+            "spawn failed",
+            Utc::now(),
+        ));
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            ComputerEvent::DiagnosticsChanged { revision: 1 }
+        );
+        let snap = s.snapshot(0, 0, 0, 0);
+        assert_eq!(snap.diagnostics.len(), 1);
+        assert_eq!(snap.diagnostics[0].code, DiagnosticCode::McpStartFailed);
+        assert_eq!(snap.diagnostics_revision, 1);
+    }
+
+    #[test]
+    fn record_supersedes_same_key_and_coexists_across_keys() {
+        // 验收④：同键（code+target）覆盖（supersede），异键并存——单项问题不覆盖其他并存问题。
+        let s = RuntimeStatus::new();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "first failure",
+            Utc::now(),
+        ));
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "second failure",
+            Utc::now(),
+        ));
+        // 异键并存：另一 bundle + marketplace 级。
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("b"),
+            "other server",
+            Utc::now(),
+        ));
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::MarketplaceSyncFailed,
+            DiagnosticSeverity::Degraded,
+            DiagnosticTarget::Marketplace("acme".into()),
+            "unreachable",
+            Utc::now(),
+        ));
+        let diags = s.diagnostics();
+        assert_eq!(diags.len(), 3, "1 同键替代 + 2 异键并存");
+        assert_eq!(
+            diags
+                .iter()
+                .find(|d| d.target == bundle("a"))
+                .unwrap()
+                .message,
+            "second failure",
+            "同键后写替代先写"
+        );
+    }
+
+    #[test]
+    fn record_equal_diagnostic_deduped() {
+        // 全等（除 occurred_at）重复记录 → 不 bump、不发事件（防双接线风暴，对齐 oauth 去重先例）。
+        let s = RuntimeStatus::new();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "same problem",
+            Utc::now(),
+        ));
+        let rev = s.diagnostics_revision();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "same problem",
+            Utc::now() + chrono::Duration::seconds(5),
+        ));
+        assert_eq!(s.diagnostics_revision(), rev, "问题未变 → 不 bump");
+        assert_eq!(s.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn clear_where_removes_only_matching_and_noop_clear_does_not_bump() {
+        let s = RuntimeStatus::new();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "x",
+            Utc::now(),
+        ));
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::MarketplaceSyncFailed,
+            DiagnosticSeverity::Degraded,
+            DiagnosticTarget::Marketplace("mp".into()),
+            "y",
+            Utc::now(),
+        ));
+        let rev = s.diagnostics_revision();
+        // 谓词精确清除：只清 Boot 源（无命中 → no-op 不 bump）。
+        s.clear_diagnostics_where(|d| d.source == DiagnosticSource::Boot);
+        assert_eq!(s.diagnostics_revision(), rev, "空清除不 bump");
+        // 按 target 清除。
+        s.clear_diagnostics_where(|d| d.target == bundle("a"));
+        assert_eq!(s.diagnostics_revision(), rev + 1);
+        assert_eq!(s.diagnostics().len(), 1, "marketplace 级条目不受影响");
+    }
+
+    #[test]
+    fn last_error_and_degraded_reason_derived_from_map() {
+        // 投影：按 severity 过滤取 occurred_at 最大条目；空 map → 双 None。
         let s = RuntimeStatus::new();
         s.transition(LifecycleState::Degraded);
-        s.set_degraded_reason(Some("marketplace X unreachable".into()));
-        s.set_last_error(Some("boot recovery partial".into()));
+        let t0 = Utc.with_ymd_and_hms(2026, 8, 20, 10, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 8, 20, 11, 0, 0).unwrap();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::BootManagerInitFailed,
+            DiagnosticSeverity::Error,
+            DiagnosticTarget::Runtime,
+            "boot failed earlier",
+            t0,
+        ));
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "marketplace X unreachable",
+            t1,
+        ));
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Error,
+            bundle("b"),
+            "boot recovery partial",
+            t1,
+        ));
         let snap = s.snapshot(3, 1, 7, 2);
         assert_eq!(snap.lifecycle, LifecycleState::Degraded);
         assert_eq!(snap.mcp_servers, 3);
@@ -582,15 +868,96 @@ mod tests {
         assert_eq!(snap.tools, 7);
         assert_eq!(snap.skills, 2);
         assert_eq!(
+            snap.last_error.as_deref(),
+            Some("boot recovery partial"),
+            "Error 级取最近（t1 > t0）"
+        );
+        assert_eq!(
             snap.degraded_reason.as_deref(),
             Some("marketplace X unreachable")
         );
-        assert_eq!(snap.last_error.as_deref(), Some("boot recovery partial"));
-        // 清除 → 快照 None。
-        s.set_degraded_reason(None);
-        s.set_last_error(None);
+        // 清空 → 双 None（旧 set/clear 流入快照语义的等价覆盖）。
+        s.clear_diagnostics_where(|_| true);
         let snap2 = s.snapshot(0, 0, 0, 0);
         assert!(snap2.degraded_reason.is_none());
         assert!(snap2.last_error.is_none());
+        assert!(snap2.diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_frozen_after_shutdown() {
+        // §4.7：shutdown 后 record/clear 全 no-op——map 冻结、revision 不增、无事件；快照仍可读（终态审计）。
+        let s = RuntimeStatus::new();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "x",
+            Utc::now(),
+        ));
+        let rev = s.diagnostics_revision();
+        s.enter_shutdown();
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("b"),
+            "after shutdown",
+            Utc::now(),
+        ));
+        s.clear_diagnostics_where(|_| true);
+        assert_eq!(s.diagnostics_revision(), rev, "shutdown 后不 bump");
+        assert_eq!(s.diagnostics().len(), 1, "map 冻结");
+        let snap = s.snapshot(0, 0, 0, 0);
+        assert_eq!(snap.diagnostics.len(), 1, "快照仍可读（终态审计）");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_event_lag_resyncs_from_snapshot() {
+        // 验收⑥：事件丢失（Lagged）→ 经 snapshot() 重建（诊断集 + revision）。
+        let s = RuntimeStatus::new();
+        let mut rx = s.subscribe();
+        for i in 0..=EVENT_CHANNEL_CAPACITY + 1 {
+            s.record_diagnostic(diag_at(
+                DiagnosticCode::McpStartFailed,
+                DiagnosticSeverity::Degraded,
+                bundle("a"),
+                &format!("failure round {i}"),
+                Utc::now(),
+            ));
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        let snap = s.snapshot(0, 0, 0, 0);
+        assert_eq!(snap.diagnostics.len(), 1, "同键替代 → 仍单条最新");
+        assert_eq!(
+            snap.diagnostics[0].message,
+            format!("failure round {}", EVENT_CHANNEL_CAPACITY + 1)
+        );
+        assert_eq!(
+            snap.diagnostics_revision as usize,
+            EVENT_CHANNEL_CAPACITY + 2
+        );
+    }
+
+    #[test]
+    fn empty_diagnostics_omitted_from_serde() {
+        // #128 兼容姿势：空诊断集不序列化 `diagnostics` 键（干净快照字节不变）。
+        let s = RuntimeStatus::new();
+        let snap = s.snapshot(0, 0, 0, 0);
+        let v = serde_json::to_value(&snap).unwrap();
+        assert!(v.get("diagnostics").is_none());
+        assert_eq!(v["diagnostics_revision"], serde_json::json!(0));
+        // 有诊断 → 键出现。
+        s.record_diagnostic(diag_at(
+            DiagnosticCode::McpStartFailed,
+            DiagnosticSeverity::Degraded,
+            bundle("a"),
+            "x",
+            Utc::now(),
+        ));
+        let v2 = serde_json::to_value(s.snapshot(0, 0, 0, 0)).unwrap();
+        assert!(v2.get("diagnostics").is_some());
     }
 }
