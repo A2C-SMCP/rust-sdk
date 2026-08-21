@@ -441,6 +441,7 @@ async fn runtime_mutation_bumps_config_and_capability_independently_and_emits_ev
             ComputerEvent::CapabilityRevisionBumped { .. } => saw_cap = true,
             ComputerEvent::LifecycleChanged { .. } => {}
             ComputerEvent::OAuthStatusChanged { .. } => {}
+            ComputerEvent::DiagnosticsChanged { .. } => {}
         }
     }
     assert!(saw_config, "config mutate 必广播 ConfigRevisionBumped");

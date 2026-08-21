@@ -437,6 +437,20 @@ impl MCPClientProtocol for StdioMCPClient {
         let guard = self.get_service().await?;
         let service = guard.as_ref().unwrap();
 
+        // 能力校验：未声明 `resources` → CapabilityNotSupported（上层映射 4015）。
+        // #161：与下方 `list_resources_page` 共用同一能力门——窗口枚举聚合层（manager
+        // `list_windows_with_diagnostics`）依赖此信号区分「capability 缺失」与「成功空集」。
+        // Capability gate: no `resources` → CapabilityNotSupported (mapped to 4015 upstream).
+        let supports_resources = service
+            .peer_info()
+            .map(|info| info.capabilities.resources.is_some())
+            .unwrap_or(false);
+        if !supports_resources {
+            return Err(MCPClientError::CapabilityNotSupported(
+                "resources".to_string(),
+            ));
+        }
+
         let all_resources = service
             .list_all_resources()
             .await
