@@ -116,6 +116,16 @@ fn parse_headers_string(headers: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// 异步 Socket.IO auth provider。每次调用返回下一次 CONNECT 使用的完整 auth JSON。
+/// Async Socket.IO auth provider returning the complete auth JSON for the next CONNECT.
+///
+/// Provider 自行负责凭证获取、刷新、等待与重试；本 SDK 不为 Provider 定义失败或取消语义。
+/// The provider owns credential acquisition, refresh, waiting, and retry behavior; the SDK does
+/// not define provider failure or cancellation semantics.
+pub type SocketIoAuthProvider = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'static>> + Send + Sync,
+>;
+
 /// [`Computer::connect_socketio`] 的连接可选项 / Options for [`Computer::connect_socketio`].
 ///
 /// 用具名字段替代位置参。#86 起连接面鉴权**唯一**走 Socket.IO auth dict
@@ -124,8 +134,14 @@ fn parse_headers_string(headers: &str) -> HashMap<String, String> {
 ///
 /// Named-field options. Since #86 connection auth lives **only** in the Socket.IO auth dict
 /// (`auth_payload`); HTTP headers are routing-only.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectOptions {
+    /// 动态 Socket.IO auth provider；配置时优先于 [`auth_payload`](Self::auth_payload)，并在首次连接及
+    /// 每次自动重连的 CONNECT 前调用。
+    /// Dynamic Socket.IO auth provider. When configured, it takes precedence over
+    /// [`auth_payload`](Self::auth_payload) and is called before the initial CONNECT and every
+    /// automatic reconnect CONNECT.
+    pub auth_provider: Option<SocketIoAuthProvider>,
     /// Socket.IO CONNECT `auth` 字段负载（连接面鉴权唯一信道）；auth-agnostic，整个 JSON 由调用方决定。
     /// Socket.IO CONNECT `auth` payload (the sole connection-auth channel; caller owns the JSON).
     pub auth_payload: Option<serde_json::Value>,
@@ -140,10 +156,28 @@ pub struct ConnectOptions {
 impl Default for ConnectOptions {
     fn default() -> Self {
         Self {
+            auth_provider: None,
             auth_payload: None,
             headers: None,
             namespace: smcp::SMCP_NAMESPACE.to_string(),
         }
+    }
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field(
+                "auth_provider",
+                &self.auth_provider.as_ref().map(|_| "<provider>"),
+            )
+            .field(
+                "auth_payload",
+                &self.auth_payload.as_ref().map(|_| "<redacted>"),
+            )
+            .field("headers", &self.headers)
+            .field("namespace", &self.namespace)
+            .finish()
     }
 }
 
@@ -4181,8 +4215,10 @@ impl<S: Session> Computer<S> {
         )
         .namespace(options.namespace)
         .computer_ops(ops);
-        // #86：auth dict 负载接到 Builder（Builder 再透传到 CONNECT auth + 4900 重连）——唯一鉴权信道。
-        if let Some(payload) = options.auth_payload {
+        // #201：动态 Provider 优先；未配置时保留 #86 静态 auth dict 行为。
+        if let Some(provider) = options.auth_provider {
+            builder = builder.auth_provider(provider);
+        } else if let Some(payload) = options.auth_payload {
             builder = builder.auth_payload(payload);
         }
         if let Some(h) = parsed_headers {

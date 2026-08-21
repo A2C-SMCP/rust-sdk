@@ -580,6 +580,7 @@ impl CommandHandler {
             .connect_socketio(
                 url,
                 ConnectOptions {
+                    auth_provider: None,
                     auth_payload,
                     headers: headers.clone(),
                     namespace: namespace.to_string(),

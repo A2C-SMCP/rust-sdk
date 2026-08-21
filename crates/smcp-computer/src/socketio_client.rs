@@ -9,7 +9,7 @@
 */
 
 use crate::blob::encode_skill_handle;
-use crate::computer::ComputerHandlerOps;
+use crate::computer::{ComputerHandlerOps, SocketIoAuthProvider};
 use crate::desktop::{organize_desktop, WindowInfo};
 use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
@@ -33,7 +33,7 @@ use smcp::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tf_rust_socketio::{
-    asynchronous::{Client, ClientBuilder},
+    asynchronous::{Client, ClientBuilder, ReconnectSettings},
     Event, Payload, TransportType,
 };
 use tokio::sync::RwLock;
@@ -54,6 +54,10 @@ pub struct SmcpComputerClientBuilder {
     /// #85/#86: payload for the Socket.IO CONNECT `auth` field — the sole connection-auth channel
     /// (HTTP-header auth retired in #86). Auth-agnostic: the caller owns the field name.
     auth_payload: Option<Value>,
+    /// #201：首连与每次自动重连前调用的动态 auth provider；配置时优先于 `auth_payload`。
+    /// #201: dynamic auth provider called before the initial connection and every automatic
+    /// reconnect; takes precedence over `auth_payload` when configured.
+    auth_provider: Option<SocketIoAuthProvider>,
     namespace: Option<String>,
     headers: Option<HashMap<String, String>>,
     /// INT-03 #72：Computer 操作句柄（socketio-detached），供 blob/skill/cancel/tool_call handler 调用。
@@ -76,6 +80,7 @@ impl SmcpComputerClientBuilder {
             computer_name: computer_name.into(),
             inputs,
             auth_payload: None,
+            auth_provider: None,
             namespace: None,
             headers: None,
             computer_ops: None,
@@ -104,6 +109,21 @@ impl SmcpComputerClientBuilder {
         self
     }
 
+    /// #201：配置动态 Socket.IO auth provider。
+    /// Configure a dynamic Socket.IO auth provider.
+    ///
+    /// 同一个 Provider 会在首次连接与每次底层自动重连的 CONNECT 前调用。Provider 返回完整 auth
+    /// JSON，且配置时优先于静态 [`auth_payload`](Self::auth_payload)。Provider 调用由底层重连流程
+    /// 串行驱动，本 Builder 不增加并行刷新任务、失败回退或额外重试策略。
+    /// The same provider is called before the initial CONNECT and every automatic reconnect
+    /// CONNECT. It returns the complete auth JSON and takes precedence over static
+    /// [`auth_payload`](Self::auth_payload). Calls are serialized by the transport reconnect flow;
+    /// this builder adds no parallel refresh task, failure fallback, or retry policy.
+    pub fn auth_provider(mut self, provider: SocketIoAuthProvider) -> Self {
+        self.auth_provider = Some(provider);
+        self
+    }
+
     /// 自定义 Socket.IO 应用层 namespace；未设置时默认 [`SMCP_NAMESPACE`] (`/smcp`)。
     /// Customize the Socket.IO application-layer namespace; defaults to
     /// [`SMCP_NAMESPACE`] (`/smcp`) when not set.
@@ -128,6 +148,7 @@ impl SmcpComputerClientBuilder {
             self.computer_name,
             self.inputs,
             self.auth_payload,
+            self.auth_provider,
             namespace,
             self.headers,
             self.computer_ops,
@@ -191,6 +212,7 @@ impl SmcpComputerClient {
         computer_name: String,
         inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
         auth_payload: Option<Value>,
+        auth_provider: Option<SocketIoAuthProvider>,
         namespace: String,
         headers: Option<HashMap<String, String>>,
         computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
@@ -223,6 +245,13 @@ impl SmcpComputerClient {
             }
         }
 
+        // #201：Provider 在首连前解析一次；未配置时复用静态 payload。Provider 优先级在此统一收口，
+        // 使 Builder 直用与 Computer::connect_socketio 行为一致。
+        let initial_auth_payload = match auth_provider.as_ref() {
+            Some(provider) => Some(provider().await),
+            None => auth_payload,
+        };
+
         // 使用ClientBuilder注册事件处理器
         // Use ClientBuilder to register event handlers
         let mut builder = ClientBuilder::new(&handshake_url).namespace(namespace.clone());
@@ -248,8 +277,22 @@ impl SmcpComputerClient {
         // 供下方 `connect_and_classify` 在 4900→polling 重连时重放（否则重连退化为无 auth dict）。
         // AUTH-DICT #85: inject the Socket.IO CONNECT `auth` field on the primary builder; the original
         // is kept (clone here) and replayed by `connect_and_classify` on the 4900→polling reconnect.
-        if let Some(payload) = &auth_payload {
+        if let Some(payload) = &initial_auth_payload {
             builder = builder.auth(payload.clone());
+        }
+
+        // #201：底层在每次自动重连尝试前串行调用 on_reconnect。这里只更新 auth，不改变地址、
+        // headers、退避或最大重试策略，也不在 Provider 失败时回放旧凭证。
+        if let Some(provider) = auth_provider {
+            builder = builder.on_reconnect(move || {
+                let provider = Arc::clone(&provider);
+                async move {
+                    let mut settings = ReconnectSettings::new();
+                    settings.auth(provider().await);
+                    settings
+                }
+                .boxed()
+            });
         }
 
         // 注册事件处理器（on_any 消费并返回 builder）/ Register handlers (on_any consumes & returns builder)。
@@ -499,7 +542,7 @@ impl SmcpComputerClient {
             builder,
             &handshake_url,
             &namespace,
-            auth_payload,
+            initial_auth_payload,
             handshake_headers,
         )
         .await
