@@ -140,7 +140,8 @@ pub struct ComputerStatusSnapshot {
     pub lifecycle: LifecycleState,
     /// config revision（声明式配置内容摘要单调计数；S6 mutate 落盘时 bump）/ config revision。
     pub config_revision: u64,
-    /// capability revision（Agent-facing 能力投影单调计数；MCP 起停 / boot 时 bump）/ capability revision。
+    /// capability revision（Agent-facing 能力投影单调计数；MCP 起停 / boot / 运行期工具定义变化时 bump）/
+    /// capability revision。
     pub capability_revision: u64,
     /// 已声明 MCP server 数（desired 集）/ declared MCP server count。
     pub mcp_servers: usize,
