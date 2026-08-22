@@ -3,6 +3,7 @@ name = "smcp-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "A2C-SMCP Agent client implementation"
 repository = "https://github.com/A2C-SMCP/rust-sdk"
 keywords = ["smcp", "agent", "client", "mcp"]

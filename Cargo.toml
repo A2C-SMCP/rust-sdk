@@ -9,16 +9,29 @@ members = [
     "crates/smcp-server-hyper",
 ]
 
+# MSRV 兼容：工具链低于声明的 rust-version 时，解析阶段回落到兼容版本的依赖
+# （Cargo ≥ 1.84 支持；旧工具链因此得到清晰提示而非晦涩的 manifest 解析错误）。
+# Fall back to rust-version-compatible deps on older toolchains (Cargo ≥ 1.84),
+# so they get a clear MSRV message instead of a cryptic manifest parse error.
+[resolver]
+incompatible-rust-versions = "fallback"
+
 [workspace.package]
 edition = "2021"
 license = "MIT"
 version = "0.3.1"
+# MSRV 下限由依赖决定：clap_lex 1.1.0 / engineioxide-core 0.2.0 已采用 edition 2024
+# 并声明 rust-version ≥ 1.85/1.86，cargo < 1.85 无法解析其 manifest。
+# Floor dictated by deps: clap_lex 1.1.0 / engineioxide-core 0.2.0 are edition 2024
+# with rust-version ≥ 1.85/1.86; cargo < 1.85 cannot parse their manifests.
+rust-version = "1.86"
 
 [package]
 name = "a2c-smcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "A2C-SMCP Rust SDK - Agent, Computer, and Server implementation"
 authors = ["A2C Team"]
 repository = "https://github.com/a2c-smcp/rust-sdk"
