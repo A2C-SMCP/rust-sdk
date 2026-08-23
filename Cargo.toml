@@ -9,12 +9,9 @@ members = [
     "crates/smcp-server-hyper",
 ]
 
-# MSRV 兼容：工具链低于声明的 rust-version 时，解析阶段回落到兼容版本的依赖
-# （Cargo ≥ 1.84 支持；旧工具链因此得到清晰提示而非晦涩的 manifest 解析错误）。
-# Fall back to rust-version-compatible deps on older toolchains (Cargo ≥ 1.84),
-# so they get a clear MSRV message instead of a cryptic manifest parse error.
-[resolver]
-incompatible-rust-versions = "fallback"
+# 注：`[resolver] incompatible-rust-versions = "fallback"` 已移至 .cargo/config.toml ——
+# 该表是 config-only（RFC 3537），放在 manifest 中不生效且新版 Cargo 会报
+# "unused manifest key: resolver" 警告。
 
 [workspace.package]
 edition = "2021"
