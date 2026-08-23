@@ -426,7 +426,7 @@ impl SmcpComputerClient {
                             manager,
                             computer_name,
                             office_id,
-                            client_clone,
+                            Some(client_clone),
                         )
                         .await
                         {
@@ -887,20 +887,15 @@ impl SmcpComputerClient {
             }
             // 兼容旧入口（无 Computer ops）：退回 manager.execute_tool（无取消/铸造）。
             None => {
-                let result = {
-                    let manager_guard = manager.read().await;
-                    match manager_guard.as_ref() {
-                        Some(mgr) => {
-                            mgr.execute_tool(&req.tool_name, req.params, timeout_duration)
-                                .await?
-                        }
-                        None => {
-                            return Err(ComputerError::InvalidState(
-                                "MCP Manager not initialized".to_string(),
-                            ));
-                        }
-                    }
+                // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+                let Some(mgr) = manager.read().await.as_ref().cloned() else {
+                    return Err(ComputerError::InvalidState(
+                        "MCP Manager not initialized".to_string(),
+                    ));
                 };
+                let result = mgr
+                    .execute_tool(&req.tool_name, req.params, timeout_duration)
+                    .await?;
                 let mut value =
                     serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
                 // #92：同上——旧 manager 兜底路径亦须把顶层 `_meta` 提升为 `meta`（无标记则 no-op）。
@@ -934,28 +929,22 @@ impl SmcpComputerClient {
         }
 
         // 获取工具列表 / Get tools list
+        // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+        let Some(mgr) = manager.read().await.as_ref().cloned() else {
+            return Err(ComputerError::InvalidState(
+                "MCP Manager not initialized".to_string(),
+            ));
+        };
         let tools: Vec<smcp::SMCPTool> = {
-            let manager_guard = manager.read().await;
-            match manager_guard.as_ref() {
-                Some(mgr) => {
-                    // 转换Tool为SMCPTool
-                    // Convert Tool to SMCPTool
-                    // 携 bundle_id 拉取（协议 0.3.0 D1 / #136）：每个 SMCPTool 必带其所属 server 的
-                    // 解析后 bundle_id，供 Agent 归属工具（禁切 exposed `__` 前缀反推）。
-                    let tool_list = mgr.list_available_tools_with_bundle_id().await;
-                    tool_list
-                        .into_iter()
-                        .map(|(bundle_id, tool)| {
-                            convert_tool_to_smcp_tool(tool, bundle_id.as_str())
-                        })
-                        .collect()
-                }
-                None => {
-                    return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized".to_string(),
-                    ));
-                }
-            }
+            // 转换Tool为SMCPTool
+            // Convert Tool to SMCPTool
+            // 携 bundle_id 拉取（协议 0.3.0 D1 / #136）：每个 SMCPTool 必带其所属 server 的
+            // 解析后 bundle_id，供 Agent 归属工具（禁切 exposed `__` 前缀反推）。
+            let tool_list = mgr.list_available_tools_with_bundle_id().await;
+            tool_list
+                .into_iter()
+                .map(|(bundle_id, tool)| convert_tool_to_smcp_tool(tool, bundle_id.as_str()))
+                .collect()
         };
 
         let response = GetToolsRet {
@@ -999,15 +988,13 @@ impl SmcpComputerClient {
         } else {
             // Standalone client compatibility: without Computer operations, the Manager owns the
             // full configurations supplied by its caller.
-            let manager_guard = manager.read().await;
-            match manager_guard.as_ref() {
-                Some(mgr) => mgr.get_server_configs().await,
-                None => {
-                    return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized".to_string(),
-                    ));
-                }
-            }
+            // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+            let Some(mgr) = manager.read().await.as_ref().cloned() else {
+                return Err(ComputerError::InvalidState(
+                    "MCP Manager not initialized".to_string(),
+                ));
+            };
+            mgr.get_server_configs().await
         };
 
         // 获取输入定义 / Get input definitions
@@ -1046,7 +1033,7 @@ impl SmcpComputerClient {
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         _office_id: Arc<RwLock<Option<String>>>,
-        _client: Client,
+        _client: Option<Client>,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetDesktopReq>(payload)?;
 
@@ -1060,9 +1047,13 @@ impl SmcpComputerClient {
         }
 
         // 获取桌面窗口信息 / Get desktop window info
+        // #178：克隆 manager 出读锁，rmcp await 无锁进行。注意**不能**用 `if let Some(mgr) =
+        // manager.read().await.as_ref().cloned()` 的 scrutinee 内联形状——if-let 的临时守卫存活至
+        // 整个语句（含 body）结束，读锁仍会跨 `get_windows_details` await 持有（Defect 2 冻结链）。
+        // 先 let 绑定（语句结束即释放守卫），再 if-let 消费 owned 克隆。
+        let manager_snapshot = manager.read().await.as_ref().cloned();
         let desktops = {
-            let mgr_guard = manager.read().await;
-            if let Some(mgr) = mgr_guard.as_ref() {
+            if let Some(mgr) = manager_snapshot {
                 let raw_windows = mgr.get_windows_details(req.window.as_deref()).await;
                 let windows: Vec<WindowInfo> = raw_windows
                     .into_iter()
@@ -1110,20 +1101,15 @@ impl SmcpComputerClient {
         }
 
         // 单页透传 MCP `resources/list` / single-page passthrough。
-        let result = {
-            let manager_guard = manager.read().await;
-            match manager_guard.as_ref() {
-                Some(mgr) => {
-                    mgr.list_resources(&req.mcp_server, req.cursor.clone())
-                        .await
-                }
-                None => {
-                    return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized".to_string(),
-                    ));
-                }
-            }
+        // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+        let Some(mgr) = manager.read().await.as_ref().cloned() else {
+            return Err(ComputerError::InvalidState(
+                "MCP Manager not initialized".to_string(),
+            ));
         };
+        let result = mgr
+            .list_resources(&req.mcp_server, req.cursor.clone())
+            .await;
 
         match result {
             Ok((resources, next_cursor)) => {
@@ -2042,6 +2028,92 @@ mod tests {
         assert_eq!(err.mcp_server.as_deref(), Some("missing"));
         // 无嵌套 envelope：顶层即 code。
         assert!(err.capability.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_ack_handler_does_not_hold_manager_guard_across_hanging_call() {
+        // #178 回归守卫：ack handler 在挂起的 MCP 调用（`list_resources_page` 永不返回）期间
+        // 不得持有 `mcp_manager` 读锁——否则排队中的写锁（shutdown 的 take、挂载写）被永久阻塞。
+        // 修复前：handler 持读锁跨 `mgr.list_resources(...).await` → 写锁排队 → 1s 超时 panic。
+        use crate::mcp_clients::manager::test_support::inject_hanging;
+        use crate::mcp_clients::manager::MCPServerManager;
+        use std::time::Duration;
+
+        let manager = MCPServerManager::new();
+        inject_hanging(&manager, "srv-1", "t").await;
+        let lock = Arc::new(RwLock::new(Some(manager)));
+
+        // 挂起的 get_resources 调用（handler 内持读锁等待 list_resources_page 永不返回）。
+        let h_lock = lock.clone();
+        // detached：挂起 handler 设计为永不返回，绝不 await（否则测试自身卡死）。
+        let _handler = tokio::spawn(async move {
+            SmcpComputerClient::handle_get_resources_with_ack(
+                get_resources_payload("comp-1", "srv-1", None, 7),
+                h_lock,
+                "comp-1".to_string(),
+            )
+            .await
+        });
+
+        // 确定性窗口：等 handler 进入挂起（已持有读锁）后，写锁（模拟 shutdown/mount 的
+        // manager 替换）必须仍能在超时内完成。修复前：handler 持读锁跨挂起调用 → 写锁排队
+        // 永久阻塞 → 1s 超时 panic（红灯）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let w_lock = lock.clone();
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            *w_lock.write().await = None;
+        })
+        .await
+        .expect("ack handler 持读锁跨挂起调用，写锁被永久阻塞（#178）");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_get_desktop_ack_handler_does_not_hold_manager_guard_across_hanging_call() {
+        // #178 回归守卫：`handle_get_desktop_with_ack` 的 manager 读锁不得跨 `get_windows_details`
+        // await 持有。专防 **if-let scrutinee 临时守卫陷阱**——`if let Some(mgr) =
+        // manager.read().await.as_ref().cloned()` 形状下守卫存活至语句（含 body）结束，修复前的
+        // 内联形状会持读锁跨挂起的 `list_windows` → 排队写锁 1s 超时 panic（红灯）。
+        use crate::mcp_clients::manager::test_support::inject_hanging;
+        use crate::mcp_clients::manager::MCPServerManager;
+        use std::time::Duration;
+
+        let manager = MCPServerManager::new();
+        inject_hanging(&manager, "srv-1", "t").await;
+        let lock = Arc::new(RwLock::new(Some(manager)));
+
+        let mut obj = json!({
+            "agent": "agent-1",
+            "req_id": "req-1",
+            "computer": "comp-1",
+        });
+        obj.as_object_mut()
+            .unwrap()
+            .insert("window".into(), json!("window://app/w1"));
+        let payload = Payload::Text(vec![obj], Some(9));
+
+        // detached：挂起 handler 设计为永不返回，绝不 await。
+        let h_lock = lock.clone();
+        let _handler = tokio::spawn(async move {
+            SmcpComputerClient::handle_get_desktop_with_ack(
+                payload,
+                h_lock,
+                "comp-1".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+            )
+            .await
+        });
+
+        // 确定性窗口：等 handler 进入挂起（已持有读锁——修复前形状）后，写锁必须仍能完成。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let w_lock = lock.clone();
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            *w_lock.write().await = None;
+        })
+        .await
+        .expect("get_desktop ack handler 持读锁跨挂起调用，写锁被永久阻塞（#178）");
     }
 
     #[tokio::test]

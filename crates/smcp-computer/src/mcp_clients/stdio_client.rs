@@ -13,8 +13,10 @@ use super::{ResourceCache, SubscriptionManager};
 use async_trait::async_trait;
 use rmcp::model::{
     CallToolRequest, CancelledNotificationParam, ClientInfo, ClientRequest, Implementation,
-    PaginatedRequestParams, ReadResourceRequestParams, ResourceUpdatedNotificationParam,
-    ServerResult, SubscribeRequestParams, UnsubscribeRequestParams,
+    ListResourcesRequest, ListResourcesResult, ListToolsRequest, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequest, ReadResourceRequestParams,
+    ResourceUpdatedNotificationParam, ServerResult, SubscribeRequest, SubscribeRequestParams,
+    UnsubscribeRequest, UnsubscribeRequestParams,
 };
 use rmcp::service::{
     NotificationContext, PeerRequestOptions, RequestHandle, RunningService, ServiceExt,
@@ -331,13 +333,50 @@ impl MCPClientProtocol for StdioMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
-        let tools = service
-            .list_all_tools()
-            .await
-            .map_err(|e| MCPClientError::ProtocolError(format!("List tools error: {}", e)))?;
+        // #178：分页循环内 guard 仅覆盖「下发请求」（`send_request_with_option` 返回 owned handle
+        // 即释放），响应等待（`rx.await`）全程无锁——挂起的远端不再阻塞同 server 的
+        // connect/disconnect（对齐 `call_tool_cancellable` 参考模式）。
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let guard = self.get_service().await?;
+            let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
+                PaginatedRequestParams::default().with_cursor(cursor.clone()),
+            ));
+            let handle: RequestHandle<RoleClient> = guard
+                .as_ref()
+                .unwrap()
+                .send_request_with_option(request, PeerRequestOptions::no_options())
+                .await
+                .map_err(|e| MCPClientError::ProtocolError(format!("List tools error: {}", e)))?;
+            drop(guard);
+            let page: ListToolsResult = match handle.rx.await {
+                Ok(Ok(ServerResult::ListToolsResult(r))) => r,
+                Ok(Ok(_)) => {
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List tools error: {}",
+                        rmcp::ServiceError::UnexpectedResponse
+                    )));
+                }
+                Ok(Err(e)) => {
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List tools error: {}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List tools error: {}",
+                        rmcp::ServiceError::TransportClosed
+                    )));
+                }
+            };
+            tools.extend(page.tools);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
 
         info!("Found {} tools", tools.len());
         Ok(tools)
@@ -352,15 +391,31 @@ impl MCPClientProtocol for StdioMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
         let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
-        let result = service
-            .call_tool(super::utils::call_tool_request_params(tool_name, params))
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(
+            super::utils::call_tool_request_params(tool_name, params),
+        ));
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
             .map_err(MCPClientError::ToolCallError)?;
+        drop(guard);
 
-        Ok(result)
+        match handle.rx.await {
+            Ok(Ok(ServerResult::CallToolResult(r))) => Ok(r),
+            // 与原高层 `call_tool` 的 `map_err(MCPClientError::ToolCallError)` 逐字保持：
+            // 非 CallToolResult 变体 → ToolCallError(UnexpectedResponse)。
+            Ok(Ok(_)) => Err(MCPClientError::ToolCallError(
+                rmcp::ServiceError::UnexpectedResponse,
+            )),
+            Ok(Err(e)) => Err(MCPClientError::ToolCallError(e)),
+            Err(_) => Err(MCPClientError::ToolCallError(
+                rmcp::ServiceError::TransportClosed,
+            )),
+        }
     }
 
     /// 可取消 tool_call（INT-02 #70「最后一公里」的 **full-feasible** rmcp 路径）。
@@ -450,11 +505,52 @@ impl MCPClientProtocol for StdioMCPClient {
                 "resources".to_string(),
             ));
         }
+        drop(guard);
 
-        let all_resources = service
-            .list_all_resources()
-            .await
-            .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
+        // #178：分页循环内 guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
+        let mut all_resources = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let guard = self.get_service().await?;
+            let request = ClientRequest::ListResourcesRequest(ListResourcesRequest::with_param(
+                PaginatedRequestParams::default().with_cursor(cursor.clone()),
+            ));
+            let handle: RequestHandle<RoleClient> = guard
+                .as_ref()
+                .unwrap()
+                .send_request_with_option(request, PeerRequestOptions::no_options())
+                .await
+                .map_err(|e| {
+                    MCPClientError::ProtocolError(format!("List resources error: {}", e))
+                })?;
+            drop(guard);
+            let page: ListResourcesResult = match handle.rx.await {
+                Ok(Ok(ServerResult::ListResourcesResult(r))) => r,
+                Ok(Ok(_)) => {
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List resources error: {}",
+                        rmcp::ServiceError::UnexpectedResponse
+                    )));
+                }
+                Ok(Err(e)) => {
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List resources error: {}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List resources error: {}",
+                        rmcp::ServiceError::TransportClosed
+                    )));
+                }
+            };
+            all_resources.extend(page.resources);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
 
         // 过滤 window:// 资源并按 priority 降序排序（v0.2 元数据下沉，逻辑共享）
         // Filter window:// resources and sort by priority desc (shared v0.2 metadata sink).
@@ -485,14 +581,47 @@ impl MCPClientProtocol for StdioMCPClient {
                 "resources".to_string(),
             ));
         }
+        drop(guard);
 
         // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
         // Single-page passthrough: cursor in/out, no aggregation/filter, no resourceTemplates.
         let param = cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
-        let result = service
-            .list_resources(param)
+
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
+        let guard = self.get_service().await?;
+        let request = match param {
+            Some(p) => ClientRequest::ListResourcesRequest(ListResourcesRequest::with_param(p)),
+            None => ClientRequest::ListResourcesRequest(ListResourcesRequest::default()),
+        };
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
             .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
+        drop(guard);
+
+        let result: ListResourcesResult = match handle.rx.await {
+            Ok(Ok(ServerResult::ListResourcesResult(r))) => r,
+            Ok(Ok(_)) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "List resources error: {}",
+                    rmcp::ServiceError::UnexpectedResponse
+                )));
+            }
+            Ok(Err(e)) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "List resources error: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "List resources error: {}",
+                    rmcp::ServiceError::TransportClosed
+                )));
+            }
+        };
 
         Ok((result.resources, result.next_cursor))
     }
@@ -505,15 +634,34 @@ impl MCPClientProtocol for StdioMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
         let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
-        let result = service
-            .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
+        let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(
+            ReadResourceRequestParams::new(resource.uri.clone()),
+        ));
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
             .map_err(|e| MCPClientError::ProtocolError(format!("Read resource error: {}", e)))?;
+        drop(guard);
 
-        Ok(result)
+        match handle.rx.await {
+            Ok(Ok(ServerResult::ReadResourceResult(r))) => Ok(r),
+            Ok(Ok(_)) => Err(MCPClientError::ProtocolError(format!(
+                "Read resource error: {}",
+                rmcp::ServiceError::UnexpectedResponse
+            ))),
+            Ok(Err(e)) => Err(MCPClientError::ProtocolError(format!(
+                "Read resource error: {}",
+                e
+            ))),
+            Err(_) => Err(MCPClientError::ProtocolError(format!(
+                "Read resource error: {}",
+                rmcp::ServiceError::TransportClosed
+            ))),
+        }
     }
 
     async fn subscribe_window(&self, resource: Resource) -> Result<(), MCPClientError> {
@@ -521,17 +669,42 @@ impl MCPClientProtocol for StdioMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁（订阅成功响应为 EmptyResult）。
         let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
-        service
-            .subscribe(SubscribeRequestParams::new(resource.uri.clone()))
+        let request = ClientRequest::SubscribeRequest(SubscribeRequest::new(
+            SubscribeRequestParams::new(resource.uri.clone()),
+        ));
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
             .map_err(|e| {
                 MCPClientError::ProtocolError(format!("Subscribe resource error: {}", e))
             })?;
-
         drop(guard);
+
+        match handle.rx.await {
+            Ok(Ok(ServerResult::EmptyResult(_))) => {}
+            Ok(Ok(_)) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Subscribe resource error: {}",
+                    rmcp::ServiceError::UnexpectedResponse
+                )));
+            }
+            Ok(Err(e)) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Subscribe resource error: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Subscribe resource error: {}",
+                    rmcp::ServiceError::TransportClosed
+                )));
+            }
+        }
 
         // 订阅成功后，更新本地订阅状态
         let _ = self
@@ -564,17 +737,42 @@ impl MCPClientProtocol for StdioMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
         let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
-        service
-            .unsubscribe(UnsubscribeRequestParams::new(resource.uri.clone()))
+        let request = ClientRequest::UnsubscribeRequest(UnsubscribeRequest::new(
+            UnsubscribeRequestParams::new(resource.uri.clone()),
+        ));
+        let handle: RequestHandle<RoleClient> = guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
             .map_err(|e| {
                 MCPClientError::ProtocolError(format!("Unsubscribe resource error: {}", e))
             })?;
-
         drop(guard);
+
+        match handle.rx.await {
+            Ok(Ok(ServerResult::EmptyResult(_))) => {}
+            Ok(Ok(_)) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Unsubscribe resource error: {}",
+                    rmcp::ServiceError::UnexpectedResponse
+                )));
+            }
+            Ok(Err(e)) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Unsubscribe resource error: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Unsubscribe resource error: {}",
+                    rmcp::ServiceError::TransportClosed
+                )));
+            }
+        }
 
         // 取消订阅成功后，移除本地订阅状态
         let _ = self

@@ -148,6 +148,10 @@ struct ServerDeclaration {
 /// **对外标识一律 `bundle_id`**：desktop `window://` 分组（#118）与 skill `skill://` 枚举/物化（#127）均以
 /// `bundle_id` 标注——协议 §身份正交性规定 `name` 是纯 display、允许碰撞、永不做键。唯一仍与 `bundle_id`
 /// **正交**的是 `window://` / `skill://` URI 里的 **host** 段：它由 MCP Server 自选，A2C 透传不解释。
+///
+/// `Clone`（#178）：全部字段均为 `Arc` / `watch::Sender` / `Option<Arc<..>>`，克隆廉价且共享同一底层状态；
+/// `lifecycle_locks` 的 `Arc<WeakRegistry<..>>` 克隆共享同一注册表——同 bundle 挂载串行化语义必须跨克隆共享。
+#[derive(Clone)]
 pub struct MCPServerManager {
     /// Current materialized process configurations. Raw `${input:*}` declarations are owned by
     /// `Computer` and never enter this map.
@@ -3220,6 +3224,74 @@ pub(crate) mod test_support {
             .write()
             .await
             .insert(bid(server), StdArc::new(CancelMockClient { behavior }));
+        manager.tool_routes.write().await.insert(
+            tool.to_string(),
+            ExposedToolRoute {
+                bundle_id: bid(server),
+                server_name: server.to_string(),
+                original_tool_name: tool.to_string(),
+                alias: None,
+            },
+        );
+    }
+
+    /// #178 回归夹具：数据面方法永不 resolve（模拟卡死的远端 server）；控制面（`disconnect`）
+    /// 立即返回，使 `shutdown`/`close` 可完成。`list_tools` / `call_tool` / `list_resources_page`
+    /// 挂起，用于验证「持锁跨无界 rmcp await 会冻结 Computer 生命周期」缺陷的修复。
+    pub(crate) struct HangingMockClient;
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for HangingMockClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            std::future::pending().await
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            std::future::pending().await
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            std::future::pending().await
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            std::future::pending().await
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _r: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// #178：注入挂起 client + exposed→route 路由，使 `validate_tool_call` 可解析（同
+    /// `inject_callable` 约定：`server` 同时充当 `bundle_id` 与展示名，`tool` 作路由键）。
+    pub(crate) async fn inject_hanging(manager: &MCPServerManager, server: &str, tool: &str) {
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bid(server), StdArc::new(HangingMockClient));
         manager.tool_routes.write().await.insert(
             tool.to_string(),
             ExposedToolRoute {

@@ -1635,8 +1635,8 @@ impl<S: Session> Computer<S> {
         mcp_server: &str,
         cursor: Option<String>,
     ) -> ComputerResult<(Vec<Resource>, Option<String>)> {
-        let guard = self.mcp_manager.read().await;
-        let Some(manager) = guard.as_ref() else {
+        let guard = self.current_manager().await;
+        let Some(manager) = guard else {
             return Err(ComputerError::InvalidState(
                 "MCP Manager is not initialized".to_string(),
             ));
@@ -1756,13 +1756,13 @@ impl<S: Session> Computer<S> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return Vec::new();
         };
-        let manager_guard = self.mcp_manager.read().await;
-        let Some(manager) = manager_guard.as_ref() else {
+        let manager_guard = self.current_manager().await;
+        let Some(manager) = manager_guard else {
             return Vec::new();
         };
         // #77：写锁不再跨 materialize 网络持有——stage_mcp_skills 内部按 SKILL 在 finalize 阶段短持写锁。
         // #106：物化 + `mcp:` 源孤儿对账抽为共享自由函数，与 [`McpChangeReactor`] 复用（见 restage_mcp_skills_into）。
-        restage_mcp_skills_into(manager, &self.skill_registry, &home, bundle_id).await
+        restage_mcp_skills_into(&manager, &self.skill_registry, &home, bundle_id).await
     }
 
     /// 直接处理一条 MCP 运行期变化通知（#106）：刷新工具映射 / desktop 集合去抖 / MCP 源 skill 重挂，并触发
@@ -1887,6 +1887,14 @@ impl<S: Session> Computer<S> {
     /// Returns Arc-wrapped client, ensuring its lifetime
     pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Arc<SmcpComputerClient>>>> {
         self.socketio_client.clone()
+    }
+
+    /// #178：解析当前 MCP 管理器——读锁内仅克隆 `MCPServerManager`（全 Arc 字段，克隆廉价），
+    /// 守卫在语句结束即释放。所有 rmcp 调用一律在无锁的克隆上进行；锁只保护槽位替换，
+    /// 不保护在途调用。由此消除「挂起 MCP 调用持读锁 → 唯一写者（shutdown/mount）永久排队」
+    /// 的冻结链。
+    async fn current_manager(&self) -> Option<MCPServerManager> {
+        self.mcp_manager.read().await.as_ref().cloned()
     }
 
     /// 启动Computer / Boot up the computer
@@ -2489,8 +2497,8 @@ impl<S: Session> Computer<S> {
         // Before boot (or after terminal shutdown), declaration operations update only raw desired
         // state. A successful boot rebuilds Manager declarations from that atomic snapshot.
         {
-            let manager = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager {
+            let manager = self.current_manager().await;
+            if let Some(manager) = manager {
                 manager.register_raw_server(raw.clone()).await?;
             }
         }
@@ -2540,8 +2548,8 @@ impl<S: Session> Computer<S> {
         let _lifecycle_guard = lifecycle.lock().await;
         let mut removed = false;
         {
-            let manager = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager {
+            let manager = self.current_manager().await;
+            if let Some(manager) = manager {
                 removed |= manager.remove_server_by_id(id).await?;
             }
         }
@@ -2945,8 +2953,8 @@ impl<S: Session> Computer<S> {
 
     /// 获取可用工具列表 / Get available tools list
     pub async fn get_available_tools(&self) -> ComputerResult<Vec<Tool>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             let tools: Vec<Tool> = manager.list_available_tools().await;
             // TODO: 转换为SMCPTool格式 / TODO: Convert to SMCPTool format
             // 这里需要实现工具格式转换
@@ -2964,8 +2972,8 @@ impl<S: Session> Computer<S> {
         &self,
         window_uri: Option<&str>,
     ) -> ComputerResult<Vec<(String, Resource)>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             Ok(manager.list_all_windows(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
@@ -2983,8 +2991,8 @@ impl<S: Session> Computer<S> {
         &self,
         window_uri: Option<&str>,
     ) -> ComputerResult<Vec<(BundleId, ServerName, Resource)>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             Ok(manager.list_windows_with_identity(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
@@ -3003,8 +3011,8 @@ impl<S: Session> Computer<S> {
         &self,
         window_uri: Option<&str>,
     ) -> ComputerResult<WindowEnumerationReport> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             Ok(manager.list_windows_with_diagnostics(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
@@ -3021,8 +3029,8 @@ impl<S: Session> Computer<S> {
         &self,
         window_uri: Option<&str>,
     ) -> ComputerResult<Vec<(BundleId, ServerName, Resource, ReadResourceResult)>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             Ok(manager.get_windows_details(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
@@ -3037,8 +3045,8 @@ impl<S: Session> Computer<S> {
         id: &BundleId,
         resource: Resource,
     ) -> ComputerResult<ReadResourceResult> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             manager.get_window_detail(id, resource).await
         } else {
             Err(ComputerError::InvalidState(
@@ -3055,8 +3063,8 @@ impl<S: Session> Computer<S> {
         parameters: serde_json::Value,
         timeout: Option<f64>,
     ) -> ComputerResult<CallToolResult> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             // 验证工具调用（协议 0.3.0：入参为 exposed_tool_name，返回 bundle_id + 展示名 + 原始工具名）。
             let (bundle_id, server_name, tool_name) =
                 manager.validate_tool_call(tool_name, &parameters).await?;
@@ -3171,8 +3179,8 @@ impl<S: Session> Computer<S> {
         parameters: serde_json::Value,
         timeout: Option<f64>,
     ) -> ComputerResult<CallToolResult> {
-        let manager = self.mcp_manager.read().await;
-        let Some(ref manager) = *manager else {
+        let manager = self.current_manager().await;
+        let Some(manager) = manager else {
             return Err(ComputerError::InvalidState(
                 "Computer not initialized".to_string(),
             ));
@@ -3303,8 +3311,8 @@ impl<S: Session> Computer<S> {
     ///
     /// 每项自带唯一身份键 `bundle_id`；`name` 仅供展示且允许碰撞。
     pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
-        let manager_guard = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager_guard {
+        let manager_guard = self.current_manager().await;
+        if let Some(manager) = manager_guard {
             manager.get_server_runtime_statuses().await
         } else {
             Vec::new()
@@ -3315,8 +3323,8 @@ impl<S: Session> Computer<S> {
     /// `state` 表示当前连接状态。
     /// 新代码应优先使用 [`Self::get_server_runtime_statuses`]。
     pub async fn get_server_status(&self) -> Vec<(BundleId, ServerName, bool, String)> {
-        let manager_guard = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager_guard {
+        let manager_guard = self.current_manager().await;
+        if let Some(manager) = manager_guard {
             manager.get_server_status().await
         } else {
             Vec::new()
@@ -3340,8 +3348,8 @@ impl<S: Session> Computer<S> {
     pub async fn status(&self) -> ComputerStatusSnapshot {
         let mcp_servers = self.mcp_servers.read().await.len();
         let (active_mcp_servers, tools) = {
-            let manager_guard = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager_guard {
+            let manager_guard = self.current_manager().await;
+            if let Some(manager) = manager_guard {
                 let active = manager
                     .get_server_runtime_statuses()
                     .await
@@ -3426,8 +3434,8 @@ impl<S: Session> Computer<S> {
             .iter()
             .map(|(id, entry)| (id.clone(), entry.config.clone()))
             .collect();
-        let manager = self.mcp_manager.read().await;
-        let manager = manager.as_ref().ok_or_else(Self::manager_uninit)?;
+        let manager = self.current_manager().await;
+        let manager = manager.ok_or_else(Self::manager_uninit)?;
         Ok(manager.get_server_configs_for(&raw_configs).await)
     }
 
@@ -3728,8 +3736,8 @@ impl<S: Session> Computer<S> {
         let raw = entry.config;
         let scope = entry.input_scope;
         let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
+            let mgr = self.current_manager().await;
+            match mgr {
                 Some(m) => {
                     m.start_client_by_id_materialized(id, raw.disabled(), || async {
                         match scope.as_ref() {
@@ -3790,8 +3798,8 @@ impl<S: Session> Computer<S> {
         let lifecycle = self.mcp_lifecycle_lock(id);
         let _lifecycle_guard = lifecycle.lock().await;
         let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
+            let mgr = self.current_manager().await;
+            match mgr {
                 Some(m) => m.stop_client_by_id(id).await,
                 None => Err(Self::manager_uninit()),
             }
@@ -3848,8 +3856,8 @@ impl<S: Session> Computer<S> {
         let raw = entry.config;
         let scope = entry.input_scope;
         let (result, capability_changed) = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
+            let mgr = self.current_manager().await;
+            match mgr {
                 Some(m) => {
                     let was_active = m.is_client_active(id).await;
                     let result = m
@@ -3925,8 +3933,8 @@ impl<S: Session> Computer<S> {
         let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
         self.ensure_mcp_operations_open()?;
         let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
+            let mgr = self.current_manager().await;
+            match mgr {
                 Some(m) => m.stop_all().await,
                 None => Err(Self::manager_uninit()),
             }
@@ -3990,10 +3998,8 @@ impl<S: Session> Computer<S> {
         &self,
         bundle_id: &BundleId,
     ) -> Result<crate::oauth::OAuthStatus, crate::oauth::OAuthError> {
-        let manager = self.mcp_manager.read().await;
-        let manager = manager
-            .as_ref()
-            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        let manager = self.current_manager().await;
+        let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
         manager.oauth_status(bundle_id).await
     }
 
@@ -4019,10 +4025,8 @@ impl<S: Session> Computer<S> {
         bundle_id: &BundleId,
         request: crate::oauth::OAuthBeginRequest,
     ) -> Result<crate::oauth::OAuthFlow, crate::oauth::OAuthError> {
-        let manager = self.mcp_manager.read().await;
-        let manager = manager
-            .as_ref()
-            .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        let manager = self.current_manager().await;
+        let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
         manager.create_oauth_flow(bundle_id, request).await
     }
 
@@ -4036,10 +4040,8 @@ impl<S: Session> Computer<S> {
         callback: crate::oauth::OAuthCallback,
     ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
         let flow = {
-            let manager = self.mcp_manager.read().await;
-            let manager = manager
-                .as_ref()
-                .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            let manager = self.current_manager().await;
+            let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
             manager.oauth_flow_for_callback(bundle_id).await?
         };
         flow.complete(callback).await
@@ -4052,10 +4054,8 @@ impl<S: Session> Computer<S> {
         cancellation: crate::oauth::OAuthCancellation,
     ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
         let flow = {
-            let manager = self.mcp_manager.read().await;
-            let manager = manager
-                .as_ref()
-                .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            let manager = self.current_manager().await;
+            let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
             manager.oauth_flow_for_callback(bundle_id).await?
         };
         flow.cancel_compat(cancellation).await
@@ -4064,10 +4064,8 @@ impl<S: Session> Computer<S> {
     /// Clear persisted tokens and pending authorization state.
     pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), crate::oauth::OAuthError> {
         let outcome = {
-            let manager = self.mcp_manager.read().await;
-            let manager = manager
-                .as_ref()
-                .ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            let manager = self.current_manager().await;
+            let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
             manager.clear_oauth_with_outcome(bundle_id).await?
         };
 
@@ -4089,7 +4087,7 @@ impl<S: Session> Computer<S> {
 
     /// 检查 MCP Manager 是否已初始化 / Check if MCP Manager is initialized
     pub async fn is_mcp_manager_initialized(&self) -> bool {
-        let manager_guard = self.mcp_manager.read().await;
+        let manager_guard = self.current_manager().await;
         manager_guard.is_some()
     }
 
@@ -4182,7 +4180,7 @@ impl<S: Session> Computer<S> {
     {
         // 确保管理器已初始化 / Ensure manager is initialized
         let _manager_check = {
-            let manager_guard = self.mcp_manager.read().await;
+            let manager_guard = self.current_manager().await;
             match manager_guard.as_ref() {
                 Some(_m) => {
                     // Manager 已初始化
@@ -4352,8 +4350,12 @@ impl<S: Session> Computer<S> {
             warn!(error = %e, "transport disconnect during shutdown failed, skipped");
         }
 
-        let mut manager_guard = self.mcp_manager.write().await;
-        if let Some(manager) = manager_guard.take() {
+        // #178：take 置 None 后**立即释放写锁**（临时 guard 语句结束即 drop），`close()`（rmcp teardown，
+        // 可能无界）全程无锁进行——不再被在途调用持有的读锁阻塞，也不阻塞在途调用。终端态语义保持：
+        // mcp_manager 立即置 None，后续读者瞬时得 "not initialized"；并发变异已由 mcp_boot_shutdown /
+        // mcp_lifecycle_gate 排他。
+        let manager = self.mcp_manager.write().await.take();
+        if let Some(manager) = manager {
             manager.close().await?;
         }
 
@@ -9920,6 +9922,106 @@ mod tests {
             .await
             .expect("ABBA 死锁：governance 与 reactor skill 重挂未在 5s 内完成");
         }
+    }
+
+    // ── #178：锁跨无界 await——挂起 MCP 调用不得冻结 Computer 生命周期 ──────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_shutdown_completes_with_hanging_inflight_execute_tool() {
+        // #178 Defect 2 回归守卫：在途 `execute_tool_cancellable` 持 `mcp_manager` 读锁跨无界
+        // `call_tool_cancellable` await（假 client 永不返回）时，`shutdown` 的写锁（`take` 后
+        // `close().await`）不得被永久阻塞。修复前：写锁排队等待读锁 → 2s 超时 panic。
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+
+        let computer = Arc::new(computer_with_cancel_mock(CancelBehavior::BlockForever).await);
+
+        let exec = computer.clone();
+        let _inflight = tokio::spawn(async move {
+            exec.execute_tool_cancellable("rid-hang", "t", serde_json::json!({}), None)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), computer.shutdown())
+            .await
+            .expect("shutdown 被挂起的在途调用阻塞（锁跨无界 await，#178）")
+            .expect("shutdown 应成功完成");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unmount_server_completes_with_writer_queued_behind_hanging_call() {
+        // #178 回归守卫：挂起在途调用 + 排队中的 shutdown 写锁（持 `mcp_lifecycle_gate` 写锁等待
+        // `mcp_manager` 写锁）不得阻塞其它 server 的 `unmount_server`。修复前：unmount 等 gate 读锁
+        // → 被 shutdown 卡住的写锁连带阻塞 → 2s 超时 panic。
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+        use std::time::Duration;
+
+        let computer = Arc::new(computer_with_cancel_mock(CancelBehavior::BlockForever).await);
+
+        let exec = computer.clone();
+        let _inflight = tokio::spawn(async move {
+            exec.execute_tool_cancellable("rid-hang", "t", serde_json::json!({}), None)
+                .await
+        });
+        let sd = computer.clone();
+        let _shutdown = tokio::spawn(async move { sd.shutdown().await });
+        // 给 shutdown 一个进入 gate 排队的窗口（红灯路径下 unmount 必被卡死，绿灯路径下必成功）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), computer.unmount_server(&bid("srv")))
+            .await
+            .expect("unmount_server 被排队写锁阻塞（锁跨无界 await，#178）");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_two_concurrent_execute_tools_on_different_bundles_both_proceed() {
+        // #178 并发性守卫：bundle A 挂起在途时，bundle B 的正常调用必须仍能完成——读锁不跨 await
+        // 时两个读者天然并行。同时防过度修正：若把 `mcp_manager` 的 RwLock 误换为互斥锁，
+        // 两路调用被串行化 → fast 被 hang 阻塞 → 本测试红灯。
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+        use std::time::Duration;
+
+        let computer =
+            Arc::new(computer_with_hanging_and_fast_mock(CancelBehavior::CompleteOk).await);
+
+        let exec1 = computer.clone();
+        // detached：挂起任务设计为永不返回，绝不 await（否则测试自身卡死）。
+        let _hang = tokio::spawn(async move {
+            exec1
+                .execute_tool_cancellable("rid-hang", "hang-tool", serde_json::json!({}), None)
+                .await
+        });
+        let exec2 = computer.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            exec2.execute_tool_cancellable("rid-fast", "fast-tool", serde_json::json!({}), None),
+        )
+        .await;
+
+        result
+            .expect("fast 调用被 hang 在途调用阻塞（读锁跨 await 串行化，#178）")
+            .expect("fast 调用应成功完成");
+    }
+
+    /// #178：注入一个挂起 client（"hang"）+ 一个正常 client（"fast"）的 Computer。
+    async fn computer_with_hanging_and_fast_mock(
+        fast_behavior: crate::mcp_clients::manager::test_support::CancelBehavior,
+    ) -> Computer<SilentSession> {
+        use crate::mcp_clients::manager::test_support::{inject_callable, inject_hanging};
+        use crate::mcp_clients::manager::MCPServerManager;
+
+        let computer = Computer::new(
+            "test_computer",
+            SilentSession::new("t"),
+            None,
+            None,
+            true,
+            true,
+        );
+        let manager = MCPServerManager::new();
+        inject_hanging(&manager, "hang", "hang-tool").await;
+        inject_callable(&manager, "fast", "fast-tool", fast_behavior).await;
+        *computer.mcp_manager.write().await = Some(manager);
+        computer
     }
 
     // ── INT-02 #70：取消最后一公里（acancel_tool 幂等 / 守卫退场 / 结果级 meta 标记）──────────

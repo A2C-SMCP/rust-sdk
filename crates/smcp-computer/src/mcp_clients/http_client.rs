@@ -21,8 +21,10 @@ use crate::status::RuntimeStatus;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequest, CancelledNotificationParam, ClientRequest, PaginatedRequestParams,
-    ReadResourceRequestParams, ServerResult, SubscribeRequestParams, UnsubscribeRequestParams,
+    CallToolRequest, CancelledNotificationParam, ClientRequest, ListResourcesRequest,
+    ListResourcesResult, ListToolsRequest, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequest, ReadResourceRequestParams, ServerResult, SubscribeRequest,
+    SubscribeRequestParams, UnsubscribeRequest, UnsubscribeRequestParams,
 };
 use rmcp::service::{PeerRequestOptions, RequestHandle, RunningService, ServiceExt};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -721,26 +723,6 @@ impl HttpMCPClient {
         Ok(Some(guard))
     }
 
-    async fn observe_oauth_service_result<T>(
-        &self,
-        result: &Result<T, rmcp::ServiceError>,
-        expected_generation: Option<u64>,
-    ) {
-        let Some(expected_generation) = expected_generation else {
-            return;
-        };
-        if let Ok(oauth) = self.oauth().await {
-            match result {
-                Ok(_) => oauth.observe_service_success(expected_generation).await,
-                Err(error) => {
-                    oauth
-                        .observe_service_error(error, expected_generation)
-                        .await;
-                }
-            }
-        }
-    }
-
     async fn observe_oauth_service_error(
         &self,
         error: &rmcp::ServiceError,
@@ -890,17 +872,74 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
         let oauth_request = self.prepare_oauth_request().await?;
         let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        let result = service.list_all_tools().await;
+
+        // #178：分页循环内 guard 仅覆盖「下发请求」（`send_request_with_option` 返回 owned handle
+        // 即释放），响应等待（`rx.await`）全程无锁——挂起的远端不再阻塞同 server 的
+        // connect/disconnect（对齐 `call_tool_cancellable` 参考模式）。
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let guard = self.get_service().await?;
+            let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
+                PaginatedRequestParams::default().with_cursor(cursor.clone()),
+            ));
+            let handle: RequestHandle<RoleClient> = match guard
+                .as_ref()
+                .unwrap()
+                .send_request_with_option(request, PeerRequestOptions::no_options())
+                .await
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    drop(oauth_request);
+                    self.observe_oauth_service_error(&error, oauth_generation)
+                        .await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List tools error: {}",
+                        error
+                    )));
+                }
+            };
+            drop(guard);
+            let page: ListToolsResult = match handle.rx.await {
+                Ok(Ok(ServerResult::ListToolsResult(r))) => r,
+                Ok(Ok(_)) => {
+                    drop(oauth_request);
+                    let e = rmcp::ServiceError::UnexpectedResponse;
+                    self.observe_oauth_service_error(&e, oauth_generation).await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List tools error: {}",
+                        e
+                    )));
+                }
+                Ok(Err(e)) => {
+                    drop(oauth_request);
+                    self.observe_oauth_service_error(&e, oauth_generation).await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List tools error: {}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    drop(oauth_request);
+                    let e = rmcp::ServiceError::TransportClosed;
+                    self.observe_oauth_service_error(&e, oauth_generation).await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List tools error: {}",
+                        e
+                    )));
+                }
+            };
+            tools.extend(page.tools);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
         drop(oauth_request);
-        self.observe_oauth_service_result(&result, oauth_generation)
-            .await;
-        let tools = result
-            .map_err(|e| MCPClientError::ProtocolError(format!("List tools error: {}", e)))?;
+        self.observe_oauth_service_success(oauth_generation).await;
 
         info!("Found {} tools", tools.len());
         Ok(tools)
@@ -915,20 +954,56 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
         let oauth_request = self.prepare_oauth_request().await?;
         let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        let result = service
-            .call_tool(super::utils::call_tool_request_params(tool_name, params))
-            .await;
-        drop(oauth_request);
-        self.observe_oauth_service_result(&result, oauth_generation)
-            .await;
-        let result = result.map_err(MCPClientError::ToolCallError)?;
 
-        Ok(result)
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁（对齐 call_tool_cancellable）。
+        let guard = self.get_service().await?;
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(
+            super::utils::call_tool_request_params(tool_name, params),
+        ));
+        let handle: RequestHandle<RoleClient> = match guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&error, oauth_generation)
+                    .await;
+                return Err(MCPClientError::ToolCallError(error));
+            }
+        };
+        drop(guard);
+
+        match handle.rx.await {
+            Ok(Ok(ServerResult::CallToolResult(r))) => {
+                drop(oauth_request);
+                self.observe_oauth_service_success(oauth_generation).await;
+                Ok(r)
+            }
+            Ok(Ok(_)) => {
+                drop(oauth_request);
+                // 与原高层 `call_tool` 的 `map_err(MCPClientError::ToolCallError)` 逐字保持：
+                // 非 CallToolResult 变体 → ToolCallError(UnexpectedResponse)。
+                Err(MCPClientError::ToolCallError(
+                    rmcp::ServiceError::UnexpectedResponse,
+                ))
+            }
+            Ok(Err(e)) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                Err(MCPClientError::ToolCallError(e))
+            }
+            Err(_) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::TransportClosed;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                Err(MCPClientError::ToolCallError(e))
+            }
+        }
     }
 
     /// 可取消 tool_call：与 stdio 客户端同构（低层 `send_request_with_option` 捕获 rmcp `request_id`，
@@ -1023,15 +1098,74 @@ impl MCPClientProtocol for HttpMCPClient {
                 "resources".to_string(),
             ));
         }
+        drop(guard);
 
         let oauth_request = self.prepare_oauth_request().await?;
         let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        let result = service.list_all_resources().await;
+
+        // #178：分页循环内 guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
+        let mut all_resources = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let guard = self.get_service().await?;
+            let request = ClientRequest::ListResourcesRequest(ListResourcesRequest::with_param(
+                PaginatedRequestParams::default().with_cursor(cursor.clone()),
+            ));
+            let handle: RequestHandle<RoleClient> = match guard
+                .as_ref()
+                .unwrap()
+                .send_request_with_option(request, PeerRequestOptions::no_options())
+                .await
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    drop(oauth_request);
+                    self.observe_oauth_service_error(&error, oauth_generation)
+                        .await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List resources error: {}",
+                        error
+                    )));
+                }
+            };
+            drop(guard);
+            let page: ListResourcesResult = match handle.rx.await {
+                Ok(Ok(ServerResult::ListResourcesResult(r))) => r,
+                Ok(Ok(_)) => {
+                    drop(oauth_request);
+                    let e = rmcp::ServiceError::UnexpectedResponse;
+                    self.observe_oauth_service_error(&e, oauth_generation).await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List resources error: {}",
+                        e
+                    )));
+                }
+                Ok(Err(e)) => {
+                    drop(oauth_request);
+                    self.observe_oauth_service_error(&e, oauth_generation).await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List resources error: {}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    drop(oauth_request);
+                    let e = rmcp::ServiceError::TransportClosed;
+                    self.observe_oauth_service_error(&e, oauth_generation).await;
+                    return Err(MCPClientError::ProtocolError(format!(
+                        "List resources error: {}",
+                        e
+                    )));
+                }
+            };
+            all_resources.extend(page.resources);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
         drop(oauth_request);
-        self.observe_oauth_service_result(&result, oauth_generation)
-            .await;
-        let all_resources = result
-            .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
+        self.observe_oauth_service_success(oauth_generation).await;
 
         // 过滤 window:// 资源并按 priority 降序排序（v0.2 元数据下沉，逻辑共享）
         Ok(crate::desktop::metadata::filter_and_sort_window_resources(
@@ -1061,17 +1195,69 @@ impl MCPClientProtocol for HttpMCPClient {
                 "resources".to_string(),
             ));
         }
+        drop(guard);
 
         // 单页透传：cursor 进/出，不聚合、不过滤、不返回 resourceTemplates。
         let param = cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
         let oauth_request = self.prepare_oauth_request().await?;
         let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        let result = service.list_resources(param).await;
+
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
+        let guard = self.get_service().await?;
+        let request = match param {
+            Some(p) => ClientRequest::ListResourcesRequest(ListResourcesRequest::with_param(p)),
+            None => ClientRequest::ListResourcesRequest(ListResourcesRequest::default()),
+        };
+        let handle: RequestHandle<RoleClient> = match guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&error, oauth_generation)
+                    .await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "List resources error: {}",
+                    error
+                )));
+            }
+        };
+        drop(guard);
+
+        let result: ListResourcesResult = match handle.rx.await {
+            Ok(Ok(ServerResult::ListResourcesResult(r))) => r,
+            Ok(Ok(_)) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::UnexpectedResponse;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "List resources error: {}",
+                    e
+                )));
+            }
+            Ok(Err(e)) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "List resources error: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::TransportClosed;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "List resources error: {}",
+                    e
+                )));
+            }
+        };
         drop(oauth_request);
-        self.observe_oauth_service_result(&result, oauth_generation)
-            .await;
-        let result = result
-            .map_err(|e| MCPClientError::ProtocolError(format!("List resources error: {}", e)))?;
+        self.observe_oauth_service_success(oauth_generation).await;
 
         Ok((result.resources, result.next_cursor))
     }
@@ -1084,19 +1270,64 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
         let oauth_request = self.prepare_oauth_request().await?;
         let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        let result = service
-            .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
-            .await;
+
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
+        let guard = self.get_service().await?;
+        let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(
+            ReadResourceRequestParams::new(resource.uri.clone()),
+        ));
+        let handle: RequestHandle<RoleClient> = match guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&error, oauth_generation)
+                    .await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Read resource error: {}",
+                    error
+                )));
+            }
+        };
+        drop(guard);
+
+        let result: ReadResourceResult = match handle.rx.await {
+            Ok(Ok(ServerResult::ReadResourceResult(r))) => r,
+            Ok(Ok(_)) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::UnexpectedResponse;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Read resource error: {}",
+                    e
+                )));
+            }
+            Ok(Err(e)) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Read resource error: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::TransportClosed;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Read resource error: {}",
+                    e
+                )));
+            }
+        };
         drop(oauth_request);
-        self.observe_oauth_service_result(&result, oauth_generation)
-            .await;
-        let result = result
-            .map_err(|e| MCPClientError::ProtocolError(format!("Read resource error: {}", e)))?;
+        self.observe_oauth_service_success(oauth_generation).await;
 
         Ok(result)
     }
@@ -1106,22 +1337,65 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
         let oauth_request = self.prepare_oauth_request().await?;
         let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        let result = service
-            .subscribe(SubscribeRequestParams::new(resource.uri.clone()))
-            .await;
-        drop(oauth_request);
-        self.observe_oauth_service_result(&result, oauth_generation)
-            .await;
-        result.map_err(|e| {
-            MCPClientError::ProtocolError(format!("Subscribe resource error: {}", e))
-        })?;
 
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁（订阅成功响应为 EmptyResult）。
+        let guard = self.get_service().await?;
+        let request = ClientRequest::SubscribeRequest(SubscribeRequest::new(
+            SubscribeRequestParams::new(resource.uri.clone()),
+        ));
+        let handle: RequestHandle<RoleClient> = match guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&error, oauth_generation)
+                    .await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Subscribe resource error: {}",
+                    error
+                )));
+            }
+        };
         drop(guard);
+
+        match handle.rx.await {
+            Ok(Ok(ServerResult::EmptyResult(_))) => {
+                drop(oauth_request);
+                self.observe_oauth_service_success(oauth_generation).await;
+            }
+            Ok(Ok(_)) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::UnexpectedResponse;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Subscribe resource error: {}",
+                    e
+                )));
+            }
+            Ok(Err(e)) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Subscribe resource error: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::TransportClosed;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Subscribe resource error: {}",
+                    e
+                )));
+            }
+        }
 
         // 订阅成功后，更新本地订阅状态
         let _ = self
@@ -1154,22 +1428,65 @@ impl MCPClientProtocol for HttpMCPClient {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
         }
 
-        let guard = self.get_service().await?;
-        let service = guard.as_ref().unwrap();
-
         let oauth_request = self.prepare_oauth_request().await?;
         let oauth_generation = oauth_request.as_ref().map(OAuthRequestGuard::generation);
-        let result = service
-            .unsubscribe(UnsubscribeRequestParams::new(resource.uri.clone()))
-            .await;
-        drop(oauth_request);
-        self.observe_oauth_service_result(&result, oauth_generation)
-            .await;
-        result.map_err(|e| {
-            MCPClientError::ProtocolError(format!("Unsubscribe resource error: {}", e))
-        })?;
 
+        // #178：guard 仅覆盖「下发请求」，响应等待（rx.await）无锁。
+        let guard = self.get_service().await?;
+        let request = ClientRequest::UnsubscribeRequest(UnsubscribeRequest::new(
+            UnsubscribeRequestParams::new(resource.uri.clone()),
+        ));
+        let handle: RequestHandle<RoleClient> = match guard
+            .as_ref()
+            .unwrap()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&error, oauth_generation)
+                    .await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Unsubscribe resource error: {}",
+                    error
+                )));
+            }
+        };
         drop(guard);
+
+        match handle.rx.await {
+            Ok(Ok(ServerResult::EmptyResult(_))) => {
+                drop(oauth_request);
+                self.observe_oauth_service_success(oauth_generation).await;
+            }
+            Ok(Ok(_)) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::UnexpectedResponse;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Unsubscribe resource error: {}",
+                    e
+                )));
+            }
+            Ok(Err(e)) => {
+                drop(oauth_request);
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Unsubscribe resource error: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                drop(oauth_request);
+                let e = rmcp::ServiceError::TransportClosed;
+                self.observe_oauth_service_error(&e, oauth_generation).await;
+                return Err(MCPClientError::ProtocolError(format!(
+                    "Unsubscribe resource error: {}",
+                    e
+                )));
+            }
+        }
 
         // 取消订阅成功后，移除本地订阅状态
         let _ = self
