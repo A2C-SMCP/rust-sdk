@@ -34,6 +34,18 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # 回归防护（#203）：`[resolver]` 是 config-only 表（RFC 3537），置于 Cargo.toml 不生效
+      # 且新版 Cargo 报 "unused manifest key: resolver" 警告；仅允许存在于 .cargo/config.toml。
+      # 覆盖 TOML 空白/子表变体（[ resolver ]、[resolver.*]）；config 侧用 awk 把 key 约束在
+      # [resolver] 表作用域内（避免 key 被移入其他表后静默失效）。
+      - name: Check resolver config location (#203)
+        run: |
+          if grep -Eq '^\[[[:space:]]*resolver([[:space:]]*\.|[[:space:]]*\])' Cargo.toml; then
+            echo "::error::[resolver] is config-only (RFC 3537) — must live in .cargo/config.toml, not Cargo.toml"
+            exit 1
+          fi
+          awk '/^\[[[:space:]]*resolver([[:space:]]*\.|[[:space:]]*\])/ {on=1} /^\[/ && $0 !~ /^\[[[:space:]]*resolver([[:space:]]*\.|[[:space:]]*\])/ {on=0} on && /^[[:space:]]*incompatible-rust-versions[[:space:]]*=[[:space:]]*"fallback"/ {f=1} END {exit f?0:1}' .cargo/config.toml
+
       - name: Clippy (workspace)
         run: cargo clippy --workspace --features agent,computer,server -- -D warnings
 
