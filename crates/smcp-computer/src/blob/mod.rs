@@ -13,12 +13,14 @@
 //!
 //! 对标 Python 治理层资产 `a2c_smcp/computer/blob/`（0.2.1）。含 [`handle`]（无状态句柄编解码，BLB-01
 //! #62）、[`resolver`]（解析器接口 + SKILL 解析器 + 惰性切片，BLB-02 #64）、[`thresholds`]（SKILL/blob
-//! 通道阈值，BLB-02 #64）、[`toolspool`]（tool_call 二进制内容寻址暂存 + 惰性切片解析器，BLB-03 #66）。
+//! 通道阈值，BLB-02 #64）、[`toolspool`]（tool_call 二进制内容寻址暂存 + 惰性切片解析器，BLB-03 #66）、
+//! [`upload`]（`client:put_blob` 上行写入的有界上传会话，v0.4.0 #195）。
 
 pub mod handle;
 pub mod resolver;
 pub mod thresholds;
 pub mod toolspool;
+pub mod upload;
 
 pub use handle::{
     decode_blob_handle, encode_skill_handle, encode_toolspool_handle, BlobHandleError,
@@ -28,8 +30,11 @@ pub use handle::{
 pub use resolver::{BlobResolver, BlobSlicer, ResolvedBlob, SkillBlobResolver, SkillRootLookup};
 pub use thresholds::{
     default_thresholds, BlobThresholds, DEFAULT_CHUNK_MAX_BYTES, DEFAULT_INLINE_BUDGET,
-    DEFAULT_TOO_LARGE_CAP, ENV_CHUNK_MAX_BYTES, ENV_INLINE_BUDGET, ENV_TOO_LARGE_CAP,
+    DEFAULT_TOO_LARGE_CAP, DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS, DEFAULT_UPLOAD_MAX_BYTES,
+    DEFAULT_UPLOAD_MAX_CONCURRENT, ENV_CHUNK_MAX_BYTES, ENV_INLINE_BUDGET, ENV_TOO_LARGE_CAP,
+    ENV_UPLOAD_IDLE_TIMEOUT, ENV_UPLOAD_MAX_BYTES, ENV_UPLOAD_MAX_CONCURRENT,
 };
 pub use toolspool::{
     BlobStat, ToolspoolBlobResolver, ToolspoolBlobStore, ToolspoolStoreError, BLOBSPOOL_DIRNAME,
 };
+pub use upload::{sanitize_name_hint, BlobUploadStore, PART_DIR_NAME};

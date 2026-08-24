@@ -524,6 +524,7 @@ async fn tool_call_binary_blob_roundtrip() {
         inline_budget: 256, // < 4 KiB → 必走 blob 旁路
         too_large_cap: 64 * 1024 * 1024,
         chunk_max_bytes: 1024, // 4 KiB / 1 KiB ≈ 4 块 → 验证分块重组
+        ..BlobThresholds::default()
     };
     let computer = spawn_computer(&server.url(), OFFICE, COMPUTER, &td, Some(thresholds)).await;
     let agent = agent_client(&server.url()).await;

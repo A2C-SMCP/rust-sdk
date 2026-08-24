@@ -140,6 +140,10 @@ pub enum ErrorCode {
     SkillResourceNotAccessible = 4017,
     /// 二进制 blob 不可达 / Binary blob not accessible（invalid_handle / forbidden / gone / range）。
     BlobNotAccessible = 4018,
+    /// 二进制 blob 上行写入失败 / Binary blob write failed（v0.4.0，
+    /// `client:put_blob` 写入期唯一错误码；`details.reason` ∈ invalid_upload / invalid_declaration /
+    /// range / too_large / busy / forbidden / integrity / io_error，开放枚举）。
+    BlobWriteFailed = 4019,
 }
 
 impl ErrorCode {
@@ -160,6 +164,7 @@ impl ErrorCode {
             4016 => Some(Self::SkillNameInvalid),
             4017 => Some(Self::SkillResourceNotAccessible),
             4018 => Some(Self::BlobNotAccessible),
+            4019 => Some(Self::BlobWriteFailed),
             _ => None,
         }
     }
@@ -382,6 +387,8 @@ pub mod events {
     pub const CLIENT_GET_SKILL: &str = "client:get_skill";
     /// 客户端通用二进制拉取请求（v0.2.1）/ Generic binary pull (v0.2.1)。
     pub const CLIENT_GET_BLOB: &str = "client:get_blob";
+    /// 客户端通用二进制上行写入请求（v0.4.0）/ Generic binary push (v0.4.0)。
+    pub const CLIENT_PUT_BLOB: &str = "client:put_blob";
 
     /// 服务器加入办公室请求
     pub const SERVER_JOIN_OFFICE: &str = "server:join_office";
@@ -1194,6 +1201,137 @@ pub struct GetBlobRet {
     pub req_id: Option<ReqId>,
 }
 
+/// `client:put_blob` 事件名 / event name（顶层别名，等于 [`events::CLIENT_PUT_BLOB`]）。
+///
+/// 对齐 Python `a2c_smcp.smcp.PUT_BLOB_EVENT`。
+pub const PUT_BLOB_EVENT: &str = events::CLIENT_PUT_BLOB;
+
+/// 通用二进制上行写入请求（`client:put_blob`，v0.4.0）。
+///
+/// [`GetBlobReq`] 的方向镜像：`chunk_offset` / `eof` 由 **Agent 驱动推进**，`sha256` / `total_size`
+/// 由 **Agent 声明、Computer 校验**。线格式 **snake_case 直映**（与 GetBlobReq 一致，无 camelCase 转换）。
+///
+/// 键语义 / Key semantics（对齐 python `PutBlobReq` TypedDict）：
+/// - 可选字段缺失 = 键**整个缺席**（`Option` + `skip_serializing_if`，镜像 python NotRequired）
+/// - 首块 = `upload_id` 缺席（`chunk_offset` 0）且携带声明字段；后续块 MUST NOT 携带声明字段
+///   （违反 → `4019 invalid_declaration`）；`in-order` 强制（`chunk_offset` == Computer 已收字节）
+///
+/// 协议依据 / Protocol: events.md §client:put_blob；data-structures.md §PutBlobReq；
+/// blob-transfer.md §3（有界会话）/ §7（landing 沙箱）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PutBlobReq {
+    #[serde(flatten)]
+    pub base: AgentCallData,
+    /// 目标 Computer 名 / target Computer name。
+    pub computer: String,
+    /// 可选：缺省即首块（offset 0），Computer 分配并回传 / optional: absent ⟺ first chunk。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
+    /// 本块起始字节偏移；MUST == Computer 已收字节（in-order，无稀疏缓冲）/ chunk start offset。
+    pub chunk_offset: u64,
+    /// 末块标志 / end-of-file marker。
+    pub eof: bool,
+    /// 仅首块：声明总字节（MUST ≥ 1）/ first chunk only: declared total bytes。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_size: Option<u64>,
+    /// 仅首块：声明全量 sha256（六十四进制）/ first chunk only: declared full sha256 (hex)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// 仅首块可选：建议文件名；Computer 消毒后采用或自定 / first chunk only: preferred name。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_hint: Option<String>,
+    /// 本块字节的 base64 编码 / base64 of this chunk's bytes。
+    pub blob: String,
+}
+
+impl PutBlobReq {
+    /// 构造首块请求（`blob_raw` 内部 base64 编码为 `blob` 字段）。
+    ///
+    /// 对齐 Python `create_put_blob_request`（首块 + declaration 分支）；`agent` 为自身标识，
+    /// `req_id` 自动生成。声明字段（total_size / sha256 / name_hint）随首块携带。
+    #[allow(clippy::too_many_arguments)] // 协议字段齐备之必需（同 build_put_blob_request 先例）。
+    pub fn first_chunk(
+        agent: &str,
+        computer: &str,
+        chunk_offset: u64,
+        eof: bool,
+        blob_raw: &[u8],
+        total_size: u64,
+        sha256: &str,
+        name_hint: Option<&str>,
+    ) -> Self {
+        Self {
+            base: AgentCallData {
+                agent: agent.to_string(),
+                req_id: ReqId::new(),
+            },
+            computer: computer.to_string(),
+            upload_id: None,
+            chunk_offset,
+            eof,
+            total_size: Some(total_size),
+            sha256: Some(sha256.to_string()),
+            name_hint: name_hint.map(str::to_string),
+            blob: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, blob_raw),
+        }
+    }
+
+    /// 构造后续块请求（携带 `upload_id`；MUST NOT 携带声明字段）。
+    ///
+    /// 对齐 Python `create_put_blob_request`（非首块分支）。
+    pub fn chunk(
+        agent: &str,
+        computer: &str,
+        upload_id: &str,
+        chunk_offset: u64,
+        eof: bool,
+        blob_raw: &[u8],
+    ) -> Self {
+        Self {
+            base: AgentCallData {
+                agent: agent.to_string(),
+                req_id: ReqId::new(),
+            },
+            computer: computer.to_string(),
+            upload_id: Some(upload_id.to_string()),
+            chunk_offset,
+            eof,
+            total_size: None,
+            sha256: None,
+            name_hint: None,
+            blob: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, blob_raw),
+        }
+    }
+}
+
+/// 通用二进制上行写入响应 / Generic binary push response（`PutBlobRet`）。
+///
+/// 仅末块 ack 携带 `landing_path` / `total_size` / `sha256`；`sha256` 为 Computer 重算全量值
+/// （== 首块声明才成功），Agent **SHOULD** 比对声明。`landing_path` 为 landing root 内**绝对路径**
+/// （Computer 生成安全名 = `upload_id` 派生 + 消毒后 `name_hint`），Agent 原样嵌入后续
+/// `client:tool_call` 参数。
+///
+/// 协议依据 / Protocol: data-structures.md §PutBlobRet；blob-transfer.md §3。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PutBlobRet {
+    /// 首块 ack 回传；后续块回显 / echoed upload id。
+    pub upload_id: String,
+    /// 回显本块起始字节偏移 / echoed chunk start offset。
+    pub chunk_offset: u64,
+    /// 仅末块 ack：landing root 内绝对路径（安全名）/ final chunk only: absolute landing path。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_path: Option<String>,
+    /// 仅末块 ack：实际落盘字节（== 声明值才成功）/ final chunk only: actual stored bytes。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_size: Option<u64>,
+    /// 仅末块 ack：Computer 重算全量 sha256（== 声明值）/ final chunk only: recomputed sha256。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// 回显的请求 id（可选）/ echoed request id (optional)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_id: Option<ReqId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,7 +1540,7 @@ mod tests {
     #[test]
     fn test_is_protocol_error_payload_flat_true() {
         // 顶层 code 为协议 ErrorCode 取值 → true
-        for code in [404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018] {
+        for code in [404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019] {
             let v = serde_json::json!({ "code": code, "message": "x" });
             assert!(
                 is_protocol_error_payload(&v),
@@ -1586,6 +1724,7 @@ mod tests {
         assert_eq!(ErrorCode::SkillNameInvalid.code(), 4016);
         assert_eq!(ErrorCode::SkillResourceNotAccessible.code(), 4017);
         assert_eq!(ErrorCode::BlobNotAccessible.code(), 4018);
+        assert_eq!(ErrorCode::BlobWriteFailed.code(), 4019);
     }
 
     #[test]
@@ -1606,6 +1745,8 @@ mod tests {
     fn test_error_code_deserializes_from_int() {
         let c: ErrorCode = serde_json::from_str("4014").unwrap();
         assert_eq!(c, ErrorCode::McpServerNotFound);
+        let c: ErrorCode = serde_json::from_str("4019").unwrap();
+        assert_eq!(c, ErrorCode::BlobWriteFailed);
         // 未知码值必须报错（解析方对已知集合是封闭的）
         assert!(serde_json::from_str::<ErrorCode>("9999").is_err());
         assert_eq!(ErrorCode::from_code(9999), None);
@@ -1623,6 +1764,7 @@ mod tests {
             ErrorCode::SkillNameInvalid,
             ErrorCode::SkillResourceNotAccessible,
             ErrorCode::BlobNotAccessible,
+            ErrorCode::BlobWriteFailed,
         ] {
             let json = serde_json::to_string(&code).unwrap();
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
@@ -1744,6 +1886,136 @@ mod tests {
         assert_eq!(v["eof"], true);
         let back: GetBlobRet = serde_json::from_value(v).unwrap();
         assert_eq!(back, last);
+    }
+
+    // ── #195 client:put_blob 上行写入 / Upstream binary push ──────────────
+
+    #[test]
+    fn test_put_blob_event_constant() {
+        // PUT_BLOB_EVENT 字符串精确匹配，且与 events 模块同源（对齐 python PUT_BLOB_EVENT）
+        assert_eq!(PUT_BLOB_EVENT, "client:put_blob");
+        assert_eq!(PUT_BLOB_EVENT, events::CLIENT_PUT_BLOB);
+    }
+
+    #[test]
+    fn test_put_blob_req_first_chunk_serde() {
+        // 首块：upload_id 缺席、声明字段平铺、blob 为 base64（内部编码）
+        let req = PutBlobReq::first_chunk(
+            "agent-1",
+            "comp-1",
+            0,
+            false,
+            b"hello",
+            5,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            Some("my.txt"),
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["agent"], "agent-1");
+        assert_eq!(v["computer"], "comp-1");
+        assert_eq!(v["chunk_offset"], 0);
+        assert_eq!(v["eof"], false);
+        assert_eq!(v["total_size"], 5);
+        assert_eq!(
+            v["sha256"],
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(v["name_hint"], "my.txt");
+        assert_eq!(v["blob"], "aGVsbG8="); // base64("hello")
+        assert!(v.get("upload_id").is_none(), "首块不得携带 upload_id");
+        assert!(v.get("req_id").is_some());
+        // 对拍 python `create_put_blob_request` 实测键集（python: agent/blob/chunk_offset/computer/
+        // eof/name_hint/req_id/sha256/total_size——无 upload_id，无 null 键）。
+        let keys: std::collections::BTreeSet<&str> =
+            v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "agent", "blob", "chunk_offset", "computer", "eof", "name_hint", "req_id",
+                "sha256", "total_size"
+            ]
+            .into_iter()
+            .collect()
+        );
+        let back: PutBlobReq = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+        assert_eq!(back.upload_id, None);
+    }
+
+    #[test]
+    fn test_put_blob_req_first_chunk_without_name_hint_omits_key() {
+        let req = PutBlobReq::first_chunk(
+            "a", "c", 0, true, b"x", 1, "abc", None,
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(
+            v.get("name_hint").is_none(),
+            "无 name_hint 时键应整个缺席（非 null）"
+        );
+    }
+
+    #[test]
+    fn test_put_blob_req_chunk_omits_declaration_keys() {
+        // 后续块：upload_id 回显、声明字段 MUST NOT 出现
+        let req = PutBlobReq::chunk("agent-1", "comp-1", "u1", 5, true, b"world");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["upload_id"], "u1");
+        assert_eq!(v["chunk_offset"], 5);
+        assert_eq!(v["eof"], true);
+        assert_eq!(v["blob"], "d29ybGQ="); // base64("world")
+        for key in ["total_size", "sha256", "name_hint"] {
+            assert!(v.get(key).is_none(), "后续块不得携带 {key}");
+        }
+        // 对拍 python `create_put_blob_request` 实测键集（agent/blob/chunk_offset/computer/eof/
+        // req_id/upload_id——无声明键）。
+        let keys: std::collections::BTreeSet<&str> =
+            v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["agent", "blob", "chunk_offset", "computer", "eof", "req_id", "upload_id"]
+                .into_iter()
+                .collect()
+        );
+        let back: PutBlobReq = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+        assert_eq!(back.upload_id.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn test_put_blob_ret_first_vs_final_chunk_roundtrip() {
+        // 中间块 ack：仅 upload_id / chunk_offset / req_id（landing 字段键缺席）
+        let mid = PutBlobRet {
+            upload_id: "u1".to_string(),
+            chunk_offset: 0,
+            landing_path: None,
+            total_size: None,
+            sha256: None,
+            req_id: Some(ReqId::from_string("r1".to_string())),
+        };
+        let v = serde_json::to_value(&mid).unwrap();
+        assert_eq!(v["upload_id"], "u1");
+        assert_eq!(v["chunk_offset"], 0);
+        for key in ["landing_path", "total_size", "sha256"] {
+            assert!(v.get(key).is_none(), "中间块 ack 不得携带 {key}");
+        }
+        let back: PutBlobRet = serde_json::from_value(v).unwrap();
+        assert_eq!(back, mid);
+
+        // 末块 ack：landing 字段齐备
+        let final_ret = PutBlobRet {
+            upload_id: "u1".to_string(),
+            chunk_offset: 5,
+            landing_path: Some("/tmp/landing/u1_my.txt".to_string()),
+            total_size: Some(5),
+            sha256: Some("abc".to_string()),
+            req_id: Some(ReqId::from_string("r2".to_string())),
+        };
+        let v2 = serde_json::to_value(&final_ret).unwrap();
+        assert_eq!(v2["landing_path"], "/tmp/landing/u1_my.txt");
+        assert_eq!(v2["total_size"], 5);
+        assert_eq!(v2["sha256"], "abc");
+        let back2: PutBlobRet = serde_json::from_value(v2).unwrap();
+        assert_eq!(back2, final_ret);
     }
 
     // ── #42 CallToolResult meta / _meta 标记 ─────────────────────────────

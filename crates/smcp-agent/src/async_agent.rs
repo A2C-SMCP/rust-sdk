@@ -17,7 +17,8 @@ use crate::{
     request_builders::{
         build_get_blob_request, build_get_config_request, build_get_desktop_request,
         build_get_resources_request, build_get_skill_request, build_get_skills_request,
-        build_get_tools_request, build_tool_call_cancel, build_tool_call_request,
+        build_get_tools_request, build_put_blob_request, build_tool_call_cancel,
+        build_tool_call_request,
     },
     response::{
         ensure_req_id, parse_get_blob_response, parse_get_config_response,
@@ -26,10 +27,14 @@ use crate::{
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport},
 };
+use smcp::utils::blob::{
+    pump_blob, BlobChunkFailure, PumpBlobOptions, PutBlobChunkRequest, PutBlobResult,
+    DEFAULT_CHUNK_SIZE,
+};
 use smcp::{
     events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetComputerConfigRet,
-    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, ReqId, Role, SMCPTool, SessionInfo,
-    SMCP_NAMESPACE,
+    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, PutBlobRet, ReqId, Role,
+    SMCPTool, SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -653,6 +658,83 @@ impl AsyncSmcpAgent {
                 Err(SmcpAgentError::from(blob_err))
             }
         }
+    }
+
+    /// 上行落盘到 Computer landing root（v0.4.0 #195）/ Upload bytes to the Computer landing root.
+    ///
+    /// 分块推送 `data` 至 `client:put_blob`：首块声明 `total_size`/`sha256`（+可选 `name_hint`）→
+    /// ack-paced 顺序发送 → 末块取绝对 `landing_path`，可直接嵌入后续 `client:tool_call` 参数。
+    /// 复用 UTIL-02 [`smcp::utils::blob::pump_blob`]，注入「以本 Agent transport 发 `client:put_blob`」
+    /// 的单块 `call` 闭包。能力门控 = 自身 `PROTOCOL_VERSION` minor ≥ 0.4（pump 内强制）。
+    ///
+    /// 失败语义（协议 §3，`client:put_blob` 写入期一切失败 = 4019）：4019 reason（busy / too_large /
+    /// forbidden / integrity ……）→ [`SmcpAgentError::Upload`]（调用方可按 reason 决定退避；重试 =
+    /// 新 `upload_id` 从 0 重传）；首块超时 → `UploadUnsupported`（目标疑似不支持 put_blob，字节留
+    /// 上下文，防御性兜底）；非首块传输错误 → `ChunkTransport`。
+    /// 对标 Python `a2c_smcp/agent/client.py::put_blob` + `utils/blob.py::pump_blob`。
+    pub async fn put_blob(
+        &self,
+        computer: &str,
+        data: &[u8],
+        name_hint: Option<&str>,
+        chunk_size: Option<u64>,
+    ) -> Result<PutBlobResult> {
+        let transport = self.resolve_transport().await?;
+        let agent = self.auth_provider.get_agent_config().agent.clone();
+        let get_timeout = self.config.get_timeout;
+
+        let call = move |chunk: PutBlobChunkRequest| {
+            let agent = agent.clone();
+            let transport = Arc::clone(&transport);
+            async move {
+                let req = build_put_blob_request(
+                    &agent,
+                    &chunk.computer,
+                    chunk.upload_id.as_deref(),
+                    chunk.chunk_offset,
+                    chunk.eof,
+                    &chunk.chunk,
+                    chunk.declaration,
+                );
+                let data = match serde_json::to_value(&req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(BlobChunkFailure::Transport(format!(
+                            "serialize put_blob request failed: {e}"
+                        )));
+                    }
+                };
+                match transport.call(CLIENT_PUT_BLOB, data, get_timeout).await {
+                    // flat ErrorPayload（4019 等）→ 交 pump 分类（4019→WriteFailed，余→Protocol）。
+                    Ok(resp) if smcp::is_protocol_error_payload(&resp) => {
+                        Err(BlobChunkFailure::Protocol(error_payload_from_value(&resp)))
+                    }
+                    Ok(resp) => match serde_json::from_value::<PutBlobRet>(resp) {
+                        Ok(ret) => Ok(ret),
+                        Err(e) => {
+                            Err(BlobChunkFailure::Transport(format!(
+                                "malformed PutBlobRet: {e}"
+                            )))
+                        }
+                    },
+                    Err(SmcpAgentError::Timeout) => Err(BlobChunkFailure::Timeout),
+                    Err(e) => Err(BlobChunkFailure::Transport(format!("{e}"))),
+                }
+            }
+        };
+
+        pump_blob(
+            call,
+            computer,
+            data,
+            PumpBlobOptions {
+                name_hint: name_hint.map(str::to_string),
+                // `None` → 默认 256 KiB；显式 0 由 pump 拒（bad_chunk_size，镜像 python）。
+                chunk_size: chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE),
+            },
+        )
+        .await
+        .map_err(|e| SmcpAgentError::Upload(Box::new(e)))
     }
 
     /// 调用工具

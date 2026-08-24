@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 // INT-01 #68：SKILL / blob 子系统编排 / SKILL & blob subsystem orchestration。
 use crate::blob::{
     decode_blob_handle, default_thresholds, encode_toolspool_handle, BlobHandleError, BlobResolver,
-    BlobThresholds, BlobTooLargeError, DecodedHandle, ResolvedBlob, SkillBlobResolver,
+    BlobThresholds, BlobTooLargeError, BlobUploadStore, DecodedHandle, ResolvedBlob, SkillBlobResolver,
     SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
@@ -58,7 +58,7 @@ use crate::settings::reconciler::InstalledPluginRecord;
 use crate::settings::recovery::{
     plugin_enabled_origin, BundledServerRecord, GovernanceRecoveryReport,
 };
-use crate::settings::schema::SettingsScope;
+use crate::settings::schema::{SettingsScope, FIELD_LANDING_ROOT};
 use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
@@ -67,6 +67,8 @@ use crate::skills::{
 };
 use smcp::utils::env_truthy;
 use smcp::A2CSkillRef;
+
+use smcp::{ErrorPayload, PutBlobReq, PutBlobRet};
 
 use crate::errors::{ComputerError, ComputerResult};
 // #162：结构化 Runtime diagnostics 词汇（记录 / 清除接线全走 `RuntimeStatus` 的键控集）。
@@ -580,8 +582,18 @@ pub struct Computer<S: Session> {
     blob_thresholds: BlobThresholds,
     /// 内容寻址暂存（boot 时建；mint 时写入）/ toolspool store (built at boot)。
     toolspool_store: Arc<RwLock<Option<Arc<ToolspoolBlobStore>>>>,
-    /// kind → resolver 派发表（boot 时装配 toolspool；skill 由 resolve_blob async 处理）/ resolver table。
+    /// kind → resolver 派发表（boot 时装配 toolspool；skill 由 resolve_blob async 处理）/ resolver table.
     blob_resolvers: Arc<RwLock<HashMap<String, Arc<dyn BlobResolver>>>>,
+    /// `client:put_blob` 落盘根（v0.4.0 #195）：§7 config-first lazy——已配置进程内缓存、未配置每次
+    /// 重查（镜像 python `computer.py::landing_root` 热启用语义）/ landing root (lazy-resolved).
+    landing_root: Arc<RwLock<Option<PathBuf>>>,
+    /// 上传会话 store（lazy 双检锁构造；仅 landing root 已配置才缓存——None-root store 拒绝一切上传）/
+    /// upload-session store (double-checked lazy construction).
+    blob_upload_store: Arc<RwLock<Option<Arc<BlobUploadStore>>>>,
+    /// lazy 双检锁（store 构造串行化）/ double-check construction lock.
+    blob_upload_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 落盘根注入覆盖（测试/部署；短路 settings 查询）/ landing-root injection override.
+    landing_root_override: Option<PathBuf>,
 
     // ── INT-02 #70：tool_call 取消最后一公里 / tool_call cancellation last-mile ──────────
     /// 在途可取消工具调用注册表（`req_id` → [`CancellationToken`]），响应 `notify:tool_call_cancel`。
@@ -967,6 +979,10 @@ impl<S: Session> Computer<S> {
             blob_thresholds: default_thresholds(),
             toolspool_store: Arc::new(RwLock::new(None)),
             blob_resolvers: Arc::new(RwLock::new(HashMap::new())),
+            landing_root: Arc::new(RwLock::new(None)),
+            blob_upload_store: Arc::new(RwLock::new(None)),
+            blob_upload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            landing_root_override: None,
             inflight_tool_tasks: Arc::new(StdMutex::new(HashMap::new())),
             desktop_window_uris: Arc::new(RwLock::new(HashSet::new())),
             mcp_notify_task: Arc::new(Mutex::new(None)),
@@ -990,6 +1006,14 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_blob_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.blob_cache_root_override = Some(root.into());
+        self
+    }
+
+    /// 注入 `client:put_blob` 落盘根覆盖（测试/部署；短路 settings `landingRoot` 查询）。
+    /// Inject a landing-root override (tests/deployment; short-circuits the settings query).
+    #[must_use]
+    pub fn with_landing_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.landing_root_override = Some(root.into());
         self
     }
 
@@ -1815,6 +1839,58 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn blob_thresholds(&self) -> BlobThresholds {
         self.blob_thresholds
+    }
+
+    // ── #195：client:put_blob 上行 / upstream write channel ──────────────────
+
+    /// 解析 `client:put_blob` 落盘根（§7 config-first lazy——镜像 python `computer.py::landing_root`
+    /// 热启用语义：已配置进程内缓存；未配置每次重查，事后补配置可即时生效）。
+    ///
+    /// 优先 `with_landing_root` 注入覆盖；否则从 settings `landingRoot` 取（绝对路径；project scope
+    /// 供给已被 [`TRUSTED_SCOPE_ONLY_FIELDS`](crate::settings::schema::TRUSTED_SCOPE_ONLY_FIELDS)
+    /// 过滤）。未配置 → `None` → store fail-closed（`4019 forbidden`，零字节落盘）。
+    pub async fn landing_root(&self) -> Option<PathBuf> {
+        if let Some(override_root) = self.landing_root_override.clone() {
+            return Some(override_root);
+        }
+        let mut slot = self.landing_root.write().await;
+        if let Some(cached) = slot.as_ref() {
+            return Some(cached.clone());
+        }
+        if let Some(root) = resolve_landing_root_settings(&self.config_dir(), self.config_env()) {
+            *slot = Some(root.clone());
+            return Some(root);
+        }
+        None
+    }
+
+    /// `client:put_blob` 上传会话表（lazy 双检锁构造；镜像 python
+    /// `computer.py::blob_upload_store`：**已配置 landing root 后进程内单例**——会话状态只在 store
+    /// 内存里；**未配置时不缓存**——None-root store 拒绝一切上传（4019 forbidden），重建零代价）。
+    pub async fn blob_upload_store(&self) -> Arc<BlobUploadStore> {
+        if let Some(store) = self.blob_upload_store.read().await.clone() {
+            return store;
+        }
+        let _guard = self.blob_upload_lock.lock().await;
+        if let Some(store) = self.blob_upload_store.read().await.clone() {
+            return store;
+        }
+        let candidate = Arc::new(BlobUploadStore::new(
+            self.landing_root().await,
+            self.blob_thresholds,
+        ));
+        if candidate.landing_root().is_some() {
+            *self.blob_upload_store.write().await = Some(candidate.clone());
+        }
+        candidate
+    }
+
+    /// 处理单个 `client:put_blob` 块（首块 / 后续块 / 末块统一入口，§3）。
+    ///
+    /// 委托 [`BlobUploadStore::handle_chunk`]；4019 flat ErrorPayload 处理失败面（语义见 upload.rs）。
+    pub async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload> {
+        // blob_upload_store 恒构造一个 store（None-root 亦拒绝一切上传），此处不做 None 分支。
+        self.blob_upload_store().await.handle_chunk(req)
     }
 
     /// 铸造 `kind=toolspool` 不透明句柄并写盘 / Mint an opaque toolspool handle。
@@ -4358,6 +4434,10 @@ impl<S: Session> Computer<S> {
             blob_thresholds: self.blob_thresholds,
             toolspool_store: Arc::clone(&self.toolspool_store),
             blob_resolvers: Arc::clone(&self.blob_resolvers),
+            landing_root: Arc::clone(&self.landing_root),
+            blob_upload_store: Arc::clone(&self.blob_upload_store),
+            blob_upload_lock: Arc::clone(&self.blob_upload_lock),
+            landing_root_override: self.landing_root_override.clone(),
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
             // desktop 缓存共享（clone 与本体同一 window:// 集合视图）；通知任务句柄不复制（仅本体持有消费者）。
             desktop_window_uris: Arc::clone(&self.desktop_window_uris),
@@ -4622,6 +4702,11 @@ impl<S: Session + Clone> Clone for Computer<S> {
             blob_thresholds: self.blob_thresholds,
             toolspool_store: Arc::clone(&self.toolspool_store),
             blob_resolvers: Arc::clone(&self.blob_resolvers),
+            // #195：put_blob 落盘根与上传 store 为整机运行态——clone 命中同一 Arc。
+            landing_root: Arc::clone(&self.landing_root),
+            blob_upload_store: Arc::clone(&self.blob_upload_store),
+            blob_upload_lock: Arc::clone(&self.blob_upload_lock),
+            landing_root_override: self.landing_root_override.clone(),
             // 取消注册表属**共享态**：clone 体与原 Computer 须命中同一表，否则跨 clone 的 acancel_tool 失效。
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
             // desktop 缓存与通知消费者均属整机运行态，任一公开 handle shutdown 都须可确定性清理。
@@ -4674,6 +4759,8 @@ pub(crate) trait ComputerHandlerOps: Send + Sync {
     ) -> Result<String, BlobMintError>;
     /// blob 阈值（inline / too_large / chunk_max）/ blob thresholds。
     fn blob_thresholds(&self) -> BlobThresholds;
+    /// 处理单个 `client:put_blob` 块（首块/后续/末块统一入口，v0.4.0 #195）/ handle one put_blob chunk。
+    async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload>;
     /// 可取消执行工具调用（取消/超时写结果级 meta）/ cancellable tool-call execution。
     async fn execute_tool_cancellable(
         &self,
@@ -4717,6 +4804,9 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
     fn blob_thresholds(&self) -> BlobThresholds {
         Computer::blob_thresholds(self)
     }
+    async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload> {
+        Computer::put_blob_chunk(self, req).await
+    }
     async fn execute_tool_cancellable(
         &self,
         req_id: &str,
@@ -4729,6 +4819,28 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
     async fn acancel_tool(&self, req_id: &str) -> bool {
         Computer::acancel_tool(self, req_id).await
     }
+}
+
+/// 从 settings 五层合并视图解析 `landingRoot`（§7 config-first；project 供给已被 schema 过滤）。
+///
+/// 与 python `landing_root` 属性同构：`~` 前缀经 [`expand_home`](crate::skills::home::expand_home)
+/// 展开（尊重注入 env，保持 hermetic）；非字符串 / 空值 → `None`（fail-closed）。
+fn resolve_landing_root_settings(
+    config_dir: &std::path::Path,
+    env: Option<&EnvMap>,
+) -> Option<PathBuf> {
+    let policy = resolve_policy_settings(None, None, None);
+    let resolved = resolve_settings(ResolveSettingsArgs {
+        cwd: Some(config_dir),
+        env,
+        flag_settings_path: None,
+        policy_settings: Some(&policy),
+    });
+    let raw = resolved.settings.get(FIELD_LANDING_ROOT)?.as_str()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(crate::skills::home::expand_home(raw.trim(), env))
 }
 
 /// MCP 源 SKILL 重物化的共享自由函数（#106）：`Computer::restage_mcp_skills` 与 [`McpChangeReactor`] 共用，
@@ -7158,6 +7270,7 @@ mod tests {
                 inline_budget: 8,
                 too_large_cap: 4,
                 chunk_max_bytes: 8,
+                ..BlobThresholds::default()
             });
         computer.boot_up().await.unwrap();
         let err = computer

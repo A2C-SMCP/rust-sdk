@@ -29,6 +29,19 @@
 //! 注：此处刻意比 Python 参考更稳健——Python `_drain_parallel_sync` 用 `as_completed` + 首错即停，
 //! range 先完成会掩盖并存 fatal（与其 `_drain_parallel_async` 不一致）；已出建议报告促 Python 对齐。
 //! Deliberately more robust than the Python reference, whose sync path can mask a co-occurring fatal.
+//!
+//! # 上行写 / Upstream write（client:put_blob，v0.4.0）
+//!
+//! [`pump_blob`] / [`pump_blob_sync`] 是对称的上行落盘例程：ack-paced **顺序**单块发送（协议
+//! in-order 强制，无并行红利）；首块声明 `total_size` / `sha256` / 可选 `name_hint` --> 末块
+//! `eof` 取 `landing_path`。**无自动重试**：`busy` 等 4019 落到 [`BlobUploadError::WriteFailed`]，
+//! 退避后重试 = 新 `upload_id` 从 0 重传（协议 §3 无跨尝试断点），由调用方决定。
+//! 对标 / mirrors the Python reference: `a2c_smcp/utils/blob.py`（`pump_blob` /
+//! `pump_blob_sync` / `BlobUploadError` / `BlobUploadUnsupportedError`）。
+//!
+//! 能力门控（协议 §3）：自身 `PROTOCOL_VERSION` minor ≥ 0.4 才可发起上行（版本握手 MINOR 严格
+//! 匹配且同房间传递）；首块超时视为不支持（〔`BlobUploadError::UploadUnsupported`〕载荷随异常
+//! 保留）——防御性兜底，**不是**正式回退路径。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -39,7 +52,7 @@ use base64::Engine as _;
 use futures::stream::{self, StreamExt as _};
 
 use crate::utils::hash::sha256_hex;
-use crate::{ErrorCode, ErrorPayload, GetBlobRet};
+use crate::{ErrorCode, ErrorPayload, GetBlobRet, PutBlobRet};
 
 /// 默认单块上限 256 KiB / default chunk-size cap.
 ///
@@ -235,6 +248,385 @@ where
         Err(ParallelErr::Fallback) => {
             drain_serial_sync(&call, computer, blob_handle, chunk_size, max_retries)
         }
+    }
+}
+
+// ── 上行（client:put_blob）公开类型 / Upstream (client:put_blob) public types ──
+
+/// 首块声明 / first-chunk declaration（Agent 声明、Computer 校验）。
+///
+/// 对标 Python `create_put_blob_request` 的 `declaration` dict。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutBlobDeclaration {
+    /// 声明总字节（MUST ≥ 1）/ declared total bytes。
+    pub total_size: u64,
+    /// 声明全量 sha256（十六进制）/ declared full sha256 (hex)。
+    pub sha256: String,
+    /// 建议文件名（可选，Computer 消毒后采用或自定）/ preferred file name (optional)。
+    pub name_hint: Option<String>,
+}
+
+/// 单块上行请求参数 / single-chunk upload params（传入调用方注入的 `call`）。
+///
+/// 对标 Python `AsyncPutCall` / `SyncPutCall` 的 `(upload_id, chunk_offset, eof, chunk_bytes,
+/// declaration)` 元组：`upload_id` 为 `None` 即首块（携带 `declaration`）。调用方（Agent SDK）
+/// 据此封装底层 `client:put_blob` ack 调用，注入 `agent` / `req_id`、base64 编码本块字节。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutBlobChunkRequest {
+    /// 目标 Computer 名（仅诊断；`call` 已具体路由）/ target Computer (diagnostic only)。
+    pub computer: String,
+    /// `None` ⟺ 首块（offset 0），Computer 分配并回传 / `None` ⟺ first chunk。
+    pub upload_id: Option<String>,
+    /// 本块起始字节偏移；MUST == Computer 已收字节（in-order）/ chunk start offset。
+    pub chunk_offset: u64,
+    /// 末块标志 / end-of-file marker。
+    pub eof: bool,
+    /// 本块原始字节（调用方负责 base64 编码进 wire）/ raw chunk bytes。
+    pub chunk: Vec<u8>,
+    /// 仅首块：声明 / first chunk only: declaration。
+    pub declaration: Option<PutBlobDeclaration>,
+}
+
+/// `pump_blob` 调优选项 / tuning options。
+#[derive(Debug, Clone)]
+pub struct PumpBlobOptions {
+    /// 建议文件名（仅首块送入声明）/ preferred file name (first chunk only)。
+    pub name_hint: Option<String>,
+    /// 单块原始字节上限；`0` 取 [`DEFAULT_CHUNK_SIZE`] / per-chunk raw-byte cap (`0` → default)。
+    pub chunk_size: u64,
+}
+
+impl Default for PumpBlobOptions {
+    fn default() -> Self {
+        Self {
+            name_hint: None,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+        }
+    }
+}
+
+/// 上行落盘成功结果 / final-chunk ack essentials。
+///
+/// 对标 Python `PutBlobResult`：`landing_path` 可直接嵌入后续 `client:tool_call` 参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutBlobResult {
+    /// landing root 内绝对路径（Computer 生成安全名）/ absolute path in the landing root。
+    pub landing_path: String,
+    /// 实际落盘字节（== 声明值才成功）/ stored bytes。
+    pub total_size: u64,
+    /// Computer 重算全量 sha256（回显值，Agent SHOULD 比对声明）/ recomputed sha256 echo。
+    pub sha256: String,
+}
+
+/// 4019 `details.reason` 开放枚举 / open enum for the 4019 reason。
+///
+/// 与 [`BlobErrorReason`]（4018 下行）分属两套 reason 集，MUST NOT 混用；未知值落 [`Self::Other`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobWriteErrorReason {
+    /// `upload_id` 无法识别 / 已过期 / unknown or expired session。
+    InvalidUpload,
+    /// 声明非法（字段齐备性 / 形状）/ invalid declaration。
+    InvalidDeclaration,
+    /// `chunk_offset` 与已收字节不符 / out-of-order offset。
+    Range,
+    /// 声明总字节超可配上限 / declared total exceeds the upload cap。
+    TooLarge,
+    /// 并发上传会话已达上限 / too many concurrent uploads。
+    Busy,
+    /// landing root 未配置 / 不可写 / denied by the landing sandbox。
+    Forbidden,
+    /// 重算 sha256 与声明不符（丢弃不落盘）/ integrity mismatch。
+    Integrity,
+    /// 落盘 IO 失败 / storage IO failure。
+    IoError,
+    /// 未知 reason（协议要求容忍）/ unknown reason。
+    Other(String),
+}
+
+impl BlobWriteErrorReason {
+    /// 解析协议 `details.reason` 字符串 / parse the protocol `details.reason` string。
+    pub fn parse(reason: &str) -> Self {
+        match reason {
+            "invalid_upload" => Self::InvalidUpload,
+            "invalid_declaration" => Self::InvalidDeclaration,
+            "range" => Self::Range,
+            "too_large" => Self::TooLarge,
+            "busy" => Self::Busy,
+            "forbidden" => Self::Forbidden,
+            "integrity" => Self::Integrity,
+            "io_error" => Self::IoError,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// 线格式 reason 字符串 / the wire reason string。
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::InvalidUpload => "invalid_upload",
+            Self::InvalidDeclaration => "invalid_declaration",
+            Self::Range => "range",
+            Self::TooLarge => "too_large",
+            Self::Busy => "busy",
+            Self::Forbidden => "forbidden",
+            Self::Integrity => "integrity",
+            Self::IoError => "io_error",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl std::fmt::Display for BlobWriteErrorReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 单块调用失败信号 / per-chunk call failure signal（`call` 返回值）。
+///
+/// 对标 Python：单个 ack 回传的 flat `ErrorPayload` → [`Self::Protocol`]（对应
+/// `_raise_for_put_blob_error` 的分类输入）；`socketio.TimeoutError` → [`Self::Timeout`]
+/// （首块 → [`BlobUploadError::UploadUnsupported`]，后续块 → [`BlobUploadError::ChunkTransport`]）；
+/// 其它传输异常 → [`Self::Transport`]。
+///
+/// 注：`ErrorPayload` 无 `Eq`（含 serde_json 宽字段）→ 本类型仅 `PartialEq`，与 `BlobTransferError` 同；
+/// `Protocol` 持全 flat `ErrorPayload`（宽结构）→ 局部 allow `large_enum_variant`，勿装箱
+/// （错误面保真优先，仓库先例）。
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum BlobChunkFailure {
+    /// ack 回传 flat ErrorPayload（4019 / 其它协议码）/ ack carried a flat ErrorPayload。
+    Protocol(ErrorPayload),
+    /// ack 超时 / ack timeout。
+    Timeout,
+    /// 其它传输失败（断连等）/ other transport failure。
+    Transport(String),
+}
+
+/// `pump_blob` 上行阶段错误 / upload-stage error。
+///
+/// 对标 Python `BlobUploadError` + `BlobUploadUnsupportedError`（`UnsupportedBySdk` /
+/// `UploadUnsupported` 对应后者；`WriteFailed` 对应 4019 reason 细分；`Protocol` 对应非 4019
+/// 协议码原样透传）。
+///
+/// 大变体 `UploadUnsupported` 持完整载荷（首块超时兜底需字节留上下文——协议 §3「字节留上下文
+/// 不落盘」）。盒装会改变载荷语义（python 直接持 bytes），按仓库先例局部 allow 即可。
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BlobUploadError {
+    /// 载荷为空（协议 `total_size >= 1`）/ empty payload。
+    #[error("put_blob requires at least one byte (protocol total_size >= 1)")]
+    EmptyPayload,
+    /// `chunk_size < 1`（负 / 零切片会恒空 → offset 永不前进）/ bad chunk size。
+    #[error("chunk_size must be >= 1, got {chunk_size}")]
+    BadChunkSize {
+        /// 给定的非法值 / the offending value。
+        chunk_size: u64,
+    },
+    /// 自身 `PROTOCOL_VERSION` minor < 0.4（能力门控 fail-fast）/ SDK does not support uploads。
+    #[error("client:put_blob requires protocol minor >= 0.4; this SDK speaks {0}")]
+    UnsupportedBySdk(String),
+    /// 首块超时（目标疑似不支持 put_blob；载荷随异常保留）/ first-chunk timeout。
+    #[error("put_blob first chunk timed out; target likely predates protocol 0.4.0")]
+    UploadUnsupported {
+        /// 完整载荷（字节留上下文，不落盘）/ the full payload.
+        data: Vec<u8>,
+        /// 声明总字节 / declared total bytes。
+        total_size: u64,
+        /// 声明 sha256 / declared sha256。
+        sha256: String,
+        /// 建议文件名（如果有）/ preferred file name (if any)。
+        name_hint: Option<String>,
+    },
+    /// 4019 写入失败，按 `details.reason` 细分 / 4019 write failed, keyed by reason。
+    #[error("blob write failed (reason: {reason}): {message}")]
+    WriteFailed {
+        /// 协议 4019 `details.reason` / the 4019 reason。
+        reason: BlobWriteErrorReason,
+        /// 协议 `message` / the protocol message。
+        message: String,
+    },
+    /// 末块 ack 缺失 / 空 `landing_path` / final ack missing landing_path。
+    #[error("final chunk ack missing landing_path")]
+    IncompleteAck,
+    /// 末块回显 sha256 与声明不符（落盘内容与声明不符的损坏信号）/ echo sha mismatch。
+    #[error("Computer echo sha256 {echo} != declared {declared}")]
+    EchoMismatch {
+        /// 回显值 / the echoed value。
+        echo: String,
+        /// 声明值 / the declared value。
+        declared: String,
+    },
+    /// 其它（非 4019）协议错误码原样透传 / other (non-4019) protocol code surfaced verbatim。
+    #[error("blob upload protocol error (code {code}): {message}")]
+    Protocol {
+        /// 协议 `ErrorPayload.code` / the protocol error code。
+        code: i64,
+        /// 协议 `message` / the protocol message。
+        message: String,
+    },
+    /// 非首块超时 / 其它传输失败（传输故障，未归一为协议错误）/ chunk transport failure。
+    #[error("put_blob chunk transport failure: {0}")]
+    ChunkTransport(String),
+}
+
+// ── 上行公开 API / Upstream public API ────────────────────────────────────
+
+/// 异步上行落盘 / upload bytes to the Computer landing root。
+///
+/// ack-paced **顺序**单块发送（协议 in-order 强制，无并行）：首块声明 `total_size` / `sha256` /
+/// 可选 `name_hint` → 逐块 base64 → 末块 `eof` 取 `landing_path`。**无自动重试**：4019 `busy` /
+/// `too_large` 等 → [`BlobUploadError::WriteFailed`]，调用方可按 reason 决定退避——任何失败重试 =
+/// 新 `upload_id` 从 0 重传（协议 §3 无跨尝试断点）。
+///
+/// `call` 为调用方注入的单块上行函数：`Fn(PutBlobChunkRequest) -> Future<Output = Result<
+/// PutBlobRet, BlobChunkFailure>>`——成功返回 [`PutBlobRet`]，失败返回 [`BlobChunkFailure`]。
+///
+/// # Errors
+/// 入口自检（能力门控 minor ≥ 0.4 / 空载荷 / `chunk_size < 1`）后进入循环；首块超时 →
+/// [`BlobUploadError::UploadUnsupported`]（载荷随异常保留）；4019 → [`WriteFailed`]；
+/// 末块 `landing_path` 缺失 → [`BlobUploadError::IncompleteAck`]；回显 sha 不符 →
+/// [`BlobUploadError::EchoMismatch`]。
+///
+/// [`WriteFailed`]: BlobUploadError::WriteFailed
+pub async fn pump_blob<F, Fut>(
+    call: F,
+    computer: &str,
+    data: &[u8],
+    opts: PumpBlobOptions,
+) -> Result<PutBlobResult, BlobUploadError>
+where
+    F: Fn(PutBlobChunkRequest) -> Fut,
+    Fut: Future<Output = Result<PutBlobRet, BlobChunkFailure>>,
+{
+    ensure_upload_supported(crate::PROTOCOL_VERSION)?;
+    if data.is_empty() {
+        return Err(BlobUploadError::EmptyPayload);
+    }
+    // 显式 `chunk_size=0` → bad_chunk_size（镜像 python `_prepare_declaration`：0/负 显拒；
+    // rust 无负 u64，调用方缺省经 `None→DEFAULT_CHUNK_SIZE` 表达）。
+    if opts.chunk_size == 0 {
+        return Err(BlobUploadError::BadChunkSize { chunk_size: 0 });
+    }
+    let chunk_size = opts.chunk_size;
+    let total_size = data.len() as u64;
+    let sha256 = sha256_hex(data);
+    let mut upload_id: Option<String> = None;
+    let mut offset: usize = 0;
+    loop {
+        // saturating_add：巨大 chunk_size 不得溢出（debug panic / release wrap 都会致切片 panic）。
+        let end = offset.saturating_add(chunk_size as usize).min(data.len());
+        let eof = end == data.len();
+        let first = upload_id.is_none();
+        let req = PutBlobChunkRequest {
+            computer: computer.to_owned(),
+            upload_id: upload_id.clone(),
+            chunk_offset: offset as u64,
+            eof,
+            chunk: data[offset..end].to_vec(),
+            declaration: first.then(|| PutBlobDeclaration {
+                total_size,
+                sha256: sha256.clone(),
+                name_hint: opts.name_hint.clone(),
+            }),
+        };
+        let ret = match call(req).await {
+            Ok(ret) => ret,
+            Err(BlobChunkFailure::Timeout) => {
+                // 协议 §3 防御性兜底：首块超时视为不支持（字节留上下文，不落盘）。
+                if first {
+                    return Err(BlobUploadError::UploadUnsupported {
+                        data: data.to_vec(),
+                        total_size,
+                        sha256,
+                        name_hint: opts.name_hint.clone(),
+                    });
+                }
+                return Err(BlobUploadError::ChunkTransport(
+                    "put_blob chunk ack timed out".to_string(),
+                ));
+            }
+            Err(BlobChunkFailure::Transport(e)) => {
+                return Err(BlobUploadError::ChunkTransport(e));
+            }
+            Err(BlobChunkFailure::Protocol(e)) => return Err(classify_upload_failure(&e)),
+        };
+        upload_id = Some(ret.upload_id.clone());
+        if eof {
+            return finalize_upload(ret, &sha256, total_size);
+        }
+        offset = end;
+    }
+}
+
+/// 同步上行落盘 / synchronous mirror of [`pump_blob`]。
+///
+/// # Errors
+/// 同 [`pump_blob`]。
+pub fn pump_blob_sync<F>(
+    call: F,
+    computer: &str,
+    data: &[u8],
+    opts: PumpBlobOptions,
+) -> Result<PutBlobResult, BlobUploadError>
+where
+    F: Fn(PutBlobChunkRequest) -> Result<PutBlobRet, BlobChunkFailure>,
+{
+    ensure_upload_supported(crate::PROTOCOL_VERSION)?;
+    if data.is_empty() {
+        return Err(BlobUploadError::EmptyPayload);
+    }
+    // 显式 `chunk_size=0` → bad_chunk_size（镜像 python `_prepare_declaration`：0/负 显拒；
+    // rust 无负 u64，调用方缺省经 `None→DEFAULT_CHUNK_SIZE` 表达）。
+    if opts.chunk_size == 0 {
+        return Err(BlobUploadError::BadChunkSize { chunk_size: 0 });
+    }
+    let chunk_size = opts.chunk_size;
+    let total_size = data.len() as u64;
+    let sha256 = sha256_hex(data);
+    let mut upload_id: Option<String> = None;
+    let mut offset: usize = 0;
+    loop {
+        // saturating_add：巨大 chunk_size 不得溢出（debug panic / release wrap 都会致切片 panic）。
+        let end = offset.saturating_add(chunk_size as usize).min(data.len());
+        let eof = end == data.len();
+        let first = upload_id.is_none();
+        let req = PutBlobChunkRequest {
+            computer: computer.to_owned(),
+            upload_id: upload_id.clone(),
+            chunk_offset: offset as u64,
+            eof,
+            chunk: data[offset..end].to_vec(),
+            declaration: first.then(|| PutBlobDeclaration {
+                total_size,
+                sha256: sha256.clone(),
+                name_hint: opts.name_hint.clone(),
+            }),
+        };
+        let ret = match call(req) {
+            Ok(ret) => ret,
+            Err(BlobChunkFailure::Timeout) => {
+                if first {
+                    return Err(BlobUploadError::UploadUnsupported {
+                        data: data.to_vec(),
+                        total_size,
+                        sha256,
+                        name_hint: opts.name_hint.clone(),
+                    });
+                }
+                return Err(BlobUploadError::ChunkTransport(
+                    "put_blob chunk ack timed out".to_string(),
+                ));
+            }
+            Err(BlobChunkFailure::Transport(e)) => {
+                return Err(BlobUploadError::ChunkTransport(e));
+            }
+            Err(BlobChunkFailure::Protocol(e)) => return Err(classify_upload_failure(&e)),
+        };
+        upload_id = Some(ret.upload_id.clone());
+        if eof {
+            return finalize_upload(ret, &sha256, total_size);
+        }
+        offset = end;
     }
 }
 
@@ -693,6 +1085,75 @@ fn extract_reason(err: &ErrorPayload) -> BlobErrorReason {
         .and_then(|v| v.as_str())
         .unwrap_or("invalid_handle");
     BlobErrorReason::parse(raw)
+}
+
+/// 能力门控（协议 §3）：自身 `PROTOCOL_VERSION` minor ≥ 0.4 才可发起上行 / capability gate。
+///
+/// 版本握手 MINOR 严格匹配 + 同房间传递 ⇒ 连上即保证房间内 Computer 同 minor。本检查是编译期
+/// 常量的运行时断言（常量回退时 fail-fast）；首块超时兜底见 [`BlobUploadError::UploadUnsupported`]。
+fn ensure_upload_supported(version: &str) -> Result<(), BlobUploadError> {
+    let minor = crate::ProtocolVersion::parse(version).map(|v| v.minor).unwrap_or(0);
+    if minor >= 4 {
+        Ok(())
+    } else {
+        Err(BlobUploadError::UnsupportedBySdk(version.to_string()))
+    }
+}
+
+/// 分类单块失败为 [`BlobUploadError`]：4019 → [`BlobUploadError::WriteFailed`]，其它协议码透传。
+fn classify_upload_failure(err: &ErrorPayload) -> BlobUploadError {
+    if err.code == i64::from(ErrorCode::BlobWriteFailed.code()) {
+        BlobUploadError::WriteFailed {
+            reason: extract_write_reason(err),
+            message: err.message.clone(),
+        }
+    } else {
+        BlobUploadError::Protocol {
+            code: err.code,
+            message: err.message.clone(),
+        }
+    }
+}
+
+/// 从 4019 ErrorPayload 提取 `details.reason`（缺省 `invalid_upload`）/ extract 4019 reason。
+fn extract_write_reason(err: &ErrorPayload) -> BlobWriteErrorReason {
+    let raw = err
+        .details
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("invalid_upload");
+    BlobWriteErrorReason::parse(raw)
+}
+
+/// 末块 ack 收口：取 `landing_path`，回显 sha256 与声明比对（协议 SHOULD）。
+///
+/// 对标 Python `_finalize_result`：`landing_path` 缺失/空 → [`BlobUploadError::IncompleteAck`]；
+/// 回显 sha 非空且 != 声明 → [`BlobUploadError::EchoMismatch`]；`total_size` 缺省回退声明值。
+fn finalize_upload(
+    ret: PutBlobRet,
+    declared_sha: &str,
+    declared_total: u64,
+) -> Result<PutBlobResult, BlobUploadError> {
+    let landing_path = ret.landing_path.as_deref().filter(|s| !s.is_empty()).ok_or(
+        BlobUploadError::IncompleteAck,
+    )?;
+    let echo_sha = ret.sha256.as_deref().unwrap_or("");
+    if !echo_sha.is_empty() && echo_sha != declared_sha {
+        return Err(BlobUploadError::EchoMismatch {
+            echo: echo_sha.to_string(),
+            declared: declared_sha.to_string(),
+        });
+    }
+    Ok(PutBlobResult {
+        landing_path: landing_path.to_string(),
+        total_size: ret.total_size.unwrap_or(declared_total),
+        sha256: if echo_sha.is_empty() {
+            declared_sha.to_string()
+        } else {
+            echo_sha.to_string()
+        },
+    })
 }
 
 /// base64 标准编码解码 / standard base64 decode。
@@ -1364,5 +1825,284 @@ mod tests {
         };
         let (bytes, _mime) = drain_blob(call, "c", "h", opts).await.unwrap();
         assert_eq!(bytes, *data);
+    }
+
+    // ── 上行 pump / upstream pump ──────────────────────────────────────
+
+    /// 模拟 Computer ack：首块回 `u1`；其余回显；末块回 landing 字段（total/sha 回显缺省 →
+    /// pump 回退声明值——对拍 python `_finalize_result` 的 fallback 分支）。
+    fn upload_ack(req: &PutBlobChunkRequest) -> PutBlobRet {
+        PutBlobRet {
+            upload_id: req.upload_id.clone().unwrap_or_else(|| "u1".to_string()),
+            chunk_offset: req.chunk_offset,
+            landing_path: req.eof.then(|| "/landing/u1.txt".to_string()),
+            total_size: None,
+            sha256: None,
+            req_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_multi_chunk_calls_sequence() {
+        let data = sample(1000);
+        let sha = sha256_hex(&data);
+        let seen: Mutex<Vec<PutBlobChunkRequest>> = Mutex::new(Vec::new());
+        let call = |req: PutBlobChunkRequest| {
+            let seen = &seen;
+            async move {
+                seen.lock().unwrap().push(req.clone());
+                Ok::<_, BlobChunkFailure>(upload_ack(&req))
+            }
+        };
+        let opts = PumpBlobOptions {
+            name_hint: Some("big.bin".to_string()),
+            chunk_size: 256,
+        };
+        let ret = pump_blob(call, "c", &data, opts).await.unwrap();
+        assert_eq!(ret.landing_path, "/landing/u1.txt");
+        assert_eq!(ret.total_size, 1000);
+        assert_eq!(ret.sha256, sha);
+
+        let reqs = seen.into_inner().unwrap();
+        assert_eq!(reqs.len(), 4, "1000 / 256 → 4 块");
+        // eof 仅末块；chunk_offset 顺序推进；upload_id 贯穿（首块 None）；声明仅首块。
+        for (i, r) in reqs.iter().enumerate() {
+            assert_eq!(r.chunk_offset, (i as u64) * 256);
+            assert_eq!(r.eof, i == 3);
+            assert_eq!(r.upload_id, if i == 0 { None } else { Some("u1".into()) });
+            assert_eq!(r.declaration.is_some(), i == 0);
+            if i == 0 {
+                let d = r.declaration.as_ref().unwrap();
+                assert_eq!(d.name_hint.as_deref(), Some("big.bin"));
+                assert_eq!(d.total_size, 1000);
+                assert_eq!(d.sha256, sha);
+            }
+            assert_eq!(r.computer, "c");
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_single_chunk_degenerate() {
+        let data = sample(1);
+        let sha = sha256_hex(&data);
+        let call = |req: PutBlobChunkRequest| async move {
+            assert!(req.eof, "单块即 eof");
+            assert_eq!(req.declaration.as_ref().map(|d| d.total_size), Some(1));
+            Ok::<_, BlobChunkFailure>(upload_ack(&req))
+        };
+        let ret = pump_blob(call, "c", &data, PumpBlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(ret.total_size, 1);
+        assert_eq!(ret.sha256, sha);
+    }
+
+    #[tokio::test]
+    async fn pump_empty_payload_rejected() {
+        let call = |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
+        let err = pump_blob(call, "c", &[], PumpBlobOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err, BlobUploadError::EmptyPayload);
+    }
+
+    #[tokio::test]
+    async fn pump_zero_chunk_size_rejected() {
+        // 显式 0 → bad_chunk_size（镜像 python `_prepare_declaration`：`chunk_size < 1` 显拒）。
+        let call = |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
+        let err = pump_blob(
+            call,
+            "c",
+            b"hello",
+            PumpBlobOptions { chunk_size: 0, ..Default::default() },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, BlobUploadError::BadChunkSize { chunk_size: 0 });
+        // sync 同构。
+        let call_sync = |_req: PutBlobChunkRequest| Err::<PutBlobRet, _>(BlobChunkFailure::Timeout);
+        let err_sync = pump_blob_sync(
+            call_sync,
+            "c",
+            b"hello",
+            PumpBlobOptions { chunk_size: 0, ..Default::default() },
+        )
+        .unwrap_err();
+        assert_eq!(err_sync, BlobUploadError::BadChunkSize { chunk_size: 0 });
+    }
+
+    #[tokio::test]
+    async fn pump_4019_busy_maps_write_failed() {
+        let call = |_req: PutBlobChunkRequest| async {
+            Err::<PutBlobRet, _>(BlobChunkFailure::Protocol(
+                ErrorPayload::new(4019, "too many concurrent uploads").with_detail("reason", "busy"),
+            ))
+        };
+        let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BlobUploadError::WriteFailed {
+                reason: BlobWriteErrorReason::Busy,
+                message: "too many concurrent uploads".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_4019_without_reason_defaults_invalid_upload() {
+        let call = |_req: PutBlobChunkRequest| async {
+            Err::<PutBlobRet, _>(BlobChunkFailure::Protocol(ErrorPayload::new(
+                4019,
+                "unknown session",
+            )))
+        };
+        let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlobUploadError::WriteFailed {
+                reason: BlobWriteErrorReason::InvalidUpload,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pump_other_protocol_code_surfaces() {
+        let call = |_req: PutBlobChunkRequest| async {
+            Err::<PutBlobRet, _>(BlobChunkFailure::Protocol(ErrorPayload::new(404, "nope")))
+        };
+        let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BlobUploadError::Protocol {
+                code: 404,
+                message: "nope".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_missing_landing_path_is_incomplete_ack() {
+        let call = |req: PutBlobChunkRequest| async move {
+            // eof 但缺 landing_path。
+            Ok::<_, BlobChunkFailure>(PutBlobRet {
+                upload_id: "u1".into(),
+                chunk_offset: req.chunk_offset,
+                landing_path: None,
+                total_size: None,
+                sha256: None,
+                req_id: None,
+            })
+        };
+        let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err, BlobUploadError::IncompleteAck);
+    }
+
+    #[tokio::test]
+    async fn pump_echo_sha_mismatch() {
+        let call = |req: PutBlobChunkRequest| async move {
+            let decl = req.declaration.clone().unwrap();
+            Ok::<_, BlobChunkFailure>(PutBlobRet {
+                upload_id: "u1".into(),
+                chunk_offset: req.chunk_offset,
+                landing_path: Some("/landing/u1.txt".into()),
+                total_size: Some(decl.total_size),
+                sha256: Some("0".repeat(64)),
+                req_id: None,
+            })
+        };
+        let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobUploadError::EchoMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn pump_first_chunk_timeout_is_unsupported_and_carries_data() {
+        let call = |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
+        let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
+            .await
+            .unwrap_err();
+        match err {
+            BlobUploadError::UploadUnsupported { data, total_size, .. } => {
+                assert_eq!(data, b"hello");
+                assert_eq!(total_size, 5);
+            }
+            other => panic!("expected UploadUnsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_second_chunk_timeout_is_chunk_transport() {
+        // 首块成功，后续块超时 → 传输故障（非能力缺失）。
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let call = move |req: PutBlobChunkRequest| {
+            let first = first.clone();
+            async move {
+                if req.upload_id.is_none() {
+                    first.store(true, Ordering::SeqCst);
+                    Ok::<_, BlobChunkFailure>(upload_ack(&req))
+                } else {
+                    Err(BlobChunkFailure::Timeout)
+                }
+            }
+        };
+        let err = pump_blob(call, "c", b"hello", PumpBlobOptions { chunk_size: 2, ..Default::default() })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobUploadError::ChunkTransport(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn pump_sync_mirror_multi_chunk() {
+        let data = sample(1000);
+        let sha = sha256_hex(&data);
+        let seen = Arc::new(Mutex::new(Vec::<PutBlobChunkRequest>::new()));
+        let call = {
+            let seen = seen.clone();
+            move |req: PutBlobChunkRequest| {
+                seen.lock().unwrap().push(req.clone());
+                Ok::<_, BlobChunkFailure>(upload_ack(&req))
+            }
+        };
+        let opts = PumpBlobOptions {
+            name_hint: Some("s.bin".into()),
+            chunk_size: 256,
+        };
+        let ret = pump_blob_sync(call, "c", &data, opts).unwrap();
+        assert_eq!(ret.landing_path, "/landing/u1.txt");
+        assert_eq!(ret.total_size, 1000);
+        assert_eq!(ret.sha256, sha);
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn ensure_upload_supported_gates_on_minor() {
+        assert!(ensure_upload_supported("0.4.0").is_ok());
+        assert!(ensure_upload_supported("0.4.5").is_ok());
+        let err = ensure_upload_supported("0.3.9").unwrap_err();
+        assert!(matches!(err, BlobUploadError::UnsupportedBySdk(_)));
+    }
+
+    #[test]
+    fn write_reason_parse_round_trip() {
+        for r in [
+            "invalid_upload", "invalid_declaration", "range", "too_large", "busy",
+            "forbidden", "integrity", "io_error",
+        ] {
+            assert_eq!(BlobWriteErrorReason::parse(r).as_str(), r);
+        }
+        assert_eq!(
+            BlobWriteErrorReason::parse("future_write_reason"),
+            BlobWriteErrorReason::Other("future_write_reason".to_string())
+        );
     }
 }

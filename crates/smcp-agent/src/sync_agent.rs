@@ -15,8 +15,8 @@ use crate::{
     AsyncSmcpAgent,
 };
 use smcp::{
-    A2CSkillRef, GetBlobRet, GetComputerConfigRet, GetResourcesRet, GetSkillRet, SMCPTool,
-    SessionInfo,
+    utils::blob::PutBlobResult, A2CSkillRef, GetBlobRet, GetComputerConfigRet, GetResourcesRet,
+    GetSkillRet, SMCPTool, SessionInfo,
 };
 use tokio::runtime::Runtime;
 
@@ -136,6 +136,25 @@ impl SyncSmcpAgent {
             blob_handle,
             chunk_offset,
             max_chunk_bytes,
+        ))
+    }
+
+    /// 上行落盘到 Computer landing root（v0.4.0 #195，同步）/ Upload bytes to the landing root (sync)。
+    ///
+    /// 阻塞包装 [`AsyncSmcpAgent::put_blob`]；错误面与 async 版一致（4019 → [`SmcpAgentError::Upload`]，
+    /// 首块超时 → `UploadUnsupported` 等）。镜像 Python `sync_client.py::put_blob`。
+    pub fn put_blob(
+        &self,
+        computer: &str,
+        data: &[u8],
+        name_hint: Option<&str>,
+        chunk_size: Option<u64>,
+    ) -> Result<PutBlobResult> {
+        self.runtime.block_on(self.async_agent.put_blob(
+            computer,
+            data,
+            name_hint,
+            chunk_size,
         ))
     }
 

@@ -82,7 +82,7 @@ fn env_lookup(env: Option<&EnvMap>, key: &str) -> Option<String> {
 ///
 /// 仅前导 `~` / `~/...` 展开；中段 `~` 不动。区别于 [`smcp::utils::path`] 的私有 `expanduser`（读进程
 /// `HOME`）——此处尊重注入 `env` 以保证 `resolve_skill_home` 测试可完全隔离进程环境。
-fn expand_home(raw: &str, env: Option<&EnvMap>) -> PathBuf {
+pub(crate) fn expand_home(raw: &str, env: Option<&EnvMap>) -> PathBuf {
     if raw == "~" {
         if let Some(home) = env_lookup(env, HOME_ENV) {
             return PathBuf::from(home);
