@@ -584,6 +584,8 @@ impl CommandHandler {
                     auth_payload,
                     headers: headers.clone(),
                     namespace: namespace.to_string(),
+                    namespace_connect_timeout:
+                        crate::socketio_client::DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
                 },
             )
             .await?;

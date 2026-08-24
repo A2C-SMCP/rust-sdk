@@ -22,6 +22,7 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use serde_json::{json, Value};
 use socketioxide::extract::{AckSender, Data, SocketRef, TryData};
+use socketioxide::handler::ConnectHandler;
 use socketioxide::SocketIo;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -31,6 +32,7 @@ use tokio::time::{sleep, timeout};
 use tower::Layer;
 
 use smcp_computer::computer::{Computer, ConnectOptions, SilentSession, SocketIoAuthProvider};
+use smcp_computer::errors::ComputerError;
 use smcp_computer::mcp_clients::manager::MCPServerManager;
 use smcp_computer::mcp_clients::model::MCPServerInput;
 use smcp_computer::socketio_client::SmcpComputerClientBuilder;
@@ -111,6 +113,51 @@ async fn start_capture_server(captured: Arc<Captured>) -> (String, oneshot::Send
     (format!("http://{addr}"), shutdown_tx)
 }
 
+/// Start a real Engine.IO server whose Socket.IO namespace middleware never completes.
+/// This isolates the post-transport/pre-namespace timeout branch without relying on wall-clock
+/// sleeps or a mock client.
+async fn start_stalled_namespace_server() -> (String, Arc<AtomicUsize>, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let active_transports = Arc::new(AtomicUsize::new(0));
+
+    let (layer, io) = SocketIo::new_layer();
+    let middleware =
+        || async { std::future::pending::<Result<(), std::convert::Infallible>>().await };
+    io.ns("/smcp", (|| {}).with(middleware));
+
+    let fallback = tower::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
+        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::<Bytes>::new(Bytes::new())))
+    });
+    let service = layer.layer(fallback);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let task_active_transports = Arc::clone(&active_transports);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((stream, _)) = accepted {
+                        let active_transports = Arc::clone(&task_active_transports);
+                        active_transports.fetch_add(1, Ordering::SeqCst);
+                        let tio = hyper_util::rt::TokioIo::new(stream);
+                        let svc = hyper_util::service::TowerToHyperService::new(service.clone());
+                        tokio::spawn(async move {
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(tio, svc)
+                                .with_upgrades()
+                                .await;
+                            active_transports.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                }
+                _ = &mut shutdown_rx => break,
+            }
+        }
+    });
+
+    (format!("http://{addr}"), active_transports, shutdown_tx)
+}
+
 /// 可事件驱动观测 CONNECT auth、并通过关闭真实 TCP 连接触发底层自动重连的测试服务。
 /// Event-driven CONNECT-auth capture server that can trigger transport auto-reconnect by closing
 /// real TCP connections.
@@ -118,6 +165,7 @@ struct ReconnectCaptureServer {
     url: String,
     auth_rx: mpsc::UnboundedReceiver<Value>,
     join_rx: mpsc::UnboundedReceiver<Value>,
+    join_ack_rx: mpsc::UnboundedReceiver<usize>,
     active_connections: Arc<AtomicUsize>,
     namespace_socket: Arc<Mutex<Option<SocketRef>>>,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -140,6 +188,23 @@ impl ReconnectCaptureServer {
             .expect("capture server stopped before receiving join_office")
     }
 
+    async fn wait_for_join_ack(&mut self, expected_attempt: usize) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let attempt = self
+                    .join_ack_rx
+                    .recv()
+                    .await
+                    .expect("capture server stopped before sending join ACK");
+                if attempt == expected_attempt {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for join ACK attempt {expected_attempt}"));
+    }
+
     async fn wait_for_active_connections(&self, expected: usize) {
         timeout(Duration::from_secs(10), async {
             loop {
@@ -153,9 +218,12 @@ impl ReconnectCaptureServer {
         .unwrap_or_else(|_| panic!("timed out waiting for {expected} active connections"));
     }
 
-    async fn assert_no_additional_auth(&mut self) {
+    async fn assert_no_additional_auth_after_convergence(&mut self) {
+        // tf-rust-socketio 0.8.1 caps reconnect backoff at 5s. Wait beyond that policy boundary
+        // only after the connection count has converged; this preserves the negative assertion
+        // without racing the library's longest legitimate retry delay.
         assert!(
-            timeout(Duration::from_millis(1500), self.auth_rx.recv())
+            timeout(Duration::from_secs(6), self.auth_rx.recv())
                 .await
                 .is_err(),
             "an already-retired client unexpectedly reconnected"
@@ -197,6 +265,7 @@ async fn start_reconnect_capture_server(
     let backend_addr = backend_listener.local_addr().unwrap();
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
     let (join_tx, join_rx) = mpsc::unbounded_channel();
+    let (join_ack_tx, join_ack_rx) = mpsc::unbounded_channel();
     let join_attempts = Arc::new(AtomicUsize::new(0));
     let active_connections = Arc::new(AtomicUsize::new(0));
     let namespace_socket = Arc::new(Mutex::new(None));
@@ -209,6 +278,7 @@ async fn start_reconnect_capture_server(
         move |socket: SocketRef, TryData(auth): TryData<Value>| {
             let auth_tx = auth_tx.clone();
             let join_tx = join_tx.clone();
+            let join_ack_tx = join_ack_tx.clone();
             let join_attempts = Arc::clone(&join_attempts);
             let active_connections = Arc::clone(&namespace_active_connections);
             let namespace_socket = Arc::clone(&connected_namespace_socket);
@@ -231,6 +301,7 @@ async fn start_reconnect_capture_server(
                     "server:join_office",
                     move |_socket: SocketRef, Data::<Value>(data), ack: AckSender| {
                         let join_tx = join_tx.clone();
+                        let join_ack_tx = join_ack_tx.clone();
                         let join_attempts = Arc::clone(&join_attempts);
                         async move {
                             let attempt = join_attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -241,6 +312,7 @@ async fn start_reconnect_capture_server(
                             let success = reject_join_attempt != Some(attempt);
                             let message = (!success).then(|| "rejoin rejected".to_string());
                             let _ = ack.send(&(success, message));
+                            let _ = join_ack_tx.send(attempt);
                         }
                     },
                 );
@@ -304,6 +376,7 @@ async fn start_reconnect_capture_server(
         url: format!("http://{proxy_addr}"),
         auth_rx,
         join_rx,
+        join_ack_rx,
         active_connections,
         namespace_socket,
         connection_tasks,
@@ -356,6 +429,58 @@ async fn auth_payload_is_injected_into_socketio_connect_auth_dict() {
     );
 
     client.disconnect().await.ok();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn configurable_namespace_connect_timeout_closes_stalled_transport() {
+    let (url, active_transports, shutdown) = start_stalled_namespace_server().await;
+    let result = timeout(Duration::from_secs(5), async move {
+        SmcpComputerClientBuilder::new(url, empty_manager(), "namespace-timeout", empty_inputs())
+            .namespace_connect_timeout(Duration::from_millis(250))
+            .connect()
+            .await
+    })
+    .await
+    .expect("configured namespace timeout did not bound connect");
+    assert!(matches!(
+        result,
+        Err(ComputerError::TimeoutError(message))
+            if message.contains("namespace connect timed out")
+    ));
+    assert_eq!(
+        wait_for(|| { (active_transports.load(Ordering::SeqCst) == 0).then_some(()) }).await,
+        Some(()),
+        "namespace timeout must close the underlying Engine.IO transport"
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn namespace_readiness_timeout_disconnects_client_returned_by_transport_builder() {
+    let (url, active_transports, shutdown) = start_stalled_namespace_server().await;
+    let result = timeout(Duration::from_secs(5), async move {
+        SmcpComputerClientBuilder::new(
+            url,
+            empty_manager(),
+            "namespace-readiness-timeout",
+            empty_inputs(),
+        )
+        .namespace("/missing")
+        .namespace_connect_timeout(Duration::from_millis(250))
+        .connect()
+        .await
+    })
+    .await
+    .expect("configured namespace readiness timeout did not bound connect");
+    assert!(matches!(result, Err(ComputerError::TimeoutError(_))));
+    assert_eq!(
+        wait_for(|| { (active_transports.load(Ordering::SeqCst) == 0).then_some(()) }).await,
+        Some(()),
+        "readiness timeout must disconnect the client returned by the transport builder"
+    );
+
     let _ = shutdown.send(());
 }
 
@@ -666,7 +791,7 @@ async fn consecutive_disconnects_ignore_stale_rejoin_ack() {
     let _ = server.next_auth().await;
     assert_eq!(server.next_join().await["office_id"], "office-generation");
     wait_for_lifecycle(&mut events, LifecycleState::JoinedOffice).await;
-    sleep(Duration::from_millis(900)).await;
+    server.wait_for_join_ack(2).await;
 
     assert_eq!(computer.lifecycle_state(), LifecycleState::JoinedOffice);
     let socketio = computer.get_socketio_client();
@@ -677,9 +802,7 @@ async fn consecutive_disconnects_ignore_stale_rejoin_ack() {
     );
     drop(socketio);
     assert!(
-        timeout(Duration::from_millis(250), server.join_rx.recv())
-            .await
-            .is_err(),
+        server.join_rx.try_recv().is_err(),
         "a stale Connect task must not emit a duplicate join"
     );
 
@@ -735,7 +858,7 @@ async fn disconnect_aborts_inflight_rejoin_and_clears_retained_client_state() {
     assert_eq!(retained_client.get_office_id().await, None);
 
     // Let the server-side delayed ACK fire. The aborted, invalidated task must not commit it.
-    sleep(Duration::from_millis(900)).await;
+    server.wait_for_join_ack(2).await;
     assert_eq!(computer.lifecycle_state(), LifecycleState::Started);
     assert_eq!(retained_client.get_office_id().await, None);
 
@@ -1161,8 +1284,8 @@ async fn replacement_closes_transport_after_server_namespace_disconnect() {
     // the old wrapper returned early after namespace Close and emitted a second CONNECT auth.
     server.force_network_disconnect();
     let _ = server.next_auth().await;
-    server.assert_no_additional_auth().await;
     server.wait_for_active_connections(1).await;
+    server.assert_no_additional_auth_after_convergence().await;
 
     computer.shutdown().await.expect("shutdown computer");
     server.shutdown();
@@ -1301,7 +1424,6 @@ async fn replacement_retires_old_client_already_inside_reconnect_backoff() {
     // 0.8.1's already-entered retry loop will make one late CONNECT despite Manual. The retiring
     // callback closes it inline and the server converges back to the replacement only.
     let _ = server.next_auth().await;
-    sleep(Duration::from_millis(250)).await;
     server.wait_for_active_connections(1).await;
     assert_eq!(computer.lifecycle_state(), LifecycleState::JoinedOffice);
 

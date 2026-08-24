@@ -94,7 +94,9 @@ use crate::mcp_clients::{
     ConfigRender, RenderError,
 };
 use crate::oauth::{InMemoryOAuthCredentialStore, OAuthCredentialStore};
-use crate::socketio_client::{SmcpComputerClient, SmcpComputerClientBuilder};
+use crate::socketio_client::{
+    SmcpComputerClient, SmcpComputerClientBuilder, DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+};
 use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
 /// 确认回调函数类型 / Confirmation callback function type
@@ -103,13 +105,81 @@ type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> b
 /// Process-unique tokens fence stale Socket.IO clients from publishing Computer lifecycle changes.
 static NEXT_SOCKETIO_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+/// Private dependency boundary for the Socket.IO slot installation transaction.
+///
+/// Keeping transport teardown and lifecycle ownership behind one interface makes the failure
+/// invariants deterministic to test without weakening the public client API or adding production
+/// failpoints.
+#[async_trait]
+trait SocketIoInstallClient: Send + Sync {
+    fn has_active_runtime_lifecycle(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+    ) -> bool;
+
+    fn claim_runtime_lifecycle(
+        &self,
+        status: Arc<RuntimeStatus>,
+        owner: Arc<StdMutex<u64>>,
+        token: u64,
+    ) -> bool;
+
+    fn activate_runtime_lifecycle(&self, token: u64) -> bool;
+
+    fn release_runtime_lifecycle_claim(&self, token: u64);
+
+    fn deactivate_runtime_lifecycle(&self);
+
+    async fn disconnect_for_install(&self) -> ComputerResult<()>;
+}
+
+#[async_trait]
+impl SocketIoInstallClient for SmcpComputerClient {
+    fn has_active_runtime_lifecycle(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+    ) -> bool {
+        self.has_active_runtime_lifecycle(status, owner)
+    }
+
+    fn claim_runtime_lifecycle(
+        &self,
+        status: Arc<RuntimeStatus>,
+        owner: Arc<StdMutex<u64>>,
+        token: u64,
+    ) -> bool {
+        self.claim_runtime_lifecycle(status, owner, token)
+    }
+
+    fn activate_runtime_lifecycle(&self, token: u64) -> bool {
+        self.activate_runtime_lifecycle(token)
+    }
+
+    fn release_runtime_lifecycle_claim(&self, token: u64) {
+        self.release_runtime_lifecycle_claim(token);
+    }
+
+    fn deactivate_runtime_lifecycle(&self) {
+        self.deactivate_runtime_lifecycle();
+    }
+
+    async fn disconnect_for_install(&self) -> ComputerResult<()> {
+        self.disconnect().await
+    }
+}
+
 /// Install one already-connected client while the Computer Socket.IO lifecycle gate is held.
-async fn install_socketio_client_locked(
-    socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+async fn install_socketio_client_locked<C>(
+    socketio_client: Arc<RwLock<Option<Arc<C>>>>,
     status: Arc<RuntimeStatus>,
     owner: Arc<StdMutex<u64>>,
-    client: Arc<SmcpComputerClient>,
-) -> ComputerResult<()> {
+    client: Arc<C>,
+) -> ComputerResult<()>
+where
+    C: SocketIoInstallClient + 'static,
+{
     let mut socketio_ref = socketio_client.write().await;
     if socketio_ref
         .as_ref()
@@ -120,7 +190,15 @@ async fn install_socketio_client_locked(
                 "Computer is shut down".to_string(),
             ));
         }
-        return Ok(());
+        return client
+            .has_active_runtime_lifecycle(&status, &owner)
+            .then_some(())
+            .ok_or_else(|| {
+                ComputerError::InvalidState(
+                    "Socket.IO client is retired or has lost its lifecycle ownership; create a new client"
+                        .to_string(),
+                )
+            });
     }
 
     // The reservation is atomic inside the client, unlike a separate check followed by bind.
@@ -136,7 +214,7 @@ async fn install_socketio_client_locked(
     // Claim before cleanup so a shut-down Computer cannot disconnect a candidate currently owned
     // by another Computer. An unowned candidate is still retired before the rejection returns.
     if status.state() == LifecycleState::Shutdown {
-        let cleanup = client.disconnect().await;
+        let cleanup = client.disconnect_for_install().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         cleanup?;
         return Err(ComputerError::InvalidState(
@@ -148,8 +226,8 @@ async fn install_socketio_client_locked(
     // not close it. Retire it before publishing the replacement; if 0.8.1 is already in reconnect
     // backoff, the retiring event gate closes its next namespace before any app handler can run.
     if let Some(previous) = socketio_ref.as_ref() {
-        if let Err(error) = previous.disconnect().await {
-            if let Err(cleanup_error) = client.disconnect().await {
+        if let Err(error) = previous.disconnect_for_install().await {
+            if let Err(cleanup_error) = client.disconnect_for_install().await {
                 warn!(
                     error = %cleanup_error,
                     "replacement Socket.IO client cleanup failed after old teardown error"
@@ -159,10 +237,14 @@ async fn install_socketio_client_locked(
             return Err(error);
         }
         previous.deactivate_runtime_lifecycle();
+        // The old transport is now permanently retired. Remove it before candidate activation so
+        // a concurrent direct disconnect that invalidates the candidate cannot leave a dead old
+        // Arc masquerading as the current slot value.
+        socketio_ref.take();
     }
 
     if !client.activate_runtime_lifecycle(lifecycle_token) {
-        let _ = client.disconnect().await;
+        let _ = client.disconnect_for_install().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         return Err(ComputerError::RuntimeError(
             "Socket.IO lifecycle ownership was lost during installation".to_string(),
@@ -224,6 +306,9 @@ pub struct ConnectOptions {
     /// 应用层 namespace；[`Default`] 为 [`smcp::SMCP_NAMESPACE`] (`/smcp`)。
     /// Application-layer namespace; defaults to `/smcp`.
     pub namespace: String,
+    /// Maximum total wait for initial Engine.IO establishment and Socket.IO namespace readiness.
+    /// Defaults to 30 seconds.
+    pub namespace_connect_timeout: std::time::Duration,
 }
 
 impl Default for ConnectOptions {
@@ -233,6 +318,7 @@ impl Default for ConnectOptions {
             auth_payload: None,
             headers: None,
             namespace: smcp::SMCP_NAMESPACE.to_string(),
+            namespace_connect_timeout: DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
         }
     }
 }
@@ -250,6 +336,7 @@ impl std::fmt::Debug for ConnectOptions {
             )
             .field("headers", &self.headers)
             .field("namespace", &self.namespace)
+            .field("namespace_connect_timeout", &self.namespace_connect_timeout)
             .finish()
     }
 }
@@ -4328,6 +4415,7 @@ impl<S: Session> Computer<S> {
             self.inputs.clone(),
         )
         .namespace(options.namespace)
+        .namespace_connect_timeout(options.namespace_connect_timeout)
         .computer_ops(ops);
         // #201：动态 Provider 优先；未配置时保留 #86 静态 auth dict 行为。
         if let Some(provider) = options.auth_provider {
@@ -4844,6 +4932,154 @@ mod tests {
         CommandInput, MCPServerConfig, MCPServerInput, PickStringInput, PickStringOption,
         PromptStringInput, StdioServerConfig, StdioServerParameters,
     };
+    use std::sync::atomic::AtomicBool;
+
+    struct FakeSocketIoInstallClient {
+        active: AtomicBool,
+        claim_succeeds: bool,
+        activate_succeeds: bool,
+        disconnect_fails: bool,
+        disconnect_calls: AtomicU64,
+        released: AtomicBool,
+        deactivated: AtomicBool,
+    }
+
+    impl FakeSocketIoInstallClient {
+        fn new(active: bool) -> Self {
+            Self {
+                active: AtomicBool::new(active),
+                claim_succeeds: true,
+                activate_succeeds: true,
+                disconnect_fails: false,
+                disconnect_calls: AtomicU64::new(0),
+                released: AtomicBool::new(false),
+                deactivated: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SocketIoInstallClient for FakeSocketIoInstallClient {
+        fn has_active_runtime_lifecycle(
+            &self,
+            _status: &Arc<RuntimeStatus>,
+            _owner: &Arc<StdMutex<u64>>,
+        ) -> bool {
+            self.active.load(Ordering::Acquire)
+        }
+
+        fn claim_runtime_lifecycle(
+            &self,
+            _status: Arc<RuntimeStatus>,
+            _owner: Arc<StdMutex<u64>>,
+            _token: u64,
+        ) -> bool {
+            self.claim_succeeds
+        }
+
+        fn activate_runtime_lifecycle(&self, _token: u64) -> bool {
+            if self.activate_succeeds {
+                self.active.store(true, Ordering::Release);
+            }
+            self.activate_succeeds
+        }
+
+        fn release_runtime_lifecycle_claim(&self, _token: u64) {
+            self.released.store(true, Ordering::Release);
+        }
+
+        fn deactivate_runtime_lifecycle(&self) {
+            self.active.store(false, Ordering::Release);
+            self.deactivated.store(true, Ordering::Release);
+        }
+
+        async fn disconnect_for_install(&self) -> ComputerResult<()> {
+            self.disconnect_calls.fetch_add(1, Ordering::AcqRel);
+            if self.disconnect_fails {
+                Err(ComputerError::RuntimeError(
+                    "injected Socket.IO teardown failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    type InstallTestState<C> = (
+        Arc<RwLock<Option<Arc<C>>>>,
+        Arc<RuntimeStatus>,
+        Arc<StdMutex<u64>>,
+    );
+
+    fn install_test_state<C>(current: Option<Arc<C>>) -> InstallTestState<C> {
+        (
+            Arc::new(RwLock::new(current)),
+            Arc::new(RuntimeStatus::new()),
+            Arc::new(StdMutex::new(0)),
+        )
+    }
+
+    #[tokio::test]
+    async fn socketio_same_arc_fast_path_rejects_inactive_lease() {
+        let client = Arc::new(FakeSocketIoInstallClient::new(false));
+        let (slot, status, owner) = install_test_state(Some(Arc::clone(&client)));
+
+        let result = install_socketio_client_locked(slot, status, owner, client).await;
+
+        assert!(matches!(result, Err(ComputerError::InvalidState(_))));
+    }
+
+    #[tokio::test]
+    async fn socketio_install_teardown_failure_retains_previous_and_releases_candidate() {
+        let previous = Arc::new(FakeSocketIoInstallClient {
+            disconnect_fails: true,
+            ..FakeSocketIoInstallClient::new(true)
+        });
+        let candidate = Arc::new(FakeSocketIoInstallClient::new(false));
+        let (slot, status, owner) = install_test_state(Some(Arc::clone(&previous)));
+
+        let result = install_socketio_client_locked(
+            Arc::clone(&slot),
+            status,
+            owner,
+            Arc::clone(&candidate),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(slot
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &previous)));
+        assert!(!previous.deactivated.load(Ordering::Acquire));
+        assert_eq!(candidate.disconnect_calls.load(Ordering::Acquire), 1);
+        assert!(candidate.released.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn socketio_install_activation_failure_leaves_no_retired_slot_value() {
+        let previous = Arc::new(FakeSocketIoInstallClient::new(true));
+        let candidate = Arc::new(FakeSocketIoInstallClient {
+            activate_succeeds: false,
+            ..FakeSocketIoInstallClient::new(false)
+        });
+        let (slot, status, owner) = install_test_state(Some(Arc::clone(&previous)));
+
+        let result = install_socketio_client_locked(
+            Arc::clone(&slot),
+            status,
+            owner,
+            Arc::clone(&candidate),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ComputerError::RuntimeError(_))));
+        assert!(slot.read().await.is_none());
+        assert!(previous.deactivated.load(Ordering::Acquire));
+        assert_eq!(candidate.disconnect_calls.load(Ordering::Acquire), 1);
+        assert!(candidate.released.load(Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn test_computer_creation() {
