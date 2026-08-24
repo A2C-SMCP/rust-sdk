@@ -2314,6 +2314,39 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_to_smcp_tool_a2c_tool_meta_canonical_string() {
+        // #200：wire 线格式 —— `a2c_tool_meta` 终值为 JSON **字符串**（非嵌套对象），解析后含 ToolMeta
+        // **全字段**（未设置=null，与 python `model_dump(mode="json")` 同形）；原生 `_meta` key 原样保留。
+        let mut meta = serde_json::Map::new();
+        meta.insert("custom_key".to_string(), serde_json::json!("v"));
+        meta.insert(
+            "a2c_tool_meta".to_string(),
+            serde_json::json!({
+                "auto_apply": null, "alias": null, "tags": ["read"], "ret_object_mapper": null
+            }),
+        );
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None), "test_bundle");
+
+        let meta_map = smcp_tool.meta.unwrap().as_object().unwrap().clone();
+        assert_eq!(
+            meta_map["custom_key"],
+            serde_json::json!("v"),
+            "原生 _meta key 原样保留"
+        );
+        let wire = meta_map["a2c_tool_meta"]
+            .as_str()
+            .expect("a2c_tool_meta MUST 是 JSON 字符串");
+        let parsed: serde_json::Value = serde_json::from_str(wire).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "auto_apply": null, "alias": null, "tags": ["read"], "ret_object_mapper": null
+            }),
+            "wire 字符串解析后应为全字段 canonical（双 SDK 同形）"
+        );
+    }
+
+    #[test]
     fn test_tool_to_smcp_tool_string_value_not_double_serialized() {
         let mut meta = serde_json::Map::new();
         meta.insert(

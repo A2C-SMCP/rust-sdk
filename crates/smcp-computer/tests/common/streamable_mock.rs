@@ -36,11 +36,14 @@ pub fn empty_body() -> BoxBody {
 /// - `reject_status`：`tools/call` 返回的状态码（寻址对拍用 403；AUTH-01 用 401/403）。
 /// - `with_www_authenticate`：拒绝响应是否带 `WWW-Authenticate` 头（rmcp 401 短路成 `AuthRequired` 的触发条件）。
 /// - `expose_resources`：是否声明 resources capability 并响应 `resources/list`（寻址对拍需；AUTH-01 不需）。
-#[derive(Debug, Clone, Copy)]
+/// - `tool_meta`：`tools/list` 产出的 `protected` 工具携带的 `_meta`（#200 ToolMeta 三层合并对拍用）。
+///   `None`（默认）= 不带 `_meta` —— 与既有测试逐字一致。
+#[derive(Debug, Clone)]
 pub struct MockOpts {
     pub reject_status: StatusCode,
     pub with_www_authenticate: bool,
     pub expose_resources: bool,
+    pub tool_meta: Option<serde_json::Value>,
 }
 
 impl Default for MockOpts {
@@ -49,6 +52,7 @@ impl Default for MockOpts {
             reject_status: StatusCode::FORBIDDEN,
             with_www_authenticate: false,
             expose_resources: true,
+            tool_meta: None,
         }
     }
 }
@@ -106,13 +110,18 @@ async fn streamable_handler(
             "serverInfo": { "name": "streamable-mock", "version": "0.1.0" },
             "capabilities": capabilities,
         }),
-        "tools/list" => serde_json::json!({
-            "tools": [{
+        "tools/list" => {
+            // 默认（tool_meta=None）与既有逐字一致：不带 `meta` key（rmcp 解析为 None）。
+            let mut tool = serde_json::json!({
                 "name": "protected",
                 "description": "Requires upstream auth",
                 "inputSchema": { "type": "object" }
-            }]
-        }),
+            });
+            if let Some(meta) = &opts.tool_meta {
+                tool["_meta"] = meta.clone();
+            }
+            serde_json::json!({ "tools": [tool] })
+        }
         "resources/list" if opts.expose_resources => serde_json::json!({
             "resources": [{
                 "uri": "window://streamable-mock/main",
@@ -145,9 +154,14 @@ pub async fn spawn_streamable_mock(opts: MockOpts) -> u16 {
                 break;
             };
             let io = TokioIo::new(stream);
+            // MockOpts 非 Copy（#200 加 tool_meta 后 Clone 化）：循环内每连接 clone 一份，供服务闭包按值持有。
+            let opts = opts.clone();
             tokio::spawn(async move {
-                let service =
-                    service_fn(move |req| async move { streamable_handler(req, opts).await });
+                // service_fn 要求 Fn：每请求再 clone 供 handler 按值消费。
+                let service = service_fn(move |req| {
+                    let opts = opts.clone();
+                    async move { streamable_handler(req, opts).await }
+                });
                 // reqwest 0.13 may optimistically reuse a just-closed test connection under
                 // parallel load; advertise close explicitly so auth status assertions observe
                 // the intended 401/403 response instead of a transient IncompleteMessage.

@@ -31,6 +31,7 @@ async fn connected_client(expose_resources: bool) -> HttpMCPClient {
         reject_status: StatusCode::FORBIDDEN,
         with_www_authenticate: false,
         expose_resources,
+        ..Default::default()
     })
     .await;
     let client = HttpMCPClient::new(HttpServerParameters {
