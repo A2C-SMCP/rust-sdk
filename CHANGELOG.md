@@ -24,6 +24,12 @@ All notable changes to this project will be documented in this file.
   validation with a migration diagnostic. The configuration-only `OAuthError` variants
   `ConflictingAuthorizationHeader`, `ExplicitPolicyRequiresOptions`, and
   `DisabledPolicyWithOptions` are also removed.
+- *(computer)* #204 changes `Computer::set_socketio_client` to return `ComputerResult<()>` and
+  adds `ConnectOptions::namespace_connect_timeout`. Exhaustive `ConnectOptions` literals must set
+  the new field or use `..Default::default()`; the default is 30 seconds.
+- *(computer)* #204 makes `SmcpComputerClient::get_office_id` and
+  `get_current_office_id` report only server-confirmed membership. During an initial join or
+  automatic rejoin they now return `None` / `InvalidState` until the join ACK succeeds.
 - *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
 
 ### Features
@@ -56,6 +62,10 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- *(computer)* #204 restores Office membership after Socket.IO transport reconnect, fences stale
+  join ACKs by connection generation, and makes client installation/replacement, disconnect, and
+  shutdown ownership atomic. Calling `disconnect_socketio` with an empty slot is now a no-op and
+  no longer forces the lifecycle back to `Started`.
 - *(computer)* #179 makes automatic OAuth startup a bounded transaction: persisted Authorization
   Code credentials and both Client Credentials modes connect in one `start_client_by_id` call,
   while truly missing user authorization still returns `OAuthRequired`. Persisted automatic OAuth
@@ -68,6 +78,10 @@ All notable changes to this project will be documented in this file.
 
 ### Migration Notes
 
+- Handle the `ComputerResult` returned by `set_socketio_client`. When constructing
+  `ConnectOptions`, prefer `..Default::default()` or set `namespace_connect_timeout` explicitly for
+  networks where namespace authentication can legitimately take longer than 30 seconds. Treat
+  Office getters as confirmed server state rather than desired join intent.
 - Remove `oauth`, `authPolicy`, and `auth_policy` from every HTTP server configuration; they now
   produce a validation error. Without static credentials, Streamable HTTP always connects
   anonymously first and admits OAuth only after a standards-compliant Bearer challenge. Static

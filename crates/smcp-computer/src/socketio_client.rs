@@ -34,12 +34,18 @@ use smcp::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tf_rust_socketio::{
     asynchronous::{Client, ClientBuilder, ReconnectSettings},
-    Event, Payload, TransportType,
+    CloseReason, Event, Payload, TransportType,
 };
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// Default deadline for the initial Socket.IO namespace CONNECT handshake.
+pub const DEFAULT_NAMESPACE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+const NAMESPACE_CONNECT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A client may publish Computer lifecycle changes only while it owns the current Socket.IO slot.
 #[derive(Clone)]
@@ -98,6 +104,36 @@ impl RuntimeLifecycle {
         if let Some(lease) = lease {
             lease.transition(next);
         }
+    }
+
+    fn is_active_for(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+        retiring: &AtomicBool,
+    ) -> bool {
+        if retiring.load(Ordering::Acquire) {
+            return false;
+        }
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|lease| {
+                lease.active
+                    && Arc::ptr_eq(&lease.status, status)
+                    && Arc::ptr_eq(&lease.owner, owner)
+            })
+            .cloned();
+        let Some(lease) = lease else {
+            return false;
+        };
+        let current_owner = lease
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *current_owner == lease.token && !retiring.load(Ordering::Acquire)
     }
 
     /// Atomically reserve this client for exactly one Computer. The inactive reservation keeps
@@ -220,6 +256,7 @@ pub struct SmcpComputerClientBuilder {
     /// reconnect; takes precedence over `auth_payload` when configured.
     auth_provider: Option<SocketIoAuthProvider>,
     namespace: Option<String>,
+    namespace_connect_timeout: Duration,
     headers: Option<HashMap<String, String>>,
     /// INT-03 #72：Computer 操作句柄（socketio-detached），供 blob/skill/cancel/tool_call handler 调用。
     /// `Option`：兼容旧入口（`SmcpComputerClient::new` / 不接 Computer 的测试）——缺省时 blob/skill/cancel
@@ -243,6 +280,7 @@ impl SmcpComputerClientBuilder {
             auth_payload: None,
             auth_provider: None,
             namespace: None,
+            namespace_connect_timeout: DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
             headers: None,
             computer_ops: None,
         }
@@ -293,6 +331,16 @@ impl SmcpComputerClientBuilder {
         self
     }
 
+    /// Configure the total time [`connect`](Self::connect) allows for initial transport
+    /// establishment and namespace readiness.
+    ///
+    /// Engine.IO transport establishment alone is not enough for application events, so connect
+    /// returns only after the namespace callback fires. The default is 30 seconds.
+    pub fn namespace_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.namespace_connect_timeout = timeout;
+        self
+    }
+
     /// 附加任意 HTTP upgrade header（路由用，如 TF 生态 `X-TF-RobotId`；**非鉴权信道**）。
     /// Attach arbitrary HTTP upgrade headers (routing, e.g. TF ecosystem headers; NOT for auth).
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
@@ -311,6 +359,7 @@ impl SmcpComputerClientBuilder {
             self.auth_payload,
             self.auth_provider,
             namespace,
+            self.namespace_connect_timeout,
             self.headers,
             self.computer_ops,
         )
@@ -341,6 +390,16 @@ pub struct SmcpComputerClient {
 }
 
 impl SmcpComputerClient {
+    /// Whether this client still owns the active lifecycle lease for the supplied Computer.
+    pub(crate) fn has_active_runtime_lifecycle(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+    ) -> bool {
+        self.runtime_status
+            .is_active_for(status, owner, &self.retiring)
+    }
+
     /// Atomically reserve this client for one Computer before touching its current slot value.
     pub(crate) fn claim_runtime_lifecycle(
         &self,
@@ -427,6 +486,7 @@ impl SmcpComputerClient {
         auth_payload: Option<Value>,
         auth_provider: Option<SocketIoAuthProvider>,
         namespace: String,
+        namespace_connect_timeout: Duration,
         headers: Option<HashMap<String, String>>,
         computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
     ) -> ComputerResult<Self> {
@@ -525,7 +585,7 @@ impl SmcpComputerClient {
             let retiring = Arc::clone(&close_retiring);
             async move {
                 let transport_close = !retiring.load(Ordering::Acquire)
-                    && Self::payload_contains_text(&payload, "transport close");
+                    && Self::payload_contains_text(&payload, CloseReason::TransportClose.as_str());
                 let rejoin_task = {
                     let mut membership = lock_office_membership(&membership);
                     let rejoin_task = membership.invalidate_connection(transport_close);
@@ -878,27 +938,33 @@ impl SmcpComputerClient {
         // 连接服务器（polling-first 已设；分类版本握手错误，4900 时改 polling 取 4008）
         // Connect (polling-first already set; classify version-handshake errors; on 4900 re-fetch
         // the authoritative 4008 over polling).
-        let client = match smcp_client_transport::connect_and_classify(
-            builder,
-            &handshake_url,
-            &namespace,
-            initial_auth_payload,
-            handshake_headers,
-        )
-        .await
-        {
-            Ok(client) => client,
-            Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
-                return Err(ComputerError::ProtocolVersionMismatch(pve));
-            }
-            Err(smcp_client_transport::ConnectError::Connection(msg)) => {
-                return Err(ComputerError::SocketIoError(msg));
-            }
-        };
+        // Bound both the tf builder's namespace CONNECT send and our callback readiness wait. With
+        // polling transport, a server-side namespace middleware can hold the CONNECT request itself,
+        // so timing only the Notify wait would still let Builder::connect hang forever.
+        let pending_cleanup = Arc::new(Mutex::new(None::<Client>));
+        let connection_cleanup = Arc::clone(&pending_cleanup);
+        let connection = async {
+            let client = match smcp_client_transport::connect_and_classify(
+                builder,
+                &handshake_url,
+                &namespace,
+                initial_auth_payload,
+                handshake_headers,
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
+                    return Err(ComputerError::ProtocolVersionMismatch(pve));
+                }
+                Err(smcp_client_transport::ConnectError::Connection(msg)) => {
+                    return Err(ComputerError::SocketIoError(msg));
+                }
+            };
+            *connection_cleanup.lock().await = Some(client.clone());
 
-        // ClientBuilder::connect only establishes Engine.IO. Wait for namespace CONNECT so a
-        // successful return is immediately join-ready; a fixed sleep leaves a deterministic race.
-        let namespace_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            // A successful return is immediately join-ready; a fixed sleep leaves a deterministic
+            // race between Engine.IO establishment and the namespace CONNECT callback.
             loop {
                 let notified = namespace_ready.notified();
                 if lock_office_membership(&office_membership).connected {
@@ -906,17 +972,31 @@ impl SmcpComputerClient {
                 }
                 notified.await;
             }
-        })
-        .await;
-        if namespace_result.is_err() {
-            // The tf client reader retains an internal clone, so an error return alone would leak
-            // the Engine.IO transport. Arm the retiring callbacks and close the current socket.
-            retiring.store(true, Ordering::Release);
-            let _ = client.disconnect().await;
-            return Err(ComputerError::TimeoutError(
-                "Socket.IO namespace connect timed out".to_string(),
-            ));
-        }
+            Ok(client)
+        };
+        let client = match tokio::time::timeout(namespace_connect_timeout, connection).await {
+            Ok(result) => {
+                let client = result?;
+                pending_cleanup.lock().await.take();
+                client
+            }
+            Err(_) => {
+                // The tf reader retains an internal clone after connect_and_classify returns. Arm
+                // callbacks first, then give teardown a separate bounded budget; if the builder was
+                // still sending CONNECT, dropping its future owns the only client and closes it.
+                retiring.store(true, Ordering::Release);
+                if let Some(client) = pending_cleanup.lock().await.take() {
+                    let _ = tokio::time::timeout(
+                        NAMESPACE_CONNECT_CLEANUP_TIMEOUT,
+                        client.disconnect(),
+                    )
+                    .await;
+                }
+                return Err(ComputerError::TimeoutError(
+                    "Socket.IO namespace connect timed out".to_string(),
+                ));
+            }
+        };
 
         info!(
             "Connected to SMCP server at {} with computer name: {}",
