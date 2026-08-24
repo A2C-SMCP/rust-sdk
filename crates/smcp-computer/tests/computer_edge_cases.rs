@@ -1,5 +1,6 @@
 use smcp_computer::{
     computer::{Computer, SilentSession},
+    errors::ComputerError,
     mcp_clients::bundle_id::resolve_bundle_id,
     mcp_clients::model::{
         BundleId, MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification,
@@ -219,8 +220,7 @@ async fn test_computer_multiple_boot_up() {
     // 第一次启动 / First boot up
     computer.boot_up().await.unwrap();
 
-    // 第二次启动应该成功（可能重置状态）
-    // Second boot up should succeed (might reset state)
+    // 重复启动是幂等 no-op，不替换运行中的 manager / Repeated boot is idempotent.
     computer.boot_up().await.unwrap();
 
     // 第三次启动 / Third boot up
@@ -228,9 +228,12 @@ async fn test_computer_multiple_boot_up() {
 
     computer.shutdown().await.unwrap();
 
-    // 关闭后再次启动 / Boot up after shutdown
-    computer.boot_up().await.unwrap();
-    computer.shutdown().await.unwrap();
+    // shutdown 是终态；复用会留下关闭的 status/debouncer 与新 manager 相矛盾。
+    let error = computer.boot_up().await.unwrap_err();
+    assert!(matches!(
+        error,
+        ComputerError::InvalidState(reason) if reason.contains("terminal")
+    ));
 }
 
 #[tokio::test]

@@ -1,0 +1,1148 @@
+{
+  "issue": "https://github.com/A2C-SMCP/rust-sdk/issues/196",
+  "unix_started_at": 1787205725,
+  "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "cargo": "cargo 1.94.0 (85eff7c80 2026-01-15)",
+  "node": "v23.5.0",
+  "git_head": "07d7cc04dfce51ec9c0951ee94e3556f4c99b585",
+  "repetitions": 3,
+  "runs": [
+    {
+      "run": 1,
+      "initial_status": {
+        "lifecycle": "started",
+        "config_revision": 0,
+        "capability_revision": 2,
+        "mcp_servers": 1,
+        "active_mcp_servers": 1,
+        "tools": 1,
+        "skills": 0,
+        "last_error": null,
+        "degraded_reason": null
+      },
+      "initial_projection": [
+        {
+          "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+          "inputSchema": {
+            "properties": {
+              "phase": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "phase"
+            ],
+            "type": "object"
+          },
+          "name": "mutable__set_phase"
+        }
+      ],
+      "transitions": [
+        {
+          "run": 1,
+          "transition": "add_tool",
+          "requested_phase": 1,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 1,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 28,
+          "before_projection": [
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema A)",
+              "inputSchema": {
+                "properties": {
+                  "x": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "x"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 1,
+          "transition": "schema_change_same_count",
+          "requested_phase": 2,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 0,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema A)",
+              "inputSchema": {
+                "properties": {
+                  "x": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "x"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 1,
+          "transition": "same_projection",
+          "requested_phase": 2,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 250,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 1,
+          "transition": "remove_tool",
+          "requested_phase": 3,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 1,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 27,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        }
+      ]
+    },
+    {
+      "run": 2,
+      "initial_status": {
+        "lifecycle": "started",
+        "config_revision": 0,
+        "capability_revision": 2,
+        "mcp_servers": 1,
+        "active_mcp_servers": 1,
+        "tools": 1,
+        "skills": 0,
+        "last_error": null,
+        "degraded_reason": null
+      },
+      "initial_projection": [
+        {
+          "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+          "inputSchema": {
+            "properties": {
+              "phase": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "phase"
+            ],
+            "type": "object"
+          },
+          "name": "mutable__set_phase"
+        }
+      ],
+      "transitions": [
+        {
+          "run": 2,
+          "transition": "add_tool",
+          "requested_phase": 1,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 1,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 28,
+          "before_projection": [
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema A)",
+              "inputSchema": {
+                "properties": {
+                  "x": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "x"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 2,
+          "transition": "schema_change_same_count",
+          "requested_phase": 2,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 2,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema A)",
+              "inputSchema": {
+                "properties": {
+                  "x": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "x"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 2,
+          "transition": "same_projection",
+          "requested_phase": 2,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 250,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 2,
+          "transition": "remove_tool",
+          "requested_phase": 3,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 1,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 27,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        }
+      ]
+    },
+    {
+      "run": 3,
+      "initial_status": {
+        "lifecycle": "started",
+        "config_revision": 0,
+        "capability_revision": 2,
+        "mcp_servers": 1,
+        "active_mcp_servers": 1,
+        "tools": 1,
+        "skills": 0,
+        "last_error": null,
+        "degraded_reason": null
+      },
+      "initial_projection": [
+        {
+          "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+          "inputSchema": {
+            "properties": {
+              "phase": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "phase"
+            ],
+            "type": "object"
+          },
+          "name": "mutable__set_phase"
+        }
+      ],
+      "transitions": [
+        {
+          "run": 3,
+          "transition": "add_tool",
+          "requested_phase": 1,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 1,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 27,
+          "before_projection": [
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema A)",
+              "inputSchema": {
+                "properties": {
+                  "x": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "x"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 3,
+          "transition": "schema_change_same_count",
+          "requested_phase": 2,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 0,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema A)",
+              "inputSchema": {
+                "properties": {
+                  "x": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "x"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 3,
+          "transition": "same_projection",
+          "requested_phase": 2,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 250,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        },
+        {
+          "run": 3,
+          "transition": "remove_tool",
+          "requested_phase": 3,
+          "before": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 2,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "after": {
+            "lifecycle": "started",
+            "config_revision": 0,
+            "capability_revision": 2,
+            "mcp_servers": 1,
+            "active_mcp_servers": 1,
+            "tools": 1,
+            "skills": 0,
+            "last_error": null,
+            "degraded_reason": null
+          },
+          "projection_reached": true,
+          "projection_wait_ms": 28,
+          "before_projection": [
+            {
+              "description": "dynamic tool (schema B, renamed)",
+              "inputSchema": {
+                "properties": {
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "y"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__dyn_tool"
+            },
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "after_projection": [
+            {
+              "description": "Switch the server phase; mutates the tool/resource set and emits list_changed",
+              "inputSchema": {
+                "properties": {
+                  "phase": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "name": "mutable__set_phase"
+            }
+          ],
+          "observed_events": []
+        }
+      ]
+    }
+  ]
+}

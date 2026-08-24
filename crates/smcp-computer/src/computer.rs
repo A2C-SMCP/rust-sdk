@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
@@ -49,10 +50,15 @@ use crate::settings::lifecycle::{
     AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceRefreshRow,
     MarketplaceRemoveOutcome, RemoveMarketplaceParams,
 };
-use crate::settings::mcp_config::canonicalize_persist_body;
+use crate::settings::mcp_config::{
+    canonicalize_persist_body, mcp_server_status, McpApprovalStatus,
+};
 use crate::settings::policy::resolve_policy_settings;
 use crate::settings::reconciler::InstalledPluginRecord;
-use crate::settings::recovery::{BundledServerRecord, GovernanceRecoveryReport};
+use crate::settings::recovery::{
+    plugin_enabled_origin, BundledServerRecord, GovernanceRecoveryReport,
+};
+use crate::settings::schema::SettingsScope;
 use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
@@ -63,28 +69,108 @@ use smcp::utils::env_truthy;
 use smcp::A2CSkillRef;
 
 use crate::errors::{ComputerError, ComputerResult};
+// #162：结构化 Runtime diagnostics 词汇（记录 / 清除接线全走 `RuntimeStatus` 的键控集）。
+use crate::diagnostics::{
+    classify_recovery, DiagnosticCode, DiagnosticOperation, DiagnosticSeverity, DiagnosticSource,
+    DiagnosticTarget, RuntimeDiagnostic,
+};
 use crate::inputs::handler::InputHandler;
 use crate::inputs::load_env_file;
 use crate::inputs::model::InputValue;
 use crate::inputs::plugin_pool::PluginScope;
 use crate::inputs::runtime_resolver::{
-    InputKind, InputResolutionError, InputValueResolver, SecretValueResolver,
+    validate_resolved_value, InputKind, InputResolutionError, InputValueResolver,
+    SecretValueResolver,
 };
 use crate::inputs::{env_var_name, utils::run_command};
 use crate::mcp_clients::{
     manager::MCPServerManager,
     model::{
         content_as_text, is_call_tool_error, BundleId, CallToolResult, CancellableCallOutcome,
-        Content, MCPServerConfig, MCPServerInput, McpChangeKind, McpServerNotification,
-        ReadResourceResult, Resource, ServerName, Tool,
+        Content, MCPServerConfig, MCPServerInput, MCPServerRuntimeStatus, McpChangeKind,
+        McpServerNotification, ReadResourceResult, Resource, ServerName, Tool,
+        WindowEnumerationReport,
     },
     ConfigRender, RenderError,
 };
+use crate::oauth::{InMemoryOAuthCredentialStore, OAuthCredentialStore};
 use crate::socketio_client::{SmcpComputerClient, SmcpComputerClientBuilder};
 use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
 /// 确认回调函数类型 / Confirmation callback function type
 type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>;
+
+/// Process-unique tokens fence stale Socket.IO clients from publishing Computer lifecycle changes.
+static NEXT_SOCKETIO_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Install one already-connected client while the Computer Socket.IO lifecycle gate is held.
+async fn install_socketio_client_locked(
+    socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+    status: Arc<RuntimeStatus>,
+    owner: Arc<StdMutex<u64>>,
+    client: Arc<SmcpComputerClient>,
+) -> ComputerResult<()> {
+    let mut socketio_ref = socketio_client.write().await;
+    if socketio_ref
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &client))
+    {
+        if status.state() == LifecycleState::Shutdown {
+            return Err(ComputerError::InvalidState(
+                "Computer is shut down".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    // The reservation is atomic inside the client, unlike a separate check followed by bind.
+    // Different Computers have different lifecycle gates, so only this client-local claim can
+    // prevent concurrent installation of the same standalone Arc into two slots.
+    let lifecycle_token = NEXT_SOCKETIO_LIFECYCLE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if !client.claim_runtime_lifecycle(Arc::clone(&status), Arc::clone(&owner), lifecycle_token) {
+        return Err(ComputerError::InvalidState(
+            "Socket.IO client is already installed in another Computer".to_string(),
+        ));
+    }
+
+    // Claim before cleanup so a shut-down Computer cannot disconnect a candidate currently owned
+    // by another Computer. An unowned candidate is still retired before the rejection returns.
+    if status.state() == LifecycleState::Shutdown {
+        let cleanup = client.disconnect().await;
+        client.release_runtime_lifecycle_claim(lifecycle_token);
+        cleanup?;
+        return Err(ComputerError::InvalidState(
+            "Computer is shut down".to_string(),
+        ));
+    }
+
+    // A tf-rust-socketio reader owns an internal Client clone, so dropping the old public Arc does
+    // not close it. Retire it before publishing the replacement; if 0.8.1 is already in reconnect
+    // backoff, the retiring event gate closes its next namespace before any app handler can run.
+    if let Some(previous) = socketio_ref.as_ref() {
+        if let Err(error) = previous.disconnect().await {
+            if let Err(cleanup_error) = client.disconnect().await {
+                warn!(
+                    error = %cleanup_error,
+                    "replacement Socket.IO client cleanup failed after old teardown error"
+                );
+            }
+            client.release_runtime_lifecycle_claim(lifecycle_token);
+            return Err(error);
+        }
+        previous.deactivate_runtime_lifecycle();
+    }
+
+    if !client.activate_runtime_lifecycle(lifecycle_token) {
+        let _ = client.disconnect().await;
+        client.release_runtime_lifecycle_claim(lifecycle_token);
+        return Err(ComputerError::RuntimeError(
+            "Socket.IO lifecycle ownership was lost during installation".to_string(),
+        ));
+    }
+    *socketio_ref = Some(client);
+    Ok(())
+}
 
 /// 解析 "key:value,foo:bar" 格式的 headers 字符串为 HashMap
 /// Parse "key:value,foo:bar" format headers string into HashMap
@@ -103,6 +189,16 @@ fn parse_headers_string(headers: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// 异步 Socket.IO auth provider。每次调用返回下一次 CONNECT 使用的完整 auth JSON。
+/// Async Socket.IO auth provider returning the complete auth JSON for the next CONNECT.
+///
+/// Provider 自行负责凭证获取、刷新、等待与重试；本 SDK 不为 Provider 定义失败或取消语义。
+/// The provider owns credential acquisition, refresh, waiting, and retry behavior; the SDK does
+/// not define provider failure or cancellation semantics.
+pub type SocketIoAuthProvider = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'static>> + Send + Sync,
+>;
+
 /// [`Computer::connect_socketio`] 的连接可选项 / Options for [`Computer::connect_socketio`].
 ///
 /// 用具名字段替代位置参。#86 起连接面鉴权**唯一**走 Socket.IO auth dict
@@ -111,8 +207,14 @@ fn parse_headers_string(headers: &str) -> HashMap<String, String> {
 ///
 /// Named-field options. Since #86 connection auth lives **only** in the Socket.IO auth dict
 /// (`auth_payload`); HTTP headers are routing-only.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectOptions {
+    /// 动态 Socket.IO auth provider；配置时优先于 [`auth_payload`](Self::auth_payload)，并在首次连接及
+    /// 每次自动重连的 CONNECT 前调用。
+    /// Dynamic Socket.IO auth provider. When configured, it takes precedence over
+    /// [`auth_payload`](Self::auth_payload) and is called before the initial CONNECT and every
+    /// automatic reconnect CONNECT.
+    pub auth_provider: Option<SocketIoAuthProvider>,
     /// Socket.IO CONNECT `auth` 字段负载（连接面鉴权唯一信道）；auth-agnostic，整个 JSON 由调用方决定。
     /// Socket.IO CONNECT `auth` payload (the sole connection-auth channel; caller owns the JSON).
     pub auth_payload: Option<serde_json::Value>,
@@ -127,10 +229,28 @@ pub struct ConnectOptions {
 impl Default for ConnectOptions {
     fn default() -> Self {
         Self {
+            auth_provider: None,
             auth_payload: None,
             headers: None,
             namespace: smcp::SMCP_NAMESPACE.to_string(),
         }
+    }
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field(
+                "auth_provider",
+                &self.auth_provider.as_ref().map(|_| "<provider>"),
+            )
+            .field(
+                "auth_payload",
+                &self.auth_payload.as_ref().map(|_| "<redacted>"),
+            )
+            .field("headers", &self.headers)
+            .field("namespace", &self.namespace)
+            .finish()
     }
 }
 
@@ -231,10 +351,13 @@ impl Session for SilentSession {
                 input.default.clone().unwrap_or_default(),
             )),
             MCPServerInput::PickString(input) => Ok(serde_json::Value::String(
-                input
-                    .default
-                    .clone()
-                    .unwrap_or_else(|| input.options.first().cloned().unwrap_or_default()),
+                input.default.clone().unwrap_or_else(|| {
+                    input
+                        .options
+                        .first()
+                        .map(|option| option.value.clone())
+                        .unwrap_or_default()
+                }),
             )),
             MCPServerInput::Command(input) => {
                 // 静默Session执行命令并返回输出 / Silent session executes command and returns output
@@ -264,6 +387,12 @@ impl Session for SilentSession {
 }
 
 /// Computer核心结构体 / Core Computer struct
+#[derive(Clone)]
+struct RawMcpServerEntry {
+    config: MCPServerConfig,
+    input_scope: Option<PluginScope>,
+}
+
 pub struct Computer<S: Session> {
     /// 计算机名称 / Computer name
     name: String,
@@ -280,7 +409,23 @@ pub struct Computer<S: Session> {
     /// 使 `list_mcp_servers` / inventory 归属 / CLI `status` 少一条身份、并令 `server rm <bundle_id>`
     /// 删错对象。存 **raw** config（保留 `${input:*}` 引用，与落盘一致）；键取 `render_server_config`
     /// 已 stamp 的值（从 raw 派生，#117：不在此重派生，避免 raw/rendered 连接身份漂移）。
-    mcp_servers: RwLock<HashMap<BundleId, MCPServerConfig>>,
+    /// Config and its input scope form one atomic desired-state entry: a concurrent start must never
+    /// observe a new raw config with an old plugin scope (or vice versa).
+    mcp_servers: Arc<RwLock<HashMap<BundleId, RawMcpServerEntry>>>,
+    /// Global gate around Manager replacement. Per-server operations take a read guard before their
+    /// keyed lock; boot/shutdown take the write guard before installing or removing the Manager.
+    mcp_lifecycle_gate: Arc<RwLock<()>>,
+    /// Serializes the complete boot and shutdown transactions, including background task setup and
+    /// teardown. This is separate from `mcp_lifecycle_gate` because boot-time governance may mount
+    /// declarations after the Manager has been installed.
+    mcp_boot_shutdown: Arc<Mutex<()>>,
+    /// Actual process lifecycle is closed before boot and after terminal shutdown. Raw declaration
+    /// mount/unmount remains available before boot; only a successful first boot opens this flag.
+    mcp_operations_open: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes Computer-owned desired state with the Manager declaration/process state for one
+    /// bundle. Every per-server lifecycle path takes this lock before entering the Manager's own
+    /// lifecycle lock, so mount/unmount cannot leave a raw-only or declaration-only split state.
+    mcp_lifecycle_locks: Arc<crate::weak_registry::WeakRegistry<BundleId, Mutex<()>>>,
     /// #147/S14：宿主构造入参 `Computer::new(mcp_servers=…)` 的 **frozen 声明快照**（embed 层）。
     ///
     /// 与 `mcp_servers`（运行期可变物化集，随 mount/unmount/add 变动）**分离**——本字段构造后**不可变**、
@@ -308,6 +453,9 @@ pub struct Computer<S: Session> {
     /// 经 [`with_client_factory`](Self::with_client_factory) 注入；[`new_manager`](Self::new_manager)（boot_up /
     /// mount_server 惰性建 manager 处）应用到 manager，使 hermetic 测试能注入假 client 测「mount→running」。
     client_factory_override: Option<crate::mcp_clients::manager::ClientFactory>,
+    /// OAuth credential storage is host-owned and explicitly injectable. The default is process-local
+    /// memory, so constructing a `Computer` never probes an OS keyring or cloud secret service.
+    oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     /// 工具调用历史 / Tool call history
     tool_history: Arc<Mutex<Vec<ToolCallRecord>>>,
     /// Session实例 / Session instance
@@ -316,6 +464,10 @@ pub struct Computer<S: Session> {
     /// 使用 Arc 而不是 Weak 以确保 client 生命周期
     /// Using Arc instead of Weak to ensure client lifetime
     socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+    /// Serializes connect/install/disconnect/shutdown and owns their cancellation boundary.
+    socketio_lifecycle_gate: Arc<Mutex<()>>,
+    /// Active Socket.IO client's lifecycle publication token.
+    socketio_lifecycle_owner: Arc<StdMutex<u64>>,
     /// 确认回调函数 / Confirmation callback function
     confirm_callback: Option<ConfirmCallbackType>,
 
@@ -669,9 +821,17 @@ impl<S: Session> Computer<S> {
         // 与下方运行期可变物化集分离。
         let embed_servers: Vec<MCPServerConfig> = raw_mcp_servers.values().cloned().collect();
         // 按 bundle_id 重建键（丢弃调用方键，见上方 rustdoc）。
-        let mcp_servers: HashMap<BundleId, MCPServerConfig> = raw_mcp_servers
+        let mcp_servers: HashMap<BundleId, RawMcpServerEntry> = raw_mcp_servers
             .into_values()
-            .map(|cfg| (crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg), cfg))
+            .map(|config| {
+                (
+                    crate::mcp_clients::bundle_id::resolve_bundle_id(&config),
+                    RawMcpServerEntry {
+                        config,
+                        input_scope: None,
+                    },
+                )
+            })
             .collect();
 
         // 共享 Arc 句柄先建，供去抖器回调捕获（避免 Computer ↔ debouncer 强引用环）。
@@ -692,16 +852,23 @@ impl<S: Session> Computer<S> {
             name,
             mcp_manager: Arc::new(RwLock::new(None)),
             inputs: Arc::new(RwLock::new(inputs)),
-            mcp_servers: RwLock::new(mcp_servers),
+            mcp_servers: Arc::new(RwLock::new(mcp_servers)),
+            mcp_lifecycle_gate: Arc::new(RwLock::new(())),
+            mcp_boot_shutdown: Arc::new(Mutex::new(())),
+            mcp_operations_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mcp_lifecycle_locks: Arc::new(crate::weak_registry::WeakRegistry::default()),
             embed_servers,
             mcp_flag_config: None,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
             auto_reconnect,
             client_factory_override: None,
+            oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
             tool_history: Arc::new(Mutex::new(Vec::new())),
             session,
             socketio_client,
+            socketio_lifecycle_gate: Arc::new(Mutex::new(())),
+            socketio_lifecycle_owner: Arc::new(StdMutex::new(0)),
             confirm_callback: None,
             skill_registry,
             skill_home,
@@ -750,6 +917,24 @@ impl<S: Session> Computer<S> {
         factory: crate::mcp_clients::manager::ClientFactory,
     ) -> Self {
         self.client_factory_override = Some(factory);
+        self
+    }
+
+    /// Inject the host-owned OAuth credential store shared by every manager this computer creates.
+    ///
+    /// The default is an in-memory store. Hosts that require cross-process resume may inject their
+    /// own durable implementation without changing the SDK's storage policy. Rebuilding a
+    /// `Computer` restores credentials when the new instance receives the same durable store (or
+    /// another handle to the same backend) and the OAuth bundle/resource/issuer/grant key is
+    /// unchanged.
+    ///
+    /// Multi-tenant hosts should bind trusted tenant/principal context when constructing `store`;
+    /// that context does not belong in serializable server configuration. An explicitly injected
+    /// store is authoritative: backend failures are returned and never trigger a silent in-memory
+    /// fallback.
+    #[must_use]
+    pub fn with_oauth_credential_store(mut self, store: Arc<dyn OAuthCredentialStore>) -> Self {
+        self.oauth_credential_store = store;
         self
     }
 
@@ -1333,23 +1518,47 @@ impl<S: Session> Computer<S> {
         // `declared` 覆盖：CLI 参考接线传 **flag-aware** 合并视图（`--settings` scope 生效，对齐 Python
         // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（user + 进程 cwd 的 project/local +
         // policy，**无** `--settings` flag scope；跨重启可靠 disable 请写 user scope）。cwd=None（进程态）。
+        //
+        // #165 Option B：`scope_layers`（per-scope 原始层）用于 project-origin 检测——与 `declared` **解耦**。
+        // `declared==None` 时与 declared 同源解析；`declared==Some(flag-aware)` 时单独解析。二者均锚定**本实例
+        // `config_dir`**（#113：override > 进程 cwd；与 governance_snapshot 等同源，且令测试 hermetic）——project scope
+        // 必在此解析内，故门在所有挂载路径（含 CLI `run_governance_remount`）生效（Python #182 在 declared=Some
+        // 路径 per_scope_layers=None ⇒ 门不触发，本实现显式收紧）。flag 层受信（免批准）不参与 origin 判定，其缺席
+        // 仅影响罕见 flag+project 重叠（过度提示，安全）。
+        let config_dir = self.config_dir();
         let resolved_declared;
+        let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)>;
         let declared: &serde_json::Map<String, serde_json::Value> = match declared {
-            Some(d) => d,
-            None => {
+            Some(d) => {
                 let policy = resolve_policy_settings(None, None, None);
-                resolved_declared = resolve_settings(ResolveSettingsArgs {
-                    cwd: None,
+                scope_layers = resolve_settings(ResolveSettingsArgs {
+                    cwd: Some(&config_dir),
                     env,
                     flag_settings_path: None,
                     policy_settings: Some(&policy),
                 })
-                .settings;
+                .scope_layers;
+                d
+            }
+            None => {
+                let policy = resolve_policy_settings(None, None, None);
+                let resolved = resolve_settings(ResolveSettingsArgs {
+                    cwd: Some(&config_dir),
+                    env,
+                    flag_settings_path: None,
+                    policy_settings: Some(&policy),
+                });
+                resolved_declared = resolved.settings;
+                scope_layers = resolved.scope_layers;
                 &resolved_declared
             }
         };
 
         // 阶段一：重挂 marketplace skills（持 `skill_registry` 写锁；stage 含 git await，boot 期无并发故安全）。
+        // #162：代际重算——开场清上一轮 Governance 源诊断，本轮结果随后重记：上轮失败的 marketplace 本轮
+        // 恢复即自然清除（运行期恢复路径，boot 与运行期统一语义）。
+        self.status
+            .clear_diagnostics_where(|d| d.source == DiagnosticSource::Governance);
         let mut report = {
             let mut reg = self.skill_registry.write().await;
             crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, env, declared)
@@ -1367,6 +1576,28 @@ impl<S: Session> Computer<S> {
             &mut report,
         )
         .await;
+
+        // #162：治理降级进结构化诊断（Degraded 级 + Governance 源；marketplace 键 / plugin 键）。
+        for mp in &report.failed_marketplaces {
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::MarketplaceSyncFailed,
+                DiagnosticSeverity::Degraded,
+                DiagnosticSource::Governance,
+                DiagnosticOperation::MarketplaceSync,
+                DiagnosticTarget::Marketplace(mp.clone()),
+                format!("marketplace source failed to sync: {mp}"),
+            ));
+        }
+        for pid in &report.failed_rematerialize {
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::LedgerRematerializeFailed,
+                DiagnosticSeverity::Degraded,
+                DiagnosticSource::Governance,
+                DiagnosticOperation::LedgerRematerialize,
+                DiagnosticTarget::Plugin(pid.clone()),
+                format!("ledger rematerialize failed for enabled plugin: {pid}"),
+            ));
+        }
 
         // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
         // 严格镜像 Python `computer.py::reconcile_governance` remount 臂（PR #119 / #100 设计 Y）：
@@ -1387,6 +1618,28 @@ impl<S: Session> Computer<S> {
                 if existing.contains(&bid) {
                     warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id,
                         "reconcile_governance: remount skipped (bundle_id conflicts with an existing server, existing wins)");
+                    continue;
+                }
+                // #169：安全层 Gate 1-3——所有 bundled server（不论 origin）必经（协议指南 §2.3）。
+                // policy deny/allow/disabledMcpjson → 拒绝（不挂载、不入 pending）。
+                if crate::settings::mcp_config::security_layer_check(bid.as_str(), declared) {
+                    warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id,
+                        "reconcile_governance: bundled server disabled by security layer (policy deny/allow/disabledMcpjson) — not mounted");
+                    continue;
+                }
+                // #165 Option B：project-origin bundled server 回落审批门（协议 §5 item 10 条件化 / 指南 §2.2）。
+                // 仅 project scope 供给的 `enabledPlugins=true` → PENDING；受信 scope（user/local/flag/policy）免批准。
+                // 再过 `mcp_server_status`（F8① 签名未变，bundle_id 作 name 传入）：落 PENDING 才不挂载——
+                // 用户手动加入 `enabledMcpjsonServers` → ENABLED 仍挂载；policy `deniedMcpServers` → DISABLED 亦落
+                // 既有路径。兑现「作为未决 server 自然落档⑦」（非「进门后改判」，不复活 #131 档④）。
+                if plugin_enabled_origin(&scope_layers, &rec.plugin_id)
+                    == Some(SettingsScope::Project)
+                    && mcp_server_status(bid.as_str(), declared, false)
+                        == McpApprovalStatus::Pending
+                {
+                    info!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id,
+                        "reconcile_governance: bundled server enabled by project scope — PENDING approval, not auto-mounted");
+                    report.pending_bundled_servers.push(rec);
                     continue;
                 }
                 // 每 plugin 根注入一次 inputs；注入失败 → 隔离该 server（roots 不入集，同根后续 server 会重试）。
@@ -1418,6 +1671,17 @@ impl<S: Session> Computer<S> {
                     Err(e) => {
                         warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id, error = %e,
                             "reconcile_governance: remount register_server failed (non-blocking)");
+                        // #162：重挂失败进结构化诊断（Degraded + Bundle 键——start 失败由
+                        // `start_mcp_client` 自身记录，此处只记 register 臂；`McpHookError` 非
+                        // `ComputerError`，恢复属性走缺省 false）。
+                        self.status.record_diagnostic(RuntimeDiagnostic::new(
+                            DiagnosticCode::BundledRemountFailed,
+                            DiagnosticSeverity::Degraded,
+                            DiagnosticSource::Governance,
+                            DiagnosticOperation::RemountBundledServer,
+                            DiagnosticTarget::Bundle(bid.clone()),
+                            format!("reconcile remount register failed: {e}"),
+                        ));
                     }
                 }
             }
@@ -1426,6 +1690,12 @@ impl<S: Session> Computer<S> {
         // 派生注册表已变更才标脏（交去抖器 emit `server:update_skills`；boot 期 socketio 未连 → no-op）。
         if !report.restored_skills.is_empty() {
             self.mark_skills_dirty();
+        }
+        // #162：窄域恢复迁移——上一轮降级（`Degraded`）且本轮诊断集已无 Degraded 级条目（开场代际清除 +
+        // 本轮无新失败）→ 恢复 `Started`。**仅出 Degraded**：运行期治理失败只进诊断集、绝不从
+        // `Connected`/`JoinedOffice` 迁入 Degraded（运行期降级由诊断集承载，lifecycle 状态机不被打穿）。
+        if self.status.state() == LifecycleState::Degraded && !self.status.has_degraded() {
+            self.status.transition(LifecycleState::Started);
         }
         report
     }
@@ -1444,8 +1714,8 @@ impl<S: Session> Computer<S> {
         mcp_server: &str,
         cursor: Option<String>,
     ) -> ComputerResult<(Vec<Resource>, Option<String>)> {
-        let guard = self.mcp_manager.read().await;
-        let Some(manager) = guard.as_ref() else {
+        let guard = self.current_manager().await;
+        let Some(manager) = guard else {
             return Err(ComputerError::InvalidState(
                 "MCP Manager is not initialized".to_string(),
             ));
@@ -1565,13 +1835,13 @@ impl<S: Session> Computer<S> {
         let Some(home) = self.skill_home.read().expect("skill_home poisoned").clone() else {
             return Vec::new();
         };
-        let manager_guard = self.mcp_manager.read().await;
-        let Some(manager) = manager_guard.as_ref() else {
+        let manager_guard = self.current_manager().await;
+        let Some(manager) = manager_guard else {
             return Vec::new();
         };
         // #77：写锁不再跨 materialize 网络持有——stage_mcp_skills 内部按 SKILL 在 finalize 阶段短持写锁。
         // #106：物化 + `mcp:` 源孤儿对账抽为共享自由函数，与 [`McpChangeReactor`] 复用（见 restage_mcp_skills_into）。
-        restage_mcp_skills_into(manager, &self.skill_registry, &home, bundle_id).await
+        restage_mcp_skills_into(&manager, &self.skill_registry, &home, bundle_id).await
     }
 
     /// 直接处理一条 MCP 运行期变化通知（#106）：刷新工具映射 / desktop 集合去抖 / MCP 源 skill 重挂，并触发
@@ -1585,6 +1855,7 @@ impl<S: Session> Computer<S> {
     fn mcp_change_reactor(&self) -> McpChangeReactor {
         McpChangeReactor {
             manager: Arc::downgrade(&self.mcp_manager),
+            status: Arc::clone(&self.status),
             socketio_client: Arc::clone(&self.socketio_client),
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
@@ -1697,26 +1968,63 @@ impl<S: Session> Computer<S> {
         self.socketio_client.clone()
     }
 
+    /// #178：解析当前 MCP 管理器——读锁内仅克隆 `MCPServerManager`（全 Arc 字段，克隆廉价），
+    /// 守卫在语句结束即释放。所有 rmcp 调用一律在无锁的克隆上进行；锁只保护槽位替换，
+    /// 不保护在途调用。由此消除「挂起 MCP 调用持读锁 → 唯一写者（shutdown/mount）永久排队」
+    /// 的冻结链。
+    async fn current_manager(&self) -> Option<MCPServerManager> {
+        self.mcp_manager.read().await.as_ref().cloned()
+    }
+
     /// 启动Computer / Boot up the computer
     ///
     /// # Errors
-    /// 渲染阶段对已定义但 resolver/env/default 均无法提供的 input/secret 上抛
-    /// [`ComputerError::InputResolution`]（#144，对齐 [`Self::mount_server`]，**非仅日志**）；client 据此驱动补录
-    /// UI 并在保存后重试。失败落 `Error` 状态、不残留 manager/task/transport，可安全重试。管理器初始化失败（manager 错）。
+    /// Raw declaration validation/manager initialization failures. Input values and commands are not
+    /// resolved during boot; their structured errors surface from the next actual start/restart.
     pub async fn boot_up(&self) -> ComputerResult<()> {
         info!("Starting Computer: {}", self.name);
+        let _boot_shutdown = self.mcp_boot_shutdown.lock().await;
+        if self.lifecycle_state() == LifecycleState::Shutdown {
+            return Err(ComputerError::InvalidState(
+                "Computer shutdown is terminal; construct a new Computer to boot again".to_string(),
+            ));
+        }
+        if self.mcp_manager.read().await.is_some() {
+            if self
+                .mcp_operations_open
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                // Repeated boot of an already-running Computer is an idempotent no-op. Replacing
+                // the live Manager would orphan active processes and background transports.
+                return Ok(());
+            }
+            return Err(ComputerError::InvalidState(
+                "MCP Manager already exists but process lifecycle is not running".to_string(),
+            ));
+        }
         // #140：注册期 env 名坍缩 fail-fast——两 input id 经 ENV_SEGMENT 归一同一完整 env 名（如 `a-b`/`a_b`）
         // 会静默串味（后写的赢，含 `password:true` 密钥）。live 解析只用裸 id ⇒ 检 `self.inputs` 键集即全部活跃
         // env 名（对齐 python `raise_on_env_name_collisions`，接线 server/tool 段时须扩形）。
         {
             let inputs = self.inputs.read().await;
+            for input in inputs.values() {
+                input
+                    .validate()
+                    .map_err(ComputerError::InvalidConfiguration)?;
+            }
             // 迭代 `values().id()`（value 的权威 id）而非 map key——live resolve 亦用 `input.id()`，二者对齐；
             // 畸形调用方令 key ≠ value.id() 时不致检查落到错误 keyspace。
             smcp::utils::env_segment::raise_on_env_name_collisions(inputs.values().map(|v| v.id()))
                 .map_err(|e| ComputerError::InvalidConfiguration(e.to_string()))?;
         }
+        let lifecycle_gate = self.mcp_lifecycle_gate.write().await;
+        self.mcp_operations_open
+            .store(false, std::sync::atomic::Ordering::Release);
         // #114 S7：进入 Starting（加载 config / 解析本地状态 / 启动 MCP 资源，契约 §3）。
+        // #162：boot 代际开启——清上一轮 Boot 源残留诊断（重启语义，等价升级自 `set_last_error(None)`）。
         self.status.transition(LifecycleState::Starting);
+        self.status
+            .clear_diagnostics_where(|d| d.source == DiagnosticSource::Boot);
 
         // 创建MCP服务器管理器 / Create MCP server manager（#152：经 new_manager 应用 client factory override 接缝）
         let manager = self.new_manager().await;
@@ -1726,53 +2034,58 @@ impl<S: Session> Computer<S> {
         let (change_tx, change_rx) = mpsc::unbounded_channel::<McpServerNotification>();
         manager.set_change_sender(change_tx).await;
 
-        // 渲染并验证服务器配置 / Render and validate server configurations
+        // Raw configs remain Computer-owned. Manager receives only declaration metadata until an
+        // actual start/restart supplies a freshly rendered process config.
         let servers = self.mcp_servers.read().await;
-        let mut validated_servers = Vec::new();
-
-        for server_config in servers.values() {
-            match self.render_server_config(server_config).await {
-                Ok(validated) => validated_servers.push(validated),
-                Err(e) => {
-                    // #144：D1 结构化 input 解析错误（Missing/ResolverFailed）须上抛供 client 驱动补录（非仅日志，
-                    // 对齐 mount_server）。此处位于 commit/spawn/watcher 之前 ⇒ 无残留 manager/task/transport，boot 可
-                    // 安全重试。落 `Error` + last_error（同下方 initialize 失败路径）使观测面反映失败、不卡 `Starting`；
-                    // 诊断仅用 error_code + 名（不含渲染细节/secret，契约 §3）。其余渲染错误维持「保留原配置」容错。
-                    if matches!(e, ComputerError::InputResolution(_)) {
-                        self.status.set_last_error(Some(format!(
-                            "boot failed to render server config '{}' (code {})",
-                            server_config.name(),
-                            e.error_code()
-                        )));
-                        self.status.transition(LifecycleState::Error);
-                        return Err(e);
-                    }
-                    error!(
-                        "Failed to render server config {}: {}",
-                        server_config.name(),
-                        e
-                    );
-                    // 保留原配置作为回退 / Keep original config as fallback
-                    validated_servers.push(server_config.clone());
-                }
-            }
-        }
+        let raw_servers: Vec<MCPServerConfig> =
+            servers.values().map(|entry| entry.config.clone()).collect();
+        drop(servers);
 
         // 初始化管理器 / Initialize manager
         // #114 S7：boot 的硬失败点之一（另一为上方 #144 render 阶段的 InputResolution）。失败 → 落 `Error` 状态 +
-        // 公开诊断（不含 secret，仅错误类别串），使观测面反映「boot 失败」而非卡在 `Starting`（契约 §3 `error` 语义）。
-        // 诊断用 `error_code` + 简述，避免透传可能含渲染细节的 Display 全文。
-        if let Err(e) = manager.initialize(validated_servers).await {
-            self.status.set_last_error(Some(format!(
-                "boot failed to initialize MCP manager (code {})",
-                e.error_code()
-            )));
+        // 结构化诊断（#162：Error 级 + Boot 源；不含 secret，仅错误类别码），使观测面反映「boot 失败」而非卡在
+        // `Starting`（契约 §3 `error` 语义）。诊断用 `error_code` + 简述，避免透传可能含渲染细节的 Display 全文。
+        if let Err(e) = manager.initialize(Vec::new()).await {
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::BootManagerInitFailed,
+                DiagnosticSeverity::Error,
+                DiagnosticSource::Boot,
+                DiagnosticOperation::InitializeManager,
+                DiagnosticTarget::Runtime,
+                format!(
+                    "boot failed to initialize MCP manager (code {})",
+                    e.error_code()
+                ),
+            ));
             self.status.transition(LifecycleState::Error);
             return Err(e);
+        }
+        for raw in raw_servers {
+            if let Err(e) = manager.register_raw_server(raw).await {
+                self.status.record_diagnostic(RuntimeDiagnostic::new(
+                    DiagnosticCode::BootDeclarationRejected,
+                    DiagnosticSeverity::Error,
+                    DiagnosticSource::Boot,
+                    DiagnosticOperation::RegisterDeclaration,
+                    DiagnosticTarget::Runtime,
+                    format!(
+                        "boot failed to register MCP declaration (code {})",
+                        e.error_code()
+                    ),
+                ));
+                self.status.transition(LifecycleState::Error);
+                return Err(e);
+            }
         }
 
         // 设置管理器到实例 / Set manager to instance
         *self.mcp_manager.write().await = Some(manager);
+
+        // 健康监控不在此默认启动：`start_health_monitor` 是公开的选择性 API；boot 默认启用属于
+        // 生产行为切换（慢 health_check 的下游 server 会被 30s 周期误判收割且不自愈，见 #186
+        // 复审裁决），如需默认启用须另行显式推进并通知下游。
+
+        drop(lifecycle_gate);
 
         // #106：起 MCP 变化通知单消费者任务。reactor 持 Weak manager（断 sender 自持环——sender 存于 manager，
         // 若强持 manager 则 rx 永不关闭）+ 强持 socketio/skill/desktop 缓存；逐条 recv → 反应（刷新工具映射 /
@@ -1816,6 +2129,15 @@ impl<S: Session> Computer<S> {
             Err(e) => {
                 error!(error = %e, cache_root = %cache_root.display(),
                     "toolspool blob store init failed (non-blocking); blob disabled this session");
+                // #162：非阻断失败进结构化诊断（Degraded：本会话 blob 禁用 = 部分能力受限）。
+                self.status.record_diagnostic(RuntimeDiagnostic::new(
+                    DiagnosticCode::BlobStoreInitFailed,
+                    DiagnosticSeverity::Degraded,
+                    DiagnosticSource::Boot,
+                    DiagnosticOperation::InitBlobStore,
+                    DiagnosticTarget::Runtime,
+                    format!("toolspool blob store init failed; blob disabled this session: {e}"),
+                ));
             }
         }
 
@@ -1862,21 +2184,19 @@ impl<S: Session> Computer<S> {
         self.start_skill_watcher().await;
 
         // #114 S7：本地 runtime 已初始化 → 能力投影首次就绪，bump capability revision（能力变化计数，§12 R2）。
-        // marketplace 源部分失败 → Degraded + 公开诊断（契约 §3/§5.2「其它 sources 可继续」），否则 Started。
-        // boot 成功完成 → 清除上一轮可能残留的 boot `last_error`（重启语义）。
+        // #162：marketplace 源部分失败 → Degraded + 结构化诊断（契约 §3/§5.2「其它 sources 可继续」），否则
+        // Started。降级判定 = 诊断集存在 Degraded 级条目（含 marketplace 同步 / 账本重物化 / blob 初始化失败，
+        // 均由上方各接线点经 `reconcile_governance` / blob 块写入 Boot/Governance 源）——上一轮残留已在
+        // boot 开场代际清除，此处无须再显式清。
         self.status.bump_capability();
-        self.status.set_last_error(None);
-        if recovery.failed_marketplaces.is_empty() {
-            self.status.set_degraded_reason(None);
-            self.status.transition(LifecycleState::Started);
-        } else {
-            self.status.set_degraded_reason(Some(format!(
-                "{} marketplace source(s) failed to sync: {}",
-                recovery.failed_marketplaces.len(),
-                recovery.failed_marketplaces.join(", ")
-            )));
+        if self.status.has_degraded() {
             self.status.transition(LifecycleState::Degraded);
+        } else {
+            self.status.transition(LifecycleState::Started);
         }
+
+        self.mcp_operations_open
+            .store(true, std::sync::atomic::Ordering::Release);
 
         info!("Computer {} started successfully", self.name);
         Ok(())
@@ -1884,11 +2204,16 @@ impl<S: Session> Computer<S> {
 
     /// D1（#112 S5）运行期解析单个 input：SDK 不落盘明文值/secret，缺失且无默认值 → 结构化错误（**非仅日志**）。
     ///
-    /// 解析序：**client resolver**（`secret_resolver` / `input_resolver`，D1 权威源）→ **env** `A2C_SMCP_<ENV_SEGMENT(id)>`
-    /// （编排注入）→ **session**（自定义交互 Session 给真值 / `SilentSession` 给 default-or-empty；Command 经此执行）
-    /// → **定义默认值** → [`InputResolutionError::Missing`]。仅当既无 resolver/env/session 命中**且**无默认值时硬错
-    /// （有默认值仍回退默认，保后向兼容）。value store 明文已硬退役——本路径不落盘任何明文。
+    /// 解析序：**client resolver**（`secret_resolver` / `input_resolver`）→ **显式内存 cache** → **env**
+    /// `A2C_SMCP_<ENV_SEGMENT(id)>`（编排注入）→ **session**（自定义交互 Session 给真值 /
+    /// `SilentSession` 给 default-or-empty；Command 经此执行）→ **定义默认值** →
+    /// [`InputResolutionError::Missing`]。每个已存在候选都先校验；非法 PickString 必须直接返回
+    /// `InvalidSelection`，不得继续 fallback。cache 仅为当前 Computer 的内存态，本路径不落盘明文。
     async fn resolve_one_input(&self, input: &MCPServerInput) -> ComputerResult<serde_json::Value> {
+        input
+            .validate()
+            .map_err(ComputerError::InvalidConfiguration)?;
+
         // Command：非交互 subprocess，经 session 执行（无默认值；失败即 Err，不静默）。
         if let MCPServerInput::Command(_) = input {
             return self.session.resolve_input(input).await;
@@ -1897,6 +2222,8 @@ impl<S: Session> Computer<S> {
         let kind = InputKind::of(input);
 
         // 1. client resolver（D1 权威源；keyring 亦作为一种 secret resolver 由 client opt-in 注入）。
+        //    resolver 必须先于 SDK legacy cache：client-owned InputEntry / Keychain 是实际值的决策入口，旧 cache
+        //    不得绕过 client 的查询、确认或取消。`Ok(None)` 才表示 client 主动不参与，允许继续既有 fallback。
         if matches!(kind, InputKind::Secret) {
             if let Some(resolver) = &self.secret_resolver {
                 if let Some(secret) = resolver.resolve_secret(input).await? {
@@ -1905,20 +2232,35 @@ impl<S: Session> Computer<S> {
             }
         } else if let Some(resolver) = &self.input_resolver {
             if let Some(value) = resolver.resolve_input(input).await? {
-                return Ok(value);
+                return Ok(validate_resolved_value(input, value)?);
             }
         }
 
-        // 2. 环境变量 A2C_SMCP_<ENV_SEGMENT(id)>（编排层注入）。
+        // 2. Explicit Computer cache（legacy compatibility fallback）。A present-but-stale selection is an
+        //    error, never absence. No resolver, or an explicit resolver `Ok(None)`, preserves existing callers.
+        if let Some(value) = self
+            .input_handler
+            .read()
+            .await
+            .get_cached_value(input.id())
+            .await
+        {
+            return Ok(validate_resolved_value(input, input_value_to_json(value))?);
+        }
+
+        // 3. 环境变量 A2C_SMCP_<ENV_SEGMENT(id)>（编排层注入）。
         let var = env_var_name(input.id());
         if let Ok(env_val) = std::env::var(&var) {
-            return Ok(serde_json::Value::String(env_val));
+            return Ok(validate_resolved_value(
+                input,
+                serde_json::Value::String(env_val),
+            )?);
         }
         // #140 迁移诊断（UX-gate）：新名未命中但旧 `A2C_INPUT_<UPPER>` 仍在环境 ⇒ WARN 教改名。
         // **仅检测存在性、绝不读旧值**（F5 无双读、无过渡期，旧名恒被忽略）。
         warn_if_legacy_env_var_present(input.id(), &var);
 
-        // 3. session（自定义交互 Session 可给真值；SilentSession 给 default-or-empty）。
+        // 4. session（自定义交互 Session 可给真值；SilentSession 给 default-or-empty）。
         //    - Ok(空串) 仅在「有默认值」时算有意义（显式空默认），否则视作未命中继续回退——区分「无默认值缺失」与「解析到空」。
         //    - Err（自定义 Session 硬失败，如 GUI 关闭 / IPC 断）：有默认值则回退默认（后向兼容），否则**上抛真实错误**
         //      优于误导性 Missing（SilentSession 永不 Err，故仅影响自定义 Session）。
@@ -1927,7 +2269,7 @@ impl<S: Session> Computer<S> {
                 let is_empty_string =
                     matches!(&value, serde_json::Value::String(s) if s.is_empty());
                 if !is_empty_string || input.default().is_some() {
-                    return Ok(value);
+                    return Ok(validate_resolved_value(input, value)?);
                 }
             }
             Err(e) => {
@@ -1937,12 +2279,12 @@ impl<S: Session> Computer<S> {
             }
         }
 
-        // 4. 定义默认值（后向兼容：有默认值绝不硬错）。
+        // 5. 定义默认值（后向兼容：有默认值绝不硬错）。
         if let Some(default) = input.default() {
-            return Ok(default);
+            return Ok(validate_resolved_value(input, default)?);
         }
 
-        // 5. 无 resolver / env / session / 默认值 → 结构化缺失错误（非仅日志，绝不静默用空串）。
+        // 6. 无 cache / resolver / env / session / 默认值 → 结构化缺失错误（非仅日志，绝不静默用空串）。
         Err(ComputerError::InputResolution(
             InputResolutionError::missing(input.id(), kind),
         ))
@@ -2089,6 +2431,11 @@ impl<S: Session> Computer<S> {
                             ) => ComputerError::InputResolution(
                                 InputResolutionError::resolver_failed(&scoped_id, reason),
                             ),
+                            ComputerError::InputResolution(
+                                InputResolutionError::InvalidSelection { value, .. },
+                            ) => ComputerError::InputResolution(
+                                InputResolutionError::invalid_selection(&scoped_id, value),
+                            ),
                             other => other,
                         };
                         deferred_errors.insert(input_id.clone(), scoped_err);
@@ -2159,7 +2506,7 @@ impl<S: Session> Computer<S> {
         Ok(rendered_config)
     }
 
-    /// **运行期挂载** MCP server（render + manager + 内存投影 + capability bump + emit），**不落盘** /
+    /// **运行期登记** MCP server raw declaration（manager declaration + 内存投影 + capability bump + emit），**不落盘** /
     /// mount an MCP server at runtime only (no persistence)。
     ///
     /// #122：这是供 **plugin / 治理 Hook**（[`McpInstallHooks`] 实现，含 **SDK 外部** client，如 tfrobot-client）
@@ -2173,7 +2520,7 @@ impl<S: Session> Computer<S> {
     ///   只 bump **capability** revision。
     /// - [`add_or_update_server`](Self::add_or_update_server)（**declare-durable**）：**用户显式声明**、真相就是这份声明、
     ///   须重启存活 → **落盘**（#123：新 server 默认落非 git 共享的 local `mcp.local.json`；`add_or_update_server_in_scope`
-    ///   可显式选 project/user；bump **config** revision）后再运行期物化。
+    ///   可显式选 project/user；bump **config** revision）后再登记 raw desired state。
     ///
     /// - `#106` ABBA：manager 惰性初始化**先 read 探测、仅 None 才升写锁**（governance 路径持 `skill_registry`
     ///   写锁 → hooks → 此方法；post-boot manager 恒 `Some` 只取读锁，与 `McpChangeReactor` 的读锁相容）。
@@ -2187,7 +2534,7 @@ impl<S: Session> Computer<S> {
     /// 约束。经 [`McpInstallHooks`] 标准路径挂载（installer 已做冲突门）无此顾虑。
     ///
     /// # Errors
-    /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；运行期物化失败（manager 错）。
+    /// Registering the raw declaration with the runtime manager fails.
     pub async fn mount_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
         // 公开入口：未绑定 plugin scope（外部直挂 / 用户路径）→ 裸 `${input:}` 仅按全局解析（§5.11 用户 server）。
         self.mount_server_with_scope(server, None).await
@@ -2202,49 +2549,53 @@ impl<S: Session> Computer<S> {
         server: MCPServerConfig,
         scope: Option<PluginScope>,
     ) -> ComputerResult<()> {
-        // 渲染并验证配置（**唯一一次** render——resolver 可能有副作用如 keyring/交互取值，禁重复调用）。
-        let validated = self
-            .render_server_config_with_scope(&server, scope.as_ref())
-            .await?;
-        self.mount_rendered(server, validated).await
+        self.mount_raw(server, scope).await
     }
 
-    /// 运行期物化**核心**：入 manager + 内存投影 + capability bump + emit，**不 render、不落盘** / mount core。
-    ///
-    /// #113 S6：抽出以复用于 [`mount_server`]（治理物化，render 后调）与 [`add_or_update_server`]（用户声明，
-    /// 落盘前已 render 一次后调）——二者共用同一次 `render` 结果，**避免重复触发 input/secret resolver 副作用**。
-    /// `raw` 存内存投影（保留 `${input:*}` 引用，与落盘一致）、`validated` 入 manager（渲染后运行期用）。
-    async fn mount_rendered(
+    /// Raw declaration mount core: register desired state + update the in-memory projection without
+    /// resolving inputs. A running client keeps its current rendered config until restart.
+    async fn mount_raw(
         &self,
         raw: MCPServerConfig,
-        validated: MCPServerConfig,
+        scope: Option<PluginScope>,
     ) -> ComputerResult<()> {
-        // 确保管理器已初始化（read-first 探测，仅 boot 前冷启动升写锁，彼时消费者尚未 spawn，无并发）。
-        if self.mcp_manager.read().await.is_none() {
-            let mut manager_guard = self.mcp_manager.write().await;
-            if manager_guard.is_none() {
-                // #152：经 new_manager 应用 client factory override 接缝（hermetic 测试 mount→running）。
-                *manager_guard = Some(self.new_manager().await);
-            }
-        }
+        self.mount_raw_inner(raw, scope, std::future::ready(()))
+            .await
+    }
 
-        // 投影键取 `validated` 的身份——`render_server_config` 已从 **raw** 派生并 stamp（#117），故它与
-        // manager 的 `resolve_key` 结果**按构造相同**；不在此重派生，避免 raw/rendered 连接身份漂移。
-        let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&validated);
+    async fn mount_raw_inner<F>(
+        &self,
+        raw: MCPServerConfig,
+        scope: Option<PluginScope>,
+        after_manager_register: F,
+    ) -> ComputerResult<()>
+    where
+        F: Future<Output = ()>,
+    {
+        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        self.ensure_mcp_declarations_mutable()?;
+        let bundle_id = crate::mcp_clients::bundle_id::resolve_bundle_id(&raw);
+        let lifecycle = self.mcp_lifecycle_lock(&bundle_id);
+        let _lifecycle_guard = lifecycle.lock().await;
 
-        // 添加到管理器 / Add to manager
+        // Before boot (or after terminal shutdown), declaration operations update only raw desired
+        // state. A successful boot rebuilds Manager declarations from that atomic snapshot.
         {
-            let manager = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager {
-                manager.add_or_update_server(validated).await?;
+            let manager = self.current_manager().await;
+            if let Some(manager) = manager {
+                manager.register_raw_server(raw.clone()).await?;
             }
         }
+        after_manager_register.await;
 
         // 更新本地配置映射（键 = bundle_id，值存原始引用与落盘一致）/ Update local projection, keyed by bundle_id
-        {
-            let mut servers = self.mcp_servers.write().await;
-            servers.insert(bundle_id, raw);
-        }
+        self.mcp_servers.write().await.insert(
+            bundle_id,
+            RawMcpServerEntry {
+                config: raw,
+                input_scope: scope,
+            },
+        );
 
         // 工具投影变化 → capability revision +1（§12 R2）。
         self.status.bump_capability();
@@ -2275,10 +2626,14 @@ impl<S: Session> Computer<S> {
     /// # Errors
     /// 运行期停摘失败（manager 错）。
     pub async fn unmount_server(&self, id: &BundleId) -> ComputerResult<bool> {
+        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        self.ensure_mcp_declarations_mutable()?;
+        let lifecycle = self.mcp_lifecycle_lock(id);
+        let _lifecycle_guard = lifecycle.lock().await;
         let mut removed = false;
         {
-            let manager = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager {
+            let manager = self.current_manager().await;
+            if let Some(manager) = manager {
                 removed |= manager.remove_server_by_id(id).await?;
             }
         }
@@ -2288,19 +2643,21 @@ impl<S: Session> Computer<S> {
             let mut servers = self.mcp_servers.write().await;
             removed |= servers.remove(id).is_some();
         }
-
         // 仅**真摘到**才是工具投影变化 → 才 bump capability + 通知（§12 R2；no-op 不是能力变化）。
         if removed {
             self.status.bump_capability();
+            // #162：server 移除 → 其诊断一并清除（否则移除的 server 诊断永久滞留——「消亡也是恢复」）。
+            self.status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone()));
             let _ = self.emit_update_config().await;
         }
 
         Ok(removed)
     }
 
-    /// 动态添加或更新服务器配置（**落盘 + 运行期物化**）/ Add or update a server config (persist + mount)。
+    /// 动态添加或更新服务器配置（**落盘 + 登记 raw desired state**）/ Add or update a server config。
     ///
-    /// #113 S6（补 #96 洞）：用户经此声明的 server 现**落盘**（重启不丢），再运行期物化。
+    /// #113 S6（补 #96 洞）：用户经此声明的 server 现**落盘**（重启不丢），再登记到运行期 desired state。
     /// - **新 server 默认落 `local` scope**（`mcp.local.json`，**不入 git**；#123 / 协议#19 加固）——避免 API/UI
     ///   加的 server 静默污染团队共享的 `mcp.json`；local 仍 boot 读取→**重启存活**（不损失 #113 收益）。想入 git
     ///   团队共享 → 用 [`add_or_update_server_in_scope`](Self::add_or_update_server_in_scope) 显式选 `Project`/`User`。
@@ -2311,12 +2668,12 @@ impl<S: Session> Computer<S> {
     ///   plugin 声明是**最低基线层**、被任何用户侧 scope 覆盖（用户主权）；`guides/mcp-approval-gate-alignment.md`
     ///   §5 明定 upsert **MUST NOT** 因「同 bundle_id 已由 plugin 提供」拒写。此前 #126 的 `Synthesized` 拒写门控
     ///   据此**移除**。（`remove_server` 侧门控仍在——有意非对称，其 origin 判据改造属 F3(b) / #138。）
-    /// - **§12 R2**：落盘成功后 bump **config** revision；随后运行期物化 bump **capability**。
-    /// - 治理物化（bundled 重挂）**不**走此路径（走 [`Self::mount_server`]），避免 ledger 意图重复写入 mcp.json。
+    /// - **§12 R2**：落盘成功后 bump **config** revision；随后登记 raw declaration bump **capability**。
+    /// - 治理登记（bundled 重挂）**不**走此路径（走 [`Self::mount_server`]），避免 ledger 意图重复写入 mcp.json。
+    /// - 已运行的进程不会热更新；raw declaration 仅在下次 actual start/restart 时解析 input 并物化。
     ///
     /// # Errors
-    /// render 校验失败（[`ComputerError::RenderError`] / [`ComputerError::InputResolution`]）；落盘失败
-    /// （[`ComputerError::ConfigPersist`]，含只读 origin / I/O）；运行期物化失败（manager 错）。
+    /// 落盘失败（[`ComputerError::ConfigPersist`]，含只读 origin / I/O）；登记 raw declaration 失败（manager 错）。
     pub async fn add_or_update_server(&self, server: MCPServerConfig) -> ComputerResult<()> {
         // #123（协议#19 加固）：默认 `Local`（不入 git、机器本地、重启存活）。
         self.add_or_update_server_in_scope(server, WriteScope::Local)
@@ -2336,6 +2693,11 @@ impl<S: Session> Computer<S> {
         server: MCPServerConfig,
         upsert_new_scope: WriteScope,
     ) -> ComputerResult<()> {
+        // Serialize the complete persistent+runtime mutation with terminal shutdown. Checking only
+        // inside `mount_raw` would report InvalidState after the file had already been changed.
+        let _boot_shutdown = self.mcp_boot_shutdown.lock().await;
+        self.ensure_mcp_declarations_mutable()?;
+
         // #121：以本实例上下文（含 User env + Skill Home）解析写目标，绝不误写宿主 User config。
         let config_dir = self.config_dir();
         let home = self.skill_home();
@@ -2351,10 +2713,6 @@ impl<S: Session> Computer<S> {
         //
         // 注：`remove_server` 的归属门控仍在（有意非对称）——删除面的 origin 判据改造属 F3(b)，见 #138。
 
-        // 先 render 校验：非法 config / 无法解析的 input 早失败，**不落盘**（**唯一一次** render，下方物化复用其结果，
-        // 避免重复触发 resolver 副作用）/ validate before persist; single render reused by mount_rendered below。
-        let validated = self.render_server_config(&server).await?;
-
         // 落盘（原始引用；D1 不落 secret）→ 经 S2 消解器定 scope + S3 执行器两阶段写。
         let body = canonicalize_persist_body(serde_json::to_value(&server)?);
         // 内容摘要 revision（S1）：仅当真落盘（内容变）才 bump config，避免 no-op/幂等 mutate 虚假 bump（§12 R2）。
@@ -2363,13 +2721,13 @@ impl<S: Session> Computer<S> {
         let after = update_config(&ctx, std::slice::from_ref(&edit))
             .map_err(|e| ComputerError::ConfigPersist(e.to_string()))?;
 
-        // 落盘且内容真变 → config revision +1（§12 R2；capability 于 mount_rendered bump）。
+        // 落盘且内容真变 → config revision +1（§12 R2；capability 于 mount_raw bump）。
         if after.revision != before_rev {
             self.bump_config_revision();
         }
 
-        // 运行期物化（复用上面已 render 的 validated，不重复 render）+ 内存投影 + capability bump + emit。
-        self.mount_rendered(server, validated).await
+        // 更新 raw desired state。运行中的 client 保持其当前 rendered config；下次 restart 生效。
+        self.mount_raw(server, None).await
     }
 
     /// #151 Part 2：typed MCP **零写 preflight**——对一批 server 做确定性 + 引用语法可达校验，预测落盘清单。
@@ -2427,6 +2785,10 @@ impl<S: Session> Computer<S> {
     /// # Errors
     /// 落盘失败（[`ComputerError::ConfigPersist`]，含只读 origin / synthesized / I/O）；运行期停摘失败（manager 错）。
     pub async fn remove_server(&self, bundle_id: &BundleId) -> ComputerResult<bool> {
+        // Keep persistence and runtime unmount on the same side of terminal shutdown.
+        let _boot_shutdown = self.mcp_boot_shutdown.lock().await;
+        self.ensure_mcp_declarations_mutable()?;
+
         // #121 A：以本实例上下文（含 User env + Skill Home）解析 config，绝不误读/误删宿主 User config。
         // remove 不 upsert（删所有可写 scope，S2 R1），`upsert_new_scope` 对其无影响，占位传 `Local`。
         let config_dir = self.config_dir();
@@ -2499,6 +2861,11 @@ impl<S: Session> Computer<S> {
         &self,
         inputs: HashMap<String, MCPServerInput>,
     ) -> ComputerResult<()> {
+        for input in inputs.values() {
+            input
+                .validate()
+                .map_err(ComputerError::InvalidConfiguration)?;
+        }
         *self.inputs.write().await = inputs;
 
         // 重新创建输入处理器 / Recreate input handler
@@ -2515,6 +2882,9 @@ impl<S: Session> Computer<S> {
 
     /// 添加或更新单个input / Add or update single input
     pub async fn add_or_update_input(&self, input: MCPServerInput) -> ComputerResult<()> {
+        input
+            .validate()
+            .map_err(ComputerError::InvalidConfiguration)?;
         let input_id = input.id().to_string();
         {
             let mut inputs = self.inputs.write().await;
@@ -2591,13 +2961,15 @@ impl<S: Session> Computer<S> {
         input_id: &str,
         value: serde_json::Value,
     ) -> ComputerResult<bool> {
-        // 检查input是否存在 / Check if input exists
-        {
+        // 检查 input 是否存在，并在写入 cache 前按当前定义校验候选值。
+        let input = {
             let inputs = self.inputs.read().await;
-            if !inputs.contains_key(input_id) {
-                return Ok(false);
-            }
-        }
+            inputs.get(input_id).cloned()
+        };
+        let Some(input) = input else {
+            return Ok(false);
+        };
+        validate_resolved_value(&input, value.clone())?;
 
         // 设置缓存值 / Set cached value
         let handler = self.input_handler.read().await;
@@ -2643,7 +3015,12 @@ impl<S: Session> Computer<S> {
             let cached_values = handler.get_all_cached_values().await;
             let keys_to_remove: Vec<String> = cached_values
                 .keys()
-                .filter(|key| key.starts_with(id))
+                .filter(|key| {
+                    key.as_str() == id
+                        || key
+                            .strip_prefix(id)
+                            .is_some_and(|suffix| suffix.starts_with(':'))
+                })
                 .cloned()
                 .collect();
 
@@ -2660,8 +3037,8 @@ impl<S: Session> Computer<S> {
 
     /// 获取可用工具列表 / Get available tools list
     pub async fn get_available_tools(&self) -> ComputerResult<Vec<Tool>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             let tools: Vec<Tool> = manager.list_available_tools().await;
             // TODO: 转换为SMCPTool格式 / TODO: Convert to SMCPTool format
             // 这里需要实现工具格式转换
@@ -2679,8 +3056,8 @@ impl<S: Session> Computer<S> {
         &self,
         window_uri: Option<&str>,
     ) -> ComputerResult<Vec<(String, Resource)>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             Ok(manager.list_all_windows(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
@@ -2698,9 +3075,29 @@ impl<S: Session> Computer<S> {
         &self,
         window_uri: Option<&str>,
     ) -> ComputerResult<Vec<(BundleId, ServerName, Resource)>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             Ok(manager.list_windows_with_identity(window_uri).await)
+        } else {
+            Err(ComputerError::InvalidState(
+                "Computer not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// #161：结构化窗口枚举——携带逐 server 诊断，可区分「成功空集 / capability 缺失 / 全部失败 /
+    /// 部分成功」（[`WindowEnumerationReport::status`]）。
+    ///
+    /// 与 [`list_windows_with_identity`](Self::list_windows_with_identity) 同为**零 read** 枚举
+    /// （只 `resources/list`，从不 `resources/read`）；后者即本结果 `windows` 字段的投影。
+    /// 逐 server 失败不中断其余 server（部分成功语义），诊断以 `bundle_id` 标识（展示名仅随附）。
+    pub async fn list_windows_with_diagnostics(
+        &self,
+        window_uri: Option<&str>,
+    ) -> ComputerResult<WindowEnumerationReport> {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
+            Ok(manager.list_windows_with_diagnostics(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
                 "Computer not initialized".to_string(),
@@ -2716,8 +3113,8 @@ impl<S: Session> Computer<S> {
         &self,
         window_uri: Option<&str>,
     ) -> ComputerResult<Vec<(BundleId, ServerName, Resource, ReadResourceResult)>> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             Ok(manager.get_windows_details(window_uri).await)
         } else {
             Err(ComputerError::InvalidState(
@@ -2732,8 +3129,8 @@ impl<S: Session> Computer<S> {
         id: &BundleId,
         resource: Resource,
     ) -> ComputerResult<ReadResourceResult> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             manager.get_window_detail(id, resource).await
         } else {
             Err(ComputerError::InvalidState(
@@ -2750,8 +3147,8 @@ impl<S: Session> Computer<S> {
         parameters: serde_json::Value,
         timeout: Option<f64>,
     ) -> ComputerResult<CallToolResult> {
-        let manager = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager {
+        let manager = self.current_manager().await;
+        if let Some(manager) = manager {
             // 验证工具调用（协议 0.3.0：入参为 exposed_tool_name，返回 bundle_id + 展示名 + 原始工具名）。
             let (bundle_id, server_name, tool_name) =
                 manager.validate_tool_call(tool_name, &parameters).await?;
@@ -2866,8 +3263,8 @@ impl<S: Session> Computer<S> {
         parameters: serde_json::Value,
         timeout: Option<f64>,
     ) -> ComputerResult<CallToolResult> {
-        let manager = self.mcp_manager.read().await;
-        let Some(ref manager) = *manager else {
+        let manager = self.current_manager().await;
+        let Some(manager) = manager else {
             return Err(ComputerError::InvalidState(
                 "Computer not initialized".to_string(),
             ));
@@ -2994,18 +3391,46 @@ impl<S: Session> Computer<S> {
         Ok(history.clone())
     }
 
-    /// 获取服务器状态列表 `(bundle_id, name, is_active, state)` / Get server status list。
+    /// 获取正交的 MCP Server 启动与连接状态 / Get orthogonal activation and connection states.
     ///
-    /// 每行**自带身份键** `bundle_id`（#127）——`remove_server` 按 bundle_id 寻址（协议 §身份：`name` 非
-    /// 身份键），故 client / CLI 直接从本列表拿到寻址键，**无需**再按 name 去 join 另一张映射（旧的
-    /// `materialized_server_bundle_ids` 即为此 join 而设，其 name-keyed map 在同名场景下会折叠身份，
-    /// 令 CLI 给两行打印同一个 bundle_id → `server rm` 删错对象；该 API 随本次修复移除）。
+    /// 每项自带唯一身份键 `bundle_id`；`name` 仅供展示且允许碰撞。
+    pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
+        let manager_guard = self.current_manager().await;
+        if let Some(manager) = manager_guard {
+            manager.get_server_runtime_statuses().await
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 兼容 tuple 状态接口 `(bundle_id, name, is_active, state)`；`is_active` 表示已启动，
+    /// `state` 表示当前连接状态。
+    /// 新代码应优先使用 [`Self::get_server_runtime_statuses`]。
     pub async fn get_server_status(&self) -> Vec<(BundleId, ServerName, bool, String)> {
-        let manager_guard = self.mcp_manager.read().await;
-        if let Some(ref manager) = *manager_guard {
+        let manager_guard = self.current_manager().await;
+        if let Some(manager) = manager_guard {
             manager.get_server_status().await
         } else {
             Vec::new()
+        }
+    }
+
+    /// 启动健康监控（逐 MCP 健康检查 + 自动重连）/ Start the per-MCP health monitor.
+    ///
+    /// **boot_up 不默认启动**（生产行为切换裁决，见 #186）：慢 `health_check` 的下游 server 会被
+    /// 周期误判收割且不自愈——下游按需显式调用本方法开启。健康检查重连的连接状态变化经
+    /// #186 统一投影链发布 [`ComputerEvent::MCPServerStatusChanged`] 事件。
+    /// 幂等：再次调用先停旧任务再起新任务；`shutdown`/`close` 均会防御性停止。
+    pub async fn start_health_monitor(&self) {
+        if let Some(manager) = self.current_manager().await {
+            manager.start_health_monitor().await;
+        }
+    }
+
+    /// 停止健康监控 / Stop the per-MCP health monitor（幂等；无任务时 no-op）。
+    pub async fn stop_health_monitor(&self) {
+        if let Some(manager) = self.current_manager().await {
+            manager.stop_health_monitor().await;
         }
     }
 
@@ -3026,13 +3451,13 @@ impl<S: Session> Computer<S> {
     pub async fn status(&self) -> ComputerStatusSnapshot {
         let mcp_servers = self.mcp_servers.read().await.len();
         let (active_mcp_servers, tools) = {
-            let manager_guard = self.mcp_manager.read().await;
-            if let Some(ref manager) = *manager_guard {
+            let manager_guard = self.current_manager().await;
+            if let Some(manager) = manager_guard {
                 let active = manager
-                    .get_server_status()
+                    .get_server_runtime_statuses()
                     .await
                     .into_iter()
-                    .filter(|(_, _, active, _)| *active)
+                    .filter(MCPServerRuntimeStatus::is_connected)
                     .count();
                 // 廉价：读已缓存 tool_mapping 长度，不发 tools/list RPC（🟡 修复：status 不因 MCP server 挂起而阻塞）。
                 let tools = manager.tool_count().await;
@@ -3048,9 +3473,10 @@ impl<S: Session> Computer<S> {
 
     /// 订阅 runtime 观测事件流（#114 S7）/ subscribe to runtime observability events。
     ///
-    /// 返回 [`tokio::sync::broadcast::Receiver`]：生命周期迁移 / revision 增长逐条广播。**shutdown 后**（契约
+    /// 返回 [`tokio::sync::broadcast::Receiver`]：生命周期迁移、revision 增长及 OAuth 状态变化逐条广播。**shutdown 后**（契约
     /// §4.7）除进入 shutdown 时的终态 [`ComputerEvent::LifecycleChanged`]`(shutdown)` 外不再收到新事件。滞后订阅者
-    /// 会收到 `Lagged`——可经 [`status`](Self::status) 重新拉取全量快照对齐。
+    /// 会收到 `Lagged`——runtime 状态可经 [`status`](Self::status) 重同步，OAuth 状态可按事件中的
+    /// `bundle_id` 经 [`oauth_status`](Self::oauth_status) 重同步。
     pub fn subscribe_events(&self) -> broadcast::Receiver<ComputerEvent> {
         self.status.subscribe()
     }
@@ -3061,10 +3487,22 @@ impl<S: Session> Computer<S> {
         self.status.config_revision()
     }
 
-    /// 当前 capability revision（Agent-facing 能力投影单调计数）/ current capability revision。
+    /// 当前 capability revision（Agent-facing 能力投影单调计数；含运行期 MCP 工具定义变化）/
+    /// current capability revision。
     #[must_use]
     pub fn capability_revision(&self) -> u64 {
         self.status.capability_revision()
+    }
+
+    /// 当前诊断集 revision（#162；单调，事件 [`ComputerEvent::DiagnosticsChanged`] 携同值）/
+    /// current diagnostics revision。
+    ///
+    /// 诊断本体经 [`status`](Self::status) 快照的 `diagnostics` 字段读取——**只读透传**：
+    /// 记录 / 清除由生命周期（boot / reconcile / MCP 起停 / 移除）驱动，不公开主动清除
+    /// （防消费方抹错正在生效的诊断）。
+    #[must_use]
+    pub fn diagnostics_revision(&self) -> u64 {
+        self.status.diagnostics_revision()
     }
 
     /// 当前生命周期状态 / current lifecycle state。
@@ -3086,7 +3524,60 @@ impl<S: Session> Computer<S> {
     /// 列出 MCP 服务器配置 / List MCP server configurations
     pub async fn list_mcp_servers(&self) -> Vec<MCPServerConfig> {
         let servers = self.mcp_servers.read().await;
-        servers.values().cloned().collect()
+        servers.values().map(|entry| entry.config.clone()).collect()
+    }
+
+    /// Build the protocol config projection from raw desired declarations plus live Manager
+    /// status. Rendered process values must never flow back into `client:get_config`.
+    async fn get_computer_config_servers(&self) -> ComputerResult<serde_json::Value> {
+        let raw_configs: HashMap<BundleId, MCPServerConfig> = self
+            .mcp_servers
+            .read()
+            .await
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.config.clone()))
+            .collect();
+        let manager = self.current_manager().await;
+        let manager = manager.ok_or_else(Self::manager_uninit)?;
+        Ok(manager.get_server_configs_for(&raw_configs).await)
+    }
+
+    /// #165 Option B：当前**回落审批门 PENDING**（project-origin 激活）的 bundled server 列表 / pending bundled.
+    ///
+    /// 供 CLI boot 批准框 / 下游 client（如 tfrobot-client 审批 UI）查询「哪些 plugin bundled server 待批准」。
+    /// project scope `enabledPlugins=true` 激活、且 [`mcp_server_status`] 判 [`McpApprovalStatus::Pending`] 的
+    /// bundled server（受信 scope 激活的不在此列——免批准直挂）。TOFU：经
+    /// [`approve_bundled_plugin`](crate::settings::mcp_config::approve_bundled_plugin) 批准 → 写 local scope →
+    /// 下次 [`reconcile_governance`](Self::reconcile_governance) origin 变 local（受信）→ 直挂、退出此列表。
+    ///
+    /// 现算（lock-free 纯读）：resolve settings →
+    /// [`collect_enabled_bundled_servers`](crate::settings::recovery::collect_enabled_bundled_servers) → 过滤
+    /// project-origin ∧ PENDING。与 reconcile 阶段二**同源同判据**（origin + `mcp_server_status`）。
+    #[must_use]
+    pub fn list_pending_bundled_approvals(&self) -> Vec<BundledServerRecord> {
+        let home = self.skill_home();
+        let env = self.config_env();
+        let config_dir = self.config_dir();
+        let resolved = resolve_settings(ResolveSettingsArgs {
+            cwd: Some(&config_dir),
+            env,
+            flag_settings_path: None,
+            policy_settings: Some(&resolve_policy_settings(None, None, None)),
+        });
+        let declared = &resolved.settings;
+        let scope_layers = &resolved.scope_layers;
+        crate::settings::recovery::collect_enabled_bundled_servers(&home, env, declared)
+            .into_iter()
+            .filter(|rec| {
+                let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
+                // #169：安全层 Gate 1-3 → Disabled 的 server 不入 pending 列表。
+                !crate::settings::mcp_config::security_layer_check(bid.as_str(), declared)
+                    && plugin_enabled_origin(scope_layers, &rec.plugin_id)
+                        == Some(SettingsScope::Project)
+                    && mcp_server_status(bid.as_str(), declared, false)
+                        == McpApprovalStatus::Pending
+            })
+            .collect()
     }
 
     /// 本实例 enabled-bundled 归属集（intent ∧ `enabledPlugins==true` 门控）/ enabled bundled ownership set。
@@ -3180,7 +3671,8 @@ impl<S: Session> Computer<S> {
         // 来源一：运行期已物化 server。`bundle_id` 命中 ledger bundled 集 → plugin，否则 user。
         {
             let servers = self.mcp_servers.read().await;
-            for (bundle_id, cfg) in servers.iter() {
+            for (bundle_id, entry) in servers.iter() {
+                let cfg = &entry.config;
                 materialized.insert(bundle_id.clone());
                 let managed_by = match bundled.get(bundle_id) {
                     Some(rec) => plugin_ownership(rec),
@@ -3331,24 +3823,68 @@ impl<S: Session> Computer<S> {
 
     /// 启动 MCP 客户端 / Start MCP client
     pub async fn start_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
+        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        self.ensure_mcp_operations_open()?;
+        let lifecycle = self.mcp_lifecycle_lock(id);
+        let _lifecycle_guard = lifecycle.lock().await;
+        let entry = self
+            .mcp_servers
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                ComputerError::InvalidConfiguration(format!("Unknown server bundle_id: {id}"))
+            })?;
+        let raw = entry.config;
+        let scope = entry.input_scope;
         let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
-                Some(m) => m.start_client_by_id(id).await,
+            let mgr = self.current_manager().await;
+            match mgr {
+                Some(m) => {
+                    m.start_client_by_id_materialized(id, raw.disabled(), || async {
+                        match scope.as_ref() {
+                            Some(scope) => {
+                                self.render_server_config_with_scope(&raw, Some(scope))
+                                    .await
+                            }
+                            None => self.render_server_config(&raw).await,
+                        }
+                    })
+                    .await
+                }
                 None => Err(Self::manager_uninit()),
             }
         };
-        // #148：成功后 bump capability + joined 时自动广播 server:update_tool_list
-        // （manager 层 start_client_by_id 已 refresh_tool_routes，本地 tool mapping 已最新）。
-        //
-        // 注：start 类（含 restart/all）在**任何** Ok 都广播——与 stop 的 `Ok(true)` gate 不对称：manager 层
-        // `start_client_by_id` 对「已启动再 start」早返 Ok(())（manager.rs 无 bool 返回），故「无实际变更」的
-        // 幂等 start 也会触发一次广播。这与既有 capability_revision 在同路径的 spurious bump 同形；Agent 侧
-        // 回拉幂等（一次额外 tools/list，结果不变），无正确性影响。精确化（manager 返回 bool）为后续 follow-up。
-        if result.is_ok() {
+        // Only an actual start changes the tool projection. An idempotent start does not resolve
+        // inputs and does not publish a spurious capability revision.
+        if matches!(result, Ok(true)) {
             self.on_capability_changed().await;
         }
-        result
+        // #162：任一 start 成功（真启动或幂等已运行）= 该 bundle 恢复 → 清其全部诊断；
+        // 真实操作失败（manager 侧错，非前置 InvalidState 误用）→ 记 Degraded 结构化诊断
+        // （部分能力受限；retryable/transient 由启发式补充）。
+        match &result {
+            Ok(_) => self
+                .status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone())),
+            Err(e) if !matches!(e, ComputerError::InvalidState(_)) => {
+                let (retryable, transient) = classify_recovery(e);
+                self.status.record_diagnostic(
+                    RuntimeDiagnostic::new(
+                        DiagnosticCode::McpStartFailed,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Mcp,
+                        DiagnosticOperation::StartClient,
+                        DiagnosticTarget::Bundle(id.clone()),
+                        format!("{e}"),
+                    )
+                    .with_recovery(retryable, transient),
+                );
+            }
+            Err(_) => {}
+        }
+        result.map(|_| ())
     }
 
     /// 停止单个 MCP 客户端（**bundle_id 寻址**）；返回**是否真的停了** / Stop by bundle_id; returns whether it stopped。
@@ -3360,9 +3896,13 @@ impl<S: Session> Computer<S> {
     /// （拼错的 server 名几乎总是合法字面量），那条 token 会一路走到这里、对缺席键幂等返回。故本方法**如实上报**
     /// `Ok(true)=确有活跃客户端被停` / `Ok(false)=无活跃客户端、未做任何事`，由调用方（CLI）据此打真实回执。
     pub async fn stop_mcp_client(&self, id: &BundleId) -> ComputerResult<bool> {
+        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        self.ensure_mcp_operations_open()?;
+        let lifecycle = self.mcp_lifecycle_lock(id);
+        let _lifecycle_guard = lifecycle.lock().await;
         let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
+            let mgr = self.current_manager().await;
+            match mgr {
                 Some(m) => m.stop_client_by_id(id).await,
                 None => Err(Self::manager_uninit()),
             }
@@ -3371,44 +3911,133 @@ impl<S: Session> Computer<S> {
         if matches!(result, Ok(true)) {
             self.on_capability_changed().await;
         }
+        // #162：停成功（真停或幂等无活跃）→ 清该 bundle 的 McpStopFailed（「停止问题」已解决——含
+        // 对侧已代停的自愈场景）；真停到还额外清全部（server 有意消停，残留 start/restart 失败均失效）。
+        // 真实操作失败 → 记 McpStopFailed（Degraded：能力仍在、到不了 desired 态）。
+        match &result {
+            Ok(true) => self
+                .status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone())),
+            Ok(false) => self.status.clear_diagnostics_where(|d| {
+                d.target == DiagnosticTarget::Bundle(id.clone())
+                    && d.code == DiagnosticCode::McpStopFailed
+            }),
+            Err(e) if !matches!(e, ComputerError::InvalidState(_)) => {
+                let (retryable, transient) = classify_recovery(e);
+                self.status.record_diagnostic(
+                    RuntimeDiagnostic::new(
+                        DiagnosticCode::McpStopFailed,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Mcp,
+                        DiagnosticOperation::StopClient,
+                        DiagnosticTarget::Bundle(id.clone()),
+                        format!("{e}"),
+                    )
+                    .with_recovery(retryable, transient),
+                );
+            }
+            Err(_) => {}
+        }
         result
     }
 
     /// 重启单个 MCP 客户端（**bundle_id 寻址**）/ Restart one MCP client by bundle_id（#141 新增公开 restart）。
     pub async fn restart_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
-        let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
-                Some(m) => m.restart_client_by_id(id).await,
-                None => Err(Self::manager_uninit()),
+        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        self.ensure_mcp_operations_open()?;
+        let lifecycle = self.mcp_lifecycle_lock(id);
+        let _lifecycle_guard = lifecycle.lock().await;
+        let entry = self
+            .mcp_servers
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                ComputerError::InvalidConfiguration(format!("Unknown server bundle_id: {id}"))
+            })?;
+        let raw = entry.config;
+        let scope = entry.input_scope;
+        let (result, capability_changed) = {
+            let mgr = self.current_manager().await;
+            match mgr {
+                Some(m) => {
+                    let was_active = m.is_client_active(id).await;
+                    let result = m
+                        .restart_client_by_id_materialized(id, raw.disabled(), || async {
+                            match scope.as_ref() {
+                                Some(scope) => {
+                                    self.render_server_config_with_scope(&raw, Some(scope))
+                                        .await
+                                }
+                                None => self.render_server_config(&raw).await,
+                            }
+                        })
+                        .await;
+                    let is_active = m.is_client_active(id).await;
+                    let changed = result.is_ok() || was_active != is_active;
+                    (result, changed)
+                }
+                None => (Err(Self::manager_uninit()), false),
             }
         };
-        if result.is_ok() {
+        if capability_changed {
             self.on_capability_changed().await;
+        }
+        // #162：restart 成功 = 该 bundle 恢复 → 清其全部诊断；失败 → 记 McpRestartFailed（Degraded）。
+        match &result {
+            Ok(()) => self
+                .status
+                .clear_diagnostics_where(|d| d.target == DiagnosticTarget::Bundle(id.clone())),
+            Err(e) if !matches!(e, ComputerError::InvalidState(_)) => {
+                let (retryable, transient) = classify_recovery(e);
+                self.status.record_diagnostic(
+                    RuntimeDiagnostic::new(
+                        DiagnosticCode::McpRestartFailed,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Mcp,
+                        DiagnosticOperation::RestartClient,
+                        DiagnosticTarget::Bundle(id.clone()),
+                        format!("{e}"),
+                    )
+                    .with_recovery(retryable, transient),
+                );
+            }
+            Err(_) => {}
         }
         result
     }
 
     /// 启动全部 MCP 客户端（CLI `start all`）/ Start all MCP clients。
     pub async fn start_all_mcp_clients(&self) -> ComputerResult<()> {
-        let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
-                Some(m) => m.start_all().await,
-                None => Err(Self::manager_uninit()),
+        if self.mcp_manager.read().await.is_none() {
+            return Err(Self::manager_uninit());
+        }
+        let bundle_ids: Vec<BundleId> = self
+            .mcp_servers
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| !entry.config.disabled())
+            .map(|(bundle_id, _)| bundle_id.clone())
+            .collect();
+        let mut result = Ok(());
+        for bundle_id in bundle_ids {
+            if let Err(error) = self.start_mcp_client(&bundle_id).await {
+                result = Err(error);
+                break;
             }
-        };
-        if result.is_ok() {
-            self.on_capability_changed().await;
         }
         result
     }
 
     /// 停止全部 MCP 客户端（CLI `stop all`）/ Stop all MCP clients。
     pub async fn stop_all_mcp_clients(&self) -> ComputerResult<()> {
+        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        self.ensure_mcp_operations_open()?;
         let result = {
-            let mgr = self.mcp_manager.read().await;
-            match mgr.as_ref() {
+            let mgr = self.current_manager().await;
+            match mgr {
                 Some(m) => m.stop_all().await,
                 None => Err(Self::manager_uninit()),
             }
@@ -3423,17 +4052,132 @@ impl<S: Session> Computer<S> {
         ComputerError::InvalidState("MCP Manager not initialized".to_string())
     }
 
+    fn ensure_mcp_operations_open(&self) -> ComputerResult<()> {
+        if self
+            .mcp_operations_open
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Ok(())
+        } else {
+            Err(ComputerError::InvalidState(
+                "MCP lifecycle is booting or shut down".to_string(),
+            ))
+        }
+    }
+
+    fn ensure_mcp_declarations_mutable(&self) -> ComputerResult<()> {
+        if self.lifecycle_state() == LifecycleState::Shutdown {
+            Err(ComputerError::InvalidState(
+                "Computer shutdown is terminal; MCP declarations can no longer be changed"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mcp_lifecycle_lock(&self, id: &BundleId) -> Arc<Mutex<()>> {
+        self.mcp_lifecycle_locks
+            .get_or_insert_with(id.clone(), || Mutex::new(()))
+    }
+
     /// 建一个 `MCPServerManager` 并应用本实例的 client factory override（#152 测试接缝）/ new manager.
     ///
-    /// 统一 [`boot_up`](Self::boot_up) 与 [`mount_rendered`](Self::mount_rendered) 惰性建 manager 两处：注入了
+    /// 统一 [`boot_up`](Self::boot_up) 与 [`mount_raw`](Self::mount_raw) 惰性建 manager 两处：注入了
     /// [`with_client_factory`](Self::with_client_factory) override 时应用到 manager（hermetic 测试用），否则保持
     /// 真实 `client_factory`。**`change_sender` 仍由 `boot_up` 在调用本方法后单独注入**（本方法不涉及）。
     async fn new_manager(&self) -> MCPServerManager {
-        let manager = MCPServerManager::new();
+        let manager =
+            MCPServerManager::with_oauth_credential_store(Arc::clone(&self.oauth_credential_store))
+                .with_runtime_status(Arc::clone(&self.status));
         if let Some(factory) = self.client_factory_override.clone() {
             manager.set_client_factory(Some(factory)).await;
         }
         manager
+    }
+
+    /// Query OAuth state for a protected remote MCP server.
+    pub async fn oauth_status(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<crate::oauth::OAuthStatus, crate::oauth::OAuthError> {
+        let manager = self.current_manager().await;
+        let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.oauth_status(bundle_id).await
+    }
+
+    /// Begin Authorization Code + PKCE. The embedding app opens the returned URL.
+    ///
+    /// This compatibility facade waits for provider discovery. New hosts should use
+    /// [`create_oauth_flow`](Self::create_oauth_flow), whose returned handle can be cancelled
+    /// before discovery or dynamic registration completes.
+    pub async fn begin_oauth(
+        &self,
+        bundle_id: &BundleId,
+        request: crate::oauth::OAuthBeginRequest,
+    ) -> Result<crate::oauth::OAuthLaunch, crate::oauth::OAuthError> {
+        self.create_oauth_flow(bundle_id, request)
+            .await?
+            .launch()
+            .await
+    }
+
+    /// Create and register a cancellable interactive OAuth flow before provider I/O begins.
+    pub async fn create_oauth_flow(
+        &self,
+        bundle_id: &BundleId,
+        request: crate::oauth::OAuthBeginRequest,
+    ) -> Result<crate::oauth::OAuthFlow, crate::oauth::OAuthError> {
+        let manager = self.current_manager().await;
+        let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
+        manager.create_oauth_flow(bundle_id, request).await
+    }
+
+    /// Complete the browser callback without starting an SDK-owned listener.
+    ///
+    /// The returned outcome contains the granted scopes. Expired, mismatched-state, and
+    /// mismatched-issuer callbacks remain typed [`crate::oauth::OAuthError`] values.
+    pub async fn complete_oauth(
+        &self,
+        bundle_id: &BundleId,
+        callback: crate::oauth::OAuthCallback,
+    ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
+        let flow = {
+            let manager = self.current_manager().await;
+            let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            manager.oauth_flow_for_callback(bundle_id).await?
+        };
+        flow.complete(callback).await
+    }
+
+    /// Cancel a pending browser flow, delete its PKCE/CSRF state, and return the resulting status.
+    pub async fn cancel_oauth(
+        &self,
+        bundle_id: &BundleId,
+        cancellation: crate::oauth::OAuthCancellation,
+    ) -> Result<crate::oauth::OAuthFlowOutcome, crate::oauth::OAuthError> {
+        let flow = {
+            let manager = self.current_manager().await;
+            let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            manager.oauth_flow_for_callback(bundle_id).await?
+        };
+        flow.cancel_compat(cancellation).await
+    }
+
+    /// Clear persisted tokens and pending authorization state.
+    pub async fn clear_oauth(&self, bundle_id: &BundleId) -> Result<(), crate::oauth::OAuthError> {
+        let outcome = {
+            let manager = self.current_manager().await;
+            let manager = manager.ok_or(crate::oauth::OAuthError::NotConfigured)?;
+            manager.clear_oauth_with_outcome(bundle_id).await?
+        };
+
+        // The manager commits connection/client/route state before returning. Release its guard
+        // before publishing the revision so event consumers always re-query the final projection.
+        if outcome.capability_changed {
+            self.on_capability_changed().await;
+        }
+        Ok(())
     }
 
     /// #148：MCP 起停**真有变更**后：bump capability revision（§12 R2：改变 Agent-facing 工具投影）
@@ -3446,18 +4190,29 @@ impl<S: Session> Computer<S> {
 
     /// 检查 MCP Manager 是否已初始化 / Check if MCP Manager is initialized
     pub async fn is_mcp_manager_initialized(&self) -> bool {
-        let manager_guard = self.mcp_manager.read().await;
+        let manager_guard = self.current_manager().await;
         manager_guard.is_some()
     }
 
     /// 设置Socket.IO客户端 / Set Socket.IO client
     /// 此方法会替换现有的 client（如果有）并保持强引用
     /// This method replaces existing client (if any) and keeps strong reference
-    pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) {
-        let mut socketio_ref = self.socketio_client.write().await;
-        // 替换旧的 client（如果有），旧的会被自动 drop
-        // Replace old client (if any), old one will be dropped automatically
-        *socketio_ref = Some(client);
+    pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) -> ComputerResult<()> {
+        let gate = Arc::clone(&self.socketio_lifecycle_gate);
+        let socketio_client = Arc::clone(&self.socketio_client);
+        let status = Arc::clone(&self.status);
+        let owner = Arc::clone(&self.socketio_lifecycle_owner);
+
+        // The task owns the candidate and completes the transaction even if its caller drops the
+        // returned Future while waiting for the slot or old transport teardown.
+        tokio::spawn(async move {
+            let _gate = gate.lock().await;
+            install_socketio_client_locked(socketio_client, status, owner, client).await
+        })
+        .await
+        .map_err(|error| {
+            ComputerError::RuntimeError(format!("Socket.IO installation task failed: {error}"))
+        })?
     }
 
     /// 连接Socket.IO服务器 / Connect to Socket.IO server
@@ -3480,8 +4235,12 @@ impl<S: Session> Computer<S> {
         Self {
             name: self.name.clone(),
             mcp_manager: Arc::clone(&self.mcp_manager),
-            inputs: Arc::new(RwLock::new(HashMap::new())), // 运行时态不复制（同 Clone 语义）。
-            mcp_servers: RwLock::new(HashMap::new()),
+            inputs: Arc::clone(&self.inputs),
+            mcp_servers: Arc::clone(&self.mcp_servers),
+            mcp_lifecycle_gate: Arc::clone(&self.mcp_lifecycle_gate),
+            mcp_boot_shutdown: Arc::clone(&self.mcp_boot_shutdown),
+            mcp_operations_open: Arc::clone(&self.mcp_operations_open),
+            mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
@@ -3490,9 +4249,12 @@ impl<S: Session> Computer<S> {
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
             client_factory_override: self.client_factory_override.clone(),
+            oauth_credential_store: Arc::clone(&self.oauth_credential_store),
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: detached_socketio.clone(),
+            socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
+            socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
             confirm_callback: self.confirm_callback.clone(),
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
@@ -3534,7 +4296,7 @@ impl<S: Session> Computer<S> {
     {
         // 确保管理器已初始化 / Ensure manager is initialized
         let _manager_check = {
-            let manager_guard = self.mcp_manager.read().await;
+            let manager_guard = self.current_manager().await;
             match manager_guard.as_ref() {
                 Some(_m) => {
                     // Manager 已初始化
@@ -3567,21 +4329,33 @@ impl<S: Session> Computer<S> {
         )
         .namespace(options.namespace)
         .computer_ops(ops);
-        // #86：auth dict 负载接到 Builder（Builder 再透传到 CONNECT auth + 4900 重连）——唯一鉴权信道。
-        if let Some(payload) = options.auth_payload {
+        // #201：动态 Provider 优先；未配置时保留 #86 静态 auth dict 行为。
+        if let Some(provider) = options.auth_provider {
+            builder = builder.auth_provider(provider);
+        } else if let Some(payload) = options.auth_payload {
             builder = builder.auth_payload(payload);
         }
         if let Some(h) = parsed_headers {
             builder = builder.headers(h);
         }
-        let client = builder.connect().await?;
-
-        // 设置客户端到Computer / Set client to Computer
-        let client_arc = Arc::new(client);
-        self.set_socketio_client(client_arc.clone()).await;
-
-        // #114 S7：Socket.IO 已连接（Office join 可能未完成，契约 §3）/ connected。
-        self.status.transition(LifecycleState::Connected);
+        let gate = Arc::clone(&self.socketio_lifecycle_gate);
+        let socketio_client = Arc::clone(&self.socketio_client);
+        let status = Arc::clone(&self.status);
+        let owner = Arc::clone(&self.socketio_lifecycle_owner);
+        tokio::spawn(async move {
+            let _gate = gate.lock().await;
+            if status.state() == LifecycleState::Shutdown {
+                return Err(ComputerError::InvalidState(
+                    "Computer is shut down".to_string(),
+                ));
+            }
+            let client = Arc::new(builder.connect().await?);
+            install_socketio_client_locked(socketio_client, status, owner, client).await
+        })
+        .await
+        .map_err(|error| {
+            ComputerError::RuntimeError(format!("Socket.IO connection task failed: {error}"))
+        })??;
 
         info!(
             "Connected to SMCP server at {} with computer name: {}",
@@ -3599,12 +4373,14 @@ impl<S: Session> Computer<S> {
     /// 背后 reader 后台任务持克隆，仅 Drop 用户句柄**不会**关 transport，必须显式 `disconnect()`），
     /// 成功后再置 `None`。幂等：槽已空 → no-op。
     ///
-    /// 失败上抛 Err、**不**清槽、**不**迁移 lifecycle——槽内 client 保留可重试（契约：`Ok` ⟹ 旧 transport
-    /// 已结束，而非仅表示 SDK 丢弃本地引用）。
+    /// 失败上抛 Err 且**不**清槽，槽内 client 保留可重试。membership/lifecycle 会在底层 await 前失效，
+    /// 这是 disconnect Future 的取消安全边界。若底层 0.8.1 已进入 reconnect backoff，`Ok` 表示该
+    /// client 已逻辑退役：业务 handler 已同步闸断，晚到 namespace 会在 Connect callback 内立即关闭。
     async fn close_socketio_transport(&self) -> ComputerResult<()> {
         let mut socketio_ref = self.socketio_client.write().await;
         if let Some(client) = socketio_ref.as_ref() {
             client.disconnect().await?;
+            client.deactivate_runtime_lifecycle();
         }
         *socketio_ref = None;
         Ok(())
@@ -3612,11 +4388,11 @@ impl<S: Session> Computer<S> {
 
     /// 断开Socket.IO连接 / Disconnect Socket.IO
     pub async fn disconnect_socketio(&self) -> ComputerResult<()> {
-        // #148：自身完成底层 transport disconnect（不再仅置 None）。失败上抛 Err、不迁移 lifecycle。
+        let _socketio_lifecycle = self.socketio_lifecycle_gate.lock().await;
+        // #148：自身完成底层 transport disconnect（不再仅置 None）。Client 在第一个 await 前以
+        // 当前连接租约迁移到 Started；这里不能在释放 slot 写锁后再次直接写共享状态，否则并发安装的
+        // replacement client 可能刚进入 Connected/JoinedOffice 又被旧 disconnect 覆盖。
         self.close_socketio_transport().await?;
-        // #114 S7：断开 Socket.IO 后本地 runtime 仍存活 → 回 Started（契约 §4.5：断开后不再向旧 Office 发
-        // `server:update_*`——由 client=None 天然保证；本地管理操作可继续）。已 shutdown 则 transition 为 no-op。
-        self.status.transition(LifecycleState::Started);
         info!("Disconnected from server");
         Ok(())
     }
@@ -3628,8 +4404,6 @@ impl<S: Session> Computer<S> {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
             client.join_office(office_id).await?;
-            // #114 S7：已加入 Office，可接收路由来的 `client:*`（契约 §3）/ joined office。
-            self.status.transition(LifecycleState::JoinedOffice);
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -3645,8 +4419,6 @@ impl<S: Session> Computer<S> {
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
             let current_office_id = client.get_current_office_id().await?;
             client.leave_office(&current_office_id).await?;
-            // #114 S7：离开 Office 但连接仍在 → 回 Connected（契约 §3）/ back to connected。
-            self.status.transition(LifecycleState::Connected);
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -3671,6 +4443,14 @@ impl<S: Session> Computer<S> {
     /// 关闭Computer / Shutdown computer
     pub async fn shutdown(&self) -> ComputerResult<()> {
         info!("Shutting down Computer: {}", self.name);
+        let _boot_shutdown = self.mcp_boot_shutdown.lock().await;
+        // Linearize terminal shutdown before any new candidate can be installed. A connect/set
+        // transaction that won the gate first is completed and then closed below; one that starts
+        // later observes Shutdown and tears down its candidate instead of publishing it.
+        let _socketio_lifecycle = self.socketio_lifecycle_gate.lock().await;
+        let _lifecycle_gate = self.mcp_lifecycle_gate.write().await;
+        self.mcp_operations_open
+            .store(false, std::sync::atomic::Ordering::Release);
 
         // #114 S7：**在拆除资源之前**即进入 Shutdown 终态并闸断观测事件流（契约 §4.7「shutdown 开始即阻断 stale
         // callbacks / emissions」）。放在开头而非结尾——否则若下方 `stop_all().await?` 失败提前 return，闸门将永不
@@ -3698,9 +4478,16 @@ impl<S: Session> Computer<S> {
             warn!(error = %e, "transport disconnect during shutdown failed, skipped");
         }
 
-        let mut manager_guard = self.mcp_manager.write().await;
-        if let Some(manager) = manager_guard.take() {
-            manager.stop_all().await?;
+        // #178：take 置 None 后**立即释放写锁**（临时 guard 语句结束即 drop），`close()`（rmcp teardown，
+        // 可能无界）全程无锁进行——不再被在途调用持有的读锁阻塞，也不阻塞在途调用。终端态语义保持：
+        // mcp_manager 立即置 None，后续读者瞬时得 "not initialized"；并发变异已由 mcp_boot_shutdown /
+        // mcp_lifecycle_gate 排他。
+        let manager = self.mcp_manager.write().await.take();
+        if let Some(manager) = manager {
+            // 防御性收口：无论监控由谁经公开 `start_health_monitor` 启动，shutdown 前停止，
+            // 防后台重连继续骚扰关闭中的实例（#186 事件接线一并覆盖 monitor 触发的状态变化）。
+            manager.stop_health_monitor().await;
+            manager.close().await?;
         }
 
         info!("Computer {} shutdown successfully", self.name);
@@ -3714,8 +4501,12 @@ impl<S: Session + Clone> Clone for Computer<S> {
         Self {
             name: self.name.clone(),
             mcp_manager: Arc::clone(&self.mcp_manager),
-            inputs: Arc::new(RwLock::new(HashMap::new())), // Note: 不复制运行时状态 / Don't copy runtime state
-            mcp_servers: RwLock::new(HashMap::new()),
+            inputs: Arc::clone(&self.inputs),
+            mcp_servers: Arc::clone(&self.mcp_servers),
+            mcp_lifecycle_gate: Arc::clone(&self.mcp_lifecycle_gate),
+            mcp_boot_shutdown: Arc::clone(&self.mcp_boot_shutdown),
+            mcp_operations_open: Arc::clone(&self.mcp_operations_open),
+            mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
@@ -3724,22 +4515,20 @@ impl<S: Session + Clone> Clone for Computer<S> {
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
             client_factory_override: self.client_factory_override.clone(),
+            oauth_credential_store: Arc::clone(&self.oauth_credential_store),
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: Arc::clone(&self.socketio_client),
+            socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
+            socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
             confirm_callback: self.confirm_callback.clone(),
-            // SKILL/blob 子系统：共享同一组 Arc 句柄；去抖器按相同句柄重建（非 Clone）。
+            // Public Clone is another handle to the same Computer lifecycle. All resources that
+            // boot creates and shutdown tears down must therefore share the exact cleanup handles.
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
             skill_home_override: self.skill_home_override.clone(),
-            skill_debouncer: Arc::new(build_skill_debouncer(
-                &self.skill_registry,
-                &self.skill_home,
-                &self.socketio_client,
-            )),
-            // watcher 属**运行时态**（非共享句柄）：克隆体重启时自建（同 inputs/mcp_servers 重置语义）。
-            // 否则共享 watcher 的 on_change 仍驱动**原** debouncer、克隆体 shutdown 会误 stop 共享 watcher。
-            skill_watcher: Arc::new(Mutex::new(None)),
+            skill_debouncer: Arc::clone(&self.skill_debouncer),
+            skill_watcher: Arc::clone(&self.skill_watcher),
             skill_watch_polling: self.skill_watch_polling,
             blob_cache_root_override: self.blob_cache_root_override.clone(),
             blob_thresholds: self.blob_thresholds,
@@ -3747,9 +4536,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
             blob_resolvers: Arc::clone(&self.blob_resolvers),
             // 取消注册表属**共享态**：clone 体与原 Computer 须命中同一表，否则跨 clone 的 acancel_tool 失效。
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
-            // desktop 缓存共享（clone 与本体同一 window:// 集合视图）；通知任务句柄不复制（仅本体持有消费者）。
+            // desktop 缓存与通知消费者均属整机运行态，任一公开 handle shutdown 都须可确定性清理。
             desktop_window_uris: Arc::clone(&self.desktop_window_uris),
-            mcp_notify_task: Arc::new(Mutex::new(None)),
+            mcp_notify_task: Arc::clone(&self.mcp_notify_task),
             // resolver 注入随 clone 保留（handler 路径不渲染 server config，仅占位满足 struct 完整性）。
             input_resolver: self.input_resolver.clone(),
             secret_resolver: self.secret_resolver.clone(),
@@ -3775,6 +4564,8 @@ impl<S: Session + Clone> Clone for Computer<S> {
 /// 各方法为对 [`Computer`] 同名 inherent 方法的纯委托，无逻辑重复。
 #[async_trait]
 pub(crate) trait ComputerHandlerOps: Send + Sync {
+    /// Raw desired MCP declarations joined with current runtime status / protocol config view.
+    async fn get_computer_config_servers(&self) -> ComputerResult<serde_json::Value>;
     /// 解析 blob 句柄（toolspool / skill）→ 可切片描述符 / resolve a blob handle。
     async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError>;
     /// 活跃 SKILL 列表（排除孤儿）/ active SKILL refs。
@@ -3809,6 +4600,9 @@ pub(crate) trait ComputerHandlerOps: Send + Sync {
 
 #[async_trait]
 impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
+    async fn get_computer_config_servers(&self) -> ComputerResult<serde_json::Value> {
+        Computer::get_computer_config_servers(self).await
+    }
     async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError> {
         Computer::resolve_blob(self, handle).await
     }
@@ -3898,6 +4692,9 @@ async fn broadcast_tool_list_update(slot: &Arc<RwLock<Option<Arc<SmcpComputerCli
 struct McpChangeReactor {
     /// `Weak` 管理器 cell（断开 sender 自持环，见类型注释）。
     manager: Weak<RwLock<Option<MCPServerManager>>>,
+    /// Shared runtime event/revision holder. It contains no MCP notification sender, so retaining
+    /// it in the reactor does not recreate the manager/channel ownership cycle described above.
+    status: Arc<RuntimeStatus>,
     socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
     skill_registry: Arc<RwLock<SkillRegistry>>,
     skill_home: Arc<StdRwLock<Option<PathBuf>>>,
@@ -3907,7 +4704,7 @@ struct McpChangeReactor {
 
 impl McpChangeReactor {
     /// 反应一条 MCP 变化通知。协议映射（events.md §server:update_* / desktop.md / skill.md §8）：
-    /// - `tools/list_changed` → 刷新 tool_mapping 后 emit `server:update_tool_list`；
+    /// - `tools/list_changed` → 刷新完整工具投影，真实变化后 bump capability + emit tool list；
     /// - `resources/list_changed` → desktop 集合去抖 emit + MCP 源 skill 重挂（去抖 emit_update_skills）；
     /// - `resources/updated{uri}` → `window://` 直接刷桌面 / `skill://` 重挂该源 / 其它忽略。
     async fn handle(&self, notif: McpServerNotification) {
@@ -3928,17 +4725,33 @@ impl McpChangeReactor {
     }
 
     async fn on_tool_list_changed(&self) {
-        // 先刷新 tool_mapping 再 emit：保证 Agent 回拉 get_tools 时 mapping 已含运行期新增工具（修"坑 1"），
-        // 并顺带修 execute_tool 路由校验对新工具的可见性。消费者任务不在 rmcp event loop 内，调用安全无死锁。
-        if let Some(mgr_cell) = self.manager.upgrade() {
+        // Commit the refreshed route/definition projection before publishing the revision. Event
+        // consumers can therefore call Computer::status/get_available_tools immediately and see
+        // the new state. MCP list_changed is only an invalidation hint: duplicate hints with an
+        // identical projection must not advance the monotonic capability revision or reload Office.
+        let projection_changed = if let Some(mgr_cell) = self.manager.upgrade() {
             let guard = mgr_cell.read().await;
             if let Some(mgr) = guard.as_ref() {
-                if let Err(e) = mgr.refresh_tool_mapping().await {
-                    warn!(error = %e, "refresh_tool_mapping on tools/list_changed failed");
+                match mgr.refresh_tool_mapping_with_outcome().await {
+                    Ok(outcome) => outcome.projection_changed,
+                    Err(e) => {
+                        warn!(error = %e, "refresh_tool_mapping on tools/list_changed failed");
+                        return;
+                    }
                 }
+            } else {
+                return;
             }
+        } else {
+            return;
+        };
+
+        if projection_changed {
+            self.status.bump_capability();
+            self.emit_tool_list().await;
+        } else {
+            debug!("Agent-facing tool projection unchanged, skip capability revision and emit");
         }
-        self.emit_tool_list().await;
     }
 
     async fn on_desktop_maybe_changed(&self) {
@@ -4026,10 +4839,10 @@ impl McpChangeReactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_clients::manager::test_support::bid;
+    use crate::mcp_clients::manager::test_support::{bid, inject_err_tools, inject_tools};
     use crate::mcp_clients::model::{
-        CommandInput, MCPServerConfig, MCPServerInput, PickStringInput, PromptStringInput,
-        StdioServerConfig, StdioServerParameters,
+        CommandInput, MCPServerConfig, MCPServerInput, PickStringInput, PickStringOption,
+        PromptStringInput, StdioServerConfig, StdioServerParameters,
     };
 
     #[tokio::test]
@@ -4069,6 +4882,98 @@ mod tests {
         assert_eq!(snap.capability_revision, 0);
         assert!(snap.last_error.is_none());
         assert!(snap.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_list_refresh_error_preserves_revision_event_and_routes() {
+        let bundle_id = bid("srv");
+        let manager = MCPServerManager::new();
+        manager
+            .initialize(vec![user_stdio_server97("srv")])
+            .await
+            .expect("initialize manager");
+        let input_schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"type": "object"})).unwrap();
+        inject_tools(
+            &manager,
+            &bundle_id,
+            vec![rmcp::model::Tool::new(
+                "stable".to_string(),
+                "stable tool",
+                std::sync::Arc::new(input_schema),
+            )],
+        )
+        .await;
+        manager
+            .refresh_tool_mapping()
+            .await
+            .expect("initial route refresh");
+        inject_err_tools(&manager, &bundle_id).await;
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        *computer.mcp_manager.write().await = Some(manager);
+        let before = computer.status().await;
+        assert_eq!(before.tools, 1);
+        let mut events = computer.subscribe_events();
+
+        computer
+            .handle_mcp_notification(McpServerNotification {
+                server: bundle_id,
+                kind: McpChangeKind::ToolListChanged,
+            })
+            .await;
+
+        assert_eq!(computer.capability_revision(), before.capability_revision);
+        assert_eq!(computer.status().await.tools, 1, "old routes must survive");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "failed refresh must not publish a capability event"
+        );
+    }
+
+    /// #162：boot 代际清除——Boot 源残留诊断在**下一次** boot 开场被清（重启语义从裸字符串
+    /// `set_last_error(None)` 等价升级为按键控源清除）。
+    #[tokio::test]
+    async fn boot_up_clears_stale_boot_diagnostics() {
+        use crate::diagnostics::{
+            DiagnosticCode, DiagnosticOperation, DiagnosticSeverity, DiagnosticSource,
+            DiagnosticTarget, RuntimeDiagnostic,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_config_dir(tmp.path().join("config"))
+            .with_config_env(EnvMap::new());
+        // 预埋一条上一轮的 Boot 源诊断（模拟 boot 失败后的重试场景）。
+        computer.status.record_diagnostic(RuntimeDiagnostic::new(
+            DiagnosticCode::BootManagerInitFailed,
+            DiagnosticSeverity::Error,
+            DiagnosticSource::Boot,
+            DiagnosticOperation::InitializeManager,
+            DiagnosticTarget::Runtime,
+            "previous boot failed",
+        ));
+        assert_eq!(
+            computer.status().await.last_error.as_deref(),
+            Some("previous boot failed")
+        );
+
+        computer.boot_up().await.unwrap();
+
+        let snap = computer.status().await;
+        assert!(
+            snap.diagnostics
+                .iter()
+                .all(|d| d.source != DiagnosticSource::Boot),
+            "boot 开场清 Boot 源残留：{:?}",
+            snap.diagnostics
+        );
+        assert!(snap.last_error.is_none(), "Error 级残留投影随之消失");
+        assert_eq!(snap.lifecycle, LifecycleState::Started);
     }
 
     /// #147/#139：`Clone` / `clone_for_handlers` MUST 保留 frozen embed 声明快照——否则克隆出的 Computer 上
@@ -4289,6 +5194,47 @@ mod tests {
             snap.mcp.servers.iter().any(|s| s.name == "declared"),
             "local scope 声明须重投影可读（重启存活）"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_rejects_persistent_server_mutations_before_disk_write() {
+        use crate::settings::config::{load_config, ConfigContext};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path());
+        computer
+            .add_or_update_server(user_stdio_server97("kept"))
+            .await
+            .unwrap();
+        let before = load_config(&ConfigContext::new(tmp.path()));
+        let kept_id = crate::mcp_clients::bundle_id::resolve_bundle_id(
+            &before
+                .mcp
+                .servers
+                .iter()
+                .find(|server| server.name == "kept")
+                .unwrap()
+                .config,
+        );
+        computer.shutdown().await.unwrap();
+
+        assert!(matches!(
+            computer
+                .add_or_update_server(user_stdio_server97("late"))
+                .await,
+            Err(ComputerError::InvalidState(reason)) if reason.contains("terminal")
+        ));
+        assert!(matches!(
+            computer.remove_server(&kept_id).await,
+            Err(ComputerError::InvalidState(reason)) if reason.contains("terminal")
+        ));
+
+        let after = load_config(&ConfigContext::new(tmp.path()));
+        assert_eq!(after.revision, before.revision);
+        assert!(after.mcp.servers.iter().any(|server| server.name == "kept"));
+        assert!(!after.mcp.servers.iter().any(|server| server.name == "late"));
+        assert_eq!(computer.config_revision(), 1);
     }
 
     /// mount_server（治理物化路径）**不落盘**、只 bump capability 不 bump config——bundled server 归属 ledger
@@ -4620,11 +5566,11 @@ mod tests {
         assert!(snap.degraded_reason.is_none());
         assert!(snap.last_error.is_none());
 
-        // start/stop MCP（空配置 → Ok）改变工具投影 → 各 bump 一次 capability（单调）。
+        // start-all on an empty declaration set is a true no-op and must not fabricate a revision.
         let cap_after_boot = computer.capability_revision();
         computer.start_all_mcp_clients().await.unwrap();
         let cap_after_start = computer.capability_revision();
-        assert!(cap_after_start > cap_after_boot, "start 应 bump capability");
+        assert_eq!(cap_after_start, cap_after_boot);
         computer.stop_all_mcp_clients().await.unwrap();
         assert!(
             computer.capability_revision() > cap_after_start,
@@ -5081,6 +6027,313 @@ mod tests {
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
     }
 
+    /// #165 Option B（变异验证判据）：project-scope `enabledPlugins=true`（入 git、随仓库分发）激活的 plugin
+    /// bundled server **MUST 回落审批门 PENDING**——不自动挂载、入 `pending_bundled_servers`。删去 project-scope
+    /// enable（origin 变 None / 非 Project）→ 恢复免批准直挂（回归守护）。镜像协议 §5 item 10 条件化 / 指南 §2.2。
+    #[tokio::test]
+    async fn reconcile_governance_project_origin_bundled_server_is_pending_165() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        // project-scope（入 git）enable：模拟攻击者 `<cwd>/.tfrobot/settings.json`。
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            serde_json::json!({ "enabledPlugins": { "audit@acme": true } }).to_string(),
+        )
+        .unwrap();
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+
+        // project-origin → PENDING：不挂载、入 pending 列表、hooks 未注册。
+        assert!(
+            report.remounted_servers.is_empty(),
+            "project-origin bundled server MUST NOT auto-mount (must go PENDING)"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "project-origin bundled server MUST NOT be registered"
+        );
+        assert_eq!(
+            report.pending_bundled_servers.len(),
+            1,
+            "project-origin bundled server lands in pending list"
+        );
+        assert_eq!(report.pending_bundled_servers[0].plugin_id, "audit@acme");
+        assert_eq!(report.pending_bundled_servers[0].config.name(), "audit-mcp");
+
+        // 回归守护（变异）：删去 project-scope enable → origin=None（非 Project）→ 免批准直挂。
+        std::fs::remove_file(tfrobot.join("settings.json")).unwrap();
+        let hooks2 = RecordingRemountHooks::new();
+        let report2 = comp_b
+            .reconcile_governance(Some(&hooks2), Some(&declared_audit_enabled()))
+            .await;
+        assert_eq!(
+            report2.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "non-project-origin bundled server mounts approval-free (regression guard)"
+        );
+        assert!(report2.pending_bundled_servers.is_empty());
+    }
+
+    /// #165：local-scope（受信）覆盖 project-scope enable → origin=Local → 免批准直挂（**非** PENDING）。
+    ///
+    /// issue #165 正文曾误把 Local 归 PENDING；协议 §2.2 + Python #182 一致：`user/local/flag/policy` 受信。
+    /// 此测试同时堵变异：若门判据误写 `origin.is_some()`（而非 `== Some(Project)`），origin=Some(Local) 会错误落
+    /// PENDING ⇒ 本测试断言「直挂」失败。
+    #[tokio::test]
+    async fn reconcile_governance_local_scope_overrides_project_to_approval_free_165() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        // project-scope enable（入 git）+ local-scope enable（个人、受信）：
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tfrobot.join("settings.local.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+
+        let comp = Computer::new("l", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-l"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+
+        // local（受信）覆盖 project → origin=Local → 免批准直挂、不入 pending。
+        assert_eq!(
+            report.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "local-origin (trusted) bundled server mounts approval-free"
+        );
+        assert!(report.pending_bundled_servers.is_empty());
+    }
+
+    /// #165 TOFU 闭环：project-origin PENDING → `approve_bundled_plugin` 写 local → 下次 reconcile origin 变
+    /// local（受信）→ 免批准直挂、退出 pending 列表。
+    #[tokio::test]
+    async fn approve_bundled_plugin_promotes_pending_to_mounted_on_next_reconcile_165() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+
+        let comp = Computer::new("t", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-t"));
+
+        // 1) project-origin → PENDING（不挂载）。
+        let hooks = RecordingRemountHooks::new();
+        let r1 = comp
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+        assert!(r1.remounted_servers.is_empty());
+        assert_eq!(r1.pending_bundled_servers.len(), 1);
+
+        // 2) TOFU：approve 写 local[audit@acme]=true → 下次 reconcile origin=Local（受信）→ 直挂、退出 pending。
+        crate::settings::mcp_config::approve_bundled_plugin("audit@acme", Some(&wd)).unwrap();
+        let hooks2 = RecordingRemountHooks::new();
+        let r2 = comp
+            .reconcile_governance(Some(&hooks2), Some(&declared_audit_enabled()))
+            .await;
+        assert_eq!(
+            r2.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "approved plugin mounts on next reconcile"
+        );
+        assert!(
+            r2.pending_bundled_servers.is_empty(),
+            "approved plugin exits pending list"
+        );
+    }
+
+    // ── #169：安全层（Gate 1-3）对 plugin baseline 强制生效（protocol D#42）───────────────
+
+    /// 测试用 helper：返回 audit-mcp server 的 bundle_id（与 `cold_start_setup95` 同源 config）。
+    fn audit_mcp_bundle_id() -> String {
+        let config: MCPServerConfig = serde_json::from_str(
+            r#"{"type":"stdio","name":"audit-mcp","server_parameters":{"command":"node"}}"#,
+        )
+        .unwrap();
+        crate::mcp_clients::bundle_id::resolve_bundle_id(&config).to_string()
+    }
+
+    /// #169：policy `deniedMcpServers` 拒绝 → trusted origin（user scope）bundled server **不挂载**、
+    /// 不入 `pending_bundled_servers`（安全层对所有 server 强制生效）。
+    #[tokio::test]
+    async fn security_layer_denied_blocks_trusted_origin_bundled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+
+        let mut declared = declared_audit_enabled();
+        declared.insert(
+            "deniedMcpServers".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(bid.clone())]),
+        );
+
+        let comp = Computer::new("d", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-d"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared))
+            .await;
+
+        assert!(
+            report.remounted_servers.is_empty(),
+            "deniedMcpServers MUST block bundled server mount (trusted origin)"
+        );
+        assert!(
+            report.pending_bundled_servers.is_empty(),
+            "deniedMcpServers MUST NOT produce pending bundled (security layer rejected)"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "deniedMcpServers MUST NOT register denied server"
+        );
+    }
+
+    /// #169：policy `allowedMcpServers` 白名单不含该 bundle_id → project origin bundled server
+    /// **不挂载**、不入 `pending_bundled_servers`。
+    #[tokio::test]
+    async fn security_layer_allowed_blocks_project_origin_bundled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+        // 显式验证 bundle_id 不出现在白名单中（若非 Gate 2 拒绝则测试是假绿）
+        assert_ne!(
+            bid, "other-server",
+            "precondition: bundle_id must differ from allowed list"
+        );
+
+        // project scope enabledPlugins=true（入 git）+ policy 白名单不含 audit-mcp
+        let mut declared = declared_audit_enabled();
+        declared.insert(
+            "allowedMcpServers".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("other-server".to_string())]),
+        );
+
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            serde_json::json!({"enabledPlugins": {"audit@acme": true}}).to_string(),
+        )
+        .unwrap();
+
+        let comp = Computer::new("a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-a"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared))
+            .await;
+
+        assert!(
+            report.remounted_servers.is_empty(),
+            "allowedMcpServers (non-matching) MUST block bundled server mount"
+        );
+        assert!(
+            report.pending_bundled_servers.is_empty(),
+            "allowedMcpServers (non-matching) MUST NOT produce pending bundled"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "allowedMcpServers (non-matching) MUST NOT register denied server"
+        );
+    }
+
+    /// #169：`disabledMcpjsonServers`（Gate 3, fail-safe）→ bundled server **不挂载**。
+    #[tokio::test]
+    async fn security_layer_disabled_mcpjson_blocks_bundled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+
+        let mut declared = declared_audit_enabled();
+        declared.insert(
+            "disabledMcpjsonServers".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(bid.clone())]),
+        );
+
+        let comp = Computer::new("m", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-m"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared))
+            .await;
+
+        assert!(
+            report.remounted_servers.is_empty(),
+            "disabledMcpjsonServers MUST block bundled server mount"
+        );
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "disabledMcpjsonServers MUST NOT register disabled server"
+        );
+    }
+
+    /// #169：`list_pending_bundled_approvals` MUST NOT 包含安全层 Disabled server。
+    #[tokio::test]
+    async fn list_pending_bundled_approvals_excludes_security_layer_disabled_169() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let bid = audit_mcp_bundle_id();
+
+        // project scope enabledPlugins=true → 本应 PENDING，但 policy deny 先拦截
+        let wd = tmp.path().join("wd");
+        let tfrobot = wd.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        // `disabledMcpjsonServers` 是 fail-safe 字段（任意 scope 可供给）→ 经 project
+        // settings.json 写入可被 `resolve_settings` 保留（`deniedMcpServers` 为 POLICY_ONLY，
+        // project scope 供给会被过滤，不适用于此测试）。
+        std::fs::write(
+            tfrobot.join("settings.json"),
+            serde_json::json!({"enabledPlugins": {"audit@acme": true}, "disabledMcpjsonServers": [&bid]}).to_string(),
+        )
+        .unwrap();
+
+        let comp = Computer::new("l", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_blob_cache_root(tmp.path().join("blob-l"));
+        let pending = comp.list_pending_bundled_approvals();
+
+        assert!(
+            pending.is_empty(),
+            "list_pending_bundled_approvals MUST exclude security-layer Disabled servers"
+        );
+    }
+
     /// #152：cold-start 治理恢复重挂 enabled bundled MCP server 后，应**启动**达 running（协议 #11「enable
     /// 原子激活 servers」）。经 `MountingRemountHooks` 真挂载进 manager + 注入假 client factory（`MockSkillClient`，
     /// `connect()`→Ok）使启动 hermetic 可复现。修复前：mount 仅 pending（`is_active=false`）⇒ 断言 running **失败**。
@@ -5106,6 +6359,9 @@ mod tests {
             .with_skill_home(home)
             .with_blob_cache_root(tmp.path().join("blob-b"))
             .with_client_factory(fake_factory);
+        // Process lifecycle is closed before boot. Clients reconcile bundled MCP with their hooks
+        // only after the Computer runtime is ready; declaration-only preboot mounts cannot start.
+        comp_b.boot_up().await.unwrap();
         let hooks = MountingRemountHooks::new(&comp_b);
         let report = comp_b
             .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
@@ -5125,6 +6381,7 @@ mod tests {
             "enabled bundled MCP 应在治理恢复后启动（running），实得 status={}",
             audit.3
         );
+        comp_b.shutdown().await.unwrap();
     }
 
     /// §63（#104）：账本被外部删除后，reconcile_governance 从 `installedPlugins` 意图重建账本派生缓存
@@ -5831,7 +7088,16 @@ mod tests {
         let pick_input = MCPServerInput::PickString(PickStringInput {
             id: "pick".to_string(),
             description: "Pick input".to_string(),
-            options: vec!["option1".to_string(), "option2".to_string()],
+            options: vec![
+                PickStringOption {
+                    label: "Option 1".to_string(),
+                    value: "option1".to_string(),
+                },
+                PickStringOption {
+                    label: "Option 2".to_string(),
+                    value: "option2".to_string(),
+                },
+            ],
             default: Some("option1".to_string()),
         });
 
@@ -5958,7 +7224,16 @@ mod tests {
         let pick_input = MCPServerInput::PickString(PickStringInput {
             id: "pick".to_string(),
             description: "Pick".to_string(),
-            options: vec!["opt1".to_string(), "opt2".to_string()],
+            options: vec![
+                PickStringOption {
+                    label: "Option 1".to_string(),
+                    value: "opt1".to_string(),
+                },
+                PickStringOption {
+                    label: "Option 2".to_string(),
+                    value: "opt2".to_string(),
+                },
+            ],
             default: Some("opt2".to_string()),
         });
 
@@ -6057,6 +7332,28 @@ mod tests {
 
         let still_exists = computer.get_input_value("input2").await.unwrap();
         assert!(still_exists.is_some());
+
+        // Clearing one id must honor the cache-key boundary. A simple prefix match would
+        // incorrectly delete `input2` when clearing `input` (or `region_backup` for `region`).
+        computer
+            .input_handler
+            .read()
+            .await
+            .set_cached_value(
+                "input2:server:tool".to_string(),
+                InputValue::String("contextual".to_string()),
+            )
+            .await;
+        computer.clear_input_values(Some("input")).await.unwrap();
+        assert_eq!(
+            computer
+                .input_handler
+                .read()
+                .await
+                .get_cached_value("input2:server:tool")
+                .await,
+            Some(InputValue::String("contextual".to_string()))
+        );
 
         // 测试清空所有缓存 / Test clearing all cache
         computer.clear_input_values(None).await.unwrap();
@@ -6249,10 +7546,25 @@ mod tests {
 
         // 测试关闭未初始化的Computer / Test shutting down uninitialized computer
         computer.shutdown().await.unwrap();
+        assert!(matches!(
+            computer.boot_up().await,
+            Err(ComputerError::InvalidState(reason)) if reason.contains("terminal")
+        ));
 
-        // 测试关闭已初始化的Computer / Test shutting down initialized computer
-        computer.boot_up().await.unwrap();
-        computer.shutdown().await.unwrap();
+        // 测试关闭已初始化的Computer / Test shutting down initialized computer. A terminal
+        // Computer is not reusable; construct a fresh lifecycle owner.
+        let running = Computer::new(
+            "running_computer",
+            SilentSession::new("test"),
+            None,
+            None,
+            true,
+            true,
+        )
+        .with_skill_home(td.path().join("running-skills"))
+        .with_blob_cache_root(td.path().join("running-blob"));
+        running.boot_up().await.unwrap();
+        running.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6369,6 +7681,40 @@ mod tests {
         }
     }
 
+    struct MutableInputResolver {
+        value: Arc<StdMutex<String>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::inputs::runtime_resolver::InputValueResolver for MutableInputResolver {
+        async fn resolve_input(
+            &self,
+            _def: &MCPServerInput,
+        ) -> Result<Option<serde_json::Value>, InputResolutionError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(serde_json::Value::String(
+                self.value.lock().unwrap().clone(),
+            )))
+        }
+    }
+
+    struct RecordingInputResolver {
+        values: HashMap<String, serde_json::Value>,
+        seen: Arc<StdMutex<Vec<MCPServerInput>>>,
+    }
+
+    #[async_trait]
+    impl crate::inputs::runtime_resolver::InputValueResolver for RecordingInputResolver {
+        async fn resolve_input(
+            &self,
+            def: &MCPServerInput,
+        ) -> Result<Option<serde_json::Value>, InputResolutionError> {
+            self.seen.lock().unwrap().push(def.clone());
+            Ok(self.values.get(def.id()).cloned())
+        }
+    }
+
     /// 测试用 map-backed secret resolver / test double。
     struct MapSecretResolver(HashMap<String, String>);
     #[async_trait]
@@ -6388,6 +7734,37 @@ mod tests {
             default: default.map(|s| s.to_string()),
             password: Some(password),
         })
+    }
+
+    fn region_pick_def() -> MCPServerInput {
+        MCPServerInput::PickString(PickStringInput {
+            id: "region".to_string(),
+            description: "Region".to_string(),
+            options: vec![
+                PickStringOption {
+                    label: "China".to_string(),
+                    value: "cn".to_string(),
+                },
+                PickStringOption {
+                    label: "Europe".to_string(),
+                    value: "eu".to_string(),
+                },
+            ],
+            default: Some("cn".to_string()),
+        })
+    }
+
+    #[tokio::test]
+    async fn silent_pick_without_default_returns_first_option_value() {
+        let mut input = region_pick_def();
+        let MCPServerInput::PickString(pick) = &mut input else {
+            unreachable!();
+        };
+        pick.default = None;
+        assert_eq!(
+            SilentSession::new("t").resolve_input(&input).await.unwrap(),
+            serde_json::json!("cn")
+        );
     }
 
     fn stdio_with_arg(arg: &str) -> MCPServerConfig {
@@ -6414,6 +7791,838 @@ mod tests {
             MCPServerConfig::Stdio(c) => c.server_parameters.args[0].clone(),
             _ => panic!("Expected Stdio config"),
         }
+    }
+
+    #[tokio::test]
+    async fn actual_start_restart_and_start_all_rematerialize_raw_config() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current = Arc::new(StdMutex::new("cn".to_string()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let created = Arc::new(StdMutex::new(Vec::<MCPServerConfig>::new()));
+        let captured = Arc::clone(&created);
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |config, _| {
+            captured.lock().unwrap().push(config);
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let mut first = stdio_with_arg("${input:region}");
+        if let MCPServerConfig::Stdio(config) = &mut first {
+            config
+                .server_parameters
+                .env
+                .insert("REGION".to_string(), "${input:region}".to_string());
+        }
+        let servers = HashMap::from([
+            ("s".to_string(), first),
+            (
+                "second".to_string(),
+                MCPServerConfig::Stdio(StdioServerConfig {
+                    name: "second".to_string(),
+                    ..match stdio_with_arg("${input:region}") {
+                        MCPServerConfig::Stdio(config) => config,
+                        _ => unreachable!(),
+                    }
+                }),
+            ),
+        ]);
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), region_pick_def())])),
+            Some(servers),
+            false,
+            false,
+        )
+        .with_config_dir(tmp.path())
+        .with_skill_home(tmp.path().join("skill-home"))
+        .with_blob_cache_root(tmp.path().join("blob"))
+        .with_input_resolver(Arc::new(MutableInputResolver {
+            value: Arc::clone(&current),
+            calls: Arc::clone(&calls),
+        }))
+        .with_client_factory(factory);
+
+        computer.boot_up().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "boot only loads raw config"
+        );
+
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rendered_arg0(created.lock().unwrap()[0].clone()), "cn");
+
+        *current.lock().unwrap() = "eu".to_string();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "idempotent start of a running server must not resolve again"
+        );
+
+        computer.restart_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(rendered_arg0(created.lock().unwrap()[1].clone()), "eu");
+
+        computer
+            .mount_server(stdio_with_arg("${input:region}-new"))
+            .await
+            .unwrap();
+        assert_eq!(
+            created.lock().unwrap().len(),
+            2,
+            "updating raw config must not replace a running process"
+        );
+        computer.restart_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(rendered_arg0(created.lock().unwrap()[2].clone()), "eu-new");
+
+        computer.start_all_mcp_clients().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "start-all resolves only the second server that actually starts"
+        );
+        assert_eq!(rendered_arg0(created.lock().unwrap()[3].clone()), "eu");
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn computer_config_projection_keeps_raw_placeholders_before_and_after_start() {
+        let created = Arc::new(StdMutex::new(Vec::<MCPServerConfig>::new()));
+        let captured = Arc::clone(&created);
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |config, _| {
+            captured.lock().unwrap().push(config);
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), region_pick_def())])),
+            Some(one_server_referencing("${input:region}")),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        let before = computer.get_computer_config_servers().await.unwrap();
+        assert_eq!(
+            before["s"]["server_parameters"]["args"][0],
+            serde_json::json!("${input:region}")
+        );
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(rendered_arg0(created.lock().unwrap()[0].clone()), "cn");
+
+        let after = computer.get_computer_config_servers().await.unwrap();
+        assert_eq!(
+            after["s"]["server_parameters"]["args"][0],
+            serde_json::json!("${input:region}"),
+            "protocol projection must never expose the rendered process value"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_start_and_restart_do_not_resolve_inputs() {
+        use std::sync::atomic::Ordering;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut server = stdio_with_arg("${input:region}");
+        if let MCPServerConfig::Stdio(config) = &mut server {
+            config.disabled = true;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), region_pick_def())])),
+            Some(HashMap::from([("s".to_string(), server)])),
+            false,
+            false,
+        )
+        .with_input_resolver(Arc::new(MutableInputResolver {
+            value: Arc::new(StdMutex::new("cn".to_string())),
+            calls: Arc::clone(&calls),
+        }))
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        let error = computer.start_mcp_client(&bid("s")).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ComputerError::InvalidConfiguration(reason) if reason.contains("disabled")
+        ));
+        computer.restart_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a disabled non-start must not query resolvers or execute Commands"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_start_rematerializes_latest_input_value() {
+        use std::sync::atomic::Ordering;
+
+        let current = Arc::new(StdMutex::new("cn".to_string()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let created = Arc::new(StdMutex::new(Vec::<MCPServerConfig>::new()));
+        let captured = Arc::clone(&created);
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |config, _| {
+            captured.lock().unwrap().push(config);
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), region_pick_def())])),
+            Some(one_server_referencing("${input:region}")),
+            false,
+            false,
+        )
+        .with_input_resolver(Arc::new(MutableInputResolver {
+            value: Arc::clone(&current),
+            calls: Arc::clone(&calls),
+        }))
+        .with_client_factory(factory);
+
+        computer.boot_up().await.unwrap();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        assert!(computer.stop_mcp_client(&bid("s")).await.unwrap());
+        *current.lock().unwrap() = "eu".to_string();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(rendered_arg0(created.lock().unwrap()[0].clone()), "cn");
+        assert_eq!(rendered_arg0(created.lock().unwrap()[1].clone()), "eu");
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_mount_and_unmount_leave_consistent_absent_state() {
+        let computer = Arc::new(Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            None,
+            false,
+            false,
+        ));
+        computer.boot_up().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mount_computer = Arc::clone(&computer);
+        let mount_entered = Arc::clone(&entered);
+        let mount_release = Arc::clone(&release);
+        let mount = tokio::spawn(async move {
+            mount_computer
+                .mount_raw_inner(stdio_with_arg("value"), None, async move {
+                    mount_entered.notify_one();
+                    mount_release.notified().await;
+                })
+                .await
+        });
+        entered.notified().await;
+
+        let unmount_started = Arc::new(tokio::sync::Notify::new());
+        let unmount_computer = Arc::clone(&computer);
+        let started = Arc::clone(&unmount_started);
+        let unmount = tokio::spawn(async move {
+            started.notify_one();
+            unmount_computer.unmount_server(&bid("s")).await
+        });
+        unmount_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !unmount.is_finished(),
+            "unmount must wait for the overlapping mount transaction"
+        );
+        release.notify_one();
+
+        mount.await.unwrap().unwrap();
+        assert!(unmount.await.unwrap().unwrap());
+        assert!(!computer.mcp_servers.read().await.contains_key(&bid("s")));
+        assert!(!computer
+            .get_server_runtime_statuses()
+            .await
+            .iter()
+            .any(|status| status.bundle_id == bid("s")));
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_raw_update_and_actual_start_use_one_declaration_version() {
+        let created = Arc::new(StdMutex::new(Vec::<MCPServerConfig>::new()));
+        let captured = Arc::clone(&created);
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |config, _| {
+            captured.lock().unwrap().push(config);
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let computer = Arc::new(
+            Computer::new(
+                "c",
+                SilentSession::new("t"),
+                None,
+                Some(HashMap::from([("s".to_string(), stdio_with_arg("old"))])),
+                false,
+                false,
+            )
+            .with_client_factory(factory),
+        );
+        computer.boot_up().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let update_computer = Arc::clone(&computer);
+        let update_entered = Arc::clone(&entered);
+        let update_release = Arc::clone(&release);
+        let update = tokio::spawn(async move {
+            update_computer
+                .mount_raw_inner(stdio_with_arg("new"), None, async move {
+                    update_entered.notify_one();
+                    update_release.notified().await;
+                })
+                .await
+        });
+        entered.notified().await;
+
+        let start_attempted = Arc::new(tokio::sync::Notify::new());
+        let start_computer = Arc::clone(&computer);
+        let attempted = Arc::clone(&start_attempted);
+        let start = tokio::spawn(async move {
+            attempted.notify_one();
+            start_computer.start_mcp_client(&bid("s")).await
+        });
+        start_attempted.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !start.is_finished(),
+            "actual start must wait for the overlapping raw update"
+        );
+        release.notify_one();
+
+        update.await.unwrap().unwrap();
+        start.await.unwrap().unwrap();
+        assert_eq!(created.lock().unwrap().len(), 1);
+        assert_eq!(rendered_arg0(created.lock().unwrap()[0].clone()), "new");
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_cached_pick_value_fails_without_default_fallback() {
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), region_pick_def())])),
+            Some(one_server_referencing("${input:region}")),
+            false,
+            false,
+        );
+
+        let setter_error = computer
+            .set_input_value("region", serde_json::json!("obsolete"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            setter_error,
+            ComputerError::InputResolution(InputResolutionError::InvalidSelection {
+                ref id,
+                ref value
+            }) if id == "region" && value == "obsolete"
+        ));
+
+        // Simulate a value that was valid under an older definition. The actual render boundary
+        // must reject it rather than treating cache as absence and selecting the current default.
+        computer
+            .input_handler
+            .read()
+            .await
+            .set_cached_value(
+                "region".to_string(),
+                InputValue::String("obsolete".to_string()),
+            )
+            .await;
+        computer.boot_up().await.unwrap();
+        let error = computer.start_mcp_client(&bid("s")).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ComputerError::InputResolution(InputResolutionError::InvalidSelection {
+                ref id,
+                ref value
+            }) if id == "region" && value == "obsolete"
+        ));
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_serializes_with_mount_and_closes_operation_gate() {
+        let computer = Arc::new(Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            None,
+            false,
+            false,
+        ));
+        computer.boot_up().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mount_computer = Arc::clone(&computer);
+        let mount_entered = Arc::clone(&entered);
+        let mount_release = Arc::clone(&release);
+        let mount = tokio::spawn(async move {
+            mount_computer
+                .mount_raw_inner(stdio_with_arg("value"), None, async move {
+                    mount_entered.notify_one();
+                    mount_release.notified().await;
+                })
+                .await
+        });
+        entered.notified().await;
+
+        let shutdown_started = Arc::new(tokio::sync::Notify::new());
+        let shutdown_computer = Arc::clone(&computer);
+        let started = Arc::clone(&shutdown_started);
+        let shutdown = tokio::spawn(async move {
+            started.notify_one();
+            shutdown_computer.shutdown().await
+        });
+        shutdown_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must wait for an in-flight per-server transaction"
+        );
+        release.notify_one();
+
+        mount.await.unwrap().unwrap();
+        shutdown.await.unwrap().unwrap();
+        assert!(computer.mcp_manager.read().await.is_none());
+        assert!(computer.mcp_servers.read().await.contains_key(&bid("s")));
+        let error = computer
+            .mount_server(stdio_with_arg("after-shutdown"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComputerError::InvalidState(reason) if reason.contains("terminal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preboot_mount_records_desired_state_but_process_start_requires_boot() {
+        let created = Arc::new(StdMutex::new(Vec::<MCPServerConfig>::new()));
+        let captured = Arc::clone(&created);
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |config, _| {
+            captured.lock().unwrap().push(config);
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("t"), None, None, false, false)
+            .with_client_factory(factory)
+            .with_skill_home(td.path().join("skills"))
+            .with_blob_cache_root(td.path().join("blob"));
+
+        computer
+            .mount_server(stdio_with_arg("preboot"))
+            .await
+            .unwrap();
+        assert!(computer.mcp_manager.read().await.is_none());
+        assert!(matches!(
+            computer.start_mcp_client(&bid("s")).await,
+            Err(ComputerError::InvalidState(reason)) if reason.contains("booting or shut down")
+        ));
+
+        computer.boot_up().await.unwrap();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(created.lock().unwrap().len(), 1);
+        assert_eq!(rendered_arg0(created.lock().unwrap()[0].clone()), "preboot");
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_clone_shares_inputs_raw_state_and_manager_projection() {
+        let created = Arc::new(StdMutex::new(Vec::<MCPServerConfig>::new()));
+        let captured = Arc::clone(&created);
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |config, _| {
+            captured.lock().unwrap().push(config);
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(HashMap::from([("s".to_string(), stdio_with_arg("old"))])),
+            false,
+            false,
+        )
+        .with_client_factory(factory);
+        computer.boot_up().await.unwrap();
+        let notify_task_before = computer
+            .mcp_notify_task
+            .lock()
+            .await
+            .as_ref()
+            .map(tokio::task::JoinHandle::id);
+        computer.boot_up().await.unwrap();
+        let notify_task_after = computer
+            .mcp_notify_task
+            .lock()
+            .await
+            .as_ref()
+            .map(tokio::task::JoinHandle::id);
+        assert_eq!(
+            notify_task_before, notify_task_after,
+            "repeated boot must not replace whole-machine background tasks"
+        );
+        let cloned = computer.clone();
+        assert!(Arc::ptr_eq(
+            &computer.skill_debouncer,
+            &cloned.skill_debouncer
+        ));
+        assert!(Arc::ptr_eq(&computer.skill_watcher, &cloned.skill_watcher));
+        assert!(Arc::ptr_eq(
+            &computer.mcp_notify_task,
+            &cloned.mcp_notify_task
+        ));
+
+        cloned
+            .add_or_update_input(MCPServerInput::PromptString(PromptStringInput {
+                id: "shared".to_string(),
+                description: "shared".to_string(),
+                default: Some("value".to_string()),
+                password: Some(false),
+            }))
+            .await
+            .unwrap();
+        assert!(computer.get_input("shared").await.unwrap().is_some());
+
+        cloned.mount_server(stdio_with_arg("new")).await.unwrap();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(created.lock().unwrap().len(), 1);
+        assert_eq!(rendered_arg0(created.lock().unwrap()[0].clone()), "new");
+        cloned.shutdown().await.unwrap();
+        assert!(computer.mcp_manager.read().await.is_none());
+        assert!(computer.mcp_notify_task.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_cannot_bypass_computer_materialization_before_or_after_first_start() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current = Arc::new(StdMutex::new("cn".to_string()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(|_, _| {
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), region_pick_def())])),
+            Some(one_server_referencing("${input:region}")),
+            false,
+            false,
+        )
+        .with_config_dir(tmp.path())
+        .with_skill_home(tmp.path().join("skill-home"))
+        .with_blob_cache_root(tmp.path().join("blob"))
+        .with_input_resolver(Arc::new(MutableInputResolver {
+            value: current,
+            calls: Arc::clone(&calls),
+        }))
+        .with_client_factory(factory);
+        computer.boot_up().await.unwrap();
+
+        {
+            let manager = computer.mcp_manager.read().await;
+            let error = manager
+                .as_ref()
+                .unwrap()
+                .start_client_by_id(&bid("s"))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ComputerError::InvalidConfiguration(reason)
+                    if reason.contains("Computer-owned")
+            ));
+        }
+
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        computer.stop_mcp_client(&bid("s")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let manager = computer.mcp_manager.read().await;
+        for error in [
+            manager
+                .as_ref()
+                .unwrap()
+                .start_client_by_id(&bid("s"))
+                .await
+                .unwrap_err(),
+            manager
+                .as_ref()
+                .unwrap()
+                .restart_client_by_id(&bid("s"))
+                .await
+                .unwrap_err(),
+            manager.as_ref().unwrap().start_all().await.unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                ComputerError::InvalidConfiguration(reason)
+                    if reason.contains("Computer-owned")
+            ));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "public Manager lifecycle APIs must not reuse or rerender Computer-owned configs"
+        );
+        drop(manager);
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_invalid_selection_preserves_running_client() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current = Arc::new(StdMutex::new("cn".to_string()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(|_, _| {
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), region_pick_def())])),
+            Some(one_server_referencing("${input:region}")),
+            false,
+            false,
+        )
+        .with_config_dir(tmp.path())
+        .with_skill_home(tmp.path().join("skill-home"))
+        .with_blob_cache_root(tmp.path().join("blob"))
+        .with_input_resolver(Arc::new(MutableInputResolver {
+            value: Arc::clone(&current),
+            calls: Arc::clone(&calls),
+        }))
+        .with_client_factory(factory);
+        computer.boot_up().await.unwrap();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+
+        *current.lock().unwrap() = "obsolete".to_string();
+        let error = computer.restart_mcp_client(&bid("s")).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ComputerError::InputResolution(InputResolutionError::InvalidSelection {
+                ref id,
+                ref value
+            }) if id == "region" && value == "obsolete"
+        ));
+        let status = computer.get_server_runtime_statuses().await;
+        assert!(status
+            .iter()
+            .any(|status| status.bundle_id == bid("s") && status.is_connected()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        computer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_connect_failure_publishes_capability_revocation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let factory_attempts = Arc::clone(&attempts);
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_, _| {
+            if factory_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                    pages: vec![],
+                    fail: false,
+                    cap_fail: false,
+                    read_text: String::new(),
+                })
+            } else {
+                Arc::new(crate::mcp_clients::manager::test_support::ConnectFailClient)
+            }
+        });
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(HashMap::from([("s".to_string(), stdio_with_arg("static"))])),
+            false,
+            false,
+        )
+        .with_client_factory(factory);
+        computer.boot_up().await.unwrap();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+        let before = computer.capability_revision();
+        assert!(computer.restart_mcp_client(&bid("s")).await.is_err());
+        assert!(computer.capability_revision() > before);
+        assert!(!computer
+            .get_server_runtime_statuses()
+            .await
+            .into_iter()
+            .any(|status| status.bundle_id == bid("s") && status.is_connected()));
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #186：Computer 层健康监控透传——`start_health_monitor` 首轮检查即触达活跃客户端、
+    /// `stop_health_monitor` 幂等。（boot 不默认启动由代码注释与复审锚定；监控首轮检查在
+    /// spawn 即刻执行、boot 时无活跃客户端，30s 周期使「未启动」在快测试窗口内不可观测。）
+    #[tokio::test]
+    async fn computer_health_monitor_opt_in_passthrough() {
+        use crate::mcp_clients::manager::ClientFactory;
+        use crate::mcp_clients::model::{
+            CallToolResult, ClientState, HealthCheckResult, MCPClientError, MCPClientProtocol,
+            ReadResourceResult, Resource, Tool,
+        };
+        use serde_json::Value;
+        use std::time::Duration;
+
+        struct GatedHealthClient {
+            ready: std::sync::Arc<tokio::sync::Notify>,
+            release: std::sync::Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl MCPClientProtocol for GatedHealthClient {
+            fn state(&self) -> ClientState {
+                ClientState::Connected
+            }
+            async fn connect(&self) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn disconnect(&self) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+                Ok(vec![])
+            }
+            async fn call_tool(
+                &self,
+                _tool: &str,
+                _params: Value,
+            ) -> Result<CallToolResult, MCPClientError> {
+                Err(MCPClientError::ProtocolError("n/a".into()))
+            }
+            async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+                Ok(vec![])
+            }
+            async fn list_resources_page(
+                &self,
+                _cursor: Option<String>,
+            ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+                Ok((vec![], None))
+            }
+            async fn get_window_detail(
+                &self,
+                _resource: Resource,
+            ) -> Result<ReadResourceResult, MCPClientError> {
+                Err(MCPClientError::ProtocolError("n/a".into()))
+            }
+            async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn health_check(&self) -> HealthCheckResult {
+                self.ready.notify_one();
+                self.release.notified().await;
+                HealthCheckResult {
+                    is_healthy: false,
+                    checked_at: std::time::Instant::now(),
+                    error: Some("injected unhealthy".into()),
+                    response_time_ms: None,
+                }
+            }
+        }
+
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (c_ready, c_release) = (ready.clone(), release.clone());
+        let factory: ClientFactory = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(GatedHealthClient {
+                ready: c_ready.clone(),
+                release: c_release.clone(),
+            })
+        });
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(HashMap::from([("s".to_string(), stdio_with_arg("static"))])),
+            false,
+            false,
+        )
+        .with_client_factory(factory);
+        computer.boot_up().await.unwrap();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+
+        // 显式开启 → 首轮检查触达活跃客户端（透传接线证明）。
+        let inspected = ready.notified();
+        computer.start_health_monitor().await;
+        tokio::time::timeout(Duration::from_secs(2), inspected)
+            .await
+            .expect("start_health_monitor 必须触达活跃客户端（#186 透传）");
+        // 放行 gated health_check（不健康 → 重连路径，桩瞬时完成）；随后停止并验证幂等。
+        release.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        computer.stop_health_monitor().await;
+        computer.stop_health_monitor().await;
+        computer.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6500,6 +8709,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_resolver_value_overrides_sdk_cache() {
+        let mut inputs = HashMap::new();
+        inputs.insert("region".to_string(), region_pick_def());
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(MapInputResolver(HashMap::from([(
+                "region".to_string(),
+                serde_json::json!("eu"),
+            )]))));
+        computer
+            .set_input_value("region", serde_json::json!("cn"))
+            .await
+            .unwrap();
+
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:region}"))
+            .await
+            .unwrap();
+
+        assert_eq!(rendered_arg0(rendered), "eu");
+    }
+
+    #[tokio::test]
+    async fn client_resolver_none_falls_back_to_sdk_cache() {
+        let mut inputs = HashMap::new();
+        inputs.insert("region".to_string(), region_pick_def());
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(RecordingInputResolver {
+                values: HashMap::new(),
+                seen: Arc::clone(&seen),
+            }));
+        computer
+            .set_input_value("region", serde_json::json!("eu"))
+            .await
+            .unwrap();
+
+        let rendered = computer
+            .render_server_config(&stdio_with_arg("${input:region}"))
+            .await
+            .unwrap();
+
+        assert_eq!(rendered_arg0(rendered), "eu");
+        assert_eq!(seen.lock().unwrap().as_slice(), &[region_pick_def()]);
+    }
+
+    #[tokio::test]
+    async fn client_resolver_receives_complete_existing_input_definitions() {
+        let prompt = MCPServerInput::PromptString(PromptStringInput {
+            id: "account".to_string(),
+            description: "Account name".to_string(),
+            default: Some("alice".to_string()),
+            password: Some(false),
+        });
+        let pick = region_pick_def();
+        let inputs = HashMap::from([
+            ("account".to_string(), prompt.clone()),
+            ("region".to_string(), pick.clone()),
+        ]);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
+            .with_input_resolver(Arc::new(RecordingInputResolver {
+                values: HashMap::from([
+                    ("account".to_string(), serde_json::json!("confirmed")),
+                    ("region".to_string(), serde_json::json!("eu")),
+                ]),
+                seen: Arc::clone(&seen),
+            }));
+        let mut raw = stdio_with_arg("${input:account}");
+        let MCPServerConfig::Stdio(config) = &mut raw else {
+            unreachable!();
+        };
+        config
+            .server_parameters
+            .args
+            .push("${input:region}".to_string());
+
+        computer.render_server_config(&raw).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&prompt));
+        assert!(seen.contains(&pick));
+    }
+
+    #[tokio::test]
     async fn render_resolves_secret_via_injected_secret_resolver() {
         // D1：password:true input 经 client secret_resolver 取值（SDK 不落盘 secret 明文）。
         let mut inputs = HashMap::new();
@@ -6508,6 +8802,10 @@ mod tests {
         m.insert("s5_key".to_string(), "sk-injected".to_string());
         let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
             .with_secret_resolver(Arc::new(MapSecretResolver(m)));
+        computer
+            .set_input_value("s5_key", serde_json::json!("cached-secret"))
+            .await
+            .unwrap();
         let rendered = computer
             .render_server_config(&stdio_with_arg("${input:s5_key}"))
             .await
@@ -6552,9 +8850,16 @@ mod tests {
     async fn render_propagates_resolver_hard_failure() {
         // resolver 侧硬失败（Err）→ 引用取用时 propagate（区别于「未提供」的 Ok(None) 回退）。
         let mut inputs = HashMap::new();
-        inputs.insert("s5_fail".to_string(), prompt_def("s5_fail", None, false));
+        inputs.insert(
+            "s5_fail".to_string(),
+            prompt_def("s5_fail", Some("default"), false),
+        );
         let computer = Computer::new("c", SilentSession::new("t"), Some(inputs), None, true, true)
             .with_input_resolver(Arc::new(FailingInputResolver));
+        computer
+            .set_input_value("s5_fail", serde_json::json!("cached"))
+            .await
+            .unwrap();
         let err = computer
             .render_server_config(&stdio_with_arg("${input:s5_fail}"))
             .await
@@ -6624,7 +8929,7 @@ mod tests {
         );
     }
 
-    // ── #144：boot_up 须把 D1 结构化 InputResolution 上抛（非仅日志），对齐 mount_server ──────────
+    // ── #187：boot 保留 raw config，结构化 InputResolution 延迟到实际 start ──────────
 
     /// 构造单个引用 `${input:<id>}` 的 stdio server 的 mcp_servers 映射（boot_up 读 self.mcp_servers 渲染）。
     fn one_server_referencing(arg: &str) -> HashMap<String, MCPServerConfig> {
@@ -6632,8 +8937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_up_propagates_missing_value_input() {
-        // #144：已定义、无默认值、无 resolver/env 的 value input → boot_up 上抛 InputResolution::Missing（非 Ok+日志）。
+    async fn actual_start_propagates_missing_value_input() {
         let mut inputs = HashMap::new();
         inputs.insert("b144_val".to_string(), prompt_def("b144_val", None, false));
         let computer = Computer::new(
@@ -6644,10 +8948,8 @@ mod tests {
             false,
             false,
         );
-        let err = computer
-            .boot_up()
-            .await
-            .expect_err("boot_up MUST propagate missing-value InputResolution");
+        computer.boot_up().await.unwrap();
+        let err = computer.start_mcp_client(&bid("s")).await.unwrap_err();
         match &err {
             ComputerError::InputResolution(InputResolutionError::Missing { id, kind, .. }) => {
                 assert_eq!(id, "b144_val");
@@ -6659,8 +8961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_up_propagates_missing_secret_input() {
-        // #144：password:true secret 缺失 → Missing{kind:Secret}。Missing 结构体无值字段 ⇒ 安全验收：错误天然不含明文。
+    async fn actual_start_propagates_missing_secret_input() {
         let mut inputs = HashMap::new();
         inputs.insert("b144_sec".to_string(), prompt_def("b144_sec", None, true));
         let computer = Computer::new(
@@ -6671,10 +8972,8 @@ mod tests {
             false,
             false,
         );
-        let err = computer
-            .boot_up()
-            .await
-            .expect_err("boot_up MUST propagate missing-secret InputResolution");
+        computer.boot_up().await.unwrap();
+        let err = computer.start_mcp_client(&bid("s")).await.unwrap_err();
         match &err {
             ComputerError::InputResolution(InputResolutionError::Missing {
                 id,
@@ -6694,8 +8993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_up_propagates_resolver_hard_failure() {
-        // #144：client resolver 硬失败（Err）→ boot_up 上抛 ResolverFailed（区别于 Ok(None) 的 Missing 回退）。
+    async fn actual_start_propagates_resolver_hard_failure() {
         let mut inputs = HashMap::new();
         inputs.insert(
             "b144_fail".to_string(),
@@ -6710,10 +9008,8 @@ mod tests {
             false,
         )
         .with_input_resolver(Arc::new(FailingInputResolver));
-        let err = computer
-            .boot_up()
-            .await
-            .expect_err("boot_up MUST propagate resolver hard-failure");
+        computer.boot_up().await.unwrap();
+        let err = computer.start_mcp_client(&bid("s")).await.unwrap_err();
         match &err {
             ComputerError::InputResolution(InputResolutionError::ResolverFailed { id, reason }) => {
                 assert_eq!(id, "b144_fail");
@@ -6724,9 +9020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_up_input_resolution_sets_error_status() {
-        // #144：失败须落 Error 状态 + last_error（对齐 manager.initialize 失败路径）——boot 可安全重试、观测面反映失败，
-        // 而非卡在 Starting。失败发生在 render 循环（commit/spawn/watcher 之前）⇒ 无残留 manager/task/transport。
+    async fn boot_up_does_not_resolve_inputs_before_actual_start() {
         let mut inputs = HashMap::new();
         inputs.insert(
             "b144_state".to_string(),
@@ -6740,26 +9034,41 @@ mod tests {
             false,
             false,
         );
-        assert!(
-            computer.boot_up().await.is_err(),
-            "boot MUST fail on missing input"
-        );
+        computer.boot_up().await.unwrap();
         let snap = computer.status().await;
         assert_eq!(
             snap.lifecycle,
-            LifecycleState::Error,
-            "失败后状态须为 Error（非卡 Starting）"
+            LifecycleState::Started,
+            "loading raw declarations must not resolve inputs"
         );
-        assert!(
-            snap.last_error.is_some(),
-            "last_error 须落诊断（仅错误类别串、不含 secret）"
-        );
+        assert!(snap.last_error.is_none());
     }
 
     #[tokio::test]
-    async fn boot_up_retry_succeeds_after_resolver_provides_value() {
-        // #144：boot 失败后生命周期可安全重试——同一 Computer 在值可得后再次 boot 成功（无残留状态阻塞）。
-        // Error→Starting 迁移被允许（仅 Shutdown 终态拒绝），故首轮失败后可直挂重试。
+    async fn boot_up_rejects_programmatically_constructed_invalid_pick_string() {
+        let invalid = MCPServerInput::PickString(PickStringInput {
+            id: "region".to_string(),
+            description: "Region".to_string(),
+            options: vec![],
+            default: None,
+        });
+        let computer = Computer::new(
+            "invalid-pick",
+            SilentSession::new("t"),
+            Some(HashMap::from([("region".to_string(), invalid)])),
+            None,
+            false,
+            false,
+        );
+        assert!(matches!(
+            computer.boot_up().await,
+            Err(ComputerError::InvalidConfiguration(reason))
+                if reason.contains("at least one item")
+        ));
+    }
+
+    #[tokio::test]
+    async fn actual_start_retry_succeeds_after_resolver_provides_value() {
         let id = "b144_retry";
         let var = env_var_name(id); // A2C_SMCP_b144_retry（#140 保留大小写）
         std::env::remove_var(&var); // 确保首轮缺失
@@ -6776,20 +9085,30 @@ mod tests {
         )
         .with_skill_home(tmp.path().join("skills"))
         .with_blob_cache_root(tmp.path().join("blob"))
-        .with_config_dir(tmp.path().join("config"));
+        .with_config_dir(tmp.path().join("config"))
+        .with_client_factory(Arc::new(|_, _| {
+            Arc::new(crate::mcp_clients::manager::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        }));
 
-        // 首轮：值缺失 → boot 失败（InputResolution），状态落 Error。
+        computer.boot_up().await.unwrap();
+        // 首轮实际 start：值缺失 → 结构化失败，raw declaration 和 manager 均可安全重试。
         assert!(
-            computer.boot_up().await.is_err(),
-            "首轮 boot 须因 missing input 失败"
+            computer.start_mcp_client(&bid("s")).await.is_err(),
+            "首轮 start 须因 missing input 失败"
         );
-        assert_eq!(computer.status().await.lifecycle, LifecycleState::Error);
+        assert_eq!(computer.status().await.lifecycle, LifecycleState::Started);
 
-        // 提供值（env 回退路径）→ 同一 Computer 重试成功（证明无残留 manager/task/transport 阻塞重试）。
+        // 提供值（env 回退路径）→ 同一 Computer 的 actual start 重试成功。
         std::env::set_var(&var, "provided");
-        let second = computer.boot_up().await;
+        let second = computer.start_mcp_client(&bid("s")).await;
         std::env::remove_var(&var);
-        second.expect("重试 boot 须在值可得后成功（无残留状态阻塞）");
+        second.expect("重试 start 须在值可得后成功（无残留状态阻塞）");
+        computer.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -7345,6 +9664,71 @@ mod tests {
         assert!(matches!(err, ComputerError::InvalidState(_)));
     }
 
+    /// #161：Computer 门面 `list_windows_with_diagnostics` 转发 manager 结构化枚举结果
+    /// （部分成功语义 + 逐 server 诊断完整穿透）；未 boot（manager 为 None）→ InvalidState。
+    #[tokio::test]
+    async fn computer_list_windows_with_diagnostics_forwards_161() {
+        use crate::mcp_clients::manager::test_support::{
+            bid, inject_config, inject_window_enum, stdio_cfg_with_bundle, WindowEnumClient,
+            WindowListOutcome,
+        };
+        use crate::mcp_clients::model::{
+            make_resource, WindowEnumerationErrorCategory, WindowEnumerationStatus,
+        };
+
+        // 未 boot → InvalidState（对齐 get_resources 先例）。
+        let bare = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let err = bare.list_windows_with_diagnostics(None).await.unwrap_err();
+        assert!(matches!(err, ComputerError::InvalidState(_)));
+
+        // 注入 manager + 2 server（1 成功带窗、1 能力缺失）→ PartialSuccess 经门面完整穿透。
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false);
+        let manager = MCPServerManager::new();
+        for (id, outcome) in [
+            (
+                "id_ok",
+                WindowListOutcome::Ok(vec![make_resource(
+                    "window://ok.example.com/w",
+                    "w",
+                    None,
+                    None,
+                )]),
+            ),
+            ("id_cap", WindowListOutcome::CapabilityMissing),
+        ] {
+            inject_config(
+                &manager,
+                &bid(id),
+                stdio_cfg_with_bundle(&format!("srv-{id}"), Some(id)),
+            )
+            .await;
+            inject_window_enum(
+                &manager,
+                &bid(id),
+                WindowEnumClient {
+                    outcome,
+                    detail_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+            )
+            .await;
+        }
+        *computer.mcp_manager.write().await = Some(manager);
+
+        let report = computer
+            .list_windows_with_diagnostics(None)
+            .await
+            .expect("boot 后枚举须成功");
+        assert_eq!(report.status(), WindowEnumerationStatus::PartialSuccess);
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].0.as_str(), "id_ok");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bundle_id.as_str(), "id_cap");
+        assert_eq!(
+            report.failures[0].category,
+            WindowEnumerationErrorCategory::MissingResourcesCapability
+        );
+    }
+
     /// #127 扫漏（根因）：`Computer` 的运行期投影 `mcp_servers` 按 **bundle_id** 键，非 display 名。
     ///
     /// 两个 display 名相同、`bundle_id` 不同的合法共存 server（协议：`name` 允许碰撞）：旧的 name-keyed
@@ -7776,6 +10160,107 @@ mod tests {
             .await
             .expect("ABBA 死锁：governance 与 reactor skill 重挂未在 5s 内完成");
         }
+    }
+
+    // ── #178：锁跨无界 await——挂起 MCP 调用不得冻结 Computer 生命周期 ──────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_shutdown_completes_with_hanging_inflight_execute_tool() {
+        // #178 Defect 2 回归守卫：在途 `execute_tool_cancellable` 持 `mcp_manager` 读锁跨无界
+        // `call_tool_cancellable` await（假 client 永不返回）时，`shutdown` 的写锁（`take` 后
+        // `close().await`）不得被永久阻塞。修复前：写锁排队等待读锁 → 2s 超时 panic。
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+
+        let computer = Arc::new(computer_with_cancel_mock(CancelBehavior::BlockForever).await);
+
+        let exec = computer.clone();
+        let _inflight = tokio::spawn(async move {
+            exec.execute_tool_cancellable("rid-hang", "t", serde_json::json!({}), None)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), computer.shutdown())
+            .await
+            .expect("shutdown 被挂起的在途调用阻塞（锁跨无界 await，#178）")
+            .expect("shutdown 应成功完成");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unmount_server_completes_with_writer_queued_behind_hanging_call() {
+        // #178 回归守卫：挂起在途调用 + 排队中的 shutdown 写锁（持 `mcp_lifecycle_gate` 写锁等待
+        // `mcp_manager` 写锁）不得阻塞其它 server 的 `unmount_server`。修复前：unmount 等 gate 读锁
+        // → 被 shutdown 卡住的写锁连带阻塞 → 2s 超时 panic。
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+        use std::time::Duration;
+
+        let computer = Arc::new(computer_with_cancel_mock(CancelBehavior::BlockForever).await);
+
+        let exec = computer.clone();
+        let _inflight = tokio::spawn(async move {
+            exec.execute_tool_cancellable("rid-hang", "t", serde_json::json!({}), None)
+                .await
+        });
+        let sd = computer.clone();
+        let _shutdown = tokio::spawn(async move { sd.shutdown().await });
+        // 给 shutdown 一个进入 gate 排队的窗口（红灯路径下 unmount 必被卡死，绿灯路径下必成功）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 判据是「2s 内完成」而非内层结果：绿灯 = 不被排队写锁死锁卡住（#178）。
+        let _ = tokio::time::timeout(Duration::from_secs(2), computer.unmount_server(&bid("srv")))
+            .await
+            .expect("unmount_server 被排队写锁阻塞（锁跨无界 await，#178）");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_two_concurrent_execute_tools_on_different_bundles_both_proceed() {
+        // #178 并发性守卫：bundle A 挂起在途时，bundle B 的正常调用必须仍能完成——读锁不跨 await
+        // 时两个读者天然并行。同时防过度修正：若把 `mcp_manager` 的 RwLock 误换为互斥锁，
+        // 两路调用被串行化 → fast 被 hang 阻塞 → 本测试红灯。
+        use crate::mcp_clients::manager::test_support::CancelBehavior;
+        use std::time::Duration;
+
+        let computer =
+            Arc::new(computer_with_hanging_and_fast_mock(CancelBehavior::CompleteOk).await);
+
+        let exec1 = computer.clone();
+        // detached：挂起任务设计为永不返回，绝不 await（否则测试自身卡死）。
+        let _hang = tokio::spawn(async move {
+            exec1
+                .execute_tool_cancellable("rid-hang", "hang-tool", serde_json::json!({}), None)
+                .await
+        });
+        let exec2 = computer.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            exec2.execute_tool_cancellable("rid-fast", "fast-tool", serde_json::json!({}), None),
+        )
+        .await;
+
+        result
+            .expect("fast 调用被 hang 在途调用阻塞（读锁跨 await 串行化，#178）")
+            .expect("fast 调用应成功完成");
+    }
+
+    /// #178：注入一个挂起 client（"hang"）+ 一个正常 client（"fast"）的 Computer。
+    async fn computer_with_hanging_and_fast_mock(
+        fast_behavior: crate::mcp_clients::manager::test_support::CancelBehavior,
+    ) -> Computer<SilentSession> {
+        use crate::mcp_clients::manager::test_support::{inject_callable, inject_hanging};
+        use crate::mcp_clients::manager::MCPServerManager;
+
+        let computer = Computer::new(
+            "test_computer",
+            SilentSession::new("t"),
+            None,
+            None,
+            true,
+            true,
+        );
+        let manager = MCPServerManager::new();
+        inject_hanging(&manager, "hang", "hang-tool").await;
+        inject_callable(&manager, "fast", "fast-tool", fast_behavior).await;
+        *computer.mcp_manager.write().await = Some(manager);
+        computer
     }
 
     // ── INT-02 #70：取消最后一公里（acancel_tool 幂等 / 守卫退场 / 结果级 meta 标记）──────────

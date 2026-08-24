@@ -35,9 +35,10 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use crate::mcp_clients::model::MCPServerInput;
+use crate::mcp_clients::model::{MCPServerInput, PickStringOption};
 use crate::settings::scope::EnvMap;
 
+use super::model::is_valid_pick_string_value;
 use super::plugin_pool::prefix_input_id;
 use super::secret_store::SecretStore;
 
@@ -64,6 +65,9 @@ pub enum InputResolveError {
     /// 交互 prompt 失败 / interactive prompt failed。
     #[error("failed to prompt for '{0}': {1}")]
     Prompt(String, String),
+    /// A PickString source returned a value outside the current option set.
+    #[error("invalid selection for input '{id}': {value:?} does not match any option value")]
+    InvalidSelection { id: String, value: String },
 }
 
 /// 交互 prompt 接缝（headless 默认 / 真实 CLI / 测试替身）/ interactive prompt seam。
@@ -84,7 +88,7 @@ pub trait Prompter: Send + Sync {
     fn pick_string(
         &self,
         message: &str,
-        options: &[String],
+        options: &[PickStringOption],
         default_index: Option<usize>,
     ) -> std::io::Result<String>;
 }
@@ -103,7 +107,12 @@ impl Prompter for NonInteractivePrompter {
             "no interactive TTY",
         ))
     }
-    fn pick_string(&self, _m: &str, _o: &[String], _d: Option<usize>) -> std::io::Result<String> {
+    fn pick_string(
+        &self,
+        _m: &str,
+        _o: &[PickStringOption],
+        _d: Option<usize>,
+    ) -> std::io::Result<String> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "no interactive TTY",
@@ -183,7 +192,7 @@ impl InputResolver {
 
         // 2. 进程内 cache（按解析后池 id）
         if let Some(v) = self.cache.lock().unwrap().get(&resolved_id) {
-            return Ok(v.clone());
+            return validate_pick_value(&cfg, &resolved_id, v.clone());
         }
 
         let is_password =
@@ -192,6 +201,7 @@ impl InputResolver {
         // 3. 环境变量 A2C_SMCP_<ENV_SEGMENT(id)>（编排层注入）
         if let Some(env_val) = self.env.get(&env_var_name(&resolved_id)) {
             let v = Value::String(env_val.clone());
+            let v = validate_pick_value(&cfg, &resolved_id, v)?;
             self.cache.lock().unwrap().insert(resolved_id, v.clone());
             return Ok(v);
         }
@@ -214,7 +224,8 @@ impl InputResolver {
             ));
         }
 
-        let value = self.prompt_value(&cfg, &resolved_id)?;
+        let value =
+            validate_pick_value(&cfg, &resolved_id, self.prompt_value(&cfg, &resolved_id)?)?;
 
         // 解析后持久化：D1（#112 S5）已硬退役明文 value store——非密钥值**不再落盘**，仅进程内缓存（会话级）。
         // password 交互得值仍写 OS keyring（加密、非明文）；keyring 不可用 → 仅会话缓存、绝不明文。
@@ -251,7 +262,7 @@ impl InputResolver {
                 let default_index = p
                     .default
                     .as_ref()
-                    .and_then(|d| p.options.iter().position(|o| o == d));
+                    .and_then(|d| p.options.iter().position(|o| o.value == *d));
                 let picked = self
                     .prompter
                     .pick_string(&msg, &p.options, default_index)
@@ -309,6 +320,30 @@ fn value_as_str(v: &Value) -> String {
     }
 }
 
+fn validate_pick_value(
+    input: &MCPServerInput,
+    resolved_id: &str,
+    value: Value,
+) -> Result<Value, InputResolveError> {
+    let MCPServerInput::PickString(pick) = input else {
+        return Ok(value);
+    };
+    let Some(candidate) = value.as_str() else {
+        return Err(InputResolveError::InvalidSelection {
+            id: resolved_id.to_string(),
+            value: value.to_string(),
+        });
+    };
+    if is_valid_pick_string_value(&pick.options, candidate) {
+        Ok(value)
+    } else {
+        Err(InputResolveError::InvalidSelection {
+            id: resolved_id.to_string(),
+            value: candidate.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,7 +397,7 @@ mod tests {
         fn pick_string(
             &self,
             _m: &str,
-            _o: &[String],
+            _o: &[PickStringOption],
             _d: Option<usize>,
         ) -> std::io::Result<String> {
             Ok(self.answer.clone())
@@ -493,7 +528,7 @@ mod tests {
             fn pick_string(
                 &self,
                 m: &str,
-                o: &[String],
+                o: &[PickStringOption],
                 d: Option<usize>,
             ) -> std::io::Result<String> {
                 self.0.pick_string(m, o, d)
@@ -594,7 +629,16 @@ mod tests {
         let pick = MCPServerInput::PickString(PickStringInput {
             id: "env".to_string(),
             description: String::new(),
-            options: vec!["dev".into(), "prod".into()],
+            options: vec![
+                PickStringOption {
+                    label: "Development".into(),
+                    value: "dev".into(),
+                },
+                PickStringOption {
+                    label: "Production".into(),
+                    value: "prod".into(),
+                },
+            ],
             default: Some("dev".into()),
         });
         let resolver = InputResolver::new(
@@ -610,6 +654,32 @@ mod tests {
             resolver.resolve_by_id("env", None, None).unwrap(),
             json!("prod")
         );
+    }
+
+    #[test]
+    fn pick_rejects_obsolete_environment_value_without_default_fallback() {
+        let pick = MCPServerInput::PickString(PickStringInput {
+            id: "region".to_string(),
+            description: String::new(),
+            options: vec![PickStringOption {
+                label: "China".into(),
+                value: "cn".into(),
+            }],
+            default: Some("cn".into()),
+        });
+        let mut env = EnvMap::new();
+        env.insert("A2C_SMCP_region".to_string(), "eu".to_string());
+        let resolver = InputResolver::new(
+            [pick],
+            Box::new(NonInteractivePrompter),
+            Some(env),
+            Some(secret_store(true)),
+        );
+        assert!(matches!(
+            resolver.resolve_by_id("region", None, None),
+            Err(InputResolveError::InvalidSelection { id, value })
+                if id == "region" && value == "eu"
+        ));
     }
 
     // ---- command 非交互：headless 照常执行（parity 修复）---------------------

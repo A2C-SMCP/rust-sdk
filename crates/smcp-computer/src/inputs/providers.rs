@@ -77,10 +77,14 @@ impl CliInputProvider {
     }
 
     /// 从标准输入读取选择 / Read pick from stdin
-    async fn read_pick(&self, prompt: &str, options: &[String]) -> InputResult<String> {
+    async fn read_pick(
+        &self,
+        prompt: &str,
+        options: &[crate::mcp_clients::model::PickStringOption],
+    ) -> InputResult<String> {
         println!("{}", prompt);
         for (i, option) in options.iter().enumerate() {
-            println!("  {}) {}", i + 1, option);
+            println!("  {}) {}", i + 1, option.label);
         }
 
         loop {
@@ -90,7 +94,7 @@ impl CliInputProvider {
 
             match input.parse::<usize>() {
                 Ok(n) if n >= 1 && n <= options.len() => {
-                    return Ok(options[n - 1].clone());
+                    return Ok(options[n - 1].value.clone());
                 }
                 _ => {
                     println!("无效选项，请重新输入 (Invalid option, please try again)");
@@ -377,7 +381,15 @@ impl InputProvider for EnvironmentInputProvider {
                 // 根据输入类型转换值 / Convert value based on input type
                 let converted_value = match &request.input_type {
                     InputType::String { .. } => InputValue::String(value),
-                    InputType::PickString { .. } => InputValue::String(value),
+                    InputType::PickString { options, .. } => {
+                        if !is_valid_pick_string_value(options, &value) {
+                            return Err(InputError::ValidationFailed(format!(
+                                "invalid selection for input '{}': value does not match any option",
+                                request.id
+                            )));
+                        }
+                        InputValue::String(value)
+                    }
                     InputType::FilePath { .. } => InputValue::String(value),
                     InputType::Command { .. } => InputValue::String(value),
                     InputType::Number { .. } => {

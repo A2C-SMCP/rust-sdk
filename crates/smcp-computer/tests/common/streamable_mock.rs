@@ -148,9 +148,12 @@ pub async fn spawn_streamable_mock(opts: MockOpts) -> u16 {
             tokio::spawn(async move {
                 let service =
                     service_fn(move |req| async move { streamable_handler(req, opts).await });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
+                // reqwest 0.13 may optimistically reuse a just-closed test connection under
+                // parallel load; advertise close explicitly so auth status assertions observe
+                // the intended 401/403 response instead of a transient IncompleteMessage.
+                let mut builder = hyper::server::conn::http1::Builder::new();
+                builder.keep_alive(false);
+                let _ = builder.serve_connection(io, service).await;
             });
         }
     });

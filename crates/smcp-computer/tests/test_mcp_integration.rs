@@ -77,10 +77,12 @@ async fn test_http_client_connection_timeout() {
     let client = HttpMCPClient::new(params);
 
     // 测试连接超时 / Test connection timeout
-    let connect_result = timeout(Duration::from_secs(35), client.connect()).await;
+    // Allow enough scheduling/cleanup headroom around the client's 30-second timeout when the
+    // workspace suite runs in parallel or an environment proxy handles the TEST-NET address.
+    let connect_result = timeout(Duration::from_secs(45), client.connect()).await;
     assert!(
         connect_result.is_ok(),
-        "Connection should timeout within 35 seconds"
+        "Connection should timeout within 45 seconds"
     );
 
     let result = connect_result.unwrap();

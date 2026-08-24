@@ -7,7 +7,8 @@
 * 依赖: serde, async-trait
 * 描述: MCP客户端相关的数据模型定义
 */
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, IgnoredAny};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
@@ -16,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 // Re-export MCP protocol types from rmcp
 pub use rmcp::model::{
-    Annotated, CallToolResult, Content, RawContent, RawResource, RawTextContent,
-    ReadResourceResult, Resource, ResourceContents, Tool, ToolAnnotations,
+    CallToolResult, ContentBlock as Content, ReadResourceResult, Resource, ResourceContents, Tool,
+    ToolAnnotations,
 };
 
 // 常量定义 / Constants definition
@@ -326,6 +327,12 @@ pub struct SseServerConfig {
 /// HTTP服务器配置 / HTTP server configuration
 ///
 /// `#[non_exhaustive]`：跨 crate 须经 [`HttpServerConfig::new`]（见 [`StdioServerConfig`]，rust-sdk#117）。
+///
+/// Without a static `Authorization` header, connections are anonymous-first and OAuth is admitted
+/// only after a standards-compliant Bearer challenge and validated metadata. OAuth resource,
+/// scopes, authorization server, and dynamic client registration are protocol-derived. The
+/// removed `oauth`, `authPolicy`, and `auth_policy` serialized fields are rejected with a migration
+/// diagnostic.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HttpServerConfig {
@@ -357,8 +364,46 @@ pub struct HttpServerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub env_file: Option<String>,
+    // Removed OAuth configuration keys remain represented only as private deserialization guards.
+    // This preserves the model's intentional tolerance for unrelated extension keys while making
+    // these security-sensitive legacy keys fail loudly instead of being ignored by serde.
+    #[serde(
+        default,
+        rename = "oauth",
+        skip_serializing,
+        deserialize_with = "reject_removed_oauth_config"
+    )]
+    _removed_oauth: (),
+    #[serde(
+        default,
+        rename = "authPolicy",
+        alias = "auth_policy",
+        skip_serializing,
+        deserialize_with = "reject_removed_auth_policy"
+    )]
+    _removed_auth_policy: (),
     /// HTTP服务器参数 / HTTP server parameters
     pub server_parameters: HttpServerParameters,
+}
+
+fn reject_removed_oauth_config<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let _ = IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(
+        "the 'oauth' HTTP server configuration field is no longer supported; remove it to use automatic OAuth negotiation",
+    ))
+}
+
+fn reject_removed_auth_policy<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let _ = IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(
+        "the 'authPolicy'/'auth_policy' HTTP server configuration field is no longer supported; remove it to use automatic OAuth negotiation",
+    ))
 }
 
 impl StdioServerConfig {
@@ -410,6 +455,8 @@ impl HttpServerConfig {
             default_tool_meta: None,
             vrl: None,
             env_file: None,
+            _removed_oauth: (),
+            _removed_auth_policy: (),
             server_parameters,
         }
     }
@@ -508,6 +555,14 @@ impl MCPServerInput {
             }
         }
     }
+
+    /// Validate invariants that cannot be expressed by the enum's wire shape alone.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            MCPServerInput::PickString(input) => input.validate(),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// 字符串输入类型 / String input type
@@ -526,18 +581,93 @@ pub struct PromptStringInput {
 }
 
 /// 选择输入类型 / Pick string input type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickStringInput {
     /// 输入ID / Input ID
     pub id: String,
     /// 描述 / Description
     pub description: String,
     /// 选项 / Options
-    #[serde(default)]
-    pub options: Vec<String>,
+    pub options: Vec<PickStringOption>,
     /// 默认值 / Default value
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+}
+
+impl PickStringInput {
+    /// Validate the PickString definition while deliberately allowing duplicate labels and values.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.options.is_empty() {
+            return Err("PickString options must contain at least one item".to_string());
+        }
+        for (index, option) in self.options.iter().enumerate() {
+            if option.label.is_empty() {
+                return Err(format!("PickString option {index} label must not be empty"));
+            }
+            if option.value.is_empty() {
+                return Err(format!("PickString option {index} value must not be empty"));
+            }
+        }
+        if let Some(default) = &self.default {
+            if !self.options.iter().any(|option| option.value == *default) {
+                return Err(format!(
+                    "PickString default {default:?} must match at least one option value"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PickStringInputWire {
+    id: String,
+    description: String,
+    #[serde(default)]
+    options: Vec<PickStringOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<String>,
+}
+
+impl Serialize for PickStringInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        PickStringInputWire {
+            id: self.id.clone(),
+            description: self.description.clone(),
+            options: self.options.clone(),
+            default: self.default.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PickStringInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PickStringInputWire::deserialize(deserializer)?;
+        let input = Self {
+            id: wire.id,
+            description: wire.description,
+            options: wire.options,
+            default: wire.default,
+        };
+        input.validate().map_err(serde::de::Error::custom)?;
+        Ok(input)
+    }
+}
+
+/// A PickString choice with an independent display label and runtime value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PickStringOption {
+    /// Human-readable label shown by clients.
+    pub label: String,
+    /// Stable value inserted into the rendered MCP server configuration.
+    pub value: String,
 }
 
 /// 命令输入类型 / Command input type
@@ -689,6 +819,18 @@ pub trait MCPClientProtocol: Send + Sync {
     /// 获取客户端状态 / Get client state
     fn state(&self) -> ClientState;
 
+    /// 设置 live 状态变化回调（#186 逐 MCP runtime 状态事件接线）/ set live state-change callback。
+    ///
+    /// **默认空实现**——仅传输类（stdio/sse/http）经
+    /// [`BaseMCPClient`](crate::mcp_clients::base_client::BaseMCPClient) 委托覆写；未接线时
+    /// live `ClientState` 变化（进程自退、传输断连等）不产生状态事件（管理器 remember 路径
+    /// 之外的变化须靠本回调触发 `MCPServerManager::fire_projected_if_changed`）。
+    fn set_state_change_callback(
+        &self,
+        _callback: Box<dyn Fn(ClientState, ClientState) + Send + Sync>,
+    ) {
+    }
+
     /// 连接MCP服务器 / Connect to MCP server
     async fn connect(&self) -> Result<(), MCPClientError>;
 
@@ -826,12 +968,90 @@ impl fmt::Display for ClientState {
     }
 }
 
+/// 用户对 MCP Server 的启动意图 / User-requested MCP server activation state.
+///
+/// 该状态与传输连接正交：OAuth 授权尚未完成时，Server 仍可保持 `Started`，但连接状态为
+/// [`MCPServerConnectionState::AuthorizationRequired`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MCPServerActivationState {
+    /// 未启动或已被显式停止 / Not started or explicitly stopped.
+    Stopped,
+    /// 已接受启动请求 / Start request has been accepted.
+    Started,
+}
+
+impl fmt::Display for MCPServerActivationState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped => write!(f, "stopped"),
+            Self::Started => write!(f, "started"),
+        }
+    }
+}
+
+/// MCP Server 的数据面连接状态 / MCP server data-plane connection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MCPServerConnectionState {
+    /// 当前没有连接 / No current connection.
+    Disconnected,
+    /// 正在建立连接 / Establishing a connection.
+    Connecting,
+    /// 已连接，可提供 MCP 能力 / Connected and able to provide MCP capabilities.
+    Connected,
+    /// 连接被 OAuth 授权前置条件阻塞 / Connection is blocked on OAuth authorization.
+    AuthorizationRequired,
+    /// 最近一次连接尝试失败 / The latest connection attempt failed.
+    Error,
+}
+
+impl fmt::Display for MCPServerConnectionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disconnected => write!(f, "disconnected"),
+            Self::Connecting => write!(f, "connecting"),
+            Self::Connected => write!(f, "connected"),
+            Self::AuthorizationRequired => write!(f, "authorization_required"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// MCP Server 的正交运行时状态 / Orthogonal MCP server runtime status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MCPServerRuntimeStatus {
+    /// 稳定身份键 / Stable identity key.
+    pub bundle_id: BundleId,
+    /// 展示名称 / Display name.
+    pub name: ServerName,
+    /// 控制面启动意图 / Control-plane activation intent.
+    pub activation: MCPServerActivationState,
+    /// 数据面连接状态 / Data-plane connection state.
+    pub connection: MCPServerConnectionState,
+}
+
+impl MCPServerRuntimeStatus {
+    /// 是否已接受启动请求 / Whether activation has been requested and retained.
+    pub fn is_started(&self) -> bool {
+        self.activation == MCPServerActivationState::Started
+    }
+
+    /// 是否已连接并可提供 MCP 能力 / Whether the data plane is connected.
+    pub fn is_connected(&self) -> bool {
+        self.connection == MCPServerConnectionState::Connected
+    }
+}
+
 /// MCP客户端错误 / MCP client error
 #[derive(Debug, Error)]
 pub enum MCPClientError {
     /// 连接错误 / Connection error
     #[error("Connection error: {0}")]
     ConnectionError(String),
+    /// Structured HTTP authentication negotiation result.
+    #[error("HTTP authentication error: {0}")]
+    HttpAuthentication(#[from] HttpAuthenticationError),
     /// 协议错误 / Protocol error
     #[error("Protocol error: {0}")]
     ProtocolError(String),
@@ -862,6 +1082,151 @@ pub enum MCPClientError {
     Other(String),
 }
 
+/// #161：逐 server 窗口枚举失败的**稳定错误类别**（小闭集，从 [`MCPClientError`] 投影）。
+///
+/// 供下游（如 tfrobot-client TFRC-75）在不解析错误文案的前提下区分「capability 缺失」「认证过期
+/// （可引导用户重新授权）」「传输失败」等可操作状态。**进程内诊断类别，非 wire 错误码**——与
+/// `smcp::ErrorCode::McpCapabilityNotSupported`（4015）语义对应但不绑数值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WindowEnumerationErrorCategory {
+    /// Server 未声明 `resources` capability（`CapabilityNotSupported` → 4015 语义，INT-04 #78
+    /// 三传输统一）。与「成功空集」的区别即窗口枚举诊断的核心分叉。
+    MissingResourcesCapability,
+    /// 连接态/传输断开（枚举前 state 检查或传输失败）。
+    Connection,
+    /// HTTP 认证协商失败（OAuth 过期等——下游唯一「可引导用户操作恢复」的失败类）。
+    Authentication,
+    /// Server 返回协议错误/畸形响应。
+    Protocol,
+    /// 超时。
+    Timeout,
+    /// 其余（IO / JSON / 工具调用类等）。
+    Other,
+}
+
+impl From<&MCPClientError> for WindowEnumerationErrorCategory {
+    fn from(e: &MCPClientError) -> Self {
+        match e {
+            MCPClientError::CapabilityNotSupported(_) => Self::MissingResourcesCapability,
+            MCPClientError::ConnectionError(_) => Self::Connection,
+            MCPClientError::HttpAuthentication(_) => Self::Authentication,
+            MCPClientError::ProtocolError(_) => Self::Protocol,
+            MCPClientError::TimeoutError(_) => Self::Timeout,
+            // `list_windows` 路径不产生 ToolCallError；Io/Json/Other 归 Other。
+            MCPClientError::ToolCallError(_)
+            | MCPClientError::IoError(_)
+            | MCPClientError::JsonError(_)
+            | MCPClientError::Other(_) => Self::Other,
+        }
+    }
+}
+
+/// #161：单个 server 的枚举失败诊断。**身份键 = `bundle_id`**（寻址/去重一律用它——协议
+/// §身份正交性：`name` 允许碰撞）；`server_name` 仅展示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowEnumerationFailure {
+    pub bundle_id: BundleId,
+    pub server_name: ServerName,
+    pub category: WindowEnumerationErrorCategory,
+    /// 安全消息 = [`MCPClientError`] 的 `Display`（该错误族不携带凭据——参见
+    /// `HttpAuthenticationError` 的保安全设计注释）。
+    pub message: String,
+}
+
+/// #161：结构化窗口枚举结果——进程内 SDK API 的返回体（**不上 wire、不持久化、无 UI/Robot/
+/// Manager 字段**，验收⑥）。由 `MCPServerManager::list_windows_with_diagnostics` 产出，供下游
+/// 区分「成功空集 / capability 缺失 / 全部失败 / 部分成功」四态（经 [`status`](Self::status)）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowEnumerationReport {
+    /// 枚举成功的窗口：`(bundle_id, 展示名, resource)`，与 manager 的
+    /// `list_windows_with_identity` 同形（后者即本字段的投影）。
+    /// 部分失败**不丢**其余 server 的窗口。
+    pub windows: Vec<(BundleId, ServerName, Resource)>,
+    /// 本次尝试枚举的活跃 server 总数（= `active_clients` 快照长度）。
+    pub servers_attempted: usize,
+    /// **通过 resources 能力门的 server 数** = `servers_attempted` − `failures` 中 category 为
+    /// [`MissingResourcesCapability`](WindowEnumerationErrorCategory::MissingResourcesCapability)
+    /// 的条数。近似语义：client 层连接检查先于能力检查，连接失败的 server 其能力声明不可确知，
+    /// 按「未因能力缺失被排除」计（不扣减）。
+    pub servers_with_resources_capability: usize,
+    /// 逐 server 失败（每 server 至多一条；成功 server 不出现）。
+    pub failures: Vec<WindowEnumerationFailure>,
+}
+
+/// #161：枚举结果四态（+正常成功）推导，规则全序且全覆盖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WindowEnumerationStatus {
+    /// 全部成功且有窗口。
+    Success,
+    /// 全部成功但窗口为空（**含 `servers_attempted == 0`**：零活跃 server；消费方可再查
+    /// `servers_attempted` 细分「没有 server」与「有 server 但零窗口」）。
+    SuccessEmpty,
+    /// 所有 server 均未声明 `resources` capability（失败非空且全为能力缺失）。
+    AllServersMissingCapability,
+    /// 全部失败（零成功且非纯能力缺失——含混合失败类别）。
+    AllServersFailed,
+    /// 部分成功（≥1 server 成功 且 ≥1 失败）；其余 server 的窗口保留在 `windows`。
+    PartialSuccess,
+}
+
+impl WindowEnumerationReport {
+    /// 四态推导。成功 server 数 = `servers_attempted` − `failures.len()`（每 server 至多一条
+    /// 失败，恒 ≥ 0）：failures 空 → `Success`/`SuccessEmpty`（按 `windows` 是否为空）；零成功
+    /// 且失败全为能力缺失 → `AllServersMissingCapability`；零成功其余 → `AllServersFailed`；
+    /// 有成功有失败 → `PartialSuccess`。
+    pub fn status(&self) -> WindowEnumerationStatus {
+        let succeeded = self.servers_attempted.saturating_sub(self.failures.len());
+        if self.failures.is_empty() {
+            return if self.windows.is_empty() {
+                WindowEnumerationStatus::SuccessEmpty
+            } else {
+                WindowEnumerationStatus::Success
+            };
+        }
+        if succeeded == 0 {
+            let all_missing = self
+                .failures
+                .iter()
+                .all(|f| f.category == WindowEnumerationErrorCategory::MissingResourcesCapability);
+            return if all_missing {
+                WindowEnumerationStatus::AllServersMissingCapability
+            } else {
+                WindowEnumerationStatus::AllServersFailed
+            };
+        }
+        WindowEnumerationStatus::PartialSuccess
+    }
+}
+
+/// Stable result categories for HTTP authentication negotiation.
+///
+/// Challenge values and provider response bodies are intentionally not retained so credentials
+/// and provider diagnostics cannot leak through `Debug` or `Display`.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HttpAuthenticationError {
+    /// A valid OAuth protected-resource and authorization-server relationship was discovered.
+    #[error("OAuth authorization is required")]
+    OAuthRequired,
+    /// A configured static Authorization header was rejected.
+    #[error("static Authorization credentials were rejected")]
+    StaticCredentialsRejected,
+    /// The server requested Basic, Digest, or another unsupported authentication scheme.
+    #[error("the server requested an unsupported HTTP authentication scheme")]
+    UnsupportedChallenge,
+    /// A Bearer challenge was present but OAuth metadata discovery or validation failed.
+    #[error("OAuth metadata discovery failed")]
+    OAuthDiscoveryFailed,
+    /// The server returned 401 without a usable authentication challenge.
+    #[error("the server rejected the anonymous request without a usable authentication challenge")]
+    Unauthorized,
+    /// The server denied the request without a valid OAuth insufficient-scope challenge.
+    #[error("the server denied the HTTP MCP request")]
+    Forbidden,
+}
+
 /// 便捷函数：创建 Resource / Convenience: create a Resource
 pub fn make_resource(
     uri: impl Into<String>,
@@ -869,11 +1234,10 @@ pub fn make_resource(
     description: Option<String>,
     mime_type: Option<String>,
 ) -> Resource {
-    use rmcp::model::AnnotateAble;
-    let mut raw = RawResource::new(uri, name);
-    raw.description = description;
-    raw.mime_type = mime_type;
-    raw.no_annotation()
+    let mut resource = Resource::new(uri, name);
+    resource.description = description;
+    resource.mime_type = mime_type;
+    resource
 }
 
 /// 便捷函数：检查 CallToolResult 是否为错误 / Convenience: check if CallToolResult is error
@@ -949,6 +1313,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pick_string_label_value_round_trip_and_duplicates_are_valid() {
+        let raw = serde_json::json!({
+            "id": "region",
+            "type": "PickString",
+            "description": "Region",
+            "options": [
+                {"label": "China", "value": "cn"},
+                {"label": "China", "value": "cn"}
+            ],
+            "default": "cn"
+        });
+        let input: MCPServerInput = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(input).unwrap(), raw);
+    }
+
+    #[test]
+    fn pick_string_rejects_legacy_and_invalid_definitions() {
+        let cases = [
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": ["cn"], "default": "cn"
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": []
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": [{"label": "", "value": "cn"}]
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": [{"label": "China", "value": ""}]
+            }),
+            serde_json::json!({
+                "id": "region", "type": "PickString", "description": "Region",
+                "options": [{"label": "China", "value": "cn"}], "default": "eu"
+            }),
+        ];
+        for raw in cases {
+            assert!(serde_json::from_value::<MCPServerInput>(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn http_oauth_configuration_is_automatic_only() {
+        let automatic = serde_json::json!({
+            "name": "remote",
+            "disabled": false,
+            "forbidden_tools": [],
+            "tool_meta": {},
+            "default_tool_meta": null,
+            "vrl": null,
+            "server_parameters": {
+                "url": "https://mcp.example/mcp",
+                "headers": {}
+            }
+        });
+        let automatic: HttpServerConfig = serde_json::from_value(automatic).unwrap();
+        let encoded = serde_json::to_value(&automatic).unwrap();
+        assert!(encoded.get("authPolicy").is_none());
+        assert!(encoded.get("auth_policy").is_none());
+        assert!(encoded.get("oauth").is_none());
+
+        for (field, value) in [
+            ("authPolicy", serde_json::json!("auto")),
+            ("auth_policy", serde_json::json!("auto")),
+            ("oauth", serde_json::json!({})),
+        ] {
+            let mut rejected = encoded.clone();
+            rejected[field] = value;
+            let error = serde_json::from_value::<HttpServerConfig>(rejected).unwrap_err();
+            assert!(
+                error.to_string().contains("no longer supported"),
+                "unexpected error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_is_call_tool_error() {
         let ok_result = CallToolResult::success(vec![Content::text("ok")]);
         assert!(!is_call_tool_error(&ok_result));
@@ -985,10 +1429,10 @@ mod tests {
     #[test]
     fn test_make_resource() {
         let resource = make_resource("window://test", "Test", Some("desc".into()), None);
-        assert_eq!(resource.raw.uri, "window://test");
-        assert_eq!(resource.raw.name, "Test");
-        assert_eq!(resource.raw.description, Some("desc".into()));
-        assert!(resource.raw.mime_type.is_none());
+        assert_eq!(resource.uri, "window://test");
+        assert_eq!(resource.name, "Test");
+        assert_eq!(resource.description, Some("desc".into()));
+        assert!(resource.mime_type.is_none());
     }
 
     // ---- #74 INT-04：envFile 字段解析（envFile alias + env_file 名）----

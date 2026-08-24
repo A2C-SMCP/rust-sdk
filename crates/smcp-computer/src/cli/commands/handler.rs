@@ -11,7 +11,9 @@
 use crate::computer::{Computer, ConnectOptions, SilentSession};
 use crate::errors::ComputerError;
 use crate::inventory::{McpOwnership, McpServerWithMetadata};
-use crate::mcp_clients::model::{BundleId, MCPServerConfig, MCPServerInput};
+use crate::mcp_clients::model::{
+    BundleId, MCPServerActivationState, MCPServerConfig, MCPServerConnectionState, MCPServerInput,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -116,27 +118,42 @@ impl CommandHandler {
 
         // 获取 MCP Manager 状态
         if self.computer.is_mcp_manager_initialized().await {
-            // 获取服务器状态列表
-            let server_status = self.computer.get_server_status().await;
+            // 获取正交的启动与连接状态，避免把等待 OAuth 的 server 显示成 Running。
+            let server_status = self.computer.get_server_runtime_statuses().await;
             let active_count = server_status
                 .iter()
-                .filter(|(_, _, active, _)| *active)
+                .filter(|status| status.is_started())
+                .count();
+            let connected_count = server_status
+                .iter()
+                .filter(|status| status.is_connected())
                 .count();
 
             println!("  MCP Manager: 已初始化 / Initialized");
             println!("  Active Servers: {}", active_count);
+            println!("  Connected Servers: {}", connected_count);
 
             // #121 B：一并展示 bundle_id（软件唯一身份）——`server rm` 按 bundle_id 寻址。
-            // #127：`bundle_id` 随 `get_server_status` 每行同源直出，**不再**按 name join 另一张映射——
+            // #127：`bundle_id` 随 runtime status 每行同源直出，**不再**按 name join 另一张映射——
             // 那张映射是 name-keyed 的，同名 server 会折叠，导致两行打印同一个 bundle_id、用户按提示
             // `server rm <bundle_id>` 删错对象且另一条从 CLI 完全无法寻址。
-            for (bundle_id, name, active, state) in server_status {
-                let status = if active {
-                    "运行中 / Running"
-                } else {
-                    "已停止 / Stopped"
+            for server in server_status {
+                let status = match (server.activation, server.connection) {
+                    (MCPServerActivationState::Stopped, _) => "已停止 / Stopped",
+                    (_, MCPServerConnectionState::Connected) => "运行中 / Running",
+                    (_, MCPServerConnectionState::Connecting) => "连接中 / Connecting",
+                    (_, MCPServerConnectionState::AuthorizationRequired) => {
+                        "等待授权 / Authorization required"
+                    }
+                    (_, MCPServerConnectionState::Error) => "连接错误 / Connection error",
+                    (_, MCPServerConnectionState::Disconnected) => {
+                        "已启动但未连接 / Started, disconnected"
+                    }
                 };
-                println!("    - {name} [bundle_id={bundle_id}]: {status} ({state})");
+                println!(
+                    "    - {} [bundle_id={}]: {} ({})",
+                    server.name, server.bundle_id, status, server.connection
+                );
             }
 
             // 获取可用工具数量
@@ -148,6 +165,25 @@ impl CommandHandler {
             println!("  MCP Manager: 未初始化 / Not initialized");
             println!("  Active Servers: 0");
             println!("  Available Tools: 0");
+        }
+
+        // #165 Option B：pending bundled server（project-origin 激活、待批准）/ pending bundled approvals.
+        let pending = self.computer.list_pending_bundled_approvals();
+        if !pending.is_empty() {
+            println!(
+                "  Pending Bundled (project-origin, awaiting approval): {}",
+                pending.len()
+            );
+            for rec in &pending {
+                let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&rec.config);
+                println!(
+                    "    - {} [bundle_id={}] (plugin {}) — approve: settings.local.json enabledPlugins[\"{}\"]=true",
+                    rec.config.name(),
+                    bid.as_str(),
+                    rec.plugin_id,
+                    rec.plugin_id
+                );
+            }
         }
 
         Ok(())
@@ -244,23 +280,26 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// #141/R4：人机面 `token`（name 或 bundle_id）→ `BundleId` 解析（**只在人机面**，库层永不 name 寻址）。
+    /// #141/R4 + #171/Candidate B：人机面 `token`（name 或 bundle_id）→ `BundleId` 解析（**只在人机面**，库层
+    /// 永不 name 寻址）。
     ///
-    /// **步骤序严格按协议 §5.1（`sdk-api-guidance.md` 行 127-145），与 python `cli/resolve.py:183-192` 逐行
-    /// 同构——顺序有意义，勿重排**：
+    /// **步骤序严格按协议 §5.1（`sdk-api-guidance.md` 行 127-145），与 python `cli/resolve.py` 逐行同构——
+    /// 顺序有意义，勿重排**：
     ///
     /// 1. token 按 **display name** 反查，**唯一命中** → 其 bundle_id；
-    /// 2. **多命中** → 报错并列出候选（bundle_id + name + 归属），要求改用 bundle_id 重试；
-    /// 3. **0 命中** ∧ token 是**合法且已注册**的 bundle_id → token 本身；
-    /// 4. 其余 → 报错「未找到」。
+    /// 2. **多命中**，且 token 精确等于其中某候选的 bundle_id → 按该 bundle_id 执行（#171 Candidate B：
+    ///    用户已显式表达身份意图，bundle_id 全局唯一，不构成真实二义性）；
+    /// 3. **多命中**，且 token 不等于任何候选的 bundle_id → 报错并列出候选（bundle_id + name + 归属），
+    ///    要求改用 bundle_id 重试（禁字典序最小：把不确定的错变成确定的错）；
+    /// 4. **0 命中** ∧ token 是**合法且已注册**的 bundle_id → token 本身；
+    /// 5. 其余 → 报错「未找到」。
     ///
-    /// 🔴 两条曾被写反、经隔离复审在真二进制上复现（本 doc 即订正记录）：
+    /// 🔴 订正记录（#141 复审发现，保留以警示未来维护者）：
     ///
     /// - **name 必须先于 bundle_id 查**。反过来会让 `server rm foo` 在「A(name=foo, id=foo_1) + B(name=bar,
     ///   id=foo)」时删掉 **B**——用户敲的是自己看得见的名字，回执里的 bundle_id 他分辨不出是别人的。
     /// - **语法合法 ≠ 存在**。放行未注册的合法 id 会让拼错的 token 一路走到底层幂等 no-op ⇒ 假成功复活
-    ///   （协议步骤 2 明文「仍无 → 报错「未找到」」、步骤 5「未命中 MUST 报错，MUST NOT 静默成功」）。
-    ///   此前注释宣称「R4 必须放行」——**协议、issue 正文、python 三处均无此说，系凭空杜撰**。
+    ///   （协议步骤 5「未命中 MUST 报错，MUST NOT 静默成功」）。
     async fn resolve_target(&self, token: &str) -> Result<BundleId, CommandError> {
         let servers = self.candidates().await;
         let name_hits: Vec<&McpServerWithMetadata> =
@@ -273,8 +312,15 @@ impl CommandHandler {
             });
         }
 
-        // ② 多命中 → 列候选报错（禁字典序最小：把不确定的错变成确定的错）。
+        // ② 多命中：先精确 bundle_id 匹配（Candidate B / §5.1 步骤 2），再报错。
         if name_hits.len() > 1 {
+            // token 精确等于某候选的 bundle_id → 执行用户显式表达的身份意图。
+            if let Ok(id) = BundleId::try_from(token) {
+                if name_hits.iter().any(|s| s.bundle_id == token) {
+                    return Ok(id);
+                }
+            }
+            // 仍不匹配 → 列候选报错（禁字典序最小：把不确定的错变成确定的错）。
             let candidates = name_hits
                 .iter()
                 .map(|s| {
@@ -351,9 +397,13 @@ impl CommandHandler {
         Ok(remove_receipt(&id, removed))
     }
 
-    /// 启动客户端（`<target>|all`，target = name 或 bundle_id）/ start（#141：经 `resolve_target`）。
+    /// 启动客户端（`<target>|all`，target = name 或 bundle_id）/ start（#141：经 `resolve_target`；#175：挂载态守卫）。
+    ///
+    /// #175：非 `all` 分支经 `start_client_line` 做挂载态检查——已声明但未挂载
+    /// 的 server 收到诚实诊断而非库层内部错误（`Unknown server bundle_id` 泄露）。
     pub async fn start_client(&self, target: &str) -> Result<(), CommandError> {
         if target == "all" {
+            // `all` 分支只迭代已挂载 server（不遍历声明面），故不受 #175 挂载态守卫影响。
             return match self.computer.start_all_mcp_clients().await {
                 Ok(()) => {
                     println!("✅ 所有服务器启动完成 / All servers started");
@@ -365,9 +415,8 @@ impl CommandHandler {
                 }
             };
         }
-        let id = self.resolve_target(target).await?;
-        match self.computer.start_mcp_client(&id).await {
-            Ok(()) => println!("✅ 服务器 [bundle_id={id}] 启动完成 / Server started"),
+        match self.start_client_line(target).await? {
+            Ok(line) => println!("{line}"),
             Err(e) => println!("❌ 启动服务器失败: {e}"),
         }
         Ok(())
@@ -419,13 +468,61 @@ impl CommandHandler {
             .map(|stopped| stop_receipt(&id, stopped)))
     }
 
+    /// [`start_client`](Self::start_client) 的**可断言内核**（非 `all` 分支）：返回回执行而非直接 `println!`。
+    ///
+    /// #175：`resolve_target` 查找空间 ∪ 声明面后，对「已声明但未挂载」的目标做挂载态检查，
+    /// 诚实陈述而非透传库层内部错误（如 `Unknown server bundle_id`）。外层 `Result` = resolve 失败，
+    /// 内层 = 库层启动失败；未挂载走 `Ok(Ok(…))` 返回诚实诊断。
+    ///
+    /// 见 [`stop_client_line`](Self::stop_client_line) 里同一条理由。
+    pub(crate) async fn start_client_line(
+        &self,
+        target: &str,
+    ) -> Result<Result<String, ComputerError>, CommandError> {
+        let id = self.resolve_target(target).await?;
+        if !self.is_mounted(&id).await {
+            return Ok(Ok(start_not_mounted_receipt(&id)));
+        }
+        Ok(self
+            .computer
+            .start_mcp_client(&id)
+            .await
+            .map(|()| format!("✅ 服务器 [bundle_id={id}] 启动完成 / Server started")))
+    }
+
+    /// [`restart_client`](Self::restart_client) 的**可断言内核**：同 [`start_client_line`](Self::start_client_line) 模式。
+    pub(crate) async fn restart_client_line(
+        &self,
+        target: &str,
+    ) -> Result<Result<String, ComputerError>, CommandError> {
+        let id = self.resolve_target(target).await?;
+        if !self.is_mounted(&id).await {
+            return Ok(Ok(start_not_mounted_receipt(&id)));
+        }
+        Ok(self
+            .computer
+            .restart_mcp_client(&id)
+            .await
+            .map(|()| format!("✅ 服务器 [bundle_id={id}] 重启完成 / Server restarted")))
+    }
+
+    /// #175 helper：查询 `bundle_id` 是否在活跃配置集（mounted set）中。
+    async fn is_mounted(&self, id: &BundleId) -> bool {
+        self.computer
+            .list_mcp_servers_with_metadata()
+            .await
+            .iter()
+            .any(|s| s.bundle_id.as_str() == id.as_str())
+    }
+
     /// 重启客户端（`<target>`，target = name 或 bundle_id；不收 `all`）/ restart（#141）。
     ///
     /// 兑现 [`Computer::restart_mcp_client`] 的公开面——此前该 API 无任何调用点、doc 却已声称供 CLI 使用。
+    ///
+    /// #175：经 `restart_client_line` 做挂载态守卫。
     pub async fn restart_client(&self, target: &str) -> Result<(), CommandError> {
-        let id = self.resolve_target(target).await?;
-        match self.computer.restart_mcp_client(&id).await {
-            Ok(()) => println!("✅ 服务器 [bundle_id={id}] 重启完成 / Server restarted"),
+        match self.restart_client_line(target).await? {
+            Ok(line) => println!("{line}"),
             Err(e) => println!("❌ 重启服务器失败: {e}"),
         }
         Ok(())
@@ -483,6 +580,7 @@ impl CommandHandler {
             .connect_socketio(
                 url,
                 ConnectOptions {
+                    auth_provider: None,
                     auth_payload,
                     headers: headers.clone(),
                     namespace: namespace.to_string(),
@@ -839,6 +937,19 @@ fn stop_receipt(id: &BundleId, stopped: bool) -> String {
     }
 }
 
+/// `start <target>` 对「已声明但未挂载」的诚实诊断 / honest diagnostic for declared-but-not-mounted.
+///
+/// 协议 §5.1 生命周期动词规范行为：`start <已声明未挂载>` MUST 诚实陈述
+/// "declared but not mounted; it may be pending the approval gate"，MUST NOT 透传库层内部错误
+/// （如 `Unknown server bundle_id`——内部概念泄露给用户）。
+///
+/// 同 [`stop_receipt`]：纯函数、可断言——回执文案正是本 issue 的交付物本身。
+fn start_not_mounted_receipt(id: &BundleId) -> String {
+    format!(
+        "ℹ️ 服务器 [bundle_id={id}] 已声明但尚未挂载，无法启动（可能等待审批）/ declared but not mounted; it may be pending the approval gate"
+    )
+}
+
 /// `server rm <target>` 的用户可见回执 / user-facing receipt for `server rm`。
 ///
 /// 同 [`stop_receipt`]：`removed=false` 表示**既无声明落盘可删、也无运行期实例可停摘**——必须如实说
@@ -875,7 +986,9 @@ mod tests {
             false,
             false,
         )
-        .with_config_dir(config_dir)
+        .with_config_dir(config_dir.clone())
+        .with_skill_home(config_dir.join("skills"))
+        .with_blob_cache_root(config_dir.join("blob"))
     }
 
     /// 创建测试用的 CommandHandler 实例 / Create test CommandHandler instance
@@ -1009,6 +1122,7 @@ mod tests {
     async fn cli_receipts_are_honest_through_real_call_chain_141() {
         let computer = create_test_computer().await;
         mount(&computer, "everything", None).await;
+        computer.boot_up().await.unwrap();
         let handler = create_test_handler(computer);
 
         // ① 拼错的 target：止步于 resolve，**根本打不出回执**（第一道防线）。
@@ -1043,6 +1157,7 @@ mod tests {
         );
         // 再删一次：此时既无声明也无实例 ⇒ MUST 报「未做任何操作」，且该 target 已不可寻址。
         assert!(handler.remove_server_line("everything").await.is_err());
+        handler.computer.shutdown().await.unwrap();
     }
 
     /// #141/R4：同名多 server → **列候选（bundle_id + name + 归属）报错，禁字典序最小**。
@@ -1082,6 +1197,43 @@ mod tests {
             handler.resolve_target("dup-b").await.unwrap().as_str(),
             "dup-b"
         );
+    }
+
+    /// #171 Candidate B：bundle_id 精确等于冲突名时 MUST 命中，不应报「请用 bundle_id 重试」。
+    ///
+    /// 死锁场景：A(name="foo", bundle_id="foo") + B(name="foo", bundle_id="bundle_x") 同时存在时，
+    /// 步骤②多命中直接报错，而步骤③ bundle_id 匹配被「0 name hits」门阻断 ⇒ A 永远不可寻址。
+    /// Candidate B 在步骤②多命中分支内先做精确 bundle_id 匹配，匹配到则直接返回。
+    #[tokio::test]
+    async fn resolve_target_deadlock_bundle_id_equals_collision_name_171() {
+        let computer = create_test_computer().await;
+        // A: name="foo", bundle_id="foo"（缺省派生——与冲突名完全重合的死锁场景）
+        mount(&computer, "foo", None).await;
+        // B: name="foo", bundle_id="bundle_x"（plugin 贡献的同名 server）
+        mount(&computer, "foo", Some("bundle_x")).await;
+        let handler = create_test_handler(computer);
+
+        // 核心断言：token 精确等于 A 的 bundle_id → MUST 命中 A
+        assert_eq!(
+            handler.resolve_target("foo").await.unwrap().as_str(),
+            "foo",
+            "bundle_id 精确等于冲突名时，MUST 命中该 server 而非报错"
+        );
+        // B 仍通过自己的 bundle_id 可达（步骤③ 0 name hit 路径）
+        assert_eq!(
+            handler.resolve_target("bundle_x").await.unwrap().as_str(),
+            "bundle_x"
+        );
+        // 即使再加第三个同名 server（C: name="foo", bundle_id="foo_2"），
+        // token "foo" 仍精确命中 A 的 bundle_id → 不报歧义。
+        mount(&handler.computer, "foo", Some("foo_2")).await;
+        assert_eq!(
+            handler.resolve_target("foo").await.unwrap().as_str(),
+            "foo",
+            "新增同名 server 后，精确 bundle_id 匹配仍优先"
+        );
+        // 同名无精确匹配 → 仍报歧义（现有 resolve_target_ambiguous_lists_candidates_141 已覆盖：
+        // dup-a/dup-b 同时存在，token="dup" 不匹配任何 bundle_id → 报错列候选）。
     }
 
     #[tokio::test]
@@ -1350,5 +1502,131 @@ mod tests {
                 assert!(result.is_err(), "Should fail: {}", description);
             }
         }
+    }
+
+    // ── #175 helpers ──────────────────────────────────────────────
+    /// 创建带**仅声明面** server 的 Computer（直写 project mcp.json，不挂载到 mcp_servers）。
+    ///
+    /// `config_dir()` 为 private——故本 helper 自管 TempDir 生命周期（`forget` 保留至进程退出）。
+    async fn computer_with_declared_only_server(name: &str) -> Computer<SilentSession> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let tfrobot = config_dir.join(".tfrobot");
+        std::fs::create_dir_all(&tfrobot).unwrap();
+        let content = serde_json::json!({
+            "servers": {
+                name: {
+                    "type": "stdio",
+                    "name": name,
+                    "server_parameters": {
+                        "command": "echo",
+                        "args": ["hello"],
+                        "env": {}
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            tfrobot.join("mcp.json"),
+            serde_json::to_string_pretty(&content).unwrap(),
+        )
+        .unwrap();
+        Computer::new(
+            "test_computer",
+            SilentSession::new("test_session"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .with_config_dir(config_dir)
+    }
+
+    /// #175：`start <已声明未挂载>` MUST 诚实陈述，MUST NOT 透传库层内部错误。
+    ///
+    /// 对仅在声明面（mcp.json 落盘）但未挂载的 server 调 `start_client_line`：
+    /// - `resolve_target` 须成功（查找空间 = 活跃集 ∪ 声明面）
+    /// - 回执须含「已声明但尚未挂载」，不含 `Unknown server` 或 `❌`
+    #[tokio::test]
+    async fn start_declared_but_unmounted_returns_honest_diagnostic_175() {
+        let computer = computer_with_declared_only_server("declared_srv").await;
+        let handler = create_test_handler(computer);
+
+        // ① resolve 能查到（声明面兜底）。
+        let id = handler
+            .resolve_target("declared_srv")
+            .await
+            .expect("已声明的 server 按 display 名 MUST 可寻址（即便未挂载）");
+        assert_eq!(id.as_str(), "declared_srv");
+
+        // ② start_client_line：诚实诊断，不泄漏内部错误。
+        let line = handler
+            .start_client_line("declared_srv")
+            .await
+            .expect("resolve 通过")
+            .expect("不是库层错误");
+        assert!(
+            !line.contains("Unknown server"),
+            "MUST NOT leak internal error: {line}"
+        );
+        assert!(!line.contains('❌'), "MUST NOT show error marker: {line}");
+        assert!(
+            line.contains("已声明但尚未挂载") || line.contains("declared but not mounted"),
+            "回执须诚实陈述「未挂载」, got: {line}"
+        );
+    }
+
+    /// #175：`restart <已声明未挂载>` 同受挂载态守卫——经 `restart_client_line` 内核断言真实调用链。
+    #[tokio::test]
+    async fn restart_declared_but_unmounted_honest_diagnostic_175() {
+        let computer = computer_with_declared_only_server("restart_srv").await;
+        let handler = create_test_handler(computer);
+
+        let id = handler
+            .resolve_target("restart_srv")
+            .await
+            .expect("已声明的 server MUST 可寻址");
+        assert_eq!(id.as_str(), "restart_srv");
+
+        // 走 `restart_client_line` 内核断言回执——不依赖 `println!`。
+        let line = handler
+            .restart_client_line("restart_srv")
+            .await
+            .expect("resolve 通过")
+            .expect("不是库层错误");
+        assert!(
+            !line.contains("Unknown server"),
+            "MUST NOT leak internal error: {line}"
+        );
+        assert!(!line.contains('❌'), "MUST NOT show error marker: {line}");
+        assert!(
+            line.contains("已声明但尚未挂载") || line.contains("declared but not mounted"),
+            "回执须诚实陈述「未挂载」, got: {line}"
+        );
+    }
+
+    /// #175：`rm <已声明未挂载>` 行为不变——resolve_target 守卫仅用于 start/restart，不波及 rm。
+    #[tokio::test]
+    async fn remove_declared_but_unmounted_still_works_175() {
+        let computer = computer_with_declared_only_server("rm_me").await;
+        let handler = create_test_handler(computer);
+
+        // rm 仍可解析已声明未挂载的目标（双空间语义）。
+        let id = handler.resolve_target("rm_me").await.unwrap();
+        assert_eq!(id.as_str(), "rm_me");
+    }
+
+    /// #175：`start_user_not_mounted_receipt` 纯函数可断言——文案不含内部错误措辞。
+    #[test]
+    fn start_not_mounted_receipt_is_honest_175() {
+        let id = BundleId::try_from("my_srv".to_string()).unwrap();
+        let receipt = start_not_mounted_receipt(&id);
+        assert!(
+            receipt.contains("已声明但尚未挂载") || receipt.contains("declared but not mounted")
+        );
+        assert!(!receipt.contains("Unknown server"));
+        assert!(!receipt.contains('❌'));
+        assert!(receipt.contains("my_srv"), "receipt must include bundle_id");
     }
 }

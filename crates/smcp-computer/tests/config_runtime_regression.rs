@@ -19,15 +19,19 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use tempfile::TempDir;
 
 use smcp_computer::computer::{Computer, SilentSession};
 use smcp_computer::errors::ComputerError;
 use smcp_computer::mcp_clients::bundle_id::resolve_bundle_id;
 use smcp_computer::mcp_clients::model::{
-    BundleId, HttpServerConfig, HttpServerParameters, MCPServerConfig, ServerName,
-    StdioServerConfig, StdioServerParameters,
+    BundleId, CallToolResult, ClientState, HttpServerConfig, HttpServerParameters, MCPClientError,
+    MCPClientProtocol, MCPServerActivationState, MCPServerConfig, ReadResourceResult, Resource,
+    ServerName, StdioServerConfig, StdioServerParameters, Tool,
 };
 use smcp_computer::settings::config::{
     export_config, import_config, load_config, migrate_config, update_config, validate_config,
@@ -440,6 +444,9 @@ async fn runtime_mutation_bumps_config_and_capability_independently_and_emits_ev
             }
             ComputerEvent::CapabilityRevisionBumped { .. } => saw_cap = true,
             ComputerEvent::LifecycleChanged { .. } => {}
+            ComputerEvent::OAuthStatusChanged { .. } => {}
+            ComputerEvent::DiagnosticsChanged { .. } => {}
+            ComputerEvent::MCPServerStatusChanged { .. } => {}
         }
     }
     assert!(saw_config, "config mutate 必广播 ConfigRevisionBumped");
@@ -1031,4 +1038,113 @@ async fn issue122_teardown_failure_then_rebuild_has_no_resurrection() {
     );
 
     comp_b.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// #186 逐 MCP runtime 状态变更事件：Computer 生命周期驱动 + revision 对账
+// ---------------------------------------------------------------------------
+
+/// 最小成功 client（集成测试注入 client factory 用；真实 stdio/http 连接受环境约束，此桩保证
+/// 事件序与生产一致——connect/disconnect 成功、工具恒空、state 恒 Connected）。
+struct FakeOkClient;
+
+#[async_trait]
+impl MCPClientProtocol for FakeOkClient {
+    fn state(&self) -> ClientState {
+        ClientState::Connected
+    }
+    async fn connect(&self) -> Result<(), MCPClientError> {
+        Ok(())
+    }
+    async fn disconnect(&self) -> Result<(), MCPClientError> {
+        Ok(())
+    }
+    async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+        Ok(vec![])
+    }
+    async fn call_tool(
+        &self,
+        _tool: &str,
+        _params: Value,
+    ) -> Result<CallToolResult, MCPClientError> {
+        Err(MCPClientError::ProtocolError("n/a".into()))
+    }
+    async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+        Ok(vec![])
+    }
+    async fn list_resources_page(
+        &self,
+        _cursor: Option<String>,
+    ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+        Ok((vec![], None))
+    }
+    async fn get_window_detail(
+        &self,
+        _resource: Resource,
+    ) -> Result<ReadResourceResult, MCPClientError> {
+        Err(MCPClientError::ProtocolError("n/a".into()))
+    }
+    async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+        Ok(())
+    }
+    async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn mcp_status_changes_published_over_lifecycle() {
+    // #186：add → start → stop 驱动逐 server 状态事件；`status().server_status_revision` 与事件对账。
+    let td = TempDir::new().unwrap();
+    let computer = isolate_boot(
+        Computer::new("c", SilentSession::new("s"), None, None, false, false).with_client_factory(
+            Arc::new(|_, _| -> Arc<dyn MCPClientProtocol> { Arc::new(FakeOkClient) }),
+        ),
+        &td,
+    );
+    computer.boot_up().await.unwrap();
+
+    let mut rx = computer.subscribe_events();
+    computer.add_or_update_server(stdio("s7")).await.unwrap();
+    let bundle_id = BundleId::try_from("s7").unwrap();
+
+    computer.start_mcp_client(&bundle_id).await.unwrap();
+    computer.stop_mcp_client(&bundle_id).await.unwrap();
+
+    let mut saw_connected = false;
+    let mut saw_stopped = false;
+    let mut last_revision = 0u64;
+    // 排空到静默窗口再对账：resync 不变量是**静止点**等式——提前 break 会让仍在途的事件
+    // 使快照 revision 领先最后观察值（早期 (Stopped,Disconnected) 提交事件即可满足 stopped 标志）。
+    // 静默窗口 300ms 与 manager 侧 `collect_status_changes` 同约定。
+    loop {
+        match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+            Err(_) => break,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => break,
+            Ok(Ok(ComputerEvent::MCPServerStatusChanged {
+                bundle_id: bid,
+                status,
+                revision,
+            })) => {
+                assert_eq!(bid, bundle_id, "事件必须携 server 标识");
+                assert!(revision > last_revision, "revision 严格递增");
+                last_revision = revision;
+                saw_connected |= status.is_connected();
+                saw_stopped |= status.activation == MCPServerActivationState::Stopped;
+            }
+            Ok(Ok(_)) => {}
+        }
+    }
+    assert!(saw_connected, "start 必须发布 Connected 状态事件（#186）");
+    assert!(saw_stopped, "stop 必须发布 Stopped 状态事件（#186）");
+
+    // lag/resync 对账：静默点快照 revision = 最后事件 revision（下游可凭此忽略乱序 / 取全量）。
+    let snap = computer.status().await;
+    assert_eq!(
+        snap.server_status_revision, last_revision,
+        "快照 revision 与事件对账（#186 resync 不变量）"
+    );
+
+    computer.shutdown().await.unwrap();
 }

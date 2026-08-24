@@ -11,7 +11,24 @@ use super::http_client::HttpMCPClient;
 use super::model::*;
 use super::sse_client::SseMCPClient;
 use super::stdio_client::StdioMCPClient;
+use rmcp::model::CallToolRequestParams;
 use std::sync::Arc as StdArc;
+
+/// Build rmcp tool-call parameters without changing the pre-rmcp-2 wire contract.
+///
+/// The public SDK accepts any JSON value for historical compatibility. Only JSON objects are
+/// valid MCP `arguments`; other values were previously represented by an absent field and must
+/// not be silently rewritten to an explicit empty object.
+pub(crate) fn call_tool_request_params(
+    tool_name: &str,
+    params: serde_json::Value,
+) -> CallToolRequestParams {
+    let request = CallToolRequestParams::new(tool_name.to_string());
+    match params.as_object().cloned() {
+        Some(arguments) => request.with_arguments(arguments),
+        None => request,
+    }
+}
 
 /// 判定 MCP Server 的 initialize `result` 是否声明 `resources` 能力（v0.2 `get_resources` 4015 预检）。
 /// Whether a server's initialize `result` declares the `resources` capability (for the 4015 pre-check).
@@ -92,6 +109,30 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn call_tool_arguments_preserve_legacy_absent_vs_object_contract() {
+        let object = serde_json::to_value(call_tool_request_params(
+            "tool",
+            serde_json::json!({"a": 1}),
+        ))
+        .unwrap();
+        assert_eq!(object["arguments"], serde_json::json!({"a": 1}));
+
+        for non_object in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("value"),
+            serde_json::json!(1),
+        ] {
+            let encoded =
+                serde_json::to_value(call_tool_request_params("tool", non_object)).unwrap();
+            assert!(
+                encoded.get("arguments").is_none(),
+                "non-object arguments must remain absent: {encoded}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_client_factory_stdio() {
         let config = MCPServerConfig::Stdio(StdioServerConfig {
@@ -117,20 +158,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_factory_http() {
-        let config = MCPServerConfig::Http(HttpServerConfig {
-            env_file: None,
-            name: "test_http".to_string(),
-            bundle_id: None,
-            disabled: false,
-            forbidden_tools: vec![],
-            tool_meta: HashMap::new(),
-            default_tool_meta: None,
-            vrl: None,
-            server_parameters: HttpServerParameters {
+        let config = MCPServerConfig::Http(HttpServerConfig::new(
+            "test_http",
+            HttpServerParameters {
                 url: "http://localhost:8080".to_string(),
                 headers: HashMap::new(),
             },
-        });
+        ));
 
         let client = client_factory(config, None);
         assert_eq!(client.state(), ClientState::Initialized);

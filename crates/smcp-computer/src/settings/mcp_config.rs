@@ -646,6 +646,29 @@ fn str_list<'a>(settings: &'a Map<String, Value>, key: &str) -> Vec<&'a str> {
         .unwrap_or_default()
 }
 
+/// #169：安全层判定（Gate 1-3）——所有 server（含 plugin baseline）必经（协议指南 §2.3）。
+///
+/// 与 [`mcp_server_status`] 共享 Gate 1-3 逻辑，但本函数是纯安全层判定——
+/// 只回答「policy/disable 是否拒绝该 server」，不涉及信任/批准面。
+/// 返回 `true` 表示被拒绝（等效 `Disabled`）；`false` 表示通过安全层。
+///
+/// 优先级（先到先决）：① `deniedMcpServers` → 拒绝；② `allowedMcpServers` 非空且不在其中 → 拒绝；
+/// ③ `disabledMcpjsonServers` → 拒绝；④ 否则 → 通过。
+#[must_use]
+pub(crate) fn security_layer_check(name: &str, settings: &Map<String, Value>) -> bool {
+    if str_list(settings, FIELD_DENIED_MCP_SERVERS).contains(&name) {
+        return true;
+    }
+    let allowed = str_list(settings, FIELD_ALLOWED_MCP_SERVERS);
+    if !allowed.is_empty() && !allowed.contains(&name) {
+        return true;
+    }
+    if str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS).contains(&name) {
+        return true;
+    }
+    false
+}
+
 /// 判定单个 MCP server 的批准状态（**顺序即优先级**）/ Decide one server's approval status。
 ///
 /// 协议依据：[审批门对齐指南][guide] §2 档位表（SDK 非规范性共同对齐锚点，双 SDK MUST 行为一致）。
@@ -665,6 +688,10 @@ fn str_list<'a>(settings: &'a Map<String, Value>, key: &str) -> Vec<&'a str> {
 /// → Enabled；⑤ `enabledMcpjsonServers` → Enabled；⑥ `enableAllProjectMcpServers == true` → Enabled；
 /// ⑦ 否则 → Pending。
 ///
+/// 安全层（Gate 1-3）抽至 `security_layer_check`，本函数首步调用它——对声明 server 行为不变（纯重构）。
+/// 对 plugin bundled server，reconcile 阶段二以 `security_layer_check` 独立判定（见
+/// `computer.rs` `reconcile_governance`）。安全层 Disabled ⇏ 挂载、⇏ `pending_bundled_servers`。
+///
 /// # 「bundled 名免批准」档位已删除，MUST NOT 以任何形状复活（#131 · 指南 §2 danger）
 ///
 /// 本函数**只**判定 `mcp.json` 各 scope **声明的** server；plugin 声明依赖的 server **MUST NOT 进入本门迭代**
@@ -683,14 +710,7 @@ pub fn mcp_server_status(
     settings: &Map<String, Value>,
     trusted_origin: bool,
 ) -> McpApprovalStatus {
-    if str_list(settings, FIELD_DENIED_MCP_SERVERS).contains(&name) {
-        return McpApprovalStatus::Disabled;
-    }
-    let allowed = str_list(settings, FIELD_ALLOWED_MCP_SERVERS);
-    if !allowed.is_empty() && !allowed.contains(&name) {
-        return McpApprovalStatus::Disabled;
-    }
-    if str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS).contains(&name) {
+    if security_layer_check(name, settings) {
         return McpApprovalStatus::Disabled;
     }
     if trusted_origin {
@@ -845,6 +865,55 @@ pub fn approve_all_project_mcp(cwd: Option<&Path>) -> Result<(), McpConfigError>
     Ok(())
 }
 
+/// 写 `enabledPlugins[<pid>] = value` 到 local scope（#165 Option B 的 TOFU 批准/拒绝写）/ Write enabledPlugins[pid].
+///
+/// project-origin bundled server 的 TOFU：`approve` 写 `true`（local 覆盖 project → origin 变受信 → 下次
+/// reconcile 免批准直挂）；`reject` 写 `false`（**整 plugin 禁用**，协议半态禁令——不可只禁单个 bundled server）。
+/// 复用 store 旁车锁 + 原子写 + [`apply_write`]（嵌套对象写：仅改该 pid，不毁兄弟 `enabledPlugins` 条目）。
+fn write_local_enabled_plugin(
+    pid: &str,
+    value: bool,
+    cwd: Option<&Path>,
+) -> Result<(), McpConfigError> {
+    let path = local_settings_write_path(cwd)?;
+    store::with_settings_lock(&path, || -> io::Result<()> {
+        let (existing, _errors) = load_settings_file(&path, SettingsScope::Local);
+        let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
+        inner.insert(pid.to_string(), WriteValue::Set(Value::Bool(value)));
+        let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
+        updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
+        let updated = apply_write(&existing, &updates);
+        store::atomic_write_settings_json(&path, &Value::Object(updated))
+    })??;
+    Ok(())
+}
+
+/// #165：批准 project-origin bundled server 所属 plugin → 写 `enabledPlugins[pid]=true` 到 local scope / Approve.
+///
+/// TOFU（协议指南 §2.2）：local 覆盖 project，origin 变受信（local）→ 下次 [`reconcile_governance`](crate::computer::Computer::reconcile_governance)
+/// 该 bundled server 免批准直挂（不再 PENDING）。镜像 [`approve_mcp_server`] 的「写 local」模式，但写
+/// `enabledPlugins`（plugin 维度）而非 `enabledMcpjsonServers`（server 维度）——bundled server 的可信性由
+/// install ∧ enable 门保证（runtime-contract §5 item 10）。
+///
+/// #98：写锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
+///
+/// # Errors
+/// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
+pub fn approve_bundled_plugin(pid: &str, cwd: Option<&Path>) -> Result<(), McpConfigError> {
+    write_local_enabled_plugin(pid, true, cwd)
+}
+
+/// #165：拒绝 project-origin bundled server 所属 plugin → 写 `enabledPlugins[pid]=false` 到 local scope / Reject.
+///
+/// **整 plugin 禁用**（协议半态禁令：不可只禁单个 bundled server；与档③ `disabledMcpjsonServers`「DENY 方向
+/// 任意 scope、fail-safe 永远更安全」同姿）。project 的 `false` 同样 fail-safe 有效（指南 §2.2 方向性）。
+///
+/// # Errors
+/// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
+pub fn reject_bundled_plugin(pid: &str, cwd: Option<&Path>) -> Result<(), McpConfigError> {
+    write_local_enabled_plugin(pid, false, cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,6 +928,32 @@ mod tests {
 
     fn settings_with(arrays: Value) -> Map<String, Value> {
         arrays.as_object().cloned().unwrap()
+    }
+
+    // ---- #165：approve_bundled_plugin / reject_bundled_plugin（写 local scope）--------
+    #[test]
+    fn approve_reject_bundled_plugin_writes_local_enabled_plugins_165() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("wd");
+        fs::create_dir_all(cwd.join(".tfrobot")).unwrap();
+        let local_path = cwd.join(".tfrobot").join("settings.local.json");
+
+        // approve → enabledPlugins[pid]=true 写 local scope（TOFU：local 覆盖 project → origin 受信）。
+        approve_bundled_plugin("audit@acme", Some(&cwd)).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["audit@acme"], Value::Bool(true));
+
+        // reject → enabledPlugins[pid]=false（整 plugin 禁用，半态禁令）。
+        reject_bundled_plugin("audit@acme", Some(&cwd)).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["audit@acme"], Value::Bool(false));
+
+        // 嵌套对象写不毁兄弟：先 approve 另一 plugin、再 reject audit@acme → 前者保留。
+        approve_bundled_plugin("other@mp", Some(&cwd)).unwrap();
+        reject_bundled_plugin("audit@acme", Some(&cwd)).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["audit@acme"], Value::Bool(false));
+        assert_eq!(v["enabledPlugins"]["other@mp"], Value::Bool(true));
     }
 
     // ---- load_mcp_config_file ----------------------------------------------
@@ -1785,6 +1880,34 @@ mod tests {
         assert!(validate_server("s", &bad, SettingsScope::User, None)
             .0
             .is_none());
+    }
+
+    #[test]
+    fn removed_http_oauth_fields_are_rejected_with_actionable_diagnostics() {
+        for field in ["authPolicy", "auth_policy", "oauth"] {
+            let mut sdef = json!({
+                "type": "streamable",
+                "server_parameters": {
+                    "url": "https://mcp.example/mcp",
+                    "headers": {}
+                }
+            });
+            sdef[field] = if field == "oauth" {
+                json!({})
+            } else {
+                json!("auto")
+            };
+
+            let (server, errors) = validate_server("remote", &sdef, SettingsScope::User, None);
+            assert!(server.is_none(), "{field} must invalidate the server");
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].field, "servers.remote");
+            assert!(
+                errors[0].reason.contains("no longer supported"),
+                "unexpected diagnostic for {field}: {}",
+                errors[0].reason
+            );
+        }
     }
 
     // ---- 🟡1：resolve 层补测（对标 Python test_mcp_config 集成层）----------------

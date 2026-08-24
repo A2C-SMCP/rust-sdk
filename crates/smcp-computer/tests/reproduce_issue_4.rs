@@ -244,9 +244,9 @@ async fn spawn_strict_sse_mock() -> (u16, Arc<StrictSseState>) {
                     let st = st.clone();
                     async move { strict_sse_handler(req, st).await }
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
+                let mut builder = hyper::server::conn::http1::Builder::new();
+                builder.keep_alive(false);
+                let _ = builder.serve_connection(io, service).await;
             });
         }
     });
@@ -360,9 +360,9 @@ async fn spawn_strict_http_mock() -> (u16, Arc<StrictHttpState>) {
                     let st = st.clone();
                     async move { strict_http_handler(req, st).await }
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
+                let mut builder = hyper::server::conn::http1::Builder::new();
+                builder.keep_alive(false);
+                let _ = builder.serve_connection(io, service).await;
             });
         }
     });

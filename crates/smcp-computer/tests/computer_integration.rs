@@ -67,10 +67,13 @@ impl Session for TestSession {
                     input.default.clone().unwrap_or_default(),
                 )),
                 MCPServerInput::PickString(input) => Ok(serde_json::Value::String(
-                    input
-                        .default
-                        .clone()
-                        .unwrap_or_else(|| input.options.first().cloned().unwrap_or_default()),
+                    input.default.clone().unwrap_or_else(|| {
+                        input
+                            .options
+                            .first()
+                            .map(|option| option.value.clone())
+                            .unwrap_or_default()
+                    }),
                 )),
                 MCPServerInput::Command(_input) => Ok(serde_json::Value::Null),
             }

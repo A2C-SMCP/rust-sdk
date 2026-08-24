@@ -38,7 +38,9 @@ use tracing::{debug, error, info, warn};
 
 /// 异步SMCP Agent
 pub struct AsyncSmcpAgent {
-    transport: Arc<RwLock<Option<SocketIoTransport>>>,
+    /// #178：槽位内为 `Arc<SocketIoTransport>`——读锁内仅克隆 Arc（廉价），守卫绝不跨 await 持有；
+    /// 所有 I/O（call/emit/drain）一律在无锁的 Arc 上进行。
+    transport: Arc<RwLock<Option<Arc<SocketIoTransport>>>>,
     auth_provider: Arc<dyn AuthProvider>,
     event_handler: Option<Arc<dyn AsyncAgentEventHandler>>,
     config: SmcpAgentConfig,
@@ -63,6 +65,18 @@ impl AsyncSmcpAgent {
     pub fn with_event_handler(mut self, handler: impl AsyncAgentEventHandler + 'static) -> Self {
         self.event_handler = Some(Arc::new(handler));
         self
+    }
+
+    /// #178：解析当前 transport——读锁内仅克隆 `Arc`（廉价），守卫在函数返回前释放。
+    /// 所有 I/O（call/emit/drain）一律在返回的无锁 Arc 上进行；锁只保护槽位替换，不保护在途调用。
+    /// 由此消除旧实现的死锁环：`get_skill`/`tool_call` 外层读锁（跨响应 await）+ `drain_blob_bytes`
+    /// 内层重入读 + `connect()` 排队写（tokio RwLock write-preferring 阻塞新读者）。
+    async fn resolve_transport(&self) -> Result<Arc<SocketIoTransport>> {
+        let guard = self.transport.read().await;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))
     }
 
     /// 连接到服务器
@@ -240,7 +254,7 @@ impl AsyncSmcpAgent {
         });
 
         self.notification_task = Some(notification_task);
-        *self.transport.write().await = Some(transport);
+        *self.transport.write().await = Some(Arc::new(transport));
 
         info!("Connected to SMCP server at {}", url);
         Ok(())
@@ -255,10 +269,7 @@ impl AsyncSmcpAgent {
             office_id: office_id.clone(),
         };
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(req)?;
         transport.emit(SERVER_JOIN_OFFICE, data).await?;
 
@@ -273,10 +284,7 @@ impl AsyncSmcpAgent {
             office_id: office_id.clone(),
         };
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(req)?;
         transport.emit(SERVER_LEAVE_OFFICE, data).await?;
 
@@ -292,10 +300,7 @@ impl AsyncSmcpAgent {
 
         debug!("Getting tools from computer: {}", computer);
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_TOOLS, data, self.config.get_timeout)
@@ -336,10 +341,7 @@ impl AsyncSmcpAgent {
 
         debug!("Getting config from computer: {}", computer);
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_CONFIG, data, self.config.get_timeout)
@@ -368,10 +370,7 @@ impl AsyncSmcpAgent {
 
         debug!("Getting desktop from computer: {}", computer);
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_DESKTOP, data, self.config.get_timeout)
@@ -424,10 +423,7 @@ impl AsyncSmcpAgent {
             computer, mcp_server, cursor
         );
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_RESOURCES, data, self.config.get_timeout)
@@ -457,10 +453,7 @@ impl AsyncSmcpAgent {
 
         debug!("Getting skills from computer: {}", computer);
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_SKILLS, data, self.config.get_timeout)
@@ -501,10 +494,7 @@ impl AsyncSmcpAgent {
             name, rel_path, computer
         );
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_SKILL, data, self.config.get_timeout)
@@ -572,10 +562,7 @@ impl AsyncSmcpAgent {
             computer, blob_handle, chunk_offset
         );
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
         let response = transport
             .call(CLIENT_GET_BLOB, data, self.config.get_timeout)
@@ -600,6 +587,10 @@ impl AsyncSmcpAgent {
     ) -> Result<(Vec<u8>, String)> {
         use smcp::utils::blob::{drain_blob, BlobChunkRequest, DrainBlobOptions};
 
+        // #178：槽位解析一次（读锁内仅克隆 Arc，守卫即释放），drain 全程在无锁 Arc 上进行——
+        // 不再在分块闭包内重入 `transport.read()`（旧实现与调用方外层读锁构成 write-preferring
+        // RwLock 死锁环）。
+        let transport = self.resolve_transport().await?;
         let agent = self.auth_provider.get_agent_config().agent.clone();
         let get_timeout = self.config.get_timeout;
         // drain 的 `call` 仅能回 ErrorPayload，无法表达传输层错误；用 out-of-band 暂存保真
@@ -610,6 +601,7 @@ impl AsyncSmcpAgent {
         let call = |chunk: BlobChunkRequest| {
             let agent = agent.clone();
             let stash = stash.clone();
+            let transport = Arc::clone(&transport);
             async move {
                 let req = build_get_blob_request(
                     &agent,
@@ -626,15 +618,6 @@ impl AsyncSmcpAgent {
                             -1,
                             "serialize get_blob request failed",
                         ));
-                    }
-                };
-                let guard = self.transport.read().await;
-                let transport = match guard.as_ref() {
-                    Some(t) => t,
-                    None => {
-                        *stash.lock().unwrap() =
-                            Some(SmcpAgentError::connection("Not connected".to_string()));
-                        return Err(smcp::ErrorPayload::new(-1, "not connected"));
                     }
                 };
                 match transport.call(CLIENT_GET_BLOB, data, get_timeout).await {
@@ -691,10 +674,7 @@ impl AsyncSmcpAgent {
 
         debug!("Calling tool {} on computer: {}", tool_name, computer);
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
 
         match transport
@@ -798,10 +778,7 @@ impl AsyncSmcpAgent {
         let cancel = build_tool_call_cancel(&agent_config.agent, req_id);
         let data = serde_json::to_value(cancel)?;
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
 
         // fire-and-forget：emit 不等待 ack（仅表示「已交给传输层发出」），契合 server:tool_call_cancel 无 ack 语义。
         transport.emit(SERVER_TOOL_CALL_CANCEL, data).await?;
@@ -823,10 +800,7 @@ impl AsyncSmcpAgent {
 
         debug!("Listing sessions in office: {}", office_id);
 
-        let transport = self.transport.read().await;
-        let transport = transport
-            .as_ref()
-            .ok_or_else(|| SmcpAgentError::connection("Not connected".to_string()))?;
+        let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(req)?;
         let response = transport
             .call(SERVER_LIST_ROOM, data, self.config.default_timeout)
@@ -958,5 +932,44 @@ mod tests {
         );
         // 关键：被三态分类器归为 TimedOut（之前无 meta 时归 Failed）。
         assert_eq!(classify_tool_call_outcome(&v), ToolCallOutcome::TimedOut);
+    }
+
+    /// #178 Defect 1 回归守卫：`resolve_transport` 的读锁内**不跨任何 await**（仅克隆 Arc）。
+    /// 并发读者 + 排队写者（模拟 `connect()` 槽位替换）必须在超时内全部完成——旧实现的
+    /// 「外层读锁跨响应 + `drain_blob_bytes` 内层重入读」在 tokio write-preferring RwLock 下
+    /// 构成永久死锁环（队列中的写者阻塞新读者）。本测试按仓库「transport 无 mock 接缝，
+    /// 约定抽纯 helper 单测」的约定，直接对锁模式做并发验证。
+    #[tokio::test]
+    async fn test_resolve_transport_not_deadlocked_by_queued_connect_write() {
+        use crate::auth::DefaultAuthProvider;
+        use std::time::Duration;
+
+        let agent = Arc::new(AsyncSmcpAgent::new(
+            DefaultAuthProvider::new("agent".into(), "office".into()),
+            SmcpAgentConfig::default(),
+        ));
+
+        // 16 个并发读者（模拟 in-flight 的 get_skill/tool_call 解析槽位）+ 1 个排队写者
+        // （模拟 connect() 的 `*self.transport.write().await = Some(..)`）。
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let a = Arc::clone(&agent);
+            tasks.push(tokio::spawn(async move {
+                // transport 槽位为 None → 统一得 connection 错误；关键在于不卡死。
+                let _ = a.resolve_transport().await;
+            }));
+        }
+        let w = Arc::clone(&agent);
+        tasks.push(tokio::spawn(async move {
+            *w.transport.write().await = None;
+        }));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for t in tasks {
+                let _ = t.await;
+            }
+        })
+        .await
+        .expect("resolve_transport 读锁与排队写者构成死锁（#178）");
     }
 }

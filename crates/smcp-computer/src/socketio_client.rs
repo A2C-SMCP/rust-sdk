@@ -9,12 +9,13 @@
 */
 
 use crate::blob::encode_skill_handle;
-use crate::computer::ComputerHandlerOps;
+use crate::computer::{ComputerHandlerOps, SocketIoAuthProvider};
 use crate::desktop::{organize_desktop, WindowInfo};
 use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
 use crate::mcp_clients::model::MCPServerInput;
 use crate::skills::naming::parse_skill_name;
+use crate::status::{LifecycleState, RuntimeStatus};
 use base64::Engine as _;
 use futures_util::FutureExt;
 use serde_json::Value;
@@ -31,13 +32,173 @@ use smcp::{
     GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tf_rust_socketio::{
-    asynchronous::{Client, ClientBuilder},
+    asynchronous::{Client, ClientBuilder, ReconnectSettings},
     Event, Payload, TransportType,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// A client may publish Computer lifecycle changes only while it owns the current Socket.IO slot.
+#[derive(Clone)]
+struct RuntimeLifecycleLease {
+    status: Arc<RuntimeStatus>,
+    owner: Arc<StdMutex<u64>>,
+    token: u64,
+    active: bool,
+}
+
+impl RuntimeLifecycleLease {
+    fn state(&self) -> LifecycleState {
+        self.status.state()
+    }
+
+    fn transition(&self, next: LifecycleState) {
+        if !self.active {
+            return;
+        }
+        let owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        if *owner == self.token {
+            self.status.transition(next);
+        }
+    }
+
+    fn activate(&self, next: LifecycleState) {
+        let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        *owner = self.token;
+        self.status.transition(next);
+    }
+}
+
+/// Mutable lifecycle binding installed when a client becomes a Computer's active slot value.
+/// Public standalone builders start unbound and can be attached later without rebuilding their
+/// event callbacks.
+#[derive(Clone, Default)]
+struct RuntimeLifecycle {
+    lease: Arc<StdMutex<Option<RuntimeLifecycleLease>>>,
+}
+
+impl RuntimeLifecycle {
+    fn state(&self) -> Option<LifecycleState> {
+        self.lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(RuntimeLifecycleLease::state)
+    }
+
+    fn transition(&self, next: LifecycleState) {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(lease) = lease {
+            lease.transition(next);
+        }
+    }
+
+    /// Atomically reserve this client for exactly one Computer. The inactive reservation keeps
+    /// callbacks from publishing to that Computer until replacement teardown has completed.
+    fn try_claim(&self, lease: RuntimeLifecycleLease, retiring: &AtomicBool) -> bool {
+        let mut current = self.lease.lock().unwrap_or_else(|error| error.into_inner());
+        if retiring.load(Ordering::Acquire) || current.is_some() {
+            return false;
+        }
+        *current = Some(lease);
+        true
+    }
+
+    fn activate_claim(&self, token: u64, next: LifecycleState, retiring: &AtomicBool) -> bool {
+        let lease = {
+            let mut current = self.lease.lock().unwrap_or_else(|error| error.into_inner());
+            if retiring.load(Ordering::Acquire) {
+                return false;
+            }
+            let Some(lease) = current.as_mut().filter(|lease| lease.token == token) else {
+                return false;
+            };
+            lease.active = true;
+            lease.clone()
+        };
+        lease.activate(next);
+        true
+    }
+
+    fn release_claim(&self, token: u64) {
+        let mut current = self.lease.lock().unwrap_or_else(|error| error.into_inner());
+        if current.as_ref().is_some_and(|lease| lease.token == token) {
+            current.take();
+        }
+    }
+
+    fn begin_retiring(&self, retiring: &AtomicBool) {
+        // Serialize retirement with claim/activation so a client can never be published after a
+        // concurrent direct disconnect has started, nor reclaimed after cleanup releases a lease.
+        let _lease = self.lease.lock().unwrap_or_else(|error| error.into_inner());
+        retiring.store(true, Ordering::Release);
+    }
+
+    fn deactivate(&self) {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(lease) = lease else {
+            return;
+        };
+        let mut owner = lease
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *owner == lease.token {
+            *owner = 0;
+        }
+    }
+}
+
+/// Office membership is scoped to one Socket.IO namespace connection.
+///
+/// All fields that form the public membership invariant live behind one mutex so a transport
+/// callback cannot interleave between generation validation and the confirmed/lifecycle commit.
+#[derive(Default)]
+struct OfficeMembership {
+    desired: Option<String>,
+    confirmed: Option<String>,
+    generation: u64,
+    connected: bool,
+    rejoin_task: Option<tokio::task::AbortHandle>,
+}
+
+impl OfficeMembership {
+    fn next_generation(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    fn is_current(&self, generation: u64, desired: &str) -> bool {
+        self.connected && self.generation == generation && self.desired.as_deref() == Some(desired)
+    }
+
+    fn invalidate_connection(&mut self, retain_desired: bool) -> Option<tokio::task::AbortHandle> {
+        self.next_generation();
+        self.connected = false;
+        self.confirmed = None;
+        if !retain_desired {
+            self.desired = None;
+        }
+        self.rejoin_task.take()
+    }
+}
+
+fn lock_office_membership(
+    membership: &StdMutex<OfficeMembership>,
+) -> std::sync::MutexGuard<'_, OfficeMembership> {
+    membership.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 /// SMCP Computer Socket.IO客户端 Builder /
 /// Builder for the SMCP Computer Socket.IO client.
@@ -54,6 +215,10 @@ pub struct SmcpComputerClientBuilder {
     /// #85/#86: payload for the Socket.IO CONNECT `auth` field — the sole connection-auth channel
     /// (HTTP-header auth retired in #86). Auth-agnostic: the caller owns the field name.
     auth_payload: Option<Value>,
+    /// #201：首连与每次自动重连前调用的动态 auth provider；配置时优先于 `auth_payload`。
+    /// #201: dynamic auth provider called before the initial connection and every automatic
+    /// reconnect; takes precedence over `auth_payload` when configured.
+    auth_provider: Option<SocketIoAuthProvider>,
     namespace: Option<String>,
     headers: Option<HashMap<String, String>>,
     /// INT-03 #72：Computer 操作句柄（socketio-detached），供 blob/skill/cancel/tool_call handler 调用。
@@ -76,6 +241,7 @@ impl SmcpComputerClientBuilder {
             computer_name: computer_name.into(),
             inputs,
             auth_payload: None,
+            auth_provider: None,
             namespace: None,
             headers: None,
             computer_ops: None,
@@ -104,6 +270,21 @@ impl SmcpComputerClientBuilder {
         self
     }
 
+    /// #201：配置动态 Socket.IO auth provider。
+    /// Configure a dynamic Socket.IO auth provider.
+    ///
+    /// 同一个 Provider 会在首次连接与每次底层自动重连的 CONNECT 前调用。Provider 返回完整 auth
+    /// JSON，且配置时优先于静态 [`auth_payload`](Self::auth_payload)。Provider 调用由底层重连流程
+    /// 串行驱动，本 Builder 不增加并行刷新任务、失败回退或额外重试策略。
+    /// The same provider is called before the initial CONNECT and every automatic reconnect
+    /// CONNECT. It returns the complete auth JSON and takes precedence over static
+    /// [`auth_payload`](Self::auth_payload). Calls are serialized by the transport reconnect flow;
+    /// this builder adds no parallel refresh task, failure fallback, or retry policy.
+    pub fn auth_provider(mut self, provider: SocketIoAuthProvider) -> Self {
+        self.auth_provider = Some(provider);
+        self
+    }
+
     /// 自定义 Socket.IO 应用层 namespace；未设置时默认 [`SMCP_NAMESPACE`] (`/smcp`)。
     /// Customize the Socket.IO application-layer namespace; defaults to
     /// [`SMCP_NAMESPACE`] (`/smcp`) when not set.
@@ -128,6 +309,7 @@ impl SmcpComputerClientBuilder {
             self.computer_name,
             self.inputs,
             self.auth_payload,
+            self.auth_provider,
             namespace,
             self.headers,
             self.computer_ops,
@@ -143,16 +325,68 @@ pub struct SmcpComputerClient {
     client: Client,
     /// Computer名称 / Computer name
     computer_name: String,
-    /// 当前所在的office ID / Current office ID
-    office_id: Arc<RwLock<Option<String>>>,
+    /// Desired and server-confirmed Office plus the current namespace connection generation.
+    office_membership: Arc<StdMutex<OfficeMembership>>,
+    /// Serialize explicit join/leave and automatic rejoin wire operations.
+    office_operation: Arc<Mutex<()>>,
     /// 输入定义映射 / Input definitions map
     #[allow(dead_code)]
     inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
     /// 实际握手使用的 Socket.IO namespace / Socket.IO namespace used during handshake
     namespace: String,
+    /// Shared Computer lifecycle binding; installed when attached to a Computer.
+    runtime_status: RuntimeLifecycle,
+    /// Once set, application handlers are inert and any late reconnect is closed immediately.
+    retiring: Arc<AtomicBool>,
 }
 
 impl SmcpComputerClient {
+    /// Atomically reserve this client for one Computer before touching its current slot value.
+    pub(crate) fn claim_runtime_lifecycle(
+        &self,
+        status: Arc<RuntimeStatus>,
+        owner: Arc<StdMutex<u64>>,
+        token: u64,
+    ) -> bool {
+        self.runtime_status.try_claim(
+            RuntimeLifecycleLease {
+                status,
+                owner,
+                token,
+                active: false,
+            },
+            &self.retiring,
+        )
+    }
+
+    /// Activate a previously acquired ownership reservation after replacement teardown succeeds.
+    pub(crate) fn activate_runtime_lifecycle(&self, token: u64) -> bool {
+        let membership = self
+            .office_membership
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = if membership.confirmed.is_some() {
+            LifecycleState::JoinedOffice
+        } else if membership.connected {
+            LifecycleState::Connected
+        } else {
+            LifecycleState::Started
+        };
+        self.runtime_status
+            .activate_claim(token, state, &self.retiring)
+    }
+
+    /// Roll back an installation reservation that was never published.
+    pub(crate) fn release_runtime_lifecycle_claim(&self, token: u64) {
+        self.runtime_status.release_claim(token);
+    }
+
+    /// Revoke this client's lifecycle lease after its transport has been closed and removed from
+    /// the owning Computer. The token check prevents a stale client from revoking a replacement.
+    pub(crate) fn deactivate_runtime_lifecycle(&self) {
+        self.runtime_status.deactivate();
+    }
+
     /// 创建新的Socket.IO客户端（便捷入口） /
     /// Create a new Socket.IO client (convenience entry point).
     ///
@@ -191,14 +425,18 @@ impl SmcpComputerClient {
         computer_name: String,
         inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
         auth_payload: Option<Value>,
+        auth_provider: Option<SocketIoAuthProvider>,
         namespace: String,
         headers: Option<HashMap<String, String>>,
         computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
     ) -> ComputerResult<Self> {
-        let office_id = Arc::new(RwLock::new(None));
+        let office_membership = Arc::new(StdMutex::new(OfficeMembership::default()));
+        let office_operation = Arc::new(Mutex::new(()));
+        let runtime_status = RuntimeLifecycle::default();
+        let retiring = Arc::new(AtomicBool::new(false));
+        let namespace_ready = Arc::new(Notify::new());
         let manager_clone = manager.clone();
         let computer_name_clone = computer_name.clone();
-        let office_id_clone = office_id.clone();
         let inputs_clone = inputs.clone();
         // INT-03 #72：Computer ops 句柄供 blob/skill/cancel/tool_call handler 闭包按需克隆。
         let computer_ops_clone = computer_ops.clone();
@@ -222,6 +460,13 @@ impl SmcpComputerClient {
                 handshake_headers.insert(key, value);
             }
         }
+
+        // #201：Provider 在首连前解析一次；未配置时复用静态 payload。Provider 优先级在此统一收口，
+        // 使 Builder 直用与 Computer::connect_socketio 行为一致。
+        let initial_auth_payload = match auth_provider.as_ref() {
+            Some(provider) => Some(provider().await),
+            None => auth_payload,
+        };
 
         // 使用ClientBuilder注册事件处理器
         // Use ClientBuilder to register event handlers
@@ -248,12 +493,158 @@ impl SmcpComputerClient {
         // 供下方 `connect_and_classify` 在 4900→polling 重连时重放（否则重连退化为无 auth dict）。
         // AUTH-DICT #85: inject the Socket.IO CONNECT `auth` field on the primary builder; the original
         // is kept (clone here) and replayed by `connect_and_classify` on the 4900→polling reconnect.
-        if let Some(payload) = &auth_payload {
+        if let Some(payload) = &initial_auth_payload {
             builder = builder.auth(payload.clone());
         }
 
+        // #201：底层在每次自动重连尝试前串行调用 on_reconnect。这里只更新 auth，不改变地址、
+        // headers、退避或最大重试策略，也不在 Provider 失败时回放旧凭证。
+        if let Some(provider) = auth_provider {
+            builder = builder.on_reconnect(move || {
+                let provider = Arc::clone(&provider);
+                async move {
+                    let mut settings = ReconnectSettings::new();
+                    settings.auth(provider().await);
+                    settings
+                }
+                .boxed()
+            });
+        }
+
+        // #204：Office room membership belongs to a Socket.IO namespace connection and therefore
+        // never survives a transport reconnect. Close/Connect update one membership state machine:
+        // unexpected transport close retains only the desired Office, while clean server disconnect
+        // clears it. Manual disconnect is invalidated explicitly in `disconnect`, because
+        // tf-rust-socketio does not emit Event::Close for that path.
+        let close_membership = Arc::clone(&office_membership);
+        let close_status = runtime_status.clone();
+        let close_retiring = Arc::clone(&retiring);
+        builder = builder.on(Event::Close, move |payload, _client| {
+            let membership = Arc::clone(&close_membership);
+            let status = close_status.clone();
+            let retiring = Arc::clone(&close_retiring);
+            async move {
+                let transport_close = !retiring.load(Ordering::Acquire)
+                    && Self::payload_contains_text(&payload, "transport close");
+                let rejoin_task = {
+                    let mut membership = lock_office_membership(&membership);
+                    let rejoin_task = membership.invalidate_connection(transport_close);
+                    let next = if transport_close {
+                        LifecycleState::Connecting
+                    } else {
+                        LifecycleState::Started
+                    };
+                    if status.state() != Some(next) {
+                        status.transition(next);
+                    }
+                    rejoin_task
+                };
+                if let Some(task) = rejoin_task {
+                    task.abort();
+                }
+            }
+            .boxed()
+        });
+
+        let connect_membership = Arc::clone(&office_membership);
+        let connect_operation = Arc::clone(&office_operation);
+        let connect_name = computer_name.clone();
+        let connect_status = runtime_status.clone();
+        let connect_retiring = Arc::clone(&retiring);
+        let connect_ready = Arc::clone(&namespace_ready);
+        builder = builder.on(Event::Connect, move |_payload, client| {
+            let membership = Arc::clone(&connect_membership);
+            let operation = Arc::clone(&connect_operation);
+            let computer_name = connect_name.clone();
+            let status = connect_status.clone();
+            let retiring = Arc::clone(&connect_retiring);
+            let ready = Arc::clone(&connect_ready);
+            async move {
+                if retiring.load(Ordering::Acquire) {
+                    // 0.8.1 does not re-check Manual once its reconnect loop is in backoff. Close
+                    // a late namespace inline before the reader can process following app events.
+                    let _ = client.disconnect().await;
+                    return;
+                }
+                // Capture the generation inside the reader callback, before the task can queue
+                // behind an explicit Office operation. A later Close/Connect invalidates it.
+                let (generation, desired, previous_task) = {
+                    let mut membership = lock_office_membership(&membership);
+                    let previous_task = membership.rejoin_task.take();
+                    let generation = membership.next_generation();
+                    membership.connected = true;
+                    membership.confirmed = None;
+                    let desired = membership.desired.clone();
+                    if desired.is_none() {
+                        status.transition(LifecycleState::Connected);
+                    }
+                    (generation, desired, previous_task)
+                };
+                ready.notify_one();
+                if let Some(task) = previous_task {
+                    task.abort();
+                }
+
+                let Some(desired) = desired else {
+                    return;
+                };
+
+                // The reader awaits event callbacks, so waiting for an ACK inline would self-block.
+                // The detached task is generation-bound and aborted by Close/manual disconnect.
+                let task_membership = Arc::clone(&membership);
+                let task_status = status.clone();
+                let task_desired = desired.clone();
+                let task = tokio::spawn(async move {
+                    let _operation = operation.lock().await;
+                    {
+                        let membership = lock_office_membership(&task_membership);
+                        if !membership.is_current(generation, &task_desired) {
+                            return;
+                        }
+                    }
+
+                    let result =
+                        Self::join_office_with_client(&client, &computer_name, &task_desired).await;
+                    let mut membership = lock_office_membership(&task_membership);
+                    if !membership.is_current(generation, &task_desired) {
+                        return;
+                    }
+                    membership.rejoin_task = None;
+
+                    match result {
+                        Ok(()) => {
+                            membership.confirmed = Some(task_desired.clone());
+                            task_status.transition(LifecycleState::JoinedOffice);
+                            info!("Automatically rejoined office: {}", task_desired);
+                        }
+                        Err(error) => {
+                            membership.desired = None;
+                            membership.confirmed = None;
+                            task_status.transition(LifecycleState::Connected);
+                            error!(
+                                "Failed to automatically rejoin office {}: {}",
+                                task_desired, error
+                            );
+                        }
+                    }
+                });
+                let abort_handle = task.abort_handle();
+                let mut current = lock_office_membership(&membership);
+                if current.is_current(generation, &desired) {
+                    current.rejoin_task = Some(abort_handle);
+                } else {
+                    task.abort();
+                }
+            }
+            .boxed()
+        });
+
         // 注册事件处理器（on_any 消费并返回 builder）/ Register handlers (on_any consumes & returns builder)。
+        let event_retiring = Arc::clone(&retiring);
         builder = builder.on_any(move |event, payload, client| {
+            if event_retiring.load(Ordering::Acquire) {
+                return async {}.boxed();
+            }
             // 只处理自定义事件
             // Only handle custom events
             let event_str = match event {
@@ -266,7 +657,6 @@ impl SmcpComputerClient {
                     let manager = manager_clone.clone();
                     let computer_name = computer_name_clone.clone();
                     let ops = computer_ops_clone.clone();
-                    let office_id = office_id_clone.clone();
                     let client_clone = client.clone();
                     let payload_clone = payload.clone();
 
@@ -276,7 +666,6 @@ impl SmcpComputerClient {
                             manager,
                             computer_name,
                             ops,
-                            office_id,
                             client_clone,
                         )
                         .await
@@ -310,7 +699,6 @@ impl SmcpComputerClient {
                 CLIENT_GET_TOOLS => {
                     let manager = manager_clone.clone();
                     let computer_name = computer_name_clone.clone();
-                    let office_id = office_id_clone.clone();
                     let client_clone = client.clone();
 
                     async move {
@@ -318,7 +706,6 @@ impl SmcpComputerClient {
                             payload,
                             manager,
                             computer_name,
-                            office_id,
                             client_clone,
                         )
                         .await
@@ -340,7 +727,7 @@ impl SmcpComputerClient {
                 CLIENT_GET_CONFIG => {
                     let manager = manager_clone.clone();
                     let computer_name = computer_name_clone.clone();
-                    let office_id = office_id_clone.clone();
+                    let ops = computer_ops_clone.clone();
                     let client_clone = client.clone();
                     let inputs = inputs_clone.clone();
 
@@ -349,7 +736,7 @@ impl SmcpComputerClient {
                             payload,
                             manager,
                             computer_name,
-                            office_id,
+                            ops,
                             client_clone,
                             inputs,
                         )
@@ -372,7 +759,6 @@ impl SmcpComputerClient {
                 CLIENT_GET_DESKTOP => {
                     let manager = manager_clone.clone();
                     let computer_name = computer_name_clone.clone();
-                    let office_id = office_id_clone.clone();
                     let client_clone = client.clone();
 
                     async move {
@@ -380,8 +766,7 @@ impl SmcpComputerClient {
                             payload,
                             manager,
                             computer_name,
-                            office_id,
-                            client_clone,
+                            Some(client_clone),
                         )
                         .await
                         {
@@ -497,7 +882,7 @@ impl SmcpComputerClient {
             builder,
             &handshake_url,
             &namespace,
-            auth_payload,
+            initial_auth_payload,
             handshake_headers,
         )
         .await
@@ -511,13 +896,27 @@ impl SmcpComputerClient {
             }
         };
 
-        // 等待一小段时间确保 Socket.IO namespace 连接完全建立
-        // Wait a short time to ensure Socket.IO namespace connection is fully established
-        // Socket.IO 有两个连接阶段：Transport 层和 Namespace 层
-        // Socket.IO has two connection phases: Transport layer and Namespace layer
-        // connect() 只保证 Transport 层连接，namespace 连接是异步的
-        // connect() only guarantees Transport layer connection, namespace connection is async
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // ClientBuilder::connect only establishes Engine.IO. Wait for namespace CONNECT so a
+        // successful return is immediately join-ready; a fixed sleep leaves a deterministic race.
+        let namespace_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notified = namespace_ready.notified();
+                if lock_office_membership(&office_membership).connected {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        if namespace_result.is_err() {
+            // The tf client reader retains an internal clone, so an error return alone would leak
+            // the Engine.IO transport. Arm the retiring callbacks and close the current socket.
+            retiring.store(true, Ordering::Release);
+            let _ = client.disconnect().await;
+            return Err(ComputerError::TimeoutError(
+                "Socket.IO namespace connect timed out".to_string(),
+            ));
+        }
 
         info!(
             "Connected to SMCP server at {} with computer name: {}",
@@ -527,9 +926,12 @@ impl SmcpComputerClient {
         Ok(Self {
             client,
             computer_name,
-            office_id,
+            office_membership,
+            office_operation,
             inputs,
             namespace,
+            runtime_status,
+            retiring,
         })
     }
 
@@ -537,79 +939,101 @@ impl SmcpComputerClient {
     /// Join an Office (Socket.IO Room)
     pub async fn join_office(&self, office_id: &str) -> ComputerResult<()> {
         debug!("Joining office: {}", office_id);
+        let _operation = self.office_operation.lock().await;
+        let (generation, previous_desired, previous_confirmed) = {
+            let mut membership = lock_office_membership(&self.office_membership);
+            if !membership.connected {
+                return Err(ComputerError::InvalidState(
+                    "Socket.IO client not connected".to_string(),
+                ));
+            }
+            let generation = membership.next_generation();
+            let previous_desired = membership.desired.clone();
+            let previous_confirmed = membership.confirmed.clone();
+            membership.desired = Some(office_id.to_string());
+            (generation, previous_desired, previous_confirmed)
+        };
 
-        // 先设置office_id
-        // Set office_id first
-        *self.office_id.write().await = Some(office_id.to_string());
+        let result =
+            Self::join_office_with_client(&self.client, &self.computer_name, office_id).await;
+        let mut membership = lock_office_membership(&self.office_membership);
+        if !membership.is_current(generation, office_id) {
+            return Err(ComputerError::SocketIoError(
+                "Socket.IO connection changed while joining office".to_string(),
+            ));
+        }
 
+        match result {
+            Ok(()) => {
+                membership.confirmed = Some(office_id.to_string());
+                self.runtime_status.transition(LifecycleState::JoinedOffice);
+                info!("Successfully joined office: {}", office_id);
+                Ok(())
+            }
+            Err(error) => {
+                membership.desired = previous_desired;
+                membership.confirmed = previous_confirmed;
+                self.runtime_status
+                    .transition(if membership.confirmed.is_some() {
+                        LifecycleState::JoinedOffice
+                    } else {
+                        LifecycleState::Connected
+                    });
+                Err(error)
+            }
+        }
+    }
+
+    /// Send `server:join_office` over a specific namespace connection and validate its ACK.
+    async fn join_office_with_client(
+        client: &Client,
+        computer_name: &str,
+        office_id: &str,
+    ) -> ComputerResult<()> {
         let req_data = serde_json::json!({
             "office_id": office_id,
             "role": "computer",
-            "name": self.computer_name
+            "name": computer_name
         });
+        let response =
+            Self::call_with_client(client, SERVER_JOIN_OFFICE, req_data, Some(10)).await?;
+        debug!("Join office response: {:?}", response);
 
-        // 使用call方法等待服务器响应
-        // Use call method to wait for server response
-        match self.call(SERVER_JOIN_OFFICE, req_data, Some(10)).await {
-            Ok(response) => {
-                // 服务器返回的是 (bool, Option<String>) 元组序列化后的数组
-                // Server returns serialized array of (bool, Option<String>) tuple
-                debug!("Join office response: {:?}", response);
+        // The ACK may arrive as `[true, null]` or as one nested tuple argument `[[true, null]]`.
+        let actual_response = if response.len() == 1 {
+            response
+                .first()
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or(response)
+        } else {
+            response
+        };
 
-                // 检查响应是否包含嵌套数组
-                // Check if response contains nested array
-                let actual_response = if response.len() == 1 {
-                    if let Some(arr) = response.first().and_then(|v| v.as_array()) {
-                        arr.to_vec()
-                    } else {
-                        response
-                    }
-                } else {
-                    response
-                };
-
-                if !actual_response.is_empty() {
-                    if let Some(success) = actual_response.first().and_then(|v| v.as_bool()) {
-                        if success {
-                            info!("Successfully joined office: {}", office_id);
-                            Ok(())
-                        } else {
-                            // 加入失败，重置office_id / Reset office_id on failure
-                            *self.office_id.write().await = None;
-                            let error_msg = actual_response
-                                .get(1)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Unknown error");
-                            Err(ComputerError::SocketIoError(format!(
-                                "Failed to join office: {}",
-                                error_msg
-                            )))
-                        }
-                    } else {
-                        *self.office_id.write().await = None;
-                        Err(ComputerError::SocketIoError(format!(
-                            "Invalid response format from server: {:?}",
-                            actual_response
-                        )))
-                    }
-                } else {
-                    *self.office_id.write().await = None;
-                    Err(ComputerError::SocketIoError(
-                        "Empty response from server".to_string(),
-                    ))
-                }
+        match actual_response.first().and_then(Value::as_bool) {
+            Some(true) => Ok(()),
+            Some(false) => {
+                let error_msg = actual_response
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown error");
+                Err(ComputerError::SocketIoError(format!(
+                    "Failed to join office: {error_msg}"
+                )))
             }
-            Err(e) => {
-                *self.office_id.write().await = None;
-                Err(e)
-            }
+            None if actual_response.is_empty() => Err(ComputerError::SocketIoError(
+                "Empty response from server".to_string(),
+            )),
+            None => Err(ComputerError::SocketIoError(format!(
+                "Invalid response format from server: {actual_response:?}"
+            ))),
         }
     }
 
     /// 获取当前Office ID / Get current Office ID
     pub async fn get_current_office_id(&self) -> ComputerResult<String> {
-        let office_id = self.office_id.read().await;
-        match office_id.as_ref() {
+        let membership = lock_office_membership(&self.office_membership);
+        match membership.confirmed.as_ref() {
             Some(id) => Ok(id.clone()),
             None => Err(ComputerError::InvalidState(
                 "Not currently in any office".to_string(),
@@ -621,23 +1045,59 @@ impl SmcpComputerClient {
     /// Leave an Office
     pub async fn leave_office(&self, office_id: &str) -> ComputerResult<()> {
         debug!("Leaving office: {}", office_id);
+        let _operation = self.office_operation.lock().await;
+        let (generation, previous_desired, previous_confirmed) = {
+            let mut membership = lock_office_membership(&self.office_membership);
+            if !membership.connected {
+                return Err(ComputerError::InvalidState(
+                    "Socket.IO client not connected".to_string(),
+                ));
+            }
+            let generation = membership.next_generation();
+            let previous_desired = membership.desired.take();
+            let previous_confirmed = membership.confirmed.clone();
+            (generation, previous_desired, previous_confirmed)
+        };
 
         let req_data = serde_json::json!({
             "office_id": office_id
         });
 
-        self.emit(SERVER_LEAVE_OFFICE, req_data).await?;
-        *self.office_id.write().await = None;
+        let result = self.emit(SERVER_LEAVE_OFFICE, req_data).await;
+        let mut membership = lock_office_membership(&self.office_membership);
+        if membership.generation != generation || !membership.connected {
+            return Err(ComputerError::SocketIoError(
+                "Socket.IO connection changed while leaving office".to_string(),
+            ));
+        }
+        if let Err(error) = result {
+            membership.desired = previous_desired;
+            membership.confirmed = previous_confirmed;
+            self.runtime_status
+                .transition(if membership.confirmed.is_some() {
+                    LifecycleState::JoinedOffice
+                } else {
+                    LifecycleState::Connected
+                });
+            return Err(error);
+        }
+        membership.confirmed = None;
+        self.runtime_status.transition(LifecycleState::Connected);
 
         info!("Left office: {}", office_id);
         Ok(())
     }
 
+    async fn has_confirmed_office(&self) -> bool {
+        lock_office_membership(&self.office_membership)
+            .confirmed
+            .is_some()
+    }
+
     /// 发送配置更新通知
     /// Emit config update notification
     pub async fn emit_update_config(&self) -> ComputerResult<()> {
-        let office_id = self.office_id.read().await;
-        if office_id.is_some() {
+        if self.has_confirmed_office().await {
             let req_data = serde_json::json!({
                 "computer": self.computer_name
             });
@@ -650,8 +1110,7 @@ impl SmcpComputerClient {
     /// 发送工具列表更新通知
     /// Emit tool list update notification
     pub async fn emit_update_tool_list(&self) -> ComputerResult<()> {
-        let office_id = self.office_id.read().await;
-        if office_id.is_some() {
+        if self.has_confirmed_office().await {
             let req_data = serde_json::json!({
                 "computer": self.computer_name
             });
@@ -664,8 +1123,7 @@ impl SmcpComputerClient {
     /// 发送 SKILL 集合更新通知（`server:update_skills` → Server 广播 `notify:update_skills`，SRV-02 #50）
     /// Emit SKILL-set update notification (INT-01 #68; handler/broadcast refined by SRV-02/#72)
     pub async fn emit_update_skills(&self) -> ComputerResult<()> {
-        let office_id = self.office_id.read().await;
-        if office_id.is_some() {
+        if self.has_confirmed_office().await {
             let req_data = serde_json::json!({
                 "computer": self.computer_name
             });
@@ -678,8 +1136,7 @@ impl SmcpComputerClient {
     /// 发送桌面更新通知
     /// Emit desktop update notification
     pub async fn emit_update_desktop(&self) -> ComputerResult<()> {
-        let office_id = self.office_id.read().await;
-        if office_id.is_some() {
+        if self.has_confirmed_office().await {
             let req_data = serde_json::json!({
                 "computer": self.computer_name
             });
@@ -710,10 +1167,9 @@ impl SmcpComputerClient {
             .map_err(|e| ComputerError::SocketIoError(format!("Failed to emit {}: {}", event, e)))
     }
 
-    /// 发送事件并等待响应
-    /// Emit event and wait for response
-    async fn call(
-        &self,
+    /// Send an event with ACK over the supplied namespace connection.
+    async fn call_with_client(
+        client: &Client,
         event: &str,
         data: Value,
         timeout_secs: Option<u64>,
@@ -741,7 +1197,7 @@ impl SmcpComputerClient {
             async {}.boxed()
         };
 
-        self.client
+        client
             .emit_with_ack(event, Payload::Text(vec![data], None), timeout, callback)
             .await
             .map_err(|e| {
@@ -795,7 +1251,6 @@ impl SmcpComputerClient {
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
         ops: Option<Arc<dyn ComputerHandlerOps>>,
-        _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<ToolCallReq>(payload)?;
@@ -842,20 +1297,15 @@ impl SmcpComputerClient {
             }
             // 兼容旧入口（无 Computer ops）：退回 manager.execute_tool（无取消/铸造）。
             None => {
-                let result = {
-                    let manager_guard = manager.read().await;
-                    match manager_guard.as_ref() {
-                        Some(mgr) => {
-                            mgr.execute_tool(&req.tool_name, req.params, timeout_duration)
-                                .await?
-                        }
-                        None => {
-                            return Err(ComputerError::InvalidState(
-                                "MCP Manager not initialized".to_string(),
-                            ));
-                        }
-                    }
+                // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+                let Some(mgr) = manager.read().await.as_ref().cloned() else {
+                    return Err(ComputerError::InvalidState(
+                        "MCP Manager not initialized".to_string(),
+                    ));
                 };
+                let result = mgr
+                    .execute_tool(&req.tool_name, req.params, timeout_duration)
+                    .await?;
                 let mut value =
                     serde_json::to_value(result).map_err(ComputerError::SerializationError)?;
                 // #92：同上——旧 manager 兜底路径亦须把顶层 `_meta` 提升为 `meta`（无标记则 no-op）。
@@ -874,7 +1324,6 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
-        _office_id: Arc<RwLock<Option<String>>>,
         _client: Client,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetToolsReq>(payload)?;
@@ -889,28 +1338,22 @@ impl SmcpComputerClient {
         }
 
         // 获取工具列表 / Get tools list
+        // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+        let Some(mgr) = manager.read().await.as_ref().cloned() else {
+            return Err(ComputerError::InvalidState(
+                "MCP Manager not initialized".to_string(),
+            ));
+        };
         let tools: Vec<smcp::SMCPTool> = {
-            let manager_guard = manager.read().await;
-            match manager_guard.as_ref() {
-                Some(mgr) => {
-                    // 转换Tool为SMCPTool
-                    // Convert Tool to SMCPTool
-                    // 携 bundle_id 拉取（协议 0.3.0 D1 / #136）：每个 SMCPTool 必带其所属 server 的
-                    // 解析后 bundle_id，供 Agent 归属工具（禁切 exposed `__` 前缀反推）。
-                    let tool_list = mgr.list_available_tools_with_bundle_id().await;
-                    tool_list
-                        .into_iter()
-                        .map(|(bundle_id, tool)| {
-                            convert_tool_to_smcp_tool(tool, bundle_id.as_str())
-                        })
-                        .collect()
-                }
-                None => {
-                    return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized".to_string(),
-                    ));
-                }
-            }
+            // 转换Tool为SMCPTool
+            // Convert Tool to SMCPTool
+            // 携 bundle_id 拉取（协议 0.3.0 D1 / #136）：每个 SMCPTool 必带其所属 server 的
+            // 解析后 bundle_id，供 Agent 归属工具（禁切 exposed `__` 前缀反推）。
+            let tool_list = mgr.list_available_tools_with_bundle_id().await;
+            tool_list
+                .into_iter()
+                .map(|(bundle_id, tool)| convert_tool_to_smcp_tool(tool, bundle_id.as_str()))
+                .collect()
         };
 
         let response = GetToolsRet {
@@ -932,7 +1375,7 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
-        _office_id: Arc<RwLock<Option<String>>>,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
         _client: Client,
         inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
     ) -> ComputerResult<(Option<i32>, Value)> {
@@ -948,20 +1391,18 @@ impl SmcpComputerClient {
         }
 
         // 获取配置 / Get config
-        let servers = {
-            let manager_guard = manager.read().await;
-            match manager_guard.as_ref() {
-                Some(mgr) => {
-                    // 获取完整服务器配置（不只是状态）
-                    // Get complete server configurations (not just status)
-                    mgr.get_server_configs().await
-                }
-                None => {
-                    return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized".to_string(),
-                    ));
-                }
-            }
+        let servers = if let Some(ops) = ops {
+            ops.get_computer_config_servers().await?
+        } else {
+            // Standalone client compatibility: without Computer operations, the Manager owns the
+            // full configurations supplied by its caller.
+            // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+            let Some(mgr) = manager.read().await.as_ref().cloned() else {
+                return Err(ComputerError::InvalidState(
+                    "MCP Manager not initialized".to_string(),
+                ));
+            };
+            mgr.get_server_configs().await
         };
 
         // 获取输入定义 / Get input definitions
@@ -999,8 +1440,7 @@ impl SmcpComputerClient {
         payload: Payload,
         manager: Arc<RwLock<Option<MCPServerManager>>>,
         computer_name: String,
-        _office_id: Arc<RwLock<Option<String>>>,
-        _client: Client,
+        _client: Option<Client>,
     ) -> ComputerResult<(Option<i32>, Value)> {
         let (ack_id, req) = Self::extract_ack_and_parse::<GetDesktopReq>(payload)?;
 
@@ -1014,9 +1454,13 @@ impl SmcpComputerClient {
         }
 
         // 获取桌面窗口信息 / Get desktop window info
+        // #178：克隆 manager 出读锁，rmcp await 无锁进行。注意**不能**用 `if let Some(mgr) =
+        // manager.read().await.as_ref().cloned()` 的 scrutinee 内联形状——if-let 的临时守卫存活至
+        // 整个语句（含 body）结束，读锁仍会跨 `get_windows_details` await 持有（Defect 2 冻结链）。
+        // 先 let 绑定（语句结束即释放守卫），再 if-let 消费 owned 克隆。
+        let manager_snapshot = manager.read().await.as_ref().cloned();
         let desktops = {
-            let mgr_guard = manager.read().await;
-            if let Some(mgr) = mgr_guard.as_ref() {
+            if let Some(mgr) = manager_snapshot {
                 let raw_windows = mgr.get_windows_details(req.window.as_deref()).await;
                 let windows: Vec<WindowInfo> = raw_windows
                     .into_iter()
@@ -1064,20 +1508,15 @@ impl SmcpComputerClient {
         }
 
         // 单页透传 MCP `resources/list` / single-page passthrough。
-        let result = {
-            let manager_guard = manager.read().await;
-            match manager_guard.as_ref() {
-                Some(mgr) => {
-                    mgr.list_resources(&req.mcp_server, req.cursor.clone())
-                        .await
-                }
-                None => {
-                    return Err(ComputerError::InvalidState(
-                        "MCP Manager not initialized".to_string(),
-                    ));
-                }
-            }
+        // #178：克隆 manager 出读锁（守卫语句结束即释放），rmcp await 无锁进行。
+        let Some(mgr) = manager.read().await.as_ref().cloned() else {
+            return Err(ComputerError::InvalidState(
+                "MCP Manager not initialized".to_string(),
+            ));
         };
+        let result = mgr
+            .list_resources(&req.mcp_server, req.cursor.clone())
+            .await;
 
         match result {
             Ok((resources, next_cursor)) => {
@@ -1345,6 +1784,16 @@ impl SmcpComputerClient {
         }
     }
 
+    /// Whether a callback payload contains the given textual close reason.
+    fn payload_contains_text(payload: &Payload, expected: &str) -> bool {
+        match payload {
+            Payload::Text(values, _) => values.iter().any(|value| value.as_str() == Some(expected)),
+            #[allow(deprecated)]
+            Payload::String(value, _) => value == expected,
+            Payload::Binary(_, _) => false,
+        }
+    }
+
     /// 从payload中提取ack_id并解析数据
     /// Extract ack_id from payload and parse data
     fn extract_ack_and_parse<T: serde::de::DeserializeOwned>(
@@ -1392,18 +1841,39 @@ impl SmcpComputerClient {
     /// Disconnect from server (sends the Socket.IO DISCONNECT packet and closes the transport).
     pub async fn disconnect(&self) -> ComputerResult<()> {
         debug!("Disconnecting from server");
-        self.client
-            .disconnect()
-            .await
-            .map_err(|e| ComputerError::SocketIoError(format!("Failed to disconnect: {}", e)))?;
-        info!("Disconnected from server");
-        Ok(())
+        // This synchronous gate also covers a tf-rust-socketio reconnect loop that has already
+        // entered backoff: any later Connect is closed inline and all application events are inert.
+        self.runtime_status.begin_retiring(&self.retiring);
+        // tf-rust-socketio marks manual teardown internally and does not emit Event::Close. Invalidate
+        // before awaiting transport shutdown so an in-flight ACK can never resurrect Office state.
+        let rejoin_task = {
+            let mut membership = lock_office_membership(&self.office_membership);
+            let rejoin_task = membership.invalidate_connection(false);
+            // Publish the membership/lifecycle pair before the first cancellation point. If this
+            // future is dropped while the transport is closing, callers must not observe the old
+            // JoinedOffice state after desired/confirmed membership has already been cleared.
+            self.runtime_status.transition(LifecycleState::Started);
+            rejoin_task
+        };
+        if let Some(task) = rejoin_task {
+            task.abort();
+        }
+
+        let result = match self.client.disconnect().await {
+            Ok(()) | Err(tf_rust_socketio::Error::IllegalActionBeforeOpen()) => Ok(()),
+            Err(error) => Err(ComputerError::SocketIoError(format!(
+                "Failed to disconnect: {error}"
+            ))),
+        };
+        result.map(|()| info!("Disconnected from server"))
     }
 
     /// 获取当前office ID
     /// Get current office ID
     pub async fn get_office_id(&self) -> Option<String> {
-        self.office_id.read().await.clone()
+        lock_office_membership(&self.office_membership)
+            .confirmed
+            .clone()
     }
 
     /// 获取连接的 URL
@@ -1422,7 +1892,7 @@ impl SmcpComputerClient {
     }
 }
 
-/// 将 MCP `Resource`（rmcp `Annotated<RawResource>`）转换为 A2C 协议层 [`smcp::A2CResource`]（snake_case
+/// 将 MCP `Resource` 转换为 A2C 协议层 [`smcp::A2CResource`]（snake_case
 /// mirror）/ Convert an MCP `Resource` to the A2C protocol-level `A2CResource`。
 ///
 /// 元数据分工 / metadata partition：MCP 标准 annotations（`priority`/`audience`/`last_modified`）→
@@ -1462,7 +1932,7 @@ pub(crate) fn to_a2c_resource(resource: &crate::mcp_clients::model::Resource) ->
         name: Some(resource.name.clone()),
         description: resource.description.clone(),
         mime_type: resource.mime_type.clone(),
-        size: resource.size.map(u64::from),
+        size: resource.size,
         annotations,
         meta,
     }
@@ -1692,16 +2162,10 @@ mod tests {
         use std::sync::Arc;
         let input_schema: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(json!({"type": "object"})).unwrap();
-        Tool {
-            name: "test_tool".into(),
-            title: None,
-            description: Some("A test tool".into()),
-            input_schema: Arc::new(input_schema),
-            output_schema: None,
-            annotations,
-            icons: None,
-            meta: meta.map(rmcp::model::Meta),
-        }
+        let mut tool = Tool::new("test_tool", "A test tool", Arc::new(input_schema));
+        tool.annotations = annotations;
+        tool.meta = meta.map(rmcp::model::Meta);
+        tool
     }
 
     #[test]
@@ -1711,13 +2175,13 @@ mod tests {
             "a2c_tool_meta".to_string(),
             json!({"tags": ["browser"], "priority": 1}),
         );
-        let annotations = ToolAnnotations {
-            title: Some("Test".to_string()),
-            read_only_hint: Some(false),
-            destructive_hint: Some(false),
-            idempotent_hint: None,
-            open_world_hint: Some(false),
-        };
+        let annotations = ToolAnnotations::from_raw(
+            Some("Test".to_string()),
+            Some(false),
+            Some(false),
+            None,
+            Some(false),
+        );
         let smcp_tool =
             convert_tool_to_smcp_tool(make_tool(Some(meta), Some(annotations)), "fs-bundle");
 
@@ -1746,13 +2210,13 @@ mod tests {
 
     #[test]
     fn test_tool_to_smcp_tool_only_annotations() {
-        let annotations = ToolAnnotations {
-            title: Some("My Tool".to_string()),
-            read_only_hint: Some(true),
-            destructive_hint: Some(false),
-            idempotent_hint: None,
-            open_world_hint: Some(false),
-        };
+        let annotations = ToolAnnotations::from_raw(
+            Some("My Tool".to_string()),
+            Some(true),
+            Some(false),
+            None,
+            Some(false),
+        );
         let smcp_tool =
             convert_tool_to_smcp_tool(make_tool(None, Some(annotations)), "test_bundle");
 
@@ -1788,24 +2252,25 @@ mod tests {
 
     #[test]
     fn test_to_a2c_resource_full() {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
         use rmcp::model::{Annotations, Meta, Role};
 
-        let mut raw = RawResource::new("window://app/w1", "Win");
-        raw.description = Some("desc".into());
-        raw.mime_type = Some("text/plain".into());
-        raw.size = Some(42);
+        let mut resource = Resource::new("window://app/w1", "Win");
+        resource.description = Some("desc".into());
+        resource.mime_type = Some("text/plain".into());
+        resource.size = Some(42);
         let mut m = serde_json::Map::new();
         m.insert("fullscreen".into(), serde_json::Value::Bool(true));
-        raw.meta = Some(Meta(m));
+        resource.meta = Some(Meta(m));
         // last_modified 设为定值，覆盖 DateTime<Utc> → RFC3339 映射分支。
         let dt: chrono::DateTime<chrono::Utc> = "2025-01-02T03:04:05Z".parse().unwrap();
-        let ann = Annotations {
-            audience: Some(vec![Role::Assistant]),
-            priority: Some(0.7),
-            last_modified: Some(dt),
-        };
-        let a2c = to_a2c_resource(&Annotated::new(raw, Some(ann)));
+        resource.annotations = Some(
+            Annotations::default()
+                .with_audience(vec![Role::Assistant])
+                .with_priority(0.7)
+                .with_timestamp(dt),
+        );
+        let a2c = to_a2c_resource(&resource);
 
         assert_eq!(a2c.uri.as_deref(), Some("window://app/w1"));
         assert_eq!(a2c.name.as_deref(), Some("Win"));
@@ -1832,13 +2297,14 @@ mod tests {
 
     #[test]
     fn test_to_a2c_resource_empty_annotations_folded() {
-        use crate::mcp_clients::model::{Annotated, RawResource};
+        use crate::mcp_clients::model::Resource;
         use rmcp::model::Annotations;
 
         // MCP server 主动发回 `"annotations": {}` → rmcp 解析为 Some(全 None)。转换器须折叠为 None，
         // 与 Python `if ann:` 守卫字节对齐（否则线格式残留空 `"annotations": {}`）。
-        let raw = RawResource::new("custom://a/b", "R");
-        let a2c = to_a2c_resource(&Annotated::new(raw, Some(Annotations::default())));
+        let mut resource = Resource::new("custom://a/b", "R");
+        resource.annotations = Some(Annotations::default());
+        let a2c = to_a2c_resource(&resource);
         assert!(
             a2c.annotations.is_none(),
             "all-None annotations must fold to None"
@@ -2000,6 +2466,91 @@ mod tests {
         assert_eq!(err.mcp_server.as_deref(), Some("missing"));
         // 无嵌套 envelope：顶层即 code。
         assert!(err.capability.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_ack_handler_does_not_hold_manager_guard_across_hanging_call() {
+        // #178 回归守卫：ack handler 在挂起的 MCP 调用（`list_resources_page` 永不返回）期间
+        // 不得持有 `mcp_manager` 读锁——否则排队中的写锁（shutdown 的 take、挂载写）被永久阻塞。
+        // 修复前：handler 持读锁跨 `mgr.list_resources(...).await` → 写锁排队 → 1s 超时 panic。
+        use crate::mcp_clients::manager::test_support::inject_hanging;
+        use crate::mcp_clients::manager::MCPServerManager;
+        use std::time::Duration;
+
+        let manager = MCPServerManager::new();
+        inject_hanging(&manager, "srv-1", "t").await;
+        let lock = Arc::new(RwLock::new(Some(manager)));
+
+        // 挂起的 get_resources 调用（handler 内持读锁等待 list_resources_page 永不返回）。
+        let h_lock = lock.clone();
+        // detached：挂起 handler 设计为永不返回，绝不 await（否则测试自身卡死）。
+        let _handler = tokio::spawn(async move {
+            SmcpComputerClient::handle_get_resources_with_ack(
+                get_resources_payload("comp-1", "srv-1", None, 7),
+                h_lock,
+                "comp-1".to_string(),
+            )
+            .await
+        });
+
+        // 确定性窗口：等 handler 进入挂起（已持有读锁）后，写锁（模拟 shutdown/mount 的
+        // manager 替换）必须仍能在超时内完成。修复前：handler 持读锁跨挂起调用 → 写锁排队
+        // 永久阻塞 → 1s 超时 panic（红灯）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let w_lock = lock.clone();
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            *w_lock.write().await = None;
+        })
+        .await
+        .expect("ack handler 持读锁跨挂起调用，写锁被永久阻塞（#178）");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_get_desktop_ack_handler_does_not_hold_manager_guard_across_hanging_call() {
+        // #178 回归守卫：`handle_get_desktop_with_ack` 的 manager 读锁不得跨 `get_windows_details`
+        // await 持有。专防 **if-let scrutinee 临时守卫陷阱**——`if let Some(mgr) =
+        // manager.read().await.as_ref().cloned()` 形状下守卫存活至语句（含 body）结束，修复前的
+        // 内联形状会持读锁跨挂起的 `list_windows` → 排队写锁 1s 超时 panic（红灯）。
+        use crate::mcp_clients::manager::test_support::inject_hanging;
+        use crate::mcp_clients::manager::MCPServerManager;
+        use std::time::Duration;
+
+        let manager = MCPServerManager::new();
+        inject_hanging(&manager, "srv-1", "t").await;
+        let lock = Arc::new(RwLock::new(Some(manager)));
+
+        let mut obj = json!({
+            "agent": "agent-1",
+            "req_id": "req-1",
+            "computer": "comp-1",
+        });
+        obj.as_object_mut()
+            .unwrap()
+            .insert("window".into(), json!("window://app/w1"));
+        let payload = Payload::Text(vec![obj], Some(9));
+
+        // detached：挂起 handler 设计为永不返回，绝不 await。
+        let h_lock = lock.clone();
+        let _handler = tokio::spawn(async move {
+            SmcpComputerClient::handle_get_desktop_with_ack(
+                payload,
+                h_lock,
+                "comp-1".to_string(),
+                None,
+            )
+            .await
+        });
+
+        // 确定性窗口：等 handler 进入挂起（已持有读锁——修复前形状）后，写锁必须仍能完成。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let w_lock = lock.clone();
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            *w_lock.write().await = None;
+        })
+        .await
+        .expect("get_desktop ack handler 持读锁跨挂起调用，写锁被永久阻塞（#178）");
     }
 
     #[tokio::test]

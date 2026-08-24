@@ -3,6 +3,7 @@ name = "smcp-client-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Shared client-side Socket.IO connect + version-handshake error handling for SMCP"
 
 [dependencies]

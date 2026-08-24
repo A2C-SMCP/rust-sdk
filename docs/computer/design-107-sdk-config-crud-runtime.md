@@ -95,11 +95,12 @@ ComputerConfigSnapshot {
 > `InputValueResolver` / `SecretValueResolver`（= `RuntimeOptions.input_resolver` / `secret_resolver`），经
 > `Computer::with_input_resolver` / `with_secret_resolver` 注入；`KeyringSecretResolver` 把 keyring 降级为 **opt-in**
 > secret resolver 实现（不再属 SDK-owned config）。`render_server_config` 全接入实时解析路径，解析序 **client
-> resolver → env `A2C_INPUT_<ID>` → session（默认 / 自定义交互 / Command 执行）→ 定义默认值 → 结构化
+> resolver → SDK legacy 内存 cache → env `A2C_SMCP_<ENV_SEGMENT(id)>` → session（默认 / 自定义交互 / Command
+> 执行）→ 定义默认值 → 结构化
 > `ComputerError::InputResolution`**（复用暂存-仅引用才上抛的容忍语义，替换旧「解析失败→debug 日志→静默空串」反
 > 模式；新增 `RenderError::InputUnresolved` 与 `InputNotFound`「保留原样」刻意区分）。**明文 value store 硬退役**：
 > `inputs/value_store.rs` 已删除，非密钥值不再落盘（仅会话缓存）。**迁移**：旧 `input-values.json` 残留被**孤儿化**
-> （不再读取）——用户升级后须经 resolver / env `A2C_INPUT_*` 重新提供该值（见 §12 R3；「无损迁移」验收项按用户决策
+> （不再读取）——用户升级后须经 resolver / env `A2C_SMCP_<ENV_SEGMENT(id)>` 重新提供该值（见 §12 R3；「无损迁移」验收项按用户决策
 > 显式豁免，换取代码零残留 + 立即停止明文依赖）。
 
 ---
@@ -282,5 +283,5 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 
 - **R1 多 scope remove 策略**：✅ **已拍板（#109）**=删**所有可写 scope**（真删干净）；origin=policy/flag → `ReadOnlyOrigin` 硬错（非 partial）。✅ **执行器已落地（#110，`config/executor.rs`）**：no-change 判定用**精确语义比对**（`is_no_change`/`strip_fresh_scaffold`——只剥「本次写新物化、且在 existing 缺失/非对象」的空对象脚手架，**不**对称剥两侧，故既不凭空建 `{"servers":{}}`、也不误跳磁盘上空对象值 server 的真实删除）。多文件 fan-out 落盘前加 pre-flight 只读探测（corrupt/IO），收窄半落盘窗口。
 - **R2 revision 语义**：✅ **已拍板并落地（#114 S7）**=**分离**两个独立单调计数（`config_revision` ⊥ `capability_revision`），因 config 改不一定改 capability（如 disable 一个本未激活的 server）。`status.rs` 的 `RuntimeStatus` 各持一个 `AtomicU64`；capability 于 boot / MCP start·stop bump，config 于 S6 mutate 落盘 bump。
-- **R3 value_store 退役的兼容**：✅ **已拍板（#112，用户决策=硬退役）**=删 `inputs/value_store.rs` 读写，旧 `input-values.json` 残留**孤儿化**（不再读取）。「无损迁移」验收项**显式豁免**（换取代码零残留 + 立即停止明文依赖）；升级迁移路径=用户经 `RuntimeOptions.input_resolver` 或 env `A2C_INPUT_<ID>` 重新提供该值。`secret_store.rs`（keyring，加密非明文）**保留**为 `KeyringSecretResolver`（opt-in secret resolver），非退役目标。
+- **R3 value_store 退役的兼容**：✅ **已拍板（#112，用户决策=硬退役）**=删 `inputs/value_store.rs` 读写，旧 `input-values.json` 残留**孤儿化**（不再读取）。「无损迁移」验收项**显式豁免**（换取代码零残留 + 立即停止明文依赖）；升级迁移路径=用户经 `RuntimeOptions.input_resolver` 或 env `A2C_SMCP_<ENV_SEGMENT(id)>` 重新提供该值。`secret_store.rs`（keyring，加密非明文）**保留**为 `KeyringSecretResolver`（opt-in secret resolver），非退役目标。
 - **R4 duplicate/import 跨机**：协议 §5.8「install path 非权威、boot 重校验」——duplicate 到新 `config_dir` 后物化账本须重建，不可照搬 installPath。

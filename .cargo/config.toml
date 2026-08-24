@@ -35,3 +35,12 @@ doc-check = "doc --workspace --all-features --no-deps"
 run-server = "run -p smcp-server-hyper"
 run-agent = "run -p smcp-agent --bin agent"
 run-computer = "run -p smcp-computer --bin computer"
+
+# MSRV 兼容：工具链低于声明的 rust-version 时，解析阶段回落到兼容版本的依赖
+# （Cargo ≥ 1.84 支持；旧工具链因此得到清晰提示而非晦涩的 manifest 解析错误）。
+# Fall back to rust-version-compatible deps on older toolchains (Cargo ≥ 1.84),
+# so they get a clear MSRV message instead of a cryptic manifest parse error.
+# config-only table（RFC 3537）：放在 Cargo.toml 中不生效，且新版 Cargo 会报
+# "unused manifest key: resolver" 警告。
+[resolver]
+incompatible-rust-versions = "fallback"

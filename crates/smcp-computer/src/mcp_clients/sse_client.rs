@@ -212,8 +212,6 @@ impl SseMCPClient {
             })?;
         }
 
-        let es_client = builder.build();
-
         // 创建通信通道 / Create communication channels
         let (request_tx, request_rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let (response_tx, response_rx) = mpsc::unbounded_channel::<serde_json::Value>();
@@ -232,8 +230,16 @@ impl SseMCPClient {
         let notify = self.notify.clone();
 
         // 启动SSE事件处理任务 / Start SSE event handling task
+        // Plain HTTP must not initialize a TLS connector. On macOS, doing so loads the platform
+        // certificate store and concurrent local clients can block or fail with errSecIO (-36).
+        // This also keeps non-success POST handling on the prompt-error path covered by the
+        // integration suite instead of waiting for the SSE connection timeout.
         let stream: Pin<Box<dyn Stream<Item = Result<es::SSE, es::Error>> + Send + Sync>> =
-            es_client.stream();
+            if url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "http") {
+                builder.build_http().stream()
+            } else {
+                builder.build().stream()
+            };
 
         tokio::spawn(async move {
             let mut stream = Box::pin(stream);
@@ -538,6 +544,13 @@ impl MCPClientProtocol for SseMCPClient {
         self.base.state()
     }
 
+    fn set_state_change_callback(
+        &self,
+        callback: Box<dyn Fn(ClientState, ClientState) + Send + Sync>,
+    ) {
+        self.base.set_state_change_callback(callback);
+    }
+
     async fn connect(&self) -> Result<(), MCPClientError> {
         // 检查是否可以连接 / Check if can connect
         if !self.base.can_connect().await {
@@ -676,6 +689,17 @@ impl MCPClientProtocol for SseMCPClient {
     async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
         if self.base.get_state().await != ClientState::Connected {
             return Err(MCPClientError::ConnectionError("Not connected".to_string()));
+        }
+
+        // 4015 能力预检：server 未声明 `resources` → CapabilityNotSupported（上层映射 4015），
+        // 与下方 `list_resources_page` 共用同一能力门（INT-04 #78 三传输统一）。
+        // #161：窗口枚举聚合层（manager `list_windows_with_diagnostics`）依赖此信号区分
+        // 「capability 缺失」与「成功空集」。
+        // Capability gate mirroring list_resources_page: undeclared `resources` ⇒ 4015.
+        if !self.supports_resources().await {
+            return Err(MCPClientError::CapabilityNotSupported(
+                "resources".to_string(),
+            ));
         }
 
         // SSE 客户端目前不支持分页，直接获取所有资源

@@ -1,0 +1,8 @@
+{
+  "name": "uat-seed-mp",
+  "owner": {"name": "UAT Seed"},
+  "metadata": {"pluginRoot": "./plugins"},
+  "plugins": [
+    {"name": "foo", "source": "foo"}
+  ]
+}

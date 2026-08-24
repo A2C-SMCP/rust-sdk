@@ -3,6 +3,7 @@ name = "smcp-server-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "A2C-SMCP Server core implementation with Socket.IO"
 repository = "https://github.com/A2C-SMCP/rust-sdk"
 keywords = ["smcp", "server", "socketio", "mcp"]

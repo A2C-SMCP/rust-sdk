@@ -17,6 +17,46 @@ Rust版本的A2C-SMCP Computer模块实现，提供MCP服务器连接管理和�
 - **超时控制**: 所有操作支持超时机制，防止任务挂起
 - **资源清理**: 显式的shutdown机制，确保资源正确释放
 
+### OAuth Credential Storage
+
+Streamable HTTP MCP connections are anonymous-first by default. A connection becomes actionable
+OAuth only after a Bearer `WWW-Authenticate` challenge with `resource_metadata` leads to validated
+RFC 9728 protected-resource and issuer-bearing RFC 8414/OIDC authorization-server metadata; rmcp's
+derived legacy endpoints are not sufficient for automatic admission. Basic, Digest, bare
+401/403, failed discovery, and rejected static `Authorization` credentials remain distinct
+`HttpAuthenticationError` results and never enable the OAuth UI. OAuth negotiation has no public
+configuration: `oauth`, `authPolicy`, and `auth_policy` are rejected with an actionable validation
+error. A static `Authorization` header always selects static-only authentication and never falls
+back to OAuth when rejected. After admission, the same `connect` call restores usable persisted
+Authorization Code credentials and completes one authenticated initialize; `OAuthRequired` is
+returned only when interactive user authorization is actually needed.
+
+OAuth HTTP MCP credentials are keyed by bundle, canonical resource, authorization server, and
+grant/client identity. `Computer` uses a private `InMemoryOAuthCredentialStore` by default and
+never probes the OS Keychain. Hosts that need persistence inject one shared store:
+
+```rust
+let store: Arc<dyn OAuthCredentialStore> = Arc::new(HostCredentialStore::new()?);
+let computer = Computer::new(name, session, inputs, servers, false, false)
+    .with_oauth_credential_store(store);
+```
+
+Desktop hosts may implement the trait with an OS Keychain backend. Cloud hosts should bind trusted
+tenant/principal context when constructing a DB/Vault-backed store. The injected backend must
+encrypt values at rest and must not log them. Pending PKCE state and callback routing are separate
+from credential storage. See [the OAuth architecture decision][oauth-architecture].
+For browser/callback ownership, failure mapping, and local/cloud flow-driver requirements, follow
+the normative [OAuth host integration contract](docs/oauth-host-integration.md).
+
+The canonical RFC 8707 resource, authorization server, scopes, and client registration are derived
+from the challenged endpoint and validated metadata; hosts cannot override them in server
+configuration. Hosts can observe
+deduplicated `ComputerEvent::OAuthStatusChanged { bundle_id, status }` events through
+`Computer::subscribe_events()` and use `Computer::oauth_status()` to resynchronize after a bounded
+broadcast receiver reports lag.
+
+[oauth-architecture]: https://github.com/A2C-SMCP/rust-sdk/blob/main/docs/computer/rmcp-oauth-decision.md
+
 ## 架构设计 / Architecture
 
 ```
@@ -382,12 +422,16 @@ cargo test -- --nocapture
 use tracing_subscriber;
 tracing_subscriber::fmt::init();
 
-// 监控服务器状态 / Monitor server status
-// 每行 = (bundle_id, name, is_active, state)：bundle_id 是唯一身份/寻址键，name 仅供展示（可碰撞）。
-let status = manager.get_server_status().await;
-for (bundle_id, name, active, state) in status {
-    println!("Server {} [{}]: active={}, state={}", name, bundle_id, active, state);
+// 监控正交的启动与连接状态 / Monitor orthogonal activation and connection states.
+let statuses = manager.get_server_runtime_statuses().await;
+for status in statuses {
+    println!(
+        "Server {} [{}]: activation={}, connection={}",
+        status.name, status.bundle_id, status.activation, status.connection
+    );
 }
+
+// 兼容接口 get_server_status() 仍可用；其中 is_active 表示“已启动”，state 表示连接状态。
 
 // 检查工具映射 / Check tool mapping
 let tools = manager.list_available_tools().await;

@@ -2,6 +2,131 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-08-24
+
+### Breaking Changes
+
+- *(computer)* #157 upgrades the public MCP model and transport surface from `rmcp 0.11`
+  to exactly `rmcp 2.2.0`. Downstream code must use the rmcp 2.2 resource/content
+  layouts; removed legacy aliases and construction shims such as `RawContent`,
+  `RawTextContent`, `RawResource`, and `Annotated` are no longer re-exported.
+- *(computer)* `OAuthError::Protocol` now carries the SDK-owned
+  `OAuthProtocolError` category instead of rmcp's `AuthError`. Provider response
+  details are intentionally discarded at this boundary.
+- *(computer)* #160 changes interactive `complete_oauth` and `cancel_oauth` to return
+  `OAuthFlowOutcome`. Expired and issuer-mismatched callbacks now use dedicated
+  `OAuthError` variants instead of a generic protocol error.
+- *(computer)* #167 adds `ComputerEvent::OAuthStatusChanged`. Exhaustive event matches need the
+  new variant, and `ComputerEvent` is no longer `Copy`.
+- *(computer)* #180 removes the public `HttpServerConfig.oauth`, `authPolicy`/`auth_policy`,
+  `OAuthOptions`, `OAuthClientMode`, and `OAuthClientRegistration` configuration surface. HTTP
+  OAuth is now automatic-only; serialized configurations containing removed fields fail
+  validation with a migration diagnostic. The configuration-only `OAuthError` variants
+  `ConflictingAuthorizationHeader`, `ExplicitPolicyRequiresOptions`, and
+  `DisabledPolicyWithOptions` are also removed.
+- *(computer)* [**breaking**] #165 project-scope enabledPlugins bundled MCP server
+  自我批准回落审批门——启用的 bundled server 在 project scope 显式声明即受
+  PENDING 门控（Option B，审批门绕过残面收口）。
+- *(computer)* [**breaking**] #169 安全层 Gate 1-3 对 plugin baseline 强制生效——
+  plugin 引入的 MCP server 在 reconcile 阶段受到与用户声明一致的 policy
+  deny/allow/disable 门控。
+
+### Features
+
+- *(computer)* #174 makes Streamable HTTP authentication anonymous-first by default and admits
+  OAuth only after a Bearer challenge plus validated RFC 9728/RFC 8414 metadata. Hosts receive
+  structured results for OAuth-required, unsupported challenge, discovery failure, ordinary
+  401/403, and rejected static credentials; automatic flows reuse the existing credential store,
+  status events, refresh, scope step-up, and cancellation lifecycle.
+
+- *(computer)* #157 adds OAuth status, begin, callback completion, and credential
+  clearing APIs for Streamable HTTP servers. Automatic negotiation uses Authorization
+  Code + PKCE with standards-derived metadata and dynamic client registration, with refresh and bounded
+  `insufficient_scope` step-up.
+- *(computer)* #159 makes OAuth credential policy host-injectable through
+  `Computer::with_oauth_credential_store`; credentials are isolated by bundle ID, canonical protected resource,
+  issuer, client mode, client identity, and configured scopes. The SDK default is
+  process-local memory and never probes an OS credential vault; hosts that need
+  cross-process resume must inject an `OAuthCredentialStore`.
+- *(computer)* #160 defines one browser/callback host contract for local loopback and
+  headless HTTPS Gateway flow drivers, with structured completion/termination outcomes,
+  one-time opaque-state routing, deterministic expiry, and rustdoc-integrated guidance.
+- *(computer)* #167 isolates the canonical RFC 8707 OAuth resource discovered for an HTTP MCP
+  endpoint and publishes deduplicated, bundle-aware OAuth status changes through the shared
+  Computer event stream, including refresh failure and 401/403 background transitions.
+- *(computer)* #170 adds `Computer::create_oauth_flow` and the cloneable `OAuthFlow` handle, making
+  discovery, DCR, callback exchange, server replacement/removal, and shutdown cancellation
+  bounded without provider-timeout waits. Interactive reauthorization now stages candidate
+  credentials and commits them only after completion wins the terminal race.
+- *(computer)* #161 结构化窗口枚举诊断 + 三传输 list_windows 能力门——能力不支持的传输
+  显式返回 CapabilityNotSupported（聚合侧需要信号而非静默空列表）。
+- *(computer)* #162 结构化 Runtime diagnostics：键控可清除 + 单调 revision/事件——
+  stop-after-failed-start 语义收敛到协议门控。
+- *(computer)* #186 逐 MCP runtime 状态变更事件——投影单源、弱锚点断环、自死锁根治；
+  订阅滞后后按 revision 排空。
+- *(computer)* #190 启动时物化 MCP runtime inputs（进程级输入挂载）。
+- *(computer)* #192 客户端 resolver 优先于缓存——同名 server 先查客户端配置。
+- *(computer)* #201 建连与自动重连支持动态 Socket.IO auth provider（动态凭据刷新）。
+
+### Bug Fixes
+
+- *(computer)* #179 makes automatic OAuth startup a bounded transaction: persisted Authorization
+  Code credentials and both Client Credentials modes connect in one `start_client_by_id` call,
+  while truly missing user authorization still returns `OAuthRequired`. Persisted automatic OAuth
+  credentials can also be cleared before the first reconnect.
+- *(computer)* Bound process-local OAuth and MCP lifecycle registries by retaining only
+  weak references and reclaiming dead slots during server/configuration churn.
+- *(computer)* Keep plain-HTTP SSE clients from initializing the platform TLS
+  certificate store. This prevents macOS Keychain contention from delaying or
+  failing concurrent local MCP connections and their prompt error handling.
+- *(computer)* #166 settings show --scope policy 经 validate_settings 做字段校验——
+  判废字段不再零警告穿出。
+- *(computer)* #171 resolve_target §5.1 步骤序死锁——多命中时精确 bundle_id 匹配优先
+  （Candidate B），捆绑名不再永远不可寻址。
+- *(computer)* #175 start 对「已声明未挂载」目标增加生命周期守卫（对标 stop_receipt）。
+- *(computer)* #176 空 OAuth scope 配置采纳 PRM scopes_supported 进行初始授权——
+  业务工具不再因空 scope 授权后不可用。
+- *(computer)* #178 锁跨无界 await 并发缺陷——transport 重入死锁 & manager 生命周期冻结。
+- *(computer)* #182 启动与 connect 状态解耦——未授权 MCP 启动后不再显示 inactive/pending。
+- *(computer)* #184 认证能力撤销后传播 capability revision 与 Office 工具通知。
+- *(computer)* #188 staging 根归属——URI 前缀优先于 _meta.source，被覆盖资源不再当独立根物化。
+- *(computer)* #189 裸 Bearer challenge 准入放开——well-known 回退链 + RFC 8414 §3.3
+  issuer 一致性门（含直取形态与 reset 行为锚定审查跟进）。
+- *(computer)* #199 publish dynamic tool changes——运行期工具变更即时发布。
+- *(computer)* #204 自动重连后恢复 Office membership——office server 服务不丢失。
+
+### Migration Notes
+
+- Remove `oauth`, `authPolicy`, and `auth_policy` from every HTTP server configuration; they now
+  produce a validation error. Without static credentials, Streamable HTTP always connects
+  anonymously first and admits OAuth only after a standards-compliant Bearer challenge. Static
+  `Authorization` headers always remain static-only and never fall back to OAuth.
+  Automatic negotiation binds admission to the challenged protected-resource metadata and requires
+  its effective resource to match the MCP endpoint plus issuer-bearing RFC 8414/OIDC metadata;
+  derived legacy endpoints and cross-resource configuration are not admitted.
+- The embedding Desktop/CLI must open `OAuthLaunch.authorization_url`, receive the
+  loopback/HTTPS callback, and pass its `code`, `state`, and optional `issuer` to
+  `complete_oauth`. Map `access_denied` and other OAuth errors to the corresponding
+  `OAuthCancellationReason` and call `cancel_oauth`; neither method returns `()`.
+  The SDK does not open a browser or bind a callback listener.
+- Persistent OAuth is now host policy: Desktop applications may inject a Keychain-backed
+  `OAuthCredentialStore`, while multi-tenant services should bind their injected store to
+  tenant/principal runtime context. Without injection, credentials are lost on process exit.
+- OAuth status fields serialize as camelCase. Existing non-OAuth
+  HTTP servers retain normal redirect behavior; OAuth requests only follow
+  same-origin redirects.
+- Resource, scopes, authorization server, and client registration are no longer configurable;
+  they are derived from validated metadata. After `subscribe_events()` reports lag, call
+  `oauth_status(bundle_id)` to resynchronize OAuth UI state.
+- Match `OAuthError::Protocol(OAuthProtocolError::...)` for stable control flow. Raw
+  rmcp/provider errors are no longer available through the public error value.
+- New hosts should retain the `OAuthFlow` returned by `create_oauth_flow`, await `flow.launch()`,
+  and drive `flow.complete`, `flow.cancel_callback`, or `flow.cancel`. Existing
+  `begin_oauth`/`complete_oauth`/`cancel_oauth` methods remain available with their existing
+  signatures, but cannot cancel the pre-launch interval because they do not expose a handle before
+  state generation. The exhaustive public `OAuthError` enum adds lifecycle-specific variants, so
+  downstream exhaustive matches must add corresponding arms.
+
 ## [0.3.1] - 2026-07-27
 
 ### Bug Fixes
@@ -434,4 +559,3 @@ All notable changes to this project will be documented in this file.
 ### Ci
 
 - 添加 GitHub Actions 流水线配置
-
