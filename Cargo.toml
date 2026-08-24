@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.3.2"
+version = "0.4.0-dev.0"
 # MSRV 下限由依赖决定：clap_lex 1.1.0 / engineioxide-core 0.2.0 已采用 edition 2024
 # 并声明 rust-version ≥ 1.85/1.86，cargo < 1.85 无法解析其 manifest。
 # Floor dictated by deps: clap_lex 1.1.0 / engineioxide-core 0.2.0 are edition 2024
@@ -172,12 +172,12 @@ rpassword = "7.2"
 vrl = "0.29.0"
 
 # 内部 crate / Internal crates
-smcp = { path = "crates/smcp", version = "0.3.2" }
-smcp-agent = { path = "crates/smcp-agent", version = "0.3.2" }
-smcp-client-transport = { path = "crates/smcp-client-transport", version = "0.3.2" }
-smcp-computer = { path = "crates/smcp-computer", version = "0.3.2" }
-smcp-server-core = { path = "crates/smcp-server-core", version = "0.3.2" }
-smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.3.2" }
+smcp = { path = "crates/smcp", version = "0.4.0-dev.0" }
+smcp-agent = { path = "crates/smcp-agent", version = "0.4.0-dev.0" }
+smcp-client-transport = { path = "crates/smcp-client-transport", version = "0.4.0-dev.0" }
+smcp-computer = { path = "crates/smcp-computer", version = "0.4.0-dev.0" }
+smcp-server-core = { path = "crates/smcp-server-core", version = "0.4.0-dev.0" }
+smcp-server-hyper = { path = "crates/smcp-server-hyper", version = "0.4.0-dev.0" }
 
 # 测试 / Testing
 tempfile = "3.8"
