@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
@@ -98,6 +99,78 @@ use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, Runti
 
 /// 确认回调函数类型 / Confirmation callback function type
 type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> bool + Send + Sync>;
+
+/// Process-unique tokens fence stale Socket.IO clients from publishing Computer lifecycle changes.
+static NEXT_SOCKETIO_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Install one already-connected client while the Computer Socket.IO lifecycle gate is held.
+async fn install_socketio_client_locked(
+    socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+    status: Arc<RuntimeStatus>,
+    owner: Arc<StdMutex<u64>>,
+    client: Arc<SmcpComputerClient>,
+) -> ComputerResult<()> {
+    let mut socketio_ref = socketio_client.write().await;
+    if socketio_ref
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &client))
+    {
+        if status.state() == LifecycleState::Shutdown {
+            return Err(ComputerError::InvalidState(
+                "Computer is shut down".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    // The reservation is atomic inside the client, unlike a separate check followed by bind.
+    // Different Computers have different lifecycle gates, so only this client-local claim can
+    // prevent concurrent installation of the same standalone Arc into two slots.
+    let lifecycle_token = NEXT_SOCKETIO_LIFECYCLE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if !client.claim_runtime_lifecycle(Arc::clone(&status), Arc::clone(&owner), lifecycle_token) {
+        return Err(ComputerError::InvalidState(
+            "Socket.IO client is already installed in another Computer".to_string(),
+        ));
+    }
+
+    // Claim before cleanup so a shut-down Computer cannot disconnect a candidate currently owned
+    // by another Computer. An unowned candidate is still retired before the rejection returns.
+    if status.state() == LifecycleState::Shutdown {
+        let cleanup = client.disconnect().await;
+        client.release_runtime_lifecycle_claim(lifecycle_token);
+        cleanup?;
+        return Err(ComputerError::InvalidState(
+            "Computer is shut down".to_string(),
+        ));
+    }
+
+    // A tf-rust-socketio reader owns an internal Client clone, so dropping the old public Arc does
+    // not close it. Retire it before publishing the replacement; if 0.8.1 is already in reconnect
+    // backoff, the retiring event gate closes its next namespace before any app handler can run.
+    if let Some(previous) = socketio_ref.as_ref() {
+        if let Err(error) = previous.disconnect().await {
+            if let Err(cleanup_error) = client.disconnect().await {
+                warn!(
+                    error = %cleanup_error,
+                    "replacement Socket.IO client cleanup failed after old teardown error"
+                );
+            }
+            client.release_runtime_lifecycle_claim(lifecycle_token);
+            return Err(error);
+        }
+        previous.deactivate_runtime_lifecycle();
+    }
+
+    if !client.activate_runtime_lifecycle(lifecycle_token) {
+        let _ = client.disconnect().await;
+        client.release_runtime_lifecycle_claim(lifecycle_token);
+        return Err(ComputerError::RuntimeError(
+            "Socket.IO lifecycle ownership was lost during installation".to_string(),
+        ));
+    }
+    *socketio_ref = Some(client);
+    Ok(())
+}
 
 /// 解析 "key:value,foo:bar" 格式的 headers 字符串为 HashMap
 /// Parse "key:value,foo:bar" format headers string into HashMap
@@ -391,6 +464,10 @@ pub struct Computer<S: Session> {
     /// 使用 Arc 而不是 Weak 以确保 client 生命周期
     /// Using Arc instead of Weak to ensure client lifetime
     socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+    /// Serializes connect/install/disconnect/shutdown and owns their cancellation boundary.
+    socketio_lifecycle_gate: Arc<Mutex<()>>,
+    /// Active Socket.IO client's lifecycle publication token.
+    socketio_lifecycle_owner: Arc<StdMutex<u64>>,
     /// 确认回调函数 / Confirmation callback function
     confirm_callback: Option<ConfirmCallbackType>,
 
@@ -790,6 +867,8 @@ impl<S: Session> Computer<S> {
             tool_history: Arc::new(Mutex::new(Vec::new())),
             session,
             socketio_client,
+            socketio_lifecycle_gate: Arc::new(Mutex::new(())),
+            socketio_lifecycle_owner: Arc::new(StdMutex::new(0)),
             confirm_callback: None,
             skill_registry,
             skill_home,
@@ -4118,11 +4197,22 @@ impl<S: Session> Computer<S> {
     /// 设置Socket.IO客户端 / Set Socket.IO client
     /// 此方法会替换现有的 client（如果有）并保持强引用
     /// This method replaces existing client (if any) and keeps strong reference
-    pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) {
-        let mut socketio_ref = self.socketio_client.write().await;
-        // 替换旧的 client（如果有），旧的会被自动 drop
-        // Replace old client (if any), old one will be dropped automatically
-        *socketio_ref = Some(client);
+    pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) -> ComputerResult<()> {
+        let gate = Arc::clone(&self.socketio_lifecycle_gate);
+        let socketio_client = Arc::clone(&self.socketio_client);
+        let status = Arc::clone(&self.status);
+        let owner = Arc::clone(&self.socketio_lifecycle_owner);
+
+        // The task owns the candidate and completes the transaction even if its caller drops the
+        // returned Future while waiting for the slot or old transport teardown.
+        tokio::spawn(async move {
+            let _gate = gate.lock().await;
+            install_socketio_client_locked(socketio_client, status, owner, client).await
+        })
+        .await
+        .map_err(|error| {
+            ComputerError::RuntimeError(format!("Socket.IO installation task failed: {error}"))
+        })?
     }
 
     /// 连接Socket.IO服务器 / Connect to Socket.IO server
@@ -4163,6 +4253,8 @@ impl<S: Session> Computer<S> {
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: detached_socketio.clone(),
+            socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
+            socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
             confirm_callback: self.confirm_callback.clone(),
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
@@ -4246,14 +4338,24 @@ impl<S: Session> Computer<S> {
         if let Some(h) = parsed_headers {
             builder = builder.headers(h);
         }
-        let client = builder.connect().await?;
-
-        // 设置客户端到Computer / Set client to Computer
-        let client_arc = Arc::new(client);
-        self.set_socketio_client(client_arc.clone()).await;
-
-        // #114 S7：Socket.IO 已连接（Office join 可能未完成，契约 §3）/ connected。
-        self.status.transition(LifecycleState::Connected);
+        let gate = Arc::clone(&self.socketio_lifecycle_gate);
+        let socketio_client = Arc::clone(&self.socketio_client);
+        let status = Arc::clone(&self.status);
+        let owner = Arc::clone(&self.socketio_lifecycle_owner);
+        tokio::spawn(async move {
+            let _gate = gate.lock().await;
+            if status.state() == LifecycleState::Shutdown {
+                return Err(ComputerError::InvalidState(
+                    "Computer is shut down".to_string(),
+                ));
+            }
+            let client = Arc::new(builder.connect().await?);
+            install_socketio_client_locked(socketio_client, status, owner, client).await
+        })
+        .await
+        .map_err(|error| {
+            ComputerError::RuntimeError(format!("Socket.IO connection task failed: {error}"))
+        })??;
 
         info!(
             "Connected to SMCP server at {} with computer name: {}",
@@ -4271,12 +4373,14 @@ impl<S: Session> Computer<S> {
     /// 背后 reader 后台任务持克隆，仅 Drop 用户句柄**不会**关 transport，必须显式 `disconnect()`），
     /// 成功后再置 `None`。幂等：槽已空 → no-op。
     ///
-    /// 失败上抛 Err、**不**清槽、**不**迁移 lifecycle——槽内 client 保留可重试（契约：`Ok` ⟹ 旧 transport
-    /// 已结束，而非仅表示 SDK 丢弃本地引用）。
+    /// 失败上抛 Err 且**不**清槽，槽内 client 保留可重试。membership/lifecycle 会在底层 await 前失效，
+    /// 这是 disconnect Future 的取消安全边界。若底层 0.8.1 已进入 reconnect backoff，`Ok` 表示该
+    /// client 已逻辑退役：业务 handler 已同步闸断，晚到 namespace 会在 Connect callback 内立即关闭。
     async fn close_socketio_transport(&self) -> ComputerResult<()> {
         let mut socketio_ref = self.socketio_client.write().await;
         if let Some(client) = socketio_ref.as_ref() {
             client.disconnect().await?;
+            client.deactivate_runtime_lifecycle();
         }
         *socketio_ref = None;
         Ok(())
@@ -4284,11 +4388,11 @@ impl<S: Session> Computer<S> {
 
     /// 断开Socket.IO连接 / Disconnect Socket.IO
     pub async fn disconnect_socketio(&self) -> ComputerResult<()> {
-        // #148：自身完成底层 transport disconnect（不再仅置 None）。失败上抛 Err、不迁移 lifecycle。
+        let _socketio_lifecycle = self.socketio_lifecycle_gate.lock().await;
+        // #148：自身完成底层 transport disconnect（不再仅置 None）。Client 在第一个 await 前以
+        // 当前连接租约迁移到 Started；这里不能在释放 slot 写锁后再次直接写共享状态，否则并发安装的
+        // replacement client 可能刚进入 Connected/JoinedOffice 又被旧 disconnect 覆盖。
         self.close_socketio_transport().await?;
-        // #114 S7：断开 Socket.IO 后本地 runtime 仍存活 → 回 Started（契约 §4.5：断开后不再向旧 Office 发
-        // `server:update_*`——由 client=None 天然保证；本地管理操作可继续）。已 shutdown 则 transition 为 no-op。
-        self.status.transition(LifecycleState::Started);
         info!("Disconnected from server");
         Ok(())
     }
@@ -4300,8 +4404,6 @@ impl<S: Session> Computer<S> {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
             client.join_office(office_id).await?;
-            // #114 S7：已加入 Office，可接收路由来的 `client:*`（契约 §3）/ joined office。
-            self.status.transition(LifecycleState::JoinedOffice);
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -4317,8 +4419,6 @@ impl<S: Session> Computer<S> {
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
             let current_office_id = client.get_current_office_id().await?;
             client.leave_office(&current_office_id).await?;
-            // #114 S7：离开 Office 但连接仍在 → 回 Connected（契约 §3）/ back to connected。
-            self.status.transition(LifecycleState::Connected);
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -4344,6 +4444,10 @@ impl<S: Session> Computer<S> {
     pub async fn shutdown(&self) -> ComputerResult<()> {
         info!("Shutting down Computer: {}", self.name);
         let _boot_shutdown = self.mcp_boot_shutdown.lock().await;
+        // Linearize terminal shutdown before any new candidate can be installed. A connect/set
+        // transaction that won the gate first is completed and then closed below; one that starts
+        // later observes Shutdown and tears down its candidate instead of publishing it.
+        let _socketio_lifecycle = self.socketio_lifecycle_gate.lock().await;
         let _lifecycle_gate = self.mcp_lifecycle_gate.write().await;
         self.mcp_operations_open
             .store(false, std::sync::atomic::Ordering::Release);
@@ -4415,6 +4519,8 @@ impl<S: Session + Clone> Clone for Computer<S> {
             tool_history: Arc::clone(&self.tool_history),
             session: self.session.clone(),
             socketio_client: Arc::clone(&self.socketio_client),
+            socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
+            socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
             confirm_callback: self.confirm_callback.clone(),
             // Public Clone is another handle to the same Computer lifecycle. All resources that
             // boot creates and shutdown tears down must therefore share the exact cleanup handles.
