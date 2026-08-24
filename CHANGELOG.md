@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.2] - 2026-08-24
 
 ### Breaking Changes
 
@@ -24,7 +24,12 @@ All notable changes to this project will be documented in this file.
   validation with a migration diagnostic. The configuration-only `OAuthError` variants
   `ConflictingAuthorizationHeader`, `ExplicitPolicyRequiresOptions`, and
   `DisabledPolicyWithOptions` are also removed.
-- *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
+- *(computer)* [**breaking**] #165 project-scope enabledPlugins bundled MCP server
+  自我批准回落审批门——启用的 bundled server 在 project scope 显式声明即受
+  PENDING 门控（Option B，审批门绕过残面收口）。
+- *(computer)* [**breaking**] #169 安全层 Gate 1-3 对 plugin baseline 强制生效——
+  plugin 引入的 MCP server 在 reconcile 阶段受到与用户声明一致的 policy
+  deny/allow/disable 门控。
 
 ### Features
 
@@ -53,6 +58,15 @@ All notable changes to this project will be documented in this file.
   discovery, DCR, callback exchange, server replacement/removal, and shutdown cancellation
   bounded without provider-timeout waits. Interactive reauthorization now stages candidate
   credentials and commits them only after completion wins the terminal race.
+- *(computer)* #161 结构化窗口枚举诊断 + 三传输 list_windows 能力门——能力不支持的传输
+  显式返回 CapabilityNotSupported（聚合侧需要信号而非静默空列表）。
+- *(computer)* #162 结构化 Runtime diagnostics：键控可清除 + 单调 revision/事件——
+  stop-after-failed-start 语义收敛到协议门控。
+- *(computer)* #186 逐 MCP runtime 状态变更事件——投影单源、弱锚点断环、自死锁根治；
+  订阅滞后后按 revision 排空。
+- *(computer)* #190 启动时物化 MCP runtime inputs（进程级输入挂载）。
+- *(computer)* #192 客户端 resolver 优先于缓存——同名 server 先查客户端配置。
+- *(computer)* #201 建连与自动重连支持动态 Socket.IO auth provider（动态凭据刷新）。
 
 ### Bug Fixes
 
@@ -65,6 +79,21 @@ All notable changes to this project will be documented in this file.
 - *(computer)* Keep plain-HTTP SSE clients from initializing the platform TLS
   certificate store. This prevents macOS Keychain contention from delaying or
   failing concurrent local MCP connections and their prompt error handling.
+- *(computer)* #166 settings show --scope policy 经 validate_settings 做字段校验——
+  判废字段不再零警告穿出。
+- *(computer)* #171 resolve_target §5.1 步骤序死锁——多命中时精确 bundle_id 匹配优先
+  （Candidate B），捆绑名不再永远不可寻址。
+- *(computer)* #175 start 对「已声明未挂载」目标增加生命周期守卫（对标 stop_receipt）。
+- *(computer)* #176 空 OAuth scope 配置采纳 PRM scopes_supported 进行初始授权——
+  业务工具不再因空 scope 授权后不可用。
+- *(computer)* #178 锁跨无界 await 并发缺陷——transport 重入死锁 & manager 生命周期冻结。
+- *(computer)* #182 启动与 connect 状态解耦——未授权 MCP 启动后不再显示 inactive/pending。
+- *(computer)* #184 认证能力撤销后传播 capability revision 与 Office 工具通知。
+- *(computer)* #188 staging 根归属——URI 前缀优先于 _meta.source，被覆盖资源不再当独立根物化。
+- *(computer)* #189 裸 Bearer challenge 准入放开——well-known 回退链 + RFC 8414 §3.3
+  issuer 一致性门（含直取形态与 reset 行为锚定审查跟进）。
+- *(computer)* #199 publish dynamic tool changes——运行期工具变更即时发布。
+- *(computer)* #204 自动重连后恢复 Office membership——office server 服务不丢失。
 
 ### Migration Notes
 
