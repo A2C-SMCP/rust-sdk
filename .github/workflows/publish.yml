@@ -15,7 +15,7 @@ jobs:
     name: Validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -37,13 +37,19 @@ jobs:
       - name: Dry-run publish (smcp)
         run: cargo publish --dry-run -p smcp
 
+      # rust-cache 的 post-save 会遍历 target/package/**（cargo package 暂存区，
+      # 含已剔除的 tests/target、tests/trybuild 目录）→ 每版 4 条 ENOENT 红 annotation。
+      # 在 post-action 保存缓存前清掉暂存区，消除该噪声。
+      - name: Clean up package staging
+        run: rm -rf target/package
+
   publish:
     name: Publish
     runs-on: ubuntu-latest
     needs: validate
     environment: crates-io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -170,3 +176,9 @@ jobs:
             echo "Waiting for a2c-smcp@$VERSION... (${i}/12)"; sleep 5
           done
           echo "Timeout waiting for index, proceeding anyway"
+
+      # rust-cache 的 post-save 会遍历 target/package/**（cargo package 暂存区，
+      # 含已剔除的 tests/target、tests/trybuild 目录）→ 每版 12 条 ENOENT 红 annotation。
+      # 在 post-action 保存缓存前清掉暂存区，消除该噪声。
+      - name: Clean up package staging
+        run: rm -rf target/package

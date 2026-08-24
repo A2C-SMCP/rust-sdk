@@ -78,15 +78,20 @@ gh workflow run "Publish to crates.io"
 
 流水线会按依赖顺序自动发布所有 crate，完整定义见 [`.github/workflows/publish.yml`](../../.github/workflows/publish.yml)。
 
+> **定序必须按依赖树核对，不靠印象**：cargo publish 会校验全部依赖（**含 dev-dependencies**）
+> 在 registry 中已有索引版本。v0.3.2 事故：smcp-server-hyper 排在 smcp-agent/smcp-computer
+> 之后（后者 dev-deps 引用 `smcp-server-hyper ^x.y.z`）→ 三个 crate 未发布。核对方式：
+> `grep -l 'smcp-server-hyper' crates/*/Cargo.toml` 找出谁依赖谁，再回看 workflow 步骤顺序。
+
 本地可提前用 dry-run 验证打包是否正常：
 
 ```bash
 cargo publish --dry-run -p smcp
 ```
 
-## 第 5 步：等待发布结果
+## 第 5 步：发布验收与失败恢复
 
-触发发布后，必须轮询 workflow 运行状态直到完成：
+触发发布后，轮询 workflow 运行状态直到完成：
 
 ```bash
 # 查看最近的 workflow 运行
@@ -96,12 +101,42 @@ gh run list --workflow=publish.yml --limit=1
 gh run watch <run-id>
 ```
 
-- 若发布**成功**，向用户确认发布完成并附上 Release 链接。
-- 若发布**失败**，使用 `gh run view <run-id> --log-failed` 获取失败日志，分析原因并报告给用户。
+**⚠️ job success ≠ 发布成功**。publish.yml 每个发布步骤带 `|| true`（容忍
+already-exists 以便重跑），真实失败也会被吞掉、workflow 仍绿（v0.2.2/v0.2.3/v0.3.2
+三次实测）。**必须逐 crate 验收 crates.io**（API 不传 User-Agent 会被 403 拒绝 → 误判
+"未发布"）：
+
+```bash
+for c in a2c-smcp smcp smcp-agent smcp-client-transport smcp-computer \
+         smcp-server-core smcp-server-hyper; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H 'User-Agent: a2c-smcp-release-check' \
+    "https://crates.io/api/v1/crates/$c/<version>")
+  echo "$c <version> -> $code"   # 全部应为 200
+done
+```
+
+- 若**全部 200**：向用户确认发布完成并附上 Release 链接。
+- 若有 404/失败：**优先修复流水线后重跑**，不要绕道本地手工 `cargo publish`
+  （crates.io 版本不可删且失败不留在 CI 痕迹里，只作当次兜底）：
+
+```bash
+# 1. 用全量日志定位真因（--log-failed 抓不到——每步 exit 0，必须全量 grep）
+gh run view <run-id> --log > /tmp/publish.log && grep -n 'error' /tmp/publish.log
+
+# 2. 修 publish.yml（依赖序 / wait-for-index curl 补 User-Agent）→ push main（develop 同步）
+
+# 3. 重跑（已在 registry 的 crate 会 "already exists" 被 || true 跳过，自动补发缺的）
+gh workflow run publish.yml --ref main
+```
+
+- **rust-cache ENOENT 是噪声，不是发布失败**：Validate job 的 Post Cache 步骤在
+  `target/package/<crate>-<ver>/tests/{target,trybuild}`（cargo package 剔除的目录）
+  上 `opendir` 扑空，页面 4 条红 annotation 但 job 仍绿，每版必现。勿据此判失败。
 
 ## 新增子 crate 时的检查清单
 
 1. 子 crate `Cargo.toml` 使用 `version.workspace = true`
 2. 根 `Cargo.toml` 的 `[workspace.dependencies]` 添加对应条目（带 `path` 和 `version`）
 3. 其他 crate 引用该依赖时使用 `workspace = true`
-4. [`.github/workflows/publish.yml`](../../.github/workflows/publish.yml) 中补充对应的 publish 步骤
+4. [`.github/workflows/publish.yml`](../../.github/workflows/publish.yml) 中补充对应的 publish 步骤，且**放对位置**：必须出现在所有依赖它的 crate（含仅 dev-deps 引用）发布步骤**之前**
