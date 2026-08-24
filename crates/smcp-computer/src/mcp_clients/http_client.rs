@@ -820,6 +820,13 @@ impl MCPClientProtocol for HttpMCPClient {
         self.base.state()
     }
 
+    fn set_state_change_callback(
+        &self,
+        callback: Box<dyn Fn(ClientState, ClientState) + Send + Sync>,
+    ) {
+        self.base.set_state_change_callback(callback);
+    }
+
     async fn connect(&self) -> Result<(), MCPClientError> {
         // 检查是否可以连接 / Check if can connect
         if !self.base.can_connect().await {

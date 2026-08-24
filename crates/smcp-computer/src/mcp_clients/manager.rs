@@ -25,7 +25,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc as StdArc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -209,11 +209,23 @@ pub struct MCPServerManager {
     /// One host-injected keyed store shared by every OAuth MCP managed by this instance.
     oauth_credential_store: Arc<dyn OAuthCredentialStore>,
     /// Optional Computer-owned event sink for OAuth status transitions.
-    oauth_events: Option<Arc<RuntimeStatus>>,
+    runtime_status: Option<Arc<RuntimeStatus>>,
     #[cfg(test)]
     test_http_root_certificates: Arc<RwLock<Vec<reqwest::Certificate>>>,
     /// Serialize start/stop/update for each server identity without blocking unrelated servers.
     lifecycle_locks: Arc<WeakRegistry<BundleId, Mutex<()>>>,
+}
+
+/// #186 回调断环用的**弱投影锚点集**：闭包只持 `Weak`，使 `manager → client → callback` 的强引用环
+/// 在回调侧断开（#106 Weak 断环先例的字段级形态）；spawn 任务 upgrade 失败（manager 已 drop）即 no-op。
+#[derive(Clone)]
+struct ProjectionAnchors {
+    runtime_status: Option<Weak<RuntimeStatus>>,
+    server_declarations: Weak<RwLock<HashMap<BundleId, ServerDeclaration>>>,
+    servers_config: Weak<RwLock<HashMap<BundleId, MCPServerConfig>>>,
+    activation_intents: Weak<RwLock<HashSet<BundleId>>>,
+    connection_states: Weak<RwLock<HashMap<BundleId, MCPServerConnectionState>>>,
+    active_clients: Weak<RwLock<HashMap<BundleId, StdArc<dyn MCPClientProtocol>>>>,
 }
 
 /// 管理器状态 / Manager state
@@ -270,7 +282,7 @@ impl MCPServerManager {
             client_factory_override: Arc::new(RwLock::new(None)),
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
-            oauth_events: None,
+            runtime_status: None,
             #[cfg(test)]
             test_http_root_certificates: Arc::new(RwLock::new(Vec::new())),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
@@ -306,7 +318,7 @@ impl MCPServerManager {
             client_factory_override: Arc::new(RwLock::new(None)),
             oauth_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_credential_store: Arc::new(InMemoryOAuthCredentialStore::default()),
-            oauth_events: None,
+            runtime_status: None,
             #[cfg(test)]
             test_http_root_certificates: Arc::new(RwLock::new(Vec::new())),
             lifecycle_locks: Arc::new(WeakRegistry::default()),
@@ -323,8 +335,8 @@ impl MCPServerManager {
         }
     }
 
-    pub(crate) fn with_oauth_events(mut self, events: Arc<RuntimeStatus>) -> Self {
-        self.oauth_events = Some(events);
+    pub(crate) fn with_runtime_status(mut self, events: Arc<RuntimeStatus>) -> Self {
+        self.runtime_status = Some(events);
         self
     }
 
@@ -535,6 +547,7 @@ impl MCPServerManager {
                 .await
                 .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
+        self.fire_projected_if_changed(&bundle_id).await;
 
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
@@ -752,7 +765,6 @@ impl MCPServerManager {
         };
 
         let server_name = config.name().to_string();
-
         if config.disabled() {
             return Err(ComputerError::InvalidConfiguration(format!(
                 "Cannot start disabled server: {}",
@@ -766,23 +778,27 @@ impl MCPServerManager {
             .write()
             .await
             .insert(bundle_id.clone());
+        // #186：激活意图是「已提交」状态之一部分；此刻 live/remembered 均缺失 → 投影 (Started, Disconnected)。
+        self.fire_projected_if_changed(bundle_id).await;
 
         // 检查是否已连接 / Check if already connected
-        {
-            let clients = self.active_clients.read().await;
-            if clients.contains_key(bundle_id) {
-                self.connection_states
-                    .write()
-                    .await
-                    .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
-                return Ok(()); // 已经启动 / Already started
-            }
+        // 读 guard 须先放再 fire：#186 投影发布会重读 `active_clients`，持读锁跨 fire 与他任务
+        // 排队的写锁构成 ABBA 死锁（同「fire 不得在 manager 锁内调用」不变量）。
+        let already_connected = self.active_clients.read().await.contains_key(bundle_id);
+        if already_connected {
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+            self.fire_projected_if_changed(bundle_id).await;
+            return Ok(()); // 已经启动 / Already started
         }
 
         self.connection_states
             .write()
             .await
             .insert(bundle_id.clone(), MCPServerConnectionState::Connecting);
+        self.fire_projected_if_changed(bundle_id).await;
 
         // 创建客户端（注入通知上报接缝，用 **bundle_id** 打来源标签——消费侧定向重挂按身份寻址，#106/#127）。
         let notify = self.notify_ctx_for(bundle_id).await;
@@ -797,7 +813,7 @@ impl MCPServerManager {
                         .with_oauth_context(
                             bundle_id.clone(),
                             Arc::clone(&self.oauth_credential_store),
-                            self.oauth_events.clone(),
+                            self.runtime_status.clone(),
                         )
                         .with_notify(notify.clone());
                     #[cfg(test)]
@@ -819,6 +835,23 @@ impl MCPServerManager {
             _ => self.make_client(config, notify),
         };
 
+        // #186：live 状态变化（进程自退 / 传输断连等）→ 统一投影发布。回调内**仅** spawn（不持锁、
+        // 不等锁），fire 在独立任务里读执行时刻投影；重复投影由 RuntimeStatus 去重吸收。
+        // 回调只持**弱锚点集**（#106 Weak 断环先例的字段级形态）：manager → client → callback 的
+        // 强引用环在回调侧断开，异常路径（未 shutdown）不再整图泄漏；spawn 任务 upgrade 失败
+        // （manager 已 drop）即 no-op。
+        {
+            let owner = bundle_id.clone();
+            let anchors = self.projection_anchors();
+            client.set_state_change_callback(Box::new(move |_from, _to| {
+                let anchors = anchors.clone();
+                let owner = owner.clone();
+                tokio::spawn(async move {
+                    Self::fire_projected(&anchors, &owner).await;
+                });
+            }));
+        }
+
         // 连接服务器 / Connect to server
         if let Err(error) = client.connect().await {
             let connection = if matches!(
@@ -833,6 +866,7 @@ impl MCPServerManager {
                 .write()
                 .await
                 .insert(bundle_id.clone(), connection);
+            self.fire_projected_if_changed(bundle_id).await;
             return Err(match error {
                 MCPClientError::HttpAuthentication(error) => {
                     ComputerError::HttpAuthentication(error)
@@ -855,6 +889,7 @@ impl MCPServerManager {
             .write()
             .await
             .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        self.fire_projected_if_changed(bundle_id).await;
 
         // 刷新工具路由 / Refresh tool routes
         self.refresh_tool_routes().await?;
@@ -882,6 +917,7 @@ impl MCPServerManager {
 
     async fn stop_client_by_id_inner(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         let was_started = self.activation_intents.write().await.remove(bundle_id);
+        self.fire_projected_if_changed(bundle_id).await;
         let was_connected = self.disconnect_client_by_id_inner(bundle_id).await?;
 
         if was_started || was_connected {
@@ -1011,21 +1047,24 @@ impl MCPServerManager {
                 "materialized config identity changed from {bundle_id} to {resolved}"
             )));
         }
-
         self.retire_oauth_client(bundle_id).await?;
         self.stop_client_by_id_inner(bundle_id).await?;
         self.servers_config
             .write()
             .await
             .insert(bundle_id.clone(), config.clone());
-        let mut declarations = self.server_declarations.write().await;
-        declarations
-            .entry(bundle_id.clone())
-            .and_modify(|declaration| declaration.name = config.name().to_string())
-            .or_insert_with(|| ServerDeclaration {
-                name: config.name().to_string(),
-                requires_computer_materialization: true,
-            });
+        // 声明写入必须在独立块内完成：`start_client_by_id_inner` 内部的 #186 投影发布会读
+        // `server_declarations`，写 guard 若存活到调用点即构成同任务自死锁（持写锁等读锁）。
+        {
+            let mut declarations = self.server_declarations.write().await;
+            declarations
+                .entry(bundle_id.clone())
+                .and_modify(|declaration| declaration.name = config.name().to_string())
+                .or_insert_with(|| ServerDeclaration {
+                    name: config.name().to_string(),
+                    requires_computer_materialization: true,
+                });
+        }
         if enabled {
             self.start_client_by_id_inner(bundle_id).await?;
         }
@@ -1041,12 +1080,15 @@ impl MCPServerManager {
         let lifecycle = self.lifecycle_lock(&bundle_id);
         let _lifecycle_guard = lifecycle.lock().await;
         self.server_declarations.write().await.insert(
-            bundle_id,
+            bundle_id.clone(),
             ServerDeclaration {
                 name: config.name().to_string(),
                 requires_computer_materialization: true,
             },
         );
+        // #186：与 `add_or_update_server` 的 fire 语义对齐——首个提交即投影 (Stopped, Disconnected)，
+        // 纯事件订阅方（不轮询快照）也能看到新增 server（guard 为语句临时量，fire 前已释放）。
+        self.fire_projected_if_changed(&bundle_id).await;
         Ok(())
     }
 
@@ -1120,6 +1162,9 @@ impl MCPServerManager {
 
     /// 关闭管理器 / Close manager
     pub async fn close(&self) -> Result<(), ComputerError> {
+        // 与 `Computer::shutdown` 的停止序列对齐：先停后台监控任务（其自持 manager 强引用，
+        // 不停止则 manager 永不回收、任务空转轮询）。
+        self.stop_health_monitor().await;
         let stop_result = self.stop_all().await;
         // OAuth cleanup is unconditional: a transport disconnect failure must not leave browser
         // authorization running until the provider timeout.
@@ -1620,10 +1665,55 @@ impl MCPServerManager {
             .await
     }
 
-    /// 获取正交的服务器运行时状态 / Get orthogonal server runtime statuses.
-    pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
-        let mut declared_names: HashMap<BundleId, ServerName> = self
-            .server_declarations
+    /// 单 server 的投影规则（#186 单源化 #182 语义）/ orthogonal runtime projection for one server。
+    ///
+    /// `connection` 优先级：激活 `Stopped` → `Disconnected`（掩蔽 remembered 残留）→
+    /// `remembered == AuthorizationRequired`（终态用户操作边界，优先于并发采样的 live）→
+    /// live `ClientState` 映射 → `remembered` 回退（无则 `Disconnected`）。**本函数为快照与事件的
+    /// 单一真相**——两者靠它保持一致（resync 不变量）。
+    fn project_one(
+        bundle_id: BundleId,
+        name: ServerName,
+        activation: MCPServerActivationState,
+        remembered: Option<MCPServerConnectionState>,
+        live: Option<ClientState>,
+    ) -> MCPServerRuntimeStatus {
+        let connection = if activation == MCPServerActivationState::Stopped {
+            MCPServerConnectionState::Disconnected
+        } else if remembered == Some(MCPServerConnectionState::AuthorizationRequired) {
+            MCPServerConnectionState::AuthorizationRequired
+        } else if let Some(state) = live {
+            match state {
+                ClientState::Initialized => MCPServerConnectionState::Connecting,
+                ClientState::Connected => MCPServerConnectionState::Connected,
+                ClientState::Disconnected => MCPServerConnectionState::Disconnected,
+                ClientState::Error => MCPServerConnectionState::Error,
+            }
+        } else {
+            remembered.unwrap_or(MCPServerConnectionState::Disconnected)
+        };
+        MCPServerRuntimeStatus {
+            bundle_id,
+            name,
+            activation,
+            connection,
+        }
+    }
+
+    /// 声明行集：声明 ∪ 已物化配置（后者是当前渲染进程名，优先）/ declared runtime rows。
+    ///
+    /// 合并规则的**单一代码落点**（#186 复审）：快照路径与弱锚点投影都经
+    /// [`Self::declared_runtime_rows_from`] 取行，避免两处复制同一规则后漂移。
+    async fn declared_runtime_rows(&self) -> Vec<(BundleId, ServerName)> {
+        Self::declared_runtime_rows_from(&self.server_declarations, &self.servers_config).await
+    }
+
+    /// 声明行合并核心：通过字段锁引用读取（非 `&self`），供弱锚点升级后的回调投影复用。
+    async fn declared_runtime_rows_from(
+        server_declarations: &RwLock<HashMap<BundleId, ServerDeclaration>>,
+        servers_config: &RwLock<HashMap<BundleId, MCPServerConfig>>,
+    ) -> Vec<(BundleId, ServerName)> {
+        let mut declared_names: HashMap<BundleId, ServerName> = server_declarations
             .read()
             .await
             .iter()
@@ -1632,22 +1722,29 @@ impl MCPServerManager {
         // Keep direct test/standalone injections observable, while preferring the current rendered
         // process name whenever a materialized config exists.
         declared_names.extend(
-            self.servers_config
+            servers_config
                 .read()
                 .await
                 .iter()
                 .map(|(bundle_id, config)| (bundle_id.clone(), config.name().to_string())),
         );
-        let configs: Vec<(BundleId, ServerName)> = declared_names.into_iter().collect();
+        declared_names.into_iter().collect()
+    }
+
+    /// 获取正交的服务器运行时状态 / Get orthogonal server runtime statuses.
+    pub async fn get_server_runtime_statuses(&self) -> Vec<MCPServerRuntimeStatus> {
+        let configs = self.declared_runtime_rows().await;
         let activation_intents = self.activation_intents.read().await.clone();
         let remembered_connections = self.connection_states.read().await.clone();
-        let live_connections: HashMap<BundleId, ClientState> = self
-            .active_clients
-            .read()
-            .await
-            .iter()
-            .map(|(bundle_id, client)| (bundle_id.clone(), client.state()))
-            .collect();
+        // `client.state()` 可能走 `BaseMCPClient` 的 block_in_place 降级路径——guard 释放后再调用
+        // （与 `project_runtime_status` 同姿势，避免持读锁阻塞 worker，#186 复审）。
+        let live_connections: HashMap<BundleId, ClientState> = {
+            let clients = self.active_clients.read().await.clone();
+            clients
+                .into_iter()
+                .map(|(bundle_id, client)| (bundle_id, client.state()))
+                .collect()
+        };
 
         configs
             .into_iter()
@@ -1658,30 +1755,138 @@ impl MCPServerManager {
                     MCPServerActivationState::Stopped
                 };
                 let remembered = remembered_connections.get(&bundle_id).copied();
-                let connection = if activation == MCPServerActivationState::Stopped {
-                    MCPServerConnectionState::Disconnected
-                } else if remembered == Some(MCPServerConnectionState::AuthorizationRequired) {
-                    // This terminal user-action boundary is committed before the unusable live
-                    // client is retired, so prefer it over a concurrently sampled client state.
-                    MCPServerConnectionState::AuthorizationRequired
-                } else if let Some(state) = live_connections.get(&bundle_id) {
-                    match state {
-                        ClientState::Initialized => MCPServerConnectionState::Connecting,
-                        ClientState::Connected => MCPServerConnectionState::Connected,
-                        ClientState::Disconnected => MCPServerConnectionState::Disconnected,
-                        ClientState::Error => MCPServerConnectionState::Error,
-                    }
-                } else {
-                    remembered.unwrap_or(MCPServerConnectionState::Disconnected)
-                };
-                MCPServerRuntimeStatus {
-                    bundle_id,
+                Self::project_one(
+                    bundle_id.clone(),
                     name,
                     activation,
-                    connection,
-                }
+                    remembered,
+                    live_connections.get(&bundle_id).copied(),
+                )
             })
             .collect()
+    }
+
+    /// 单 server 的当前投影（#186 事件变化检测用；与快照同源）/ projected status for one server。
+    ///
+    /// 锁序与 [`Self::get_server_runtime_statuses`] 一致（声明名 → 激活意图 → remembered → live），
+    /// 每把读锁 clone 后即放、不跨 await；`client.state()` 在 `active_clients` guard 释放后调用
+    /// （同步 trait 调用，避免持锁触发 `BaseMCPClient::state()` 的 block_in_place 降级路径）。
+    async fn project_runtime_status(&self, bundle_id: &BundleId) -> Option<MCPServerRuntimeStatus> {
+        Self::project_runtime_status_from(
+            &self.server_declarations,
+            &self.servers_config,
+            &self.activation_intents,
+            &self.connection_states,
+            &self.active_clients,
+            bundle_id,
+        )
+        .await
+    }
+
+    /// 投影核心（快照 / 事件 / 弱锚点 fire 三方**单一真相**）：通过字段锁引用而非 `&self` 读取，
+    /// 使回调弱引用升级后的任务复用同一投影逻辑（#186 复审断环）。
+    async fn project_runtime_status_from(
+        server_declarations: &RwLock<HashMap<BundleId, ServerDeclaration>>,
+        servers_config: &RwLock<HashMap<BundleId, MCPServerConfig>>,
+        activation_intents: &RwLock<HashSet<BundleId>>,
+        connection_states: &RwLock<HashMap<BundleId, MCPServerConnectionState>>,
+        active_clients: &RwLock<HashMap<BundleId, StdArc<dyn MCPClientProtocol>>>,
+        bundle_id: &BundleId,
+    ) -> Option<MCPServerRuntimeStatus> {
+        let (name, activation, remembered, live) = {
+            let name = Self::declared_runtime_rows_from(server_declarations, servers_config)
+                .await
+                .into_iter()
+                .find(|(id, _)| id == bundle_id)
+                .map(|(_, name)| name)?;
+            let activation = if activation_intents.read().await.contains(bundle_id) {
+                MCPServerActivationState::Started
+            } else {
+                MCPServerActivationState::Stopped
+            };
+            let remembered = connection_states.read().await.get(bundle_id).copied();
+            let live_client = { active_clients.read().await.get(bundle_id).cloned() };
+            let live = live_client.map(|client| client.state());
+            (name, activation, remembered, live)
+        };
+        Some(Self::project_one(
+            bundle_id.clone(),
+            name,
+            activation,
+            remembered,
+            live,
+        ))
+    }
+
+    /// 回调闭包捕获的弱锚点集（[`ProjectionAnchors`]）/ weak anchors captured by the state-change callback.
+    fn projection_anchors(&self) -> ProjectionAnchors {
+        ProjectionAnchors {
+            runtime_status: self.runtime_status.as_ref().map(Arc::downgrade),
+            server_declarations: Arc::downgrade(&self.server_declarations),
+            servers_config: Arc::downgrade(&self.servers_config),
+            activation_intents: Arc::downgrade(&self.activation_intents),
+            connection_states: Arc::downgrade(&self.connection_states),
+            active_clients: Arc::downgrade(&self.active_clients),
+        }
+    }
+
+    /// 经弱锚点升级后的投影发布（[`Self::fire_projected_if_changed`] 的断环形态）：任一锚点已亡
+    /// （manager 已 drop）→ no-op。投影核心与快照 / 事件同源。
+    async fn fire_projected(anchors: &ProjectionAnchors, bundle_id: &BundleId) {
+        let Some(runtime_status) = &anchors.runtime_status else {
+            return;
+        };
+        let (
+            Some(runtime_status),
+            Some(server_declarations),
+            Some(servers_config),
+            Some(activation_intents),
+            Some(connection_states),
+            Some(active_clients),
+        ) = (
+            runtime_status.upgrade(),
+            anchors.server_declarations.upgrade(),
+            anchors.servers_config.upgrade(),
+            anchors.activation_intents.upgrade(),
+            anchors.connection_states.upgrade(),
+            anchors.active_clients.upgrade(),
+        )
+        else {
+            return;
+        };
+        let Some(status) = Self::project_runtime_status_from(
+            &server_declarations,
+            &servers_config,
+            &activation_intents,
+            &connection_states,
+            &active_clients,
+            bundle_id,
+        )
+        .await
+        else {
+            return;
+        };
+        runtime_status.update_server_status(bundle_id.clone(), status);
+    }
+
+    /// #186：投影变化检测并发布逐 server 状态事件。
+    ///
+    /// 单 server 投影与快照**同源**（[`Self::project_runtime_status`] 与
+    /// [`Self::get_server_runtime_statuses`] 共用 [`Self::project_one`]），resync 不变量成立；
+    /// 重复 / 未变状态由 [`RuntimeStatus::update_server_status`] 去重吸收。
+    /// 无事件 sink（裸 `MCPServerManager::new()` 单测）或 server 未声明 → no-op。
+    ///
+    /// **调用约束（死锁不变量）**：本函数读取全部 manager 状态锁，调用方除 per-bundle
+    /// lifecycle 锁（本函数不触碰它）外**不得持有任何 manager 锁**——持写锁调用即同任务
+    /// 自死锁（持写锁等读锁、永不唤醒）。
+    pub(crate) async fn fire_projected_if_changed(&self, bundle_id: &BundleId) {
+        let Some(runtime_status) = &self.runtime_status else {
+            return;
+        };
+        let Some(status) = self.project_runtime_status(bundle_id).await else {
+            return;
+        };
+        runtime_status.update_server_status(bundle_id.clone(), status);
     }
 
     /// 获取服务器状态列表 `(bundle_id, name, is_active, state)` / Get server status list。
@@ -2396,6 +2601,8 @@ impl MCPServerManager {
         let tool_routes = self.tool_routes.clone();
         let tool_projection = self.tool_projection.clone();
         let disabled_tools = self.disabled_tools.clone();
+        // #186 health 重连状态变化也须走统一事件发布（manager.clone 为全 Arc 浅拷贝）。
+        let manager_ref = self.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2482,6 +2689,7 @@ impl MCPServerManager {
                                 .write()
                                 .await
                                 .insert(bundle_id.clone(), MCPServerConnectionState::Connecting);
+                            manager_ref.fire_projected_if_changed(&bundle_id).await;
 
                             // 尝试断开并重新连接 / Try disconnect and reconnect
                             if let Err(e) = client.disconnect().await {
@@ -2495,6 +2703,7 @@ impl MCPServerManager {
                                         bundle_id.clone(),
                                         MCPServerConnectionState::Connected,
                                     );
+                                    manager_ref.fire_projected_if_changed(&bundle_id).await;
                                     // 重置重试计数 / Reset retry count
                                     retry_counts.write().await.remove(&bundle_id);
                                 }
@@ -2513,6 +2722,7 @@ impl MCPServerManager {
                                             bundle_id.clone(),
                                             MCPServerConnectionState::AuthorizationRequired,
                                         );
+                                        manager_ref.fire_projected_if_changed(&bundle_id).await;
                                         let mut clients = active_clients.write().await;
                                         if clients
                                             .get(&bundle_id)
@@ -2540,6 +2750,7 @@ impl MCPServerManager {
                                             bundle_id.clone(),
                                             MCPServerConnectionState::Error,
                                         );
+                                        manager_ref.fire_projected_if_changed(&bundle_id).await;
                                         retry_counts
                                             .write()
                                             .await
@@ -2832,6 +3043,7 @@ impl MCPServerManager {
                 MCPServerConnectionState::Disconnected
             },
         );
+        self.fire_projected_if_changed(bundle_id).await;
         let mut connected = {
             let mut clients = self.active_clients.write().await;
             let connected = clients.remove(bundle_id);
@@ -2885,7 +3097,7 @@ impl MCPServerManager {
             HttpMCPClient::new(http.server_parameters).with_oauth_context(
                 bundle_id.clone(),
                 Arc::clone(&self.oauth_credential_store),
-                self.oauth_events.clone(),
+                self.runtime_status.clone(),
             ),
         );
         let mut oauth_clients = self.oauth_clients.write().await;
@@ -6828,5 +7040,547 @@ mod tests {
             .read()
             .await
             .contains_key(&exposed("serverB", "shared")));
+    }
+
+    // =========================================================================
+    // #186 逐 MCP runtime 状态变更事件（红灯基线：修复前下列断言全部失败——
+    // 状态写入点不发布事件，`collect_status_changes` 恒空）
+    // =========================================================================
+
+    /// 提取 `mcpserver_status_changed` 事件的 `(revision, status)`（实现后已改为 type 匹配）。
+    fn status_change_of(
+        ev: &crate::status::ComputerEvent,
+    ) -> Option<(u64, MCPServerRuntimeStatus)> {
+        match ev {
+            crate::status::ComputerEvent::MCPServerStatusChanged {
+                status, revision, ..
+            } => Some((*revision, status.clone())),
+            _ => None,
+        }
+    }
+
+    /// 在等待窗口内收集全部 `mcpserver_status_changed` 事件（Lagged 跳过；静默窗口止）。
+    async fn collect_status_changes(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::status::ComputerEvent>,
+        wait_ms: u64,
+    ) -> Vec<(u64, MCPServerRuntimeStatus)> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(wait_ms), rx.recv()).await {
+                Err(_) => break,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => break,
+                Ok(Ok(ev)) => {
+                    if let Some(change) = status_change_of(&ev) {
+                        out.push(change);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    async fn inject_mock_factory(manager: &MCPServerManager) {
+        let factory: ClientFactory = Arc::new(|_, _| {
+            Arc::new(super::test_support::MockSkillClient {
+                pages: vec![],
+                fail: false,
+                cap_fail: false,
+                read_text: String::new(),
+            })
+        });
+        manager.set_client_factory(Some(factory)).await;
+    }
+
+    #[tokio::test]
+    async fn start_publishes_activation_and_connection_sequence() {
+        // #186：显式 start → (Started,Disconnected) → (Started,Connecting) → (Started,Connected)。
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        inject_mock_factory(&manager).await;
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("seq", Some("seq")))
+            .await
+            .unwrap();
+        let bundle_id = bid("seq");
+
+        manager.start_client_by_id(&bundle_id).await.unwrap();
+
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let got: Vec<&str> = changes
+            .iter()
+            .map(|(_, s)| match (s.activation, s.connection) {
+                (MCPServerActivationState::Stopped, MCPServerConnectionState::Disconnected) => {
+                    "stopped/disconnected"
+                }
+                (MCPServerActivationState::Started, MCPServerConnectionState::Disconnected) => {
+                    "started/disconnected"
+                }
+                (MCPServerActivationState::Started, MCPServerConnectionState::Connecting) => {
+                    "started/connecting"
+                }
+                (MCPServerActivationState::Started, MCPServerConnectionState::Connected) => {
+                    "started/connected"
+                }
+                (a, c) => panic!("unexpected status: {a:?}/{c:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "stopped/disconnected",
+                "started/disconnected",
+                "started/connecting",
+                "started/connected"
+            ],
+            "add（首个提交 Stopped/Disconnected）+ start 按序发布（#186）"
+        );
+        for (_, change) in &changes {
+            assert_eq!(change.bundle_id, bundle_id, "事件必须携带 server 标识");
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_publishes_stopped_disconnected() {
+        // #186：显式 stop → (Stopped,Disconnected)，revision 严格递增。
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        inject_mock_factory(&manager).await;
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("stopped", Some("stopped")))
+            .await
+            .unwrap();
+        let bundle_id = bid("stopped");
+
+        manager.start_client_by_id(&bundle_id).await.unwrap();
+        manager.stop_client_by_id(&bundle_id).await.unwrap();
+
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (last_rev, last) = changes.last().expect("stop 必须发布状态事件（#186）");
+        assert_eq!(last.activation, MCPServerActivationState::Stopped);
+        assert_eq!(last.connection, MCPServerConnectionState::Disconnected);
+        // 事件序：start 序列在前，stop 状态为末尾；revision 全程严格单调（#186 新鲜度契约）。
+        assert!(*last_rev > 0, "stop 事件必须携带正 revision");
+        assert!(
+            changes.windows(2).all(|w| w[0].0 < w[1].0),
+            "状态事件 revision 必须严格单调递增"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_connect_failure_publishes_error() {
+        // #186：首次连接失败（非 OAuth）→ (Started,Error)；快照投影与事件一致（resync 不变量）。
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        let factory: ClientFactory =
+            Arc::new(|_, _| Arc::new(super::test_support::ConnectFailClient));
+        manager.set_client_factory(Some(factory)).await;
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("fail", Some("fail")))
+            .await
+            .unwrap();
+        let bundle_id = bid("fail");
+
+        assert!(manager.start_client_by_id(&bundle_id).await.is_err());
+
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, last) = changes.last().expect("首连失败必须发布状态事件（#186）");
+        assert_eq!(last.activation, MCPServerActivationState::Started);
+        assert_eq!(last.connection, MCPServerConnectionState::Error);
+        let snapshot = manager.get_server_runtime_statuses().await;
+        let row = snapshot.iter().find(|s| s.bundle_id == bundle_id).unwrap();
+        assert_eq!(row, last, "resync：快照投影必须与事件一致");
+    }
+
+    /// #186 health 重连事件测试用：live state 可迁移（disconnect→Disconnected / connect→Connected）、
+    /// connect 可注入首次失败；`health_check` 经 Notify 门控返回不健康（对齐 `HealthRaceClient` 姿势）。
+    struct LiveStateClient {
+        state: std::sync::RwLock<ClientState>,
+        connect_calls: AtomicUsize,
+        /// 首次 connect 注入失败（重连失败场景）。
+        fail_first_connect: bool,
+        health_ready: Arc<tokio::sync::Notify>,
+        health_release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for LiveStateClient {
+        fn state(&self) -> ClientState {
+            *self.state.read().unwrap()
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            let is_first = self.connect_calls.fetch_add(1, Ordering::SeqCst) == 0;
+            if is_first && self.fail_first_connect {
+                *self.state.write().unwrap() = ClientState::Disconnected;
+                return Err(MCPClientError::ConnectionError(
+                    "injected first connect failure".into(),
+                ));
+            }
+            *self.state.write().unwrap() = ClientState::Connected;
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            *self.state.write().unwrap() = ClientState::Disconnected;
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn health_check(&self) -> HealthCheckResult {
+            self.health_ready.notify_one();
+            self.health_release.notified().await;
+            HealthCheckResult {
+                is_healthy: false,
+                checked_at: std::time::Instant::now(),
+                error: Some("injected unhealthy".into()),
+                response_time_ms: None,
+            }
+        }
+    }
+
+    fn live_state_client(
+        fail_first_connect: bool,
+        ready: &Arc<tokio::sync::Notify>,
+        release: &Arc<tokio::sync::Notify>,
+    ) -> LiveStateClient {
+        LiveStateClient {
+            state: std::sync::RwLock::new(ClientState::Connected),
+            connect_calls: AtomicUsize::new(0),
+            fail_first_connect,
+            health_ready: Arc::clone(ready),
+            health_release: Arc::clone(release),
+        }
+    }
+
+    /// 组装「已连接 + 已启动」的 manager 与已注入 live client（health 重连测试统一前置）。
+    async fn health_ready_manager(
+        status: &Arc<RuntimeStatus>,
+        id: &str,
+        client: LiveStateClient,
+    ) -> (MCPServerManager, BundleId, Arc<LiveStateClient>) {
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(status));
+        let bundle_id = bid(id);
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bundle_id.clone(), stdio_cfg_with_bundle(id, Some(id)));
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        let client = Arc::new(client);
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), client.clone());
+        manager
+            .set_health_check_config(HealthCheckConfig {
+                interval_secs: 3600,
+                timeout_secs: 5,
+                enabled: true,
+            })
+            .await;
+        manager
+            .set_reconnect_policy(ReconnectPolicy {
+                enabled: true,
+                max_retries: 1,
+                initial_delay_ms: 0,
+                max_delay_ms: 0,
+                backoff_factor: 1.0,
+            })
+            .await;
+        (manager, bundle_id, client)
+    }
+
+    #[tokio::test]
+    async fn health_reconnect_failure_publishes_disconnected() {
+        // #186：健康重连失败 → 提交投影 (Started, Disconnected)（live 优先 remember Error，用户拍板）。
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let (manager, bundle_id, client) = health_ready_manager(
+            &status,
+            "health-fail",
+            live_state_client(
+                true,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+        let ready = client.health_ready.clone();
+        let release = client.health_release.clone();
+
+        let inspected = ready.notified();
+        manager.start_health_monitor().await;
+        tokio::time::timeout(Duration::from_secs(2), inspected)
+            .await
+            .expect("health monitor did not inspect the client");
+        release.notify_one();
+        sleep(Duration::from_millis(300)).await;
+        manager.stop_health_monitor().await;
+
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, last) = changes
+            .last()
+            .expect("health 重连失败必须发布状态事件（#186）");
+        assert_eq!(last.bundle_id, bundle_id);
+        assert_eq!(last.activation, MCPServerActivationState::Started);
+        assert_eq!(
+            last.connection,
+            MCPServerConnectionState::Disconnected,
+            "重连失败投影 = (Started, Disconnected)（live 优先，用户拍板）"
+        );
+        let snapshot = manager.get_server_runtime_statuses().await;
+        let row = snapshot.iter().find(|s| s.bundle_id == bundle_id).unwrap();
+        assert_eq!(row, last, "resync：快照投影必须与事件一致");
+    }
+
+    #[tokio::test]
+    async fn health_reconnect_recovery_publishes_connected() {
+        // #186：健康重连恢复 → 末事件 (Started, Connected)；revision 单调（恢复 > 断连）。
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let (manager, bundle_id, client) = health_ready_manager(
+            &status,
+            "health-ok",
+            live_state_client(
+                false,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+        let ready = client.health_ready.clone();
+        let release = client.health_release.clone();
+
+        let inspected = ready.notified();
+        manager.start_health_monitor().await;
+        tokio::time::timeout(Duration::from_secs(2), inspected)
+            .await
+            .expect("health monitor did not inspect the client");
+        release.notify_one();
+        sleep(Duration::from_millis(300)).await;
+        manager.stop_health_monitor().await;
+
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, last) = changes
+            .last()
+            .expect("health 重连恢复必须发布状态事件（#186）");
+        assert_eq!(last.bundle_id, bundle_id);
+        assert_eq!(last.activation, MCPServerActivationState::Started);
+        assert_eq!(last.connection, MCPServerConnectionState::Connected);
+    }
+
+    /// #186 弱锚点路径端到端：真实 `BaseMCPClient` 传输客户端经 `update_state` 触发回调 →
+    /// spawn 弱锚点 fire → 事件发布（Mock 桩走 trait 默认空回调，覆盖不到此路径）。
+    #[tokio::test]
+    async fn live_state_change_publishes_via_weak_anchors() {
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        let factory: ClientFactory =
+            Arc::new(|_, _| Arc::new(super::super::base_client::BaseMCPClient::new("anchor-test")));
+        manager.set_client_factory(Some(factory)).await;
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("anchor", Some("anchor")))
+            .await
+            .unwrap();
+        let bundle_id = bid("anchor");
+
+        manager.start_client_by_id(&bundle_id).await.unwrap();
+
+        // 回调任务与主路径 fire 并发，重复投影由去重吸收；末事件必为 live Connected 投影。
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, last) = changes
+            .last()
+            .expect("live 状态变化必须经弱锚点发布事件（#186）");
+        assert_eq!(last.bundle_id, bundle_id);
+        assert_eq!(last.activation, MCPServerActivationState::Started);
+        assert_eq!(last.connection, MCPServerConnectionState::Connected);
+    }
+
+    /// #186 弱锚点断环形态：manager 已 drop 后回调仍触发 → spawn 任务 upgrade 失败 no-op，
+    /// 不发布事件、不 panic。
+    #[tokio::test]
+    async fn state_change_callback_noops_after_manager_drop() {
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let client: StdArc<super::super::base_client::BaseMCPClient<&'static str>> =
+            Arc::new(super::super::base_client::BaseMCPClient::new("drop-test"));
+        let bundle_id = bid("dropped");
+        {
+            let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+            manager.servers_config.write().await.insert(
+                bundle_id.clone(),
+                stdio_cfg_with_bundle("dropped", Some("dropped")),
+            );
+            manager
+                .activation_intents
+                .write()
+                .await
+                .insert(bundle_id.clone());
+            manager.active_clients.write().await.insert(
+                bundle_id.clone(),
+                client.clone() as StdArc<dyn MCPClientProtocol>,
+            );
+            // 与 `start_client_by_id_inner` 相同的接线（闭包只持弱锚点集）。
+            let owner = bundle_id.clone();
+            let anchors = manager.projection_anchors();
+            client.set_state_change_callback(Box::new(move |_from, _to| {
+                let anchors = anchors.clone();
+                let owner = owner.clone();
+                tokio::spawn(async move {
+                    MCPServerManager::fire_projected(&anchors, &owner).await;
+                });
+            }));
+        } // manager drop：锁锚点全部失效（status 由测试持强引用，单独存活）。
+
+        client.update_state(ClientState::Connected).await;
+        // 让 spawn 的任务有机会运行（锚点已亡 → no-op）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "manager 已 drop：弱锚点 fire 必须 no-op、不得发布事件（#186 断环）"
+        );
+    }
+
+    /// #186：`register_raw_server`（Computer 层 add 的落点）与 `add_or_update_server` fire 语义对齐
+    /// ——首个提交即投影 (Stopped, Disconnected)，纯事件订阅方能看到新增 server。
+    #[tokio::test]
+    async fn register_raw_server_publishes_stopped_disconnected() {
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+
+        manager
+            .register_raw_server(stdio_cfg_with_bundle("raw", Some("raw")))
+            .await
+            .unwrap();
+
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, last) = changes
+            .last()
+            .expect("register_raw_server 必须发布状态事件（#186）");
+        assert_eq!(last.bundle_id, bid("raw"));
+        assert_eq!(last.activation, MCPServerActivationState::Stopped);
+        assert_eq!(last.connection, MCPServerConnectionState::Disconnected);
+    }
+
+    /// #186：首次连接即 OAuthRequired → (Started, AuthorizationRequired)（终态用户操作边界，
+    /// 优先于 live/remembered 的投影规则直测；此前仅经 clear_oauth 路径间接覆盖）。
+    struct OAuthRequiredConnectClient;
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for OAuthRequiredConnectClient {
+        fn state(&self) -> ClientState {
+            ClientState::Initialized
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            Err(MCPClientError::HttpAuthentication(
+                HttpAuthenticationError::OAuthRequired,
+            ))
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn first_connect_oauth_required_publishes_authorization_required() {
+        let status = Arc::new(RuntimeStatus::new());
+        let mut rx = status.subscribe();
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        let factory: ClientFactory = Arc::new(|_, _| Arc::new(OAuthRequiredConnectClient));
+        manager.set_client_factory(Some(factory)).await;
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("oauth", Some("oauth")))
+            .await
+            .unwrap();
+        let bundle_id = bid("oauth");
+
+        assert!(manager.start_client_by_id(&bundle_id).await.is_err());
+
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, last) = changes
+            .last()
+            .expect("首连 OAuthRequired 必须发布状态事件（#186）");
+        assert_eq!(last.activation, MCPServerActivationState::Started);
+        assert_eq!(
+            last.connection,
+            MCPServerConnectionState::AuthorizationRequired
+        );
+        let snapshot = manager.get_server_runtime_statuses().await;
+        let row = snapshot.iter().find(|s| s.bundle_id == bundle_id).unwrap();
+        assert_eq!(row, last, "resync：快照投影必须与事件一致");
     }
 }

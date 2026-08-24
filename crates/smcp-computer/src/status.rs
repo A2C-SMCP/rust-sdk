@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::RwLock as StdRwLock;
 
 use crate::diagnostics::{DiagnosticKey, DiagnosticSeverity, RuntimeDiagnostic};
+use crate::mcp_clients::model::MCPServerRuntimeStatus;
 use crate::mcp_clients::BundleId;
 use crate::oauth::OAuthStatus;
 use serde::{Deserialize, Serialize};
@@ -168,6 +169,9 @@ pub struct ComputerStatusSnapshot {
     /// 空集不序列化（#128 兼容姿势：干净快照字节不变）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<RuntimeDiagnostic>,
+    /// per-server runtime 状态序列 revision（#186；resync 时与事件 `revision` 对账）。
+    #[serde(default)]
+    pub server_status_revision: u64,
 }
 
 /// runtime 观测事件（[`Computer::subscribe_events`](crate::computer::Computer::subscribe_events) 广播）/ runtime event。
@@ -197,6 +201,26 @@ pub enum ComputerEvent {
         bundle_id: BundleId,
         /// Complete, non-secret status after the transition.
         status: OAuthStatus,
+    },
+    /// 逐 MCP Server 的正交 runtime 状态变化（#186）/ per-MCP-server runtime status changed。
+    ///
+    /// `status` 为**完整替换**（activation ⊥ connection 两轴，与
+    /// [`Computer::get_server_runtime_statuses`](crate::computer::Computer::get_server_runtime_statuses)
+    /// 快照投影同源——resync 不变量：快照与事件永不矛盾）；`revision` 为全局单调代数，下游
+    /// 忽略乱序/重复（`rev <= last_seen` 即弃）；同 bundle 连续相等状态**不重复发布**。
+    /// 订阅滞后（`Lagged`）/丢事件后经 [`Computer::status`](crate::computer::Computer::status)
+    /// 快照（携 `server_status_revision`）全量 resync。
+    ///
+    /// `#[serde(rename)]` 显式钉死 kind 串：`rename_all = "snake_case"` 会把手写缩写 `MCP` 拆成
+    /// `m_c_p_...`——事件 kind 是下游按字符串匹配的表面，必须稳定可预测。
+    #[serde(rename = "mcpserver_status_changed")]
+    MCPServerStatusChanged {
+        /// Stable MCP server identity.
+        bundle_id: BundleId,
+        /// Complete orthogonal runtime status after the transition.
+        status: MCPServerRuntimeStatus,
+        /// 该状态序列的全局单调 revision / global monotonic revision of this series.
+        revision: u64,
     },
     /// 诊断集变化（新增 / 替代 / 清除，#162）/ diagnostics set changed.
     ///
@@ -229,12 +253,17 @@ pub struct RuntimeStatus {
     capability_revision: AtomicU64,
     /// diagnostics revision 单调计数（第三轴，健康度 ⊥ 内容，#162/#128）/ monotonic diagnostics revision。
     diagnostics_revision: AtomicU64,
+    /// 第四轴：per-server runtime 状态序列的全局单调 revision（#186）。shutdown 后闸断、
+    /// 计数不回退（保单调），姿势与其它三轴一致。
+    server_status_revision: AtomicU64,
     /// shutdown 闸门：`true` 后事件闸断、bump 降 no-op（§4.7）/ shutdown gate。
     shutdown: AtomicBool,
     /// 公开诊断集（键控）/ the keyed diagnostics set。
     diagnostics: StdRwLock<DiagnosticsMap>,
     /// Last published OAuth status per bundle, used to suppress duplicate events.
     oauth_statuses: StdRwLock<HashMap<BundleId, OAuthStatus>>,
+    /// Last published per-server runtime status per bundle, used to suppress duplicate events (#186).
+    server_statuses: StdRwLock<HashMap<BundleId, MCPServerRuntimeStatus>>,
     /// 事件广播发送端（订阅方经 `subscribe` 取 Receiver）/ event broadcast sender。
     events: broadcast::Sender<ComputerEvent>,
 }
@@ -248,9 +277,11 @@ impl RuntimeStatus {
             config_revision: AtomicU64::new(0),
             capability_revision: AtomicU64::new(0),
             diagnostics_revision: AtomicU64::new(0),
+            server_status_revision: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             diagnostics: StdRwLock::new(BTreeMap::new()),
             oauth_statuses: StdRwLock::new(HashMap::new()),
+            server_statuses: StdRwLock::new(HashMap::new()),
             events,
         }
     }
@@ -361,6 +392,45 @@ impl RuntimeStatus {
             .cloned()
     }
 
+    /// Publish a changed per-server orthogonal runtime status through the shared Computer event
+    /// stream (#186), gated after shutdown.
+    ///
+    /// Same-status-for-same-bundle updates are suppressed (full-status equality, so a display-name
+    /// change also counts as a change). Returns `Some(revision)` when published, `None` when
+    /// suppressed (duplicate or shutdown).
+    pub(crate) fn update_server_status(
+        &self,
+        bundle_id: BundleId,
+        status: MCPServerRuntimeStatus,
+    ) -> Option<u64> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        let changed = {
+            let mut statuses = self
+                .server_statuses
+                .write()
+                .expect("server status cache poisoned");
+            if statuses.get(&bundle_id) == Some(&status) {
+                false
+            } else {
+                statuses.insert(bundle_id.clone(), status.clone());
+                true
+            }
+        };
+        if changed {
+            let revision = self.server_status_revision.fetch_add(1, Ordering::AcqRel) + 1;
+            self.emit(ComputerEvent::MCPServerStatusChanged {
+                bundle_id,
+                status,
+                revision,
+            });
+            Some(revision)
+        } else {
+            None
+        }
+    }
+
     /// 诊断集变更的统一底座：`f` 在写锁内变更 map 并**如实返回是否真变**；真变才 bump
     /// [`diagnostics_revision`](Self::diagnostics_revision) 并广播 [`ComputerEvent::DiagnosticsChanged`]。
     /// shutdown 先行闸断（§4.7：描述的 runtime 已不存在 → map 冻结、不 bump、不发事件）。
@@ -448,6 +518,11 @@ impl RuntimeStatus {
         self.diagnostics_revision.load(Ordering::Acquire)
     }
 
+    /// 当前 per-server runtime 状态序列 revision（#186，resync 对齐锚点）/ current server-status revision。
+    pub fn server_status_revision(&self) -> u64 {
+        self.server_status_revision.load(Ordering::Acquire)
+    }
+
     /// 是否已 shutdown / whether shutdown has been entered。
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
@@ -490,6 +565,7 @@ impl RuntimeStatus {
             degraded_reason,
             diagnostics_revision: self.diagnostics_revision(),
             diagnostics,
+            server_status_revision: self.server_status_revision(),
         }
     }
 }
@@ -960,5 +1036,225 @@ mod tests {
         ));
         let v2 = serde_json::to_value(s.snapshot(0, 0, 0, 0)).unwrap();
         assert!(v2.get("diagnostics").is_some());
+    }
+
+    // =========================================================================
+    // #186 逐 MCP runtime 状态变更事件（红灯基线：`update_server_status` /
+    // `MCPServerStatusChanged` 尚不存在，下列测试编译失败＝缺口确认）
+    // =========================================================================
+
+    use crate::mcp_clients::model::{
+        MCPServerActivationState, MCPServerConnectionState, MCPServerRuntimeStatus,
+    };
+
+    fn server_status(
+        bundle_id: BundleId,
+        activation: MCPServerActivationState,
+        connection: MCPServerConnectionState,
+    ) -> MCPServerRuntimeStatus {
+        let name = bundle_id.to_string();
+        MCPServerRuntimeStatus {
+            bundle_id,
+            name,
+            activation,
+            connection,
+        }
+    }
+
+    #[test]
+    fn update_server_status_dedups_and_bumps_monotonic() {
+        // #186：同 bundle 连续相等 → 去重（None / rev 不变）；状态变化 → 单调 +1；异 server 交错仍全局单调。
+        let s = RuntimeStatus::new();
+        let a = BundleId::try_from("a").unwrap();
+        let b = BundleId::try_from("b").unwrap();
+
+        assert!(
+            s.update_server_status(
+                a.clone(),
+                server_status(
+                    a.clone(),
+                    MCPServerActivationState::Started,
+                    MCPServerConnectionState::Disconnected
+                ),
+            ) == Some(1),
+            "首发布 → rev 1"
+        );
+        assert!(
+            s.update_server_status(
+                a.clone(),
+                server_status(
+                    a.clone(),
+                    MCPServerActivationState::Started,
+                    MCPServerConnectionState::Disconnected
+                ),
+            )
+            .is_none(),
+            "同状态去重、不 bump"
+        );
+        assert!(
+            s.update_server_status(
+                a.clone(),
+                server_status(
+                    a.clone(),
+                    MCPServerActivationState::Started,
+                    MCPServerConnectionState::Connected
+                ),
+            ) == Some(2),
+            "状态变化 → rev 2"
+        );
+        assert!(
+            s.update_server_status(
+                b.clone(),
+                server_status(
+                    b,
+                    MCPServerActivationState::Stopped,
+                    MCPServerConnectionState::Disconnected
+                ),
+            ) == Some(3),
+            "异 server 仍全局单调"
+        );
+        assert_eq!(s.server_status_revision(), 3);
+    }
+
+    #[tokio::test]
+    async fn update_server_status_gated_after_shutdown() {
+        // #186：shutdown 后闸断——更新 no-op、revision 不回退、无新状态事件（§4.7）。
+        let s = RuntimeStatus::new();
+        let a = BundleId::try_from("a").unwrap();
+        let mut rx = s.subscribe();
+
+        let first = s
+            .update_server_status(
+                a.clone(),
+                server_status(
+                    a.clone(),
+                    MCPServerActivationState::Started,
+                    MCPServerConnectionState::Disconnected,
+                ),
+            )
+            .unwrap();
+        // drain 预 shutdown 事件（首发布），避免与闸断断言混淆。
+        while rx.try_recv().is_ok() {}
+        s.enter_shutdown();
+        let after = s.update_server_status(
+            a.clone(),
+            server_status(
+                a,
+                MCPServerActivationState::Started,
+                MCPServerConnectionState::Connected,
+            ),
+        );
+        assert!(after.is_none(), "shutdown 后更新必须 no-op");
+        assert_eq!(s.server_status_revision(), first, "revision 不回退");
+
+        // 闸断后：绝不出现新状态事件（终态 LifecycleChanged 为唯一允许的尾部事件）。
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let mut saw_status_event = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, ComputerEvent::MCPServerStatusChanged { .. }) {
+                saw_status_event = true;
+            }
+        }
+        assert!(
+            !saw_status_event,
+            "shutdown 后不得发布 mcpserver_status_changed"
+        );
+    }
+
+    #[test]
+    fn snapshot_carries_server_status_revision() {
+        // #186：快照暴露当前 server status revision（lag/resync 对齐锚点）；serde 缺省 0（加性字段姿势）。
+        let s = RuntimeStatus::new();
+        let snap = s.snapshot(0, 0, 0, 0);
+        assert_eq!(snap.server_status_revision, 0);
+        let v = serde_json::to_value(&snap).unwrap();
+        assert_eq!(v["server_status_revision"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn mcpserver_status_changed_kind_string_is_stable() {
+        // #186：kind 串是下游按字符串匹配的表面——`rename_all = "snake_case"` 会把 `MCP` 缩写
+        // 拆成 `m_c_p_...`；`#[serde(rename)]` 若在重构中被误删即静默改名，须用测试钉死。
+        let s = RuntimeStatus::new();
+        let bid = BundleId::try_from("kind").unwrap();
+        let mut rx = s.subscribe();
+        s.update_server_status(
+            bid.clone(),
+            server_status(
+                bid,
+                MCPServerActivationState::Started,
+                MCPServerConnectionState::Disconnected,
+            ),
+        );
+        let ev = rx.try_recv().expect("update_server_status 同步发布事件");
+        assert!(matches!(ev, ComputerEvent::MCPServerStatusChanged { .. }));
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["kind"], serde_json::json!("mcpserver_status_changed"));
+    }
+
+    #[tokio::test]
+    async fn lagged_receiver_resyncs_via_snapshot_revision() {
+        // #186 验收 4：broadcast 溢出 → Lagged → 快照携 `server_status_revision` 全量 resync；
+        // resync 后的事件 revision 继续单调，下游凭 revision 过滤即恢复一致。
+        let s = RuntimeStatus::new();
+        let mut rx = s.subscribe();
+        let bid = BundleId::try_from("lag").unwrap();
+        let mut last_published = 0u64;
+        for i in 0..(EVENT_CHANNEL_CAPACITY + 8) {
+            let connection = if i % 2 == 0 {
+                MCPServerConnectionState::Connected
+            } else {
+                MCPServerConnectionState::Disconnected
+            };
+            if let Some(rev) = s.update_server_status(
+                bid.clone(),
+                server_status(bid.clone(), MCPServerActivationState::Started, connection),
+            ) {
+                last_published = rev;
+            }
+        }
+        assert_eq!(
+            last_published,
+            (EVENT_CHANNEL_CAPACITY + 8) as u64,
+            "交替状态逐次发布（去重不吸收）"
+        );
+        // 订阅后未消费 → 溢出；首个 recv 必为 Lagged。
+        match rx.recv().await {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            other => panic!("expected Lagged after overflow, got {other:?}"),
+        }
+        // resync：快照 revision 与最后发布事件对账（Lagged 前的历史整体丢弃、快照全量重建）。
+        let snap = s.snapshot(0, 0, 0, 0);
+        assert_eq!(snap.server_status_revision, last_published);
+        // 下游真实姿势：resync 后缓冲区仍滞留旧事件，按 revision 过滤逐一丢弃（rev <= last_seen 即弃）。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(ComputerEvent::MCPServerStatusChanged { revision, .. })) => {
+                    assert!(revision <= last_published, "缓冲中只有 resync 前的旧事件");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) | Err(_) => break, // 静默窗口止
+            }
+        }
+        // 续接：resync 后事件 revision 继续单调（状态须不同于循环末次发布，否则被去重吸收）。
+        let next = s
+            .update_server_status(
+                bid.clone(),
+                server_status(
+                    bid,
+                    MCPServerActivationState::Started,
+                    MCPServerConnectionState::Connected,
+                ),
+            )
+            .expect("resync 后继续发布");
+        assert_eq!(next, last_published + 1);
+        let ComputerEvent::MCPServerStatusChanged { revision, .. } =
+            rx.recv().await.expect("resync 后事件续接")
+        else {
+            panic!("expected status event after resync");
+        };
+        assert_eq!(revision, next);
     }
 }

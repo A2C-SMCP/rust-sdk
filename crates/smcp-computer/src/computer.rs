@@ -2001,6 +2001,11 @@ impl<S: Session> Computer<S> {
 
         // 设置管理器到实例 / Set manager to instance
         *self.mcp_manager.write().await = Some(manager);
+
+        // 健康监控不在此默认启动：`start_health_monitor` 是公开的选择性 API；boot 默认启用属于
+        // 生产行为切换（慢 health_check 的下游 server 会被 30s 周期误判收割且不自愈，见 #186
+        // 复审裁决），如需默认启用须另行显式推进并通知下游。
+
         drop(lifecycle_gate);
 
         // #106：起 MCP 变化通知单消费者任务。reactor 持 Weak manager（断 sender 自持环——sender 存于 manager，
@@ -3331,6 +3336,25 @@ impl<S: Session> Computer<S> {
         }
     }
 
+    /// 启动健康监控（逐 MCP 健康检查 + 自动重连）/ Start the per-MCP health monitor.
+    ///
+    /// **boot_up 不默认启动**（生产行为切换裁决，见 #186）：慢 `health_check` 的下游 server 会被
+    /// 周期误判收割且不自愈——下游按需显式调用本方法开启。健康检查重连的连接状态变化经
+    /// #186 统一投影链发布 [`ComputerEvent::MCPServerStatusChanged`] 事件。
+    /// 幂等：再次调用先停旧任务再起新任务；`shutdown`/`close` 均会防御性停止。
+    pub async fn start_health_monitor(&self) {
+        if let Some(manager) = self.current_manager().await {
+            manager.start_health_monitor().await;
+        }
+    }
+
+    /// 停止健康监控 / Stop the per-MCP health monitor（幂等；无任务时 no-op）。
+    pub async fn stop_health_monitor(&self) {
+        if let Some(manager) = self.current_manager().await {
+            manager.stop_health_monitor().await;
+        }
+    }
+
     // ── #114 S7：runtime status / observability 公开面 / runtime status surface ──────────
 
     /// runtime 状态快照（#114 S7）：生命周期 + 分离单调 revision + 能力汇总 + 公开诊断 / runtime status snapshot。
@@ -3986,7 +4010,7 @@ impl<S: Session> Computer<S> {
     async fn new_manager(&self) -> MCPServerManager {
         let manager =
             MCPServerManager::with_oauth_credential_store(Arc::clone(&self.oauth_credential_store))
-                .with_oauth_events(Arc::clone(&self.status));
+                .with_runtime_status(Arc::clone(&self.status));
         if let Some(factory) = self.client_factory_override.clone() {
             manager.set_client_factory(Some(factory)).await;
         }
@@ -4356,6 +4380,9 @@ impl<S: Session> Computer<S> {
         // mcp_lifecycle_gate 排他。
         let manager = self.mcp_manager.write().await.take();
         if let Some(manager) = manager {
+            // 防御性收口：无论监控由谁经公开 `start_health_monitor` 启动，shutdown 前停止，
+            // 防后台重连继续骚扰关闭中的实例（#186 事件接线一并覆盖 monitor 触发的状态变化）。
+            manager.stop_health_monitor().await;
             manager.close().await?;
         }
 
@@ -8376,7 +8403,6 @@ mod tests {
         computer.boot_up().await.unwrap();
         computer.start_mcp_client(&bid("s")).await.unwrap();
         let before = computer.capability_revision();
-
         assert!(computer.restart_mcp_client(&bid("s")).await.is_err());
         assert!(computer.capability_revision() > before);
         assert!(!computer
@@ -8384,6 +8410,112 @@ mod tests {
             .await
             .into_iter()
             .any(|status| status.bundle_id == bid("s") && status.is_connected()));
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #186：Computer 层健康监控透传——`start_health_monitor` 首轮检查即触达活跃客户端、
+    /// `stop_health_monitor` 幂等。（boot 不默认启动由代码注释与复审锚定；监控首轮检查在
+    /// spawn 即刻执行、boot 时无活跃客户端，30s 周期使「未启动」在快测试窗口内不可观测。）
+    #[tokio::test]
+    async fn computer_health_monitor_opt_in_passthrough() {
+        use crate::mcp_clients::manager::ClientFactory;
+        use crate::mcp_clients::model::{
+            CallToolResult, ClientState, HealthCheckResult, MCPClientError, MCPClientProtocol,
+            ReadResourceResult, Resource, Tool,
+        };
+        use serde_json::Value;
+        use std::time::Duration;
+
+        struct GatedHealthClient {
+            ready: std::sync::Arc<tokio::sync::Notify>,
+            release: std::sync::Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl MCPClientProtocol for GatedHealthClient {
+            fn state(&self) -> ClientState {
+                ClientState::Connected
+            }
+            async fn connect(&self) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn disconnect(&self) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+                Ok(vec![])
+            }
+            async fn call_tool(
+                &self,
+                _tool: &str,
+                _params: Value,
+            ) -> Result<CallToolResult, MCPClientError> {
+                Err(MCPClientError::ProtocolError("n/a".into()))
+            }
+            async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+                Ok(vec![])
+            }
+            async fn list_resources_page(
+                &self,
+                _cursor: Option<String>,
+            ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+                Ok((vec![], None))
+            }
+            async fn get_window_detail(
+                &self,
+                _resource: Resource,
+            ) -> Result<ReadResourceResult, MCPClientError> {
+                Err(MCPClientError::ProtocolError("n/a".into()))
+            }
+            async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+                Ok(())
+            }
+            async fn health_check(&self) -> HealthCheckResult {
+                self.ready.notify_one();
+                self.release.notified().await;
+                HealthCheckResult {
+                    is_healthy: false,
+                    checked_at: std::time::Instant::now(),
+                    error: Some("injected unhealthy".into()),
+                    response_time_ms: None,
+                }
+            }
+        }
+
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (c_ready, c_release) = (ready.clone(), release.clone());
+        let factory: ClientFactory = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(GatedHealthClient {
+                ready: c_ready.clone(),
+                release: c_release.clone(),
+            })
+        });
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(HashMap::from([("s".to_string(), stdio_with_arg("static"))])),
+            false,
+            false,
+        )
+        .with_client_factory(factory);
+        computer.boot_up().await.unwrap();
+        computer.start_mcp_client(&bid("s")).await.unwrap();
+
+        // 显式开启 → 首轮检查触达活跃客户端（透传接线证明）。
+        let inspected = ready.notified();
+        computer.start_health_monitor().await;
+        tokio::time::timeout(Duration::from_secs(2), inspected)
+            .await
+            .expect("start_health_monitor 必须触达活跃客户端（#186 透传）");
+        // 放行 gated health_check（不健康 → 重连路径，桩瞬时完成）；随后停止并验证幂等。
+        release.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        computer.stop_health_monitor().await;
+        computer.stop_health_monitor().await;
         computer.shutdown().await.unwrap();
     }
 
@@ -9967,7 +10099,8 @@ mod tests {
         // 给 shutdown 一个进入 gate 排队的窗口（红灯路径下 unmount 必被卡死，绿灯路径下必成功）。
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        tokio::time::timeout(Duration::from_secs(2), computer.unmount_server(&bid("srv")))
+        // 判据是「2s 内完成」而非内层结果：绿灯 = 不被排队写锁死锁卡住（#178）。
+        let _ = tokio::time::timeout(Duration::from_secs(2), computer.unmount_server(&bid("srv")))
             .await
             .expect("unmount_server 被排队写锁阻塞（锁跨无界 await，#178）");
     }

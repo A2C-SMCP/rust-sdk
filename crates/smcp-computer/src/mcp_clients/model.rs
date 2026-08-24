@@ -819,6 +819,18 @@ pub trait MCPClientProtocol: Send + Sync {
     /// 获取客户端状态 / Get client state
     fn state(&self) -> ClientState;
 
+    /// 设置 live 状态变化回调（#186 逐 MCP runtime 状态事件接线）/ set live state-change callback。
+    ///
+    /// **默认空实现**——仅传输类（stdio/sse/http）经
+    /// [`BaseMCPClient`](crate::mcp_clients::base_client::BaseMCPClient) 委托覆写；未接线时
+    /// live `ClientState` 变化（进程自退、传输断连等）不产生状态事件（管理器 remember 路径
+    /// 之外的变化须靠本回调触发 `MCPServerManager::fire_projected_if_changed`）。
+    fn set_state_change_callback(
+        &self,
+        _callback: Box<dyn Fn(ClientState, ClientState) + Send + Sync>,
+    ) {
+    }
+
     /// 连接MCP服务器 / Connect to MCP server
     async fn connect(&self) -> Result<(), MCPClientError>;
 

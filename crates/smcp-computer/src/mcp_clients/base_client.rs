@@ -11,10 +11,14 @@ use super::model::*;
 use crate::errors::ComputerError;
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
+
+/// 状态变化回调类型（#186 逐 MCP 状态事件接线；别名拆分以压低字段类型复杂度）/ state-change callback type.
+type StateChangeCallback = Box<dyn Fn(ClientState, ClientState) + Send + Sync>;
 
 /// MCP客户端基础实现 / Base MCP client implementation
 pub struct BaseMCPClient<P> {
@@ -29,7 +33,7 @@ pub struct BaseMCPClient<P> {
     /// 关闭信号 / Shutdown signal
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     /// 状态变化回调 / State change callback
-    state_change_callback: Option<Box<dyn Fn(ClientState, ClientState) + Send + Sync>>,
+    state_change_callback: StdRwLock<Option<StateChangeCallback>>,
 }
 
 impl<P> BaseMCPClient<P>
@@ -48,16 +52,19 @@ where
             state_notifier: state_tx,
             keep_alive_handle: Arc::new(Mutex::new(None)),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
-            state_change_callback: None,
+            state_change_callback: StdRwLock::new(None),
         }
     }
 
     /// 设置状态变化回调 / Set state change callback
-    pub fn set_state_change_callback<F>(&mut self, callback: F)
+    pub fn set_state_change_callback<F>(&self, callback: F)
     where
         F: Fn(ClientState, ClientState) + Send + Sync + 'static,
     {
-        self.state_change_callback = Some(Box::new(callback));
+        *self
+            .state_change_callback
+            .write()
+            .expect("state_change_callback poisoned") = Some(Box::new(callback));
     }
 
     /// 获取当前状态 / Get current state
@@ -72,15 +79,24 @@ where
 
     /// 更新状态 / Update state
     pub async fn update_state(&self, new_state: ClientState) {
-        let mut state = self.state.write().await;
-        let old_state = *state;
-        *state = new_state;
+        let old_state = {
+            let mut state = self.state.write().await;
+            let old = *state;
+            *state = new_state;
+            // 通知与状态变更同锁串行（watch send 非阻塞、不触发下游同步代码）：出锁后并发
+            // update_state 交错 send 会让 watch 通道滞留陈旧终值（终值 ≠ 实际态，#186 复审）。
+            let _ = self.state_notifier.send(new_state);
+            old
+        };
 
-        // 通知状态变化 / Notify state change
-        let _ = self.state_notifier.send(new_state);
-
-        // 调用回调 / Call callback
-        if let Some(ref callback) = self.state_change_callback {
+        // 回调须在锁外：其 spawn 的 #186 fire 会同步读 `self.state()`，持写锁期间调用会走到
+        // block_on 降级路径 / Callback runs outside the write guard to avoid the block_on fallback.
+        if let Some(callback) = self
+            .state_change_callback
+            .read()
+            .expect("state_change_callback poisoned")
+            .as_ref()
+        {
             callback(old_state, new_state);
         }
 
@@ -397,7 +413,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_change_callback() {
-        let mut client = BaseMCPClient::new("test");
+        // #186：setter 改 `&self` 后不再需要可变异绑定。
+        let client = BaseMCPClient::new("test");
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 

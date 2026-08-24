@@ -2997,6 +2997,15 @@ async fn test_computer_clear_oauth_commits_capability_event_and_joined_tool_list
             status: OAuthStatus::Unauthorized,
         }
     );
+    // #186：clear_oauth 回写连接意图（按 activation_intents 定 AuthRequired/Disconnected）→ 状态事件。
+    let status_event = events.recv().await.unwrap();
+    assert!(matches!(
+        status_event,
+        ComputerEvent::MCPServerStatusChanged { bundle_id: bid, status, .. }
+            if bid == bundle_id
+                && status.activation == MCPServerActivationState::Started
+                && status.connection == MCPServerConnectionState::AuthorizationRequired
+    ));
     let capability_event = events.recv().await.unwrap();
     assert!(matches!(
         capability_event,
