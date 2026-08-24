@@ -199,6 +199,7 @@ mod tests {
             license: Some("MIT".to_string()),
             compatibility: None,
             allowed_tools: None,
+            tags: None,
             version: Some("1.0.0".to_string()),
             skill_metadata: None,
         }

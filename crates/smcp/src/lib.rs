@@ -973,7 +973,7 @@ pub const UPDATE_SKILLS_NOTIFICATION: &str = events::NOTIFY_UPDATE_SKILLS;
 /// SKILL 引用对象 / Skill reference object —— `client:get_skills` 返回列表元素。
 ///
 /// 必选 4 字段 / required 4：`name` / `source` / `path` / `description`（生产方 Computer **MUST** 发齐；
-/// 消费方 Agent **MUST NOT** 假定任一可选字段存在）。其余 6 个为可选（`#[serde(skip_serializing_if)]`）。
+/// 消费方 Agent **MUST NOT** 假定任一可选字段存在）。其余 7 个为可选（`#[serde(skip_serializing_if)]`）。
 ///
 /// 关键约束 / Key invariants：
 /// - `name` 是协议主键（合成全局唯一裸名），Agent **MUST** 当不透明可比较字符串（勿解析结构）。
@@ -1002,6 +1002,12 @@ pub struct A2CSkillRef {
     /// frontmatter `allowed-tools` 规范化为列表 / normalized `allowed-tools` list（可选）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// frontmatter `tags` 透传（分类元数据）/ `tags` passthrough（可选）。
+    ///
+    /// 纯透传不校验（协议 skill.md §1.5）：仅严格 `list[str]` 才填 ref；畸形（非 Array / 混合元素）→
+    /// 字段省略 + 诊断日志，SKILL 照常注册。无 tags 时键**整个缺席**（非 null）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
     /// 版本（非 frontmatter 派生）/ version (not frontmatter-derived)（可选）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -1980,6 +1986,7 @@ mod tests {
             license: None,
             compatibility: None,
             allowed_tools: None,
+            tags: None,
             version: None,
             skill_metadata: None,
         };
@@ -1988,6 +1995,8 @@ mod tests {
         assert_eq!(v["source"], "user");
         assert!(v.get("uri").is_none());
         assert!(v.get("version").is_none());
+        // 无 tags → 序列化键整个缺席（非 null）。
+        assert!(v.get("tags").is_none());
         assert_eq!(serde_json::from_value::<A2CSkillRef>(v).unwrap(), user);
 
         let marketplace = A2CSkillRef {
@@ -2011,14 +2020,23 @@ mod tests {
             license: Some("MIT".to_string()),
             compatibility: Some(">=0.2".to_string()),
             allowed_tools: Some(vec!["read".to_string(), "grep".to_string()]),
+            tags: Some(vec!["audit".to_string(), "compliance".to_string()]),
             version: Some("1.2.0".to_string()),
             skill_metadata: Some(serde_json::json!({ "x": 1 })),
         };
         let v = serde_json::to_value(&mcp).unwrap();
         assert_eq!(v["uri"], "skill://tfrobot-tools/code-review");
         assert_eq!(v["allowed_tools"][1], "grep");
+        assert_eq!(v["tags"][0], "audit");
         assert_eq!(v["skill_metadata"]["x"], 1);
         assert_eq!(serde_json::from_value::<A2CSkillRef>(v).unwrap(), mcp);
+        // 空数组 → 键存在且为 `[]`（0 条合法）：「键缺席」与「空数组」是不可合并的两个形状。
+        let empty = A2CSkillRef {
+            tags: Some(Vec::new()),
+            ..marketplace.clone()
+        };
+        let v = serde_json::to_value(&empty).unwrap();
+        assert_eq!(v["tags"], serde_json::json!([]));
     }
 
     #[test]

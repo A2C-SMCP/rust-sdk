@@ -240,6 +240,7 @@ mod tests {
             license: None,
             compatibility: None,
             allowed_tools: None,
+            tags: None,
             version: None,
             skill_metadata: None,
         }
