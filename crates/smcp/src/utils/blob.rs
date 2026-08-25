@@ -1092,7 +1092,9 @@ fn extract_reason(err: &ErrorPayload) -> BlobErrorReason {
 /// 版本握手 MINOR 严格匹配 + 同房间传递 ⇒ 连上即保证房间内 Computer 同 minor。本检查是编译期
 /// 常量的运行时断言（常量回退时 fail-fast）；首块超时兜底见 [`BlobUploadError::UploadUnsupported`]。
 fn ensure_upload_supported(version: &str) -> Result<(), BlobUploadError> {
-    let minor = crate::ProtocolVersion::parse(version).map(|v| v.minor).unwrap_or(0);
+    let minor = crate::ProtocolVersion::parse(version)
+        .map(|v| v.minor)
+        .unwrap_or(0);
     if minor >= 4 {
         Ok(())
     } else {
@@ -1135,9 +1137,11 @@ fn finalize_upload(
     declared_sha: &str,
     declared_total: u64,
 ) -> Result<PutBlobResult, BlobUploadError> {
-    let landing_path = ret.landing_path.as_deref().filter(|s| !s.is_empty()).ok_or(
-        BlobUploadError::IncompleteAck,
-    )?;
+    let landing_path = ret
+        .landing_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or(BlobUploadError::IncompleteAck)?;
     let echo_sha = ret.sha256.as_deref().unwrap_or("");
     if !echo_sha.is_empty() && echo_sha != declared_sha {
         return Err(BlobUploadError::EchoMismatch {
@@ -1899,7 +1903,8 @@ mod tests {
 
     #[tokio::test]
     async fn pump_empty_payload_rejected() {
-        let call = |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
+        let call =
+            |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
         let err = pump_blob(call, "c", &[], PumpBlobOptions::default())
             .await
             .unwrap_err();
@@ -1909,12 +1914,16 @@ mod tests {
     #[tokio::test]
     async fn pump_zero_chunk_size_rejected() {
         // 显式 0 → bad_chunk_size（镜像 python `_prepare_declaration`：`chunk_size < 1` 显拒）。
-        let call = |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
+        let call =
+            |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
         let err = pump_blob(
             call,
             "c",
             b"hello",
-            PumpBlobOptions { chunk_size: 0, ..Default::default() },
+            PumpBlobOptions {
+                chunk_size: 0,
+                ..Default::default()
+            },
         )
         .await
         .unwrap_err();
@@ -1925,7 +1934,10 @@ mod tests {
             call_sync,
             "c",
             b"hello",
-            PumpBlobOptions { chunk_size: 0, ..Default::default() },
+            PumpBlobOptions {
+                chunk_size: 0,
+                ..Default::default()
+            },
         )
         .unwrap_err();
         assert_eq!(err_sync, BlobUploadError::BadChunkSize { chunk_size: 0 });
@@ -1935,7 +1947,8 @@ mod tests {
     async fn pump_4019_busy_maps_write_failed() {
         let call = |_req: PutBlobChunkRequest| async {
             Err::<PutBlobRet, _>(BlobChunkFailure::Protocol(
-                ErrorPayload::new(4019, "too many concurrent uploads").with_detail("reason", "busy"),
+                ErrorPayload::new(4019, "too many concurrent uploads")
+                    .with_detail("reason", "busy"),
             ))
         };
         let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
@@ -2027,12 +2040,15 @@ mod tests {
 
     #[tokio::test]
     async fn pump_first_chunk_timeout_is_unsupported_and_carries_data() {
-        let call = |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
+        let call =
+            |_req: PutBlobChunkRequest| async { Err::<PutBlobRet, _>(BlobChunkFailure::Timeout) };
         let err = pump_blob(call, "c", b"hello", PumpBlobOptions::default())
             .await
             .unwrap_err();
         match err {
-            BlobUploadError::UploadUnsupported { data, total_size, .. } => {
+            BlobUploadError::UploadUnsupported {
+                data, total_size, ..
+            } => {
                 assert_eq!(data, b"hello");
                 assert_eq!(total_size, 5);
             }
@@ -2055,10 +2071,21 @@ mod tests {
                 }
             }
         };
-        let err = pump_blob(call, "c", b"hello", PumpBlobOptions { chunk_size: 2, ..Default::default() })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BlobUploadError::ChunkTransport(_)), "got {err:?}");
+        let err = pump_blob(
+            call,
+            "c",
+            b"hello",
+            PumpBlobOptions {
+                chunk_size: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, BlobUploadError::ChunkTransport(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2095,8 +2122,14 @@ mod tests {
     #[test]
     fn write_reason_parse_round_trip() {
         for r in [
-            "invalid_upload", "invalid_declaration", "range", "too_large", "busy",
-            "forbidden", "integrity", "io_error",
+            "invalid_upload",
+            "invalid_declaration",
+            "range",
+            "too_large",
+            "busy",
+            "forbidden",
+            "integrity",
+            "io_error",
         ] {
             assert_eq!(BlobWriteErrorReason::parse(r).as_str(), r);
         }

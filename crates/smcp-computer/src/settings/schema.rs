@@ -303,9 +303,7 @@ fn validate_landing_root(key: &str, value: &Value, scope: SettingsScope) -> Vali
             vec![err(
                 scope,
                 key,
-                format!(
-                    "landingRoot must be an absolute path string, got relative path {s:?}"
-                ),
+                format!("landingRoot must be an absolute path string, got relative path {s:?}"),
             )],
         ),
         None => (
@@ -313,7 +311,10 @@ fn validate_landing_root(key: &str, value: &Value, scope: SettingsScope) -> Vali
             vec![err(
                 scope,
                 key,
-                format!("expected absolute path string, got {}", json_type_name(value)),
+                format!(
+                    "expected absolute path string, got {}",
+                    json_type_name(value)
+                ),
             )],
         ),
     }
@@ -882,11 +883,8 @@ mod tests {
         assert!(!cleaned.contains_key("landingRoot"));
         assert!(!errors.is_empty());
 
-        let (cleaned, errors) = validate_settings(
-            &json!({"landingRoot": 123}),
-            SettingsScope::User,
-            None,
-        );
+        let (cleaned, errors) =
+            validate_settings(&json!({"landingRoot": 123}), SettingsScope::User, None);
         assert!(!cleaned.contains_key("landingRoot"));
         assert!(!errors.is_empty());
 

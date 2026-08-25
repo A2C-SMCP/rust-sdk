@@ -1931,8 +1931,15 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "agent", "blob", "chunk_offset", "computer", "eof", "name_hint", "req_id",
-                "sha256", "total_size"
+                "agent",
+                "blob",
+                "chunk_offset",
+                "computer",
+                "eof",
+                "name_hint",
+                "req_id",
+                "sha256",
+                "total_size"
             ]
             .into_iter()
             .collect()
@@ -1944,9 +1951,7 @@ mod tests {
 
     #[test]
     fn test_put_blob_req_first_chunk_without_name_hint_omits_key() {
-        let req = PutBlobReq::first_chunk(
-            "a", "c", 0, true, b"x", 1, "abc", None,
-        );
+        let req = PutBlobReq::first_chunk("a", "c", 0, true, b"x", 1, "abc", None);
         let v = serde_json::to_value(&req).unwrap();
         assert!(
             v.get("name_hint").is_none(),
@@ -1972,9 +1977,17 @@ mod tests {
             v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["agent", "blob", "chunk_offset", "computer", "eof", "req_id", "upload_id"]
-                .into_iter()
-                .collect()
+            [
+                "agent",
+                "blob",
+                "chunk_offset",
+                "computer",
+                "eof",
+                "req_id",
+                "upload_id"
+            ]
+            .into_iter()
+            .collect()
         );
         let back: PutBlobReq = serde_json::from_value(v).unwrap();
         assert_eq!(back, req);

@@ -149,7 +149,11 @@ async fn put_blob_over_real_socketio_roundtrip() {
     computer.join_office("o", "c1").await.expect("join");
     // join 完成后 handler 类（computer_ops）由连接层接好——就绪由 join ack 保证。
 
-    let socket = computer_socket.lock().unwrap().clone().expect("computer socket");
+    let socket = computer_socket
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("computer socket");
     let data: Vec<u8> = (0..10240).map(|i| (i % 251) as u8).collect();
     let sha = smcp::utils::hash::sha256_hex(&data);
     let chunk: usize = 256;
@@ -163,9 +167,18 @@ async fn put_blob_over_real_socketio_roundtrip() {
         "blob": b64(&data[0..chunk]),
     });
     let ack1 = drive_chunk(&socket, first_payload).await;
-    let keys1: std::collections::BTreeSet<&str> =
-        ack1.as_object().unwrap().keys().map(String::as_str).collect();
-    assert_eq!(keys1, ["chunk_offset", "req_id", "upload_id"].into_iter().collect());
+    let keys1: std::collections::BTreeSet<&str> = ack1
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys1,
+        ["chunk_offset", "req_id", "upload_id"]
+            .into_iter()
+            .collect()
+    );
     let upload_id = ack1["upload_id"].as_str().unwrap().to_string();
     assert_eq!(upload_id.len(), 32);
 
@@ -189,13 +202,24 @@ async fn put_blob_over_real_socketio_roundtrip() {
         "blob": b64(&data[offset..]),
     });
     let ack_final = drive_chunk(&socket, final_payload).await;
-    let keys2: std::collections::BTreeSet<&str> =
-        ack_final.as_object().unwrap().keys().map(String::as_str).collect();
+    let keys2: std::collections::BTreeSet<&str> = ack_final
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     assert_eq!(
         keys2,
-        ["chunk_offset", "landing_path", "req_id", "sha256", "total_size", "upload_id"]
-            .into_iter()
-            .collect()
+        [
+            "chunk_offset",
+            "landing_path",
+            "req_id",
+            "sha256",
+            "total_size",
+            "upload_id"
+        ]
+        .into_iter()
+        .collect()
     );
     assert_eq!(ack_final["total_size"], json!(data.len()));
     assert_eq!(ack_final["sha256"], json!(sha));
