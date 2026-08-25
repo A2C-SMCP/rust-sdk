@@ -67,8 +67,7 @@ static SAFE_NAME_CHARS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^A-Za-z0-9._-]+").unwrap());
 
 /// sha256 十六进制形态判定（64 位小写 hex）/ 64-char lowercase-hex sha256 shape.
-static SHA256_HEX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[0-9a-f]{64}$").unwrap());
+static SHA256_HEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{64}$").unwrap());
 
 const MAX_NAME_HINT_LEN: usize = 64;
 
@@ -86,13 +85,17 @@ fn blob_write_error(reason: &str, message: impl Into<String>) -> ErrorPayload {
 ///
 /// 返回值恒可安全嵌入 ``f"{upload_id}_{fragment}"``（``upload_id`` 为 hex32 前缀，构造上杜绝穿越）。
 pub fn sanitize_name_hint(name_hint: Option<&str>) -> String {
-    let Some(raw) = name_hint else { return String::new() };
+    let Some(raw) = name_hint else {
+        return String::new();
+    };
     if raw.is_empty() {
         return String::new();
     }
     let fragment = SAFE_NAME_CHARS_RE.replace_all(raw.trim(), "_");
     let fragment: String = fragment.chars().take(MAX_NAME_HINT_LEN).collect();
-    fragment.trim_matches(|c| c == '.' || c == '_' || c == '-').to_string()
+    fragment
+        .trim_matches(|c| c == '.' || c == '_' || c == '-')
+        .to_string()
 }
 
 /// 单个在途上传会话的受限状态 / The bounded state of one in-flight upload.
@@ -113,7 +116,10 @@ impl UploadSession {
     fn close(&mut self) {
         if let Err(e) = fs::remove_file(&self.part_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("put_blob: cannot unlink stale .part {:?}: {e}", self.part_path);
+                tracing::warn!(
+                    "put_blob: cannot unlink stale .part {:?}: {e}",
+                    self.part_path
+                );
             }
         }
     }
@@ -187,7 +193,10 @@ impl BlobUploadStore {
         let total_size = match req.total_size {
             Some(v) if v >= 1 => v,
             _ => {
-                tracing::warn!("client:put_blob invalid declaration: total_size={:?}", req.total_size);
+                tracing::warn!(
+                    "client:put_blob invalid declaration: total_size={:?}",
+                    req.total_size
+                );
                 return Err(blob_write_error(
                     "invalid_declaration",
                     "total_size must be an int >= 1",
@@ -211,10 +220,11 @@ impl BlobUploadStore {
                 "client:put_blob too_large: declared={total_size} cap={}",
                 self.thresholds.upload_max_bytes
             );
-            return Err(
-                blob_write_error("too_large", "declared total_size exceeds the upload cap")
-                    .with_detail("total_size", total_size),
-            );
+            return Err(blob_write_error(
+                "too_large",
+                "declared total_size exceeds the upload cap",
+            )
+            .with_detail("total_size", total_size));
         }
 
         // 4) 并发上限 → busy（Agent SHOULD 退避后从 0 重传）。
@@ -230,7 +240,10 @@ impl BlobUploadStore {
         // 5) 接纳会话：建 landing 暂存目录（不可建 → forbidden「沙箱不可写」）+ 开 ``.part`` 句柄。
         let part_dir = root.join(PART_DIR_NAME);
         if let Err(e) = fs::create_dir_all(&part_dir) {
-            tracing::warn!("client:put_blob landing root not writable: {} ({e})", root.display());
+            tracing::warn!(
+                "client:put_blob landing root not writable: {} ({e})",
+                root.display()
+            );
             return Err(blob_write_error("forbidden", "landing root not writable"));
         }
         let upload_id = uuid::Uuid::new_v4().simple().to_string();
@@ -245,7 +258,10 @@ impl BlobUploadStore {
         let file = match fs::File::create(&part_path) {
             Ok(f) => f,
             Err(e) => {
-                tracing::warn!("client:put_blob cannot create .part {}: {e}", part_path.display());
+                tracing::warn!(
+                    "client:put_blob cannot create .part {}: {e}",
+                    part_path.display()
+                );
                 return Err(blob_write_error("forbidden", "landing root not writable"));
             }
         };
@@ -361,10 +377,11 @@ impl BlobUploadStore {
                 session.total_size
             );
             sessions.insert(upload_id.clone(), session);
-            return Err(
-                blob_write_error("range", "final chunk does not complete the declared total_size")
-                    .with_detail("upload_id", upload_id),
-            );
+            return Err(blob_write_error(
+                "range",
+                "final chunk does not complete the declared total_size",
+            )
+            .with_detail("upload_id", upload_id));
         }
 
         // 追加 + 增量 hash；IO 失败 → io_error（作废会话，删 .part）。
@@ -414,8 +431,10 @@ impl BlobUploadStore {
                 session.declared_sha256
             );
             session.close();
-            return Err(blob_write_error("integrity", "sha256 mismatch; upload discarded")
-                .with_detail("upload_id", upload_id));
+            return Err(
+                blob_write_error("integrity", "sha256 mismatch; upload discarded")
+                    .with_detail("upload_id", upload_id),
+            );
         }
         // 原子 rename 定稿（`.part` → 安全名产物）；IO 失败 → io_error。
         if let Err(e) = fs::rename(&session.part_path, &session.final_path) {
@@ -471,7 +490,9 @@ impl BlobUploadStore {
     /// 为何按龄宽限（表外 ≠ 立即孤儿）：同机多 Computer 进程共享同一 user-scope ``landingRoot``
     /// 时，另一进程在途会话的 ``.part`` 也在本表之外——其 mtime 随每次写块刷新，永不满龄。
     fn collect_orphan_parts(&self, sessions: &mut HashMap<String, UploadSession>) {
-        let Some(root) = &self.landing_root else { return };
+        let Some(root) = &self.landing_root else {
+            return;
+        };
         let part_dir = root.join(PART_DIR_NAME);
         let live: std::collections::HashSet<String> = sessions
             .values()
@@ -489,7 +510,9 @@ impl BlobUploadStore {
             return; // 目录不存在（尚无上传）/ absent until the first upload.
         };
         for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             if file_type.is_dir() {
                 continue; // 只收文件；目录非本 store 产物，勿递归（围栏纪律）。
             }
@@ -521,7 +544,9 @@ impl BlobUploadStore {
     /// Python 以 ``RuntimeError`` 显式抛；本实现返 `io_error`（fail-closed 且不中断 socketio 循环）。
     /// **canonicalize 失败亦 fail-closed**（审查 #195 🟡6a：断言解析不了 ≠ 安全，宁可报 io_error）。
     fn assert_within_root(&self, path: &Path, upload_id: &str) -> Result<(), ErrorPayload> {
-        let Some(root) = &self.landing_root else { return Ok(()) };
+        let Some(root) = &self.landing_root else {
+            return Ok(());
+        };
         let root_resolved = fs::canonicalize(root).map_err(|e| {
             tracing::error!(
                 "put_blob fence: landing root unresolvable {root:?} ({e}); fail-closed (upload_id={upload_id})"
@@ -604,10 +629,7 @@ mod tests {
 
     /// 带 root 的 store + 一次完整首块 ack（返回 upload_id）。
     fn seeded_store(tmp: &tempfile::TempDir) -> (BlobUploadStore, String) {
-        let store = BlobUploadStore::new(
-            Some(tmp.path().to_path_buf()),
-            BlobThresholds::default(),
-        );
+        let store = BlobUploadStore::new(Some(tmp.path().to_path_buf()), BlobThresholds::default());
         let ack = store
             .handle_chunk(&first_req(&[0u8; 10], false, &"a".repeat(64)))
             .unwrap();
@@ -640,10 +662,7 @@ mod tests {
     #[test]
     fn multi_chunk_roundtrip_reassembles_on_disk() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = BlobUploadStore::new(
-            Some(tmp.path().to_path_buf()),
-            BlobThresholds::default(),
-        );
+        let store = BlobUploadStore::new(Some(tmp.path().to_path_buf()), BlobThresholds::default());
         let data: Vec<u8> = (0..10240).map(|i| (i % 251) as u8).collect();
         let sha = sha_hex(&data);
         let chunk: usize = 256;
@@ -653,7 +672,12 @@ mod tests {
         let upload_id = ack1.upload_id.clone();
         let mut offset = chunk;
         while offset + chunk < data.len() {
-            let req = chunk_req(&upload_id, &data[offset..offset + chunk], offset as u64, false);
+            let req = chunk_req(
+                &upload_id,
+                &data[offset..offset + chunk],
+                offset as u64,
+                false,
+            );
             let ack = store.handle_chunk(&req).unwrap();
             assert_eq!(ack.upload_id, upload_id);
             offset += chunk;
@@ -682,7 +706,10 @@ mod tests {
             .unwrap();
         assert!(ret.landing_path.is_some());
         assert_eq!(ret.total_size, Some(data.len() as u64));
-        assert_eq!(std::fs::read(ret.landing_path.as_ref().unwrap()).unwrap(), data);
+        assert_eq!(
+            std::fs::read(ret.landing_path.as_ref().unwrap()).unwrap(),
+            data
+        );
     }
 
     #[test]
@@ -713,7 +740,10 @@ mod tests {
         }
         let mut req = first_req(b"x", true, &"a".repeat(64));
         req.sha256 = None;
-        assert_eq!(reason_of(&store.handle_chunk(&req).unwrap_err()), "invalid_declaration");
+        assert_eq!(
+            reason_of(&store.handle_chunk(&req).unwrap_err()),
+            "invalid_declaration"
+        );
     }
 
     #[test]
@@ -721,7 +751,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = BlobUploadStore::new(
             Some(tmp.path().to_path_buf()),
-            BlobThresholds { upload_max_bytes: 8, ..BlobThresholds::default() },
+            BlobThresholds {
+                upload_max_bytes: 8,
+                ..BlobThresholds::default()
+            },
         );
         let err = store
             .handle_chunk(&first_req(&[0u8; 9], false, &"a".repeat(64)))
@@ -736,7 +769,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = BlobUploadStore::new(
             Some(tmp.path().to_path_buf()),
-            BlobThresholds { upload_max_concurrent: 1, ..BlobThresholds::default() },
+            BlobThresholds {
+                upload_max_concurrent: 1,
+                ..BlobThresholds::default()
+            },
         );
         store
             .handle_chunk(&base(&[0u8; 10], 0, false, 10, &"a".repeat(64)))
@@ -773,10 +809,15 @@ mod tests {
         let (store, id) = seeded_store(&tmp);
         let mut req = chunk_req(&id, b"x", 0, false);
         req.total_size = Some(11); // 欺瞒：再携声明字段。
-        assert_eq!(reason_of(&store.handle_chunk(&req).unwrap_err()), "invalid_declaration");
+        assert_eq!(
+            reason_of(&store.handle_chunk(&req).unwrap_err()),
+            "invalid_declaration"
+        );
         // 会话保留（python 同构）：合法推进（offset 10 空块 eof）→ 静默走到定稿（此处 sha 不符 →
         // integrity）而非 invalid_upload —— 证明声明重发不 drop 会话。
-        let err2 = store.handle_chunk(&chunk_req(&id, b"", 10, true)).unwrap_err();
+        let err2 = store
+            .handle_chunk(&chunk_req(&id, b"", 10, true))
+            .unwrap_err();
         assert_eq!(reason_of(&err2), "integrity");
     }
 
@@ -787,7 +828,10 @@ mod tests {
         // 首块（offset 0 == received 0，in-order 先过）但 blob 非合法 base64 → invalid_declaration。
         let mut req = first_req(b"x", true, &"a".repeat(64));
         req.blob = "@@@".to_string();
-        assert_eq!(reason_of(&store.handle_chunk(&req).unwrap_err()), "invalid_declaration");
+        assert_eq!(
+            reason_of(&store.handle_chunk(&req).unwrap_err()),
+            "invalid_declaration"
+        );
     }
 
     #[test]
@@ -864,7 +908,11 @@ mod tests {
         let part_dir = tmp.path().join(PART_DIR_NAME);
         assert_eq!(std::fs::read_dir(&part_dir).unwrap().count(), 0);
         // 无最终产物。
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1, "仅 .a2c-upload");
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "仅 .a2c-upload"
+        );
     }
 
     #[test]
@@ -872,7 +920,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = BlobUploadStore::new(
             Some(tmp.path().to_path_buf()),
-            BlobThresholds { upload_idle_timeout_seconds: 1, ..BlobThresholds::default() },
+            BlobThresholds {
+                upload_idle_timeout_seconds: 1,
+                ..BlobThresholds::default()
+            },
         );
         let ack = store
             .handle_chunk(&base(&[0u8; 10], 0, false, 10, &"a".repeat(64)))
@@ -883,7 +934,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(reason_of(&err), "invalid_upload");
         // 过期会话的 .part 已被删。
-        assert_eq!(std::fs::read_dir(tmp.path().join(PART_DIR_NAME)).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join(PART_DIR_NAME))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -891,7 +947,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = BlobUploadStore::new(
             Some(tmp.path().to_path_buf()),
-            BlobThresholds { upload_idle_timeout_seconds: 1, ..BlobThresholds::default() },
+            BlobThresholds {
+                upload_idle_timeout_seconds: 1,
+                ..BlobThresholds::default()
+            },
         );
         let part_dir = tmp.path().join(PART_DIR_NAME);
         std::fs::create_dir_all(&part_dir).unwrap();
@@ -899,7 +958,12 @@ mod tests {
         std::fs::write(&stale, b"x").unwrap();
         // 手动回拨 mtime 到超龄（避免测试内 sleep）。
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
-        fs::File::options().write(true).open(&stale).unwrap().set_modified(old).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         // 下一次首块上传触发孤儿 GC。
         store
             .handle_chunk(&base(&[0u8; 10], 0, false, 10, &"a".repeat(64)))
@@ -912,7 +976,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = BlobUploadStore::new(
             Some(tmp.path().to_path_buf()),
-            BlobThresholds { upload_idle_timeout_seconds: 3600, ..BlobThresholds::default() },
+            BlobThresholds {
+                upload_idle_timeout_seconds: 3600,
+                ..BlobThresholds::default()
+            },
         );
         let part_dir = tmp.path().join(PART_DIR_NAME);
         std::fs::create_dir_all(&part_dir).unwrap();
@@ -932,7 +999,12 @@ mod tests {
             .handle_chunk(&base(&[0u8; 10], 0, false, 10, &"a".repeat(64)))
             .unwrap();
         store.discard_all();
-        assert_eq!(std::fs::read_dir(tmp.path().join(PART_DIR_NAME)).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join(PART_DIR_NAME))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     /// 对拍 python（#196 实测向量）：4019 flat payload 逐字段一致（code 裸整数 / details.reason）。
@@ -961,18 +1033,18 @@ mod tests {
         let sha = sha_hex(data);
         let ack1 = store.handle_chunk(&first_req(data, false, &sha)).unwrap();
         let v1 = serde_json::to_value(&ack1).unwrap();
-        let keys1: BTreeSet<&str> =
-            v1.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys1: BTreeSet<&str> = v1.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys1,
-            ["chunk_offset", "req_id", "upload_id"].into_iter().collect()
+            ["chunk_offset", "req_id", "upload_id"]
+                .into_iter()
+                .collect()
         );
         let ack2 = store
             .handle_chunk(&chunk_req(&ack1.upload_id, b"", 10, true))
             .unwrap();
         let v2 = serde_json::to_value(&ack2).unwrap();
-        let keys2: BTreeSet<&str> =
-            v2.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys2: BTreeSet<&str> = v2.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys2,
             [

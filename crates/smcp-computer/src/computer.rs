@@ -28,8 +28,8 @@ use tracing::{debug, error, info, warn};
 // INT-01 #68：SKILL / blob 子系统编排 / SKILL & blob subsystem orchestration。
 use crate::blob::{
     decode_blob_handle, default_thresholds, encode_toolspool_handle, BlobHandleError, BlobResolver,
-    BlobThresholds, BlobTooLargeError, BlobUploadStore, DecodedHandle, ResolvedBlob, SkillBlobResolver,
-    SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
+    BlobThresholds, BlobTooLargeError, BlobUploadStore, DecodedHandle, ResolvedBlob,
+    SkillBlobResolver, SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
 use crate::governance::{

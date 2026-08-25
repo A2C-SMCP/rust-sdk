@@ -33,8 +33,8 @@ use smcp::utils::blob::{
 };
 use smcp::{
     events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetComputerConfigRet,
-    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, PutBlobRet, ReqId, Role,
-    SMCPTool, SessionInfo, SMCP_NAMESPACE,
+    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, PutBlobRet, ReqId, Role, SMCPTool,
+    SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -711,11 +711,9 @@ impl AsyncSmcpAgent {
                     }
                     Ok(resp) => match serde_json::from_value::<PutBlobRet>(resp) {
                         Ok(ret) => Ok(ret),
-                        Err(e) => {
-                            Err(BlobChunkFailure::Transport(format!(
-                                "malformed PutBlobRet: {e}"
-                            )))
-                        }
+                        Err(e) => Err(BlobChunkFailure::Transport(format!(
+                            "malformed PutBlobRet: {e}"
+                        ))),
                     },
                     Err(SmcpAgentError::Timeout) => Err(BlobChunkFailure::Timeout),
                     Err(e) => Err(BlobChunkFailure::Transport(format!("{e}"))),
