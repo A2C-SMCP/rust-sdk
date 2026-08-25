@@ -28,7 +28,7 @@ async fn find_available_port() -> u16 {
 fn counter_handler(
     counter: Arc<AtomicUsize>,
     notify: Option<Arc<Notify>>,
-) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+) -> impl Fn(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
 {
     move |_payload: Payload, _client| {
         let counter = counter.clone();
@@ -50,7 +50,7 @@ fn capturing_handler(
     counter: Arc<AtomicUsize>,
     notify: Option<Arc<Notify>>,
     captured: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
-) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+) -> impl Fn(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
 {
     move |payload: Payload, _client| {
         let counter = counter.clone();
@@ -579,7 +579,7 @@ async fn test_update_notifications_and_role_checks() {
 fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+) -> impl Fn(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
 {
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);

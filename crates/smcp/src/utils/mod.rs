@@ -24,8 +24,10 @@ pub mod slice;
 
 pub use atomic_io::{atomic_write_bytes, atomic_write_text, unique_tmp_path};
 pub use blob::{
-    drain_blob, drain_blob_sync, BlobChunkRequest, BlobErrorReason, BlobTransferError,
-    DrainBlobOptions, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_RETRIES,
+    drain_blob, drain_blob_sync, pump_blob, pump_blob_sync, BlobChunkFailure, BlobChunkRequest,
+    BlobErrorReason, BlobTransferError, BlobUploadError, BlobWriteErrorReason, DrainBlobOptions,
+    PumpBlobOptions, PutBlobChunkRequest, PutBlobDeclaration, PutBlobResult, DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_RETRIES,
 };
 pub use bundle_id::{
     is_bundle_id_char, is_valid_bundle_id, validate_bundle_id, BundleId, BundleIdError,

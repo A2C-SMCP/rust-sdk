@@ -19,6 +19,10 @@
 //! - [`BlobThresholds::too_large_cap`]：`total_size` 超此 → `4017 too_large`，**不铸句柄、零字节传输**（DoS 防御）。
 //! - [`BlobThresholds::chunk_max_bytes`]：单块原始字节上限，`clamp` 后恒保证 base64(+33%)+envelope ≤ Server
 //!   `maxHttpBufferSize`（默认 1 MiB）。
+//! - [`BlobThresholds::upload_idle_timeout_seconds`] / [`BlobThresholds::upload_max_concurrent`] /
+//!   [`BlobThresholds::upload_max_bytes`]：`client:put_blob` 上行**有界会话**（协议 blob-transfer.md §3
+//!   MUST）——闲置超时 / 并发上限 / 首块声明上限（超 → `4019 too_large`，零字节落盘）。阈值 SDK
+//!   自治、独立于下行三键。
 
 use std::env;
 
@@ -28,6 +32,12 @@ pub const DEFAULT_INLINE_BUDGET: u64 = 32 * 1024;
 pub const DEFAULT_TOO_LARGE_CAP: u64 = 100 * 1024 * 1024;
 /// 单块原始字节上限默认值（256 KiB）/ Default per-chunk raw-byte ceiling。
 pub const DEFAULT_CHUNK_MAX_BYTES: u64 = 256 * 1024;
+/// 上传会话闲置超时默认值（120 s）/ Default upload-session idle timeout。
+pub const DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS: u64 = 120;
+/// 并发上传会话上限默认值（4）/ Default concurrent-upload cap。
+pub const DEFAULT_UPLOAD_MAX_CONCURRENT: u64 = 4;
+/// 首块声明总字节上限默认值（100 MiB）/ Default declared-upload size cap。
+pub const DEFAULT_UPLOAD_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 /// env 覆盖键：inline 预算 / Env override key for the inline budget。
 pub const ENV_INLINE_BUDGET: &str = "A2C_SKILL_INLINE_BUDGET";
@@ -35,6 +45,12 @@ pub const ENV_INLINE_BUDGET: &str = "A2C_SKILL_INLINE_BUDGET";
 pub const ENV_TOO_LARGE_CAP: &str = "A2C_SKILL_MAX_SIZE";
 /// env 覆盖键：单块上限 / Env override key for the chunk ceiling。
 pub const ENV_CHUNK_MAX_BYTES: &str = "A2C_BLOB_CHUNK_BYTES";
+/// env 覆盖键：上传会话闲置超时 / Env override key for the upload idle timeout。
+pub const ENV_UPLOAD_IDLE_TIMEOUT: &str = "A2C_UPLOAD_IDLE_TIMEOUT";
+/// env 覆盖键：并发上传会话上限 / Env override key for the concurrent-upload cap。
+pub const ENV_UPLOAD_MAX_CONCURRENT: &str = "A2C_UPLOAD_MAX_CONCURRENT";
+/// env 覆盖键：首块声明总字节上限 / Env override key for the declared-upload size cap。
+pub const ENV_UPLOAD_MAX_BYTES: &str = "A2C_UPLOAD_MAX_BYTES";
 
 /// SKILL / blob 阈值集合（不可变，便于注入与共享）/ Immutable threshold bundle for injection。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +61,12 @@ pub struct BlobThresholds {
     pub too_large_cap: u64,
     /// 单块原始字节上限 / per-chunk raw-byte ceiling。
     pub chunk_max_bytes: u64,
+    /// 上传会话闲置超时（秒）；作废后该 `upload_id` → `4019 invalid_upload` / idle timeout。
+    pub upload_idle_timeout_seconds: u64,
+    /// 并发上传会话上限；打满 → `4019 busy` / concurrent-upload cap。
+    pub upload_max_concurrent: u64,
+    /// 首块声明总字节上限；超 → `4019 too_large`（零字节落盘）/ declared-upload size cap。
+    pub upload_max_bytes: u64,
 }
 
 impl Default for BlobThresholds {
@@ -53,6 +75,9 @@ impl Default for BlobThresholds {
             inline_budget: DEFAULT_INLINE_BUDGET,
             too_large_cap: DEFAULT_TOO_LARGE_CAP,
             chunk_max_bytes: DEFAULT_CHUNK_MAX_BYTES,
+            upload_idle_timeout_seconds: DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS,
+            upload_max_concurrent: DEFAULT_UPLOAD_MAX_CONCURRENT,
+            upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
         }
     }
 }
@@ -78,6 +103,15 @@ pub fn default_thresholds() -> BlobThresholds {
         inline_budget: read_positive_int_env(ENV_INLINE_BUDGET, DEFAULT_INLINE_BUDGET),
         too_large_cap: read_positive_int_env(ENV_TOO_LARGE_CAP, DEFAULT_TOO_LARGE_CAP),
         chunk_max_bytes: read_positive_int_env(ENV_CHUNK_MAX_BYTES, DEFAULT_CHUNK_MAX_BYTES),
+        upload_idle_timeout_seconds: read_positive_int_env(
+            ENV_UPLOAD_IDLE_TIMEOUT,
+            DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS,
+        ),
+        upload_max_concurrent: read_positive_int_env(
+            ENV_UPLOAD_MAX_CONCURRENT,
+            DEFAULT_UPLOAD_MAX_CONCURRENT,
+        ),
+        upload_max_bytes: read_positive_int_env(ENV_UPLOAD_MAX_BYTES, DEFAULT_UPLOAD_MAX_BYTES),
     }
 }
 
@@ -102,7 +136,14 @@ mod tests {
     static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
-        for key in [ENV_INLINE_BUDGET, ENV_TOO_LARGE_CAP, ENV_CHUNK_MAX_BYTES] {
+        for key in [
+            ENV_INLINE_BUDGET,
+            ENV_TOO_LARGE_CAP,
+            ENV_CHUNK_MAX_BYTES,
+            ENV_UPLOAD_IDLE_TIMEOUT,
+            ENV_UPLOAD_MAX_CONCURRENT,
+            ENV_UPLOAD_MAX_BYTES,
+        ] {
             env::remove_var(key);
         }
     }
@@ -113,6 +154,9 @@ mod tests {
         assert_eq!(t.inline_budget, 32 * 1024);
         assert_eq!(t.too_large_cap, 100 * 1024 * 1024);
         assert_eq!(t.chunk_max_bytes, 256 * 1024);
+        assert_eq!(t.upload_idle_timeout_seconds, 120);
+        assert_eq!(t.upload_max_concurrent, 4);
+        assert_eq!(t.upload_max_bytes, 100 * 1024 * 1024);
     }
 
     #[test]
@@ -129,10 +173,16 @@ mod tests {
         env::set_var(ENV_INLINE_BUDGET, "1024");
         env::set_var(ENV_TOO_LARGE_CAP, "2048");
         env::set_var(ENV_CHUNK_MAX_BYTES, "4096");
+        env::set_var(ENV_UPLOAD_IDLE_TIMEOUT, "10");
+        env::set_var(ENV_UPLOAD_MAX_CONCURRENT, "2");
+        env::set_var(ENV_UPLOAD_MAX_BYTES, "8192");
         let t = default_thresholds();
         assert_eq!(t.inline_budget, 1024);
         assert_eq!(t.too_large_cap, 2048);
         assert_eq!(t.chunk_max_bytes, 4096);
+        assert_eq!(t.upload_idle_timeout_seconds, 10);
+        assert_eq!(t.upload_max_concurrent, 2);
+        assert_eq!(t.upload_max_bytes, 8192);
         clear_env();
     }
 

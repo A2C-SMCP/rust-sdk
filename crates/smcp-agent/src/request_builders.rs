@@ -17,7 +17,7 @@
 
 use smcp::{
     AgentCallData, GetBlobReq, GetComputerConfigReq, GetDesktopReq, GetResourcesReq, GetSkillReq,
-    GetSkillsReq, GetToolsReq, ReqId, ToolCallReq,
+    GetSkillsReq, GetToolsReq, PutBlobReq, ReqId, ToolCallReq,
 };
 
 use crate::error::{Result, SmcpAgentError};
@@ -157,6 +157,43 @@ pub fn build_get_blob_request(
         blob_handle: blob_handle.to_string(),
         chunk_offset,
         max_chunk_bytes,
+    }
+}
+
+/// 创建通用二进制上行写入单块请求 / Create a `client:put_blob` chunk request（v0.4.0 #195）。
+///
+/// 对标 Python `create_put_blob_request`：base64 编码在 [`PutBlobReq`] 构造器内完成；
+/// 首块（`declaration` 非 `None`）与后续块由 [`pump_blob`](smcp::utils::blob::pump_blob) 正确装配——
+/// 本函数仅做纯组装（`chunk_offset` / `eof` 由 Agent 驱动推进）。
+#[allow(clippy::too_many_arguments)]
+pub fn build_put_blob_request(
+    agent: &str,
+    computer: &str,
+    upload_id: Option<&str>,
+    chunk_offset: u64,
+    eof: bool,
+    blob_raw: &[u8],
+    declaration: Option<smcp::utils::blob::PutBlobDeclaration>,
+) -> PutBlobReq {
+    match declaration {
+        Some(d) => PutBlobReq::first_chunk(
+            agent,
+            computer,
+            chunk_offset,
+            eof,
+            blob_raw,
+            d.total_size,
+            &d.sha256,
+            d.name_hint.as_deref(),
+        ),
+        None => PutBlobReq::chunk(
+            agent,
+            computer,
+            upload_id.expect("subsequent chunk requires upload_id"),
+            chunk_offset,
+            eof,
+            blob_raw,
+        ),
     }
 }
 
@@ -325,5 +362,57 @@ mod tests {
             validate_emit_event("agent:whatever"),
             Err(SmcpAgentError::InvalidEvent { .. })
         ));
+    }
+
+    // ── #195：client:put_blob 上行 / upstream write channel ─────────────────
+
+    #[test]
+    fn test_build_put_blob_request_first_chunk_shape() {
+        use smcp::utils::blob::PutBlobDeclaration;
+        let v = to_val(&build_put_blob_request(
+            "agent1",
+            "c1",
+            None,
+            0,
+            false,
+            b"hello",
+            Some(PutBlobDeclaration {
+                total_size: 5,
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+                name_hint: Some("x.txt".into()),
+            }),
+        ));
+        assert_eq!(v["agent"], "agent1");
+        assert_eq!(v["computer"], "c1");
+        assert_eq!(v["chunk_offset"], 0);
+        assert_eq!(v["eof"], false);
+        assert_eq!(v["total_size"], 5);
+        assert_eq!(
+            v["sha256"],
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(v["name_hint"], "x.txt");
+        assert_eq!(v["blob"], "aGVsbG8="); // base64("hello")
+        assert!(v.get("upload_id").is_none(), "首块不得带 upload_id");
+    }
+
+    #[test]
+    fn test_build_put_blob_request_subsequent_chunk_shape() {
+        let v = to_val(&build_put_blob_request(
+            "agent1",
+            "c1",
+            Some("u1"),
+            5,
+            true,
+            b"world",
+            None,
+        ));
+        assert_eq!(v["upload_id"], "u1");
+        assert_eq!(v["chunk_offset"], 5);
+        assert_eq!(v["eof"], true);
+        assert_eq!(v["blob"], "d29ybGQ="); // base64("world")
+        for key in ["total_size", "sha256", "name_hint"] {
+            assert!(v.get(key).is_none(), "后续块不得携带 {key}");
+        }
     }
 }

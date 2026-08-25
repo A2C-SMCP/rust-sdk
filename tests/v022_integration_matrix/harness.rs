@@ -244,6 +244,76 @@ pub async fn spawn_computer(
     computer
 }
 
+/// [`spawn_computer`] 的 put_blob 变体（#195 / 🟡1）：额外注入 `landing_root`
+/// （`with_landing_root` override，短路 settings）与 **hermetic** `config_dir`
+/// （`with_config_dir` → settings 查询全空、不受宿主进程 cwd 污染），使「已配置 root 落盘
+/// 成功」与「未配置 root → 4019 forbidden」两场景都**确定**。
+pub async fn spawn_computer_with_landing(
+    server_url: &str,
+    office: &str,
+    name: &str,
+    td: &TempDir,
+    thresholds: Option<BlobThresholds>,
+    landing_root: Option<&std::path::Path>,
+) -> Computer<SilentSession> {
+    std::env::set_var("A2C_SKILL_WATCH_POLLING", "1");
+
+    let mut servers = HashMap::new();
+    servers.insert(
+        MCP_NAME.to_string(),
+        MCPServerConfig::Stdio(StdioServerConfig::new(
+            MCP_NAME,
+            StdioServerParameters {
+                command: "node".into(),
+                args: vec![mcp_server_path()],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        )),
+    );
+
+    let mut computer = Computer::new(
+        name,
+        SilentSession::new("matrix-session"),
+        None,
+        Some(servers),
+        true,
+        true,
+    )
+    .with_skill_home(td.path().join("skills"))
+    .with_blob_cache_root(td.path().join("blob"))
+    .with_config_dir(td.path().join("config"));
+    if let Some(t) = thresholds {
+        computer = computer.with_blob_thresholds(t);
+    }
+    if let Some(r) = landing_root {
+        computer = computer.with_landing_root(r);
+    }
+
+    computer.boot_up().await.expect("computer boot_up");
+    computer
+        .start_all_mcp_clients()
+        .await
+        .expect("start MCP servers");
+    computer
+        .connect_socketio(
+            server_url,
+            ConnectOptions {
+                auth_payload: Some(serde_json::json!({"token": SECRET})),
+                namespace: NS.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("computer connect_socketio");
+    computer
+        .join_office(office, name)
+        .await
+        .expect("computer join_office");
+    sleep(Duration::from_millis(250)).await;
+    computer
+}
+
 // ──────────────────────────── 裸 Agent 客户端 / raw Agent client ────────────────────────────
 
 /// 连接一个裸 Agent 客户端（websocket，鉴权走 auth dict `token` 字段；无 a2c_version——裸 server 不 gate）。
@@ -263,7 +333,7 @@ pub async fn agent_client(server_url: &str) -> Client {
 /// ack 回调：把单参 ack（`Payload::Text` 末元素）经 oneshot 投出。
 fn ack_cb(
     tx: oneshot::Sender<Value>,
-) -> impl FnMut(Payload, Client) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync {
+) -> impl Fn(Payload, Client) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync {
     let tx = Arc::new(Mutex::new(Some(tx)));
     move |p: Payload, _c: Client| {
         let tx = tx.clone();

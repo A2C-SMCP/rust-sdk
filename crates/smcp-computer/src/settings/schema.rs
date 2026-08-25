@@ -89,6 +89,8 @@ pub const FIELD_DISABLED_MCPJSON_SERVERS: &str = "disabledMcpjsonServers";
 pub const FIELD_ALLOWED_MCP_SERVERS: &str = "allowedMcpServers";
 pub const FIELD_DENIED_MCP_SERVERS: &str = "deniedMcpServers";
 pub const FIELD_PERMISSIONS: &str = "permissions";
+/// `client:put_blob` 落盘根（v0.4.0，协议 blob-transfer.md §7 顶层键，camelCase）/ landing root.
+pub const FIELD_LANDING_ROOT: &str = "landingRoot";
 
 /// policy-only 字段：出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
 /// Policy-only fields: filtered + recorded if seen outside the policy scope.
@@ -119,9 +121,19 @@ pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIE
 /// server 无安全影响，更严格永远安全。把它收进本类目属**过度矫正**，由
 /// `disabled_mcpjson_from_project_scope_is_honored_143` 守护。
 ///
+/// # 为何**含** `landingRoot`（v0.4.0，协议 blob-transfer.md §7）
+///
+/// 那是 `client:put_blob` 的**写目标**：project settings 与 `mcp.json` 一样入 git、随仓库分发，clone 的
+/// 仓库不得把写目标重定向到任意路径（如 `~/.ssh`）——否则掏空「写入沙箱由写入原语强制」的
+/// 不变量。协议 §7 明文：`landingRoot` 仅受信 scope（`user`/`local`/`flag`/`policy`/`embed`）可设；
+/// **`project` scope 提供该键 MUST 被拒绝**（本列表 + 下方 project 过滤即达成）。
+///
 /// [guide]: https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/develop/docs/guides/mcp-approval-gate-alignment.md
-pub const TRUSTED_SCOPE_ONLY_FIELDS: &[&str] =
-    &[FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP];
+pub const TRUSTED_SCOPE_ONLY_FIELDS: &[&str] = &[
+    FIELD_ENABLED_MCPJSON_SERVERS,
+    FIELD_ENABLE_ALL_PROJECT_MCP,
+    FIELD_LANDING_ROOT,
+];
 
 /// 字符串数组字段（读合并：拼接去重；写回：整体替换）/ String-array fields.
 pub const STRING_ARRAY_FIELDS: &[&str] = &[
@@ -278,6 +290,34 @@ fn validate_string_array(key: &str, value: &Value, scope: SettingsScope) -> Vali
         }
     }
     (Some(Value::Array(cleaned)), errors)
+}
+
+/// `landingRoot`：绝对路径字符串（协议 blob-transfer.md §7；镜像 python `_validate_landing_root`）。
+fn validate_landing_root(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
+    match value.as_str() {
+        Some(s) if !s.trim().is_empty() && is_absolute_path(s.trim()) => {
+            (Some(Value::String(s.trim().to_string())), vec![])
+        }
+        Some(s) => (
+            None,
+            vec![err(
+                scope,
+                key,
+                format!("landingRoot must be an absolute path string, got relative path {s:?}"),
+            )],
+        ),
+        None => (
+            None,
+            vec![err(
+                scope,
+                key,
+                format!(
+                    "expected absolute path string, got {}",
+                    json_type_name(value)
+                ),
+            )],
+        ),
+    }
 }
 
 fn validate_enabled_plugins(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
@@ -458,6 +498,7 @@ fn dispatch_validator(key: &str, value: &Value, scope: SettingsScope) -> Option<
         | FIELD_ALLOWED_MCP_SERVERS
         | FIELD_DENIED_MCP_SERVERS => validate_string_array,
         FIELD_PERMISSIONS => validate_permissions,
+        FIELD_LANDING_ROOT => validate_landing_root,
         _ => return None,
     };
     Some(validator(key, value, scope))
@@ -518,9 +559,10 @@ pub fn validate_settings(
             errors.push(err(
                 scope,
                 key.as_str(),
-                "approval-gate field not allowed in the project scope (filtered): it is a personal \
-                 decision and project settings.json is git-tracked — move it to settings.local.json \
-                 (not git-tracked) or the user scope",
+                "trusted-scope-only field not allowed in the project scope (filtered): approval-gate \
+                 inputs are personal decisions and landingRoot is a write target — both are unfit for \
+                 the git-tracked project settings.json; move it to settings.local.json (not \
+                 git-tracked) or the user scope",
             ));
             continue;
         }
@@ -617,6 +659,8 @@ pub struct ComputerSettings {
     pub denied_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<PermissionsBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_root: Option<String>,
     /// 未知顶层字段 passthrough（前向兼容）/ unknown top-level fields passthrough.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -802,6 +846,64 @@ mod tests {
             );
             assert!(errors.is_empty(), "{scope:?} 不应记错，实得 {errors:?}");
         }
+    }
+
+    // ---- #195 landingRoot（协议 blob-transfer.md §7：project MUST 拒绝）----
+
+    /// project scope（入 git）供给 `landingRoot` → 过滤 + 记错（写目标不放仓库随分发的路径重定向）。
+    #[test]
+    fn test_landing_root_filtered_in_project_scope() {
+        let raw = json!({"landingRoot": "/tmp/landing"});
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::Project, None);
+        assert!(
+            !cleaned.contains_key("landingRoot"),
+            "project scope 提供 landingRoot MUST 被拒绝"
+        );
+        assert_eq!(errors.len(), 1, "须记错，实得 {errors:?}");
+        assert!(errors[0].reason.contains("trusted-scope-only"));
+    }
+
+    /// 受信 scope（此处以 user 为代表；Local/Flag/Policy/Embed 走既有门户，不必逐层重复）→ 保留。
+    #[test]
+    fn test_landing_root_kept_in_user_scope() {
+        let raw = json!({"landingRoot": "/tmp/landing"});
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::User, None);
+        assert_eq!(cleaned["landingRoot"], json!("/tmp/landing"));
+        assert!(errors.is_empty());
+    }
+
+    /// 形态校验：相对路径 / 非字符串 → 整字段判废 + 记错；绝对路径（POSIX 与 Windows 盘符）→ 放行。
+    #[test]
+    fn test_landing_root_validation() {
+        let (cleaned, errors) = validate_settings(
+            &json!({"landingRoot": "relative/path"}),
+            SettingsScope::User,
+            None,
+        );
+        assert!(!cleaned.contains_key("landingRoot"));
+        assert!(!errors.is_empty());
+
+        let (cleaned, errors) =
+            validate_settings(&json!({"landingRoot": 123}), SettingsScope::User, None);
+        assert!(!cleaned.contains_key("landingRoot"));
+        assert!(!errors.is_empty());
+
+        for ok in ["/abs/landing", "/Users/me/.a2c", "C:\\data", "D:/data"] {
+            let (cleaned, errors) =
+                validate_settings(&json!({"landingRoot": ok}), SettingsScope::User, None);
+            assert_eq!(cleaned["landingRoot"], json!(ok), "{ok:?} 应为合法绝对路径");
+            assert!(errors.is_empty(), "{ok:?} 不应记错，实得 {errors:?}");
+        }
+    }
+
+    /// typed round-trip：`landingRoot` 以 camelCase 键进出 [`ComputerSettings`]。
+    #[test]
+    fn test_landing_root_typed_roundtrip() {
+        let parsed: ComputerSettings =
+            serde_json::from_str(r#"{"landingRoot": "/tmp/landing"}"#).unwrap();
+        assert_eq!(parsed.landing_root.as_deref(), Some("/tmp/landing"));
+        let v = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(v["landingRoot"], json!("/tmp/landing"));
     }
 
     /// ★**防过度矫正**：`disabledMcpjsonServers` 是 DENY 方向，协议 §2.1 表第 3 行明定**任意 scope 可供给**
@@ -1017,9 +1119,14 @@ mod tests {
             &["allowedMcpServers", "deniedMcpServers"]
         );
         // #143：enable 方向判据（拒 project）。**不含** disabledMcpjsonServers —— DENY 方向 fail-safe。
+        // #195：landingRoot（写目标）同属受信 scope only（协议 blob-transfer.md §7）。
         assert_eq!(
             TRUSTED_SCOPE_ONLY_FIELDS,
-            &["enabledMcpjsonServers", "enableAllProjectMcpServers"]
+            &[
+                "enabledMcpjsonServers",
+                "enableAllProjectMcpServers",
+                "landingRoot"
+            ]
         );
         assert_eq!(
             BOOL_FIELDS,

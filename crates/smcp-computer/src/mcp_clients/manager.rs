@@ -2079,27 +2079,31 @@ impl MCPServerManager {
                         .get(&route.bundle_id)
                         .copied()
                         .unwrap_or_default();
-                    let tool_meta = configs.get(&route.bundle_id).and_then(|config| {
-                        self.merged_tool_meta(config, &route.original_tool_name)
-                    });
+                    // #200：装配点携带 **config**（而非预合并 tool_meta）——三层合并 reconcile 需在拿到
+                    // 原生 Tool 后按「有声明/无声明」分四分支（config-only 预合并丢掉了「声明存在性」信息）。
+                    let config = configs.get(&route.bundle_id).cloned();
                     Some((
                         exposed_name.clone(),
                         route.clone(),
                         client,
                         generation,
-                        tool_meta,
+                        config,
                     ))
                 })
                 .collect::<Vec<_>>()
         };
         let mut candidates = Vec::new();
 
+        // #200 畸形声明诊断：每 server 每次 tools/list 刷新至多一次（#151 R1' 防刷屏先例，协议
+        // config-diagnostics 按 server 聚合——批量畸形工具只打一条）。
+        let mut warned_servers: HashSet<BundleId> = HashSet::new();
+
         // 每 bundle_id 仅拉一次 tools/list，跨该 server 的多个 routed tool 复用（对齐 Python `available_tools`
         // 的 `servers_cached_tools`；修 #91：此前每 tool 都调 list_tools → N 工具 = N 次冗余往返）。「每 server
         // 一次」仅在 list_tools **成功**时成立：持续报错则不写缓存、后续 routed tool 会重试（吞错、跳过、不 panic）。
         let mut server_tools_cache: HashMap<BundleId, Vec<Tool>> = HashMap::new();
 
-        for (exposed_name, route, client, generation, tool_meta) in snapshots {
+        for (exposed_name, route, client, generation, config) in snapshots {
             let bundle_id = &route.bundle_id;
 
             // 该 server 首见 → 拉一次并缓存；拉取失败 → 跳过（保留吞错、跳过语义）。
@@ -2121,8 +2125,15 @@ impl MCPServerManager {
                 .iter()
                 .find(|t| t.name.as_ref() == original_name.as_str())
             {
-                let display_tool = Self::agent_facing_tool(tool.clone(), &exposed_name, tool_meta)
-                    .expect("Tool and ToolMeta serialization is infallible");
+                // #200：三层合并 reconcile 落点（协议 §ToolMeta 三层合并规则）——对每个 Tool 无条件消费并
+                // 校验 Server 声明（即使 tool_meta/default_tool_meta 均不存在），四分支产出 agent-facing 副本。
+                let display_tool = self.agent_facing_tool_reconciled(
+                    tool.clone(),
+                    &exposed_name,
+                    config.as_ref(),
+                    &route,
+                    &mut warned_servers,
+                );
 
                 candidates.push((exposed_name, route, client, generation, display_tool));
             }
@@ -2480,7 +2491,66 @@ impl MCPServerManager {
         }
         self.read_resource_by_id(bundle_id, resource).await
     }
+}
 
+/// Server 声明层白名单输入（协议 §ToolMeta 三层合并规则：白名单**仅 `tags`** 一项）。
+///
+/// MUST NOT 复用完整 [`ToolMeta`] 作输入模型——白名单外字段（`auto_apply` 等）走**字段级过滤**：
+/// 值不参与合并、声明其余部分（`tags`）仍生效（Disc#56 本侧确认 P1、裁决不变量 2）。字段级过滤靠
+/// 本私有结构「只读 `tags`」实现——白名单外字段**无从**进入 canonical。
+#[derive(Debug, Clone, Default)]
+struct ServerDeclaredToolMeta {
+    tags: Option<Vec<String>>,
+}
+
+/// 解析 `Tool._meta["a2c_tool_meta"]` Server 声明（native JSON Value，非 wire 的 JSON 字符串）
+/// → `(合法提取物, None)` 或 `(None, 丢弃原因)`。
+///
+/// 畸形判据仅两条（协议 §ToolMeta 三层合并规则）：声明非对象 / `tags` 非 `list[str]`；含白名单外字段
+/// （`auto_apply` 等）**合法**——字段级过滤，值不参与合并、声明其余部分仍生效。`tags` 缺失或显式
+/// `null`：合法声明但无 tags → 继承下一层（返回 `tags=None`）。**显式 `a2c_tool_meta: null` 属「声明
+/// 非对象」畸形判据**（调用方以 key 存在性判定有无声明，本例恒入畸形支）。
+/// wire canonical 出线形式（协议 §ToolMeta 三层合并规则：解析后含 ToolMeta 全字段（未设置=null），
+/// 双 SDK 同形；key 序非判定面）。
+///
+/// [`ToolMeta`] 自身带 `skip_serializing_if` 序列化会**丢 None 字段**，与 python
+/// `model_dump(mode="json")`（恒含全字段 null）不同形——三层合并 reconcile 的写入端必须显式铸
+/// 全四键值，否则「对拍按解析后字段值」会因键缺失而分叉（V9 锚点）。
+fn tool_meta_canonical_value(meta: &ToolMeta) -> Value {
+    serde_json::json!({
+        "auto_apply": meta.auto_apply,
+        "alias": meta.alias,
+        "tags": meta.tags,
+        "ret_object_mapper": meta.ret_object_mapper,
+    })
+}
+
+fn parse_server_declared_tool_meta(
+    raw: &Value,
+) -> (Option<ServerDeclaredToolMeta>, Option<&'static str>) {
+    let Some(obj) = raw.as_object() else {
+        return (None, Some("声明非对象"));
+    };
+    let Some(raw_tags) = obj.get("tags") else {
+        return (Some(ServerDeclaredToolMeta::default()), None);
+    };
+    if raw_tags.is_null() {
+        return (Some(ServerDeclaredToolMeta::default()), None);
+    }
+    let Some(list) = raw_tags.as_array() else {
+        return (None, Some("tags 非 list[str]"));
+    };
+    if !list.iter().all(|t| t.is_string()) {
+        return (None, Some("tags 非 list[str]"));
+    }
+    let tags = list
+        .iter()
+        .map(|t| t.as_str().expect("checked string").to_string())
+        .collect();
+    (Some(ServerDeclaredToolMeta { tags: Some(tags) }), None)
+}
+
+impl MCPServerManager {
     /// 合并工具元数据 / Merge tool metadata
     ///
     /// #134：`alias` 天生 per-tool（把某个工具改名），故**只取自具体 `tool_meta[tool]`，绝不从
@@ -2520,6 +2590,105 @@ impl MCPServerManager {
         }
     }
 
+    /// 三层合并（协议 §ToolMeta 三层合并规则，protocol#51 / PR#57 裁决）：两层配置合并终值上，仅 `tags`
+    /// 按第三层回落——配置终值 tags 缺失/`null` 时采纳 Server 声明值；`[]` 显式清除、不回落；其余字段
+    /// （`auto_apply`/`alias`/`ret_object_mapper`）仍仅来自 Computer 配置（字段级过滤）。**无配置**时合法
+    /// 声明产出 tags-only canonical（声明无 tags → 全 null，与 python `ToolMeta(tags=…)` 同形）。
+    fn three_layer_tool_meta(
+        &self,
+        config: Option<&MCPServerConfig>,
+        tool_name: &str,
+        declared: &ServerDeclaredToolMeta,
+    ) -> ToolMeta {
+        match config.and_then(|c| self.merged_tool_meta(c, tool_name)) {
+            None => ToolMeta {
+                tags: declared.tags.clone(),
+                ..ToolMeta::new()
+            },
+            Some(mut merged) => {
+                if merged.tags.is_none() {
+                    merged.tags = declared.tags.clone();
+                }
+                merged
+            }
+        }
+    }
+
+    /// 产出 agent-facing 改名副本：**无条件 reconcile**（协议 §ToolMeta 三层合并规则，protocol#51 / PR#57
+    /// 裁决；镜像 python `available_tools` 的四分支 inline 逻辑）。**仅**
+    /// [`list_available_tools_with_bundle_id`](Self::list_available_tools_with_bundle_id) 的组装点使用；
+    /// [`refresh_tool_routes`](Self::refresh_tool_routes) 维持 config-only（裁决③：三个
+    /// config-only 消费点零行为差）。
+    ///
+    /// 以 **key 存在性**判定有无声明——显式 `a2c_tool_meta: null` 属「声明非对象」畸形判据，不得以值判空
+    /// 短路为「无声明」（否则 key 原样出线、违反 canonical-final）。原生 `_meta` 其它 key 全程原样保留
+    /// （shallow copy）。
+    ///
+    /// 畸形声明（非对象 / `tags` 非 `list[str]`）→ 丢弃声明 + 本地诊断（MUST NOT 令 tools/list 失败或工具
+    /// 消失）；诊断按 server 聚合（`warned_servers`），每 server 每次刷新至多一次（#151 R1' 防刷屏先例）。
+    fn agent_facing_tool_reconciled(
+        &self,
+        mut tool: Tool,
+        exposed_name: &str,
+        config: Option<&MCPServerConfig>,
+        route: &ExposedToolRoute,
+        warned_servers: &mut HashSet<BundleId>,
+    ) -> Tool {
+        let bundle_id = &route.bundle_id;
+        let tool_name = route.original_tool_name.as_str();
+        let config_meta = config.and_then(|c| self.merged_tool_meta(c, tool_name));
+        let mut merged_meta = tool.meta.as_ref().map(|m| m.0.clone()).unwrap_or_default();
+
+        if let Some(declared_raw) = merged_meta.get(A2C_TOOL_META).cloned() {
+            match parse_server_declared_tool_meta(&declared_raw) {
+                (Some(declared), None) => {
+                    // 合法声明：三层合并 canonical 恒覆写（含「合法+无配置」→ tags-only canonical）。
+                    let final_meta = self.three_layer_tool_meta(config, tool_name, &declared);
+                    merged_meta.insert(
+                        A2C_TOOL_META.to_string(),
+                        tool_meta_canonical_value(&final_meta),
+                    );
+                }
+                (None, Some(reason)) => {
+                    // 畸形声明 → 丢弃 + 本地诊断；有配置终值 → 配置 canonical（维持现状）；无 → 删除该 key。
+                    if warned_servers.insert(bundle_id.clone()) {
+                        warn!(
+                            bundle_id = %bundle_id,
+                            server_name = %route.server_name,
+                            tool = %tool_name,
+                            reason,
+                            "malformed ToolMeta server declaration dropped; using config canonical \
+                             or removing the key instead (local diagnostic, not a protocol error)"
+                        );
+                    }
+                    match config_meta {
+                        Some(cm) => {
+                            merged_meta
+                                .insert(A2C_TOOL_META.to_string(), tool_meta_canonical_value(&cm));
+                        }
+                        None => {
+                            merged_meta.remove(A2C_TOOL_META);
+                        }
+                    }
+                }
+                _ => unreachable!(
+                    "parse_server_declared_tool_meta yields exactly one valid/malformed arm"
+                ),
+            }
+        } else if let Some(cm) = config_meta {
+            // 无声明：维持现状（配置合并产物非空才写）。
+            merged_meta.insert(A2C_TOOL_META.to_string(), tool_meta_canonical_value(&cm));
+        }
+
+        tool.name = exposed_name.to_string().into();
+        tool.meta = if merged_meta.is_empty() {
+            None
+        } else {
+            Some(rmcp::model::Meta(merged_meta))
+        };
+        tool
+    }
+
     /// Apply the exact local projection that Agent-facing enumeration exposes.
     ///
     /// Route refresh uses the serialized result for semantic change detection, while
@@ -2536,7 +2705,11 @@ impl MCPServerManager {
                 tool.meta = Some(rmcp::model::Meta::new());
             }
             if let Some(ref mut meta) = tool.meta {
-                meta.insert(A2C_TOOL_META.to_string(), serde_json::to_value(tool_meta)?);
+                // 与 wire canonical 同形（全字段含 null）：投影与发布产状共享同一变换，防 revision 漂移。
+                meta.insert(
+                    A2C_TOOL_META.to_string(),
+                    tool_meta_canonical_value(&tool_meta),
+                );
             }
         }
         Ok(tool)
@@ -6591,6 +6764,476 @@ mod tests {
 
         let out = manager.list_available_tools().await;
         assert!(out.is_empty(), "list_tools 失败的 server 不应暴露工具");
+    }
+
+    // ==================== #200：ToolMeta Server 声明 tags 三层合并（protocol#51 / PR#57 / Disc#56）====================
+    //
+    // wire 契约见 a2c-smcp-protocol develop `data-structures.md §ToolMeta 三层合并规则`（PR#57 bc97eb8）；
+    // 对拍 python-sdk#199 / PR#202 的向量（`tests/unit_tests/computer/mcp_clients/test_manager.py` #199 段）。
+    // 结果**全部经真实工具流**（MockToolsClient 注入 `Tool.meta` → refresh → list_available_tools 装配点），
+    // 非直接调用三函数——防「测函数 ≠ 测接线」假绿（#142 教训）。
+
+    /// fixture 形态同 conformance §2.6 / python `_DECLARED_TOOL_META`：声明含白名单外字段（auto_apply）
+    /// 与原生 `_meta` key（custom_key）——「含白名单外字段」**不**是畸形判据，字段级过滤后不进入终值。
+    fn declared_tool_meta_fixture() -> serde_json::Value {
+        serde_json::json!({"custom_key": "v", "a2c_tool_meta": {"tags": ["read"], "auto_apply": true}})
+    }
+
+    /// 构造携带 `Tool._meta` 的 mock 工具（顶层 meta 对象，非 wire 字符串形态）。
+    fn tool_with_meta(name: &str, meta: serde_json::Value) -> Tool {
+        let mut t = tool_named(name);
+        t.meta = Some(rmcp::model::Meta(
+            serde_json::from_value(meta).expect("meta fixture 必须是对象"),
+        ));
+        t
+    }
+
+    /// canonical 终值断言（V9 锚点）：`a2c_tool_meta` 解析后含 ToolMeta **全字段**（未设置=null），与 python
+    /// `model_dump(mode="json")` 同形；key 序非判定面。字段缺失即判定失败——skip_if 丢 null 实现会由此转红。
+    fn assert_canonical(tool: &Tool, expected: serde_json::Value) {
+        let meta = tool.meta.as_ref().expect("tool.meta 应存在");
+        let v = meta.0.get(A2C_TOOL_META).expect("a2c_tool_meta key 应存在");
+        assert_eq!(v, &expected, "canonical 终值应为全字段（未设置=null）");
+    }
+
+    #[tokio::test]
+    async fn toolmeta_declared_tags_no_config_tags_only_canonical() {
+        // V1：无任何配置 + 合法声明 → tags-only canonical 覆写；白名单外 auto_apply 字段级过滤不进入终值；
+        // 原生 `_meta` key（custom_key）原样保留。
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "decl",
+                vec![tool_with_meta("safe_read", declared_tool_meta_fixture())],
+                stdio_cfg("decl", vec![], HashMap::new()),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        let tool = out
+            .iter()
+            .find(|(_, t)| t.name.as_ref() == exposed("decl", "safe_read"))
+            .expect("工具应暴露");
+        assert_eq!(
+            tool.1.meta.as_ref().unwrap().0.get("custom_key"),
+            Some(&serde_json::Value::String("v".into())),
+            "原生 _meta key MUST 原样保留"
+        );
+        assert_canonical(
+            &tool.1,
+            serde_json::json!({
+                "auto_apply": null, "alias": null, "tags": ["read"], "ret_object_mapper": null
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn toolmeta_declared_config_overrides_and_field_filter() {
+        // V8：配置覆盖 → 三层合并 canonical；声明 auto_apply=true 整体消失（不字段级残留）。
+        let mut tm = HashMap::new();
+        tm.insert(
+            "safe_read".to_string(),
+            ToolMeta {
+                tags: Some(vec!["specific".to_string()]),
+                auto_apply: Some(false),
+                ..Default::default()
+            },
+        );
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "decl",
+                vec![tool_with_meta("safe_read", declared_tool_meta_fixture())],
+                stdio_cfg("decl", vec![], tm),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        let tool = out
+            .iter()
+            .find(|(_, t)| t.name.as_ref() == exposed("decl", "safe_read"))
+            .expect("工具应暴露");
+        assert_canonical(
+            &tool.1,
+            serde_json::json!({
+                "auto_apply": false, "alias": null, "tags": ["specific"], "ret_object_mapper": null
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn toolmeta_three_layer_default_per_tool_declared() {
+        // conformance §2.6 V2/V3/V10（镜像 python `test_merged_tool_meta_three_layer`）：
+        // - V2 generic：无 per-tool → default 覆盖声明（default > Server 声明）；
+        // - V3 specific：per-tool 覆盖 default（tool_meta[tool] > default > Server 声明，恒三层齐备）；
+        // - V10 nulled：per-tool `tags: null` 与缺失等价 → 继承 default（不回落声明——default 是更高层）。
+        let mut tm = HashMap::new();
+        tm.insert(
+            "specific".to_string(),
+            ToolMeta {
+                tags: Some(vec!["specific".to_string()]),
+                ..Default::default()
+            },
+        );
+        tm.insert(
+            "nulled".to_string(),
+            ToolMeta {
+                tags: None,
+                ..Default::default()
+            },
+        );
+        let mut cfg = stdio_cfg("decl", vec![], tm);
+        if let MCPServerConfig::Stdio(c) = &mut cfg {
+            c.default_tool_meta = Some(ToolMeta {
+                tags: Some(vec!["default".to_string()]),
+                ..Default::default()
+            });
+        }
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "decl",
+                vec![
+                    tool_with_meta("generic", declared_tool_meta_fixture()),
+                    tool_with_meta("specific", declared_tool_meta_fixture()),
+                    tool_with_meta("nulled", declared_tool_meta_fixture()),
+                ],
+                cfg,
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        let tags_of = |name: &str| {
+            out.iter()
+                .find(|(_, t)| t.name.as_ref() == exposed("decl", name))
+                .expect("工具应暴露")
+                .1
+                .meta
+                .as_ref()
+                .unwrap()
+                .0[A2C_TOOL_META]["tags"]
+                .clone()
+        };
+
+        assert_eq!(tags_of("generic"), serde_json::json!(["default"]), "V2");
+        assert_eq!(tags_of("specific"), serde_json::json!(["specific"]), "V3");
+        assert_eq!(tags_of("nulled"), serde_json::json!(["default"]), "V10");
+    }
+
+    #[tokio::test]
+    async fn toolmeta_per_tool_over_default_and_empty_clears_declared() {
+        // V3/V4：per-tool > default；per-tool `tags: []` 显式清除所有下层值（不回落 Server 声明）。
+        let mut tm = HashMap::new();
+        tm.insert(
+            "cleared".to_string(),
+            ToolMeta {
+                tags: Some(vec![]),
+                ..Default::default()
+            },
+        );
+        let mut cfg = stdio_cfg("decl", vec![], tm);
+        if let MCPServerConfig::Stdio(c) = &mut cfg {
+            c.default_tool_meta = Some(ToolMeta {
+                tags: Some(vec!["default".to_string()]),
+                ..Default::default()
+            });
+        }
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "decl",
+                vec![tool_with_meta("cleared", declared_tool_meta_fixture())],
+                cfg,
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        let tool = out
+            .iter()
+            .find(|(_, t)| t.name.as_ref() == exposed("decl", "cleared"))
+            .expect("工具应暴露");
+        assert_eq!(
+            tool.1.meta.as_ref().unwrap().0[A2C_TOOL_META]["tags"],
+            serde_json::json!([]),
+            "[] 显式清除、不回落 default/声明"
+        );
+    }
+
+    #[tokio::test]
+    async fn toolmeta_config_null_tags_inherit_declared_auto_apply_from_config() {
+        // V5/V10：配置 tags 缺失/null → 继承下一层（声明值）；auto_apply 仅来自配置。
+        let mut tm = HashMap::new();
+        tm.insert(
+            "safe_read".to_string(),
+            ToolMeta {
+                tags: None,
+                auto_apply: Some(true),
+                ..Default::default()
+            },
+        );
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "decl",
+                vec![tool_with_meta("safe_read", declared_tool_meta_fixture())],
+                stdio_cfg("decl", vec![], tm),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        let tool = out
+            .iter()
+            .find(|(_, t)| t.name.as_ref() == exposed("decl", "safe_read"))
+            .expect("工具应暴露");
+        assert_canonical(
+            &tool.1,
+            serde_json::json!({
+                "auto_apply": true, "alias": null, "tags": ["read"], "ret_object_mapper": null
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn toolmeta_declared_null_tags_canonical_all_null() {
+        // 声明层 `tags: null`（合法，与缺失等价，继承下一层）→ 无配置时恒写 tags-only canonical（全字段 null）
+        // ——声明 dict 连同白名单外字段（auto_apply）整体被 canonical 覆写、无残留。
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "decl",
+                vec![tool_with_meta(
+                    "safe_read",
+                    serde_json::json!({"a2c_tool_meta": {"tags": null, "auto_apply": true}}),
+                )],
+                stdio_cfg("decl", vec![], HashMap::new()),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        let tool = out
+            .iter()
+            .find(|(_, t)| t.name.as_ref() == exposed("decl", "safe_read"))
+            .expect("工具应暴露");
+        assert_canonical(
+            &tool.1,
+            serde_json::json!({
+                "auto_apply": null, "alias": null, "tags": null, "ret_object_mapper": null
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn toolmeta_malformed_declaration_discarded_no_config() {
+        // V7a：畸形声明（tags 非 list[str] / 声明非对象 / tags 含非 str 元素）→ 丢弃 + 诊断；
+        // tools/list 正常、工具可用——畸形不令工具消失；无配置终值 → `a2c_tool_meta` 键**删除**。
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "malformed",
+                vec![
+                    tool_with_meta(
+                        "bad_tags",
+                        serde_json::json!({"a2c_tool_meta": {"tags": "read"}}),
+                    ),
+                    tool_with_meta(
+                        "bad_shape",
+                        serde_json::json!({"a2c_tool_meta": "not-an-object"}),
+                    ),
+                    tool_with_meta(
+                        "bad_elem",
+                        serde_json::json!({"a2c_tool_meta": {"tags": ["read", 1]}}),
+                    ),
+                    tool_named("good_tool"),
+                ],
+                stdio_cfg("malformed", vec![], HashMap::new()),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        let names: std::collections::HashSet<String> =
+            out.iter().map(|(_, t)| t.name.to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "malformed__bad_tags",
+                "malformed__bad_shape",
+                "malformed__bad_elem",
+                "malformed__good_tool"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            "畸形声明 MUST NOT 令工具消失"
+        );
+        for (_, tool) in &out {
+            assert!(
+                tool.meta
+                    .as_ref()
+                    .is_none_or(|m| !m.0.contains_key(A2C_TOOL_META)),
+                "无配置终值时畸形/无声明工具的 a2c_tool_meta 键 MUST 删除：{:?}",
+                tool.meta
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn toolmeta_malformed_declaration_null_and_config_canonical_kept() {
+        // V7b + 显式 null 声明：有配置终值 → 配置 canonical（维持现状），声明值（含 auto_apply）不进入；
+        // 显式 `a2c_tool_meta: null` 属「声明非对象」畸形判据（canonical-final：Server null 不得原样出线）。
+        let mut tm = HashMap::new();
+        tm.insert(
+            "bad_tags".to_string(),
+            ToolMeta {
+                tags: Some(vec!["cfg".to_string()]),
+                ..Default::default()
+            },
+        );
+        tm.insert(
+            "null_with_config".to_string(),
+            ToolMeta {
+                tags: Some(vec!["cfg".to_string()]),
+                ..Default::default()
+            },
+        );
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![(
+                "malformed",
+                vec![
+                    tool_with_meta(
+                        "bad_tags",
+                        serde_json::json!({"a2c_tool_meta": {"tags": "read", "auto_apply": true}}),
+                    ),
+                    tool_with_meta(
+                        "null_with_config",
+                        serde_json::json!({"a2c_tool_meta": null}),
+                    ),
+                ],
+                stdio_cfg("malformed", vec![], tm),
+            )],
+        )
+        .await
+        .expect("refresh ok");
+
+        let out = manager.list_available_tools_with_bundle_id().await;
+        for exposed_name in ["malformed__bad_tags", "malformed__null_with_config"] {
+            let tool = out
+                .iter()
+                .find(|(_, t)| t.name.as_ref() == exposed_name)
+                .expect("工具应暴露");
+            assert_eq!(
+                tool.1.meta.as_ref().unwrap().0[A2C_TOOL_META]["tags"],
+                serde_json::json!(["cfg"]),
+                "畸形声明 + 有配置 → 配置 canonical"
+            );
+            assert_eq!(
+                tool.1.meta.as_ref().unwrap().0[A2C_TOOL_META]["auto_apply"],
+                serde_json::Value::Null,
+                "声明 auto_apply 不进入终值"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn toolmeta_malformed_warn_per_refresh_dedup() {
+        // 验收「畸形声明降级：...warn! 诊断」的诊断语义（镜像 python
+        // `test_available_tools_malformed_warns_per_refresh`）：每 server **每次** tools/list 刷新至多一条
+        // 畸形声明诊断——同刷新批量畸形只打一条；跨刷新不累计抑制（`warned_servers` 是每次调用的局部量）。
+        // 变异防护：若去重集被提为实例字段（跨刷新永久抑制）→ 计数 1 → 转红；若按工具有无去重 → 计数 4 → 转红。
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl CapturedLogs {
+            fn contents(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+            }
+        }
+        impl std::io::Write for CapturedLogs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+
+        let manager = MCPServerManager::new();
+        let run = async {
+            setup_and_refresh(
+                &manager,
+                vec![(
+                    "malformed",
+                    vec![
+                        tool_with_meta(
+                            "bad_tags",
+                            serde_json::json!({"a2c_tool_meta": {"tags": "read"}}),
+                        ),
+                        tool_with_meta(
+                            "bad_shape",
+                            serde_json::json!({"a2c_tool_meta": "not-an-object"}),
+                        ),
+                    ],
+                    stdio_cfg("malformed", vec![], HashMap::new()),
+                )],
+            )
+            .await
+            .expect("refresh ok");
+
+            for _ in 0..2 {
+                manager.list_available_tools().await;
+            }
+        };
+        run.with_subscriber(subscriber).await;
+
+        let rendered = logs.contents();
+        let hits = rendered
+            .matches("malformed ToolMeta server declaration")
+            .count();
+        assert_eq!(
+            hits, 2,
+            "两次刷新应各打一条畸形声明诊断（同刷新批量畸形至多一条）：{rendered}"
+        );
+        assert!(
+            rendered.contains("bundle_id=malformed"),
+            "诊断 MUST 携带 bundle_id 便于定位：{rendered}"
+        );
     }
 
     /// 两 server 同名 tool1：协议 0.3.0 前缀化后跨 server **天然不冲突**（`server1__tool1` ⊥ `server2__tool1`），

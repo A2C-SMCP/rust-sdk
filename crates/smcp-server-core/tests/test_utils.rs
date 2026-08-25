@@ -118,7 +118,7 @@ pub async fn find_available_port() -> u16 {
 pub fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(
+) -> impl Fn(
     Payload,
     tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -162,7 +162,7 @@ pub async fn create_client_with_handler<F>(
     handler: F,
 ) -> tf_rust_socketio::asynchronous::Client
 where
-    F: FnMut(
+    F: Fn(
             Payload,
             tf_rust_socketio::asynchronous::Client,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -184,7 +184,7 @@ where
 #[allow(dead_code)]
 pub fn create_atomic_handler(
     flag: Arc<AtomicBool>,
-) -> impl FnMut(
+) -> impl Fn(
     Payload,
     tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>

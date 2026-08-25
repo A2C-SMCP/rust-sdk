@@ -22,24 +22,30 @@ use serde_json::Value;
 use smcp::{
     events::{
         CLIENT_GET_BLOB, CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_RESOURCES,
-        CLIENT_GET_SKILL, CLIENT_GET_SKILLS, CLIENT_GET_TOOLS, CLIENT_TOOL_CALL,
+        CLIENT_GET_SKILL, CLIENT_GET_SKILLS, CLIENT_GET_TOOLS, CLIENT_PUT_BLOB, CLIENT_TOOL_CALL,
         NOTIFY_TOOL_CALL_CANCEL, SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG,
         SERVER_UPDATE_DESKTOP, SERVER_UPDATE_SKILLS, SERVER_UPDATE_TOOL_LIST,
     },
     set_content_blob_sideband, AgentCallData, ErrorCode, ErrorPayload, GetBlobReq, GetBlobRet,
     GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetResourcesReq,
     GetResourcesRet, GetSkillReq, GetSkillRet, GetSkillsReq, GetSkillsRet, GetToolsReq,
-    GetToolsRet, ToolCallReq, SMCP_NAMESPACE,
+    GetToolsRet, PutBlobReq, ToolCallReq, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tf_rust_socketio::{
     asynchronous::{Client, ClientBuilder, ReconnectSettings},
-    Event, Payload, TransportType,
+    CloseReason, Event, Payload, TransportType,
 };
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// Default deadline for the initial Socket.IO namespace CONNECT handshake.
+pub const DEFAULT_NAMESPACE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+const NAMESPACE_CONNECT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A client may publish Computer lifecycle changes only while it owns the current Socket.IO slot.
 #[derive(Clone)]
@@ -98,6 +104,36 @@ impl RuntimeLifecycle {
         if let Some(lease) = lease {
             lease.transition(next);
         }
+    }
+
+    fn is_active_for(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+        retiring: &AtomicBool,
+    ) -> bool {
+        if retiring.load(Ordering::Acquire) {
+            return false;
+        }
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|lease| {
+                lease.active
+                    && Arc::ptr_eq(&lease.status, status)
+                    && Arc::ptr_eq(&lease.owner, owner)
+            })
+            .cloned();
+        let Some(lease) = lease else {
+            return false;
+        };
+        let current_owner = lease
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *current_owner == lease.token && !retiring.load(Ordering::Acquire)
     }
 
     /// Atomically reserve this client for exactly one Computer. The inactive reservation keeps
@@ -220,6 +256,7 @@ pub struct SmcpComputerClientBuilder {
     /// reconnect; takes precedence over `auth_payload` when configured.
     auth_provider: Option<SocketIoAuthProvider>,
     namespace: Option<String>,
+    namespace_connect_timeout: Duration,
     headers: Option<HashMap<String, String>>,
     /// INT-03 #72：Computer 操作句柄（socketio-detached），供 blob/skill/cancel/tool_call handler 调用。
     /// `Option`：兼容旧入口（`SmcpComputerClient::new` / 不接 Computer 的测试）——缺省时 blob/skill/cancel
@@ -243,6 +280,7 @@ impl SmcpComputerClientBuilder {
             auth_payload: None,
             auth_provider: None,
             namespace: None,
+            namespace_connect_timeout: DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
             headers: None,
             computer_ops: None,
         }
@@ -293,6 +331,16 @@ impl SmcpComputerClientBuilder {
         self
     }
 
+    /// Configure the total time [`connect`](Self::connect) allows for initial transport
+    /// establishment and namespace readiness.
+    ///
+    /// Engine.IO transport establishment alone is not enough for application events, so connect
+    /// returns only after the namespace callback fires. The default is 30 seconds.
+    pub fn namespace_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.namespace_connect_timeout = timeout;
+        self
+    }
+
     /// 附加任意 HTTP upgrade header（路由用，如 TF 生态 `X-TF-RobotId`；**非鉴权信道**）。
     /// Attach arbitrary HTTP upgrade headers (routing, e.g. TF ecosystem headers; NOT for auth).
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
@@ -311,6 +359,7 @@ impl SmcpComputerClientBuilder {
             self.auth_payload,
             self.auth_provider,
             namespace,
+            self.namespace_connect_timeout,
             self.headers,
             self.computer_ops,
         )
@@ -341,6 +390,16 @@ pub struct SmcpComputerClient {
 }
 
 impl SmcpComputerClient {
+    /// Whether this client still owns the active lifecycle lease for the supplied Computer.
+    pub(crate) fn has_active_runtime_lifecycle(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+    ) -> bool {
+        self.runtime_status
+            .is_active_for(status, owner, &self.retiring)
+    }
+
     /// Atomically reserve this client for one Computer before touching its current slot value.
     pub(crate) fn claim_runtime_lifecycle(
         &self,
@@ -427,6 +486,7 @@ impl SmcpComputerClient {
         auth_payload: Option<Value>,
         auth_provider: Option<SocketIoAuthProvider>,
         namespace: String,
+        namespace_connect_timeout: Duration,
         headers: Option<HashMap<String, String>>,
         computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
     ) -> ComputerResult<Self> {
@@ -525,7 +585,7 @@ impl SmcpComputerClient {
             let retiring = Arc::clone(&close_retiring);
             async move {
                 let transport_close = !retiring.load(Ordering::Acquire)
-                    && Self::payload_contains_text(&payload, "transport close");
+                    && Self::payload_contains_text(&payload, CloseReason::TransportClose.as_str());
                 let rejoin_task = {
                     let mut membership = lock_office_membership(&membership);
                     let rejoin_task = membership.invalidate_connection(transport_close);
@@ -824,6 +884,24 @@ impl SmcpComputerClient {
                     }
                     .boxed()
                 }
+                // #195：通用二进制上行写入 client:put_blob（带 ACK；4019 带内回传）。
+                CLIENT_PUT_BLOB => {
+                    let ops = computer_ops_clone.clone();
+                    let computer_name = computer_name_clone.clone();
+                    async move {
+                        match Self::handle_put_blob_with_ack(payload, ops, computer_name).await {
+                            Ok((ack_id, response)) => {
+                                if let Some(id) = ack_id {
+                                    if let Err(e) = client.ack_with_id(id, response).await {
+                                        error!("Failed to send ack: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => error!("Error handling put_blob: {}", e),
+                        }
+                    }
+                    .boxed()
+                }
                 // INT-03 #72：SKILL 清单 client:get_skills（带 ACK）。
                 CLIENT_GET_SKILLS => {
                     let ops = computer_ops_clone.clone();
@@ -878,27 +956,33 @@ impl SmcpComputerClient {
         // 连接服务器（polling-first 已设；分类版本握手错误，4900 时改 polling 取 4008）
         // Connect (polling-first already set; classify version-handshake errors; on 4900 re-fetch
         // the authoritative 4008 over polling).
-        let client = match smcp_client_transport::connect_and_classify(
-            builder,
-            &handshake_url,
-            &namespace,
-            initial_auth_payload,
-            handshake_headers,
-        )
-        .await
-        {
-            Ok(client) => client,
-            Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
-                return Err(ComputerError::ProtocolVersionMismatch(pve));
-            }
-            Err(smcp_client_transport::ConnectError::Connection(msg)) => {
-                return Err(ComputerError::SocketIoError(msg));
-            }
-        };
+        // Bound both the tf builder's namespace CONNECT send and our callback readiness wait. With
+        // polling transport, a server-side namespace middleware can hold the CONNECT request itself,
+        // so timing only the Notify wait would still let Builder::connect hang forever.
+        let pending_cleanup = Arc::new(Mutex::new(None::<Client>));
+        let connection_cleanup = Arc::clone(&pending_cleanup);
+        let connection = async {
+            let client = match smcp_client_transport::connect_and_classify(
+                builder,
+                &handshake_url,
+                &namespace,
+                initial_auth_payload,
+                handshake_headers,
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(smcp_client_transport::ConnectError::ProtocolVersion(pve)) => {
+                    return Err(ComputerError::ProtocolVersionMismatch(pve));
+                }
+                Err(smcp_client_transport::ConnectError::Connection(msg)) => {
+                    return Err(ComputerError::SocketIoError(msg));
+                }
+            };
+            *connection_cleanup.lock().await = Some(client.clone());
 
-        // ClientBuilder::connect only establishes Engine.IO. Wait for namespace CONNECT so a
-        // successful return is immediately join-ready; a fixed sleep leaves a deterministic race.
-        let namespace_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            // A successful return is immediately join-ready; a fixed sleep leaves a deterministic
+            // race between Engine.IO establishment and the namespace CONNECT callback.
             loop {
                 let notified = namespace_ready.notified();
                 if lock_office_membership(&office_membership).connected {
@@ -906,17 +990,31 @@ impl SmcpComputerClient {
                 }
                 notified.await;
             }
-        })
-        .await;
-        if namespace_result.is_err() {
-            // The tf client reader retains an internal clone, so an error return alone would leak
-            // the Engine.IO transport. Arm the retiring callbacks and close the current socket.
-            retiring.store(true, Ordering::Release);
-            let _ = client.disconnect().await;
-            return Err(ComputerError::TimeoutError(
-                "Socket.IO namespace connect timed out".to_string(),
-            ));
-        }
+            Ok(client)
+        };
+        let client = match tokio::time::timeout(namespace_connect_timeout, connection).await {
+            Ok(result) => {
+                let client = result?;
+                pending_cleanup.lock().await.take();
+                client
+            }
+            Err(_) => {
+                // The tf reader retains an internal clone after connect_and_classify returns. Arm
+                // callbacks first, then give teardown a separate bounded budget; if the builder was
+                // still sending CONNECT, dropping its future owns the only client and closes it.
+                retiring.store(true, Ordering::Release);
+                if let Some(client) = pending_cleanup.lock().await.take() {
+                    let _ = tokio::time::timeout(
+                        NAMESPACE_CONNECT_CLEANUP_TIMEOUT,
+                        client.disconnect(),
+                    )
+                    .await;
+                }
+                return Err(ComputerError::TimeoutError(
+                    "Socket.IO namespace connect timed out".to_string(),
+                ));
+            }
+        };
 
         info!(
             "Connected to SMCP server at {} with computer name: {}",
@@ -1761,6 +1859,33 @@ impl SmcpComputerClient {
         Ok((ack_id, serde_json::to_value(ret)?))
     }
 
+    /// 处理通用二进制上行写入事件 `client:put_blob`（带 ACK，v0.4.0 #195）。
+    ///
+    /// 与 [`Self::handle_get_blob_with_ack`] 同构：解析 → computer 名守卫 → ops 反射 → 带内失败
+    /// 一律以 flat 4019 ErrorPayload 走 ack（`Ok` 携带），解析/守卫失败返回 `Err`（无 ack）。
+    /// 镜像 Python `on_put_blob`（computer 会话逻辑见 [`BlobUploadStore`](crate::blob::BlobUploadStore)）。
+    async fn handle_put_blob_with_ack(
+        payload: Payload,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
+        computer_name: String,
+    ) -> ComputerResult<(Option<i32>, Value)> {
+        let (ack_id, req) = Self::extract_ack_and_parse::<PutBlobReq>(payload)?;
+        if computer_name != req.computer {
+            return Err(ComputerError::ValidationError(format!(
+                "Computer name mismatch: expected {}, got {}",
+                computer_name, req.computer
+            )));
+        }
+        let ops = ops.ok_or_else(|| {
+            ComputerError::InvalidState("Computer ops not available for put_blob".to_string())
+        })?;
+        match ops.put_blob_chunk(&req).await {
+            // 成功：PutBlobRet 逐字段 ack；失败：flat 4019（带内，照常 ack——get_blob 同款处理）。
+            Ok(ret) => Ok((ack_id, serde_json::to_value(ret)?)),
+            Err(payload) => Ok((ack_id, serde_json::to_value(payload)?)),
+        }
+    }
+
     /// 处理取消通知 `notify:tool_call_cancel`（**无 ACK**，fire-and-forget，INT-03 #72 + 取消纵切）。
     ///
     /// 解析广播载体 `{agent, req_id}`（[`AgentCallData`]），fire 对应在途调用的取消令牌
@@ -2234,6 +2359,39 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_to_smcp_tool_a2c_tool_meta_canonical_string() {
+        // #200：wire 线格式 —— `a2c_tool_meta` 终值为 JSON **字符串**（非嵌套对象），解析后含 ToolMeta
+        // **全字段**（未设置=null，与 python `model_dump(mode="json")` 同形）；原生 `_meta` key 原样保留。
+        let mut meta = serde_json::Map::new();
+        meta.insert("custom_key".to_string(), serde_json::json!("v"));
+        meta.insert(
+            "a2c_tool_meta".to_string(),
+            serde_json::json!({
+                "auto_apply": null, "alias": null, "tags": ["read"], "ret_object_mapper": null
+            }),
+        );
+        let smcp_tool = convert_tool_to_smcp_tool(make_tool(Some(meta), None), "test_bundle");
+
+        let meta_map = smcp_tool.meta.unwrap().as_object().unwrap().clone();
+        assert_eq!(
+            meta_map["custom_key"],
+            serde_json::json!("v"),
+            "原生 _meta key 原样保留"
+        );
+        let wire = meta_map["a2c_tool_meta"]
+            .as_str()
+            .expect("a2c_tool_meta MUST 是 JSON 字符串");
+        let parsed: serde_json::Value = serde_json::from_str(wire).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "auto_apply": null, "alias": null, "tags": ["read"], "ret_object_mapper": null
+            }),
+            "wire 字符串解析后应为全字段 canonical（双 SDK 同形）"
+        );
+    }
+
+    #[test]
     fn test_tool_to_smcp_tool_string_value_not_double_serialized() {
         let mut meta = serde_json::Map::new();
         meta.insert(
@@ -2612,6 +2770,7 @@ mod tests {
                 inline_budget,
                 too_large_cap,
                 chunk_max_bytes: 256 * 1024,
+                ..BlobThresholds::default()
             });
         computer.boot_up().await.unwrap();
         let ops: Arc<dyn ComputerHandlerOps> = Arc::new(computer);
@@ -2832,6 +2991,156 @@ mod tests {
         );
         let r = SmcpComputerClient::handle_get_blob_with_ack(p, None, "c".to_string()).await;
         assert!(matches!(r, Err(ComputerError::InvalidState(_))));
+        // put_blob 同样：ops 缺席 → InvalidState。
+        let p = Payload::Text(
+            vec![
+                json!({ "agent": "a", "req_id": "r1", "computer": "c", "chunk_offset": 0, "eof": true, "blob": "aGVsbG8=" }),
+            ],
+            Some(2),
+        );
+        let r = SmcpComputerClient::handle_put_blob_with_ack(p, None, "c".to_string()).await;
+        assert!(matches!(r, Err(ComputerError::InvalidState(_))));
+    }
+
+    // ── #195：client:put_blob 上行写入 / upstream write channel ─────────────
+
+    /// put_blob 单测 ops（landing root 注入 tmp；阈值与 boot_blob_ops 同款）。
+    async fn boot_upload_ops() -> (Arc<dyn ComputerHandlerOps>, tempfile::TempDir) {
+        use crate::blob::BlobThresholds;
+        use crate::computer::{Computer, SilentSession};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(tmp.path().join("home"))
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_landing_root(tmp.path().join("landing"))
+            .with_blob_thresholds(BlobThresholds {
+                inline_budget: 32 * 1024,
+                too_large_cap: 100 * 1024 * 1024,
+                chunk_max_bytes: 256 * 1024,
+                ..BlobThresholds::default()
+            });
+        computer.boot_up().await.unwrap();
+        let ops: Arc<dyn ComputerHandlerOps> = Arc::new(computer);
+        (ops, tmp)
+    }
+
+    fn put_payload(req_id: &str, value: serde_json::Value) -> Payload {
+        Payload::Text(vec![value], Some(req_id.len() as i32))
+    }
+
+    #[tokio::test]
+    async fn test_put_blob_roundtrip_first_then_final() {
+        let (ops, tmp) = boot_upload_ops().await;
+        let data = b"hello put blob";
+        let sha = smcp::utils::hash::sha256_hex(data);
+
+        // 首块（eof=false）→ ack 含 32-hex upload_id，无 landing 字段。
+        let p = put_payload(
+            "r1",
+            json!({
+                "agent": "a", "req_id": "r1", "computer": "c",
+                "chunk_offset": 0, "eof": false,
+                "total_size": data.len(), "sha256": sha,
+                "name_hint": "hi.bin",
+                "blob": base64::engine::general_purpose::STANDARD.encode(data),
+            }),
+        );
+        let (ack, resp) =
+            SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops.clone()), "c".to_string())
+                .await
+                .unwrap();
+        assert_eq!(ack, Some(2));
+        let upload_id = resp["upload_id"].as_str().unwrap().to_string();
+        assert_eq!(upload_id.len(), 32);
+        assert!(
+            resp.get("landing_path").is_none(),
+            "首块不得回 landing_path"
+        );
+        assert!(resp.get("total_size").is_none());
+
+        // 末块（eof=true，offset == 已收）→ landing_path + total_size + sha256 回显；落盘字节自证。
+        let p2 = put_payload(
+            "r2",
+            json!({
+                "agent": "a", "req_id": "r2", "computer": "c",
+                "upload_id": upload_id, "chunk_offset": data.len() as u64, "eof": true,
+                "blob": base64::engine::general_purpose::STANDARD.encode(b""),
+            }),
+        );
+        let (_, resp2) =
+            SmcpComputerClient::handle_put_blob_with_ack(p2, Some(ops.clone()), "c".to_string())
+                .await
+                .unwrap();
+        let lp = resp2["landing_path"].as_str().unwrap().to_string();
+        assert_eq!(resp2["total_size"], json!(data.len()));
+        assert_eq!(resp2["sha256"], json!(sha));
+        assert_eq!(std::fs::read(&lp).unwrap(), data);
+        // 落盘产物以 upload_id 前缀安全名落在 landing root 内。
+        let name = lp.rsplit('/').next().unwrap();
+        assert!(name.starts_with(&upload_id));
+        assert!(tmp.path().join("landing").join(name).exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_blob_single_chunk_degenerate_and_name_sanitized() {
+        let (ops, tmp) = boot_upload_ops().await;
+        let data = b"single";
+        let sha = smcp::utils::hash::sha256_hex(data);
+        let p = put_payload(
+            "r1",
+            json!({
+                "agent": "a", "req_id": "r1", "computer": "c",
+                "chunk_offset": 0, "eof": true,
+                "total_size": data.len(), "sha256": sha,
+                "name_hint": "../../etc/passwd",
+                "blob": base64::engine::general_purpose::STANDARD.encode(data),
+            }),
+        );
+        let (_, resp) = SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops), "c".to_string())
+            .await
+            .unwrap();
+        let lp = resp["landing_path"].as_str().unwrap().to_string();
+        let name = lp.rsplit('/').next().unwrap().to_string();
+        assert!(!name.contains('/'));
+        assert!(!name.contains(".."));
+        assert_eq!(std::fs::read(&lp).unwrap(), data);
+        let _ = tmp;
+    }
+
+    #[tokio::test]
+    async fn test_put_blob_unset_root_forbidden_fail_closed() {
+        // 无 with_landing_root（且无 settings landingRoot）→ 首块 4019 forbidden，零字节落盘。
+        let (ops, _tmp) = boot_blob_ops(1024, 1 << 20).await;
+        let p = put_payload(
+            "r1",
+            json!({
+                "agent": "a", "req_id": "r1", "computer": "c",
+                "chunk_offset": 0, "eof": true,
+                "total_size": 5, "sha256": "a".repeat(64),
+                "blob": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            }),
+        );
+        let (_, resp) = SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops), "c".to_string())
+            .await
+            .unwrap();
+        assert_eq!(resp["code"], json!(4019));
+        assert_eq!(resp["details"]["reason"], json!("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn test_put_blob_computer_name_mismatch() {
+        let (ops, _tmp) = boot_upload_ops().await;
+        let p = put_payload(
+            "r1",
+            json!({
+                "agent": "a", "req_id": "r1", "computer": "WRONG",
+                "chunk_offset": 0, "eof": true,
+                "total_size": 5, "sha256": "a".repeat(64),
+                "blob": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            }),
+        );
+        let r = SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops), "c".to_string()).await;
+        assert!(matches!(r, Err(ComputerError::ValidationError(_))));
     }
 
     // ── #92：tool_call ack 顶层结果级 `_meta`→`meta` 重映射（协议 §234 producer MUST=meta）──────

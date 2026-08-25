@@ -28,8 +28,8 @@ use tracing::{debug, error, info, warn};
 // INT-01 #68：SKILL / blob 子系统编排 / SKILL & blob subsystem orchestration。
 use crate::blob::{
     decode_blob_handle, default_thresholds, encode_toolspool_handle, BlobHandleError, BlobResolver,
-    BlobThresholds, BlobTooLargeError, DecodedHandle, ResolvedBlob, SkillBlobResolver,
-    SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
+    BlobThresholds, BlobTooLargeError, BlobUploadStore, DecodedHandle, ResolvedBlob,
+    SkillBlobResolver, SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
 use crate::governance::{
@@ -58,7 +58,7 @@ use crate::settings::reconciler::InstalledPluginRecord;
 use crate::settings::recovery::{
     plugin_enabled_origin, BundledServerRecord, GovernanceRecoveryReport,
 };
-use crate::settings::schema::SettingsScope;
+use crate::settings::schema::{SettingsScope, FIELD_LANDING_ROOT};
 use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
@@ -67,6 +67,8 @@ use crate::skills::{
 };
 use smcp::utils::env_truthy;
 use smcp::A2CSkillRef;
+
+use smcp::{ErrorPayload, PutBlobReq, PutBlobRet};
 
 use crate::errors::{ComputerError, ComputerResult};
 // #162：结构化 Runtime diagnostics 词汇（记录 / 清除接线全走 `RuntimeStatus` 的键控集）。
@@ -94,7 +96,9 @@ use crate::mcp_clients::{
     ConfigRender, RenderError,
 };
 use crate::oauth::{InMemoryOAuthCredentialStore, OAuthCredentialStore};
-use crate::socketio_client::{SmcpComputerClient, SmcpComputerClientBuilder};
+use crate::socketio_client::{
+    SmcpComputerClient, SmcpComputerClientBuilder, DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+};
 use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
 /// 确认回调函数类型 / Confirmation callback function type
@@ -103,13 +107,81 @@ type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> b
 /// Process-unique tokens fence stale Socket.IO clients from publishing Computer lifecycle changes.
 static NEXT_SOCKETIO_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+/// Private dependency boundary for the Socket.IO slot installation transaction.
+///
+/// Keeping transport teardown and lifecycle ownership behind one interface makes the failure
+/// invariants deterministic to test without weakening the public client API or adding production
+/// failpoints.
+#[async_trait]
+trait SocketIoInstallClient: Send + Sync {
+    fn has_active_runtime_lifecycle(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+    ) -> bool;
+
+    fn claim_runtime_lifecycle(
+        &self,
+        status: Arc<RuntimeStatus>,
+        owner: Arc<StdMutex<u64>>,
+        token: u64,
+    ) -> bool;
+
+    fn activate_runtime_lifecycle(&self, token: u64) -> bool;
+
+    fn release_runtime_lifecycle_claim(&self, token: u64);
+
+    fn deactivate_runtime_lifecycle(&self);
+
+    async fn disconnect_for_install(&self) -> ComputerResult<()>;
+}
+
+#[async_trait]
+impl SocketIoInstallClient for SmcpComputerClient {
+    fn has_active_runtime_lifecycle(
+        &self,
+        status: &Arc<RuntimeStatus>,
+        owner: &Arc<StdMutex<u64>>,
+    ) -> bool {
+        self.has_active_runtime_lifecycle(status, owner)
+    }
+
+    fn claim_runtime_lifecycle(
+        &self,
+        status: Arc<RuntimeStatus>,
+        owner: Arc<StdMutex<u64>>,
+        token: u64,
+    ) -> bool {
+        self.claim_runtime_lifecycle(status, owner, token)
+    }
+
+    fn activate_runtime_lifecycle(&self, token: u64) -> bool {
+        self.activate_runtime_lifecycle(token)
+    }
+
+    fn release_runtime_lifecycle_claim(&self, token: u64) {
+        self.release_runtime_lifecycle_claim(token);
+    }
+
+    fn deactivate_runtime_lifecycle(&self) {
+        self.deactivate_runtime_lifecycle();
+    }
+
+    async fn disconnect_for_install(&self) -> ComputerResult<()> {
+        self.disconnect().await
+    }
+}
+
 /// Install one already-connected client while the Computer Socket.IO lifecycle gate is held.
-async fn install_socketio_client_locked(
-    socketio_client: Arc<RwLock<Option<Arc<SmcpComputerClient>>>>,
+async fn install_socketio_client_locked<C>(
+    socketio_client: Arc<RwLock<Option<Arc<C>>>>,
     status: Arc<RuntimeStatus>,
     owner: Arc<StdMutex<u64>>,
-    client: Arc<SmcpComputerClient>,
-) -> ComputerResult<()> {
+    client: Arc<C>,
+) -> ComputerResult<()>
+where
+    C: SocketIoInstallClient + 'static,
+{
     let mut socketio_ref = socketio_client.write().await;
     if socketio_ref
         .as_ref()
@@ -120,7 +192,15 @@ async fn install_socketio_client_locked(
                 "Computer is shut down".to_string(),
             ));
         }
-        return Ok(());
+        return client
+            .has_active_runtime_lifecycle(&status, &owner)
+            .then_some(())
+            .ok_or_else(|| {
+                ComputerError::InvalidState(
+                    "Socket.IO client is retired or has lost its lifecycle ownership; create a new client"
+                        .to_string(),
+                )
+            });
     }
 
     // The reservation is atomic inside the client, unlike a separate check followed by bind.
@@ -136,7 +216,7 @@ async fn install_socketio_client_locked(
     // Claim before cleanup so a shut-down Computer cannot disconnect a candidate currently owned
     // by another Computer. An unowned candidate is still retired before the rejection returns.
     if status.state() == LifecycleState::Shutdown {
-        let cleanup = client.disconnect().await;
+        let cleanup = client.disconnect_for_install().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         cleanup?;
         return Err(ComputerError::InvalidState(
@@ -148,8 +228,8 @@ async fn install_socketio_client_locked(
     // not close it. Retire it before publishing the replacement; if 0.8.1 is already in reconnect
     // backoff, the retiring event gate closes its next namespace before any app handler can run.
     if let Some(previous) = socketio_ref.as_ref() {
-        if let Err(error) = previous.disconnect().await {
-            if let Err(cleanup_error) = client.disconnect().await {
+        if let Err(error) = previous.disconnect_for_install().await {
+            if let Err(cleanup_error) = client.disconnect_for_install().await {
                 warn!(
                     error = %cleanup_error,
                     "replacement Socket.IO client cleanup failed after old teardown error"
@@ -159,10 +239,14 @@ async fn install_socketio_client_locked(
             return Err(error);
         }
         previous.deactivate_runtime_lifecycle();
+        // The old transport is now permanently retired. Remove it before candidate activation so
+        // a concurrent direct disconnect that invalidates the candidate cannot leave a dead old
+        // Arc masquerading as the current slot value.
+        socketio_ref.take();
     }
 
     if !client.activate_runtime_lifecycle(lifecycle_token) {
-        let _ = client.disconnect().await;
+        let _ = client.disconnect_for_install().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         return Err(ComputerError::RuntimeError(
             "Socket.IO lifecycle ownership was lost during installation".to_string(),
@@ -224,6 +308,9 @@ pub struct ConnectOptions {
     /// 应用层 namespace；[`Default`] 为 [`smcp::SMCP_NAMESPACE`] (`/smcp`)。
     /// Application-layer namespace; defaults to `/smcp`.
     pub namespace: String,
+    /// Maximum total wait for initial Engine.IO establishment and Socket.IO namespace readiness.
+    /// Defaults to 30 seconds.
+    pub namespace_connect_timeout: std::time::Duration,
 }
 
 impl Default for ConnectOptions {
@@ -233,6 +320,7 @@ impl Default for ConnectOptions {
             auth_payload: None,
             headers: None,
             namespace: smcp::SMCP_NAMESPACE.to_string(),
+            namespace_connect_timeout: DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
         }
     }
 }
@@ -250,6 +338,7 @@ impl std::fmt::Debug for ConnectOptions {
             )
             .field("headers", &self.headers)
             .field("namespace", &self.namespace)
+            .field("namespace_connect_timeout", &self.namespace_connect_timeout)
             .finish()
     }
 }
@@ -493,8 +582,18 @@ pub struct Computer<S: Session> {
     blob_thresholds: BlobThresholds,
     /// 内容寻址暂存（boot 时建；mint 时写入）/ toolspool store (built at boot)。
     toolspool_store: Arc<RwLock<Option<Arc<ToolspoolBlobStore>>>>,
-    /// kind → resolver 派发表（boot 时装配 toolspool；skill 由 resolve_blob async 处理）/ resolver table。
+    /// kind → resolver 派发表（boot 时装配 toolspool；skill 由 resolve_blob async 处理）/ resolver table.
     blob_resolvers: Arc<RwLock<HashMap<String, Arc<dyn BlobResolver>>>>,
+    /// `client:put_blob` 落盘根（v0.4.0 #195）：§7 config-first lazy——已配置进程内缓存、未配置每次
+    /// 重查（镜像 python `computer.py::landing_root` 热启用语义）/ landing root (lazy-resolved).
+    landing_root: Arc<RwLock<Option<PathBuf>>>,
+    /// 上传会话 store（lazy 双检锁构造；仅 landing root 已配置才缓存——None-root store 拒绝一切上传）/
+    /// upload-session store (double-checked lazy construction).
+    blob_upload_store: Arc<RwLock<Option<Arc<BlobUploadStore>>>>,
+    /// lazy 双检锁（store 构造串行化）/ double-check construction lock.
+    blob_upload_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 落盘根注入覆盖（测试/部署；短路 settings 查询）/ landing-root injection override.
+    landing_root_override: Option<PathBuf>,
 
     // ── INT-02 #70：tool_call 取消最后一公里 / tool_call cancellation last-mile ──────────
     /// 在途可取消工具调用注册表（`req_id` → [`CancellationToken`]），响应 `notify:tool_call_cancel`。
@@ -880,6 +979,10 @@ impl<S: Session> Computer<S> {
             blob_thresholds: default_thresholds(),
             toolspool_store: Arc::new(RwLock::new(None)),
             blob_resolvers: Arc::new(RwLock::new(HashMap::new())),
+            landing_root: Arc::new(RwLock::new(None)),
+            blob_upload_store: Arc::new(RwLock::new(None)),
+            blob_upload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            landing_root_override: None,
             inflight_tool_tasks: Arc::new(StdMutex::new(HashMap::new())),
             desktop_window_uris: Arc::new(RwLock::new(HashSet::new())),
             mcp_notify_task: Arc::new(Mutex::new(None)),
@@ -903,6 +1006,14 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_blob_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.blob_cache_root_override = Some(root.into());
+        self
+    }
+
+    /// 注入 `client:put_blob` 落盘根覆盖（测试/部署；短路 settings `landingRoot` 查询）。
+    /// Inject a landing-root override (tests/deployment; short-circuits the settings query).
+    #[must_use]
+    pub fn with_landing_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.landing_root_override = Some(root.into());
         self
     }
 
@@ -1728,6 +1839,73 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn blob_thresholds(&self) -> BlobThresholds {
         self.blob_thresholds
+    }
+
+    // ── #195：client:put_blob 上行 / upstream write channel ──────────────────
+
+    /// 解析 `client:put_blob` 落盘根（§7 config-first lazy——镜像 python `computer.py::landing_root`
+    /// 热启用语义：已配置进程内缓存；未配置每次重查，事后补配置可即时生效）。
+    ///
+    /// 优先 `with_landing_root` 注入覆盖；否则从 settings `landingRoot` 取（绝对路径；project scope
+    /// 供给已被 [`TRUSTED_SCOPE_ONLY_FIELDS`](crate::settings::schema::TRUSTED_SCOPE_ONLY_FIELDS)
+    /// 过滤）。未配置 → `None` → store fail-closed（`4019 forbidden`，零字节落盘）。
+    pub async fn landing_root(&self) -> Option<PathBuf> {
+        if let Some(override_root) = self.landing_root_override.clone() {
+            return Some(override_root);
+        }
+        let mut slot = self.landing_root.write().await;
+        if let Some(cached) = slot.as_ref() {
+            return Some(cached.clone());
+        }
+        if let Some(root) = resolve_landing_root_settings(&self.config_dir(), self.config_env()) {
+            *slot = Some(root.clone());
+            return Some(root);
+        }
+        None
+    }
+
+    /// `client:put_blob` 上传会话表（lazy 双检锁构造；镜像 python
+    /// `computer.py::blob_upload_store`：**已配置 landing root 后进程内单例**——会话状态只在 store
+    /// 内存里；**未配置时不缓存**——None-root store 拒绝一切上传（4019 forbidden），重建零代价）。
+    pub async fn blob_upload_store(&self) -> Arc<BlobUploadStore> {
+        if let Some(store) = self.blob_upload_store.read().await.clone() {
+            return store;
+        }
+        let _guard = self.blob_upload_lock.lock().await;
+        if let Some(store) = self.blob_upload_store.read().await.clone() {
+            return store;
+        }
+        let candidate = Arc::new(BlobUploadStore::new(
+            self.landing_root().await,
+            self.blob_thresholds,
+        ));
+        if candidate.landing_root().is_some() {
+            *self.blob_upload_store.write().await = Some(candidate.clone());
+        }
+        candidate
+    }
+
+    /// 处理单个 `client:put_blob` 块（首块 / 后续块 / 末块统一入口，§3）。
+    ///
+    /// 委托 [`BlobUploadStore::handle_chunk`]；4019 flat ErrorPayload 处理失败面（语义见 upload.rs）。
+    /// 整段同步 IO（`.part` 写 / `fsync` / `rename` / 孤儿 GC / `canonicalize`）经
+    /// [`tokio::task::spawn_blocking`] offload 到阻塞池——socketio handler 在 async 线程上
+    /// 运行，FS 尾部操作（尤其末块 `fsync`+`rename`）不应霸占 event loop 线程（审查 🟡3 超集：
+    /// 全块写路径而非仅 finalize 段；锁粒度不变——闭包内同步、无 await，会话序列化保持）。
+    // ErrorPayload 是协议原生 flat 错误结构；此公开入口保持与 BlobUploadStore 一致的返回类型，
+    // 避免仅为 lint 装箱而改变 SDK API。与 blob/upload.rs 的模块级取舍保持一致（#210）。
+    #[allow(clippy::result_large_err)]
+    pub async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload> {
+        // blob_upload_store 恒构造一个 store（None-root 亦拒绝一切上传），此处不做 None 分支。
+        let store = self.blob_upload_store().await;
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || store.handle_chunk(&req))
+            .await
+            .map_err(|e| {
+                // 防御性兜底：任务 panic（handle_chunk 正常路径显式 Err，无 panic；围栏亦 fail-closed）。
+                error!(error = %e, "client:put_blob upload task panicked");
+                crate::blob::upload::blob_write_error("io_error", "upload service aborted")
+            })?
     }
 
     /// 铸造 `kind=toolspool` 不透明句柄并写盘 / Mint an opaque toolspool handle。
@@ -4271,6 +4449,10 @@ impl<S: Session> Computer<S> {
             blob_thresholds: self.blob_thresholds,
             toolspool_store: Arc::clone(&self.toolspool_store),
             blob_resolvers: Arc::clone(&self.blob_resolvers),
+            landing_root: Arc::clone(&self.landing_root),
+            blob_upload_store: Arc::clone(&self.blob_upload_store),
+            blob_upload_lock: Arc::clone(&self.blob_upload_lock),
+            landing_root_override: self.landing_root_override.clone(),
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
             // desktop 缓存共享（clone 与本体同一 window:// 集合视图）；通知任务句柄不复制（仅本体持有消费者）。
             desktop_window_uris: Arc::clone(&self.desktop_window_uris),
@@ -4328,6 +4510,7 @@ impl<S: Session> Computer<S> {
             self.inputs.clone(),
         )
         .namespace(options.namespace)
+        .namespace_connect_timeout(options.namespace_connect_timeout)
         .computer_ops(ops);
         // #201：动态 Provider 优先；未配置时保留 #86 静态 auth dict 行为。
         if let Some(provider) = options.auth_provider {
@@ -4534,6 +4717,11 @@ impl<S: Session + Clone> Clone for Computer<S> {
             blob_thresholds: self.blob_thresholds,
             toolspool_store: Arc::clone(&self.toolspool_store),
             blob_resolvers: Arc::clone(&self.blob_resolvers),
+            // #195：put_blob 落盘根与上传 store 为整机运行态——clone 命中同一 Arc。
+            landing_root: Arc::clone(&self.landing_root),
+            blob_upload_store: Arc::clone(&self.blob_upload_store),
+            blob_upload_lock: Arc::clone(&self.blob_upload_lock),
+            landing_root_override: self.landing_root_override.clone(),
             // 取消注册表属**共享态**：clone 体与原 Computer 须命中同一表，否则跨 clone 的 acancel_tool 失效。
             inflight_tool_tasks: Arc::clone(&self.inflight_tool_tasks),
             // desktop 缓存与通知消费者均属整机运行态，任一公开 handle shutdown 都须可确定性清理。
@@ -4586,6 +4774,8 @@ pub(crate) trait ComputerHandlerOps: Send + Sync {
     ) -> Result<String, BlobMintError>;
     /// blob 阈值（inline / too_large / chunk_max）/ blob thresholds。
     fn blob_thresholds(&self) -> BlobThresholds;
+    /// 处理单个 `client:put_blob` 块（首块/后续/末块统一入口，v0.4.0 #195）/ handle one put_blob chunk。
+    async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload>;
     /// 可取消执行工具调用（取消/超时写结果级 meta）/ cancellable tool-call execution。
     async fn execute_tool_cancellable(
         &self,
@@ -4629,6 +4819,9 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
     fn blob_thresholds(&self) -> BlobThresholds {
         Computer::blob_thresholds(self)
     }
+    async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload> {
+        Computer::put_blob_chunk(self, req).await
+    }
     async fn execute_tool_cancellable(
         &self,
         req_id: &str,
@@ -4641,6 +4834,35 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
     async fn acancel_tool(&self, req_id: &str) -> bool {
         Computer::acancel_tool(self, req_id).await
     }
+}
+
+/// 从 settings 五层合并视图解析 `landingRoot`（§7 config-first；project 供给已被 schema 过滤）。
+///
+/// 与 python `landing_root` 属性同构：`~` 前缀经 [`expand_home`](crate::skills::home::expand_home)
+/// 展开（尊重注入 env，保持 hermetic）；非字符串 / 空值 → `None`（fail-closed）。
+///
+/// **有意分叉（🟡2 确认）/ Deliberate divergence**: `flag_settings_path` 恒 `None`——rust
+/// `Computer` 是库组件，运行态**不持有** flag 文件路径（flag scope 仅在 CLI 命令上下文经
+/// `--settings <file>` 注入，见 `cli/commands`），与 rust 全部其它 runtime settings 解析点
+/// 一致；python `Computer(flag_settings_path=...)` 构造参数由 CLI 注入（`_resolve_declared_settings`
+/// 会并入 flag 层）。即 `landingRoot` 的 flag scope 声明在 rust 下不可见（有意取舍：flag
+/// 层声明走 CLI 直连的 settings 命令视图，非本属性职责）。
+fn resolve_landing_root_settings(
+    config_dir: &std::path::Path,
+    env: Option<&EnvMap>,
+) -> Option<PathBuf> {
+    let policy = resolve_policy_settings(None, None, None);
+    let resolved = resolve_settings(ResolveSettingsArgs {
+        cwd: Some(config_dir),
+        env,
+        flag_settings_path: None,
+        policy_settings: Some(&policy),
+    });
+    let raw = resolved.settings.get(FIELD_LANDING_ROOT)?.as_str()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(crate::skills::home::expand_home(raw.trim(), env))
 }
 
 /// MCP 源 SKILL 重物化的共享自由函数（#106）：`Computer::restage_mcp_skills` 与 [`McpChangeReactor`] 共用，
@@ -4844,6 +5066,154 @@ mod tests {
         CommandInput, MCPServerConfig, MCPServerInput, PickStringInput, PickStringOption,
         PromptStringInput, StdioServerConfig, StdioServerParameters,
     };
+    use std::sync::atomic::AtomicBool;
+
+    struct FakeSocketIoInstallClient {
+        active: AtomicBool,
+        claim_succeeds: bool,
+        activate_succeeds: bool,
+        disconnect_fails: bool,
+        disconnect_calls: AtomicU64,
+        released: AtomicBool,
+        deactivated: AtomicBool,
+    }
+
+    impl FakeSocketIoInstallClient {
+        fn new(active: bool) -> Self {
+            Self {
+                active: AtomicBool::new(active),
+                claim_succeeds: true,
+                activate_succeeds: true,
+                disconnect_fails: false,
+                disconnect_calls: AtomicU64::new(0),
+                released: AtomicBool::new(false),
+                deactivated: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SocketIoInstallClient for FakeSocketIoInstallClient {
+        fn has_active_runtime_lifecycle(
+            &self,
+            _status: &Arc<RuntimeStatus>,
+            _owner: &Arc<StdMutex<u64>>,
+        ) -> bool {
+            self.active.load(Ordering::Acquire)
+        }
+
+        fn claim_runtime_lifecycle(
+            &self,
+            _status: Arc<RuntimeStatus>,
+            _owner: Arc<StdMutex<u64>>,
+            _token: u64,
+        ) -> bool {
+            self.claim_succeeds
+        }
+
+        fn activate_runtime_lifecycle(&self, _token: u64) -> bool {
+            if self.activate_succeeds {
+                self.active.store(true, Ordering::Release);
+            }
+            self.activate_succeeds
+        }
+
+        fn release_runtime_lifecycle_claim(&self, _token: u64) {
+            self.released.store(true, Ordering::Release);
+        }
+
+        fn deactivate_runtime_lifecycle(&self) {
+            self.active.store(false, Ordering::Release);
+            self.deactivated.store(true, Ordering::Release);
+        }
+
+        async fn disconnect_for_install(&self) -> ComputerResult<()> {
+            self.disconnect_calls.fetch_add(1, Ordering::AcqRel);
+            if self.disconnect_fails {
+                Err(ComputerError::RuntimeError(
+                    "injected Socket.IO teardown failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    type InstallTestState<C> = (
+        Arc<RwLock<Option<Arc<C>>>>,
+        Arc<RuntimeStatus>,
+        Arc<StdMutex<u64>>,
+    );
+
+    fn install_test_state<C>(current: Option<Arc<C>>) -> InstallTestState<C> {
+        (
+            Arc::new(RwLock::new(current)),
+            Arc::new(RuntimeStatus::new()),
+            Arc::new(StdMutex::new(0)),
+        )
+    }
+
+    #[tokio::test]
+    async fn socketio_same_arc_fast_path_rejects_inactive_lease() {
+        let client = Arc::new(FakeSocketIoInstallClient::new(false));
+        let (slot, status, owner) = install_test_state(Some(Arc::clone(&client)));
+
+        let result = install_socketio_client_locked(slot, status, owner, client).await;
+
+        assert!(matches!(result, Err(ComputerError::InvalidState(_))));
+    }
+
+    #[tokio::test]
+    async fn socketio_install_teardown_failure_retains_previous_and_releases_candidate() {
+        let previous = Arc::new(FakeSocketIoInstallClient {
+            disconnect_fails: true,
+            ..FakeSocketIoInstallClient::new(true)
+        });
+        let candidate = Arc::new(FakeSocketIoInstallClient::new(false));
+        let (slot, status, owner) = install_test_state(Some(Arc::clone(&previous)));
+
+        let result = install_socketio_client_locked(
+            Arc::clone(&slot),
+            status,
+            owner,
+            Arc::clone(&candidate),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(slot
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &previous)));
+        assert!(!previous.deactivated.load(Ordering::Acquire));
+        assert_eq!(candidate.disconnect_calls.load(Ordering::Acquire), 1);
+        assert!(candidate.released.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn socketio_install_activation_failure_leaves_no_retired_slot_value() {
+        let previous = Arc::new(FakeSocketIoInstallClient::new(true));
+        let candidate = Arc::new(FakeSocketIoInstallClient {
+            activate_succeeds: false,
+            ..FakeSocketIoInstallClient::new(false)
+        });
+        let (slot, status, owner) = install_test_state(Some(Arc::clone(&previous)));
+
+        let result = install_socketio_client_locked(
+            Arc::clone(&slot),
+            status,
+            owner,
+            Arc::clone(&candidate),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ComputerError::RuntimeError(_))));
+        assert!(slot.read().await.is_none());
+        assert!(previous.deactivated.load(Ordering::Acquire));
+        assert_eq!(candidate.disconnect_calls.load(Ordering::Acquire), 1);
+        assert!(candidate.released.load(Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn test_computer_creation() {
@@ -6922,6 +7292,7 @@ mod tests {
                 inline_budget: 8,
                 too_large_cap: 4,
                 chunk_max_bytes: 8,
+                ..BlobThresholds::default()
             });
         computer.boot_up().await.unwrap();
         let err = computer

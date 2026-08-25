@@ -522,3 +522,69 @@ async fn test_auto_reconnect_semantics() {
         "拒绝错误 MUST 携带 name 或 bundle_id 便于诊断；实际：{msg}"
     );
 }
+
+/// #200：ToolMeta Server 声明 tags 三层合并 —— 公开面逐字段对拍（python-sdk#199 / PR#202 同向量，
+/// 协议 protocol#51 / PR#57 / 裁决 Disc#56）。
+///
+/// 走**真实 Streamable HTTP 传输**（非 MockToolsClient 旁路）：mock `tools/list` 产出的原生 `_meta`
+/// （custom_key + `a2c_tool_meta` 声明，含白名单外 `auto_apply`）经 rmcp 解析 → Computer 装配点
+/// reconcile → 断言 canonical 终值（**全字段含 null**，V9 锚点；与 python `model_dump(mode="json")`
+/// 同形）+ 原生 `_meta` key 保留。经公开 `list_available_tools`（与
+/// `list_available_tools_with_bundle_id` 同一 reconcile 落点），防「测函数 ≠ 测接线」。
+#[tokio::test]
+async fn test_toolmeta_three_layer_wire_alignment() {
+    use smcp_computer::mcp_clients::{
+        HttpServerConfig, HttpServerParameters, MCPServerConfig, MCPServerManager,
+    };
+    use streamable_mock::{spawn_streamable_mock, MockOpts};
+
+    let port = spawn_streamable_mock(MockOpts {
+        tool_meta: Some(serde_json::json!({
+            "custom_key": "v",
+            "a2c_tool_meta": {"tags": ["read"], "auto_apply": true}
+        })),
+        ..Default::default()
+    })
+    .await;
+
+    let manager = MCPServerManager::new();
+    manager
+        .initialize(vec![MCPServerConfig::Http(HttpServerConfig::new(
+            "declared",
+            HttpServerParameters {
+                url: format!("http://127.0.0.1:{port}"),
+                headers: std::collections::HashMap::new(),
+            },
+        ))])
+        .await
+        .unwrap();
+    // time-box：与 test_auto_reconnect_semantics 同约定（#149）。
+    tokio::time::timeout(std::time::Duration::from_secs(60), manager.start_all())
+        .await
+        .expect("HANG: start_all 未在 60s 内完成")
+        .unwrap();
+
+    let tools = manager.list_available_tools().await;
+    let tool = tools
+        .iter()
+        .find(|t| t.name.to_string().ends_with("__protected"))
+        .expect("protected 工具应暴露");
+    let meta_map = tool.meta.as_ref().expect("meta 应存在").0.clone();
+
+    assert_eq!(
+        meta_map.get("custom_key"),
+        Some(&serde_json::Value::String("v".into())),
+        "原生 _meta key MUST 原样保留"
+    );
+    assert_eq!(
+        meta_map.get("a2c_tool_meta"),
+        Some(&serde_json::json!({
+            "auto_apply": null,
+            "alias": null,
+            "tags": ["read"],
+            "ret_object_mapper": null
+        })),
+        "canonical 终值应为全字段（未设置=null）——与 python model_dump(mode=\"json\") 同形；\
+         白名单外 auto_apply=true MUST NOT 进入终值（字段级过滤，裁决不变量 2）"
+    );
+}

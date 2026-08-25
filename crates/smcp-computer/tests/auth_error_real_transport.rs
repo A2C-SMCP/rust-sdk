@@ -59,6 +59,7 @@ async fn call_and_capture_err(
         reject_status,
         with_www_authenticate,
         expose_resources: false,
+        ..Default::default()
     })
     .await;
     let client = HttpMCPClient::new(HttpServerParameters {

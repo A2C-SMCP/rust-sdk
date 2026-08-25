@@ -375,6 +375,20 @@ impl SmcpHandler {
             },
         );
 
+        // #195：client:put_blob 上行写入（与 get_blob 同构：按 computer 透传，逐 ack 回 4019 原样）。
+        let state_put_blob = state.clone();
+        socket.on(
+            smcp::events::CLIENT_PUT_BLOB,
+            move |socket: SocketRef, Data::<PutBlobReq>(data), ack: AckSender| async move {
+                match Self::on_client_put_blob(socket, data, state_put_blob.clone()).await {
+                    Ok(payload) => {
+                        let _ = ack.send(&payload);
+                    }
+                    Err(e) => warn!("client:put_blob relay rejected, no ack: {e}"),
+                }
+            },
+        );
+
         let state_get_resources = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_RESOURCES,
@@ -1102,6 +1116,24 @@ impl SmcpHandler {
             &data.computer,
             &data,
             smcp::events::CLIENT_GET_BLOB,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// 透明转发 `client:put_blob` 至目标 Computer（Server 不重组；Computer 的 4019 flat ErrorPayload
+    /// 原样回传，与 `get_blob` 同构）/ relay `client:put_blob` (v0.4.0 #195).
+    async fn on_client_put_blob(
+        socket: SocketRef,
+        data: PutBlobReq,
+        state: ServerState,
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_PUT_BLOB,
             &state,
             tokio::time::Duration::from_secs(30),
         )

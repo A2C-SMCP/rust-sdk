@@ -243,6 +243,23 @@ fn apply_frontmatter_optional_fields(
     {
         skill_ref.allowed_tools = Some(to_str_list(v));
     }
+    // tags 纯透传不校验（protocol skill.md §1.5）：严格 `list[str]` 才填 ref；畸形（非 Array / 混合元素）→
+    // 省略 + DEBUG，SKILL 照常注册。**勿照抄 allowed-tools 归一**（to_str_list 强制 string|array→Vec\<String\>）
+    // —— tags 口径不同：键缺席或畸形时响应键整个缺席（非 null）。
+    if let Some(v) = frontmatter.get("tags") {
+        let strs = v
+            .as_array()
+            .and_then(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>());
+        match strs {
+            Some(items) => {
+                skill_ref.tags = Some(items.into_iter().map(String::from).collect());
+            }
+            None => tracing::debug!(
+                tags = %v,
+                "frontmatter 'tags' is not a string list; field omitted, SKILL still registers (protocol skill.md §1.5)"
+            ),
+        }
+    }
     if let Some(Value::Object(m)) = frontmatter.get("metadata") {
         skill_ref.skill_metadata = Some(Value::Object(m.clone()));
     }
@@ -276,6 +293,7 @@ fn build_ref(
         license: None,
         compatibility: None,
         allowed_tools: None,
+        tags: None,
         version,
         skill_metadata: None,
     };
@@ -1723,6 +1741,50 @@ mod tests {
         assert_eq!(r.allowed_tools.as_deref(), Some(&["solo".to_string()][..]));
     }
 
+    /// tags 纯透传不校验（protocol skill.md §1.5）：严格 `list[str]` 才填 ref；畸形 → 省略 + DEBUG。
+    /// 对拍 python `_apply_frontmatter_optional_fields`（6e3e0e3）：键存在判断区分「键缺席（跳过）」vs
+    /// 「畸形（省略 + DEBUG 日志，SKILL 照常注册）」；**勿抄 allowed-tools 归一**。
+    #[test]
+    fn test_apply_frontmatter_tags_strict_string_list() {
+        let build = |fm: serde_json::Value| {
+            build_ref(
+                "s".into(),
+                "user".into(),
+                None,
+                Path::new("/abs/s"),
+                "d".into(),
+                fm.as_object().unwrap(),
+                None,
+            )
+        };
+
+        // 严格 list[str] → 填 ref（透传，不归一）。
+        let r = build(serde_json::json!({"tags": ["a", "b"]}));
+        assert_eq!(
+            r.tags.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+
+        // 空数组 → Some([])：0 条合法（python 对拍：isinstance 全空 all 成立 → 填）。
+        let r = build(serde_json::json!({"tags": []}));
+        assert_eq!(r.tags, Some(Vec::new()));
+
+        // 键缺席 → tags 保持 None（键整个缺席，非 null；wire 断言见 smcp round_trip）。
+        let r = build(serde_json::json!({}));
+        assert_eq!(r.tags, None);
+
+        // 畸形（非 Array / 混合元素）→ 省略字段（不触发拒绝路径），SKILL 照常注册。
+        for bad in [
+            serde_json::json!("solo"),
+            serde_json::json!(null),
+            serde_json::json!({"k": "v"}),
+            serde_json::json!(["a", 1]),
+        ] {
+            let r = build(serde_json::json!({ "tags": bad }));
+            assert_eq!(r.tags, None, "malformed tags should be omitted: {bad}");
+        }
+    }
+
     // ---- user 源 staging（就地，仅 home 级）/ user-source staging (home-only) ----
     #[test]
     fn test_stage_user_skills_home_only_no_workdir_dimension() {
@@ -1734,7 +1796,7 @@ mod tests {
         fs::create_dir_all(&user_skill).unwrap();
         fs::write(
             user_skill.join("SKILL.md"),
-            "---\nname: my-helper\ndescription: from home\n---\nbody",
+            "---\nname: my-helper\ndescription: from home\ntags: [gen, work]\n---\nbody",
         )
         .unwrap();
         // <home>/user/other-skill/SKILL.md
@@ -1762,6 +1824,11 @@ mod tests {
         assert_eq!(r.description, "from home");
         assert_eq!(r.source, "user");
         assert!(r.uri.is_none()); // user 源无 uri
+                                  // tags 透传：frontmatter `tags: [gen, work]` → ref（单点覆盖 user 源）。
+        assert_eq!(
+            r.tags.as_deref(),
+            Some(&["gen".to_string(), "work".to_string()][..])
+        );
     }
 
     // ---- marketplace 源 git staging（真实 git，离线 file://）/ real-git integration ----

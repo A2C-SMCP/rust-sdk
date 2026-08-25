@@ -14,7 +14,7 @@ use tokio::time::sleep;
 fn ack_to_sender<T: Send + 'static>(
     sender: tokio::sync::oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(
+) -> impl Fn(
     Payload,
     tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>

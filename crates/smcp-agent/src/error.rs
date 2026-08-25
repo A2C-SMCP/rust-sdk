@@ -56,6 +56,14 @@ pub enum SmcpAgentError {
     #[error("Blob 拉取错误: {0}")]
     Blob(Box<smcp::utils::blob::BlobTransferError>),
 
+    /// `client:put_blob` 上行落盘错误（v0.4.0 #195，`pump_blob`）：4019 各 reason（busy/too_large/
+    /// forbidden/integrity…）→ [`smcp::utils::blob::BlobUploadError::WriteFailed`]；空载荷 / 坏 chunk_size /
+    /// 首块超时（`UploadUnsupported`，目标疑似不支持）/ 末块 ack 缺 landing_path（`IncompleteAck`）/
+    /// 回显 sha 不符（`EchoMismatch`）/ 非 4019 协议码透传 / 非首块传输失败。**装箱**（同 [`Self::Blob`]）。
+    /// 注：能力门控（自身 minor < 0.4）→ [`smcp::utils::blob::BlobUploadError::UnsupportedBySdk`]。
+    #[error("Blob 上行错误: {0}")]
+    Upload(Box<smcp::utils::blob::BlobUploadError>),
+
     #[error("内部错误: {0}")]
     Internal(String),
 }
@@ -104,6 +112,13 @@ impl From<crate::protocol_error::SmcpProtocolError> for SmcpAgentError {
 impl From<smcp::utils::blob::BlobTransferError> for SmcpAgentError {
     fn from(err: smcp::utils::blob::BlobTransferError) -> Self {
         Self::Blob(Box::new(err))
+    }
+}
+
+// pump_blob 上行错误装箱收敛（#195），使 `pump_blob(...)?` 经 `?` 自动转 SmcpAgentError。
+impl From<smcp::utils::blob::BlobUploadError> for SmcpAgentError {
+    fn from(err: smcp::utils::blob::BlobUploadError) -> Self {
+        Self::Upload(Box::new(err))
     }
 }
 
