@@ -26,6 +26,7 @@
 //!    → [`get_desktop_window_filter_and_size`]（WIN-01/02 端到端，对照 get_resources 透传）
 //! 4. SKILL 发现/读取 → [`skills_discovery_and_read`] + [`skill_traversal_rejected_4017`]
 //! 5. blob drain    → [`tool_call_binary_blob_roundtrip`]（分块 offset/eof/sha256 重组）
+//!    5b. blob put（上行，#195）→ [`put_blob_upload_roundtrip`] + [`put_blob_unset_root_forbidden_4019`]
 //! 6. tool_call 二进制 → [`tool_call_binary_blob_roundtrip`]（`_meta.a2c_blob_handle` 旁路）
 //! 7. tool_call 取消/超时 → [`tool_call_cancel_fireforget_and_broadcast`] + [`tool_call_timeout_marks_meta`]
 //! 8. in-flight disconnect → [`originator_disconnect_server_survives`]
@@ -43,13 +44,14 @@ use tempfile::TempDir;
 
 use smcp::{
     events, is_protocol_error_payload, AgentCallData, GetBlobReq, GetBlobRet, GetDesktopReq,
-    GetResourcesReq, GetSkillReq, GetSkillsReq, ProtocolVersion, ReqId, Role, ToolCallReq,
-    PROTOCOL_VERSION,
+    GetResourcesReq, GetSkillReq, GetSkillsReq, ProtocolVersion, PutBlobReq, PutBlobRet, ReqId,
+    Role, ToolCallReq, PROTOCOL_VERSION,
 };
 
 use harness::{
-    agent_client, deep_find, emit_call, http_get, join, spawn_computer, to_hex, HandshakeServer,
-    RelayServer, AGENT, COMPUTER, MCP_NAME, NS, OFFICE, SECRET,
+    agent_client, deep_find, emit_call, http_get, join, spawn_computer,
+    spawn_computer_with_landing, to_hex, HandshakeServer, RelayServer, AGENT, COMPUTER, MCP_NAME,
+    NS, OFFICE, SECRET,
 };
 
 // ───────────────────────────── 1 & 2：版本握手 / Version handshake ─────────────────────────────
@@ -597,6 +599,172 @@ async fn tool_call_binary_blob_roundtrip() {
     for (i, b) in acc.iter().enumerate() {
         assert_eq!(*b, ((i * 31 + 7) & 0xff) as u8, "第 {i} 字节确定性模式不符");
     }
+
+    computer.shutdown().await.unwrap();
+    agent.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+// ─────────── 5b（#195）：client:put_blob 上行写入 round-trip / upstream write ───────────
+
+/// 场景 5b（#195）：`client:put_blob` 上行分块写入经**真** Server relay（`on_client_put_blob`
+/// 路由 + `relay_client_call`）→ 真 Computer `BlobUploadStore` 落盘 → `landing_path` 字节 /
+/// sha256 自证，「在途文件」`.part` 清空。
+///
+/// 驱动模型对齐矩阵注释：Agent 侧用裸 socket.io 客户端发 `client:*` 事件、断言 flat ack
+/// （裸客户端无法在 `on` 回调里回 ack，故只当请求发起方）——`chunk_offset` / `eof` 序列由
+/// Agent 侧推进（镜像 python `test_v02_put_blob_e2e`）。
+#[tokio::test]
+#[ignore = "e2e: REL-01 v0.2.2 matrix; run via cargo test-e2e"]
+async fn put_blob_upload_roundtrip() {
+    use sha2::{Digest, Sha256};
+
+    const BLOB_LEN: usize = 64 * 1024; // 64 KiB
+    const CHUNK: usize = 256; // 64 KiB / 256 B = 256 块（>1 块 → 验证多块续传）
+
+    let td = TempDir::new().unwrap();
+    let landing = td.path().join("landing");
+    let server = RelayServer::start().await;
+    let computer =
+        spawn_computer_with_landing(&server.url(), OFFICE, COMPUTER, &td, None, Some(&landing))
+            .await;
+    let agent = agent_client(&server.url()).await;
+    join(&agent, Role::Agent, OFFICE, AGENT).await;
+
+    // 确定性字节模式 + 声明 sha256（64 KiB）
+    let data: Vec<u8> = (0..BLOB_LEN).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+    let total = data.len() as u64;
+    let mut h = Sha256::new();
+    h.update(&data);
+    let sha = to_hex(&h.finalize());
+
+    // 分块上行：首块带声明（total_size/sha256/name_hint）；后续块仅 upload_id+offset+eof。
+    let mut upload_id: Option<String> = None;
+    let mut offset: u64 = 0;
+    let mut chunks = 0u64;
+    let (landing_path, ack_total, ack_sha) = loop {
+        let end = (offset as usize + CHUNK).min(data.len());
+        let eof = end == data.len();
+        let req = if offset == 0 {
+            PutBlobReq::first_chunk(
+                AGENT,
+                COMPUTER,
+                offset,
+                eof,
+                &data[..end],
+                total,
+                &sha,
+                Some("matrix-blob.bin"),
+            )
+        } else {
+            PutBlobReq::chunk(
+                AGENT,
+                COMPUTER,
+                upload_id.as_deref().expect("首块应回传 upload_id"),
+                offset,
+                eof,
+                &data[offset as usize..end],
+            )
+        };
+        let body = emit_call(&agent, events::CLIENT_PUT_BLOB, json!(req)).await;
+        assert!(body.get("code").is_none(), "put_blob 不应回错误: {body}");
+        let ret: PutBlobRet = serde_json::from_value(body).expect("PutBlobRet 解析");
+        assert_eq!(ret.chunk_offset, offset, "chunk_offset 应回显请求 offset");
+        if offset == 0 {
+            assert!(upload_id.is_none(), "首块 ack 才分配 upload_id");
+            assert!(!ret.upload_id.is_empty(), "首块应回传 upload_id");
+        } else {
+            assert_eq!(
+                Some(ret.upload_id.as_str()),
+                upload_id.as_deref(),
+                "upload_id 应贯穿全程"
+            );
+        }
+        upload_id = Some(ret.upload_id);
+        offset = end as u64;
+        chunks += 1;
+        if eof {
+            break (
+                ret.landing_path.expect("末块应回 landing_path"),
+                ret.total_size.expect("末块应回 total_size"),
+                ret.sha256.expect("末块应回 sha256"),
+            );
+        }
+        assert!(chunks < 1000, "防御：分块循环未在合理块数内 eof");
+    };
+    assert!(chunks >= 2, "小 CHUNK 下应多块（实测 {chunks} 块）");
+
+    // 声明-校验镜像：ack total/sha256 == Agent 首块声明值。
+    assert_eq!(ack_total, total, "ack total_size 应等于声明");
+    assert_eq!(ack_sha, sha, "ack sha256 应等于声明（Computer 重算比对）");
+
+    // landing 沙箱：绝对路径、落于注入 root、安全名 = 上传 id 前缀 + 消毒 name_hint。
+    let lp = std::path::Path::new(&landing_path);
+    assert!(
+        lp.is_absolute(),
+        "landing_path 应为绝对路径: {landing_path}"
+    );
+    assert!(
+        lp.starts_with(&landing),
+        "landing_path 应落于注入 root: {landing_path}"
+    );
+    let file_name = lp.file_name().and_then(|f| f.to_str()).unwrap_or_default();
+    assert!(
+        file_name.ends_with("_matrix-blob.bin"),
+        "安全名应含消毒 name_hint: {file_name}"
+    );
+
+    // 落盘字节自证 + `.part` 无残留（末块已原子 rename 定稿）。
+    let on_disk = std::fs::read(lp).expect("读取 landing 产物");
+    assert_eq!(on_disk, data, "落盘字节应与上行数据一致");
+    let staging = landing.join(".a2c-upload");
+    let leftovers = std::fs::read_dir(&staging)
+        .map(|d| d.count())
+        .unwrap_or_else(|e| panic!("读取 .a2c-upload 失败: {e}"));
+    assert_eq!(leftovers, 0, "finalize 后 .part 目录应为空");
+
+    computer.shutdown().await.unwrap();
+    agent.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// 场景 5b（续）：landing root **未配置**（fail-closed）→ 首块得 flat `ErrorPayload(4019
+/// forbidden)`，经真 Server relay 原样透传到 Agent；零字节落盘（无 landing 目录产生）。
+#[tokio::test]
+#[ignore = "e2e: REL-01 v0.2.2 matrix; run via cargo test-e2e"]
+async fn put_blob_unset_root_forbidden_4019() {
+    use sha2::{Digest, Sha256};
+
+    let td = TempDir::new().unwrap();
+    let server = RelayServer::start().await;
+    let computer =
+        spawn_computer_with_landing(&server.url(), OFFICE, COMPUTER, &td, None, None).await;
+    let agent = agent_client(&server.url()).await;
+    join(&agent, Role::Agent, OFFICE, AGENT).await;
+
+    let payload = [0u8; 10];
+    let mut h = Sha256::new();
+    h.update(payload);
+    let req = PutBlobReq::first_chunk(
+        AGENT,
+        COMPUTER,
+        0,
+        false,
+        &payload,
+        payload.len() as u64,
+        &to_hex(&h.finalize()),
+        None,
+    );
+    let body = emit_call(&agent, events::CLIENT_PUT_BLOB, json!(req)).await;
+    assert!(
+        is_protocol_error_payload(&body),
+        "未配置 root 应回 flat ErrorPayload: {body}"
+    );
+    assert_eq!(body["code"], 4019, "应回 BlobWriteFailed, got: {body}");
+    assert_eq!(
+        body["details"]["reason"], "forbidden",
+        "未配置 root 应 details.reason=forbidden, got: {body}"
+    );
 
     computer.shutdown().await.unwrap();
     agent.disconnect().await.unwrap();

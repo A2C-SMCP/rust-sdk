@@ -1888,12 +1888,24 @@ impl<S: Session> Computer<S> {
     /// 处理单个 `client:put_blob` 块（首块 / 后续块 / 末块统一入口，§3）。
     ///
     /// 委托 [`BlobUploadStore::handle_chunk`]；4019 flat ErrorPayload 处理失败面（语义见 upload.rs）。
+    /// 整段同步 IO（`.part` 写 / `fsync` / `rename` / 孤儿 GC / `canonicalize`）经
+    /// [`tokio::task::spawn_blocking`] offload 到阻塞池——socketio handler 在 async 线程上
+    /// 运行，FS 尾部操作（尤其末块 `fsync`+`rename`）不应霸占 event loop 线程（审查 🟡3 超集：
+    /// 全块写路径而非仅 finalize 段；锁粒度不变——闭包内同步、无 await，会话序列化保持）。
     // ErrorPayload 是协议原生 flat 错误结构；此公开入口保持与 BlobUploadStore 一致的返回类型，
-    // 避免仅为 lint 装箱而改变 SDK API。与 blob/upload.rs 的模块级取舍保持一致。
+    // 避免仅为 lint 装箱而改变 SDK API。与 blob/upload.rs 的模块级取舍保持一致（#210）。
     #[allow(clippy::result_large_err)]
     pub async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload> {
         // blob_upload_store 恒构造一个 store（None-root 亦拒绝一切上传），此处不做 None 分支。
-        self.blob_upload_store().await.handle_chunk(req)
+        let store = self.blob_upload_store().await;
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || store.handle_chunk(&req))
+            .await
+            .map_err(|e| {
+                // 防御性兜底：任务 panic（handle_chunk 正常路径显式 Err，无 panic；围栏亦 fail-closed）。
+                error!(error = %e, "client:put_blob upload task panicked");
+                crate::blob::upload::blob_write_error("io_error", "upload service aborted")
+            })?
     }
 
     /// 铸造 `kind=toolspool` 不透明句柄并写盘 / Mint an opaque toolspool handle。
@@ -4828,6 +4840,13 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
 ///
 /// 与 python `landing_root` 属性同构：`~` 前缀经 [`expand_home`](crate::skills::home::expand_home)
 /// 展开（尊重注入 env，保持 hermetic）；非字符串 / 空值 → `None`（fail-closed）。
+///
+/// **有意分叉（🟡2 确认）/ Deliberate divergence**: `flag_settings_path` 恒 `None`——rust
+/// `Computer` 是库组件，运行态**不持有** flag 文件路径（flag scope 仅在 CLI 命令上下文经
+/// `--settings <file>` 注入，见 `cli/commands`），与 rust 全部其它 runtime settings 解析点
+/// 一致；python `Computer(flag_settings_path=...)` 构造参数由 CLI 注入（`_resolve_declared_settings`
+/// 会并入 flag 层）。即 `landingRoot` 的 flag scope 声明在 rust 下不可见（有意取舍：flag
+/// 层声明走 CLI 直连的 settings 命令视图，非本属性职责）。
 fn resolve_landing_root_settings(
     config_dir: &std::path::Path,
     env: Option<&EnvMap>,

@@ -72,7 +72,10 @@ static SHA256_HEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{
 const MAX_NAME_HINT_LEN: usize = 64;
 
 /// 构造 ``4019 Blob Write Failed`` flat ErrorPayload（``reason`` 等经 ``details`` 下沉）。
-fn blob_write_error(reason: &str, message: impl Into<String>) -> ErrorPayload {
+///
+/// `pub(crate)`：Computer 层 offload 路径（`Computer::put_blob_chunk` spawn_blocking JoinError 兜底）
+/// 复用同一 4019 构造器，消息形态单一权威（审查 🟡3 附）。
+pub(crate) fn blob_write_error(reason: &str, message: impl Into<String>) -> ErrorPayload {
     ErrorPayload::from_error_code(ErrorCode::BlobWriteFailed, message.into())
         .with_detail("reason", reason)
 }
