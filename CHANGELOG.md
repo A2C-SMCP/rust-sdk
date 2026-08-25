@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-08-25
+
+### Breaking Changes
+
+- *(computer)* #204 changes `Computer::set_socketio_client` to return `ComputerResult<()>` and
+  adds `ConnectOptions::namespace_connect_timeout`. Exhaustive `ConnectOptions` literals must set
+  the new field or use `..Default::default()`; the default is 30 seconds.
+- *(computer)* #204 makes `SmcpComputerClient::get_office_id` and
+  `get_current_office_id` report only server-confirmed membership. During an initial join or
+  automatic rejoin they now return `None` / `InvalidState` until the join ACK succeeds.
+
+### Bug Fixes
+
+- *(computer)* #204 restores Office membership after Socket.IO transport reconnect, fences stale
+  join ACKs by connection generation, and makes client installation/replacement, disconnect, and
+  shutdown ownership atomic. Calling `disconnect_socketio` with an empty slot is now a no-op and
+  no longer forces the lifecycle back to `Started`.
+- *(computer)* #208 upgrades `tf-rust-socketio` and `tf-rust-engineio` to 0.9.0 so long-running
+  tool calls no longer block Socket.IO heartbeats or prompt cancellation. Independent events may
+  complete out of order while delivery remains exactly once and cancellation causality is retained.
+
+### Features
+
+- *(computer)* #200 ToolMeta Server 声明 tags 三层合并（protocol#51 / PR#57）
+- *(skill)* A2CSkillRef.tags 加性字段透传（#198，protocol#50/PR#55，镜像 python#198）
+- *(blob)* Client:put_blob 上行写入通道（#195，protocol#12/PR#53，镜像 python#196）
+- *(blob)* #195 审查下轮 3 条收口——put_blob 真 e2e + spawn_blocking + flag 分叉注记
+
+### Miscellaneous Tasks
+
+- PROTOCOL_VERSION 同步 0.4.0（对齐 protocol develop 0.4.0-dev 周期，镜像 python f8e02ab）
+- Restore CI baseline on develop (#210)
+
+### Migration Notes
+
+- Handle the `ComputerResult` returned by `set_socketio_client`. When constructing
+  `ConnectOptions`, prefer `..Default::default()` or set `namespace_connect_timeout` explicitly for
+  networks where namespace authentication can legitimately take longer than 30 seconds. Treat
+  Office getters as confirmed server state rather than desired join intent.
+- Do not rely on completion ordering between independent Socket.IO events. Preserve ordering only
+  where the protocol defines a causal boundary, such as a tool call and its cancellation.
+
 ## [0.3.2] - 2026-08-24
 
 ### Breaking Changes
@@ -24,13 +66,6 @@ All notable changes to this project will be documented in this file.
   validation with a migration diagnostic. The configuration-only `OAuthError` variants
   `ConflictingAuthorizationHeader`, `ExplicitPolicyRequiresOptions`, and
   `DisabledPolicyWithOptions` are also removed.
-- *(computer)* #204 changes `Computer::set_socketio_client` to return `ComputerResult<()>` and
-  adds `ConnectOptions::namespace_connect_timeout`. Exhaustive `ConnectOptions` literals must set
-  the new field or use `..Default::default()`; the default is 30 seconds.
-- *(computer)* #204 makes `SmcpComputerClient::get_office_id` and
-  `get_current_office_id` report only server-confirmed membership. During an initial join or
-  automatic rejoin they now return `None` / `InvalidState` until the join ACK succeeds.
-- *(workspace)* Begin the `0.4.0-dev.0` development line for the rmcp 2.2 migration.
 - *(computer)* [**breaking**] #165 project-scope enabledPlugins bundled MCP server
   自我批准回落审批门——启用的 bundled server 在 project scope 显式声明即受
   PENDING 门控（Option B，审批门绕过残面收口）。
@@ -77,10 +112,6 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
-- *(computer)* #204 restores Office membership after Socket.IO transport reconnect, fences stale
-  join ACKs by connection generation, and makes client installation/replacement, disconnect, and
-  shutdown ownership atomic. Calling `disconnect_socketio` with an empty slot is now a no-op and
-  no longer forces the lifecycle back to `Started`.
 - *(computer)* #179 makes automatic OAuth startup a bounded transaction: persisted Authorization
   Code credentials and both Client Credentials modes connect in one `start_client_by_id` call,
   while truly missing user authorization still returns `OAuthRequired`. Persisted automatic OAuth
@@ -107,10 +138,6 @@ All notable changes to this project will be documented in this file.
 
 ### Migration Notes
 
-- Handle the `ComputerResult` returned by `set_socketio_client`. When constructing
-  `ConnectOptions`, prefer `..Default::default()` or set `namespace_connect_timeout` explicitly for
-  networks where namespace authentication can legitimately take longer than 30 seconds. Treat
-  Office getters as confirmed server state rather than desired join intent.
 - Remove `oauth`, `authPolicy`, and `auth_policy` from every HTTP server configuration; they now
   produce a validation error. Without static credentials, Streamable HTTP always connects
   anonymously first and admits OAuth only after a standards-compliant Bearer challenge. Static
