@@ -263,7 +263,7 @@ pub async fn agent_client(server_url: &str) -> Client {
 /// ack 回调：把单参 ack（`Payload::Text` 末元素）经 oneshot 投出。
 fn ack_cb(
     tx: oneshot::Sender<Value>,
-) -> impl FnMut(Payload, Client) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync {
+) -> impl Fn(Payload, Client) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync {
     let tx = Arc::new(Mutex::new(Some(tx)));
     move |p: Payload, _c: Client| {
         let tx = tx.clone();

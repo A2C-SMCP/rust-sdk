@@ -610,10 +610,10 @@ async fn tool_call_binary_blob_roundtrip() {
 ///
 /// 说明（端到端取消的传输边界）：Computer 侧的结果级 `meta.a2c_cancelled` 由 `call_tool_cancellable`
 /// 的 `select!` 令牌竞速保证，并在 crate 级单测（manager `test_call_tool_cancellable_cancelled` /
-/// INT-02 #70）覆盖。但 `tf-rust-socketio` 单连接的入站 handler **顺序派发**：在途 `client:tool_call`
-/// 占用接收循环直至完成，故 `notify:tool_call_cancel` 要等其结束才被处理——协作式取消按契约「远端是否
-/// 真正停止不保证」落到**下一次**调用。因此本矩阵在传输层断言**可达成**的协议契约（无 ack + 广播），
-/// 结果级 `a2c_cancelled` 归 crate 级；内部超时态见 [`tool_call_timeout_marks_meta`]（端到端可达成）。
+/// INT-02 #70）覆盖。`tf-rust-socketio` 0.9.0 起独立并发派发入站事件，因此 pending tool call 不再
+/// 阻塞 `notify:tool_call_cancel`；跨事件完成顺序不保证，但事件不得丢失，且 tool-call/cancel 的因果边界
+/// 由 `smcp-computer/tests/tool_call_dispatch_regression.rs` 的真实 relay 回归套件覆盖。本矩阵继续断言
+/// Server 侧协议契约（无 ack + 广播）；内部超时态见 [`tool_call_timeout_marks_meta`]。
 #[tokio::test]
 #[ignore = "e2e: REL-01 v0.2.2 matrix; run via cargo test-e2e"]
 async fn tool_call_cancel_fireforget_and_broadcast() {

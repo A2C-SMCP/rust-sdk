@@ -22,7 +22,7 @@ use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 fn ack_to_sender<T: Send + 'static>(
     sender: oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
+) -> impl Fn(Payload, tf_rust_socketio::asynchronous::Client) -> BoxFuture<'static, ()> + Send + Sync
 {
     let sender = Arc::new(tokio::sync::Mutex::new(Some(sender)));
     let f = Arc::new(f);

@@ -294,7 +294,7 @@ async fn emit_event_with_ack_validation(
 pub fn ack_to_sender<T: Send + 'static>(
     sender: tokio::sync::oneshot::Sender<T>,
     f: impl Fn(Payload) -> T + Send + Sync + 'static,
-) -> impl FnMut(
+) -> impl Fn(
     Payload,
     tf_rust_socketio::asynchronous::Client,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -323,7 +323,7 @@ async fn create_client_with_handlers<F>(
     handler: F,
 ) -> Client
 where
-    F: FnMut(Payload, Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    F: Fn(Payload, Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + 'static
         + Send
         + Sync,
