@@ -1888,6 +1888,9 @@ impl<S: Session> Computer<S> {
     /// 处理单个 `client:put_blob` 块（首块 / 后续块 / 末块统一入口，§3）。
     ///
     /// 委托 [`BlobUploadStore::handle_chunk`]；4019 flat ErrorPayload 处理失败面（语义见 upload.rs）。
+    // ErrorPayload 是协议原生 flat 错误结构；此公开入口保持与 BlobUploadStore 一致的返回类型，
+    // 避免仅为 lint 装箱而改变 SDK API。与 blob/upload.rs 的模块级取舍保持一致。
+    #[allow(clippy::result_large_err)]
     pub async fn put_blob_chunk(&self, req: &PutBlobReq) -> Result<PutBlobRet, ErrorPayload> {
         // blob_upload_store 恒构造一个 store（None-root 亦拒绝一切上传），此处不做 None 分支。
         self.blob_upload_store().await.handle_chunk(req)
