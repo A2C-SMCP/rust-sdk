@@ -150,12 +150,10 @@ impl SyncSmcpAgent {
         name_hint: Option<&str>,
         chunk_size: Option<u64>,
     ) -> Result<PutBlobResult> {
-        self.runtime.block_on(self.async_agent.put_blob(
-            computer,
-            data,
-            name_hint,
-            chunk_size,
-        ))
+        self.runtime.block_on(
+            self.async_agent
+                .put_blob(computer, data, name_hint, chunk_size),
+        )
     }
 
     /// 调用工具

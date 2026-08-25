@@ -2993,7 +2993,9 @@ mod tests {
         assert!(matches!(r, Err(ComputerError::InvalidState(_))));
         // put_blob 同样：ops 缺席 → InvalidState。
         let p = Payload::Text(
-            vec![json!({ "agent": "a", "req_id": "r1", "computer": "c", "chunk_offset": 0, "eof": true, "blob": "aGVsbG8=" })],
+            vec![
+                json!({ "agent": "a", "req_id": "r1", "computer": "c", "chunk_offset": 0, "eof": true, "blob": "aGVsbG8=" }),
+            ],
             Some(2),
         );
         let r = SmcpComputerClient::handle_put_blob_with_ack(p, None, "c".to_string()).await;
@@ -3050,7 +3052,10 @@ mod tests {
         assert_eq!(ack, Some(2));
         let upload_id = resp["upload_id"].as_str().unwrap().to_string();
         assert_eq!(upload_id.len(), 32);
-        assert!(resp.get("landing_path").is_none(), "首块不得回 landing_path");
+        assert!(
+            resp.get("landing_path").is_none(),
+            "首块不得回 landing_path"
+        );
         assert!(resp.get("total_size").is_none());
 
         // 末块（eof=true，offset == 已收）→ landing_path + total_size + sha256 回显；落盘字节自证。
@@ -3091,10 +3096,9 @@ mod tests {
                 "blob": base64::engine::general_purpose::STANDARD.encode(data),
             }),
         );
-        let (_, resp) =
-            SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops), "c".to_string())
-                .await
-                .unwrap();
+        let (_, resp) = SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops), "c".to_string())
+            .await
+            .unwrap();
         let lp = resp["landing_path"].as_str().unwrap().to_string();
         let name = lp.rsplit('/').next().unwrap().to_string();
         assert!(!name.contains('/'));
@@ -3116,10 +3120,9 @@ mod tests {
                 "blob": base64::engine::general_purpose::STANDARD.encode(b"hello"),
             }),
         );
-        let (_, resp) =
-            SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops), "c".to_string())
-                .await
-                .unwrap();
+        let (_, resp) = SmcpComputerClient::handle_put_blob_with_ack(p, Some(ops), "c".to_string())
+            .await
+            .unwrap();
         assert_eq!(resp["code"], json!(4019));
         assert_eq!(resp["details"]["reason"], json!("forbidden"));
     }
