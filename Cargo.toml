@@ -194,3 +194,10 @@ tag-message = "v{{version}}"
 publish = false
 push = true
 
+
+# #212 本地全量测试提速：测试二进制以「仅行号表」debuginfo 编译（保留函数名/栈回溯，
+# 局部变量不可调试）——编译与链接时间、产物体积显著下降。`cargo build`/`run`（dev 完整
+# debuginfo）不受影响。Test binaries build with line-tables-only debuginfo (#212) — keeps
+# backtraces, speeds up compile/link of the 80 test binaries; dev builds keep full debuginfo.
+[profile.test]
+debug = "line-tables-only"
