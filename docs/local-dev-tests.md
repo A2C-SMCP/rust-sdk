@@ -36,8 +36,7 @@
    设置项自行配置。
 3. **测试剖面瘦身**：`Cargo.toml [profile.test] debug = "line-tables-only"` —— 测试二进制
    保留函数名/行号/栈回溯，去掉局部变量调试信息；编译与链接时间、产物体积显著下降。
-   `cargo build`/`run` 的 dev 完整 debuginfo 不受影响。
-   （注：该项位于 Cargo.toml，与工作区未提交改动同文件，随其提交时一并合入。）
+   `cargo build`/`run` 的 dev 完整 debuginfo 不受影响（已提交 `aac90ee`）。
 4. **链接加速（机器级，可选）**：
    - `brew install lld` 的 lld 与 brew 的 llvm 存在**版本错位**（本机实测 lld 20.1.8 vs
      llvm 21.1.5 → 链接 build script 直接崩溃），**仓库不提交** `-fuse-ld=lld`。
@@ -54,8 +53,15 @@
    缓存的是「非增量」的依赖编译（多变体/多 feature 组合复用），与 incremental 互补；
    本机已接线，首次全量后命中率逐步上升。
 6. **target/ 卫生**：APFS 上小文件爆炸（实测 1.34M 文件 / 190GB）会让 du/find/链接/fsync
-   全链路退化——这是「40 分钟跑不完」的隐性元凶之一。定期清：`cargo sweep --stale --days 30`
-   或不得已时 `cargo clean`（全量冷启动后：基线 ≤ 60 分钟）。
+   全链路退化——这是「40 分钟跑不完」的隐性元凶之一。**本机已自动化**：launchd 代理
+   `com.jqq.cargo-sweep`（`~/Library/LaunchAgents/com.jqq.cargo-sweep.plist`）每周一 03:30
+   对 `~/RustroverProjects` 全部 Cargo 项目执行
+   `cargo-sweep sweep --maxsize 40GB --recursive <path>`（各项目 target/ 超出 40GB 时按最旧
+   开始删，直到收缩）；日志 `~/Library/Logs/cargo-sweep.log`，手动验证：
+   `launchctl kickstart -k gui/$(id -u)/com.jqq.cargo-sweep`，卸载：
+   `launchctl bootout gui/$(id -u)/com.jqq.cargo-sweep`。其他机器手动清理：
+   `cargo-sweep sweep --maxsize 40GB <project>` 或不得已时 `cargo clean`（全量冷启动后：
+   基线 ≤ 60 分钟）。
 
 ## 并行注意
 
