@@ -1,0 +1,8 @@
+{
+  // #212: rust-analyzer 使用独立 target 子目录（target/rust-analyzer），避免 16 个常驻
+  // rust-analyzer 进程与命令行 cargo 争抢 target/ 构建锁与磁盘 I/O（此前可令 cargo test
+  // 卡 10+ 分钟）。target/ 已在 .gitignore 中，`cargo clean` 会一并清理。
+  // #212: give rust-analyzer its own build dir so its check builds never contend with
+  // command-line cargo for the target/ lock. Both are cleaned by `cargo clean`.
+  "rust-analyzer.cargo.targetDir": "target/rust-analyzer"
+}

@@ -3,7 +3,12 @@
 
 [alias]
 # 测试相关别名 / Test aliases
-test-ws = "test --workspace"
+# #212：test-ws 改走 cargo-nextest（并行执行各测试二进制 + per-test 计时），需要
+# `cargo install cargo-nextest --locked`；无 nextest 时用 test-ws-cargo 获得原 `cargo test` 行为（CI 对齐）。
+# test-ws now goes through cargo-nextest (parallel test binaries + per-test timing) — requires
+# `cargo install cargo-nextest --locked`; use test-ws-cargo for plain `cargo test` (CI parity).
+test-ws = "nextest run --workspace"
+test-ws-cargo = "test --workspace"
 test-all = "test --workspace --all-features"
 test-e2e = "test --workspace --features e2e -- --ignored"
 # 治理层 CLI 子命令测试在 `cli` feature 之下（marketplace/plugin/settings/skill）；默认带上避免治理套件变暗。
@@ -44,3 +49,15 @@ run-computer = "run -p smcp-computer --bin computer"
 # "unused manifest key: resolver" 警告。
 [resolver]
 incompatible-rust-versions = "fallback"
+
+# ── 链接加速（#212）── 经实测，homebrew 的 `lld` 与其 `llvm` 版本错位（本机 lld 20.1.8 vs
+# llvm 21.1.5）会在链接 build script 时崩溃（liblldELF.dylib 与 libLLVM.dylib 符号不匹配）。
+# 因此仓库不提交 rustflags linker；macOS 上推荐机器级（~/.cargo/config.toml）使用 rustup
+# 自带的 rust-lld（自洽 LLVM，无需 brew，且支持 Mach-O —— 已实测可用），样板见
+# docs/local-dev-tests.md「链接加速」节。
+# Linker acceleration (#212): `brew install lld` is version-skewed against `brew llvm` on this
+# machine (lld 20.1.8 vs llvm 21.1.5) and crashes when linking build scripts. Do NOT commit
+# -fuse-ld=lld; use rustup's bundled rust-lld at the machine level instead — see
+# docs/local-dev-tests.md (linker acceleration section).
+
+

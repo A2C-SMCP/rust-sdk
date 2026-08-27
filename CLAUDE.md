@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### 测试相关别名 / Test aliases
 
 ```bash
-cargo test-ws          # 测试整个 workspace
+cargo test-ws          # 测试整个 workspace（#212 起走 cargo-nextest：并行+per-test 计时；需 `cargo install cargo-nextest --locked`）
+cargo test-ws-cargo    # 全量的 cargo 原生形式（CI 对齐；无 nextest 时的替代）
 cargo test-all         # 测试所有 features
 cargo test-e2e         # 运行 e2e 测试（需要 --ignored 标志）
-cargo test-computer    # 只测试 smcp-computer
+cargo test-computer    # 只测试 smcp-computer（--features cli）
 cargo test-agent       # 只测试 smcp-agent
 cargo test-server      # 只测试 smcp-server-core
 
@@ -20,6 +21,11 @@ cargo test --package <crate-name> <test_name>
 # 运行带输出的测试
 cargo test -- --nocapture
 ```
+
+> ⚠️ 测试提速与性能基线汇编在 `docs/local-dev-tests.md`（#212）：nextest 并行冲突、
+> rust-lld 机器级配置、sccache、target/ 卫生。验证加速：全量慢 → 优先单 crate/套件；
+> 重命令放后台跑；IDE 的 rust-analyzer 已隔离到 `target/rust-analyzer`（仅 VS Code 的
+> `.vscode/settings.json`；其他编辑器按同名设置项自行配置），不再抢锁。
 
 ### 代码质量别名 / Code quality aliases
 
