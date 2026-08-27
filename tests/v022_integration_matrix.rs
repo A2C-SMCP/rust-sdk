@@ -967,6 +967,7 @@ async fn tool_call_unknown_computer_flat_404() {
             req_id: ReqId("nf-1".into()),
         },
         computer: "nonexistent-computer".into(),
+        // 裸名特意保留：computer 未命中在工具解析前即 404，tool_name 不进路由表。
         tool_name: "echo".into(),
         params: json!({ "message": "hi" }),
         timeout: 5,
@@ -1015,6 +1016,7 @@ async fn originator_disconnect_server_survives() {
             req_id: ReqId("orig-disc".into()),
         },
         computer: COMPUTER.into(),
+        // 裸名特意保留：目标 Computer 是不应答裸客户端，tool_name 从不进入路由解析。
         tool_name: "echo".into(),
         params: json!({ "message": "hi" }),
         timeout: 5,
