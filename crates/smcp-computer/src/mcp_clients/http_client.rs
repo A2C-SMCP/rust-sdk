@@ -1071,13 +1071,22 @@ impl MCPClientProtocol for HttpMCPClient {
                 }
             },
             _ = cancel.cancelled() => {
-                let notify = peer.notify_cancelled(CancelledNotificationParam::new(
-                    Some(request_id),
-                    Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
-                ));
-                if tokio::time::timeout(Duration::from_secs(2), notify).await.is_err() {
-                    warn!("emit MCP notifications/cancelled timed out (best-effort, ignored)");
-                }
+                // 本地取消结果不等待远端通知：rmcp 2.2 streamable worker 的 outbound 为
+                // 串行队列（长调用未完成时 notifications/cancelled 排在最后），若行内 await
+                // 会使取消 ACK 延迟到长调用结束或 2s 上限（#208 验收窗口 1s 内必达）。
+                // 通知按 best-effort 剥离执行（task 自持 2s 上限），本地立即返回 Cancelled。
+                // ⚠️ 串行队列限制下，长调用（>2s）的远端 notifications/cancelled 实际
+                // 不可达（2s 超时后丢弃）——本地取消即时生效，远端为纯 best-effort。
+                let notify_peer = peer;
+                tokio::spawn(async move {
+                    let notify = notify_peer.notify_cancelled(CancelledNotificationParam::new(
+                        Some(request_id),
+                        Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
+                    ));
+                    if tokio::time::timeout(Duration::from_secs(2), notify).await.is_err() {
+                        warn!("emit MCP notifications/cancelled timed out (best-effort, ignored)");
+                    }
+                });
                 drop(oauth_request);
                 Ok(CancellableCallOutcome::Cancelled)
             }

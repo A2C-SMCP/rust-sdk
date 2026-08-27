@@ -479,6 +479,8 @@ impl MCPClientProtocol for StdioMCPClient {
             },
             _ = cancel.cancelled() => {
                 // best-effort 协作式取消：补发 notifications/cancelled（远端可忽略）；time-box 防 teardown 卡死。
+                // 保持行内 await（与 HTTP 侧刻意不同）：stdio 管道写不受 rmcp 2.2 streamable
+                // worker 的串行 outbound 队列影响（#208），行内 2s 上限即可，延时通常为 0。
                 let notify = peer.notify_cancelled(CancelledNotificationParam::new(
                     Some(request_id),
                     Some(smcp::tool_meta::A2C_DEFAULT_CANCEL_REASON.to_string()),
