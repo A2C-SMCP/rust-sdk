@@ -46,6 +46,12 @@ pub const SECRET: &str = "test_secret";
 pub const NS: &str = "smcp";
 /// 注册的 MCP server 名 / registered MCP server name。
 pub const MCP_NAME: &str = "v022";
+
+/// v022 服务器工具名的 exposed 形态（`{bundle_id}__{原始名}`，manager.rs:1198 协议 0.3.0 命名合一）。
+/// 矩阵按生产语义以 `<server>__<tool>` 调用/断言（`SMCPTool.name` 不透明，不写裸名）。
+pub fn exposed_tool(bare: &str) -> String {
+    format!("{MCP_NAME}__{bare}")
+}
 /// 默认 office / agent / computer 名。
 pub const OFFICE: &str = "office-matrix";
 pub const AGENT: &str = "agent1";
