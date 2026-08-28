@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-08-28
+
+### Bug Fixes
+
+- *(computer)* #211 旧 transport 迟到 Close 不再清除新会话 membership
+- *(computer)* #208 长调用期间 cancel ACK 即时可达——best-effort 剥离 MCP cancelled 通知
+- *(tests)* #213 v022 e2e 矩阵适配 BundleID 工具名（exposed_tool 单一来源）
+
+### Documentation
+
+- *(tests)* #212 target 自动清理（launchd cargo-sweep）与 [profile.test] 落地注记
+
+### Features
+
+- *(tests)* #212 本地全量测试分级提速——nextest 接入 + 测试剖面瘦身 + RA 锁隔离
+- *(tests)* #212 补交 [profile.test] debug=line-tables-only（与 #211 提交拆分后补交）
+- *(computer)* #214 Computer 级 MCP 有限并发启动——统一门控/批量 API/治理恢复/CLI flag
+
+### Refactor
+
+- *(tests)* #213 复审跟进——exposed_tool 直调生产命名函数 + 保留裸名就地注释
+
 ## [0.4.0] - 2026-08-25
 
 ### Breaking Changes
