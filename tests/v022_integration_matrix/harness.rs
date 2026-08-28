@@ -46,6 +46,17 @@ pub const SECRET: &str = "test_secret";
 pub const NS: &str = "smcp";
 /// 注册的 MCP server 名 / registered MCP server name。
 pub const MCP_NAME: &str = "v022";
+
+/// v022 服务器工具名的 exposed 形态（`{bundle_id}__{原始名}`）：直接调生产命名函数
+/// [`smcp_computer::mcp_clients::bundle_id::exposed_tool_name`]（协议 0.3.0 BundleID 模型），
+/// 矩阵与生产共用同一规则、防测试内复制规则再次漂移。按生产语义以 `<server>__<tool>`
+/// 调用/断言（`SMCPTool.name` 不透明，不写裸名）。
+pub fn exposed_tool(bare: &str) -> String {
+    use smcp_computer::mcp_clients::bundle_id::{exposed_tool_name, BundleId};
+
+    let bundle_id = BundleId::try_from(MCP_NAME).expect("MCP_NAME 为合法 bundle_id");
+    exposed_tool_name(&bundle_id, None, bare)
+}
 /// 默认 office / agent / computer 名。
 pub const OFFICE: &str = "office-matrix";
 pub const AGENT: &str = "agent1";

@@ -404,16 +404,30 @@ impl CommandHandler {
     pub async fn start_client(&self, target: &str) -> Result<(), CommandError> {
         if target == "all" {
             // `all` 分支只迭代已挂载 server（不遍历声明面），故不受 #175 挂载态守卫影响。
-            return match self.computer.start_all_mcp_clients().await {
-                Ok(()) => {
-                    println!("✅ 所有服务器启动完成 / All servers started");
-                    Ok(())
+            // #214：经统一批量 API（受 Computer 级并发上限约束）**逐项回执**——单项失败只体现在该项、
+            // 不中断其余；批次收敛后输出汇总。
+            let ids = self.computer.enabled_mcp_bundle_ids().await;
+            if ids.is_empty() {
+                println!("✅ 所有服务器启动完成 / All servers started");
+                return Ok(());
+            }
+            let outcomes = self.computer.start_mcp_clients_batch(&ids).await;
+            let mut failed = 0usize;
+            for (bid, outcome) in outcomes {
+                match outcome {
+                    Ok(()) => println!("✅ {bid} 已启动 / started"),
+                    Err(e) => {
+                        println!("❌ {bid} 启动失败: {e}");
+                        failed += 1;
+                    }
                 }
-                Err(e) => {
-                    println!("❌ 启动服务器失败: {e}");
-                    Ok(())
-                }
-            };
+            }
+            if failed == 0 {
+                println!("✅ 所有服务器启动完成 / All servers started");
+            } else {
+                println!("⚠️ {failed} 个服务器启动失败 / {failed} server(s) failed to start");
+            }
+            return Ok(());
         }
         match self.start_client_line(target).await? {
             Ok(line) => println!("{line}"),

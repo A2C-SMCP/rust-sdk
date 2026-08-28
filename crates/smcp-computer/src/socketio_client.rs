@@ -205,6 +205,17 @@ struct OfficeMembership {
     desired: Option<String>,
     confirmed: Option<String>,
     generation: u64,
+    /// Kernel session epoch (tf-rust-socketio `session_epoch`) of the transport
+    /// that committed `connected` (#211); bound by the Connect callback and
+    /// never modified by invalidation. The binding reads `session_epoch()` at
+    /// callback-execution time: kernel dispatches packets as concurrent tasks
+    /// (#12) with no execution-order contract, so a Connect callback may run
+    /// after a late Close of the *same* dying session — that Close compares
+    /// against the stale binding and is dropped like any stale Close. Correct
+    /// only in practice: kernel exposes no per-connect epoch carrier (doc'd in
+    /// its `on_close_with_session`); a `on_connect_with_session` counterpart
+    /// would close this residual window.
+    transport_epoch: u64,
     connected: bool,
     rejoin_task: Option<tokio::task::AbortHandle>,
 }
@@ -219,7 +230,37 @@ impl OfficeMembership {
         self.connected && self.generation == generation && self.desired.as_deref() == Some(desired)
     }
 
-    fn invalidate_connection(&mut self, retain_desired: bool) -> Option<tokio::task::AbortHandle> {
+    /// Invalidates the membership if `close_epoch` is the current transport
+    /// epoch. A Close of an already-superseded transport must not clobber the
+    /// newer connection's state (#211): a kernel `on_close_with_session`
+    /// callback carries the epoch of the session whose transport actually
+    /// died, so a late Close (old session) arrives here with a stale epoch and
+    /// is dropped; `!self.connected` makes repeated Close of the same dead
+    /// session a no-op too. Returns `(did_invalidate, aborted_rejoin_task)` so
+    /// the caller can fold lifecycle side-effects into the guard alone.
+    fn invalidate_connection(
+        &mut self,
+        close_epoch: u64,
+        retain_desired: bool,
+    ) -> (bool, Option<tokio::task::AbortHandle>) {
+        if close_epoch != self.transport_epoch || !self.connected {
+            return (false, None);
+        }
+        self.next_generation();
+        self.connected = false;
+        self.confirmed = None;
+        if !retain_desired {
+            self.desired = None;
+        }
+        (true, self.rejoin_task.take())
+    }
+
+    /// Manual disconnect is the user's explicit fence: invalidates regardless
+    /// of the stale-close guard (which exists only for transport-Close
+    /// callbacks), clearing the desired membership too (#204 semantics:
+    /// a user disconnect must not silently rejoin the old office on a future
+    /// connect).
+    fn hard_invalidate(&mut self, retain_desired: bool) -> Option<tokio::task::AbortHandle> {
         self.next_generation();
         self.connected = false;
         self.confirmed = None;
@@ -579,7 +620,12 @@ impl SmcpComputerClient {
         let close_membership = Arc::clone(&office_membership);
         let close_status = runtime_status.clone();
         let close_retiring = Arc::clone(&retiring);
-        builder = builder.on(Event::Close, move |payload, _client| {
+        // #211: the session-aware Close callback carries the kernel epoch of
+        // the transport that actually died. `invalidate_connection` drops a
+        // stale Close (already-superseded transport) together with its
+        // lifecycle transition, so a late Close cannot clobber the newer
+        // connection.
+        builder = builder.on_close_with_session(move |payload, close_epoch, _client| {
             let membership = Arc::clone(&close_membership);
             let status = close_status.clone();
             let retiring = Arc::clone(&close_retiring);
@@ -588,14 +634,20 @@ impl SmcpComputerClient {
                     && Self::payload_contains_text(&payload, CloseReason::TransportClose.as_str());
                 let rejoin_task = {
                     let mut membership = lock_office_membership(&membership);
-                    let rejoin_task = membership.invalidate_connection(transport_close);
-                    let next = if transport_close {
-                        LifecycleState::Connecting
-                    } else {
-                        LifecycleState::Started
-                    };
-                    if status.state() != Some(next) {
-                        status.transition(next);
+                    // The guard decides both the membership invalidation and the
+                    // lifecycle transition: a stale Close (superseded transport)
+                    // must not touch either (#211).
+                    let (did_invalidate, rejoin_task) =
+                        membership.invalidate_connection(close_epoch, transport_close);
+                    if did_invalidate {
+                        let next = if transport_close {
+                            LifecycleState::Connecting
+                        } else {
+                            LifecycleState::Started
+                        };
+                        if status.state() != Some(next) {
+                            status.transition(next);
+                        }
                     }
                     rejoin_task
                 };
@@ -631,6 +683,9 @@ impl SmcpComputerClient {
                 let (generation, desired, previous_task) = {
                     let mut membership = lock_office_membership(&membership);
                     let previous_task = membership.rejoin_task.take();
+                    // #211: bind the kernel session epoch so a later Close can
+                    // be attributed to this transport vs a stale one.
+                    membership.transport_epoch = client.session_epoch();
                     let generation = membership.next_generation();
                     membership.connected = true;
                     membership.confirmed = None;
@@ -1973,7 +2028,9 @@ impl SmcpComputerClient {
         // before awaiting transport shutdown so an in-flight ACK can never resurrect Office state.
         let rejoin_task = {
             let mut membership = lock_office_membership(&self.office_membership);
-            let rejoin_task = membership.invalidate_connection(false);
+            // #211: manual teardown is the user's fence — bypass the stale-close
+            // guard so a mid-backoff disconnect still clears desired/confirmed.
+            let rejoin_task = membership.hard_invalidate(false);
             // Publish the membership/lifecycle pair before the first cancellation point. If this
             // future is dropped while the transport is closing, callers must not observe the old
             // JoinedOffice state after desired/confirmed membership has already been cleared.
@@ -2279,6 +2336,66 @@ mod tests {
     use super::*;
     use crate::mcp_clients::model::{Tool, ToolAnnotations};
     use serde_json::json;
+
+    #[test]
+    fn repro_old_close_after_new_connect_clears_new_office_membership() {
+        // Replay the callback order observed by the real Socket.IO restart
+        // experiment: a newer transport Connect/rejoin commits before the old
+        // transport's late Close callback runs. The Close carries the dying
+        // session's kernel epoch (1) while the membership now belongs to
+        // session 2.
+        let mut membership = OfficeMembership {
+            desired: Some("office-beta".to_string()),
+            confirmed: Some("office-beta".to_string()),
+            transport_epoch: 1,
+            connected: true,
+            ..Default::default()
+        };
+        membership.next_generation();
+
+        // A newer transport committed: its Connect handler binds epoch 2.
+        membership.transport_epoch = 2;
+        membership.next_generation();
+
+        // A Close whose epoch predates the current transport must be a no-op
+        // and must report the no-op so the caller skips lifecycle transitions.
+        let (did_invalidate, rejoin_task) = membership.invalidate_connection(1, true);
+        assert!(!did_invalidate, "stale Close must not report invalidation");
+        assert!(rejoin_task.is_none());
+
+        assert!(
+            membership.connected,
+            "delayed Close from the old transport cleared the newer connection"
+        );
+        assert_eq!(membership.confirmed.as_deref(), Some("office-beta"));
+
+        // A Close of the current session still invalidates (and aborts rejoin).
+        let (did_invalidate, _) = membership.invalidate_connection(2, true);
+        assert!(did_invalidate, "current Close must invalidate");
+        assert!(!membership.connected, "current Close must invalidate");
+        assert!(membership.confirmed.is_none());
+
+        // Repeated Close of the already-dead session stays a no-op.
+        let (did_invalidate, _) = membership.invalidate_connection(2, true);
+        assert!(
+            !did_invalidate,
+            "second Close of the dead session is a no-op"
+        );
+
+        // Manual disconnect is the user's fence: it clears desired even when
+        // the transport already died (backoff) and the stale guard would
+        // otherwise drop it (#204 must not silently rejoin on the next connect).
+        let mut disconnected = OfficeMembership {
+            desired: Some("office-beta".to_string()),
+            confirmed: Some("office-beta".to_string()),
+            transport_epoch: 2,
+            connected: false,
+            ..Default::default()
+        };
+        disconnected.hard_invalidate(false);
+        assert!(disconnected.desired.is_none());
+        assert!(!disconnected.connected);
+    }
 
     fn make_tool(
         meta: Option<serde_json::Map<String, serde_json::Value>>,

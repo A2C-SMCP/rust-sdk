@@ -43,6 +43,9 @@ A2C-SMCP 协议规范已拆分为独立仓库，支持多语言 SDK 开发。
 
 ## 📋 Project Structure
 
+> 💡 本地测试：`cargo test-ws` 走 cargo-nextest（并行 + per-test 计时）；性能基线、
+> rust-lld/sccache 配置与加速手段见 [`docs/local-dev-tests.md`](docs/local-dev-tests.md)（#212）。
+
 This is a **real workspace** with a main package that aggregates sub-crates:
 
 ```
@@ -353,7 +356,7 @@ Rust 端先把 SMCP 的“信令与工具调用转发”跑通；MCP Server 管�
 - ⚠️ 完整的 PTY 交互控制（进行中）
 
 **测试覆盖** - 95% 完成
-- ✅ 341 个测试用例全部通过
+- ✅ 全量测试通过（基线 1686 用例，见 [`docs/local-dev-tests.md`](docs/local-dev-tests.md)）
 - ✅ 单元测试：各 crate 内部的 `#[cfg(test)]` 模块
 - ✅ 集成测试：`tests/full_stack.rs`（Agent + Computer + Server）
 - ✅ Socket.IO 互通性测试

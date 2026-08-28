@@ -49,7 +49,7 @@ use smcp::{
 };
 
 use harness::{
-    agent_client, deep_find, emit_call, http_get, join, spawn_computer,
+    agent_client, deep_find, emit_call, exposed_tool, http_get, join, spawn_computer,
     spawn_computer_with_landing, to_hex, HandshakeServer, RelayServer, AGENT, COMPUTER, MCP_NAME,
     NS, OFFICE, SECRET,
 };
@@ -532,14 +532,15 @@ async fn tool_call_binary_blob_roundtrip() {
     let agent = agent_client(&server.url()).await;
     join(&agent, Role::Agent, OFFICE, AGENT).await;
 
-    // 1) tool_call gen_image → 结果含 _meta.a2c_blob_handle（data 被清空）。
+    // 1) tool_call v022__gen_image（exposed 名 = `{bundle_id}__{原始名}`）→ 结果含
+    // _meta.a2c_blob_handle（data 被清空）。
     let req = ToolCallReq {
         base: AgentCallData {
             agent: AGENT.into(),
             req_id: ReqId("img-1".into()),
         },
         computer: COMPUTER.into(),
-        tool_name: "gen_image".into(),
+        tool_name: exposed_tool("gen_image"),
         params: json!({ "bytes": IMG_BYTES }),
         timeout: 30,
     };
@@ -829,7 +830,7 @@ async fn tool_call_cancel_fireforget_and_broadcast() {
             req_id: ReqId("cancel-req".into()),
         },
         computer: COMPUTER.into(),
-        tool_name: "sleep".into(),
+        tool_name: exposed_tool("sleep"),
         params: json!({ "ms": 1500 }),
         timeout: 30,
     };
@@ -912,7 +913,7 @@ async fn tool_call_timeout_marks_meta() {
             req_id: ReqId("timeout-req".into()),
         },
         computer: COMPUTER.into(),
-        tool_name: "sleep".into(),
+        tool_name: exposed_tool("sleep"),
         params: json!({ "ms": 4000 }),
         timeout: 1, // 1s 工具超时 < 4s sleep → 超时分支胜出
     };
@@ -966,6 +967,7 @@ async fn tool_call_unknown_computer_flat_404() {
             req_id: ReqId("nf-1".into()),
         },
         computer: "nonexistent-computer".into(),
+        // 裸名特意保留：computer 未命中在工具解析前即 404，tool_name 不进路由表。
         tool_name: "echo".into(),
         params: json!({ "message": "hi" }),
         timeout: 5,
@@ -1014,6 +1016,7 @@ async fn originator_disconnect_server_survives() {
             req_id: ReqId("orig-disc".into()),
         },
         computer: COMPUTER.into(),
+        // 裸名特意保留：目标 Computer 是不应答裸客户端，tool_name 从不进入路由解析。
         tool_name: "echo".into(),
         params: json!({ "message": "hi" }),
         timeout: 5,
@@ -1085,7 +1088,9 @@ async fn high_level_agent_query_methods_unwrap_ack() {
         .await
         .expect("get_tools 必须成功（#82：拆 socket.io ack 外层 args 数组）");
     assert!(
-        tools.iter().any(|t| t.name == "echo"),
+        tools
+            .iter()
+            .any(|t| t.bundle_id == MCP_NAME && t.name == exposed_tool("echo")),
         "应返回 v022 MCP 的 echo 工具，实得: {:?}",
         tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
     );

@@ -515,6 +515,12 @@ pub struct Computer<S: Session> {
     /// bundle. Every per-server lifecycle path takes this lock before entering the Manager's own
     /// lifecycle lock, so mount/unmount cannot leave a raw-only or declaration-only split state.
     mcp_lifecycle_locks: Arc<crate::weak_registry::WeakRegistry<BundleId, Mutex<()>>>,
+    /// #214：Computer 级 MCP 启动并发门控——单启/批量启动/Plugin 治理恢复共享同一把，
+    /// 任意时刻总在途启动事务数 ≤ 配置上限。未配置记录 in-flight 但不限流。
+    mcp_start_gate: Arc<crate::mcp_start_gate::McpStartGate>,
+    /// #214：Input 解析全局串行锁——并发启动期间 **只允许一个交互请求在飞**
+    /// （协议 §5.13 每实际启动重解析 Input；交互式 resolver 不得并行触发多个提示）。
+    mcp_input_resolve_lock: Arc<Mutex<()>>,
     /// #147/S14：宿主构造入参 `Computer::new(mcp_servers=…)` 的 **frozen 声明快照**（embed 层）。
     ///
     /// 与 `mcp_servers`（运行期可变物化集，随 mount/unmount/add 变动）**分离**——本字段构造后**不可变**、
@@ -956,6 +962,8 @@ impl<S: Session> Computer<S> {
             mcp_boot_shutdown: Arc::new(Mutex::new(())),
             mcp_operations_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_lifecycle_locks: Arc::new(crate::weak_registry::WeakRegistry::default()),
+            mcp_start_gate: crate::mcp_start_gate::McpStartGate::new(None),
+            mcp_input_resolve_lock: Arc::new(Mutex::new(())),
             embed_servers,
             mcp_flag_config: None,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
@@ -1109,6 +1117,22 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_mcp_flag_config(mut self, path: impl Into<PathBuf>) -> Self {
         self.mcp_flag_config = Some(path.into());
+        self
+    }
+
+    /// #214：安装 Computer 级 MCP **最大并发启动数**（构造期策略，`0` 按 `1` 处理）。
+    ///
+    /// 该上限约束**单个启动、批量启动（含 `start all`）与 Plugin 治理恢复**全路径——三者共享同一
+    /// Computer 级控制器；任意时刻总在途启动事务数 ≤ 本值。**未配置**（缺省）= 保持既有行为：
+    /// 批量仍逐项串行，不新增并发。
+    ///
+    /// - 并发许可覆盖**完整启动事务**（Input 重解析 → manager start 全链），Drop 即释放；
+    ///   重叠批次与单启/恢复交叉调用也维持上限。
+    /// - **Input 解析保持串行**：交互式 resolver 不会并行触发多个请求（协议 §5.11/§5.13 语义）。
+    /// - 属于宿主运行时策略（下游接入：tfrobot-client 产品默认 5），不落盘、不成为用户配置。
+    #[must_use]
+    pub fn with_mcp_start_concurrency(self, max: usize) -> Self {
+        self.mcp_start_gate.set_max(max);
         self
     }
 
@@ -1721,6 +1745,9 @@ impl<S: Session> Computer<S> {
             // 不再互相隐身；同 bundle_id 已存在 → 既有/用户配置胜（首见胜，additive-only）。
             let mut existing: HashSet<BundleId> = h.existing_servers().into_keys().collect();
             let mut injected_roots: HashSet<PathBuf> = HashSet::new();
+            // #214：重挂成功的 bundled server 收齐后经**统一批量启动器**一次启动（共享 Computer 级
+            // 并发控件，避免恢复路径绕过上限；best-effort 降级语义见循环后 WARN）。
+            let mut pending_starts: Vec<BundleId> = Vec::new();
             for rec in
                 crate::settings::recovery::collect_enabled_bundled_servers(&home, env, declared)
             {
@@ -1770,14 +1797,11 @@ impl<S: Session> Computer<S> {
                         existing.insert(bid.clone());
                         report.remounted_servers.push(name.clone());
                         // #152：enabled bundled MCP 重挂后**启动**达 running（协议 #11「enable 原子激活
-                        // servers」；boot 活跃集 = installed ∧ enabled）。best-effort：启动失败（进程缺失 /
-                        // 连接拒绝等）仅 WARN、不阻断其余 server 恢复（与 register_server 失败降级铁律一致）。
-                        // `start_mcp_client` 幂等（已启动返 Ok）且成功自带 capability bump + joined 时广播
-                        // `update_tool_list`——恢复后 plugin tools 立即可见，无需额外接线。
-                        if let Err(e) = self.start_mcp_client(&bid).await {
-                            warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id, error = %e,
-                                "reconcile_governance: remounted server failed to start (non-blocking; stays pending)");
-                        }
+                        // servers」；boot 活跃集 = installed ∧ enabled）。#214：执行权收齐到**统一批量
+                        // 启动器**——循环只收集，循环后一次 `start_mcp_clients_batch`（受 Computer 级
+                        // 并发上限；`start_mcp_client` 幂等：已启动返 Ok、成功自带 capability bump +
+                        // 广播 `update_tool_list`——恢复后 plugin tools 立即可见，无需额外接线）。
+                        pending_starts.push(bid.clone());
                     }
                     Err(e) => {
                         warn!(server = %name, bundle_id = %bid.as_str(), plugin = %rec.plugin_id, error = %e,
@@ -1793,6 +1817,20 @@ impl<S: Session> Computer<S> {
                             DiagnosticTarget::Bundle(bid.clone()),
                             format!("reconcile remount register failed: {e}"),
                         ));
+                    }
+                }
+            }
+
+            // #214：治理校验、input 注入与挂载**全部完成后**，经统一批量启动器启动全部待启动 bundled
+            // server（共享 Computer 级并发上限；结构化 join_all，不逐项独立 spawn）。best-effort 语义
+            // 不变：失败仅 WARN、不阻断其余（与 register_server 失败降级铁律一致）；失败的结构化诊断
+            // 由 `start_mcp_client` 逐项记录（#162 McpStartFailed + Bundle 键）。
+            if !pending_starts.is_empty() {
+                let outcomes = self.start_mcp_clients_batch(&pending_starts).await;
+                for (bid, outcome) in outcomes {
+                    if let Err(e) = outcome {
+                        warn!(bundle_id = %bid.as_str(), error = %e,
+                            "reconcile_governance: remounted server failed to start (non-blocking; stays pending)");
                     }
                 }
             }
@@ -4001,6 +4039,10 @@ impl<S: Session> Computer<S> {
 
     /// 启动 MCP 客户端 / Start MCP client
     pub async fn start_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
+        // #214：先取并发许可——许可覆盖**完整启动事务**（Input 重解析 → manager start 全链），
+        // Drop 即释放；排队等待者不持任何生命周期锁，不阻塞 shutdown 排他写锁。
+        // 单启/批量/治理恢复共用此门（任意时刻总在途 ≤ 上限；未配置不限流仍计数）。
+        let _start_permit = self.mcp_start_gate.acquire().await?;
         let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
         self.ensure_mcp_operations_open()?;
         let lifecycle = self.mcp_lifecycle_lock(id);
@@ -4021,6 +4063,9 @@ impl<S: Session> Computer<S> {
             match mgr {
                 Some(m) => {
                     m.start_client_by_id_materialized(id, raw.disabled(), || async {
+                        // #214：Input 重解析全局串行——并发启动期间只允许一个交互请求在飞
+                        //（协议 §5.13 每实际启动重解析；交互式 resolver 不并行打多个提示）。
+                        let _input_serial = self.mcp_input_resolve_lock.lock().await;
                         match scope.as_ref() {
                             Some(scope) => {
                                 self.render_server_config_with_scope(&raw, Some(scope))
@@ -4121,6 +4166,8 @@ impl<S: Session> Computer<S> {
 
     /// 重启单个 MCP 客户端（**bundle_id 寻址**）/ Restart one MCP client by bundle_id（#141 新增公开 restart）。
     pub async fn restart_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
+        // #214：restart = stop→start 事务，同样占并发许可（在途启动数 ≤ 上限不变量包含 restart。
+        let _start_permit = self.mcp_start_gate.acquire().await?;
         let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
         self.ensure_mcp_operations_open()?;
         let lifecycle = self.mcp_lifecycle_lock(id);
@@ -4143,6 +4190,8 @@ impl<S: Session> Computer<S> {
                     let was_active = m.is_client_active(id).await;
                     let result = m
                         .restart_client_by_id_materialized(id, raw.disabled(), || async {
+                            // #214：Input 重解析全局串行（同 start）。
+                            let _input_serial = self.mcp_input_resolve_lock.lock().await;
                             match scope.as_ref() {
                                 Some(scope) => {
                                     self.render_server_config_with_scope(&raw, Some(scope))
@@ -4186,27 +4235,74 @@ impl<S: Session> Computer<S> {
         result
     }
 
-    /// 启动全部 MCP 客户端（CLI `start all`）/ Start all MCP clients。
-    pub async fn start_all_mcp_clients(&self) -> ComputerResult<()> {
-        if self.mcp_manager.read().await.is_none() {
-            return Err(Self::manager_uninit());
-        }
-        let bundle_ids: Vec<BundleId> = self
-            .mcp_servers
+    /// #214：当前**已挂载且未禁用**的 bundle_id 集（批量启动的输入面；CLI/宿主通用）。
+    pub(crate) async fn enabled_mcp_bundle_ids(&self) -> Vec<BundleId> {
+        self.mcp_servers
             .read()
             .await
             .iter()
             .filter(|(_, entry)| !entry.config.disabled())
             .map(|(bundle_id, _)| bundle_id.clone())
-            .collect();
-        let mut result = Ok(());
-        for bundle_id in bundle_ids {
-            if let Err(error) = self.start_mcp_client(&bundle_id).await {
-                result = Err(error);
-                break;
+            .collect()
+    }
+
+    /// #214：批量启动 MCP 客户端——受 Computer 级并发上限约束，返回**每 bundle_id 的成败**，
+    /// 顺序与 `ids` 输入顺序一致（**稳定逐项结果序**，非完成序）；单项失败**不阻塞**其他项
+    /// （协议批次接口部分失败健壮，§4.6.5 partial-failure 语义）。
+    ///
+    /// - 配置了并发上限：结构化并发（`join_all`，无 detached startup task），各启动事务统一过门控；
+    /// - 未配置上限：保持既有**逐项串行**语义（与旧 `start_all` 行为一致），仅失败改不中断后续项；
+    /// - 幂等保持：重复启动已在运行 server = Ok（不重解析 Input，协议 §5.13）；
+    /// - 失败项的诊断由 [`start_mcp_client`](Self::start_mcp_client) 逐项记录（结构化 Degraded）。
+    ///
+    /// 重叠调用（两个批次交叉/单启与批次并发/治理恢复）共享同一门控：总在途 ≤ 上限。
+    pub async fn start_mcp_clients_batch(
+        &self,
+        ids: &[BundleId],
+    ) -> Vec<(BundleId, ComputerResult<()>)> {
+        match self.mcp_start_gate.max() {
+            Some(_) => {
+                // 结构化并发：futures 全部 borrow `self`（Computer 内部字段已 Arc 共享），
+                // 无需克隆整台 Computer；join_all 驱动、门控在途限制，完成即隐式收敛（无 detached）。
+                futures::future::join_all(ids.iter().map(|id| {
+                    let id = id.clone();
+                    async move { (id.clone(), self.start_mcp_client(&id).await) }
+                }))
+                .await
+            }
+            None => {
+                let mut outcomes = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let result = self.start_mcp_client(id).await;
+                    outcomes.push((id.clone(), result));
+                }
+                outcomes
             }
         }
-        result
+    }
+
+    /// 启动全部 MCP 客户端（CLI `start all`）/ Start all MCP clients。
+    ///
+    /// #214：委托 [`start_mcp_clients_batch`](Self::start_mcp_clients_batch)——受同一并发上限约束，
+    /// 全部项都会尝试启动（不再「首错即停」），批次收敛后返回**第一个失败**。
+    pub async fn start_all_mcp_clients(&self) -> ComputerResult<()> {
+        if self.mcp_manager.read().await.is_none() {
+            return Err(Self::manager_uninit());
+        }
+        let bundle_ids = self.enabled_mcp_bundle_ids().await;
+        let outcomes = self.start_mcp_clients_batch(&bundle_ids).await;
+        let mut first_error = None;
+        for (_, outcome) in outcomes {
+            if let Err(error) = outcome {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// 停止全部 MCP 客户端（CLI `stop all`）/ Stop all MCP clients。
@@ -4419,6 +4515,8 @@ impl<S: Session> Computer<S> {
             mcp_boot_shutdown: Arc::clone(&self.mcp_boot_shutdown),
             mcp_operations_open: Arc::clone(&self.mcp_operations_open),
             mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
+            mcp_start_gate: Arc::clone(&self.mcp_start_gate),
+            mcp_input_resolve_lock: Arc::clone(&self.mcp_input_resolve_lock),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
@@ -4627,6 +4725,10 @@ impl<S: Session> Computer<S> {
     pub async fn shutdown(&self) -> ComputerResult<()> {
         info!("Shutting down Computer: {}", self.name);
         let _boot_shutdown = self.mcp_boot_shutdown.lock().await;
+        // #214：**先关启动门**——排队等待许可的启动事务即刻失败（不再接纳新任务）；
+        // 已在途事务（已持许可 + 已持 `mcp_lifecycle_gate` 读门）由下方写锁天然等待收敛，
+        // 之后 manager close 不会与在途启动竞争（无进程遗留）。
+        self.mcp_start_gate.close();
         // Linearize terminal shutdown before any new candidate can be installed. A connect/set
         // transaction that won the gate first is completed and then closed below; one that starts
         // later observes Shutdown and tears down its candidate instead of publishing it.
@@ -4690,6 +4792,8 @@ impl<S: Session + Clone> Clone for Computer<S> {
             mcp_boot_shutdown: Arc::clone(&self.mcp_boot_shutdown),
             mcp_operations_open: Arc::clone(&self.mcp_operations_open),
             mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
+            mcp_start_gate: Arc::clone(&self.mcp_start_gate),
+            mcp_input_resolve_lock: Arc::clone(&self.mcp_input_resolve_lock),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
@@ -10801,5 +10905,609 @@ mod tests {
             !computer.acancel_tool("rid-cancel").await,
             "已完成的 req_id 再次取消应回 false"
         );
+    }
+
+    // ─── #214：Computer 级 MCP 有限并发启动 ─────────────────────────────────────────
+
+    /// 构造 n 个受控 server（唯一名 + 显式 bundle_id），返回 (servers map, bundle_ids)。
+    fn n_controlled_servers(n: usize) -> (HashMap<String, MCPServerConfig>, Vec<BundleId>) {
+        let mut map = HashMap::new();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let name = format!("s{i}");
+            let bid = BundleId::try_from(name.clone()).expect("test fixture bundle_id");
+            let cfg = MCPServerConfig::Stdio(StdioServerConfig {
+                env_file: None,
+                name: name.clone(),
+                bundle_id: Some(bid.clone()),
+                disabled: false,
+                forbidden_tools: vec![],
+                tool_meta: std::collections::HashMap::new(),
+                default_tool_meta: None,
+                vrl: None,
+                server_parameters: StdioServerParameters {
+                    command: "echo".to_string(),
+                    args: vec!["echo".to_string()],
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+            });
+            map.insert(name, cfg);
+            ids.push(bid);
+        }
+        (map, ids)
+    }
+
+    /// 等待 `connect()` 进入数达到 `n`（受控握手阻塞）；超时 panic。
+    async fn wait_entered(
+        ctl: &crate::mcp_clients::manager::test_support::ConnectControl,
+        n: usize,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ctl.entered.load(std::sync::atomic::Ordering::SeqCst) < n {
+            if std::time::Instant::now() > deadline {
+                panic!("timeout waiting for {n} controlled connects");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #214 验收：并发度为 5 时前 5 个可并发，第 6 个**必须等待**；结果保输入序。
+    #[tokio::test]
+    async fn mcp_start_concurrency_caps_batch_five_of_six_and_preserves_order() {
+        use crate::mcp_clients::manager::test_support::ConnectControl;
+        let (servers, ids) = n_controlled_servers(6);
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_cfg, _| {
+            Arc::new(
+                crate::mcp_clients::manager::test_support::ControlledClient {
+                    ctl: factory_ctl.clone(),
+                },
+            )
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+        .with_mcp_start_concurrency(5);
+        computer.boot_up().await.unwrap();
+
+        let comp = computer.clone();
+        let batch_ids = ids.clone();
+        let batch = tokio::spawn(async move { comp.start_mcp_clients_batch(&batch_ids).await });
+
+        // 前 5 个进入 connect（受控握手阻塞）；第 6 个必须留在门控队列。
+        wait_entered(&ctl, 5).await;
+        // 给门控失效留一拍：「应达 5」而非「已达 6」。
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            ctl.entered.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "第 6 个启动必须等待 Computer 级上限释放槽位"
+        );
+        assert_eq!(ctl.max_active.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(computer.mcp_start_gate.in_flight(), 5);
+
+        ctl.release_pass(6);
+        let outcomes = batch.await.unwrap();
+        assert_eq!(outcomes.len(), 6);
+        for (i, (out_id, outcome)) in outcomes.iter().enumerate() {
+            assert_eq!(out_id, &ids[i], "批量结果须保持输入序");
+            assert!(outcome.is_ok(), "server {out_id} 释放后应启动成功");
+        }
+        assert_eq!(
+            computer.mcp_start_gate.in_flight(),
+            0,
+            "批次收敛后无残留在途"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #214 验收：**未配置**并发度 → 批量保持既有串行语义（同一时刻仅 1 个 connect）。
+    #[tokio::test]
+    async fn mcp_start_unconfigured_batch_stays_serial() {
+        use crate::mcp_clients::manager::test_support::ConnectControl;
+        let (servers, ids) = n_controlled_servers(6);
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_cfg, _| {
+            Arc::new(
+                crate::mcp_clients::manager::test_support::ControlledClient {
+                    ctl: factory_ctl.clone(),
+                },
+            )
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"));
+        computer.boot_up().await.unwrap();
+
+        let comp = computer.clone();
+        let batch_ids = ids.clone();
+        let batch = tokio::spawn(async move { comp.start_mcp_clients_batch(&batch_ids).await });
+
+        // 未配置 → 每次仅 1 个在飞：第 i 项放行后只允许第 i+1 项进入（串行逐步推进）。
+        for i in 0..6 {
+            wait_entered(&ctl, i + 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                ctl.entered.load(std::sync::atomic::Ordering::SeqCst),
+                i + 1,
+                "未配置上限时批量必须逐项串行（第 {} 项在飞时不得并行进入后续项）",
+                i + 1
+            );
+            assert_eq!(computer.mcp_start_gate.in_flight(), 1);
+            ctl.release_pass(1);
+        }
+        let outcomes = batch.await.unwrap();
+        assert_eq!(outcomes.len(), 6);
+        assert!(outcomes.iter().all(|(_, o)| o.is_ok()));
+        assert_eq!(
+            ctl.max_active.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "串行语义下最大并行 connect 数恒为 1"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #214 验收：单项失败**不阻塞**其他项（部分失败健壮）；逐项结果按输入序。
+    #[tokio::test]
+    async fn batch_single_failure_does_not_block_others() {
+        use crate::mcp_clients::manager::test_support::{ConnectControl, ConnectFailClient};
+        let (servers, ids) = n_controlled_servers(3);
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(
+            move |cfg, _| -> Arc<dyn crate::mcp_clients::model::MCPClientProtocol> {
+                if cfg.name() == "s1" {
+                    Arc::new(ConnectFailClient)
+                } else {
+                    Arc::new(
+                        crate::mcp_clients::manager::test_support::ControlledClient {
+                            ctl: factory_ctl.clone(),
+                        },
+                    )
+                }
+            },
+        );
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+        .with_mcp_start_concurrency(3);
+        computer.boot_up().await.unwrap();
+
+        let comp = computer.clone();
+        let batch_ids = ids.clone();
+        let batch = tokio::spawn(async move { comp.start_mcp_clients_batch(&batch_ids).await });
+
+        wait_entered(&ctl, 2).await; // s2/s3（s1 已连接失败提前退出）
+        ctl.release_pass(2);
+        let outcomes = batch.await.unwrap();
+        assert_eq!(outcomes.len(), 3);
+        // 输入序：s0/s1/s2——s1（下标 1）失败、其余成功。
+        assert!(outcomes[0].1.is_ok(), "s0 不应被 s1 的失败阻塞");
+        assert!(outcomes[1].1.is_err(), "s1 connect 失败应如实上报");
+        assert!(outcomes[2].1.is_ok(), "s2 不应被 s1 的失败阻塞");
+
+        // 聚合 API 语义：#214 起 start_all 全量收敛后返回（首个）错误——不再「首错即停」。
+        // s0/s2 幂等已运行、s1 再败 → 返回 s1 的连接错误。
+        let agg_err = computer.start_all_mcp_clients().await.unwrap_err();
+        assert!(
+            matches!(&agg_err, crate::errors::ComputerError::ConnectionError(_)),
+            "start_all 应聚合返回首个失败（ConnectionError）：{agg_err:?}"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #214 验收 8：**输入取消**（render 阶段失败/取消）——取消项隔离、其余照常、许可无泄漏。
+    #[tokio::test]
+    async fn batch_input_cancel_isolates_item_and_releases_permits() {
+        use crate::inputs::runtime_resolver::InputValueResolver;
+        use crate::mcp_clients::manager::test_support::ConnectControl;
+
+        struct CancelOnIdResolver {
+            cancel_id: String,
+        }
+        #[async_trait]
+        impl InputValueResolver for CancelOnIdResolver {
+            async fn resolve_input(
+                &self,
+                def: &MCPServerInput,
+            ) -> Result<
+                Option<serde_json::Value>,
+                crate::inputs::runtime_resolver::InputResolutionError,
+            > {
+                if def.id() == self.cancel_id {
+                    return Err(
+                        crate::inputs::runtime_resolver::InputResolutionError::resolver_failed(
+                            def.id(),
+                            "user cancelled",
+                        ),
+                    );
+                }
+                Ok(Some(serde_json::Value::String("resolved".to_string())))
+            }
+        }
+
+        let (mut servers, ids) = n_controlled_servers(4);
+        // 按 key 显式指定（HashMap 迭代序不可依赖、跨进程随机——误用迭代序会随机让「取消」落到
+        // s1..s3 上，测试变 flaky）：仅 s0 引用「取消」input，s1..s3 引用「正常」input。
+        match servers.get_mut("s0").unwrap() {
+            MCPServerConfig::Stdio(c) => {
+                c.server_parameters.args = vec!["${input:cancel-me}".into()];
+            }
+            _ => unreachable!(),
+        }
+        for name in ["s1", "s2", "s3"] {
+            match servers.get_mut(name).unwrap() {
+                MCPServerConfig::Stdio(c) => {
+                    c.server_parameters.args = vec!["${input:region-ok}".into()];
+                }
+                _ => unreachable!(),
+            }
+        }
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_cfg, _| {
+            Arc::new(
+                crate::mcp_clients::manager::test_support::ControlledClient {
+                    ctl: factory_ctl.clone(),
+                },
+            )
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([
+                (
+                    "cancel-me".to_string(),
+                    prompt_def("cancel-me", Some("x"), false),
+                ),
+                (
+                    "region-ok".to_string(),
+                    prompt_def("region-ok", Some("y"), false),
+                ),
+            ])),
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_input_resolver(Arc::new(CancelOnIdResolver {
+            cancel_id: "cancel-me".to_string(),
+        }))
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+        .with_mcp_start_concurrency(4);
+        computer.boot_up().await.unwrap();
+
+        let comp = computer.clone();
+        let batch_ids = ids.clone();
+        let batch = tokio::spawn(async move { comp.start_mcp_clients_batch(&batch_ids).await });
+        // s0 在 render 阶段即失败（不进入 connect）；s1..s3 进入受控 connect 等待。
+        wait_entered(&ctl, 3).await;
+        ctl.release_pass(3);
+        let outcomes = batch.await.unwrap();
+        assert_eq!(outcomes.len(), 4);
+        match &outcomes[0].1 {
+            Err(crate::errors::ComputerError::InputResolution(
+                crate::inputs::runtime_resolver::InputResolutionError::ResolverFailed {
+                    id, ..
+                },
+            )) => assert_eq!(id, "cancel-me", "取消项应报 ResolverFailed(cancelled)"),
+            other => panic!("expected ResolverFailed(cancel), got {other:?}"),
+        }
+        assert!(
+            outcomes[1..].iter().all(|(_, o)| o.is_ok()),
+            "取消项不得阻塞其余项（s1..s3 应全部成功）"
+        );
+        assert_eq!(
+            computer.mcp_start_gate.in_flight(),
+            0,
+            "render 阶段失败后许可必须释放（无泄漏）"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #214 验收 6：**重叠批次共享同一上限**——两个 batch 交叉的总在途 ≤ 配置值。
+    #[tokio::test]
+    async fn overlapping_batches_share_single_ceiling() {
+        use crate::mcp_clients::manager::test_support::ConnectControl;
+        let (servers, ids) = n_controlled_servers(5);
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_cfg, _| {
+            Arc::new(
+                crate::mcp_clients::manager::test_support::ControlledClient {
+                    ctl: factory_ctl.clone(),
+                },
+            )
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+        .with_mcp_start_concurrency(3);
+        computer.boot_up().await.unwrap();
+
+        // 第一批 3 项 + 第二批 2 项并发：共享同一上限 ⇒ 任意时刻在途 ≤ 3。
+        let comp_a = computer.clone();
+        let batch_a_ids = ids.clone();
+        let batch_a =
+            tokio::spawn(async move { comp_a.start_mcp_clients_batch(&batch_a_ids).await });
+        let comp_b = computer.clone();
+        let batch_b_ids = ids.clone();
+        let batch_b =
+            tokio::spawn(async move { comp_b.start_mcp_clients_batch(&batch_b_ids).await });
+
+        wait_entered(&ctl, 3).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            ctl.entered.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "重叠批次总在途不得超过配置上限（第 4/5 项必须等待）"
+        );
+        assert_eq!(computer.mcp_start_gate.in_flight(), 3);
+        ctl.release_pass(5);
+        let out_a = batch_a.await.unwrap();
+        let out_b = batch_b.await.unwrap();
+        assert_eq!(out_a.len(), 5);
+        assert_eq!(out_b.len(), 5);
+        assert!(out_a.iter().all(|(_, o)| o.is_ok()));
+        assert!(out_b.iter().all(|(_, o)| o.is_ok()));
+        assert_eq!(computer.mcp_start_gate.in_flight(), 0);
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #214 验收：并发批量下 **Input 解析保持串行**（resolver 最大并行恒 1）。
+    #[tokio::test]
+    async fn batch_input_resolution_remains_serial() {
+        use crate::inputs::runtime_resolver::InputValueResolver;
+        use crate::mcp_clients::manager::test_support::ConnectControl;
+
+        struct SerialityResolver {
+            active: Arc<std::sync::atomic::AtomicUsize>,
+            max_active: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl InputValueResolver for SerialityResolver {
+            async fn resolve_input(
+                &self,
+                _def: &MCPServerInput,
+            ) -> Result<
+                Option<serde_json::Value>,
+                crate::inputs::runtime_resolver::InputResolutionError,
+            > {
+                let a = self
+                    .active
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.max_active
+                    .fetch_max(a, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                self.active
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(serde_json::Value::String("cn".to_string())))
+            }
+        }
+
+        let (mut servers, ids) = n_controlled_servers(4);
+        // 全部 4 个 server 引用同一 input id。
+        for cfg in servers.values_mut() {
+            match cfg {
+                MCPServerConfig::Stdio(c) => {
+                    c.server_parameters.args = vec!["${input:region}".to_string()];
+                }
+                _ => unreachable!(),
+            }
+        }
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let resolver_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver_max = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_cfg, _| {
+            Arc::new(
+                crate::mcp_clients::manager::test_support::ControlledClient {
+                    ctl: factory_ctl.clone(),
+                },
+            )
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            Some(HashMap::from([(
+                "region".to_string(),
+                prompt_def("region", Some("cn"), false),
+            )])),
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_input_resolver(Arc::new(SerialityResolver {
+            active: resolver_active.clone(),
+            max_active: resolver_max.clone(),
+        }))
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+        .with_mcp_start_concurrency(4);
+        computer.boot_up().await.unwrap();
+
+        let comp = computer.clone();
+        let batch_ids = ids.clone();
+        let batch = tokio::spawn(async move { comp.start_mcp_clients_batch(&batch_ids).await });
+        wait_entered(&ctl, 4).await;
+        ctl.release_pass(4);
+        let outcomes = batch.await.unwrap();
+        assert!(outcomes.iter().all(|(_, o)| o.is_ok()));
+        assert_eq!(
+            resolver_max.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "并发批量下 Input 解析必须串行（不得并行触发多个交互请求）"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #214 验收：批量**重复启动幂等**（同一 server 第二次 no-op，不重复创建/重解析）。
+    #[tokio::test]
+    async fn batch_duplicate_start_is_idempotent() {
+        use crate::mcp_clients::manager::test_support::ConnectControl;
+        let (servers, ids) = n_controlled_servers(2);
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let created_ref = created.clone();
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_cfg, _| {
+            created_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Arc::new(
+                crate::mcp_clients::manager::test_support::ControlledClient {
+                    ctl: factory_ctl.clone(),
+                },
+            )
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+        .with_mcp_start_concurrency(2);
+        computer.boot_up().await.unwrap();
+
+        // 重复提交 s0：第一次真启动，第二次幂等 no-op。
+        let dup: Vec<BundleId> = vec![ids[0].clone(), ids[0].clone()];
+        let comp = computer.clone();
+        let batch = tokio::spawn(async move { comp.start_mcp_clients_batch(&dup).await });
+        wait_entered(&ctl, 1).await;
+        ctl.release_pass(1);
+        let outcomes = batch.await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes.iter().all(|(_, o)| o.is_ok()),
+            "幂等启动须两则皆 Ok"
+        );
+        assert_eq!(
+            created.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "重复启动不得再次创建 client（协议 §5.13 幂等 MAY no-op）"
+        );
+        assert_eq!(
+            ctl.entered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "重复启动不得再次 connect"
+        );
+        computer.shutdown().await.unwrap();
+    }
+
+    /// #214 验收：**shutdown** 停止接纳排队任务（排队者失败）、安全等待在途任务、不留进程。
+    #[tokio::test]
+    async fn shutdown_rejects_queued_starts_and_waits_inflight() {
+        use crate::mcp_clients::manager::test_support::ConnectControl;
+        let (servers, ids) = n_controlled_servers(6);
+        let ctl = ConnectControl::new();
+        let factory_ctl = ctl.clone();
+        let factory: crate::mcp_clients::manager::ClientFactory = Arc::new(move |_cfg, _| {
+            Arc::new(
+                crate::mcp_clients::manager::test_support::ControlledClient {
+                    ctl: factory_ctl.clone(),
+                },
+            )
+        });
+        let td = tempfile::TempDir::new().unwrap();
+        let computer = Computer::new(
+            "c",
+            SilentSession::new("t"),
+            None,
+            Some(servers),
+            false,
+            false,
+        )
+        .with_client_factory(factory)
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"))
+        .with_mcp_start_concurrency(2);
+        computer.boot_up().await.unwrap();
+
+        let comp = computer.clone();
+        let batch_ids = ids.clone();
+        let batch = tokio::spawn(async move { comp.start_mcp_clients_batch(&batch_ids).await });
+        wait_entered(&ctl, 2).await; // 2 个在途（受控阻塞），其余 4 个排队等许可
+
+        // shutdown 在途阻塞期间不得复归：在途事务完成前写锁等待。
+        let comp_sh = computer.clone();
+        let shutdown = tokio::spawn(async move { comp_sh.shutdown().await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!shutdown.is_finished(), "shutdown 必须等待在途启动收敛");
+
+        // 排队任务（含新单启）在 gate 关闭后即刻失败——不复归。
+        let queued_err = computer.start_mcp_client(&ids[2]).await.unwrap_err();
+        assert!(
+            matches!(queued_err, ComputerError::InvalidState(_)),
+            "shutdown 后新启动必须被拒：{queued_err:?}"
+        );
+
+        // 放行在途 → shutdown 收敛。
+        ctl.release_pass(2);
+        shutdown.await.unwrap().unwrap();
+        assert!(
+            computer.mcp_start_gate.is_closed(),
+            "shutdown 后启动门必须处于关闭态"
+        );
+        let outcomes = batch.await.unwrap();
+        assert_eq!(outcomes.len(), 6);
+        assert!(
+            outcomes[0].1.is_ok() && outcomes[1].1.is_ok(),
+            "在途 2 项应完成"
+        );
+        assert!(
+            outcomes[2..]
+                .iter()
+                .all(|(_, o)| matches!(o, Err(ComputerError::InvalidState(_)))),
+            "排队 4 项应全部以 gate 关闭失败"
+        );
+        assert_eq!(computer.mcp_start_gate.in_flight(), 0);
     }
 }

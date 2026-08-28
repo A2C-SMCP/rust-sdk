@@ -20,13 +20,13 @@ use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
-use serde_json::Value;
+use serde_json::{json, Value};
 use socketioxide::extract::{AckSender, Data, SocketRef};
-use socketioxide::SocketIo;
+use socketioxide::{SocketIo, SocketIoBuilder};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::time::sleep;
+use tokio::sync::{oneshot, Notify};
+use tokio::time::{sleep, timeout};
 use tower::Layer;
 
 use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
@@ -34,7 +34,12 @@ use smcp_computer::mcp_clients::bundle_id::resolve_bundle_id;
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, StdioServerConfig, StdioServerParameters,
 };
+use smcp_computer::mcp_clients::{HttpServerConfig, HttpServerParameters};
 use smcp_computer::LifecycleState;
+
+// #149 约定：common/mod.rs 是 cli-gated，非 cli 测试经 `#[path]` 引独立文件。
+#[path = "common/blocking_tool_mock.rs"]
+mod blocking_tool_mock;
 
 // ---------------------------------------------------------------------------
 // recording relay
@@ -110,6 +115,92 @@ async fn start_relay(obs: Arc<RelayObs>) -> (String, oneshot::Sender<()>) {
     });
 
     // 关键：layer 只叠一次后整体 clone 给每条连接（polling 跨多次 HTTP 请求维持 engine.io 会话）。
+    let fallback = tower::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
+        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::<Bytes>::new(Bytes::new())))
+    });
+    let service = layer.layer(fallback);
+
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((stream, _)) = accepted {
+                        let tio = hyper_util::rt::TokioIo::new(stream);
+                        let svc = hyper_util::service::TowerToHyperService::new(service.clone());
+                        tokio::spawn(async move {
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(tio, svc)
+                                .with_upgrades()
+                                .await;
+                        });
+                    }
+                }
+                _ = &mut shutdown_rx => break,
+            }
+        }
+    });
+
+    sleep(Duration::from_millis(150)).await;
+    (format!("http://{addr}"), shutdown_tx)
+}
+
+/// #208 relay：与 [`start_relay`] 同构，但 Engine.IO ping 可配（issue 复现参数 300ms/700ms），
+/// 并在命名空间连接时捕获 Computer 的 [`SocketRef`] —— 测试侧经 `emit_with_ack` 驱动
+/// `client:tool_call` / `notify:tool_call_cancel`，即以真实入站事件在「长调用 pending」期间的
+/// 分发时序为观测面（单 reader 阻塞期 PING/cancel 排队的判别点）。
+async fn start_relay_pinged(
+    obs: Arc<RelayObs>,
+    sockets: Arc<Mutex<Option<SocketRef>>>,
+    ping_interval: Duration,
+    ping_timeout: Duration,
+) -> (String, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // `SocketIo::new_layer()` 即 `SocketIoBuilder::new().build_layer()`；ping 参数为 #208 复现值。
+    let (layer, io) = SocketIoBuilder::new()
+        .ping_interval(ping_interval)
+        .ping_timeout(ping_timeout)
+        .build_layer();
+    io.ns("/smcp", {
+        let obs = obs.clone();
+        move |socket: SocketRef| {
+            *sockets.lock().unwrap() = Some(socket.clone());
+            obs.connect.fetch_add(1, Ordering::SeqCst);
+
+            socket.on_disconnect({
+                let obs = obs.clone();
+                move |_s: SocketRef| {
+                    let obs = obs.clone();
+                    async move {
+                        obs.disconnect.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+
+            // ACK join 成功（mirror 真实 server 的 `(bool, Option<String>)` = `[true, null]`）。
+            socket.on(
+                "server:join_office",
+                move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {
+                    let _ = ack.send(&(true, None::<String>));
+                },
+            );
+
+            socket.on("server:update_tool_list", {
+                let obs = obs.clone();
+                move |_s: SocketRef, Data::<Value>(data)| {
+                    let obs = obs.clone();
+                    async move {
+                        if let Some(c) = data.get("computer").and_then(|v| v.as_str()) {
+                            obs.tool_list_computers.lock().unwrap().push(c.to_string());
+                        }
+                    }
+                }
+            });
+        }
+    });
+
     let fallback = tower::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
         Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::<Bytes>::new(Bytes::new())))
     });
@@ -410,5 +501,271 @@ async fn start_stop_mcp_no_sync_when_not_joined() {
     );
 
     computer.shutdown().await.ok();
+    let _ = shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// Problem 3：#208 长工具调用阻塞入站循环 —— 心跳 / pending cancel / no-op / teardown
+// ---------------------------------------------------------------------------
+//
+// 判别力（防假绿）：走**真实 socketioxide relay（短 ping 300ms/700ms）+ 真实 on_any 分发 +
+// 可阻塞 Streamable HTTP mock 工具**。长调用 pending 期间 Engine.IO PING 与 cancel 事件的
+// 可达性，恰是 tf-rust-socketio 单 reader 行内 await 回调（client.rs:508）的观测面；
+// issue #208 因果对照即此形态（改调度边界后 20/20 绿）。
+//
+// 工具暴露名 = `{bundle_id}__{tool_name}`（manager.rs:6423）：bundle "blocking" + mock 工具
+// "waiting" → "blocking__waiting"。
+
+/// #208 测试基座：boot → connect → join → start blocking mock，返回
+/// `(computer, relay_obs, sockets, release, shutdown_tx)`。
+async fn setup_pending_computer() -> (
+    Computer<SilentSession>,
+    Arc<RelayObs>,
+    Arc<Mutex<Option<SocketRef>>>,
+    Arc<Notify>,
+    oneshot::Sender<()>,
+) {
+    let obs = Arc::new(RelayObs::default());
+    let sockets: Arc<Mutex<Option<SocketRef>>> = Arc::new(Mutex::new(None));
+    let (port, release) = blocking_tool_mock::spawn_blocking_tool_mock().await;
+    let (url, shutdown) = start_relay_pinged(
+        obs.clone(),
+        sockets.clone(),
+        Duration::from_millis(300),
+        Duration::from_millis(700),
+    )
+    .await;
+
+    let cfg = MCPServerConfig::Http(HttpServerConfig::new(
+        "blocking",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{port}"),
+            headers: HashMap::new(),
+        },
+    ));
+    let bid = resolve_bundle_id(&cfg);
+    let mut servers = HashMap::new();
+    servers.insert("blocking".to_string(), cfg);
+
+    let td = TempDir::new().unwrap();
+    let computer = isolate(
+        Computer::new(
+            "c208",
+            SilentSession::new("s"),
+            None,
+            Some(servers),
+            false,
+            false,
+        ),
+        &td,
+    );
+    computer.boot_up().await.expect("boot");
+    computer
+        .connect_socketio(&url, ConnectOptions::default())
+        .await
+        .expect("connect");
+    computer.join_office("o", "c208").await.expect("join");
+    computer.start_mcp_client(&bid).await.expect("start mcp");
+
+    (computer, obs, sockets, release, shutdown)
+}
+
+/// 等 relay 捕获到 Computer 的 SocketRef（join 之后必然可达）。
+async fn captured_socket(sockets: &Arc<Mutex<Option<SocketRef>>>) -> SocketRef {
+    wait_until(|| async { sockets.lock().unwrap().is_some() }, OBS_WAIT)
+        .await
+        .then(|| sockets.lock().unwrap().clone())
+        .flatten()
+        .expect("relay 未捕获 Computer SocketRef")
+}
+
+#[tokio::test]
+async fn tool_call_pending_heartbeat_survives() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let (computer, obs, sockets, release, shutdown) = setup_pending_computer().await;
+    let sock = captured_socket(&sockets).await;
+
+    let req = json!({
+        "agent": "a1", "req_id": "hb-1", "computer": "c208",
+        "tool_name": "blocking__waiting", "params": {}, "timeout": 0
+    });
+    // timeout=0 → Computer 无超时（handle_tool_call_with_ack 语义），工具只等本测试释放。
+    let ack_fut = sock
+        .emit_with_ack::<Value, Value>("client:tool_call", &req)
+        .expect("emit_with_ack 失败");
+
+    // 工具 pending（未释放）跨越 ping_interval+ping_timeout（300+700ms）：不得心跳超时断连/重连
+    // （#207 现场：alimama_login 121s、断连后工具完成才重连）。
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        obs.connect.load(Ordering::SeqCst),
+        1,
+        "长调用期间不得重连（connect 计数应稳定为 1）"
+    );
+    assert_eq!(
+        obs.disconnect.load(Ordering::SeqCst),
+        0,
+        "长调用期间不得被心跳超时断开（#207 alimama_login 现场形态）"
+    );
+
+    // 释放 → 工具自然完成，正常补发成功 ACK。
+    release.notify_waiters();
+    let ack = timeout(Duration::from_secs(5), ack_fut)
+        .await
+        .expect("ack 未在 5s 内到达")
+        .expect("ack err");
+    assert_eq!(
+        ack.get("isError").and_then(|v| v.as_bool()),
+        Some(false),
+        "工具应成功: {ack}"
+    );
+    assert_eq!(
+        computer.lifecycle_state(),
+        LifecycleState::JoinedOffice,
+        "全过程连接/办公室状态应保持"
+    );
+
+    computer.shutdown().await.ok();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn tool_call_cancel_consumed_while_pending() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let (computer, _obs, sockets, release, shutdown) = setup_pending_computer().await;
+    let sock = captured_socket(&sockets).await;
+
+    let req = json!({
+        "agent": "a1", "req_id": "c-1", "computer": "c208",
+        "tool_name": "blocking__waiting", "params": {}, "timeout": 0
+    });
+    let ack_fut = sock
+        .emit_with_ack::<Value, Value>("client:tool_call", &req)
+        .expect("emit_with_ack 失败");
+
+    // 确认工具已进入 pending（reader 已收到并（修复后）spawn），再广播取消。
+    sleep(Duration::from_millis(300)).await;
+    sock.emit(
+        "notify:tool_call_cancel",
+        &json!({"agent": "a1", "req_id": "c-1"}),
+    )
+    .expect("emit cancel");
+
+    // 取消 ACK 必须在窗口内到达且**唯一**：isError=true + meta.a2c_cancelled / a2c_cancel_reason。
+    let ack = timeout(Duration::from_secs(1), ack_fut)
+        .await
+        .expect("取消 ACK 未在 1s 内到达（pending 期间 cancel 事件排在长调用之后）")
+        .expect("ack err");
+    let meta = ack
+        .get("meta")
+        .unwrap_or_else(|| panic!("取消态应有 result-level meta: {ack}"));
+    assert_eq!(
+        meta.get("a2c_cancelled").and_then(|v| v.as_bool()),
+        Some(true),
+        "{ack}"
+    );
+    assert_eq!(
+        meta.get("a2c_cancel_reason").and_then(|v| v.as_str()),
+        Some("agent_requested"),
+        "{ack}"
+    );
+    assert_eq!(
+        ack.get("isError").and_then(|v| v.as_bool()),
+        Some(true),
+        "{ack}"
+    );
+    assert_eq!(
+        computer.lifecycle_state(),
+        LifecycleState::JoinedOffice,
+        "取消全程连接保持；取消 ACK 可达即已取消（工具未自然完成）"
+    );
+
+    // 收尾：释放工具兜底（若取消已覆盖则无影响），防残留阻塞任务。
+    release.notify_waiters();
+    computer.shutdown().await.ok();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn tool_call_cancel_unknown_req_id_noop() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let (computer, _obs, sockets, release, shutdown) = setup_pending_computer().await;
+    let sock = captured_socket(&sockets).await;
+
+    let req = json!({
+        "agent": "a1", "req_id": "u-1", "computer": "c208",
+        "tool_name": "blocking__waiting", "params": {}, "timeout": 0
+    });
+    let mut ack_fut = Box::pin(
+        sock.emit_with_ack::<Value, Value>("client:tool_call", &req)
+            .expect("emit_with_ack 失败"),
+    );
+
+    sleep(Duration::from_millis(300)).await;
+    // 未知 req_id → 幂等 no-op：不 panic、无 ACK，工具照常运行。
+    sock.emit(
+        "notify:tool_call_cancel",
+        &json!({"agent": "a1", "req_id": "nope"}),
+    )
+    .expect("emit cancel");
+    assert!(
+        timeout(Duration::from_millis(500), &mut ack_fut)
+            .await
+            .is_err(),
+        "未知 req_id 的取消不得提前产生 ACK"
+    );
+
+    // 释放 → 唯一成功 ACK（未被取消）。
+    release.notify_waiters();
+    let ack = timeout(Duration::from_secs(5), &mut ack_fut)
+        .await
+        .expect("ack 未在 5s 内到达")
+        .expect("ack err");
+    assert_eq!(
+        ack.get("isError").and_then(|v| v.as_bool()),
+        Some(false),
+        "未知 req_id 取消应为 no-op，工具正常成功: {ack}"
+    );
+    assert_eq!(computer.lifecycle_state(), LifecycleState::JoinedOffice);
+
+    computer.shutdown().await.ok();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn disconnect_aborts_pending_tool_task() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let (computer, obs, sockets, release, shutdown) = setup_pending_computer().await;
+    let sock = captured_socket(&sockets).await;
+
+    let req = json!({
+        "agent": "a1", "req_id": "d-1", "computer": "c208",
+        "tool_name": "blocking__waiting", "params": {}, "timeout": 0
+    });
+    let ack_fut = sock
+        .emit_with_ack::<Value, Value>("client:tool_call", &req)
+        .expect("emit_with_ack 失败");
+
+    sleep(Duration::from_millis(300)).await; // 工具已 pending
+    computer.disconnect_socketio().await.expect("disconnect");
+    assert!(
+        wait_until(
+            || async { obs.disconnect.load(Ordering::SeqCst) >= 1 },
+            OBS_WAIT
+        )
+        .await,
+        "relay 未观察到 transport disconnect"
+    );
+    assert_eq!(
+        computer.lifecycle_state(),
+        LifecycleState::Started,
+        "disconnect 后 lifecycle 回 Started"
+    );
+
+    // 释放后不得有延迟 ACK：disconnect 时在途任务应被 abort（无任务 → 无 ack 可投）。
+    release.notify_waiters();
+    let ack = timeout(Duration::from_secs(2), ack_fut).await;
+    assert!(!matches!(&ack, Ok(Ok(_))), "断连后不应有延迟 ACK: {ack:?}");
+
     let _ = shutdown.send(());
 }
