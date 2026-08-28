@@ -17,6 +17,7 @@ pub mod governance;
 pub mod inputs;
 pub mod inventory;
 pub mod mcp_clients;
+mod mcp_start_gate;
 pub mod oauth;
 pub mod settings;
 pub mod skills;

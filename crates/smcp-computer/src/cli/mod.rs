@@ -88,6 +88,11 @@ pub struct Args {
     #[arg(long)]
     pub approve_all_mcp: bool,
 
+    /// #214：MCP 启动最大并发数（宿主运行时策略，不落盘、非用户配置；缺省 = 串行保持既有行为）
+    /// / max concurrent MCP starts at Computer level (0 → treated as 1)
+    #[arg(long)]
+    pub concurrency: Option<usize>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -536,6 +541,11 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
     // uninstall/disable/gc 时被连坐停摘（§2.5-5 / #153 缺口形状）。
     if let Some(ref p) = mcp_config {
         computer = computer.with_mcp_flag_config(p.clone());
+    }
+    // #214：`--concurrency` 为宿主显式注入的运行时策略（不落盘；缺省 = 串行，行为不变）。
+    // 单启 / `start all` / 治理恢复共享该 Computer 级上限。
+    if let Some(max) = args.concurrency {
+        computer = computer.with_mcp_start_concurrency(max);
     }
     let computer = computer;
 

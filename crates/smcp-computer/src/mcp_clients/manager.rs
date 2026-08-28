@@ -3317,6 +3317,7 @@ impl Default for MCPServerManager {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     /// 测试夹具：构造合法 [`BundleId`]（非法字面量在此 panic —— 夹具写错须立刻暴露，而非静默成 `String`）。
     ///
@@ -3388,6 +3389,108 @@ pub(crate) mod test_support {
         ) -> Result<ReadResourceResult, MCPClientError> {
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 self.read_text.clone(),
+                "skill://x",
+            )]))
+        }
+        async fn subscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn unsubscribe_window(&self, _resource: Resource) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+    }
+
+    /// #214：受控「慢握手」假 client——`connect()` 阻塞至测试释放，配合原子计数观测
+    /// 启动并发度。语义：`entered` 记 connect 已进入；`active`/`max_active` 记**在途未完成**
+    /// 的 connect 活跃数（非硬件并行——current-thread runtime 下排队者 park 在 release 锁上，
+    /// 计数仍先行发生于锁前；对「门控失效即达 N+1」的断言有效，不构成物理并行度证明）。
+    /// 释放 = `release_pass(n)`：每次 connect 恰好消费一个一次性消息（不回收复用）。
+    /// A controllable slow-handshake fake client for concurrency-limit assertions.
+    pub(crate) struct ConnectControl {
+        pub(crate) entered: AtomicUsize,
+        pub(crate) active: AtomicUsize,
+        pub(crate) max_active: AtomicUsize,
+        release_tx: mpsc::UnboundedSender<()>,
+        release_rx: Mutex<mpsc::UnboundedReceiver<()>>,
+    }
+
+    impl ConnectControl {
+        pub(crate) fn new() -> Arc<Self> {
+            let (release_tx, release_rx) = mpsc::unbounded_channel();
+            Arc::new(Self {
+                entered: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                release_tx,
+                release_rx: Mutex::new(release_rx),
+            })
+        }
+
+        /// 放行 n 个在途 connect；每个 connect 恰好消费一个放行消息（**一次性**、不回收复用——
+        /// 逐项逐步放行可观测「未放行即串行」）。
+        pub(crate) fn release_pass(&self, n: usize) {
+            for _ in 0..n {
+                let _ = self.release_tx.send(());
+            }
+        }
+
+        async fn hold_connect(&self) -> Result<(), MCPClientError> {
+            self.entered.fetch_add(1, AtomicOrdering::SeqCst);
+            let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_active.fetch_max(active, AtomicOrdering::SeqCst);
+            // 阻塞直至测试放行（超时由测试侧兜底）。持锁等待保证了消息的串行消费（无丢失）。
+            {
+                let mut rx = self.release_rx.lock().await;
+                rx.recv().await.ok_or_else(|| {
+                    MCPClientError::ConnectionError("test release gate dropped".into())
+                })?;
+            }
+            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// 每 server 一个 client 实例（共享同一 controller）；`connect` 阻塞至 controller 放行。
+    pub(crate) struct ControlledClient {
+        pub(crate) ctl: Arc<ConnectControl>,
+    }
+
+    #[async_trait::async_trait]
+    impl MCPClientProtocol for ControlledClient {
+        fn state(&self) -> ClientState {
+            ClientState::Connected
+        }
+        async fn connect(&self) -> Result<(), MCPClientError> {
+            self.ctl.hold_connect().await
+        }
+        async fn disconnect(&self) -> Result<(), MCPClientError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _params: Value,
+        ) -> Result<CallToolResult, MCPClientError> {
+            Err(MCPClientError::ProtocolError("n/a".into()))
+        }
+        async fn list_windows(&self) -> Result<Vec<Resource>, MCPClientError> {
+            Ok(vec![])
+        }
+        async fn list_resources_page(
+            &self,
+            _cursor: Option<String>,
+        ) -> Result<(Vec<Resource>, Option<String>), MCPClientError> {
+            Ok((vec![], None))
+        }
+        async fn get_window_detail(
+            &self,
+            _resource: Resource,
+        ) -> Result<ReadResourceResult, MCPClientError> {
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                String::new(),
                 "skill://x",
             )]))
         }
