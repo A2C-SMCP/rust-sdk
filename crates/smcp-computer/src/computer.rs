@@ -518,6 +518,8 @@ pub struct Computer<S: Session> {
     /// #214：Computer 级 MCP 启动并发门控——单启/批量启动/Plugin 治理恢复共享同一把，
     /// 任意时刻总在途启动事务数 ≤ 配置上限。未配置记录 in-flight 但不限流。
     mcp_start_gate: Arc<crate::mcp_start_gate::McpStartGate>,
+    /// #214：shutdown 取消尚未进入生命周期读锁的启动事务，避免关闭写锁与排队读锁互相等待。
+    mcp_start_shutdown: CancellationToken,
     /// #214：Input 解析全局串行锁——并发启动期间 **只允许一个交互请求在飞**
     /// （协议 §5.13 每实际启动重解析 Input；交互式 resolver 不得并行触发多个提示）。
     mcp_input_resolve_lock: Arc<Mutex<()>>,
@@ -963,6 +965,7 @@ impl<S: Session> Computer<S> {
             mcp_operations_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_lifecycle_locks: Arc::new(crate::weak_registry::WeakRegistry::default()),
             mcp_start_gate: crate::mcp_start_gate::McpStartGate::new(None),
+            mcp_start_shutdown: CancellationToken::new(),
             mcp_input_resolve_lock: Arc::new(Mutex::new(())),
             embed_servers,
             mcp_flag_config: None,
@@ -4043,7 +4046,14 @@ impl<S: Session> Computer<S> {
         // Drop 即释放；排队等待者不持任何生命周期锁，不阻塞 shutdown 排他写锁。
         // 单启/批量/治理恢复共用此门（任意时刻总在途 ≤ 上限；未配置不限流仍计数）。
         let _start_permit = self.mcp_start_gate.acquire().await?;
-        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        let _global_lifecycle = tokio::select! {
+            guard = self.mcp_lifecycle_gate.read() => guard,
+            _ = self.mcp_start_shutdown.cancelled() => {
+                return Err(ComputerError::InvalidState(
+                    "MCP startup cancelled because Computer is shutting down".to_string(),
+                ));
+            }
+        };
         self.ensure_mcp_operations_open()?;
         let lifecycle = self.mcp_lifecycle_lock(id);
         let _lifecycle_guard = lifecycle.lock().await;
@@ -4168,7 +4178,14 @@ impl<S: Session> Computer<S> {
     pub async fn restart_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
         // #214：restart = stop→start 事务，同样占并发许可（在途启动数 ≤ 上限不变量包含 restart。
         let _start_permit = self.mcp_start_gate.acquire().await?;
-        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        let _global_lifecycle = tokio::select! {
+            guard = self.mcp_lifecycle_gate.read() => guard,
+            _ = self.mcp_start_shutdown.cancelled() => {
+                return Err(ComputerError::InvalidState(
+                    "MCP startup cancelled because Computer is shutting down".to_string(),
+                ));
+            }
+        };
         self.ensure_mcp_operations_open()?;
         let lifecycle = self.mcp_lifecycle_lock(id);
         let _lifecycle_guard = lifecycle.lock().await;
@@ -4516,6 +4533,7 @@ impl<S: Session> Computer<S> {
             mcp_operations_open: Arc::clone(&self.mcp_operations_open),
             mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
             mcp_start_gate: Arc::clone(&self.mcp_start_gate),
+            mcp_start_shutdown: self.mcp_start_shutdown.clone(),
             mcp_input_resolve_lock: Arc::clone(&self.mcp_input_resolve_lock),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
@@ -4729,6 +4747,7 @@ impl<S: Session> Computer<S> {
         // 已在途事务（已持许可 + 已持 `mcp_lifecycle_gate` 读门）由下方写锁天然等待收敛，
         // 之后 manager close 不会与在途启动竞争（无进程遗留）。
         self.mcp_start_gate.close();
+        self.mcp_start_shutdown.cancel();
         // Linearize terminal shutdown before any new candidate can be installed. A connect/set
         // transaction that won the gate first is completed and then closed below; one that starts
         // later observes Shutdown and tears down its candidate instead of publishing it.
@@ -4793,6 +4812,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
             mcp_operations_open: Arc::clone(&self.mcp_operations_open),
             mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
             mcp_start_gate: Arc::clone(&self.mcp_start_gate),
+            mcp_start_shutdown: self.mcp_start_shutdown.clone(),
             mcp_input_resolve_lock: Arc::clone(&self.mcp_input_resolve_lock),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
