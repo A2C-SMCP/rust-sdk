@@ -77,7 +77,12 @@ async fn test_agent_handles_disconnected_operations() {
     );
 
     let result = agent
-        .tool_call("test-computer", "echo", serde_json::json!({"text": "test"}))
+        .tool_call(
+            "test-computer",
+            "echo",
+            serde_json::json!({"text": "test"}),
+            None,
+        )
         .await;
     assert!(
         result.is_err(),

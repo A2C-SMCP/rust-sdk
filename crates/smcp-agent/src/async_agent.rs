@@ -735,12 +735,13 @@ impl AsyncSmcpAgent {
         .map_err(|e| SmcpAgentError::Upload(Box::new(e)))
     }
 
-    /// 调用工具
+    /// 调用工具，可选地响应外部取消信号。
     pub async fn tool_call(
         &self,
         computer: &str,
         tool_name: &str,
         params: serde_json::Value,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<serde_json::Value> {
         let agent_config = self.auth_provider.get_agent_config();
         let req = build_tool_call_request(
@@ -757,10 +758,29 @@ impl AsyncSmcpAgent {
         let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(&req)?;
 
-        match transport
-            .call(CLIENT_TOOL_CALL, data, self.config.tool_call_timeout)
-            .await
-        {
+        let call = transport.call(CLIENT_TOOL_CALL, data, self.config.tool_call_timeout);
+        let mut external_cancel_sent = false;
+        let call_result = if let Some(cancel) = cancel {
+            tokio::pin!(call);
+            tokio::select! {
+                result = &mut call => result,
+                _ = cancel.cancelled() => {
+                    warn!("Tool call cancellation requested: {} on {}", tool_name, computer);
+                    let cancel_data =
+                        build_tool_call_cancel(&agent_config.agent, req_id_for_cancel.as_str());
+                    let cancel_value = serde_json::to_value(cancel_data)?;
+                    if let Err(e) = transport.emit(SERVER_TOOL_CALL_CANCEL, cancel_value).await {
+                        error!("Failed to send cancel request: {}", e);
+                    }
+                    external_cancel_sent = true;
+                    call.await
+                }
+            }
+        } else {
+            call.await
+        };
+
+        match call_result {
             Ok(response) => {
                 // flat ErrorPayload → 协议错误（如 4006/4007 授权、404 未命中）；正常 CallToolResult
                 // （含 isError 的工具执行失败）无顶层协议 code，原样透传。
@@ -779,11 +799,13 @@ impl AsyncSmcpAgent {
                     tool_name, computer
                 );
                 // 发送取消请求（复用统一取消载体 builder：req_id==原 tool_call req_id）
-                let cancel_data =
-                    build_tool_call_cancel(&agent_config.agent, req_id_for_cancel.as_str());
-                let cancel_value = serde_json::to_value(cancel_data)?;
-                if let Err(e) = transport.emit(SERVER_TOOL_CALL_CANCEL, cancel_value).await {
-                    error!("Failed to send cancel request: {}", e);
+                if !external_cancel_sent {
+                    let cancel_data =
+                        build_tool_call_cancel(&agent_config.agent, req_id_for_cancel.as_str());
+                    let cancel_value = serde_json::to_value(cancel_data)?;
+                    if let Err(e) = transport.emit(SERVER_TOOL_CALL_CANCEL, cancel_value).await {
+                        error!("Failed to send cancel request: {}", e);
+                    }
                 }
 
                 // 返回超时错误（结果级 meta.a2c_timeout=true → Agent 三态分类归 TimedOut，#92 P1）
@@ -837,33 +859,6 @@ impl AsyncSmcpAgent {
             }
         }
         response
-    }
-
-    /// 取消一次在途工具调用（AGT-05 #44）/ Cancel an in-flight tool call.
-    ///
-    /// 发送 `server:tool_call_cancel`（**fire-and-forget，无 ack**）：`req_id` **MUST**==被取消的原
-    /// `client:tool_call` 的 req_id（唯一定位在途调用）。Server 收后仅向房间广播 `notify:tool_call_cancel`、
-    /// **不**回执——故本方法用 `emit`（**非** `call`）不等待 ack，交付传输层即返回 `Ok(())`；ack 缺席是
-    /// 协议合规预期，**MUST NOT** 当作失败。
-    ///
-    /// 取消是否真正中断由 Computer 侧协作式处理（INT-02 #70）；Agent 随后从原 `client:tool_call` 的 ack
-    /// 拿到取消态 `CallToolResult`（结果级 `a2c_cancelled=true`），用 [`crate::response::classify_tool_call_outcome`]
-    /// 区分取消 / 超时 / 失败。
-    ///
-    /// 注：取消载体 `AgentCallData` 仅 `{agent, req_id}`，**不含** reason 字段——取消原因
-    /// （`a2c_cancel_reason`）由 Computer 写在结果级 meta，非 Agent 发送（故本方法无 `reason` 参数）。
-    /// 调用方需自行持有原 tool_call 的 `req_id`（由另一上下文触发取消，与阻塞中的 tool_call 并行）。
-    pub async fn tool_call_cancel(&self, req_id: &str) -> Result<()> {
-        let agent_config = self.auth_provider.get_agent_config();
-        let cancel = build_tool_call_cancel(&agent_config.agent, req_id);
-        let data = serde_json::to_value(cancel)?;
-
-        let transport = self.resolve_transport().await?;
-
-        // fire-and-forget：emit 不等待 ack（仅表示「已交给传输层发出」），契合 server:tool_call_cancel 无 ack 语义。
-        transport.emit(SERVER_TOOL_CALL_CANCEL, data).await?;
-        debug!("Sent server:tool_call_cancel for req_id={}", req_id);
-        Ok(())
     }
 
     /// 列出房间内的所有会话
