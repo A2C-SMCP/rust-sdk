@@ -103,7 +103,8 @@ async fn test_session_role_name_validation() {
     let sid = "test_sid".to_string();
 
     // 注册初始会话
-    let session1 = SessionData::new(sid.clone(), "test_name".to_string(), ClientRole::Agent);
+    let session1 = SessionData::new(sid.clone(), "test_name".to_string(), ClientRole::Agent)
+        .with_office_id("test_office".to_string());
     manager.register_session(session1).unwrap();
 
     // 验证初始会话
@@ -116,7 +117,8 @@ async fn test_session_role_name_validation() {
         "different_sid".to_string(),
         "test_name".to_string(),
         ClientRole::Agent,
-    );
+    )
+    .with_office_id("test_office".to_string());
     assert!(manager.register_session(session2).is_err());
 
     println!("✅ 会话角色和名称验证测试通过");

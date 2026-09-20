@@ -648,21 +648,25 @@ impl SmcpHandler {
             }
         };
 
-        // 检查并加入房间
-        if let Err(e) =
-            Self::handle_join_room(socket.clone(), &session, &data.office_id, &state).await
-        {
-            error!("handle_join_room failed: {}", e);
-            return (false, Some(format!("Failed to join room: {}", e)));
-        }
+        // Validate and reserve the room-scoped name before touching the
+        // Socket.IO room.  This closes the concurrent same-name join window:
+        // a failed reservation cannot leave a socket as a ghost room member.
+        let decision = match Self::validate_join_room(&session, &data.office_id, &state) {
+            Ok(decision) => decision,
+            Err(e) => {
+                error!("validate_join_room failed: {}", e);
+                return (false, Some(format!("Failed to join room: {}", e)));
+            }
+        };
 
-        // 更新会话的办公室 ID（在成功加入房间后）
         if let Err(e) = state
             .session_manager
             .update_office_id(&sid, Some(data.office_id.clone()))
         {
             return (false, Some(format!("Failed to update office_id: {}", e)));
         }
+
+        Self::apply_join_room(socket.clone(), &session, &data.office_id, decision).await;
 
         // 构建通知数据
         let session_name = session.name.clone();
@@ -1382,26 +1386,24 @@ impl SmcpHandler {
     }
 
     /// 处理加入房间的逻辑
-    async fn handle_join_room(
+    async fn apply_join_room(
         socket: SocketRef,
         session: &SessionData,
         office_id: &str,
-        state: &ServerState,
-    ) -> Result<(), HandlerError> {
+        decision: JoinRoomDecision,
+    ) {
         info!(
             "handle_join_room called: sid={}, office_id={}, role={:?}",
             socket.id, office_id, session.role
         );
 
-        match Self::validate_join_room(session, office_id, state)? {
+        match decision {
             JoinRoomDecision::Noop => {
                 info!("Noop decision for sid={}", socket.id);
-                Ok(())
             }
             JoinRoomDecision::Join => {
                 info!("Joining room '{}' for sid={}", office_id, socket.id);
                 socket.join(Self::office_room(office_id));
-                Ok(())
             }
             JoinRoomDecision::LeaveAndJoin { leave_office } => {
                 info!(
@@ -1432,7 +1434,6 @@ impl SmcpHandler {
 
                 socket.leave(Self::office_room(&leave_office));
                 socket.join(Self::office_room(office_id));
-                Ok(())
             }
         }
     }
@@ -1476,10 +1477,11 @@ impl SmcpHandler {
             ClientRole::Computer => {
                 if let Some(current_office) = &session.office_id {
                     if current_office != office_id {
-                        if state
-                            .session_manager
-                            .has_computer_in_office(&office_id.to_string(), &session.name)
-                        {
+                        if state.session_manager.has_computer_in_office_except(
+                            &office_id.to_string(),
+                            &session.name,
+                            &session.sid,
+                        ) {
                             return Err(HandlerError::Session(
                                 SessionError::ComputerAlreadyExists(
                                     session.name.clone(),
@@ -1498,10 +1500,11 @@ impl SmcpHandler {
                     return Ok(JoinRoomDecision::Noop);
                 }
 
-                if state
-                    .session_manager
-                    .has_computer_in_office(&office_id.to_string(), &session.name)
-                {
+                if state.session_manager.has_computer_in_office_except(
+                    &office_id.to_string(),
+                    &session.name,
+                    &session.sid,
+                ) {
                     return Err(HandlerError::Session(SessionError::ComputerAlreadyExists(
                         session.name.clone(),
                         office_id.to_string(),
@@ -1701,6 +1704,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_join_room_same_agent_name_allowed_in_other_office() {
+        let state = create_test_state();
+        state
+            .session_manager
+            .register_session(
+                SessionData::new(
+                    "sid_agent_1".to_string(),
+                    "same_name".to_string(),
+                    ClientRole::Agent,
+                )
+                .with_office_id("office1".to_string()),
+            )
+            .unwrap();
+
+        let new_agent = SessionData::new(
+            "sid_agent_2".to_string(),
+            "same_name".to_string(),
+            ClientRole::Agent,
+        );
+        assert_eq!(
+            SmcpHandler::validate_join_room(&new_agent, "office2", &state).unwrap(),
+            JoinRoomDecision::Join
+        );
+    }
+
+    #[test]
     fn test_validate_join_room_computer_duplicate_name_in_office() {
         let state = create_test_state();
         let office_id = "office1".to_string();
@@ -1752,6 +1781,26 @@ mod tests {
 
         let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
         assert_eq!(decision, JoinRoomDecision::Noop);
+    }
+
+    #[test]
+    fn test_validate_join_room_computer_same_session_is_noop() {
+        let state = create_test_state();
+        let session = SessionData::new(
+            "sid".to_string(),
+            "computer1".to_string(),
+            ClientRole::Computer,
+        )
+        .with_office_id("office1".to_string());
+        state
+            .session_manager
+            .register_session(session.clone())
+            .unwrap();
+
+        assert_eq!(
+            SmcpHandler::validate_join_room(&session, "office1", &state).unwrap(),
+            JoinRoomDecision::Noop
+        );
     }
 
     #[test]

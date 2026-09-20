@@ -136,13 +136,18 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    fn name_key(role: &ClientRole, office_id: Option<&OfficeId>, name: &str) -> String {
+    fn name_key(role: &ClientRole, office_id: Option<&OfficeId>, name: &str) -> Option<String> {
+        let office_id = office_id?;
         match role {
-            ClientRole::Agent => format!("agent:{}", name),
-            ClientRole::Computer => match office_id {
-                Some(office_id) => format!("computer:{}:{}", office_id, name),
-                None => format!("computer::{}", name),
-            },
+            // Prefix the office length so `office_id` and `name` remain an
+            // unambiguous tuple even when either value contains `:`.
+            ClientRole::Agent => Some(format!("agent:{}:{}:{}", office_id.len(), office_id, name)),
+            ClientRole::Computer => Some(format!(
+                "computer:{}:{}:{}",
+                office_id.len(),
+                office_id,
+                name
+            )),
         }
     }
 
@@ -156,20 +161,24 @@ impl SessionManager {
 
     /// 注册新会话
     pub fn register_session(&self, session: SessionData) -> Result<(), SessionError> {
-        let key = Self::name_key(&session.role, session.office_id.as_ref(), &session.name);
-        // 检查 name 是否已被其他 sid 使用
-        if let Some(existing_sid) = self.name_to_sid.get(&key) {
-            if *existing_sid != session.sid {
-                return Err(SessionError::NameAlreadyRegistered(session.name));
+        if let Some(key) = Self::name_key(&session.role, session.office_id.as_ref(), &session.name)
+        {
+            // Name uniqueness is room-scoped; pre-room sessions have no key.
+            match self.name_to_sid.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    if *entry.get() != session.sid {
+                        return Err(SessionError::NameAlreadyRegistered(session.name));
+                    }
+                    tracing::debug!("Name '{}' re-registered by same sid", session.name);
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(session.sid.clone());
+                }
             }
-            // 如果是同一个 sid 重新注册，允许（幂等操作）
-            tracing::debug!("Name '{}' re-registered by same sid", session.name);
-            return Ok(());
         }
 
-        // 注册映射
+        // Always retain the sid -> session record, including pre-room sessions.
         self.sessions.insert(session.sid.clone(), session.clone());
-        self.name_to_sid.insert(key, session.sid.clone());
 
         tracing::debug!("Registered session: {} -> {}", session.name, session.sid);
         Ok(())
@@ -180,12 +189,13 @@ impl SessionManager {
         let session = self.sessions.remove(sid)?;
 
         // 清理 name 映射
-        let key = Self::name_key(
+        if let Some(key) = Self::name_key(
             &session.1.role,
             session.1.office_id.as_ref(),
             &session.1.name,
-        );
-        self.name_to_sid.remove(&key);
+        ) {
+            self.name_to_sid.remove(&key);
+        }
 
         tracing::debug!("Unregistered session: {} -> {}", session.1.name, sid);
         Some(session.1)
@@ -198,8 +208,20 @@ impl SessionManager {
 
     /// 通过名称获取会话 ID
     pub fn get_sid_by_name(&self, name: &str) -> Option<SessionId> {
-        let key = Self::name_key(&ClientRole::Agent, None, name);
-        self.name_to_sid.get(&key).map(|s| s.clone())
+        // Legacy compatibility lookup: without an office this is only safe
+        // when exactly one Agent with that name exists.  Ambiguous names are
+        // intentionally not resolved across rooms.
+        let mut matches = self
+            .sessions
+            .iter()
+            .filter(|s| s.role == ClientRole::Agent && s.name == name)
+            .map(|s| s.sid.clone());
+        let sid = matches.next()?;
+        if matches.next().is_none() {
+            Some(sid)
+        } else {
+            None
+        }
     }
 
     /// 更新会话的办公室 ID
@@ -221,14 +243,33 @@ impl SessionManager {
         let new_key = Self::name_key(&role, office_id.as_ref(), &name);
 
         if old_key != new_key {
-            if let Some(existing_sid) = self.name_to_sid.get(&new_key) {
-                if *existing_sid != *sid {
-                    return Err(SessionError::NameAlreadyRegistered(name));
+            let remove_old_key = if let Some(new_key) = new_key {
+                // DashMap's entry API keeps the conflict check and claim in
+                // one shard lock, preventing two joins from claiming the
+                // same room/name concurrently.
+                match self.name_to_sid.entry(new_key) {
+                    dashmap::mapref::entry::Entry::Occupied(entry) => {
+                        if *entry.get() != *sid {
+                            return Err(SessionError::NameAlreadyRegistered(name));
+                        }
+                        true
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(sid.clone());
+                        true
+                    }
+                }
+            } else {
+                true
+            };
+
+            // Drop the entry guard before touching another key in the same
+            // DashMap; otherwise a same-shard old key can deadlock on write.
+            if remove_old_key {
+                if let Some(old_key) = old_key {
+                    self.name_to_sid.remove(&old_key);
                 }
             }
-
-            self.name_to_sid.remove(&old_key);
-            self.name_to_sid.insert(new_key, sid.clone());
         }
 
         session.office_id = office_id;
@@ -255,6 +296,21 @@ impl SessionManager {
     pub fn has_computer_in_office(&self, office_id: &OfficeId, name: &str) -> bool {
         self.sessions.iter().any(|s| {
             s.office_id.as_ref() == Some(office_id)
+                && s.role == ClientRole::Computer
+                && s.name == name
+        })
+    }
+
+    /// Check for a same-name Computer in a room, excluding one session.
+    pub fn has_computer_in_office_except(
+        &self,
+        office_id: &OfficeId,
+        name: &str,
+        excluded_sid: &SessionId,
+    ) -> bool {
+        self.sessions.iter().any(|s| {
+            s.sid != *excluded_sid
+                && s.office_id.as_ref() == Some(office_id)
                 && s.role == ClientRole::Computer
                 && s.name == name
         })
@@ -342,9 +398,8 @@ mod tests {
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name, "test_agent");
 
-        // 通过名称获取 sid
-        let found_sid = manager.get_sid_by_name("test_agent");
-        assert_eq!(found_sid, Some(sid));
+        // A single unambiguous legacy lookup remains available.
+        assert_eq!(manager.get_sid_by_name("test_agent"), Some(sid));
     }
 
     #[test]
@@ -359,7 +414,8 @@ mod tests {
             sid1.clone(),
             "duplicate_name".to_string(),
             ClientRole::Agent,
-        );
+        )
+        .with_office_id("office1".to_string());
         let session2 = SessionData::new(
             sid2.clone(),
             "duplicate_name".to_string(),
@@ -383,8 +439,9 @@ mod tests {
         // 第一个注册成功
         assert!(manager.register_session(session1).is_ok());
 
-        // 第二个注册失败（Agent 名称全局唯一）
-        assert!(manager.register_session(session2).is_err());
+        // Agent names are unique only within an office.
+        let session2 = session2.with_office_id("office2".to_string());
+        assert!(manager.register_session(session2).is_ok());
 
         // Computer 名称按 office 唯一：同 office 冲突
         assert!(manager.register_session(session3.clone()).is_ok());
@@ -400,6 +457,45 @@ mod tests {
 
         // 不同 office 允许同名
         assert!(manager.register_session(session4).is_ok());
+    }
+
+    #[test]
+    fn test_pre_room_same_name_is_not_a_conflict() {
+        let manager = SessionManager::new();
+        let first = SessionData::new(
+            "sid1".to_string(),
+            "same_name".to_string(),
+            ClientRole::Agent,
+        );
+        let second = SessionData::new(
+            "sid2".to_string(),
+            "same_name".to_string(),
+            ClientRole::Agent,
+        );
+
+        assert!(manager.register_session(first).is_ok());
+        assert!(manager.register_session(second).is_ok());
+    }
+
+    #[test]
+    fn test_concurrent_pre_room_same_name_is_not_a_conflict() {
+        let manager = Arc::new(SessionManager::new());
+        let handles = (1..=2)
+            .map(|n| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    manager.register_session(SessionData::new(
+                        format!("sid{n}"),
+                        "same_name".to_string(),
+                        ClientRole::Agent,
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
+        }
     }
 
     #[test]
