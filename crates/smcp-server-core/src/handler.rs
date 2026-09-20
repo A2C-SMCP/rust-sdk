@@ -183,6 +183,23 @@ pub struct ServerState {
 pub struct SmcpHandler;
 
 impl SmcpHandler {
+    /// Return the Socket.IO room used for an SMCP office.
+    ///
+    /// Socket.IO reserves each connection SID as a private room.  Keeping office
+    /// rooms in their own namespace makes an attacker-controlled `office_id`=
+    /// `<peer sid>` harmless: the two room name spaces can never intersect.
+    fn office_room(office_id: &str) -> String {
+        format!("office:{office_id}")
+    }
+
+    /// Ack a malformed payload without reflecting parser details or input data.
+    fn ack_bad_request(ack: AckSender) {
+        let _ = ack.send(&smcp::ErrorPayload::new(
+            i64::from(smcp::error_codes::BAD_REQUEST),
+            "Invalid request payload",
+        ));
+    }
+
     /// 注册所有事件处理器
     pub fn register_handlers(io: &SocketIo, state: ServerState) {
         // 注册命名空间和连接处理器
@@ -226,18 +243,37 @@ impl SmcpHandler {
         let state_join = state.clone();
         socket.on(
             smcp::events::SERVER_JOIN_OFFICE,
-            move |socket: SocketRef, Data::<EnterOfficeReq>(data), ack: AckSender| async move {
-                let result = Self::on_server_join_office(socket, data, state_join.clone()).await;
-                let _ = ack.send(&result);
+            move |socket: SocketRef, TryData::<Value>(data), ack: AckSender| async move {
+                match data {
+                    Ok(value) => match serde_json::from_value::<EnterOfficeReq>(value) {
+                        Ok(data) => {
+                            let result =
+                                Self::on_server_join_office(socket, data, state_join.clone()).await;
+                            let _ = ack.send(&result);
+                        }
+                        Err(_) => Self::ack_bad_request(ack),
+                    },
+                    Err(_) => Self::ack_bad_request(ack),
+                }
             },
         );
 
         let state_leave = state.clone();
         socket.on(
             smcp::events::SERVER_LEAVE_OFFICE,
-            move |socket: SocketRef, Data::<LeaveOfficeReq>(data), ack: AckSender| async move {
-                let result = Self::on_server_leave_office(socket, data, state_leave.clone()).await;
-                let _ = ack.send(&result);
+            move |socket: SocketRef, TryData::<Value>(data), ack: AckSender| async move {
+                match data {
+                    Ok(value) => match serde_json::from_value::<LeaveOfficeReq>(value) {
+                        Ok(data) => {
+                            let result =
+                                Self::on_server_leave_office(socket, data, state_leave.clone())
+                                    .await;
+                            let _ = ack.send(&result);
+                        }
+                        Err(_) => Self::ack_bad_request(ack),
+                    },
+                    Err(_) => Self::ack_bad_request(ack),
+                }
             },
         );
 
@@ -268,13 +304,19 @@ impl SmcpHandler {
         let state_tool_call = state.clone();
         socket.on(
             smcp::events::CLIENT_TOOL_CALL,
-            move |socket: SocketRef, Data::<ToolCallReq>(data), ack: AckSender| async move {
-                match Self::on_client_tool_call(socket, data, state_tool_call.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<ToolCallReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        match Self::on_client_tool_call(socket, data, state_tool_call.clone()).await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            // 隔离拒绝（发起方非 Agent / 会话已断连）：镜像 Python，不投递协议 ack（发起方侧自行超时）
+                            Err(e) => warn!("client:tool_call relay rejected, no ack: {e}"),
+                        }
                     }
-                    // 隔离拒绝（发起方非 Agent / 会话已断连）：镜像 Python，不投递协议 ack（发起方侧自行超时）
-                    Err(e) => warn!("client:tool_call relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -282,12 +324,18 @@ impl SmcpHandler {
         let state_get_tools = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_TOOLS,
-            move |socket: SocketRef, Data::<GetToolsReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_tools(socket, data, state_get_tools.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<GetToolsReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        match Self::on_client_get_tools(socket, data, state_get_tools.clone()).await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_tools relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_tools relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -295,12 +343,19 @@ impl SmcpHandler {
         let state_get_desktop = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_DESKTOP,
-            move |socket: SocketRef, Data::<GetDesktopReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_desktop(socket, data, state_get_desktop.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<GetDesktopReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        match Self::on_client_get_desktop(socket, data, state_get_desktop.clone())
+                            .await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_desktop relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_desktop relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -308,12 +363,15 @@ impl SmcpHandler {
         let state_get_config = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_CONFIG,
-            move |socket: SocketRef, Data::<GetComputerConfigReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_config(socket, data, state_get_config.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<GetComputerConfigReq>(data)| async move {
+                match data {
+                    Ok(data) => match Self::on_client_get_config(socket, data, state_get_config.clone()).await {
+                        Ok(payload) => {
+                            let _ = ack.send(&payload);
+                        }
+                        Err(e) => warn!("client:get_config relay rejected, no ack: {e}"),
                     }
-                    Err(e) => warn!("client:get_config relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -329,9 +387,22 @@ impl SmcpHandler {
         let state_list_room = state.clone();
         socket.on(
             smcp::events::SERVER_LIST_ROOM,
-            move |socket: SocketRef, Data::<ListRoomReq>(data), ack: AckSender| async move {
-                let result = Self::on_server_list_room(socket, data, state_list_room.clone()).await;
-                let _ = ack.send(&result);
+            move |socket: SocketRef, ack: AckSender, TryData::<ListRoomReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        let result =
+                            Self::on_server_list_room(socket, data, state_list_room.clone()).await;
+                        match result {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                        }
+                    }
+                    Err(_) => Self::ack_bad_request(ack),
+                }
             },
         );
 
@@ -339,12 +410,19 @@ impl SmcpHandler {
         let state_get_skills = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_SKILLS,
-            move |socket: SocketRef, Data::<GetSkillsReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_skills(socket, data, state_get_skills.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<GetSkillsReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        match Self::on_client_get_skills(socket, data, state_get_skills.clone())
+                            .await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_skills relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_skills relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -352,12 +430,18 @@ impl SmcpHandler {
         let state_get_skill = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_SKILL,
-            move |socket: SocketRef, Data::<GetSkillReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_skill(socket, data, state_get_skill.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<GetSkillReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        match Self::on_client_get_skill(socket, data, state_get_skill.clone()).await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_skill relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_skill relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -365,12 +449,17 @@ impl SmcpHandler {
         let state_get_blob = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_BLOB,
-            move |socket: SocketRef, Data::<GetBlobReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_blob(socket, data, state_get_blob.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<GetBlobReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        match Self::on_client_get_blob(socket, data, state_get_blob.clone()).await {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_blob relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_blob relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -379,12 +468,17 @@ impl SmcpHandler {
         let state_put_blob = state.clone();
         socket.on(
             smcp::events::CLIENT_PUT_BLOB,
-            move |socket: SocketRef, Data::<PutBlobReq>(data), ack: AckSender| async move {
-                match Self::on_client_put_blob(socket, data, state_put_blob.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef, ack: AckSender, TryData::<PutBlobReq>(data)| async move {
+                match data {
+                    Ok(data) => {
+                        match Self::on_client_put_blob(socket, data, state_put_blob.clone()).await {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:put_blob relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:put_blob relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -392,13 +486,21 @@ impl SmcpHandler {
         let state_get_resources = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_RESOURCES,
-            move |socket: SocketRef, Data::<GetResourcesReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_resources(socket, data, state_get_resources.clone()).await
-                {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
-                    }
-                    Err(e) => warn!("client:get_resources relay rejected, no ack: {e}"),
+            move |socket: SocketRef, ack: AckSender, TryData::<GetResourcesReq>(data)| async move {
+                match data {
+                    Ok(data) => match Self::on_client_get_resources(
+                        socket,
+                        data,
+                        state_get_resources.clone(),
+                    )
+                    .await
+                    {
+                        Ok(payload) => {
+                            let _ = ack.send(&payload);
+                        }
+                        Err(e) => warn!("client:get_resources relay rejected, no ack: {e}"),
+                    },
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -469,7 +571,7 @@ impl SmcpHandler {
                 };
 
                 let _ = socket
-                    .within(office_id)
+                    .within(Self::office_room(&office_id))
                     .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
                     .await;
             }
@@ -579,7 +681,7 @@ impl SmcpHandler {
         };
 
         let result = socket
-            .to(data.office_id.clone())
+            .to(Self::office_room(&data.office_id))
             .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data)
             .await;
 
@@ -601,8 +703,15 @@ impl SmcpHandler {
         // 获取会话
         let session = match state.session_manager.get_session(&sid) {
             Some(s) => s,
-            None => return (false, Some(format!("Session not found: {}", sid))),
+            None => return (false, Some("Session is not in an office".to_string())),
         };
+
+        let Some(current_office) = session.office_id.as_deref() else {
+            return (false, Some("Session is not in an office".to_string()));
+        };
+        if current_office != data.office_id {
+            return (false, Some("Cross-room access denied".to_string()));
+        }
 
         // 构建离开通知
         let notification = if session.role == ClientRole::Computer {
@@ -621,7 +730,7 @@ impl SmcpHandler {
 
         // 广播离开消息
         let _ = socket
-            .within(data.office_id.clone())
+            .within(Self::office_room(&data.office_id))
             .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
             .await;
 
@@ -629,7 +738,7 @@ impl SmcpHandler {
         if let Err(e) = state.session_manager.update_office_id(&sid, None) {
             return (false, Some(format!("Failed to update office_id: {}", e)));
         }
-        socket.leave(data.office_id.clone());
+        socket.leave(Self::office_room(&data.office_id));
 
         (true, None)
     }
@@ -673,7 +782,7 @@ impl SmcpHandler {
         };
 
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_TOOL_CALL_CANCEL, &data)
             .await
         {
@@ -729,7 +838,7 @@ impl SmcpHandler {
         );
 
         if let Err(e) = socket
-            .to(office_id.clone())
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_CONFIG, &notification)
             .await
         {
@@ -783,7 +892,7 @@ impl SmcpHandler {
         };
 
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_TOOL_LIST, &notification)
             .await
         {
@@ -836,7 +945,7 @@ impl SmcpHandler {
             computer: data.computer,
         };
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_SKILLS, &notification)
             .await
         {
@@ -1198,7 +1307,7 @@ impl SmcpHandler {
         };
 
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_DESKTOP, &notification)
             .await
         {
@@ -1211,19 +1320,27 @@ impl SmcpHandler {
         socket: SocketRef,
         data: ListRoomReq,
         state: ServerState,
-    ) -> ListRoomRet {
+    ) -> Result<ListRoomRet, smcp::ErrorPayload> {
         // 获取发起者会话信息
         let sid = socket.id.to_string();
         let session = match state.session_manager.get_session(&sid) {
             Some(s) => s,
             None => {
                 warn!("List room from unknown session sid={}", sid);
-                return ListRoomRet {
-                    sessions: vec![],
-                    req_id: data.base.req_id,
-                };
+                return Err(smcp::ErrorPayload::new(
+                    i64::from(smcp::error_codes::NOT_IN_ROOM),
+                    "Session is not in an office",
+                ));
             }
         };
+
+        if session.office_id.is_none() {
+            warn!("List room from session outside an office sid={}", sid);
+            return Err(smcp::ErrorPayload::new(
+                i64::from(smcp::error_codes::NOT_IN_ROOM),
+                "Session is not in an office",
+            ));
+        }
 
         // 房间隔离：仅可查询自己所在的 office。判定下沉到纯函数 [`Self::list_room_authorized`]
         // （运行期 `Result`/分支，**非** `debug_assert!`）→ release build 下隔离同样硬化，对标
@@ -1234,10 +1351,11 @@ impl SmcpHandler {
                 "list_room isolation rejected: session {} (office {:?}) requested room {}",
                 sid, session.office_id, data.office_id
             );
-            return ListRoomRet {
-                sessions: vec![],
-                req_id: data.base.req_id,
-            };
+            return Err(smcp::ErrorPayload::new(
+                i64::from(smcp::error_codes::CROSS_ROOM_ACCESS),
+                "Cross-room access denied",
+            )
+            .with_details(serde_json::json!({ "office_id": data.office_id })));
         }
 
         // 获取指定办公室的所有会话
@@ -1257,10 +1375,10 @@ impl SmcpHandler {
             })
             .collect();
 
-        ListRoomRet {
+        Ok(ListRoomRet {
             sessions: session_infos,
             req_id: data.base.req_id,
-        }
+        })
     }
 
     /// 处理加入房间的逻辑
@@ -1282,7 +1400,7 @@ impl SmcpHandler {
             }
             JoinRoomDecision::Join => {
                 info!("Joining room '{}' for sid={}", office_id, socket.id);
-                socket.join(office_id.to_string());
+                socket.join(Self::office_room(office_id));
                 Ok(())
             }
             JoinRoomDecision::LeaveAndJoin { leave_office } => {
@@ -1308,12 +1426,12 @@ impl SmcpHandler {
 
                 // 向旧房间广播离开消息
                 let _ = socket
-                    .within(leave_office.clone())
+                    .within(Self::office_room(&leave_office))
                     .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &leave_notification)
                     .await;
 
-                socket.leave(leave_office);
-                socket.join(office_id.to_string());
+                socket.leave(Self::office_room(&leave_office));
+                socket.join(Self::office_room(office_id));
                 Ok(())
             }
         }
@@ -1533,6 +1651,13 @@ mod tests {
             SmcpHandler::list_room_authorized(Some("office1"), "office1"),
             "同房间应放行"
         );
+    }
+
+    #[test]
+    fn test_office_room_is_disjoint_from_socket_sid_namespace() {
+        let sid = "abc123";
+        assert_eq!(SmcpHandler::office_room(sid), "office:abc123");
+        assert_ne!(SmcpHandler::office_room(sid), sid);
     }
 
     #[test]
