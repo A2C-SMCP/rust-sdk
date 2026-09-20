@@ -1040,6 +1040,66 @@ impl fmt::Display for MCPServerConnectionState {
     }
 }
 
+/// The phase at which a stdio MCP initialization attempt failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdioInitializationPhase {
+    /// The top-level command could not be spawned.
+    SpawnFailed,
+    /// The child exited before completing the MCP initialize handshake.
+    ProcessExitedBeforeInitialize,
+    /// The child stayed alive, but the initialize transport closed.
+    InitializeConnectionClosed,
+    /// The child returned an invalid or rejected initialize response.
+    InitializeProtocolError,
+    /// The initialize handshake exceeded the configured timeout.
+    InitializeTimeout,
+}
+
+/// Safe, bounded diagnostics captured from one stdio initialization attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StdioInitializationDiagnostic {
+    /// Failure phase, suitable for programmatic branching.
+    pub phase: StdioInitializationPhase,
+    /// Sanitized tail of stderr. The SDK bounds this field before exposing it.
+    pub stderr_tail: String,
+    /// Platform process exit code when one was available.
+    pub exit_code: Option<i32>,
+    /// Whether the process reported a successful exit when a status was available.
+    pub exit_success: Option<bool>,
+}
+
+/// Structured stdio initialization failure. The message preserves the historical Display text;
+/// [`diagnostic`](Self::diagnostic) exposes machine-readable context to new callers.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct StdioInitializationError {
+    message: String,
+    diagnostic: StdioInitializationDiagnostic,
+}
+
+impl StdioInitializationError {
+    pub(crate) fn new(
+        message: impl Into<String>,
+        diagnostic: StdioInitializationDiagnostic,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            diagnostic,
+        }
+    }
+
+    /// Historical human-readable error text, without requiring callers to parse diagnostics.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Structured, sanitized context for this failed initialization attempt.
+    pub fn diagnostic(&self) -> &StdioInitializationDiagnostic {
+        &self.diagnostic
+    }
+}
+
 /// MCP Server 的正交运行时状态 / Orthogonal MCP server runtime status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MCPServerRuntimeStatus {
@@ -1099,6 +1159,11 @@ pub enum MCPClientError {
     /// 超时错误 / Timeout error
     #[error("Timeout error: {0}")]
     TimeoutError(String),
+    /// Structured stdio child-process initialization failure.
+    /// The contained message already carries the historical error prefix for this failure phase
+    /// (for example, `Timeout error:`), preserving the pre-structured Display contract.
+    #[error("{0}")]
+    StdioInitialization(#[from] StdioInitializationError),
     /// 其他错误 / Other error
     #[error("Other error: {0}")]
     Other(String),
@@ -1135,6 +1200,13 @@ impl From<&MCPClientError> for WindowEnumerationErrorCategory {
             MCPClientError::HttpAuthentication(_) => Self::Authentication,
             MCPClientError::ProtocolError(_) => Self::Protocol,
             MCPClientError::TimeoutError(_) => Self::Timeout,
+            MCPClientError::StdioInitialization(error) => match error.diagnostic().phase {
+                StdioInitializationPhase::InitializeTimeout => Self::Timeout,
+                StdioInitializationPhase::InitializeProtocolError => Self::Protocol,
+                StdioInitializationPhase::SpawnFailed
+                | StdioInitializationPhase::ProcessExitedBeforeInitialize
+                | StdioInitializationPhase::InitializeConnectionClosed => Self::Connection,
+            },
             // `list_windows` 路径不产生 ToolCallError；Io/Json/Other 归 Other。
             MCPClientError::ToolCallError(_)
             | MCPClientError::IoError(_)

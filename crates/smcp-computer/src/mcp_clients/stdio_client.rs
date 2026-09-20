@@ -10,7 +10,9 @@
 use super::base_client::BaseMCPClient;
 use super::model::*;
 use super::{ResourceCache, SubscriptionManager};
+use crate::settings::redaction::redact_git_urls_in_text;
 use async_trait::async_trait;
+use regex::Regex;
 use rmcp::model::{
     CallToolRequest, CancelledNotificationParam, ClientInfo, ClientRequest, Implementation,
     ListResourcesRequest, ListResourcesResult, ListToolsRequest, ListToolsResult,
@@ -19,14 +21,17 @@ use rmcp::model::{
     UnsubscribeRequest, UnsubscribeRequestParams,
 };
 use rmcp::service::{
-    NotificationContext, PeerRequestOptions, RequestHandle, RunningService, ServiceExt,
+    ClientInitializeError, NotificationContext, PeerRequestOptions, RequestHandle, RunningService,
+    ServiceExt,
 };
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{ClientHandler, RoleClient};
+use std::collections::BTreeSet;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::process::Command;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +43,103 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 /// 库级别默认 cwd 子目录名 / Library-level default cwd subdirectory name
 const DEFAULT_CWD_DIR_NAME: &str = ".a2c-smcp";
+
+/// Maximum stderr retained for one failed initialization attempt.
+pub const MAX_STDIO_STDERR_BYTES: usize = 16 * 1024;
+const STDERR_REDACTION_CONTEXT_BYTES: usize = 4096;
+
+struct StderrCapture {
+    raw_tail: String,
+    tail: String,
+    env_values: Vec<String>,
+}
+
+struct ReapedChild {
+    status: Option<std::process::ExitStatus>,
+    exited_before_cleanup: bool,
+}
+
+impl StderrCapture {
+    fn new(env: &std::collections::HashMap<String, String>, args: &[String]) -> Self {
+        // The child inherits the parent environment unless explicitly cleared. Include both
+        // configured and inherited values so a child that echoes an ambient token cannot expose
+        // it through the diagnostic tail.
+        let mut values = BTreeSet::new();
+        values.extend(
+            std::env::vars_os()
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+                .chain(env.values().cloned())
+                .chain(args.iter().cloned())
+                .filter(|value| !value.is_empty()),
+        );
+        let mut env_values: Vec<_> = values.into_iter().collect();
+        env_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        Self {
+            raw_tail: String::new(),
+            tail: String::new(),
+            env_values,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        self.raw_tail.push_str(&String::from_utf8_lossy(bytes));
+        trim_tail(
+            &mut self.raw_tail,
+            MAX_STDIO_STDERR_BYTES + STDERR_REDACTION_CONTEXT_BYTES,
+        );
+
+        let mut sanitized = self.raw_tail.clone();
+        for value in &self.env_values {
+            sanitized = sanitized.replace(value, "<redacted>");
+        }
+        sanitized = redact_git_urls_in_text(&sanitized);
+        self.tail = redact_stderr_key_values(&sanitized);
+        trim_tail(&mut self.tail, MAX_STDIO_STDERR_BYTES);
+    }
+}
+
+fn trim_tail(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let excess = text.len() - max_bytes;
+    let boundary = text
+        .char_indices()
+        .find(|(index, _)| *index >= excess)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    text.drain(..boundary);
+}
+
+fn redact_stderr_key_values(text: &str) -> String {
+    // Keep the key for useful diagnostics, but never expose the value. This is intentionally
+    // conservative: stderr is untrusted child-process output and may echo credentials in forms
+    // that are not present in the configured environment map.
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    static FLAG_PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b([a-z0-9_-]*(?:authorization|bearer|token|password|passwd|secret|api[_-]?key|access[_-]?key)[a-z0-9_-]*)\b\s*[:=]\s*(?:bearer\s+)?[^\s,;]+",
+        )
+        .expect("static stderr redaction pattern must compile")
+    });
+    let sanitized = pattern.replace_all(text, "$1=<redacted>");
+    let flag_pattern = FLAG_PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)(--?[a-z0-9_-]*(?:token|secret|password|passwd|api[-_]?key|access[-_]?key))\s+(?:bearer\s+)?[^\s,;]+",
+        )
+        .expect("static stderr flag redaction pattern must compile")
+    });
+    flag_pattern
+        .replace_all(&sanitized, "$1 <redacted>")
+        .into_owned()
+}
+
+fn diagnostic_status(status: Option<std::process::ExitStatus>) -> (Option<i32>, Option<bool>) {
+    status
+        .map(|status| (status.code(), Some(status.success())))
+        .unwrap_or((None, None))
+}
 
 /// 解析子进程工作目录：优先使用显式配置，否则 fallback 到 ~/.a2c-smcp
 /// Resolve child process cwd: use explicit value if provided, otherwise fallback to ~/.a2c-smcp
@@ -113,6 +215,12 @@ pub struct StdioMCPClient {
     running_service: Arc<Mutex<Option<RunningService<RoleClient, A2cClientHandler>>>>,
     /// stderr 消费任务 / Background task draining child stderr
     stderr_drain_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Child process retained separately from rmcp transport so exit status is observable.
+    child_process: Arc<Mutex<Option<Child>>>,
+    /// Bounded, sanitized stderr from the current initialization attempt.
+    stderr_capture: Arc<Mutex<StderrCapture>>,
+    /// Serialize connect/disconnect attempts so diagnostics cannot cross-contaminate retries.
+    lifecycle_lock: Arc<Mutex<()>>,
     /// 订阅管理器 / Subscription manager
     subscription_manager: SubscriptionManager,
     /// 资源缓存 / Resource cache
@@ -145,10 +253,14 @@ impl StdioMCPClient {
         params: StdioServerParameters,
         connect_timeout_secs: Option<u64>,
     ) -> Self {
+        let stderr_capture = StderrCapture::new(&params.env, &params.args);
         Self {
             base: BaseMCPClient::new(params),
             running_service: Arc::new(Mutex::new(None)),
             stderr_drain_task: Arc::new(Mutex::new(None)),
+            child_process: Arc::new(Mutex::new(None)),
+            stderr_capture: Arc::new(Mutex::new(stderr_capture)),
+            lifecycle_lock: Arc::new(Mutex::new(())),
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)),
             notify: None,
@@ -167,6 +279,124 @@ impl StdioMCPClient {
     pub fn with_notify(mut self, notify: Option<ClientNotifyCtx>) -> Self {
         self.notify = notify;
         self
+    }
+
+    async fn reap_child(&self) -> ReapedChild {
+        let child = self.child_process.lock().await.take();
+        let Some(mut child) = child else {
+            return ReapedChild {
+                status: None,
+                exited_before_cleanup: false,
+            };
+        };
+
+        match child.try_wait() {
+            Ok(Some(status)) => ReapedChild {
+                status: Some(status),
+                exited_before_cleanup: true,
+            },
+            Ok(None) => {
+                let _ = child.kill().await;
+                ReapedChild {
+                    status: child.wait().await.ok(),
+                    exited_before_cleanup: false,
+                }
+            }
+            Err(_) => {
+                // A failed status probe must not leak the child. Drop does not terminate a
+                // tokio Child, so make the same best-effort kill/wait attempt as the running
+                // branch and keep the status if wait succeeds.
+                let _ = child.kill().await;
+                ReapedChild {
+                    status: child.wait().await.ok(),
+                    exited_before_cleanup: false,
+                }
+            }
+        }
+    }
+
+    async fn finish_stderr_capture(&self) -> String {
+        if let Some(handle) = self.stderr_drain_task.lock().await.take() {
+            let _ = handle.await;
+        }
+        self.stderr_capture.lock().await.tail.clone()
+    }
+
+    async fn initialization_error(
+        &self,
+        phase: StdioInitializationPhase,
+        upgrade_to_process_exit: bool,
+        message: impl Into<String>,
+    ) -> MCPClientError {
+        let reaped = self.reap_child().await;
+        let phase = if upgrade_to_process_exit && reaped.exited_before_cleanup {
+            StdioInitializationPhase::ProcessExitedBeforeInitialize
+        } else {
+            phase
+        };
+        let (exit_code, exit_success) = diagnostic_status(if reaped.exited_before_cleanup {
+            reaped.status
+        } else {
+            None
+        });
+        let diagnostic = StdioInitializationDiagnostic {
+            phase,
+            stderr_tail: self.finish_stderr_capture().await,
+            exit_code,
+            exit_success,
+        };
+        let message = message.into();
+        let message = match phase {
+            StdioInitializationPhase::InitializeTimeout => format!("Timeout error: {message}"),
+            _ => format!("Connection error: {message}"),
+        };
+        MCPClientError::StdioInitialization(StdioInitializationError::new(message, diagnostic))
+    }
+
+    async fn terminate_child(&self) {
+        let _ = self.reap_child().await;
+        if let Some(handle) = self.stderr_drain_task.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    fn initialize_phase(error: &ClientInitializeError) -> (StdioInitializationPhase, bool) {
+        match error {
+            ClientInitializeError::ConnectionClosed(_) => {
+                (StdioInitializationPhase::InitializeConnectionClosed, true)
+            }
+            ClientInitializeError::ExpectedInitResponse(_)
+            | ClientInitializeError::ExpectedInitResult(_)
+            | ClientInitializeError::ConflictInitResponseId(_, _)
+            | ClientInitializeError::JsonRpcError(_)
+            | ClientInitializeError::Cancelled => {
+                (StdioInitializationPhase::InitializeProtocolError, false)
+            }
+            ClientInitializeError::TransportError { .. } => {
+                (StdioInitializationPhase::InitializeProtocolError, true)
+            }
+            _ => (StdioInitializationPhase::InitializeProtocolError, false),
+        }
+    }
+
+    fn safe_initialize_message(error: &ClientInitializeError) -> String {
+        match error {
+            ClientInitializeError::ConnectionClosed(context) => {
+                format!("connection closed: {context}")
+            }
+            ClientInitializeError::TransportError { .. } => {
+                "transport error during initialize".to_string()
+            }
+            ClientInitializeError::JsonRpcError(_) => {
+                "MCP server returned an initialize JSON-RPC error".to_string()
+            }
+            ClientInitializeError::Cancelled => "initialize cancelled".to_string(),
+            ClientInitializeError::ExpectedInitResponse(_)
+            | ClientInitializeError::ExpectedInitResult(_)
+            | ClientInitializeError::ConflictInitResponseId(_, _)
+            | _ => "MCP server returned an invalid initialize response".to_string(),
+        }
     }
 
     // ========== 订阅管理 API / Subscription Management API ==========
@@ -250,6 +480,7 @@ impl MCPClientProtocol for StdioMCPClient {
     }
 
     async fn connect(&self) -> Result<(), MCPClientError> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         if !self.base.can_connect().await {
             return Err(MCPClientError::ConnectionError(format!(
                 "Cannot connect in state: {}",
@@ -258,6 +489,7 @@ impl MCPClientProtocol for StdioMCPClient {
         }
 
         let params = &self.base.params;
+        *self.stderr_capture.lock().await = StderrCapture::new(&params.env, &params.args);
 
         let mut cmd = Command::new(&params.command);
         cmd.args(&params.args);
@@ -274,24 +506,90 @@ impl MCPClientProtocol for StdioMCPClient {
             debug!("Child process cwd: {:?}", cwd);
         }
 
-        debug!("Starting command: {} {:?}", params.command, params.args);
+        // Arguments may contain bearer tokens or URLs with embedded credentials; do not log
+        // them verbatim. The bounded stderr diagnostic applies the same redaction policy.
+        debug!(
+            "Starting command: {} ({} args)",
+            params.command,
+            params.args.len()
+        );
 
-        let (transport, stderr) = TokioChildProcess::builder(cmd)
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                MCPClientError::ConnectionError(format!("Failed to start process: {}", e))
-            })?;
+            // Preserve rmcp's child cleanup semantics if the client is dropped without an
+            // explicit disconnect (manager replacement, cancellation, or caller shutdown).
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            MCPClientError::StdioInitialization(StdioInitializationError::new(
+                format!("Connection error: Failed to start process: {}", e),
+                StdioInitializationDiagnostic {
+                    phase: StdioInitializationPhase::SpawnFailed,
+                    stderr_tail: String::new(),
+                    exit_code: None,
+                    exit_success: None,
+                },
+            ))
+        })?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(MCPClientError::StdioInitialization(
+                    StdioInitializationError::new(
+                        "Connection error: Failed to start process: child stdout was not piped",
+                        StdioInitializationDiagnostic {
+                            phase: StdioInitializationPhase::SpawnFailed,
+                            stderr_tail: String::new(),
+                            exit_code: None,
+                            exit_success: None,
+                        },
+                    ),
+                ));
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(MCPClientError::StdioInitialization(
+                    StdioInitializationError::new(
+                        "Connection error: Failed to start process: child stdin was not piped",
+                        StdioInitializationDiagnostic {
+                            phase: StdioInitializationPhase::SpawnFailed,
+                            stderr_tail: String::new(),
+                            exit_code: None,
+                            exit_success: None,
+                        },
+                    ),
+                ));
+            }
+        };
+        let stderr = child.stderr.take();
+        *self.child_process.lock().await = Some(child);
+        let transport = AsyncRwTransport::new_client(stdout, stdin);
 
         // Spawn background task to drain stderr, preventing pipe buffer deadlock
         let stderr_task = stderr.map(|stderr| {
+            let capture = Arc::clone(&self.stderr_capture);
             let cmd_name = params.command.clone();
             tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    debug!(target: "mcp_stderr", "[{}] {}", cmd_name, line);
+                let mut stderr = stderr;
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(size) => {
+                            capture.lock().await.append(&buffer[..size]);
+                            debug!(target: "mcp_stderr", command = %cmd_name, bytes = size, "drained child stderr");
+                        }
+                        Err(error) => {
+                            debug!(target: "mcp_stderr", command = %cmd_name, %error, "child stderr drain ended");
+                            break;
+                        }
+                    }
                 }
             })
         });
@@ -301,18 +599,36 @@ impl MCPClientProtocol for StdioMCPClient {
         let handler = A2cClientHandler::new(self.notify.clone());
 
         let connect_timeout_secs = self.connect_timeout_secs;
-        let service = tokio::time::timeout(
+        let service_result = tokio::time::timeout(
             Duration::from_secs(connect_timeout_secs),
             handler.serve(transport),
         )
-        .await
-        .map_err(|_| {
-            MCPClientError::TimeoutError(format!(
-                "STDIO connect timed out after {}s",
-                connect_timeout_secs
-            ))
-        })?
-        .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
+        .await;
+        let service = match service_result {
+            Ok(Ok(service)) => service,
+            Ok(Err(error)) => {
+                let (phase, upgrade_to_process_exit) = Self::initialize_phase(&error);
+                return Err(self
+                    .initialization_error(
+                        phase,
+                        upgrade_to_process_exit,
+                        format!(
+                            "Initialize failed: {}",
+                            Self::safe_initialize_message(&error)
+                        ),
+                    )
+                    .await);
+            }
+            Err(_) => {
+                return Err(self
+                    .initialization_error(
+                        StdioInitializationPhase::InitializeTimeout,
+                        false,
+                        format!("STDIO connect timed out after {}s", connect_timeout_secs),
+                    )
+                    .await)
+            }
+        };
 
         *self.running_service.lock().await = Some(service);
         self.base.update_state(ClientState::Connected).await;
@@ -322,6 +638,7 @@ impl MCPClientProtocol for StdioMCPClient {
     }
 
     async fn disconnect(&self) -> Result<(), MCPClientError> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         if !self.base.can_disconnect().await {
             return Err(MCPClientError::ConnectionError(format!(
                 "Cannot disconnect in state: {}",
@@ -341,10 +658,7 @@ impl MCPClientProtocol for StdioMCPClient {
             }
         }
 
-        // 终止 stderr 消费任务 / Abort stderr drain task
-        if let Some(handle) = self.stderr_drain_task.lock().await.take() {
-            handle.abort();
-        }
+        self.terminate_child().await;
 
         self.base.update_state(ClientState::Disconnected).await;
         info!("STDIO client disconnected successfully");

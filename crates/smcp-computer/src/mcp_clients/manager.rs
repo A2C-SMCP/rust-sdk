@@ -871,6 +871,12 @@ impl MCPServerManager {
                 MCPClientError::HttpAuthentication(error) => {
                     ComputerError::HttpAuthentication(error)
                 }
+                MCPClientError::StdioInitialization(error) => ComputerError::StdioInitialization(
+                    crate::mcp_clients::StdioInitializationError::new(
+                        format!("Failed to connect to {}: {}", server_name, error),
+                        error.diagnostic().clone(),
+                    ),
+                ),
                 error => ComputerError::ConnectionError(format!(
                     "Failed to connect to {}: {}",
                     server_name, error

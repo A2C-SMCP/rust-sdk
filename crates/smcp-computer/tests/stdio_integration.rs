@@ -6,7 +6,7 @@
 //! ```
 
 use smcp_computer::mcp_clients::model::{
-    ClientState, MCPClientError, MCPClientProtocol, StdioServerParameters,
+    ClientState, MCPClientError, MCPClientProtocol, StdioInitializationPhase, StdioServerParameters,
 };
 use smcp_computer::mcp_clients::stdio_client::StdioMCPClient;
 use std::collections::HashMap;
@@ -25,6 +25,153 @@ fn stderr_flood_server_path() -> String {
         "{}/../../tests/stderr-flood-mcp-server/index.js",
         manifest_dir
     )
+}
+
+#[cfg(unix)]
+fn shell_params(script: &str) -> StdioServerParameters {
+    StdioServerParameters {
+        command: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        env: HashMap::new(),
+        cwd: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_spawn_failure_is_structured() {
+    let params = StdioServerParameters {
+        command: "a2c-command-that-does-not-exist".to_string(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        cwd: None,
+    };
+    let client = StdioMCPClient::new(params);
+
+    let error = client.connect().await.expect_err("spawn should fail");
+    let display = error.to_string();
+    let MCPClientError::StdioInitialization(error) = error else {
+        panic!("expected structured stdio initialization error");
+    };
+    assert_eq!(
+        error.diagnostic().phase,
+        StdioInitializationPhase::SpawnFailed
+    );
+    assert!(error.diagnostic().stderr_tail.is_empty());
+    assert!(display.contains("Connection error: Failed to start process"));
+    assert!(display.contains("Failed to start process"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_early_exit_captures_bounded_redacted_stderr() {
+    let mut params = shell_params(
+        "printf 'port already in use token=SHOULD_NOT_LEAK\\n'; i=0; while [ $i -lt 20000 ]; do printf x >&2; i=$((i+1)); done; exit 7",
+    );
+    params.env.insert(
+        "OFFICE_SECRET".to_string(),
+        "ENV_SECRET_SHOULD_NOT_LEAK".to_string(),
+    );
+    params.args[1] = "i=0; while [ $i -lt 20000 ]; do printf x >&2; i=$((i+1)); done; printf 'port already in use token=SHOULD_NOT_LEAK ENV_SECRET_SHOULD_NOT_LEAK AWS_SECRET_ACCESS_KEY=AWS_SHOULD_NOT_LEAK Authorization: Bearer AUTH_SHOULD_NOT_LEAK --api-key FLAG_SHOULD_NOT_LEAK\\n' >&2; exit 7".to_string();
+
+    let client = StdioMCPClient::new(params);
+    let error = client.connect().await.expect_err("child should exit early");
+    let MCPClientError::StdioInitialization(error) = error else {
+        panic!("expected structured stdio initialization error");
+    };
+    let diagnostic = error.diagnostic();
+    assert_eq!(
+        diagnostic.phase,
+        StdioInitializationPhase::ProcessExitedBeforeInitialize
+    );
+    assert_eq!(diagnostic.exit_code, Some(7));
+    assert_eq!(diagnostic.exit_success, Some(false));
+    assert!(
+        diagnostic.stderr_tail.len()
+            <= smcp_computer::mcp_clients::stdio_client::MAX_STDIO_STDERR_BYTES
+    );
+    assert!(!diagnostic.stderr_tail.contains("SHOULD_NOT_LEAK"));
+    assert!(!diagnostic
+        .stderr_tail
+        .contains("ENV_SECRET_SHOULD_NOT_LEAK"));
+    assert!(!diagnostic.stderr_tail.contains("AWS_SHOULD_NOT_LEAK"));
+    assert!(!diagnostic.stderr_tail.contains("AUTH_SHOULD_NOT_LEAK"));
+    assert!(!diagnostic.stderr_tail.contains("FLAG_SHOULD_NOT_LEAK"));
+    assert!(diagnostic.stderr_tail.contains("<redacted>"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_redaction_handles_sensitive_value_split_across_reads() {
+    let client = StdioMCPClient::new(shell_params(
+        "i=0; while [ $i -lt 4095 ]; do printf x >&2; i=$((i+1)); done; printf 'token=' >&2; printf 'SPLIT_SHOULD_NOT_LEAK\\n' >&2; exit 7",
+    ));
+    let error = client.connect().await.expect_err("child should exit early");
+    let MCPClientError::StdioInitialization(error) = error else {
+        panic!("expected structured stdio initialization error");
+    };
+    assert!(!error
+        .diagnostic()
+        .stderr_tail
+        .contains("SPLIT_SHOULD_NOT_LEAK"));
+    assert!(error.diagnostic().stderr_tail.contains("<redacted>"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_initialize_timeout_is_structured() {
+    let client = StdioMCPClient::new_with_connect_timeout_secs(shell_params("sleep 5"), Some(1));
+    let error = client.connect().await.expect_err("child should time out");
+    let MCPClientError::StdioInitialization(error) = error else {
+        panic!("expected structured stdio initialization error");
+    };
+    assert_eq!(
+        error.diagnostic().phase,
+        StdioInitializationPhase::InitializeTimeout
+    );
+    assert!(error.to_string().contains("after 1s"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_protocol_error_is_distinguished() {
+    let client = StdioMCPClient::new(shell_params(
+        "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"bad initialize token=PROVIDER_SECRET_SHOULD_NOT_LEAK\"}}'",
+    ));
+    let error = client
+        .connect()
+        .await
+        .expect_err("protocol response should fail");
+    let MCPClientError::StdioInitialization(error) = error else {
+        panic!("expected structured stdio initialization error");
+    };
+    assert_eq!(
+        error.diagnostic().phase,
+        StdioInitializationPhase::InitializeProtocolError
+    );
+    assert!(!error
+        .to_string()
+        .contains("PROVIDER_SECRET_SHOULD_NOT_LEAK"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_connection_closed_while_child_alive_is_distinguished() {
+    let client = StdioMCPClient::new(shell_params("exec 1>&-; sleep 2"));
+    let error = client
+        .connect()
+        .await
+        .expect_err("closed stdout should fail initialization");
+    let MCPClientError::StdioInitialization(error) = error else {
+        panic!("expected structured stdio initialization error");
+    };
+    let diagnostic = error.diagnostic();
+    assert_eq!(
+        diagnostic.phase,
+        StdioInitializationPhase::InitializeConnectionClosed
+    );
+    assert_eq!(diagnostic.exit_code, None);
+    assert_eq!(diagnostic.exit_success, None);
 }
 
 #[tokio::test]
@@ -110,11 +257,12 @@ async fn test_stdio_custom_connect_timeout_reports_effective_value() {
         .expect("custom STDIO timeout should fire before the outer guard");
 
     match result {
-        Err(MCPClientError::TimeoutError(message)) => {
-            assert!(
-                message.contains("after 1s"),
-                "unexpected timeout message: {message}"
+        Err(MCPClientError::StdioInitialization(error)) => {
+            assert_eq!(
+                error.diagnostic().phase,
+                StdioInitializationPhase::InitializeTimeout
             );
+            assert!(error.to_string().contains("after 1s"));
         }
         other => panic!("expected a custom STDIO timeout, got {other:?}"),
     }

@@ -74,6 +74,10 @@ pub enum ComputerError {
     /// 连接错误 / Connection error
     ConnectionError(String),
 
+    #[error("Connection error: {0}")]
+    /// Structured stdio child-process initialization diagnostics.
+    StdioInitialization(#[from] crate::mcp_clients::StdioInitializationError),
+
     #[error("HTTP authentication error: {0}")]
     /// Structured HTTP authentication negotiation result.
     HttpAuthentication(#[from] crate::mcp_clients::HttpAuthenticationError),
@@ -174,6 +178,7 @@ impl ComputerError {
 
             // 连接错误 / Connection errors
             ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR
+            ComputerError::StdioInitialization(_) => 500, // INTERNAL_ERROR
             ComputerError::HttpAuthentication(error) => match error {
                 crate::mcp_clients::HttpAuthenticationError::Forbidden => 403,
                 crate::mcp_clients::HttpAuthenticationError::OAuthRequired
