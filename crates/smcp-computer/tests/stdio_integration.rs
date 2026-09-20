@@ -94,6 +94,32 @@ async fn test_stdio_connect_timeout_with_bad_server() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_custom_connect_timeout_reports_effective_value() {
+    let params = StdioServerParameters {
+        command: "sh".to_string(),
+        args: vec!["-c".to_string(), "sleep 5".to_string()],
+        env: HashMap::new(),
+        cwd: None,
+    };
+
+    let client = StdioMCPClient::new_with_connect_timeout_secs(params, Some(1));
+    let result = tokio::time::timeout(Duration::from_secs(4), client.connect())
+        .await
+        .expect("custom STDIO timeout should fire before the outer guard");
+
+    match result {
+        Err(MCPClientError::TimeoutError(message)) => {
+            assert!(
+                message.contains("after 1s"),
+                "unexpected timeout message: {message}"
+            );
+        }
+        other => panic!("expected a custom STDIO timeout, got {other:?}"),
+    }
+}
+
 /// Regression test for https://github.com/A2C-SMCP/rust-sdk/issues/10
 ///
 /// Verifies that a child process writing >128 KB to stderr does NOT deadlock

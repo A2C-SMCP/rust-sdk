@@ -2017,6 +2017,12 @@ impl MCPServerManager {
                     if let Ok(params_json) = serde_json::to_value(&stdio_config.server_parameters) {
                         server_info.insert("server_parameters".to_string(), params_json);
                     }
+                    if let Some(timeout_secs) = stdio_config.connect_timeout_secs {
+                        server_info.insert(
+                            "connect_timeout_secs".to_string(),
+                            serde_json::Value::from(timeout_secs),
+                        );
+                    }
                 }
                 MCPServerConfig::Sse(sse_config) => {
                     if let Ok(params_json) = serde_json::to_value(&sse_config.server_parameters) {
@@ -4778,6 +4784,7 @@ mod tests {
             // STDIO服务器配置 / STDIO server configuration
             MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
+                connect_timeout_secs: None,
                 bundle_id: None,
                 name: "test_stdio".to_string(),
                 disabled: false,
@@ -4825,6 +4832,7 @@ mod tests {
         // 添加服务器配置 / Add server configuration
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             bundle_id: None,
             name: "test_server".to_string(),
             disabled: false,
@@ -4920,6 +4928,7 @@ mod tests {
         let manager = MCPServerManager::new();
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             bundle_id: None,
             name: "disabled_server".to_string(),
             disabled: true,
@@ -4949,6 +4958,7 @@ mod tests {
         // 添加服务器 / Add server
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             bundle_id: None,
             name: "test_server".to_string(),
             disabled: false,
@@ -5135,6 +5145,28 @@ mod tests {
             obj["id_x"]["name"],
             serde_json::json!("display-name"),
             "value 应带 name display 字段（key 不再人类可读）"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_config_preserves_stdio_connect_timeout() {
+        let manager = MCPServerManager::new();
+        let mut config = stdio_cfg_with_bundle("slow-server", Some("slow_id"));
+        if let MCPServerConfig::Stdio(stdio) = &mut config {
+            stdio.connect_timeout_secs = Some(90);
+        } else {
+            panic!("expected stdio config");
+        }
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bid("slow_id"), config);
+
+        let cfg = manager.get_server_configs().await;
+        assert_eq!(
+            cfg["slow_id"]["connect_timeout_secs"],
+            serde_json::json!(90)
         );
     }
 
@@ -5750,6 +5782,7 @@ mod tests {
             // 第一个服务器 / First server
             MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
+                connect_timeout_secs: None,
                 bundle_id: None,
                 name: "server1".to_string(),
                 disabled: false,
@@ -5767,6 +5800,7 @@ mod tests {
             // 第二个服务器 / Second server
             MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
+                connect_timeout_secs: None,
                 bundle_id: None,
                 name: "server2".to_string(),
                 disabled: false,
@@ -6102,6 +6136,7 @@ mod tests {
         // Case 1: specific only
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             bundle_id: None,
             name: "s".to_string(),
             disabled: false,
@@ -6131,6 +6166,7 @@ mod tests {
         // Case 2: default only
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             bundle_id: None,
             name: "s".to_string(),
             disabled: false,
@@ -6159,6 +6195,7 @@ mod tests {
         // Case 3: specific + default merge (specific wins)
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             bundle_id: None,
             name: "s".to_string(),
             disabled: false,
@@ -6195,6 +6232,7 @@ mod tests {
         // Case 4: no config
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             bundle_id: None,
             name: "s".to_string(),
             disabled: false,

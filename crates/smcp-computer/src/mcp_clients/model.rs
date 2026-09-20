@@ -282,6 +282,14 @@ pub struct StdioServerConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub env_file: Option<String>,
+    /// STDIO 初始化连接超时（秒）。省略时使用 SDK 默认值 30 秒；必须为正整数。
+    /// STDIO initialization connect timeout in seconds. Defaults to 30 seconds when omitted.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_connect_timeout_secs"
+    )]
+    pub connect_timeout_secs: Option<u64>,
     /// STDIO服务器参数 / STDIO server parameters
     pub server_parameters: StdioServerParameters,
 }
@@ -410,7 +418,7 @@ impl StdioServerConfig {
     /// 构造一个 stdio server 配置（其余字段取默认；`#[non_exhaustive]` 下跨 crate 唯一构造入口）。
     ///
     /// 缺省：`bundle_id = None`（触发缺省生成）、`disabled = false`、`forbidden_tools`/`tool_meta` 为空、
-    /// `default_tool_meta`/`vrl`/`env_file` 为 `None`。字段均 `pub`，构造后可按需赋值。
+    /// `default_tool_meta`/`vrl`/`env_file`/`connect_timeout_secs` 为 `None`。字段均 `pub`，构造后可按需赋值。
     pub fn new(name: impl Into<ServerName>, server_parameters: StdioServerParameters) -> Self {
         Self {
             name: name.into(),
@@ -421,6 +429,7 @@ impl StdioServerConfig {
             default_tool_meta: None,
             vrl: None,
             env_file: None,
+            connect_timeout_secs: None,
             server_parameters,
         }
     }
@@ -468,6 +477,19 @@ where
 {
     let opt = Option::<HashMap<String, String>>::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
+}
+
+fn deserialize_connect_timeout_secs<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    match value {
+        Some(0) => Err(serde::de::Error::custom(
+            "connect_timeout_secs must be greater than zero",
+        )),
+        other => Ok(other),
+    }
 }
 
 /// STDIO服务器参数 / STDIO server parameters
@@ -1473,6 +1495,53 @@ mod tests {
         let round = serde_json::to_value(&cfg2).unwrap();
         assert_eq!(round["envFile"], serde_json::json!(".env.dev"));
         assert!(round.get("env_file").is_none());
+    }
+
+    #[test]
+    fn stdio_connect_timeout_round_trip_and_validation() {
+        let raw = serde_json::json!({
+            "name": "slow-server",
+            "type": "stdio",
+            "server_parameters": { "command": "slow-mcp" },
+            "connect_timeout_secs": 90
+        });
+        let cfg: MCPServerConfig = serde_json::from_value(raw.clone()).unwrap();
+        let MCPServerConfig::Stdio(cfg) = cfg else {
+            panic!("expected stdio config");
+        };
+        assert_eq!(cfg.connect_timeout_secs, Some(90));
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["connect_timeout_secs"],
+            90
+        );
+
+        let default_cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "name": "default-server",
+            "type": "stdio",
+            "server_parameters": { "command": "mcp" }
+        }))
+        .unwrap();
+        let MCPServerConfig::Stdio(default_cfg) = default_cfg else {
+            panic!("expected stdio config");
+        };
+        assert_eq!(default_cfg.connect_timeout_secs, None);
+        assert!(serde_json::to_value(&default_cfg)
+            .unwrap()
+            .get("connect_timeout_secs")
+            .is_none());
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("30"),
+        ] {
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            value["connect_timeout_secs"] = invalid;
+            assert!(
+                serde_json::from_value::<StdioServerConfig>(value).is_err(),
+                "invalid timeout should be rejected"
+            );
+        }
     }
 
     // ---- #74 INT-04：GetSkillRet body/blob_handle 恰一互斥校验 ----

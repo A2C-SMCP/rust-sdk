@@ -7029,6 +7029,7 @@ mod tests {
     fn user_stdio_server97(name: &str) -> MCPServerConfig {
         MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: name.to_string(),
             bundle_id: None,
             disabled: true,
@@ -7476,6 +7477,7 @@ mod tests {
             "server1".to_string(),
             MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
+                connect_timeout_secs: None,
                 name: "server1".to_string(),
                 bundle_id: None,
                 disabled: false,
@@ -7636,6 +7638,7 @@ mod tests {
         // 添加服务器配置 / Add server configuration
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: false,
@@ -7660,6 +7663,7 @@ mod tests {
         // Note: Since MCPServerManager is private, we test updates by adding duplicate servers
         let updated_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: true, // 更新为禁用状态 / Update to disabled state
@@ -8092,6 +8096,7 @@ mod tests {
         // 创建带有占位符的服务器配置 / Create server config with placeholders
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: false,
@@ -8135,6 +8140,7 @@ mod tests {
         // 创建带有不存在输入的配置 / Create config with non-existent input
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: false,
@@ -8265,6 +8271,7 @@ mod tests {
     fn stdio_with_arg(arg: &str) -> MCPServerConfig {
         MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "s".to_string(),
             bundle_id: None,
             disabled: false,
@@ -10612,6 +10619,7 @@ mod tests {
         let computer = Arc::new(computer);
         let cfg = MCPServerConfig::Stdio(crate::mcp_clients::model::StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "gov".to_string(),
             bundle_id: None,
             disabled: false,
@@ -10938,6 +10946,7 @@ mod tests {
             let bid = BundleId::try_from(name.clone()).expect("test fixture bundle_id");
             let cfg = MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
+                connect_timeout_secs: None,
                 name: name.clone(),
                 bundle_id: Some(bid.clone()),
                 disabled: false,

@@ -34,7 +34,7 @@ use tracing::{debug, error, info, warn};
 
 /// STDIO 客户端连接超时时间（秒）
 /// Connect timeout for STDIO client (seconds)
-const CONNECT_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 /// 库级别默认 cwd 子目录名 / Library-level default cwd subdirectory name
 const DEFAULT_CWD_DIR_NAME: &str = ".a2c-smcp";
@@ -119,6 +119,8 @@ pub struct StdioMCPClient {
     resource_cache: ResourceCache,
     /// 运行期变化通知上报接缝（#106，None=不转发）/ runtime change-notification seam。
     notify: Option<ClientNotifyCtx>,
+    /// 初始化握手超时时间（秒）/ initialization handshake timeout in seconds.
+    connect_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for StdioMCPClient {
@@ -134,6 +136,15 @@ impl std::fmt::Debug for StdioMCPClient {
 impl StdioMCPClient {
     /// 创建新的STDIO客户端 / Create new STDIO client
     pub fn new(params: StdioServerParameters) -> Self {
+        Self::new_with_connect_timeout_secs(params, None)
+    }
+
+    /// 创建带有 per-server 初始化连接超时的 STDIO 客户端。
+    /// Create a STDIO client with a per-server initialization connect timeout.
+    pub fn new_with_connect_timeout_secs(
+        params: StdioServerParameters,
+        connect_timeout_secs: Option<u64>,
+    ) -> Self {
         Self {
             base: BaseMCPClient::new(params),
             running_service: Arc::new(Mutex::new(None)),
@@ -141,6 +152,11 @@ impl StdioMCPClient {
             subscription_manager: SubscriptionManager::new(),
             resource_cache: ResourceCache::new(Duration::from_secs(60)),
             notify: None,
+            // Typed in-memory configs can bypass serde validation; keep the runtime safe and
+            // preserve the documented default for an invalid zero value.
+            connect_timeout_secs: connect_timeout_secs
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
         }
     }
 
@@ -284,15 +300,16 @@ impl MCPClientProtocol for StdioMCPClient {
         // #106：用自定义 handler 取代裸 ClientInfo，使运行期 tools/resources 变化通知被转发给 Computer 消费者。
         let handler = A2cClientHandler::new(self.notify.clone());
 
+        let connect_timeout_secs = self.connect_timeout_secs;
         let service = tokio::time::timeout(
-            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            Duration::from_secs(connect_timeout_secs),
             handler.serve(transport),
         )
         .await
         .map_err(|_| {
             MCPClientError::TimeoutError(format!(
                 "STDIO connect timed out after {}s",
-                CONNECT_TIMEOUT_SECS
+                connect_timeout_secs
             ))
         })?
         .map_err(|e| MCPClientError::ConnectionError(format!("Initialize failed: {}", e)))?;
@@ -814,6 +831,29 @@ mod tests {
         let client = StdioMCPClient::new(params);
         assert_eq!(client.state(), ClientState::Initialized);
         assert_eq!(client.base.params.command, "echo");
+        assert_eq!(client.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_stdio_client_custom_connect_timeout() {
+        let params = StdioServerParameters {
+            command: "echo".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+        };
+
+        let client = StdioMCPClient::new_with_connect_timeout_secs(params, Some(75));
+        assert_eq!(client.connect_timeout_secs, 75);
+
+        let params = StdioServerParameters {
+            command: "echo".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+        };
+        let client = StdioMCPClient::new_with_connect_timeout_secs(params, Some(0));
+        assert_eq!(client.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
     }
 
     #[tokio::test]

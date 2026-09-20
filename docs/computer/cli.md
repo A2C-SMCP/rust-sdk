@@ -210,6 +210,7 @@ A2C-SMCP 配置示例（`type=stdio` + `server_parameters` + 可选 `default_too
     "tags": ["browser"],
     "auto_apply": true
   },
+  "connect_timeout_secs": 60,
   "server_parameters": {
     "command": "npx",
     "args": ["@playwright/mcp@latest"],
@@ -221,6 +222,9 @@ A2C-SMCP 配置示例（`type=stdio` + `server_parameters` + 可选 `default_too
   "vrl": "# 中文: 只对 browser_navigate 和 browser_navigate_back 工具进行转换\n# English: Only transform for browser_navigate and browser_navigate_back tools\nif .tool_name == \\\"browser_navigate\\\" || .tool_name == \\\"browser_navigate_back\\\" {\n    # 中文: 提取URL，browser_navigate_back 可能没有url参数\n    # English: Extract URL, browser_navigate_back may not have url parameter\n    url = if exists(.parameters.url) {\n        .parameters.url\n    } else {\n        \\\"[BROWSER_BACK_OPERATION]\\\"\n    }\n\n    # 中文: 提取内容 / English: Extract content\n    content = if length!(.content) > 0 {\n        .content[0].text\n    } else {\n        \\\"\\\"\n    }\n\n    # 中文: 使用重新赋值方式，只保留需要的字段\n    # English: Use reassignment to keep only needed fields\n    . = {\n        \\\"url\\\": url,\n        \\\"content\\\": content\n    }\n}"
 }
 ```
+
+`connect_timeout_secs` 是 STDIO MCP Server 初始化握手超时，单位为秒，必须为正整数；省略时使用 SDK 默认值 30 秒。
+该配置只影响进程启动阶段的 `initialize` 握手，不影响后续工具调用超时。
 
 方式 A：以命令行文本形式添加（注意 `vrl` 中引号与换行需要转义）
 
