@@ -202,3 +202,108 @@ async fn office_id_cannot_target_a_peer_sid_room() {
     victim.disconnect().await.unwrap();
     server.shutdown();
 }
+
+#[tokio::test]
+async fn leave_office_uses_session_room_not_payload_room() {
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+    let victim_notified = Arc::new(AtomicBool::new(false));
+    let victim_notified_flag = victim_notified.clone();
+    let victim = create_client_with_handler(
+        &server_url,
+        SMCP_NAMESPACE,
+        events::NOTIFY_LEAVE_OFFICE,
+        move |_, _| {
+            let flag = victim_notified_flag.clone();
+            Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+            })
+        },
+    )
+    .await;
+    let attacker = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    join_office(&victim, Role::Agent, "office-b", "victim").await;
+    join_office(&attacker, Role::Agent, "office-a", "attacker").await;
+
+    let response = emit_with_ack(
+        &attacker,
+        events::SERVER_LEAVE_OFFICE,
+        json!(LeaveOfficeReq {
+            office_id: "office-b".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        response,
+        json!([null]),
+        "successful leave must use an empty ack"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !victim_notified.load(Ordering::SeqCst),
+        "a mismatched payload office must not receive a leave notification"
+    );
+
+    let list = ListRoomReq {
+        base: AgentCallData {
+            agent: "attacker".to_string(),
+            req_id: ReqId("leave-session-room".to_string()),
+        },
+        office_id: "office-a".to_string(),
+    };
+    let list_response = emit_with_ack(&attacker, events::SERVER_LIST_ROOM, json!(list)).await;
+    assert_eq!(list_response["code"], 4103);
+
+    attacker.disconnect().await.unwrap();
+    victim.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn leave_office_without_session_room_is_idempotent_and_does_not_broadcast() {
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+    let victim_notified = Arc::new(AtomicBool::new(false));
+    let victim_notified_flag = victim_notified.clone();
+    let victim = create_client_with_handler(
+        &server_url,
+        SMCP_NAMESPACE,
+        events::NOTIFY_LEAVE_OFFICE,
+        move |_, _| {
+            let flag = victim_notified_flag.clone();
+            Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+            })
+        },
+    )
+    .await;
+    let idle = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    join_office(&victim, Role::Agent, "office-b", "victim").await;
+
+    let response = emit_with_ack(
+        &idle,
+        events::SERVER_LEAVE_OFFICE,
+        json!(LeaveOfficeReq {
+            office_id: "office-b".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        response,
+        json!([null]),
+        "successful leave must use an empty ack"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !victim_notified.load(Ordering::SeqCst),
+        "a session without an office must not broadcast using the payload office"
+    );
+
+    idle.disconnect().await.unwrap();
+    victim.disconnect().await.unwrap();
+    server.shutdown();
+}

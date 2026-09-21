@@ -268,7 +268,14 @@ impl SmcpHandler {
                             let result =
                                 Self::on_server_leave_office(socket, data, state_leave.clone())
                                     .await;
-                            let _ = ack.send(&result);
+                            match result {
+                                Ok(()) => {
+                                    let _ = ack.send(&());
+                                }
+                                Err(error) => {
+                                    let _ = ack.send(&error);
+                                }
+                            }
                         }
                         Err(_) => Self::ack_bad_request(ack),
                     },
@@ -701,32 +708,56 @@ impl SmcpHandler {
         socket: SocketRef,
         data: LeaveOfficeReq,
         state: ServerState,
-    ) -> (bool, Option<String>) {
+    ) -> Result<(), smcp::ErrorPayload> {
         let sid = socket.id.to_string();
 
         // 获取会话
         let session = match state.session_manager.get_session(&sid) {
             Some(s) => s,
-            None => return (false, Some("Session is not in an office".to_string())),
+            None => {
+                // Sessions are created lazily on join.  Treat a connection
+                // without one the same as a session with no office: leave is
+                // idempotent and must not trust the payload as a room target.
+                for room in socket.rooms() {
+                    if room.as_ref() != sid {
+                        socket.leave(room.into_owned());
+                    }
+                }
+                return Ok(());
+            }
         };
 
-        let Some(current_office) = session.office_id.as_deref() else {
-            return (false, Some("Session is not in an office".to_string()));
+        let Some(current_office) = session.office_id.clone() else {
+            // `office_id` in the request is redundant and has no authority.  A
+            // stale session may still be present in an office room, so make
+            // this idempotent operation converge the Socket.IO membership
+            // before acknowledging it.
+            for room in socket.rooms() {
+                if room.as_ref() != sid {
+                    socket.leave(room.into_owned());
+                }
+            }
+            return Ok(());
         };
         if current_office != data.office_id {
-            return (false, Some("Cross-room access denied".to_string()));
+            warn!(
+                sid = %sid,
+                session_office = %current_office,
+                payload_office = %data.office_id,
+                "Ignoring leave_office payload office_id; using session office"
+            );
         }
 
         // 构建离开通知
         let notification = if session.role == ClientRole::Computer {
             LeaveOfficeNotification {
-                office_id: data.office_id.clone(),
+                office_id: current_office.clone(),
                 computer: Some(session.name),
                 agent: None,
             }
         } else {
             LeaveOfficeNotification {
-                office_id: data.office_id.clone(),
+                office_id: current_office.clone(),
                 computer: None,
                 agent: Some(session.name),
             }
@@ -734,17 +765,17 @@ impl SmcpHandler {
 
         // 广播离开消息
         let _ = socket
-            .within(Self::office_room(&data.office_id))
+            .within(Self::office_room(&current_office))
             .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
             .await;
 
         // 更新会话
         if let Err(e) = state.session_manager.update_office_id(&sid, None) {
-            return (false, Some(format!("Failed to update office_id: {}", e)));
+            return Err(HandlerError::Session(e).to_error_payload());
         }
-        socket.leave(Self::office_room(&data.office_id));
+        socket.leave(Self::office_room(&current_office));
 
-        (true, None)
+        Ok(())
     }
 
     /// 处理工具调用取消事件

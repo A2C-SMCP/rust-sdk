@@ -751,10 +751,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        leave_payload.to_string().contains("true")
-            || leave_payload.to_string().contains("[true, null]")
-    );
+    assert_eq!(leave_payload, serde_json::json!([null]));
 
     client.disconnect().await.expect("Failed to disconnect");
     server.shutdown();
