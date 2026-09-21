@@ -22,23 +22,22 @@ pub const SMCP_NAMESPACE: &str = "/smcp";
 
 /// A2C-SMCP 协议版本号 / A2C-SMCP protocol version
 ///
-/// `MAJOR.MINOR` = `0.3.0`。v0.3.0 为 plugin install/enable 生命周期分离（`computer-management.md` §2.4，
-/// 非加性、破坏性），故从 `0.2.x` bump 到 `0.3.0`，用于 HTTP 握手阶段的版本协商。**v0.x 阶段 MINOR 严格相等**
-/// （见 [`version::is_compatible`]）——三方（Agent/Computer/Server）必须同为 `0.3.x` 才能握手，`0.2.x` 与
-/// `0.3.x` 互不兼容（4008）。PATCH 不影响兼容性。
+/// `MAJOR.MINOR` = `0.5.0`。v0.5.0 引入房间事件 ack 的破坏性线格式变更，故从 `0.4.x` bump 到 `0.5.0`，
+/// 用于 HTTP 握手阶段的版本协商。**v0.x 阶段 MINOR 严格相等**（见 [`version::is_compatible`]）——三方
+///（Agent/Computer/Server）必须同为 `0.5.x` 才能握手，`0.4.x` 与 `0.5.x` 互不兼容（4008）。PATCH 不影响兼容性。
 ///
-/// `MAJOR.MINOR` = `0.3.0`. v0.3.0 splits the plugin install/enable lifecycle (breaking, not additive),
-/// bumping from `0.2.x`. In v0.x MINOR must match exactly, so all three roles must be `0.3.x` to handshake.
+/// `MAJOR.MINOR` = `0.5.0`. v0.5.0 changes room-event ack wire shapes (breaking), bumping from `0.4.x`.
+/// In v0.x MINOR must match exactly, so all three roles must be `0.5.x` to handshake.
 ///
 /// 协议依据 / Protocol: `a2c-smcp-protocol` versioning.md。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py`。
-pub const PROTOCOL_VERSION: &str = "0.4.0";
+pub const PROTOCOL_VERSION: &str = "0.5.0";
 
 /// 标准错误码模块 / Standard error codes module
 ///
 /// ⚠️ 与 [`ErrorCode`] 枚举是**两套有意不合并的命名空间**（对齐 Python `a2c_smcp/smcp.py`，
-/// 其 `ErrorCode` 同样不含 4001–4005 / 4101–4104，合并会偏离参考实现）：
-/// - 本模块 = **传输/管理层码** + 工具/房间码（400–500、4001–4005、4101–4104）。
+/// 其 `ErrorCode` 同样不含 4001–4005 / 4101–4106，合并会偏离参考实现）：
+/// - 本模块 = **传输/管理层码** + 工具/房间码（400–500、4001–4005、4101–4106）。
 /// - [`ErrorCode`] = **协议级闭集**（404、4006–4018），是 [`is_protocol_error_payload`] 识别的集合，
 ///   也是 `client:*` ack 协议级错误必用的码。
 /// - 两者仅 `404` 重合。
@@ -76,6 +75,8 @@ pub mod error_codes {
     pub const ROOM_NOT_FOUND: i32 = 4102;
     pub const NOT_IN_ROOM: i32 = 4103;
     pub const CROSS_ROOM_ACCESS: i32 = 4104;
+    pub const NAME_CONFLICT: i32 = 4105;
+    pub const ALREADY_IN_ROOM: i32 = 4106;
 }
 
 /// WebSocket 握手版本拒绝的 close code（RFC 6455 私有段 4000–4999）。

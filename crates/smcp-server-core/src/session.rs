@@ -31,10 +31,10 @@ impl SessionError {
     pub fn error_code(&self) -> i32 {
         match self {
             SessionError::NotFound(_) => smcp::error_codes::NOT_FOUND,
-            SessionError::NameAlreadyRegistered(_) => smcp::error_codes::FORBIDDEN,
-            SessionError::AgentAlreadyInRoom(_) => smcp::error_codes::FORBIDDEN,
+            SessionError::NameAlreadyRegistered(_) => smcp::error_codes::NAME_CONFLICT,
+            SessionError::AgentAlreadyInRoom(_) => smcp::error_codes::ALREADY_IN_ROOM,
             SessionError::AgentAlreadyExists => smcp::error_codes::ROOM_FULL,
-            SessionError::ComputerAlreadyExists(_, _) => smcp::error_codes::FORBIDDEN,
+            SessionError::ComputerAlreadyExists(_, _) => smcp::error_codes::NAME_CONFLICT,
             SessionError::InvalidState(_) => smcp::error_codes::BAD_REQUEST,
         }
     }
@@ -648,5 +648,30 @@ mod tests {
         let session =
             SessionData::new(sid, "n".to_string(), ClientRole::Computer).with_extra(extra.clone());
         assert_eq!(session.extra, extra);
+    }
+
+    #[test]
+    fn test_room_error_codes_follow_protocol_contract() {
+        assert_eq!(
+            SessionError::AgentAlreadyExists.error_code(),
+            smcp::error_codes::ROOM_FULL
+        );
+        assert_eq!(
+            SessionError::NameAlreadyRegistered("agent".to_string()).error_code(),
+            smcp::error_codes::NAME_CONFLICT
+        );
+        assert_eq!(
+            SessionError::ComputerAlreadyExists("computer".to_string(), "office".to_string())
+                .error_code(),
+            smcp::error_codes::NAME_CONFLICT
+        );
+        assert_eq!(
+            SessionError::AgentAlreadyInRoom("office".to_string()).error_code(),
+            smcp::error_codes::ALREADY_IN_ROOM
+        );
+        assert_ne!(
+            SessionError::AgentAlreadyInRoom("office".to_string()).error_code(),
+            smcp::error_codes::ROOM_NOT_FOUND
+        );
     }
 }

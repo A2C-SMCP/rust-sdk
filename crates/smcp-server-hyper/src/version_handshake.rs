@@ -246,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_incompatible_version_4008_with_header_and_fields() {
-        // server 默认 0.3.0（=PROTOCOL_VERSION）；client 0.1.0 → 不兼容
+        // server 默认版本（=PROTOCOL_VERSION）；client 0.1.0 → 不兼容
         // server = 默认（=PROTOCOL_VERSION）；client 取 MAJOR+1 → **必然不兼容**（与具体协议版本解耦）。
         let server_v = ProtocolVersion::parse(PROTOCOL_VERSION).unwrap();
         let client_v = ProtocolVersion::new(server_v.major + 1, server_v.minor, server_v.patch);

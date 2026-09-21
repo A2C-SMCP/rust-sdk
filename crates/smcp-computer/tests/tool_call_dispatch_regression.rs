@@ -425,7 +425,7 @@ async fn start_relay(
                 let obs = Arc::clone(&obs);
                 move |_socket: SocketRef, _data: Data<Value>, ack: AckSender| {
                     obs.join.fetch_add(1, Ordering::SeqCst);
-                    let _ = ack.send(&(true, None::<String>));
+                    let _ = ack.send(&());
                 }
             });
         }

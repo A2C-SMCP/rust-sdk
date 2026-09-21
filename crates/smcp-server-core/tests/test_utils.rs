@@ -243,23 +243,14 @@ pub async fn join_office(
         })
         .unwrap();
 
-    // 验证加入成功
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-
-    if !success {
-        let error = if let Some(arr) = result.as_array() {
-            arr.get(1)
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error")
-        } else {
-            "Invalid response format"
-        };
-        panic!("Failed to join office: {}", error);
+    // 成功回空 ack（Socket.IO 客户端表现为 `[null]`）；失败回 flat ErrorPayload。
+    if result.get("code").is_some() {
+        panic!("Failed to join office: {}", result);
     }
+    assert!(
+        result.is_null() || result == serde_json::json!([]) || result == serde_json::json!([null]),
+        "join_office success must be an empty ack, got {result}"
+    );
 }
 
 /// 离开办公室的辅助函数

@@ -644,10 +644,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        join_payload.to_string().contains("true")
-            || join_payload.to_string().contains("[true, null]")
-    );
+    assert_eq!(join_payload, serde_json::json!([null]));
 
     let (list_tx, list_rx) = oneshot::channel::<serde_json::Value>();
     client

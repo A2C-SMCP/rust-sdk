@@ -1152,7 +1152,10 @@ impl SmcpComputerClient {
             Self::call_with_client(client, SERVER_JOIN_OFFICE, req_data, Some(10)).await?;
         debug!("Join office response: {:?}", response);
 
-        // The ACK may arrive as `[true, null]` or as one nested tuple argument `[[true, null]]`.
+        // Successful room joins use an empty ack (`null` as the sole Socket.IO argument).
+        // Older servers returned `[true, null]`; accept that shape while rolling clients so a
+        // mixed deployment fails closed only for genuinely invalid responses. Failed joins are
+        // flat ErrorPayload objects.
         let actual_response = if response.len() == 1 {
             response
                 .first()
@@ -1162,6 +1165,24 @@ impl SmcpComputerClient {
         } else {
             response
         };
+
+        if actual_response.is_empty()
+            || (actual_response.len() == 1 && actual_response[0].is_null())
+        {
+            return Ok(());
+        }
+
+        if let Some(error) = actual_response.first().and_then(|value| {
+            value.get("code").and_then(Value::as_i64).map(|code| {
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Room join rejected");
+                format!("room join rejected ({code}): {message}")
+            })
+        }) {
+            return Err(ComputerError::ProtocolError(error));
+        }
 
         match actual_response.first().and_then(Value::as_bool) {
             Some(true) => Ok(()),
@@ -1174,9 +1195,6 @@ impl SmcpComputerClient {
                     "Failed to join office: {error_msg}"
                 )))
             }
-            None if actual_response.is_empty() => Err(ComputerError::SocketIoError(
-                "Empty response from server".to_string(),
-            )),
             None => Err(ComputerError::SocketIoError(format!(
                 "Invalid response format from server: {actual_response:?}"
             ))),

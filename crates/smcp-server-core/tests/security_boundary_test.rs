@@ -81,6 +81,43 @@ async fn malformed_ack_payloads_return_flat_bad_request() {
 }
 
 #[tokio::test]
+async fn join_room_conflicts_return_distinct_flat_codes() {
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+    let first_agent = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    let second_agent = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    let moving_agent = create_test_client(&server_url, SMCP_NAMESPACE).await;
+
+    join_office(&first_agent, Role::Agent, "office-a", "first").await;
+    join_office(&moving_agent, Role::Agent, "office-b", "moving").await;
+
+    let full = emit_with_ack(
+        &second_agent,
+        events::SERVER_JOIN_OFFICE,
+        json!({"role": "agent", "name": "second", "office_id": "office-a"}),
+    )
+    .await;
+    assert_eq!(full["code"], 4101);
+    assert!(full["message"].as_str().unwrap_or("").contains("Agent"));
+
+    let already_in_room = emit_with_ack(
+        &moving_agent,
+        events::SERVER_JOIN_OFFICE,
+        json!({"role": "agent", "name": "moving", "office_id": "office-c"}),
+    )
+    .await;
+    assert_eq!(already_in_room["code"], 4106);
+    let serialized = already_in_room.to_string();
+    assert!(!serialized.contains("sid"));
+    assert!(!serialized.contains("/smcp"));
+
+    first_agent.disconnect().await.unwrap();
+    second_agent.disconnect().await.unwrap();
+    moving_agent.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn list_room_after_leaving_returns_not_in_room() {
     let server = SmcpTestServer::start().await;
     let client = create_test_client(&server.url(), SMCP_NAMESPACE).await;

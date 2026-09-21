@@ -668,22 +668,9 @@ async fn test_computer_name_conflict() {
         emit_event_with_ack_validation(&computer1, "server:join_office", join_data1, true)
             .await
             .unwrap();
-    // 验证响应包含会话信息
+    // 成功响应为空 ack。
     println!("DEBUG: response1 = {:?}", response1);
-    // 响应应该是一个数组 [true, null]
-    assert!(response1.is_array(), "Response should be an array");
-    let response_array = response1.as_array().unwrap();
-    assert_eq!(
-        response_array.len(),
-        2,
-        "Response array should have 2 elements"
-    );
-    assert_eq!(response_array[0], true, "First element should be true");
-    assert_eq!(
-        response_array[1],
-        serde_json::Value::Null,
-        "Second element should be null"
-    );
+    assert_eq!(response1, serde_json::json!([null]));
 
     // 第二个 Computer 尝试使用相同名称加入
     let computer2 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
@@ -700,19 +687,13 @@ async fn test_computer_name_conflict() {
         emit_event_with_ack_validation(&computer2, "server:join_office", join_data2, false)
             .await
             .unwrap();
-    // 验证返回错误
-    assert!(response2.is_array(), "Response should be an array");
-    let response2_array = response2.as_array().unwrap();
-    assert_eq!(
-        response2_array.len(),
-        2,
-        "Response array should have 2 elements"
-    );
-    assert_eq!(response2_array[0], false, "First element should be false");
-    assert!(
-        response2_array[1].is_string(),
-        "Second element should be an error message"
-    );
+    // 失败响应为 flat ErrorPayload。
+    let response2 = response2
+        .as_array()
+        .and_then(|args| args.first())
+        .unwrap_or(&response2);
+    assert_eq!(response2["code"], smcp::error_codes::NAME_CONFLICT);
+    assert!(response2["message"].is_string());
 
     // 不同名称应该可以加入
     let computer3 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
@@ -729,20 +710,8 @@ async fn test_computer_name_conflict() {
         emit_event_with_ack_validation(&computer3, "server:join_office", join_data3, true)
             .await
             .unwrap();
-    // 验证返回成功
-    assert!(response3.is_array(), "Response should be an array");
-    let response3_array = response3.as_array().unwrap();
-    assert_eq!(
-        response3_array.len(),
-        2,
-        "Response array should have 2 elements"
-    );
-    assert_eq!(response3_array[0], true, "First element should be true");
-    assert_eq!(
-        response3_array[1],
-        serde_json::Value::Null,
-        "Second element should be null"
-    );
+    // 成功回空 ack。
+    assert_eq!(response3, serde_json::json!([null]));
 }
 
 #[tokio::test]

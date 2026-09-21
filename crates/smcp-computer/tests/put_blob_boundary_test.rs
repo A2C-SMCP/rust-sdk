@@ -52,11 +52,11 @@ async fn start_relay(
             obs.connect.fetch_add(1, Ordering::SeqCst);
             *computer_socket.lock().unwrap() = Some(socket.clone());
 
-            // ACK join 成功（mirror 真实 server 的 `(bool, Option<String>)` = `[true, null]`）。
+            // ACK join 成功（mirror 真实 server 的空 ack）。
             socket.on(
                 "server:join_office",
                 move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {
-                    let _ = ack.send(&(true, None::<String>));
+                    let _ = ack.send(&());
                 },
             );
         }

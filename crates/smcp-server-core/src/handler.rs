@@ -64,7 +64,14 @@ impl HandlerError {
     /// Agent 端按 [`smcp::is_protocol_error_payload`] 判定的协议级闭集（404/4006–4018）不会被本方法
     /// 的传输层码污染。
     pub fn to_error_payload(&self) -> smcp::ErrorPayload {
-        smcp::ErrorPayload::new(i64::from(self.error_code()), self.to_string())
+        let message = match self {
+            // A session id is an internal Socket.IO identifier and MUST NOT cross an ack
+            // boundary. Keep it in server logs via the source error, but expose only the
+            // protocol-level category to the caller.
+            HandlerError::Session(SessionError::NotFound(_)) => "Session not found".to_string(),
+            _ => self.to_string(),
+        };
+        smcp::ErrorPayload::new(i64::from(self.error_code()), message)
     }
 }
 
@@ -247,9 +254,16 @@ impl SmcpHandler {
                 match data {
                     Ok(value) => match serde_json::from_value::<EnterOfficeReq>(value) {
                         Ok(data) => {
-                            let result =
-                                Self::on_server_join_office(socket, data, state_join.clone()).await;
-                            let _ = ack.send(&result);
+                            match Self::on_server_join_office(socket, data, state_join.clone())
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = ack.send(&());
+                                }
+                                Err(error) => {
+                                    let _ = ack.send(&error);
+                                }
+                            }
                         }
                         Err(_) => Self::ack_bad_request(ack),
                     },
@@ -600,7 +614,7 @@ impl SmcpHandler {
         socket: SocketRef,
         data: EnterOfficeReq,
         state: ServerState,
-    ) -> (bool, Option<String>) {
+    ) -> Result<(), smcp::ErrorPayload> {
         info!("on_server_join_office called with data: {:?}", data);
 
         let sid = socket.id.to_string();
@@ -612,23 +626,23 @@ impl SmcpHandler {
             Some(s) => {
                 // 检查角色/状态一致性
                 if s.role != requested_role {
-                    return (
-                        false,
-                        Some(format!(
+                    return Err(smcp::ErrorPayload::new(
+                        i64::from(smcp::error_codes::FORBIDDEN),
+                        format!(
                             "Role mismatch: existing session has role {:?}, but requested {:?}",
                             s.role, requested_role
-                        )),
-                    );
+                        ),
+                    ));
                 }
 
                 if s.name != requested_name {
-                    return (
-                        false,
-                        Some(format!(
+                    return Err(smcp::ErrorPayload::new(
+                        i64::from(smcp::error_codes::FORBIDDEN),
+                        format!(
                             "Name mismatch: existing session has name '{}', but requested '{}'",
                             s.name, requested_name
-                        )),
-                    );
+                        ),
+                    ));
                 }
 
                 s
@@ -649,7 +663,7 @@ impl SmcpHandler {
                     .with_a2c_version(a2c_version);
 
                 if let Err(e) = state.session_manager.register_session(new_session.clone()) {
-                    return (false, Some(format!("Failed to register session: {}", e)));
+                    return Err(HandlerError::Session(e).to_error_payload());
                 }
                 new_session
             }
@@ -662,7 +676,7 @@ impl SmcpHandler {
             Ok(decision) => decision,
             Err(e) => {
                 error!("validate_join_room failed: {}", e);
-                return (false, Some(format!("Failed to join room: {}", e)));
+                return Err(e.to_error_payload());
             }
         };
 
@@ -670,7 +684,7 @@ impl SmcpHandler {
             .session_manager
             .update_office_id(&sid, Some(data.office_id.clone()))
         {
-            return (false, Some(format!("Failed to update office_id: {}", e)));
+            return Err(HandlerError::Session(e).to_error_payload());
         }
 
         Self::apply_join_room(socket.clone(), &session, &data.office_id, decision).await;
@@ -700,7 +714,7 @@ impl SmcpHandler {
             warn!("Failed to broadcast NOTIFY_ENTER_OFFICE: {}", e);
         }
 
-        (true, None)
+        Ok(())
     }
 
     /// 处理离开办公室事件
@@ -1607,6 +1621,15 @@ mod tests {
         assert!(message.contains("Invalid request"));
         assert!(message.contains("bad"));
         assert!(v.get("error").is_none(), "禁止嵌套 envelope"); // 回退到 {"error":{...}} 即失败
+    }
+
+    #[test]
+    fn test_session_identifier_is_not_exposed_in_error_payload() {
+        let err = HandlerError::Session(SessionError::NotFound("private-sid".to_string()));
+        let payload = err.to_error_payload();
+        assert_eq!(payload.code, i64::from(smcp::error_codes::NOT_FOUND));
+        assert_eq!(payload.message, "Session not found");
+        assert!(!payload.message.contains("private-sid"));
     }
 
     // ── #56 SRV-04：在途断连信号注册表 ──────────────────────────────────────────────

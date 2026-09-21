@@ -68,8 +68,8 @@ impl RelayObs {
 /// 启动裸 socketioxide+hyper recording relay，返回 `(url, shutdown_tx)`。
 ///
 /// - `/smcp` namespace（与 SMCP server 一致，Computer 默认可连）；
-/// - ACK `server:join_office` 为 `(true, None)`——与真实 server `on_server_join_office` 返回同构，
-///   使 Computer 的 `call`（emit-with-ack）解析为成功、达 joined 状态（`leave_office` 走 `emit` 无 ack）；
+/// - ACK `server:join_office` 为成功空 ack——与真实 server 契约同构，使 Computer 的 `call`
+///  （emit-with-ack）解析为成功、达 joined 状态（`leave_office` 走 `emit` 无 ack）；
 /// - 记录 connect / disconnect / `server:update_tool_list`。
 async fn start_relay(obs: Arc<RelayObs>) -> (String, oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -91,11 +91,11 @@ async fn start_relay(obs: Arc<RelayObs>) -> (String, oneshot::Sender<()>) {
                 }
             });
 
-            // ACK join 成功（mirror 真实 server 的 `(bool, Option<String>)` = `[true, null]`）。
+            // ACK join 成功（mirror 真实 server 的空 ack）。
             socket.on(
                 "server:join_office",
                 move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {
-                    let _ = ack.send(&(true, None::<String>));
+                    let _ = ack.send(&());
                 },
             );
 
@@ -179,11 +179,11 @@ async fn start_relay_pinged(
                 }
             });
 
-            // ACK join 成功（mirror 真实 server 的 `(bool, Option<String>)` = `[true, null]`）。
+            // ACK join 成功（mirror 真实 server 的空 ack）。
             socket.on(
                 "server:join_office",
                 move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {
-                    let _ = ack.send(&(true, None::<String>));
+                    let _ = ack.send(&());
                 },
             );
 
