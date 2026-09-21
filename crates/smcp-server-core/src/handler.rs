@@ -85,6 +85,10 @@ impl serde::Serialize for HandlerError {
     }
 }
 
+/// Ack handlers return boxed payloads so the error path stays small on the async stack while
+/// preserving the same flat `ErrorPayload` wire shape.
+type RoomAckResult<T> = Result<T, Box<smcp::ErrorPayload>>;
+
 /// 在途断连信号注册表 / In-flight disconnect signal registry.
 ///
 /// 对标 Python `SMCPNamespace._inflight_disconnect_signals`（#100 Phase 1）。每个在途
@@ -614,7 +618,7 @@ impl SmcpHandler {
         socket: SocketRef,
         data: EnterOfficeReq,
         state: ServerState,
-    ) -> Result<(), smcp::ErrorPayload> {
+    ) -> RoomAckResult<()> {
         info!("on_server_join_office called with data: {:?}", data);
 
         let sid = socket.id.to_string();
@@ -626,23 +630,23 @@ impl SmcpHandler {
             Some(s) => {
                 // 检查角色/状态一致性
                 if s.role != requested_role {
-                    return Err(smcp::ErrorPayload::new(
+                    return Err(Box::new(smcp::ErrorPayload::new(
                         i64::from(smcp::error_codes::FORBIDDEN),
                         format!(
                             "Role mismatch: existing session has role {:?}, but requested {:?}",
                             s.role, requested_role
                         ),
-                    ));
+                    )));
                 }
 
                 if s.name != requested_name {
-                    return Err(smcp::ErrorPayload::new(
+                    return Err(Box::new(smcp::ErrorPayload::new(
                         i64::from(smcp::error_codes::FORBIDDEN),
                         format!(
                             "Name mismatch: existing session has name '{}', but requested '{}'",
                             s.name, requested_name
                         ),
-                    ));
+                    )));
                 }
 
                 s
@@ -663,7 +667,7 @@ impl SmcpHandler {
                     .with_a2c_version(a2c_version);
 
                 if let Err(e) = state.session_manager.register_session(new_session.clone()) {
-                    return Err(HandlerError::Session(e).to_error_payload());
+                    return Err(Box::new(HandlerError::Session(e).to_error_payload()));
                 }
                 new_session
             }
@@ -676,7 +680,7 @@ impl SmcpHandler {
             Ok(decision) => decision,
             Err(e) => {
                 error!("validate_join_room failed: {}", e);
-                return Err(e.to_error_payload());
+                return Err(Box::new(e.to_error_payload()));
             }
         };
 
@@ -684,7 +688,7 @@ impl SmcpHandler {
             .session_manager
             .update_office_id(&sid, Some(data.office_id.clone()))
         {
-            return Err(HandlerError::Session(e).to_error_payload());
+            return Err(Box::new(HandlerError::Session(e).to_error_payload()));
         }
 
         Self::apply_join_room(socket.clone(), &session, &data.office_id, decision).await;
@@ -722,7 +726,7 @@ impl SmcpHandler {
         socket: SocketRef,
         data: LeaveOfficeReq,
         state: ServerState,
-    ) -> Result<(), smcp::ErrorPayload> {
+    ) -> RoomAckResult<()> {
         let sid = socket.id.to_string();
 
         // 获取会话
@@ -785,7 +789,7 @@ impl SmcpHandler {
 
         // 更新会话
         if let Err(e) = state.session_manager.update_office_id(&sid, None) {
-            return Err(HandlerError::Session(e).to_error_payload());
+            return Err(Box::new(HandlerError::Session(e).to_error_payload()));
         }
         socket.leave(Self::office_room(&current_office));
 
@@ -1369,26 +1373,26 @@ impl SmcpHandler {
         socket: SocketRef,
         data: ListRoomReq,
         state: ServerState,
-    ) -> Result<ListRoomRet, smcp::ErrorPayload> {
+    ) -> RoomAckResult<ListRoomRet> {
         // 获取发起者会话信息
         let sid = socket.id.to_string();
         let session = match state.session_manager.get_session(&sid) {
             Some(s) => s,
             None => {
                 warn!("List room from unknown session sid={}", sid);
-                return Err(smcp::ErrorPayload::new(
+                return Err(Box::new(smcp::ErrorPayload::new(
                     i64::from(smcp::error_codes::NOT_IN_ROOM),
                     "Session is not in an office",
-                ));
+                )));
             }
         };
 
         if session.office_id.is_none() {
             warn!("List room from session outside an office sid={}", sid);
-            return Err(smcp::ErrorPayload::new(
+            return Err(Box::new(smcp::ErrorPayload::new(
                 i64::from(smcp::error_codes::NOT_IN_ROOM),
                 "Session is not in an office",
-            ));
+            )));
         }
 
         // 房间隔离：仅可查询自己所在的 office。判定下沉到纯函数 [`Self::list_room_authorized`]
@@ -1400,11 +1404,13 @@ impl SmcpHandler {
                 "list_room isolation rejected: session {} (office {:?}) requested room {}",
                 sid, session.office_id, data.office_id
             );
-            return Err(smcp::ErrorPayload::new(
-                i64::from(smcp::error_codes::CROSS_ROOM_ACCESS),
-                "Cross-room access denied",
-            )
-            .with_details(serde_json::json!({ "office_id": data.office_id })));
+            return Err(Box::new(
+                smcp::ErrorPayload::new(
+                    i64::from(smcp::error_codes::CROSS_ROOM_ACCESS),
+                    "Cross-room access denied",
+                )
+                .with_details(serde_json::json!({ "office_id": data.office_id })),
+            ));
         }
 
         // 获取指定办公室的所有会话
