@@ -72,6 +72,34 @@ impl StderrCapture {
                 .chain(args.iter().cloned())
                 .filter(|value| !value.is_empty()),
         );
+        // Command arguments can contain secret-like literals that are not represented as a
+        // complete environment value (for example, `--api-key TOKEN`). Retain only
+        // secret-shaped fragments so ordinary diagnostic words remain readable.
+        for arg in args {
+            values.extend(
+                arg.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+                    .filter(|value| {
+                        let lower = value.to_ascii_lowercase();
+                        value.len() >= 32
+                            || [
+                                "secret",
+                                "token",
+                                "password",
+                                "passwd",
+                                "api_key",
+                                "api-key",
+                                "access_key",
+                                "access-key",
+                                "authorization",
+                                "bearer",
+                                "leak",
+                            ]
+                            .iter()
+                            .any(|marker| lower.contains(marker))
+                    })
+                    .map(str::to_owned),
+            );
+        }
         let mut env_values: Vec<_> = values.into_iter().collect();
         env_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         Self {
@@ -599,14 +627,16 @@ impl MCPClientProtocol for StdioMCPClient {
         let handler = A2cClientHandler::new(self.notify.clone());
 
         let connect_timeout_secs = self.connect_timeout_secs;
-        let service_result = tokio::time::timeout(
-            Duration::from_secs(connect_timeout_secs),
-            handler.serve(transport),
-        )
-        .await;
+        // Keep the initialization task cancellable even when the transport is waiting on a
+        // child process that has not produced any bytes. A direct timeout around `serve` can
+        // leave the transport future detached on some runtimes, delaying cleanup and diagnostics.
+        let mut service_task = tokio::spawn(handler.serve(transport));
+        let service_result =
+            tokio::time::timeout(Duration::from_secs(connect_timeout_secs), &mut service_task)
+                .await;
         let service = match service_result {
-            Ok(Ok(service)) => service,
-            Ok(Err(error)) => {
+            Ok(Ok(Ok(service))) => service,
+            Ok(Ok(Err(error))) => {
                 let (phase, upgrade_to_process_exit) = Self::initialize_phase(&error);
                 return Err(self
                     .initialization_error(
@@ -619,14 +649,25 @@ impl MCPClientProtocol for StdioMCPClient {
                     )
                     .await);
             }
+            Ok(Err(error)) => {
+                return Err(self
+                    .initialization_error(
+                        StdioInitializationPhase::InitializeProtocolError,
+                        true,
+                        format!("Initialize task failed: {error}"),
+                    )
+                    .await)
+            }
             Err(_) => {
+                service_task.abort();
+                let _ = service_task.await;
                 return Err(self
                     .initialization_error(
                         StdioInitializationPhase::InitializeTimeout,
                         false,
                         format!("STDIO connect timed out after {}s", connect_timeout_secs),
                     )
-                    .await)
+                    .await);
             }
         };
 
