@@ -60,7 +60,9 @@ jobs:
         run: cargo doc --workspace --all-features --no-deps
 
       - name: Run tests
-        run: cargo test --workspace --features agent,computer,server
+        # STDIO integration tests spawn short-lived child processes; serialize test
+        # threads to avoid timing races under shared CI runners.
+        run: cargo test --workspace --features agent,computer,server -- --test-threads=1
 
   # 单独测试各个 crate 以确保独立可用
   test-crates:
@@ -92,7 +94,9 @@ jobs:
         run: cargo test -p smcp-agent --all-features
 
       - name: Test smcp-computer
-        run: cargo test -p smcp-computer --features vrl,cli
+        # STDIO integration tests spawn short-lived child processes; serialize this
+        # crate's test threads to avoid timing races under shared CI runners.
+        run: cargo test -p smcp-computer --features vrl,cli -- --test-threads=1
 
       - name: Test Atlassian OAuth UAT driver
         run: cargo test -p smcp-computer --example oauth_atlassian_uat
