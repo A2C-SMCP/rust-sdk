@@ -72,34 +72,6 @@ impl StderrCapture {
                 .chain(args.iter().cloned())
                 .filter(|value| !value.is_empty()),
         );
-        // Command arguments can contain secret-like literals that are not represented as a
-        // complete environment value (for example, `--api-key TOKEN`). Retain only
-        // secret-shaped fragments so ordinary diagnostic words remain readable.
-        for arg in args {
-            values.extend(
-                arg.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
-                    .filter(|value| {
-                        let lower = value.to_ascii_lowercase();
-                        value.len() >= 32
-                            || [
-                                "secret",
-                                "token",
-                                "password",
-                                "passwd",
-                                "api_key",
-                                "api-key",
-                                "access_key",
-                                "access-key",
-                                "authorization",
-                                "bearer",
-                                "leak",
-                            ]
-                            .iter()
-                            .any(|marker| lower.contains(marker))
-                    })
-                    .map(str::to_owned),
-            );
-        }
         let mut env_values: Vec<_> = values.into_iter().collect();
         env_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         Self {
@@ -116,12 +88,13 @@ impl StderrCapture {
             MAX_STDIO_STDERR_BYTES + STDERR_REDACTION_CONTEXT_BYTES,
         );
 
-        let mut sanitized = self.raw_tail.clone();
+        // Redact credential syntax before environment values can obscure its keys.
+        let mut sanitized = redact_stderr_key_values(&self.raw_tail);
         for value in &self.env_values {
             sanitized = sanitized.replace(value, "<redacted>");
         }
         sanitized = redact_git_urls_in_text(&sanitized);
-        self.tail = redact_stderr_key_values(&sanitized);
+        self.tail = sanitized;
         trim_tail(&mut self.tail, MAX_STDIO_STDERR_BYTES);
     }
 }
@@ -344,8 +317,16 @@ impl StdioMCPClient {
     }
 
     async fn finish_stderr_capture(&self) -> String {
-        if let Some(handle) = self.stderr_drain_task.lock().await.take() {
-            let _ = handle.await;
+        if let Some(mut handle) = self.stderr_drain_task.lock().await.take() {
+            // Descendants can retain stderr after the direct child is reaped. Drain
+            // buffered output, but never wait indefinitely for their pipe handles.
+            if tokio::time::timeout(Duration::from_millis(250), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
         self.stderr_capture.lock().await.tail.clone()
     }
@@ -627,16 +608,14 @@ impl MCPClientProtocol for StdioMCPClient {
         let handler = A2cClientHandler::new(self.notify.clone());
 
         let connect_timeout_secs = self.connect_timeout_secs;
-        // Keep the initialization task cancellable even when the transport is waiting on a
-        // child process that has not produced any bytes. A direct timeout around `serve` can
-        // leave the transport future detached on some runtimes, delaying cleanup and diagnostics.
-        let mut service_task = tokio::spawn(handler.serve(transport));
-        let service_result =
-            tokio::time::timeout(Duration::from_secs(connect_timeout_secs), &mut service_task)
-                .await;
+        let service_result = tokio::time::timeout(
+            Duration::from_secs(connect_timeout_secs),
+            handler.serve(transport),
+        )
+        .await;
         let service = match service_result {
-            Ok(Ok(Ok(service))) => service,
-            Ok(Ok(Err(error))) => {
+            Ok(Ok(service)) => service,
+            Ok(Err(error)) => {
                 let (phase, upgrade_to_process_exit) = Self::initialize_phase(&error);
                 return Err(self
                     .initialization_error(
@@ -649,25 +628,14 @@ impl MCPClientProtocol for StdioMCPClient {
                     )
                     .await);
             }
-            Ok(Err(error)) => {
-                return Err(self
-                    .initialization_error(
-                        StdioInitializationPhase::InitializeProtocolError,
-                        true,
-                        format!("Initialize task failed: {error}"),
-                    )
-                    .await)
-            }
             Err(_) => {
-                service_task.abort();
-                let _ = service_task.await;
                 return Err(self
                     .initialization_error(
                         StdioInitializationPhase::InitializeTimeout,
                         false,
                         format!("STDIO connect timed out after {}s", connect_timeout_secs),
                     )
-                    .await);
+                    .await)
             }
         };
 
@@ -1380,6 +1348,20 @@ mod tests {
 
         // 验证状态变为已断开
         assert_eq!(client.base.get_state().await, ClientState::Disconnected);
+    }
+
+    #[test]
+    fn stderr_redacts_credentials_before_overlapping_environment_values() {
+        let mut capture = StderrCapture {
+            raw_tail: String::new(),
+            tail: String::new(),
+            // Short inherited values must not destroy credential keys before matching.
+            env_values: vec!["KEY".to_string(), "token".to_string()],
+        };
+        capture
+            .append(b"AWS_SECRET_ACCESS_KEY=hidden-one token=hidden-two --api-key hidden-three\n");
+        assert!(!capture.tail.contains("hidden-"));
+        assert!(capture.tail.contains("<redacted>"));
     }
 
     #[test]

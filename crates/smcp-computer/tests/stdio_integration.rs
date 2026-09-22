@@ -135,8 +135,13 @@ async fn test_stdio_initialize_timeout_is_structured() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_stdio_protocol_error_is_distinguished() {
+    // `exec sleep 30` 让子进程在应答后**继续存活**：判别「协议错误」要求服务端先读到 JSON-RPC error
+    // 再谈进程退出。若子进程应答完立即退出，「读到 error」与「观测到 stdout EOF / 进程退出」成为竞速，
+    // 结果会在 `InitializeProtocolError` 与 `ProcessExitedBeforeInitialize` 之间抖动（负载下实测可复现，
+    // 这也是历史上 CI 给本套件加 `--test-threads=1` 的成因）。保持存活即消除该竞速，使断言确定性成立，
+    // 同时顺带覆盖「拿到协议错误后清理（kill + 有界 stderr 抽取）」路径。
     let client = StdioMCPClient::new(shell_params(
-        "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"bad initialize token=PROVIDER_SECRET_SHOULD_NOT_LEAK\"}}'",
+        "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"bad initialize token=PROVIDER_SECRET_SHOULD_NOT_LEAK\"}}'; exec sleep 30",
     ));
     let error = client
         .connect()
@@ -246,7 +251,7 @@ async fn test_stdio_connect_timeout_with_bad_server() {
 async fn test_stdio_custom_connect_timeout_reports_effective_value() {
     let params = StdioServerParameters {
         command: "sh".to_string(),
-        args: vec!["-c".to_string(), "sleep 5".to_string()],
+        args: vec!["-c".to_string(), "sleep 5 & wait".to_string()],
         env: HashMap::new(),
         cwd: None,
     };
