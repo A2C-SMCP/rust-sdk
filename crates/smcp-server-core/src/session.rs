@@ -180,7 +180,7 @@ pub enum LeaveCommit {
 /// 从此无人释放（#226 P1-4）。
 ///
 /// 故：**读**走 DashMap 无锁路径（`client:*` 路由与 `list_room` 每帧查表，热点在读）；
-/// **写**（注册 / 入房 / 退房 / 注销）一律经 [`SessionManager::transition`] 串行化。
+/// **写**（注册 / 入房 / 退房 / 注销）一律经 `SessionManager::transition()` 临界区串行化。
 /// 临界区**只覆盖同步段**（内含零 `.await`），转换是短操作，故用 `std::sync::Mutex`。
 ///
 #[derive(Debug)]

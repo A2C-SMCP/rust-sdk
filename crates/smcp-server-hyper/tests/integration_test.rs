@@ -668,9 +668,9 @@ async fn test_computer_name_conflict() {
         emit_event_with_ack_validation(&computer1, "server:join_office", join_data1, true)
             .await
             .unwrap();
-    // 成功响应为空 ack。
-    println!("DEBUG: response1 = {:?}", response1);
-    assert_eq!(response1, serde_json::json!([null]));
+    // 成功响应为**零参**空 ack `[]`（v0.5.0 起与 python-socketio 参考实现逐字节一致；
+    // 旧的 `[null]` 是 socketioxide `ack.send(&())` 多带一个 null 实参的形态）。
+    assert_eq!(response1, serde_json::json!([]));
 
     // 第二个 Computer 尝试使用相同名称加入
     let computer2 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
@@ -710,8 +710,8 @@ async fn test_computer_name_conflict() {
         emit_event_with_ack_validation(&computer3, "server:join_office", join_data3, true)
             .await
             .unwrap();
-    // 成功回空 ack。
-    assert_eq!(response3, serde_json::json!([null]));
+    // 成功回**零参**空 ack `[]`。
+    assert_eq!(response3, serde_json::json!([]));
 }
 
 #[tokio::test]
