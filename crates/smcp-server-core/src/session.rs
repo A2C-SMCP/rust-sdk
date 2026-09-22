@@ -309,24 +309,6 @@ impl SessionManager {
         self.sessions.get(sid).map(|s| s.clone())
     }
 
-    /// 通过名称获取会话 ID
-    pub fn get_sid_by_name(&self, name: &str) -> Option<SessionId> {
-        // Legacy compatibility lookup: without an office this is only safe
-        // when exactly one Agent with that name exists.  Ambiguous names are
-        // intentionally not resolved across rooms.
-        let mut matches = self
-            .sessions
-            .iter()
-            .filter(|s| s.role == ClientRole::Agent && s.name == name)
-            .map(|s| s.sid.clone());
-        let sid = matches.next()?;
-        if matches.next().is_none() {
-            Some(sid)
-        } else {
-            None
-        }
-    }
-
     /// 取或建会话（原子）：`sid` 已存在则**原样返回**既有记录，否则按入参建一条**无房**会话。
     ///
     /// 与「先 `get_session` 再 `register_session`」的**非原子**两步式的区别：两个并发 `join` 拿不到
@@ -558,15 +540,6 @@ impl SessionManager {
         })
     }
 
-    /// 检查房间内是否有指定名称的 Computer
-    pub fn has_computer_in_office(&self, office_id: &OfficeId, name: &str) -> bool {
-        self.sessions.iter().any(|s| {
-            s.office_id.as_ref() == Some(office_id)
-                && s.role == ClientRole::Computer
-                && s.name == name
-        })
-    }
-
     /// 获取房间内指定 Computer 的 sid
     pub fn get_computer_sid_in_office(
         &self,
@@ -649,8 +622,9 @@ mod tests {
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name, "test_agent");
 
-        // A single unambiguous legacy lookup remains available.
-        assert_eq!(manager.get_sid_by_name("test_agent"), Some(sid));
+        // 房内解析（`get_computer_sid_in_office`）以外的全局按名查找已删除（#226 复审 🟡1）：
+        // 名字解析 MUST 限定在会话所在房内，故这里只能断言记录本身。
+        assert_eq!(manager.get_all_sessions().len(), 1);
     }
 
     #[test]
@@ -863,8 +837,13 @@ mod tests {
         // 检查是否有 Agent
         assert!(!manager.has_agent_in_office(&office_id));
 
-        // 检查是否有指定 Computer
-        assert!(manager.has_computer_in_office(&office_id, "test_computer"));
+        // 检查是否有指定 Computer（房内解析，替换已删除的全局按名查找）
+        assert_eq!(
+            manager
+                .get_computer_sid_in_office(&office_id, "test_computer")
+                .as_deref(),
+            Some(sid.as_str())
+        );
     }
 
     #[test]
@@ -881,7 +860,7 @@ mod tests {
 
         // 验证会话已删除
         assert!(manager.get_session(&sid).is_none());
-        assert!(manager.get_sid_by_name("test_agent").is_none());
+        assert!(manager.get_all_sessions().is_empty());
     }
 
     #[test]

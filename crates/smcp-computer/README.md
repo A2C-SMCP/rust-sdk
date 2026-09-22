@@ -335,6 +335,10 @@ match manager.execute_tool("tool_name", params, timeout).await {
     Err(ComputerError::ProtocolError(msg)) => {
         eprintln!("Protocol error: {}", msg);
     }
+    // 对端结构化拒绝（房间/身份类）：按码分流，无需解析字符串
+    Err(ComputerError::ProtocolRejection { code, message, details }) => {
+        eprintln!("Peer rejected ({code}): {message} details={details:?}");
+    }
     Err(ComputerError::TimeoutError(msg)) => {
         eprintln!("Timeout error: {}", msg);
     }

@@ -74,8 +74,13 @@ pub enum ComputerError {
     /// 连接错误 / Connection error
     ConnectionError(String),
 
-    #[error("Connection error: {0}")]
     /// Structured stdio child-process initialization diagnostics.
+    ///
+    /// **透传内层文案**（#226 复审 🟡8）：内层 `StdioInitializationError` 已按失败相位写好类别前缀
+    /// （`InitializeTimeout` ⇒ `Timeout error: …`，其余 ⇒ `Connection error: …`）。此处若再套一层
+    /// `"Connection error: "`，非超时相位会产出 `Connection error: Connection error: …` 的重复前缀，
+    /// 而超时相位会被**错误分类**为连接错误——与变体语义不符，故不再包裹。
+    #[error("{0}")]
     StdioInitialization(#[from] crate::mcp_clients::StdioInitializationError),
 
     #[error("HTTP authentication error: {0}")]
@@ -106,6 +111,26 @@ pub enum ComputerError {
     #[error("Protocol error: {0}")]
     /// 协议错误 / Protocol error
     ProtocolError(String),
+
+    /// 对端在 ack 上回传的**结构化协议拒绝**（房间/身份类）：协议码与 `details` **原样保留**。
+    ///
+    /// 与 [`Self::ProtocolError`] 的分工（#226 复审 🟡4）：`ProtocolError(String)` 是**本端**发现的
+    /// 协议违约（字符串描述即可，没有对端码）；本变体承载**对端裁决**，故必须让消费方**按码分流**——
+    /// 协议 §建议的重试策略把 `4101` / `4105` 定为传输层重连后的瞬态冲突（可有界退避重试），
+    /// `4106` / `400` 为永久失败。历史实现把整包 `format!` 成 `"room join rejected (4101): …"`，
+    /// 消费方只能靠字符串解析（#219 的按码退避因此无从实现）。
+    ///
+    /// Carries the peer's structured rejection verbatim so consumers can dispatch on `code` instead of
+    /// parsing a formatted string.
+    #[error("Protocol rejection ({code}): {message}")]
+    ProtocolRejection {
+        /// 对端 flat `ErrorPayload.code`（如 `4101` / `4105` / `4106`）。
+        code: i64,
+        /// 对端 `message`（协议 canonical 文案）。
+        message: String,
+        /// 对端 `details` 原样保留（诊断容器；`Agent` 侧同款字段语义见 `SmcpProtocolError::details`）。
+        details: Option<serde_json::Value>,
+    },
 
     #[error("Socket.IO error: {0}")]
     /// Socket.IO错误 / Socket.IO error
@@ -203,6 +228,8 @@ impl ComputerError {
 
             // 协议错误 / Protocol errors
             ComputerError::ProtocolError(_) => 500, // INTERNAL_ERROR
+            // 对端结构化拒绝：码空间就是协议码本身（4101/4105/4106…），原样透出以便按码分流。
+            ComputerError::ProtocolRejection { code, .. } => *code as i32,
 
             // 状态错误 / State errors
             ComputerError::InvalidState(_) => 400, // BAD_REQUEST
@@ -293,6 +320,47 @@ pub enum McpClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #226 复审 🟡4：对端结构化拒绝 MUST 保留 `code` / `details`，使消费方**按码分流**
+    /// （瞬态 `4101` / `4105` vs 永久 `4106` / `400`），而不是解析 `"room join rejected (4101): …"`
+    /// 这类格式化字符串。
+    #[test]
+    fn protocol_rejection_preserves_code_message_and_details() {
+        let err = ComputerError::ProtocolRejection {
+            code: 4101,
+            message: "Room already has an agent".to_string(),
+            details: Some(serde_json::json!({"office_id": "office-a"})),
+        };
+
+        // ① 码原样透出（`error_code()` 不再是笼统 500）。
+        assert_eq!(err.error_code(), 4101);
+        // ② 结构化字段可直接 match，无需字符串解析。
+        match &err {
+            ComputerError::ProtocolRejection {
+                code,
+                message,
+                details,
+            } => {
+                assert_eq!(*code, 4101);
+                assert_eq!(message, "Room already has an agent");
+                assert_eq!(
+                    details
+                        .as_ref()
+                        .and_then(|d| d.get("office_id"))
+                        .and_then(|v| v.as_str()),
+                    Some("office-a")
+                );
+            }
+            other => panic!("expected ProtocolRejection, got {other:?}"),
+        }
+        // ③ Display 仍携带码与文案（日志可读）。
+        let displayed = err.to_string();
+        assert!(displayed.contains("4101"), "{displayed}");
+        assert!(
+            displayed.contains("Room already has an agent"),
+            "{displayed}"
+        );
+    }
 
     #[test]
     fn test_protocol_version_mismatch_from_payload() {

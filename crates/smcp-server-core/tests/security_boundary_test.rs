@@ -49,6 +49,31 @@ async fn emit_with_ack(
         .expect("ack callback dropped")
 }
 
+/// 以**多个实参**发出请求（Socket.IO 事件可以携带 `[event, arg0, arg1, …]`）。
+///
+/// 仅用于「有效载荷 + 多余实参」这类**实参个数**用例：`Vec<Value>` 经 `Into<Payload>` 变成
+/// `Payload::Text(vec![…])`，即多个线上实参，而不是把它们打包进单个数组实参。
+async fn emit_with_ack_args(
+    client: &tf_rust_socketio::asynchronous::Client,
+    event: &str,
+    args: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let (tx, rx) = oneshot::channel();
+    client
+        .emit_with_ack(
+            event,
+            args,
+            Duration::from_secs(5),
+            ack_to_sender(tx, ack_value),
+        )
+        .await
+        .expect("emit_with_ack failed");
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("ack timeout")
+        .expect("ack callback dropped")
+}
+
 #[tokio::test]
 async fn malformed_ack_payloads_return_flat_bad_request() {
     let server = SmcpTestServer::start().await;
@@ -383,17 +408,36 @@ async fn leave_office_without_session_room_is_idempotent_and_does_not_broadcast(
         "a session without an office must not broadcast using the payload office"
     );
 
-    // #226 假绿清单第 3 条：旧版唯一断言是「没有广播」，把成员收敛整段删掉照样绿（idle 客户端的
-    // `socket.rooms()` 为空，所有 leave 分支都是死路）。故补一条**可判别**的收敛断言：idle 客户端
-    // 退房后必须仍**不是**该房成员——目标房成员后续的入场广播不得送达它。
-    let entered_office_received = Arc::new(AtomicBool::new(false));
-    let room_flag = entered_office_received.clone();
-    let idle = create_client_with_handler(
+    // 说明（#226 复审 🔴2）：本用例**不**再声称覆盖成员收敛——它用的连接从未入过任何房，
+    // `socket.rooms()` 恒空，把 `converge_socket_rooms` 整段删掉也照样绿（本次实测确认）。
+    // 「无房会话退房后不是任何房成员」的**判别性**覆盖交给
+    // [`leave_office_converges_socket_room_membership`]：那条用例先让客户端**真的**进房、再退房，
+    // 并带正对照证明广播确实会送达该房成员。
+    idle.disconnect().await.unwrap();
+    victim.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// #226 复审 🔴2：`converge_socket_rooms`（协议 `events.md` §server:leave_office 的 SHOULD 收敛路径）
+/// 此前**零判别性覆盖**——原用例的客户端从未入过任何房，摘掉收敛调用仍全绿。
+///
+/// 判别性构造：先让 `leaver` **真的**在 `office-b` 里（正对照：此时 `late` 入场广播必须送达它，
+/// 否则下面的负断言恒真），再让 `leaver` 退房（会话无房 ⇒ socket MUST 收敛出 `office:office-b`），
+/// 然后让新的成员进 `office-b`——`leaver` **不得**再收到该房的 `notify:enter_office`。
+/// 摘掉 `converge_socket_rooms` 即红（socket 会留在 `office:office-b` 里继续收广播）。
+#[tokio::test]
+async fn leave_office_converges_socket_room_membership() {
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+
+    let entered_received = Arc::new(AtomicBool::new(false));
+    let flag = entered_received.clone();
+    let leaver = create_client_with_handler(
         &server_url,
         SMCP_NAMESPACE,
         events::NOTIFY_ENTER_OFFICE,
         move |_, _| {
-            let flag = room_flag.clone();
+            let flag = flag.clone();
             Box::pin(async move {
                 flag.store(true, Ordering::SeqCst);
             })
@@ -401,28 +445,205 @@ async fn leave_office_without_session_room_is_idempotent_and_does_not_broadcast(
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let leave_again = emit_with_ack(
-        &idle,
+    join_office(&leaver, Role::Agent, "office-b", "leaver").await;
+
+    // ── 正对照：leaver 此刻是 office-b 成员 ⇒ 后来的成员入场广播 MUST 送达它 ──────────────
+    let late = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    join_office(&late, Role::Computer, "office-b", "late").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        entered_received.swap(false, Ordering::SeqCst),
+        "正对照失败：房内成员未收到 notify:enter_office，负断言将失去判别力"
+    );
+
+    // ── 退房：会话无房 ⇒ socket MUST 收敛出 office:office-b ────────────────────────────
+    let leave = emit_with_ack(
+        &leaver,
         events::SERVER_LEAVE_OFFICE,
         json!(LeaveOfficeReq {
             office_id: "office-b".to_string(),
         }),
     )
     .await;
-    assert_empty_ack(&leave_again, "server:leave_office（无会话连接）");
-
-    // 让 office-b 发生一次成员变更：该房成员会收到 notify:enter_office。无房会话 MUST NOT 收到。
-    let late = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    assert_empty_ack(&leave, "server:leave_office");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    join_office(&late, Role::Computer, "office-b", "late").await;
+
+    // ── 负断言：office-b 再次发生成员变更时，已退房的 leaver MUST NOT 收到其广播 ──────────
+    let newcomer = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    join_office(&newcomer, Role::Agent, "office-b", "newcomer").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        !entered_office_received.load(Ordering::SeqCst),
-        "无房会话退房后 MUST NOT 是任何房的成员（漂移收敛）"
+        !entered_received.load(Ordering::SeqCst),
+        "退房后会话 MUST NOT 仍是 office:office-b 的成员（漂移收敛：socket 仍留在房里即红）"
     );
 
+    newcomer.disconnect().await.unwrap();
     late.disconnect().await.unwrap();
-    idle.disconnect().await.unwrap();
-    victim.disconnect().await.unwrap();
+    leaver.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// #226 复审 🔴4：`403`（身份声明冲突）此前在本仓**整个错误码零覆盖**。
+///
+/// 逐条对齐 Python `tests/unit_tests/server/test_room_event_acks.py`：`role` 半、`name` 半、
+/// 无 `details`，外加「同身份的重复入房幂等成功」对照。协议 §各错误码标准字段总表没有 `403` 行，
+/// 文案是双 SDK 自拟——恰是最该被钉住的字符串。
+#[tokio::test]
+async fn identity_claim_mismatch_returns_flat_403_without_details() {
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+    let client = create_test_client(&server_url, SMCP_NAMESPACE).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    join_office(&client, Role::Agent, "office-a", "agent").await;
+
+    // ① role 半：同一连接声明 `computer`，与既有会话的 `agent` 不符 ⇒ 403。
+    let role_mismatch = emit_with_ack(
+        &client,
+        events::SERVER_JOIN_OFFICE,
+        json!({"role": "computer", "name": "agent", "office_id": "office-a"}),
+    )
+    .await;
+    assert_eq!(role_mismatch["code"], 403);
+    assert_eq!(
+        role_mismatch["message"],
+        "Role or name mismatch with existing session"
+    );
+    assert!(
+        role_mismatch.get("details").is_none(),
+        "403 无 code-specific 字段，不得携带 details: {role_mismatch}"
+    );
+
+    // ② name 半：role 不变、name 变 ⇒ 同样 403（身份在一次连接内不可变更）。
+    let name_mismatch = emit_with_ack(
+        &client,
+        events::SERVER_JOIN_OFFICE,
+        json!({"role": "agent", "name": "someone-else", "office_id": "office-a"}),
+    )
+    .await;
+    assert_eq!(name_mismatch["code"], 403);
+    assert_eq!(
+        name_mismatch["message"],
+        "Role or name mismatch with existing session"
+    );
+    assert!(name_mismatch.get("details").is_none());
+
+    // ③ 对照：身份**完全一致**的重复入房 MUST 幂等成功（空 ack）——证明 403 不是「重复 join 就拒」，
+    // 也证明前两次拒绝没有污染会话状态（否则这里会因 name 预留冲突而 4105）。
+    let same_identity = emit_with_ack(
+        &client,
+        events::SERVER_JOIN_OFFICE,
+        json!({"role": "agent", "name": "agent", "office_id": "office-a"}),
+    )
+    .await;
+    assert_empty_ack(&same_identity, "同身份重复 server:join_office");
+
+    client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// #226 复审 🟡3 的**口径落定**：无房会话发起 `client:*` 仍回 flat `404`（与 python-sdk 一致），
+/// 本轮**不**接 `4103`。
+///
+/// 协议 `error-handling.md` §Not In Room（4103）把「`client:*` 路由请求」列入触发时机，而 python-sdk
+/// 的 `namespace.py` 同样走 raise / 404——属**协议文本 vs 双 SDK** 的共同缺口，不是本仓单方缺陷。
+/// 单边接 4103 会让两个 SDK 在**同一请求**上给出不同码，与本 PR「统一错误契约」的目标相反；故本轮
+/// 保留 404 并用本用例钉死该口径（改成 4103 即红），偏差登记在协议侧待两边同步。
+#[tokio::test]
+async fn no_room_client_call_returns_flat_404_not_4103() {
+    let server = SmcpTestServer::start().await;
+    let client = create_test_client(&server.url(), SMCP_NAMESPACE).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 构造「有会话、无房」：先入房再退房（`commit_leave` 只清 `office_id`，会话记录仍在）。
+    // 注意**不要**用「从未 join 的连接」：那种连接连会话都没有，走的是 `SessionError::NotFound` ⇒
+    // `relay_client_call` 镜像 Python `raise` 而**不投递任何 ack**（发起方自行超时），与本条要钉的
+    // 「无房 ⇒ flat 404」不是同一分支。
+    join_office(&client, Role::Agent, "office-a", "agent").await;
+    let leave = emit_with_ack(
+        &client,
+        events::SERVER_LEAVE_OFFICE,
+        json!(LeaveOfficeReq {
+            office_id: "office-a".to_string(),
+        }),
+    )
+    .await;
+    assert_empty_ack(&leave, "server:leave_office");
+
+    // 无 `office_id` ⇒ 无从定位目标 Computer ⇒ flat 404（本轮口径，见函数文档）。
+    let response = emit_with_ack(
+        &client,
+        events::CLIENT_GET_TOOLS,
+        json!({"agent": "agent", "req_id": "no-room", "computer": "computer"}),
+    )
+    .await;
+
+    assert_eq!(
+        response["code"], 404,
+        "本轮口径 = 与 python 对齐的 flat 404（不是 4103）: {response}"
+    );
+    assert_eq!(
+        response["message"],
+        "Computer with name 'computer' not found"
+    );
+    assert_ne!(
+        response["code"], 4103,
+        "4103 需协议侧与 python 同步接线后再切，单边改码会制造跨 SDK 分歧"
+    );
+
+    client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// #226 复审 🟡9：**有效载荷 + 多余实参 ⇒ flat `400`**（对齐 Python
+/// `test_valid_payload_plus_extra_argument_is_rejected`）。
+///
+/// socketioxide 的解析器对非 tuple-like 的 `T` 只取**首参**、静默丢弃多余实参，故历史实现会
+/// 「接受」这类报文。服务端统一改用 1-tuple 提取器（`SingleArg<T>`）后，实参个数不为 1 即解析失败 ⇒
+/// 与其他载荷畸形走同一条 `400` 通道。摘掉 1-tuple（回退成 `TryData::<T>`）本用例即红——
+/// 例如 `server:join_office` 会以空 ack 成功返回。
+#[tokio::test]
+async fn valid_payload_plus_extra_argument_returns_flat_bad_request() {
+    let server = SmcpTestServer::start().await;
+    let client = create_test_client(&server.url(), SMCP_NAMESPACE).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let cases: [(&str, serde_json::Value); 4] = [
+        (
+            events::SERVER_JOIN_OFFICE,
+            json!({"role": "agent", "name": "agent", "office_id": "office-a"}),
+        ),
+        (
+            events::SERVER_LEAVE_OFFICE,
+            json!({"office_id": "office-a"}),
+        ),
+        (
+            events::SERVER_LIST_ROOM,
+            json!({"agent": "agent", "req_id": "extra", "office_id": "office-a"}),
+        ),
+        (
+            events::CLIENT_GET_TOOLS,
+            json!({"agent": "agent", "req_id": "extra", "computer": "computer"}),
+        ),
+    ];
+
+    for (event, valid_payload) in cases {
+        let response = emit_with_ack_args(
+            &client,
+            event,
+            vec![valid_payload, json!("surplus-argument")],
+        )
+        .await;
+        assert_eq!(
+            response["code"], 400,
+            "{event}: 有效载荷 + 多余实参 MUST 回 flat 400: {response}"
+        );
+        assert_eq!(response["message"], "Invalid request payload");
+        assert!(response.get("details").is_none());
+    }
+
+    client.disconnect().await.unwrap();
     server.shutdown();
 }

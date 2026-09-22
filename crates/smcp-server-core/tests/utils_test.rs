@@ -233,8 +233,16 @@ async fn test_validate_agent_in_office() {
     assert!(!session_manager.has_agent_in_office(&"office2".to_string()));
     assert!(!session_manager.has_agent_in_office(&"office3".to_string()));
 
-    // 测试Computer不能通过Agent验证
-    assert!(session_manager.has_computer_in_office(&"office1".to_string(), "computer1"));
+    // 测试Computer不能通过Agent验证（房内按名解析走 `get_computer_sid_in_office`；
+    // 全局按名查找 `has_computer_in_office` / `get_sid_by_name` 已按 #226 复审 🟡1 删除）
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "computer1"),
+        Some("computer_sid".to_string())
+    );
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "agent1"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -277,8 +285,15 @@ async fn test_get_agent_session_in_office() {
     let office2_sessions = session_manager.get_sessions_in_office(&"office2".to_string());
     assert!(!office2_sessions.iter().any(|s| s.name == "agent1"));
 
-    // Test Computer not found as agent
-    assert!(session_manager.has_computer_in_office(&"office1".to_string(), "computer1"));
+    // Test Computer not found as agent（按 Computer 角色解析，故 Agent 名查不到）
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "computer1"),
+        Some("computer_sid".to_string())
+    );
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "agent1"),
+        None
+    );
 }
 
 #[tokio::test]

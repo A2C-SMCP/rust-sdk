@@ -22,9 +22,13 @@ use serde_json::Value;
 /// 「无法判定」时的兜底文案（既非空 ack、也非可识别 flat ErrorPayload）。
 ///
 /// 注意它**不再**表示「空响应失败」——自协议 v0.5.0 起空 ack 是**成功**；真正落进本文案的是形状
-/// 不认识的响应（如已废除的 `(bool, str | None)` 元组形态）。逐字对齐 Python
-/// `a2c_smcp/utils/office.py::NO_RESPONSE_MESSAGE`。
-pub const NO_RESPONSE_MESSAGE: &str = "No response from server";
+/// 不认识的响应（如已废除的 `(bool, str | None)` 元组形态）。
+///
+/// ⚠️ 该串是**用户可见**的兜底文案，且与 Python 参考实现**逐字对齐**——Python
+/// `a2c_smcp/utils/office.py::NO_RESPONSE_MESSAGE` 是**双语**串
+/// （`"服务器未返回结果 / No response from server"`）。历史实现只取了英文半句却仍声称「逐字对齐」，
+/// 任何跨 SDK 的报文 / fixture 对照都会红（#226 复审 🔴1）。改文案必须两边同时改。
+pub const NO_RESPONSE_MESSAGE: &str = "服务器未返回结果 / No response from server";
 
 /// A2C-SMCP 协议级错误（flat ErrorPayload）/ A2C-SMCP protocol-level error (flat ErrorPayload)。
 ///
@@ -236,6 +240,19 @@ mod tests {
         let indeterminate = parse_room_ack(&json!([true, null])).unwrap_err();
         assert_eq!(indeterminate.code, -1);
         assert_eq!(indeterminate.message, NO_RESPONSE_MESSAGE);
+    }
+
+    /// #226 复审 🔴1：「无法判定」兜底文案必须与 Python 参考实现**逐字**一致。
+    ///
+    /// Python `a2c_smcp/utils/office.py::NO_RESPONSE_MESSAGE` 是**双语**串；历史实现只保留了英文
+    /// 半句，却在注释里声称已对齐——跨 SDK 报文对照（以及任何以文案为判据的 fixture）都会红。
+    /// 本断言把字面值钉死，改文案必须两边同时改。
+    #[test]
+    fn test_no_response_message_matches_python_reference_verbatim() {
+        assert_eq!(
+            NO_RESPONSE_MESSAGE,
+            "服务器未返回结果 / No response from server"
+        );
     }
 
     #[test]

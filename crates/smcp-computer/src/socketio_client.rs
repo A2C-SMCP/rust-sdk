@@ -1179,16 +1179,21 @@ impl SmcpComputerClient {
             return Ok(());
         }
 
-        if let Some(error) = actual_response.first().and_then(|value| {
-            value.get("code").and_then(Value::as_i64).map(|code| {
-                let message = value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Room join rejected");
-                format!("room join rejected ({code}): {message}")
-            })
-        }) {
-            return Err(ComputerError::ProtocolError(error));
+        // 结构化拒绝：码 + 文案 + `details` **原样保留**（不再 `format!` 成字符串）。
+        // 消费方（如 #219 的有界退避）据此按码分流 `4101` / `4105`（瞬态）与 `4106` / `400`（永久），
+        // 无需解析字符串（#226 复审 🟡4）。
+        if let Some(value) = actual_response.first() {
+            if let Some(code) = value.get("code").and_then(Value::as_i64) {
+                return Err(ComputerError::ProtocolRejection {
+                    code,
+                    message: value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Room join rejected")
+                        .to_string(),
+                    details: value.get("details").cloned(),
+                });
+            }
         }
 
         Err(ComputerError::SocketIoError(format!(

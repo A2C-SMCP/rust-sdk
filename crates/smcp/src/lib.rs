@@ -493,6 +493,27 @@ impl RoomRejectionCode {
     }
 }
 
+/// 房间管理事件**业务拒绝**的上下文（只含与**发起者自身**相关的字段）。
+///
+/// 为什么不是三个相邻的 `Option<&str>` 位置参数：三者语义互不相同（发起者声明的**目标房** /
+/// 发起者**自己声明**的 role / 会话**当前**所在房），而位置参数下 `(Some(x), None, None)` 与
+/// `(None, None, Some(x))` **都能编译**——写反即静默的线上语义错误（例如 `4106` 把「被拒的目标房」
+/// 当成「当前所在房」报出去，客户端据此误判自己身在何处）。具名结构体让每个值的来源在调用点自解释；
+/// Python 参考实现用 keyword-only（`*`）表达同一约束。
+///
+/// Why a named struct instead of three adjacent `Option<&str>`s: the three sources have distinct
+/// meanings and positional arguments cannot tell them apart at compile time. Python enforces the same
+/// with keyword-only arguments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoomRejectionContext<'a> {
+    /// 发起者自己声明的**目标房**：`4101` / `4104` / `4105` 的 `details.office_id`。
+    pub target_office_id: Option<&'a str>,
+    /// 发起者**自己声明**的 role：仅 `4105` 的 `details.role`（报发起方，**非**冲突方）。
+    pub declared_role: Option<&'a str>,
+    /// 会话**当前**所在房：仅 `4106` 的 `details.office_id`（**非**被拒的目标房）。
+    pub current_office_id: Option<&'a str>,
+}
+
 /// 房间管理事件的**业务拒绝** → flat [`ErrorPayload`]。
 ///
 /// 「协议码 → 文案」与「协议码 → `details` 键集」的**唯一 choke point**，与 Python
@@ -501,7 +522,7 @@ impl RoomRejectionCode {
 /// `details` 只承载**与发起者自身相关**的上下文（协议 security.md §敏感信息过滤 +
 /// error-handling.md「`details` MUST NOT 携带其它会话的内部标识」）：
 ///
-/// | `code` | `details` 键 | 取值来源 |
+/// | `code` | `details` 键 | 取值来源（[`RoomRejectionContext`] 字段）|
 /// |---|---|---|
 /// | `403` | — | 无 code-specific 字段 |
 /// | `4101` | `office_id` | `target_office_id`：发起者自己声明的**目标房** |
@@ -512,14 +533,12 @@ impl RoomRejectionCode {
 ///
 /// 无可写字段时**不产出** `details` 键，故 403 / 4103 的线上报文不含 `details`（对齐 Python）。
 ///
-/// ⚠️ **本函数不是信息流保证**：三个形参都是调用方给的裸字符串，本函数无从校验其来源。真正的来源
+/// ⚠️ **本函数不是信息流保证**：上下文里都是调用方给的裸字符串，本函数无从校验其来源。真正的来源
 /// 约束在调用点——`current_office_id` 取自会话自身、`target_office_id` 取自请求载荷、`declared_role`
 /// 取自请求声明。Not an information-flow guarantee: provenance is enforced at the call sites.
 pub fn build_room_rejection_error(
     code: RoomRejectionCode,
-    target_office_id: Option<&str>,
-    declared_role: Option<&str>,
-    current_office_id: Option<&str>,
+    context: RoomRejectionContext<'_>,
 ) -> ErrorPayload {
     let protocol_code = ErrorCode::from_code(code.code())
         .expect("every RoomRejectionCode maps to a protocol ErrorCode");
@@ -528,20 +547,20 @@ pub fn build_room_rejection_error(
         // 403 / 4103 无 code-specific 字段（协议 §各错误码标准字段总表：details 列为「—」）。
         RoomRejectionCode::Forbidden | RoomRejectionCode::NotInRoom => {}
         RoomRejectionCode::RoomFull | RoomRejectionCode::CrossRoomAccess => {
-            if let Some(office_id) = target_office_id {
+            if let Some(office_id) = context.target_office_id {
                 payload = payload.with_detail("office_id", office_id);
             }
         }
         RoomRejectionCode::NameConflict => {
-            if let Some(office_id) = target_office_id {
+            if let Some(office_id) = context.target_office_id {
                 payload = payload.with_detail("office_id", office_id);
             }
-            if let Some(role) = declared_role {
+            if let Some(role) = context.declared_role {
                 payload = payload.with_detail("role", role);
             }
         }
         RoomRejectionCode::AlreadyInRoom => {
-            if let Some(office_id) = current_office_id {
+            if let Some(office_id) = context.current_office_id {
                 payload = payload.with_detail("office_id", office_id);
             }
         }

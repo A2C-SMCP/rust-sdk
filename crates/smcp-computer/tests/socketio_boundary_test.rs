@@ -91,7 +91,11 @@ async fn start_relay(obs: Arc<RelayObs>) -> (String, oneshot::Sender<()>) {
                 }
             });
 
-            // ACK join 成功（mirror 真实 server 的空 ack）。
+            // ACK join 成功。注意本 mock 发的是 `ack.send(&())` ⇒ socketioxide 的 `to_value`
+            // 把非 tuple-like 包成 1-tuple ⇒ 线上是 `[null]`，**不是**真实 server 现在的空 ack 形态
+            // （v0.5.0 起真实 server 由 `EmptyAck::serialize_tuple(0)` 产出零参 `[]`）。因此本 mock
+            // 覆盖的是客户端「向后兼容 `[null]`」这条容忍分支；`[]` 成功路径由
+            // `auth_dict_injection_test.rs` 的 `ZeroArgAck` mock 覆盖（#226 复审 🟡5 据实订正）。
             socket.on(
                 "server:join_office",
                 move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {
@@ -179,7 +183,11 @@ async fn start_relay_pinged(
                 }
             });
 
-            // ACK join 成功（mirror 真实 server 的空 ack）。
+            // ACK join 成功。注意本 mock 发的是 `ack.send(&())` ⇒ socketioxide 的 `to_value`
+            // 把非 tuple-like 包成 1-tuple ⇒ 线上是 `[null]`，**不是**真实 server 现在的空 ack 形态
+            // （v0.5.0 起真实 server 由 `EmptyAck::serialize_tuple(0)` 产出零参 `[]`）。因此本 mock
+            // 覆盖的是客户端「向后兼容 `[null]`」这条容忍分支；`[]` 成功路径由
+            // `auth_dict_injection_test.rs` 的 `ZeroArgAck` mock 覆盖（#226 复审 🟡5 据实订正）。
             socket.on(
                 "server:join_office",
                 move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {

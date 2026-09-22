@@ -57,15 +57,17 @@ impl HandlerError {
     /// 转换为 flat 错误负载 / Convert to a flat error payload
     ///
     /// 协议 0.2.2：错误负载统一为 flat [`smcp::ErrorPayload`]（顶层 `code`/`message`），禁止嵌套
-    /// `{"error": {...}}` envelope。本方法服务于 `server:*` **管理事件** ack——其码空间是传输/管理层
-    /// [`smcp::error_codes`]（400/401/500/4101…），不受协议谓词约束。
+    /// `{"error": {...}}` envelope；码空间是传输/管理层 [`smcp::error_codes`]（400/401/500/4101…），
+    /// 不受协议谓词约束。
     ///
-    /// ✅ SRV-01 (#47) 已收敛 `client:*` 路径：`client:*` ack **永不**承载裸 `HandlerError`——
-    /// 目标未命中经 [`smcp::build_computer_not_found_error`]（[`smcp::ErrorCode::NotFound`] 404）以
-    /// bare flat ErrorPayload 投递，隔离拒绝则不投递 ack（见 `SmcpHandler::relay_client_call`）。因此
-    /// Agent 端按 [`smcp::is_protocol_error_payload`] 判定的协议级闭集（404/4006–4018）不会被本方法
-    /// 的传输层码污染。
-    pub fn to_error_payload(&self) -> smcp::ErrorPayload {
+    /// **调用面**（#226 复审 🟡8 订正旧 doc）：三个房间事件（`server:join_office` /
+    /// `server:leave_office` / `server:list_room`）已改走 [`RoomAckResult`]，其拒绝一律由
+    /// [`smcp::build_room_rejection_error`] 产出 canonical 文案与 `details` 白名单；`client:*` 路由的
+    /// 错误经 [`smcp::build_computer_not_found_error`]（404）或**不投递 ack**（隔离拒绝）表达——SRV-01
+    /// (#47) 已收敛。故本方法在生产路径上**不再**是任何 ack 的构造入口，其唯一读者是
+    /// `impl serde::Serialize for HandlerError`（框架收编处理器错误、需要落日志/诊断时用到）。
+    /// 据此降为**私有**：外部无法把它当成「房间拒绝构造器」而绕过 canonical 文案不变量。
+    fn to_error_payload(&self) -> smcp::ErrorPayload {
         let message = match self {
             // A session id is an internal Socket.IO identifier and MUST NOT cross an ack
             // boundary. Keep it in server logs via the source error, but expose only the
@@ -90,6 +92,21 @@ impl serde::Serialize for HandlerError {
 /// Ack handlers return boxed payloads so the error path stays small on the async stack while
 /// preserving the same flat `ErrorPayload` wire shape.
 type RoomAckResult<T> = Result<T, Box<smcp::ErrorPayload>>;
+
+/// **单实参**载荷提取（`(T,)` 1-tuple）。
+///
+/// socketioxide 的解析器按 `T` 是否 tuple-like 分流（`socketioxide-parser-common::value::from_value`）：
+/// 非 tuple-like 走 `FirstElement` seed——`[payload, "extra"]` 会被**静默读成** `payload`，多余实参凭空
+/// 消失；tuple-like 则要求数组里**恰好**一个元素，多一个即反序列化失败。
+///
+/// 协议每个事件只定义**单个**载荷对象（`room-model.md` / `events.md`），Python 参考实现在
+/// `test_valid_payload_plus_extra_argument_is_rejected` 里钉死「有效载荷 + 多余实参 ⇒ `400`」。
+/// 本 SDK 用 1-tuple 把同一严格性前移到提取器层，故 `TryData<SingleArg<T>>` / `Data<SingleArg<T>>`
+/// 的 `Err` 分支**同时**覆盖「载荷畸形」与「实参个数不为 1」两种情形（#226 复审 🟡9）。
+///
+/// Single-argument payload extractor: the 1-tuple makes the parser require *exactly* one argument,
+/// matching the Python reference implementation's rejection of a valid payload plus extra arguments.
+type SingleArg<T> = (T,);
 
 /// 空 ack 的线载荷 / zero-argument Socket.IO ack payload.
 ///
@@ -289,9 +306,9 @@ impl SmcpHandler {
         let state_join = state.clone();
         socket.on(
             smcp::events::SERVER_JOIN_OFFICE,
-            move |socket: SocketRef, TryData::<Value>(data), ack: AckSender| async move {
+            move |socket: SocketRef, TryData::<SingleArg<Value>>(data), ack: AckSender| async move {
                 match data {
-                    Ok(value) => match serde_json::from_value::<EnterOfficeReq>(value) {
+                    Ok((value,)) => match serde_json::from_value::<EnterOfficeReq>(value) {
                         Ok(data) => {
                             match Self::on_server_join_office(socket, data, state_join.clone())
                                 .await
@@ -314,9 +331,9 @@ impl SmcpHandler {
         let state_leave = state.clone();
         socket.on(
             smcp::events::SERVER_LEAVE_OFFICE,
-            move |socket: SocketRef, TryData::<Value>(data), ack: AckSender| async move {
+            move |socket: SocketRef, TryData::<SingleArg<Value>>(data), ack: AckSender| async move {
                 match data {
-                    Ok(value) => match serde_json::from_value::<LeaveOfficeReq>(value) {
+                    Ok((value,)) => match serde_json::from_value::<LeaveOfficeReq>(value) {
                         Ok(data) => {
                             let result =
                                 Self::on_server_leave_office(socket, data, state_leave.clone())
@@ -340,7 +357,7 @@ impl SmcpHandler {
         let state_tool_call_cancel = state.clone();
         socket.on(
             smcp::events::SERVER_TOOL_CALL_CANCEL,
-            move |socket: SocketRef, Data::<AgentCallData>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<AgentCallData>>((data,))| async move {
                 Self::on_server_tool_call_cancel(socket, data, state_tool_call_cancel.clone()).await
             },
         );
@@ -348,7 +365,7 @@ impl SmcpHandler {
         let state_update_config = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_CONFIG,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_config(socket, data, state_update_config.clone()).await
             },
         );
@@ -356,7 +373,7 @@ impl SmcpHandler {
         let state_update_tool_list = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_TOOL_LIST,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_tool_list(socket, data, state_update_tool_list.clone()).await
             },
         );
@@ -364,9 +381,11 @@ impl SmcpHandler {
         let state_tool_call = state.clone();
         socket.on(
             smcp::events::CLIENT_TOOL_CALL,
-            move |socket: SocketRef, ack: AckSender, TryData::<ToolCallReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<ToolCallReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         match Self::on_client_tool_call(socket, data, state_tool_call.clone()).await
                         {
                             Ok(payload) => {
@@ -384,9 +403,11 @@ impl SmcpHandler {
         let state_get_tools = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_TOOLS,
-            move |socket: SocketRef, ack: AckSender, TryData::<GetToolsReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetToolsReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         match Self::on_client_get_tools(socket, data, state_get_tools.clone()).await
                         {
                             Ok(payload) => {
@@ -403,9 +424,11 @@ impl SmcpHandler {
         let state_get_desktop = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_DESKTOP,
-            move |socket: SocketRef, ack: AckSender, TryData::<GetDesktopReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetDesktopReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         match Self::on_client_get_desktop(socket, data, state_get_desktop.clone())
                             .await
                         {
@@ -423,13 +446,19 @@ impl SmcpHandler {
         let state_get_config = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_CONFIG,
-            move |socket: SocketRef, ack: AckSender, TryData::<GetComputerConfigReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetComputerConfigReq>>(data)| async move {
                 match data {
-                    Ok(data) => match Self::on_client_get_config(socket, data, state_get_config.clone()).await {
-                        Ok(payload) => {
-                            let _ = ack.send(&payload);
+                    Ok((data,)) => {
+                        match Self::on_client_get_config(socket, data, state_get_config.clone())
+                            .await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_config relay rejected, no ack: {e}"),
                         }
-                        Err(e) => warn!("client:get_config relay rejected, no ack: {e}"),
                     }
                     Err(_) => Self::ack_bad_request(ack),
                 }
@@ -439,7 +468,7 @@ impl SmcpHandler {
         let state_update_desktop = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_DESKTOP,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_desktop(socket, data, state_update_desktop.clone()).await
             },
         );
@@ -447,9 +476,11 @@ impl SmcpHandler {
         let state_list_room = state.clone();
         socket.on(
             smcp::events::SERVER_LIST_ROOM,
-            move |socket: SocketRef, ack: AckSender, TryData::<ListRoomReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<ListRoomReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         let result =
                             Self::on_server_list_room(socket, data, state_list_room.clone()).await;
                         match result {
@@ -470,9 +501,11 @@ impl SmcpHandler {
         let state_get_skills = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_SKILLS,
-            move |socket: SocketRef, ack: AckSender, TryData::<GetSkillsReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetSkillsReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         match Self::on_client_get_skills(socket, data, state_get_skills.clone())
                             .await
                         {
@@ -490,9 +523,11 @@ impl SmcpHandler {
         let state_get_skill = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_SKILL,
-            move |socket: SocketRef, ack: AckSender, TryData::<GetSkillReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetSkillReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         match Self::on_client_get_skill(socket, data, state_get_skill.clone()).await
                         {
                             Ok(payload) => {
@@ -509,9 +544,11 @@ impl SmcpHandler {
         let state_get_blob = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_BLOB,
-            move |socket: SocketRef, ack: AckSender, TryData::<GetBlobReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetBlobReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         match Self::on_client_get_blob(socket, data, state_get_blob.clone()).await {
                             Ok(payload) => {
                                 let _ = ack.send(&payload);
@@ -528,9 +565,11 @@ impl SmcpHandler {
         let state_put_blob = state.clone();
         socket.on(
             smcp::events::CLIENT_PUT_BLOB,
-            move |socket: SocketRef, ack: AckSender, TryData::<PutBlobReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<PutBlobReq>>(data)| async move {
                 match data {
-                    Ok(data) => {
+                    Ok((data,)) => {
                         match Self::on_client_put_blob(socket, data, state_put_blob.clone()).await {
                             Ok(payload) => {
                                 let _ = ack.send(&payload);
@@ -546,9 +585,11 @@ impl SmcpHandler {
         let state_get_resources = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_RESOURCES,
-            move |socket: SocketRef, ack: AckSender, TryData::<GetResourcesReq>(data)| async move {
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetResourcesReq>>(data)| async move {
                 match data {
-                    Ok(data) => match Self::on_client_get_resources(
+                    Ok((data,)) => match Self::on_client_get_resources(
                         socket,
                         data,
                         state_get_resources.clone(),
@@ -568,7 +609,7 @@ impl SmcpHandler {
         let state_update_skills = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_SKILLS,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_skills(socket, data, state_update_skills.clone()).await
             },
         );
@@ -695,9 +736,7 @@ impl SmcpHandler {
             // 403 无 code-specific 字段（协议 §各错误码标准字段总表），故三个来源参数均为 `None`。
             return Err(Box::new(smcp::build_room_rejection_error(
                 smcp::RoomRejectionCode::Forbidden,
-                None,
-                None,
-                None,
+                smcp::RoomRejectionContext::default(),
             )));
         }
 
@@ -860,17 +899,27 @@ impl SmcpHandler {
         match error {
             // 4106：details 报会话**当前**所在房（非被拒的目标房）——该值由 `reserve_join` 在
             // 临界区内从权威会话读出，故并发下也不会报过期房号。
-            SessionError::AgentAlreadyInRoom(current) => {
-                smcp::build_room_rejection_error(Code::AlreadyInRoom, None, None, Some(current))
-            }
-            SessionError::AgentAlreadyExists => {
-                smcp::build_room_rejection_error(Code::RoomFull, Some(target_office_id), None, None)
-            }
+            SessionError::AgentAlreadyInRoom(current) => smcp::build_room_rejection_error(
+                Code::AlreadyInRoom,
+                smcp::RoomRejectionContext {
+                    current_office_id: Some(current),
+                    ..Default::default()
+                },
+            ),
+            SessionError::AgentAlreadyExists => smcp::build_room_rejection_error(
+                Code::RoomFull,
+                smcp::RoomRejectionContext {
+                    target_office_id: Some(target_office_id),
+                    ..Default::default()
+                },
+            ),
             SessionError::NameAlreadyRegistered(_) => smcp::build_room_rejection_error(
                 Code::NameConflict,
-                Some(target_office_id),
-                Some(&declared_role.to_string()),
-                None,
+                smcp::RoomRejectionContext {
+                    target_office_id: Some(target_office_id),
+                    declared_role: Some(&declared_role.to_string()),
+                    ..Default::default()
+                },
             ),
             // 会话不存在 / 状态非法属**内部**事故，不属房间语义：回笼统 500（协议空档内以通用码承载），
             // 原文只进日志。绝不把内部错误文本当房间拒绝文案上 wire。
@@ -1471,9 +1520,7 @@ impl SmcpHandler {
                 // 定为 4103 `Not in any room`。canonical 文案由 builder 单点产出。
                 return Err(Box::new(smcp::build_room_rejection_error(
                     smcp::RoomRejectionCode::NotInRoom,
-                    None,
-                    None,
-                    None,
+                    smcp::RoomRejectionContext::default(),
                 )));
             }
         };
@@ -1482,9 +1529,7 @@ impl SmcpHandler {
             warn!("List room from session outside an office sid={}", sid);
             return Err(Box::new(smcp::build_room_rejection_error(
                 smcp::RoomRejectionCode::NotInRoom,
-                None,
-                None,
-                None,
+                smcp::RoomRejectionContext::default(),
             )));
         }
 
@@ -1499,9 +1544,10 @@ impl SmcpHandler {
             );
             return Err(Box::new(smcp::build_room_rejection_error(
                 smcp::RoomRejectionCode::CrossRoomAccess,
-                Some(&data.office_id),
-                None,
-                None,
+                smcp::RoomRejectionContext {
+                    target_office_id: Some(&data.office_id),
+                    ..Default::default()
+                },
             )));
         }
 
@@ -1529,6 +1575,15 @@ impl SmcpHandler {
     }
 
     /// 处理加入房间的逻辑
+    ///
+    /// 三个分支都以**权威会话状态**为收敛目标（`Noop` 亦收敛，见下），故 `join` 与 `leave` 两条路径
+    /// 对「会话说在房、socket 不在房」这类漂移态的对策**对称**：只增不减或只减不增都只能收敛一半。
+    ///
+    /// ⚠️ **残余窗口（如实标注，不宣称消除）**：`apply_join_room` 操作的是 socketioxide 的成员表，
+    /// 而权威状态在 [`SessionManager`] 里——两者是**双存储**，写入之间没有共同锁。故在
+    /// 「handler 读会话」与「socket.join/leave 生效」之间仍存在一个极窄的残余窗；本 PR 消除的是
+    /// **可观测**的幽灵成员（`leave` 用提交点重读、`join` 用临界区内一次完成校验+提交），把该窗收窄到
+    /// 单次 `await` 的调度粒度，而**不是**把双存储变成单存储。
     async fn apply_join_room(
         socket: SocketRef,
         session: &SessionData,
@@ -1542,7 +1597,15 @@ impl SmcpHandler {
 
         match decision {
             JoinDecision::Noop => {
-                info!("Noop decision for sid={}", socket.id);
+                // 重复入同一房不改变权威状态，但**仍**收敛一次 socket 成员关系：`leave` 会收敛而 `join`
+                // 不收敛会形成不对称——漂移态（如 leave 的「读会话 → 收敛」之间的窄窗，或历史版本
+                // 残留的脏成员关系）只会在一次 `leave` 后才自愈。收敛是幂等的（已在目标房 ⇒
+                // `join` 无副作用；不在 ⇒ 补上），开销可忽略，故没有理由不做。
+                info!(
+                    "Noop decision for sid={}; converging socket rooms",
+                    socket.id
+                );
+                Self::converge_socket_rooms(&socket, Some(office_id));
             }
             JoinDecision::Join => {
                 info!("Joining room '{}' for sid={}", office_id, socket.id);
@@ -1699,6 +1762,33 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&err).unwrap();
         assert_eq!(v["code"], smcp::error_codes::FORBIDDEN);
         assert!(v.get("error").is_none(), "禁止嵌套 envelope");
+    }
+
+    /// #226 复审 🟡7：500 降级路径（`room_rejection` 的 `NotFound | InvalidState → InternalError`）
+    /// 此前零覆盖。Python 有三条对应用例（`test_unknown_exception_is_500_without_echoing_detail` /
+    /// `test_unmapped_rejection_code_degrades_to_500` / `test_non_int_rejection_code_degrades_to_500`）。
+    ///
+    /// 这两类错误属**内部**事故，不属房间语义：必须回笼统 `500 Internal error`，**不得**把内部
+    /// 错误文本（含 `sid` 等标识）当房间拒绝文案上 wire——那既与协议 canonical 文案不符，也是信息泄露。
+    #[test]
+    fn test_room_rejection_internal_failures_degrade_to_generic_500() {
+        for error in [
+            SessionError::NotFound("private-sid".to_string()),
+            SessionError::InvalidState("private internal state".to_string()),
+        ] {
+            let payload = SmcpHandler::room_rejection(&error, &ClientRole::Agent, "office-a");
+            assert_eq!(payload.code, i64::from(smcp::error_codes::INTERNAL_ERROR));
+            assert_eq!(payload.message, "Internal error");
+            assert!(
+                payload.details.is_none(),
+                "内部降级不得携带 details: {payload:?}"
+            );
+            let serialized = serde_json::to_string(&payload).unwrap();
+            assert!(
+                !serialized.contains("private-"),
+                "内部错误文本 MUST NOT 上 wire: {serialized}"
+            );
+        }
     }
 
     #[test]
