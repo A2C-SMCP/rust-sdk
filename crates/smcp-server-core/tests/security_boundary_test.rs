@@ -544,23 +544,42 @@ async fn identity_claim_mismatch_returns_flat_403_without_details() {
     server.shutdown();
 }
 
-/// #226 复审 🟡3 的**口径落定**：无房会话发起 `client:*` 仍回 flat `404`（与 python-sdk 一致），
-/// 本轮**不**接 `4103`。
+/// #226 复审 🟡3（**按协议接线**）：无房会话发起 `client:*` ⇒ flat `4103 Not in any room`。
 ///
-/// 协议 `error-handling.md` §Not In Room（4103）把「`client:*` 路由请求」列入触发时机，而 python-sdk
-/// 的 `namespace.py` 同样走 raise / 404——属**协议文本 vs 双 SDK** 的共同缺口，不是本仓单方缺陷。
-/// 单边接 4103 会让两个 SDK 在**同一请求**上给出不同码，与本 PR「统一错误契约」的目标相反；故本轮
-/// 保留 404 并用本用例钉死该口径（改成 4103 即红），偏差登记在协议侧待两边同步。
+/// 协议 `error-handling.md` §Not In Room 的触发时机明列「`client:*` 路由请求、`server:list_room`
+/// 等」。此前 `relay_client_call` 对无房来源回的是「目标 Computer 找不到」的 flat `404`，把
+/// 「先入房再重试即可」的**可自纠**状态伪装成「换个目标才有用」——调用方据此做出的纠错动作必然是错的。
+///
+/// 本用例覆盖两条边界：
+/// ① **有会话、无房**（join 被拒 / 已退房）⇒ 4103（协议触发态，由 [`smcp::build_room_rejection_error`]
+///    单点产出 canonical 文案，且无 `details`）；
+/// ② **无会话记录**（从未 join）⇒ **不投递 ack**（协议 0.2.2 Server MAY 不 ack；服务端连「是谁在问」
+///    都无从确认，回房间语义的 4103 反而是假装知道对方身份）。两条边界一起钉住，防止任一侧被顺手改掉。
 #[tokio::test]
-async fn no_room_client_call_returns_flat_404_not_4103() {
+async fn no_room_client_call_returns_flat_4103_but_session_less_does_not_ack() {
     let server = SmcpTestServer::start().await;
     let client = create_test_client(&server.url(), SMCP_NAMESPACE).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // ② 从未 join 的连接（无会话记录）：MUST NOT 收到任何 ack（发起方侧自行超时）。
+    let (tx, rx) = oneshot::channel::<serde_json::Value>();
+    client
+        .emit_with_ack(
+            events::CLIENT_GET_TOOLS,
+            json!({"agent": "agent", "req_id": "session-less", "computer": "computer"}),
+            Duration::from_secs(1),
+            ack_to_sender(tx, ack_value),
+        )
+        .await
+        .expect("emit_with_ack failed");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(800), rx)
+            .await
+            .is_err(),
+        "无会话连接发起 client:* MUST NOT 收到 ack（协议 0.2.2 允许不 ack）"
+    );
+
     // 构造「有会话、无房」：先入房再退房（`commit_leave` 只清 `office_id`，会话记录仍在）。
-    // 注意**不要**用「从未 join 的连接」：那种连接连会话都没有，走的是 `SessionError::NotFound` ⇒
-    // `relay_client_call` 镜像 Python `raise` 而**不投递任何 ack**（发起方自行超时），与本条要钉的
-    // 「无房 ⇒ flat 404」不是同一分支。
     join_office(&client, Role::Agent, "office-a", "agent").await;
     let leave = emit_with_ack(
         &client,
@@ -572,7 +591,7 @@ async fn no_room_client_call_returns_flat_404_not_4103() {
     .await;
     assert_empty_ack(&leave, "server:leave_office");
 
-    // 无 `office_id` ⇒ 无从定位目标 Computer ⇒ flat 404（本轮口径，见函数文档）。
+    // ① 有会话、无 `office_id` ⇒ 无从定位目标 Computer ⇒ flat 4103（协议 §Not In Room）。
     let response = emit_with_ack(
         &client,
         events::CLIENT_GET_TOOLS,
@@ -580,17 +599,16 @@ async fn no_room_client_call_returns_flat_404_not_4103() {
     )
     .await;
 
-    assert_eq!(
-        response["code"], 404,
-        "本轮口径 = 与 python 对齐的 flat 404（不是 4103）: {response}"
-    );
-    assert_eq!(
-        response["message"],
-        "Computer with name 'computer' not found"
+    assert_eq!(response["code"], 4103, "{response}");
+    // canonical 文案与 `server:list_room` 同一 choke point 产出，逐字对齐协议 §Not In Room。
+    assert_eq!(response["message"], "Not in any room");
+    assert!(
+        response.get("details").is_none(),
+        "4103 无 code-specific 字段: {response}"
     );
     assert_ne!(
-        response["code"], 4103,
-        "4103 需协议侧与 python 同步接线后再切，单边改码会制造跨 SDK 分歧"
+        response["code"], 404,
+        "4103 是「你不在任何房间」（可自纠），不是「这个 Computer 不存在」"
     );
 
     client.disconnect().await.unwrap();

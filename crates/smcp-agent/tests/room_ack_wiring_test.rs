@@ -14,7 +14,7 @@
 * 本文件起一台**真实** hyper 服务端（含版本握手中间件、真实 Socket.IO 栈），用真实 Agent 端到端钉死：
 * ① 入房失败（`4101`）⇒ `Err(Protocol{code: 4101})`，且 `details.office_id` 到达调用方；
 * ② 成功路径（空 ack）⇒ `Ok(())`；
-* ③ 未入房的 `client:*` ⇒ flat `404`；
+* ③ 有会话但无房（入房被拒）的 `client:*` ⇒ flat `4103 Not in any room`；
 * ④ `leave_office` 幂等成功；⑤ 退房后 `list_room` ⇒ `4103`（错误检查先行于 `req_id` 校验）。
 */
 
@@ -130,13 +130,17 @@ async fn test_join_office_surfaces_server_rejection_and_empty_ack_success() {
         "403 必须落在协议错误闭集内并被读成拒绝: {identity_conflict:?}"
     );
 
-    // ④ `client:*` 契约：第二个 Agent 从未真正入房 ⇒ 目标 Computer 无从定位 ⇒ flat 404
-    //    （既不是内部错误，也不是静默成功）。
+    // ④ `client:*` 契约：第二个 Agent 入房被拒 ⇒ **有会话、无房**（协议 §4103 的触发态）⇒ 目标
+    //    Computer 无从定位 ⇒ flat `4103 Not in any room`（既不是内部错误，也不是静默成功）。
     let lookup = second
         .get_tools("does-not-exist")
         .await
-        .expect_err("未入房 Agent 的 client:get_tools MUST 返回协议错误");
-    assert_eq!(protocol_code(&lookup), Some(404), "{lookup:?}");
+        .expect_err("无房 Agent 的 client:get_tools MUST 返回协议错误");
+    assert_eq!(protocol_code(&lookup), Some(4103), "{lookup:?}");
+    assert!(
+        lookup.to_string().contains("Not in any room"),
+        "无房 client:* MUST 回 canonical 4103，而不是「Computer 不存在」的 404: {lookup}"
+    );
 
     // ⑤ 退房同样等 ack：无房时也是**幂等成功**（空 ack）⇒ `Ok(())`。
     second

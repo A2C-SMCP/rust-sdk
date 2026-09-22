@@ -1150,6 +1150,23 @@ impl SmcpHandler {
         ))?)
     }
 
+    /// 构造 bare flat `ErrorPayload(4103)`（发起方无房 ⇒ 无从定位任何 Computer）的 ack 负载。
+    ///
+    /// 协议依据 / Protocol: `error-handling.md` §Not In Room（4103）——**触发时机**明列
+    /// 「会话尚无 `office_id`（未成功加入任何房间）时，发起**需要房间上下文**的操作：`client:*`
+    /// 路由请求、`server:list_room` 等」。故无房来源的 `client:*` MUST 回 4103，而**不是**
+    /// 「目标 Computer 不存在」的 404——后者会把「你不在任何房间」这个调用方可自纠的状态
+    /// （先入房再重试）伪装成「这个 Computer 不存在」（换个目标重试也永远不会成功）。
+    ///
+    /// 与 `server:list_room` 共用 [`smcp::build_room_rejection_error`] 这一唯一 choke point，
+    /// 故文案（`Not in any room`）与「无 `details`」两条线上形态天然一致。
+    fn not_in_room_value() -> Result<Value, HandlerError> {
+        Ok(serde_json::to_value(smcp::build_room_rejection_error(
+            smcp::RoomRejectionCode::NotInRoom,
+            smcp::RoomRejectionContext::default(),
+        ))?)
+    }
+
     /// 处理客户端工具调用事件
     /// 统一 `client:*` 事件路由 / Generic `client:*` event router.
     ///
@@ -1189,6 +1206,12 @@ impl SmcpHandler {
     ) -> Result<Value, HandlerError> {
         // 发起方（Agent）会话 / Originator (Agent) session
         let sid = socket.id.to_string();
+        // 无会话记录：连接从未 join 过，或会话已随断连注销（飞行中消失）。
+        //
+        // 这两类**不**回 4103，保持「不投递 ack」的历史语义（协议 0.2.2：Server MAY 不 ack、
+        // 不投 ErrorPayload；镜像 Python `_relay_client_call` 的 raise）：服务端此时连「是谁在问」
+        // 都无从确认，回一个「你不在任何房间」的房间语义拒绝反而是假装知道对方身份。
+        // **有会话、无房**（join 被拒 / 已退房）才是协议 §4103 的触发态，见下方分支。
         let session = state
             .session_manager
             .get_session(&sid)
@@ -1202,9 +1225,13 @@ impl SmcpHandler {
             ));
         }
 
-        // 发起方无 office → 无从在任何 office 内定位目标 → flat 404（诚实 + 不泄露 + 不挂起）
+        // 发起方无 office → 无从在任何 office 内定位目标 → flat **4103** `Not in any room`。
+        //
+        // 协议依据：`error-handling.md` §Not In Room 把 `client:*` 路由请求明列为触发场景
+        // （#226 复审 建议项 3 / 本轮按协议接线）。此前回的是「目标 Computer 找不到」的 404，
+        // 把「先入房再重试即可」的可自纠状态误导成「换个目标才有用」。
         let Some(office_id) = session.office_id else {
-            return Self::computer_not_found_value(computer_name);
+            return Self::not_in_room_value();
         };
 
         // office-scoped 解析目标 Computer SID：跨 office 目标天然不可达 → 404（不泄露存在性）
