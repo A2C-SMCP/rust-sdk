@@ -52,7 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 调用第一个工具
         if let Some(tool) = tools.first() {
             let result = agent
-                .tool_call(&computer_session.name, &tool.name, serde_json::json!({}))
+                .tool_call(
+                    &computer_session.name,
+                    &tool.name,
+                    serde_json::json!({}),
+                    None,
+                )
                 .await?;
             println!(
                 "Tool call result: {}",

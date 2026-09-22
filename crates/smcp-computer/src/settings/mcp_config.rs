@@ -1018,6 +1018,34 @@ mod tests {
         assert!(none.is_none() && errs.len() == 1);
     }
 
+    #[test]
+    fn validate_server_preserves_stdio_connect_timeout_and_rejects_zero() {
+        let valid = json!({
+            "type": "stdio",
+            "server_parameters": {"command": "slow-mcp"},
+            "connect_timeout_secs": 90
+        });
+        let (resolved, errors) = validate_server("slow", &valid, SettingsScope::User, None);
+        assert!(errors.is_empty());
+        let resolved = resolved.expect("valid stdio config should be retained");
+        match resolved.config {
+            MCPServerConfig::Stdio(config) => {
+                assert_eq!(config.connect_timeout_secs, Some(90));
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+
+        let invalid = json!({
+            "type": "stdio",
+            "server_parameters": {"command": "slow-mcp"},
+            "connect_timeout_secs": 0
+        });
+        let (resolved, errors) = validate_server("slow", &invalid, SettingsScope::User, None);
+        assert!(resolved.is_none());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].reason.contains("connect_timeout_secs"));
+    }
+
     // ---- resolve_mcp_config 多 scope 合并 ------------------------------------
     #[test]
     fn resolve_merges_scopes_high_wins_origin() {

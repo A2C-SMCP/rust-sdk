@@ -162,16 +162,12 @@ impl SyncSmcpAgent {
         computer: &str,
         tool_name: &str,
         params: serde_json::Value,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<serde_json::Value> {
-        self.runtime
-            .block_on(self.async_agent.tool_call(computer, tool_name, params))
-    }
-
-    /// 取消一次在途工具调用（fire-and-forget，无 ack，AGT-05 #44）。
-    /// `req_id` MUST==被取消的原 tool_call req_id。详见 [`AsyncSmcpAgent::tool_call_cancel`]。
-    pub fn tool_call_cancel(&self, req_id: &str) -> Result<()> {
-        self.runtime
-            .block_on(self.async_agent.tool_call_cancel(req_id))
+        self.runtime.block_on(
+            self.async_agent
+                .tool_call(computer, tool_name, params, cancel),
+        )
     }
 
     /// 列出房间内的所有会话

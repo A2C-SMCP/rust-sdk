@@ -502,6 +502,7 @@ mod tests {
         let hooks = CliMcpHooks::new(&comp, Some("figma".into()), Some("acme".into())).await;
         let cfg = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "s".to_string(),
             bundle_id: None,
             disabled: false,

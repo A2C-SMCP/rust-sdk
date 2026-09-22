@@ -29,6 +29,7 @@
 use std::env;
 use std::time::Duration;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use base64::Engine as _;
@@ -170,6 +171,7 @@ async fn run_mode(
                     computer,
                     "echo__echo",
                     serde_json::json!({ "message": probe }),
+                    None,
                 ),
             )
             .await
@@ -224,15 +226,68 @@ async fn run_mode(
             Err(_) => fail("list_room", "timeout"),
         },
 
-        // ── F-12：tool_call_cancel（fire-and-forget 传输契约）────────────────
-        // 在途 sleep 工具的 req_id 由 SDK 内部生成、不外露，故此处验证 server:tool_call_cancel 的
-        // fire-and-forget emit 契约（无 ack、不报错即视为传输层成立）。结果级 a2c_cancelled 由
-        // crate 级单测与 in-process 矩阵覆盖。
+        // ── F-12：tool_call 外部取消（真实在途调用）──────────────────────────
         "tool_call_cancel" => {
-            match timeout(CALL_TIMEOUT, agent.tool_call_cancel("uat-cancel-probe")).await {
-                Ok(Ok(())) => pass("tool_call_cancel", "fire-and-forget emit 成立（无 ack）"),
-                Ok(Err(e)) => fail("tool_call_cancel", &format!("emit err: {e}")),
-                Err(_) => fail("tool_call_cancel", "timeout"),
+            let tools = match timeout(CALL_TIMEOUT, agent.get_tools(computer)).await {
+                Ok(Ok(tools)) => tools,
+                Ok(Err(e)) => return fail("tool_call_cancel", &format!("get_tools err: {e}")),
+                Err(_) => return fail("tool_call_cancel", "get_tools timeout"),
+            };
+            let Some(sleep_tool) = tools.iter().find(|tool| tool.name.ends_with("sleep")) else {
+                return fail(
+                    "tool_call_cancel",
+                    &format!(
+                        "未发现 sleep 工具，实得 {:?}",
+                        tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+                    ),
+                );
+            };
+
+            let cancel = CancellationToken::new();
+            let cancel_for_call = cancel.clone();
+            let agent_for_call = agent.clone();
+            let computer_for_call = computer.to_string();
+            let tool_name = sleep_tool.name.clone();
+            let started = tokio::time::Instant::now();
+            let call = tokio::spawn(async move {
+                agent_for_call
+                    .tool_call(
+                        &computer_for_call,
+                        &tool_name,
+                        serde_json::json!({ "ms": 5000 }),
+                        Some(cancel_for_call),
+                    )
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel.cancel();
+
+            match timeout(CALL_TIMEOUT, call).await {
+                Ok(Ok(Ok(result))) => {
+                    let cancelled = result
+                        .get("meta")
+                        .or_else(|| result.get("_meta"))
+                        .and_then(|meta| meta.get("a2c_cancelled"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if cancelled {
+                        pass(
+                            "tool_call_cancel",
+                            &format!(
+                                "在途调用真实取消，{}ms 内收到 a2c_cancelled",
+                                started.elapsed().as_millis()
+                            ),
+                        )
+                    } else {
+                        fail(
+                            "tool_call_cancel",
+                            &format!("ack 未标记 a2c_cancelled: {result}"),
+                        )
+                    }
+                }
+                Ok(Ok(Err(e))) => fail("tool_call_cancel", &format!("tool_call err: {e}")),
+                Ok(Err(e)) => fail("tool_call_cancel", &format!("join err: {e}")),
+                Err(_) => fail("tool_call_cancel", "timeout waiting for cancelled ack"),
             }
         }
 
@@ -381,6 +436,7 @@ async fn run_mode(
                     computer,
                     "echo__gen_image",
                     serde_json::json!({ "bytes": N }),
+                    None,
                 ),
             )
             .await

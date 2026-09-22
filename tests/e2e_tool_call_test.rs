@@ -102,7 +102,9 @@ async fn test_tool_call_with_echo_server() {
         "message": "Hello, World!"
     });
 
-    let result = agent.tool_call(&computer_name, &tool.name, params).await;
+    let result = agent
+        .tool_call(&computer_name, &tool.name, params, None)
+        .await;
 
     match result {
         Ok(response) => {

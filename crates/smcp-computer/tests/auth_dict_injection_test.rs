@@ -257,6 +257,19 @@ impl ReconnectCaptureServer {
     }
 }
 
+/// 零参 Socket.IO ack（线格式 `[]`），与 v0.5.0 服务端 `EmptyAck` 同款。
+///
+/// socketioxide 的 `AckSender::send` 只接受单个实参，`send(&())` 会被包成 1-tuple（`[null]`）；
+/// 直接 `serialize_tuple(0)` 才能产出与 python-socketio 参考实现逐字节一致的零参 ACK。
+struct ZeroArgAck;
+
+impl serde::Serialize for ZeroArgAck {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        serializer.serialize_tuple(0)?.end()
+    }
+}
+
 async fn start_reconnect_capture_server(
     reject_join_attempt: Option<usize>,
     delayed_join_attempt: Option<usize>,
@@ -309,9 +322,19 @@ async fn start_reconnect_capture_server(
                             if delayed_join_attempt == Some(attempt) {
                                 sleep(Duration::from_millis(750)).await;
                             }
-                            let success = reject_join_attempt != Some(attempt);
-                            let message = (!success).then(|| "rejoin rejected".to_string());
-                            let _ = ack.send(&(success, message));
+                            // v0.5.0 房间 ack 契约：成功 = **空 ack**（零参 ACK `[]`），失败 = flat
+                            // ErrorPayload（顶层 `code`）。旧 `(success, message)` 元组形态已废除——
+                            // 保留它会让客户端走**已删除**的兼容分支，使新增的 flat 拒绝路径零覆盖
+                            // （#226 假绿清单第 5 条）。
+                            if reject_join_attempt == Some(attempt) {
+                                let _ = ack.send(&json!({
+                                    "code": 4101,
+                                    "message": "Room already has an agent",
+                                    "details": { "office_id": "office-rejoin-rejected" }
+                                }));
+                            } else {
+                                let _ = ack.send(&ZeroArgAck);
+                            }
                             let _ = join_ack_tx.send(attempt);
                         }
                     },

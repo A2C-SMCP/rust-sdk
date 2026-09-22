@@ -350,31 +350,20 @@ async fn test_list_room_cross_office_access_denied() {
         .expect("list_room ack timeout")
         .unwrap();
 
-    // 验证错误响应
-    // 当前实现返回空会话列表而不是错误消息
-    let sessions_count = match error_payload {
-        serde_json::Value::Array(arr) => {
-            if let Some(obj) = arr.first() {
-                obj.get("sessions")
-                    .and_then(|s| s.as_array())
-                    .map(|s| s.len())
-                    .unwrap_or(0)
-            } else {
-                0
-            }
+    // 越权访问必须返回 flat ErrorPayload，而不是伪装成空房间。
+    let error_payload = match error_payload {
+        serde_json::Value::Array(mut args)
+            if args.len() == 1 && args.first().is_some_and(serde_json::Value::is_object) =>
+        {
+            args.remove(0)
         }
-        serde_json::Value::Object(obj) => obj
-            .get("sessions")
-            .and_then(|s| s.as_array())
-            .map(|s| s.len())
-            .unwrap_or(0),
-        _ => 0,
+        payload => payload,
     };
-
-    // 验证返回空会话列表（权限被拒绝）
+    assert_eq!(error_payload["code"], smcp::error_codes::CROSS_ROOM_ACCESS);
+    assert!(error_payload.get("sessions").is_none());
     assert_eq!(
-        sessions_count, 0,
-        "Cross-office access should return empty sessions"
+        error_payload["details"]["office_id"],
+        serde_json::Value::String("office2".to_string())
     );
 
     // 清理
@@ -546,7 +535,12 @@ async fn test_computer_duplicate_name_rejected() {
             ack_to_sender(result_tx, |p| {
                 println!("Ack callback invoked for second computer! Payload: {:?}", p);
                 match p {
-                    Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
+                    Payload::Text(mut values, _) => match values.pop().unwrap_or_default() {
+                        serde_json::Value::Array(mut args) if args.len() == 1 => {
+                            args.pop().unwrap_or(serde_json::Value::Null)
+                        }
+                        value => value,
+                    },
                     _ => serde_json::Value::Null,
                 }
             }),
@@ -560,29 +554,10 @@ async fn test_computer_duplicate_name_rejected() {
         .expect("join_office ack timeout")
         .unwrap();
 
-    // 验证加入失败
-    // 服务端返回 (bool, Option<String>) 元组，序列化为 [false, "error"] 格式
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-    assert!(
-        !success,
-        "Second computer with same name should fail to join"
-    );
-
-    // 验证错误信息
-    let error_msg = if let Some(arr) = result.as_array() {
-        arr.get(1).and_then(|v| v.as_str()).unwrap_or("")
-    } else {
-        ""
-    };
-    assert!(
-        error_msg.contains("already exists"),
-        "Error should contain 'already exists', got: {}",
-        error_msg
-    );
+    // 失败回 flat ErrorPayload，冲突码为 4105，文案为协议 canonical（逐字对齐 error-handling.md
+    // §Name Conflict 与 python-sdk `_ROOM_REJECTION_MESSAGES`）。
+    assert_eq!(result["code"], smcp::error_codes::NAME_CONFLICT);
+    assert_eq!(result["message"], "Name already taken in room");
 
     // 清理
     computer1_client.disconnect().await.unwrap();
@@ -642,25 +617,8 @@ async fn test_computer_different_name_allowed() {
         .expect("join_office ack timeout")
         .unwrap();
 
-    // 验证加入成功
-    // 服务端返回 (bool, Option<String>) 元组，序列化为 [true, null] 格式
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-    assert!(
-        success,
-        "Computer with different name should succeed to join"
-    );
-
-    // 验证没有错误
-    let has_error = if let Some(arr) = result.as_array() {
-        arr.get(1).and_then(|v| v.as_str()).is_some()
-    } else {
-        true
-    };
-    assert!(!has_error, "Should not have error");
+    // 成功回空 ack（零参 ACK `[]`）。
+    assert_empty_ack(&result, "join_office");
 
     // 清理
     computer1_client.disconnect().await.unwrap();
@@ -720,25 +678,8 @@ async fn test_computer_switch_room_with_same_name_allowed() {
         .expect("join_office ack timeout")
         .unwrap();
 
-    // 验证切换成功
-    // 服务端返回 (bool, Option<String>) 元组，序列化为 [true, null] 格式
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-    assert!(
-        success,
-        "Computer should be able to switch rooms with same name"
-    );
-
-    // 验证没有错误
-    let has_error = if let Some(arr) = result.as_array() {
-        arr.get(1).and_then(|v| v.as_str()).is_some()
-    } else {
-        true
-    };
-    assert!(!has_error, "Should not have error");
+    // 成功回空 ack（零参 ACK `[]`）。
+    assert_empty_ack(&result, "join_office");
 
     // 清理
     computer_client.disconnect().await.unwrap();

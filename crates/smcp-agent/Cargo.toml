@@ -18,6 +18,7 @@ sync = ["async"]
 smcp.workspace = true
 smcp-client-transport.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # AGT-04 #41：tool_call 二进制旁路回填——drain 回字节后重编码为 content item 的 base64 内联载体。

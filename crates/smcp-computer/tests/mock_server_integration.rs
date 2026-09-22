@@ -214,7 +214,7 @@ async fn spawn_tool_list_recording_relay(
             socket.on(
                 "server:join_office",
                 |_socket: SocketRef, _data: Data<Value>, ack: AckSender| async move {
-                    let _ = ack.send(&(true, None::<String>));
+                    let _ = ack.send(&());
                 },
             );
             socket.on(

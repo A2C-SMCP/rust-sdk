@@ -1152,7 +1152,17 @@ impl SmcpComputerClient {
             Self::call_with_client(client, SERVER_JOIN_OFFICE, req_data, Some(10)).await?;
         debug!("Join office response: {:?}", response);
 
-        // The ACK may arrive as `[true, null]` or as one nested tuple argument `[[true, null]]`.
+        // 成功 = **空 ack**：零参 ACK（`[]`，python-socketio 参考实现与 v0.5.0 Rust 服务端的线格式），
+        // 或 socketioxide 1-tuple 形态（`[null]`，`ack.send(&())` 的旧产出，同样按空 ack 接受）。
+        // 失败 = flat ErrorPayload（顶层 `code`）。
+        //
+        // 已废除的 `(bool, str | None)` 元组分支**刻意不再兼容**（#226 Follow-up）：v0.x 下 MINOR 严格
+        // 相等（versioning.md），0.4.x 服务端会在 HTTP 握手层先以 4008 拒绝 0.5.0 客户端，跨版本对端
+        // 物理上不可能互联 ⇒ 兼容分支没有真实读者，只会把「未迁移的对端」静默判成成功。对标 Python
+        // `utils/office.py::parse_join_ack` 的同款决定。
+        //
+        // Success is an empty ack (`[]`, or the legacy 1-tuple `[null]`); failures are flat
+        // ErrorPayload objects. The removed tuple shape is deliberately not accepted.
         let actual_response = if response.len() == 1 {
             response
                 .first()
@@ -1163,24 +1173,32 @@ impl SmcpComputerClient {
             response
         };
 
-        match actual_response.first().and_then(Value::as_bool) {
-            Some(true) => Ok(()),
-            Some(false) => {
-                let error_msg = actual_response
-                    .get(1)
-                    .and_then(Value::as_str)
-                    .unwrap_or("Unknown error");
-                Err(ComputerError::SocketIoError(format!(
-                    "Failed to join office: {error_msg}"
-                )))
-            }
-            None if actual_response.is_empty() => Err(ComputerError::SocketIoError(
-                "Empty response from server".to_string(),
-            )),
-            None => Err(ComputerError::SocketIoError(format!(
-                "Invalid response format from server: {actual_response:?}"
-            ))),
+        if actual_response.is_empty()
+            || (actual_response.len() == 1 && actual_response[0].is_null())
+        {
+            return Ok(());
         }
+
+        // 结构化拒绝：码 + 文案 + `details` **原样保留**（不再 `format!` 成字符串）。
+        // 消费方（如 #219 的有界退避）据此按码分流 `4101` / `4105`（瞬态）与 `4106` / `400`（永久），
+        // 无需解析字符串（#226 复审 🟡4）。
+        if let Some(value) = actual_response.first() {
+            if let Some(code) = value.get("code").and_then(Value::as_i64) {
+                return Err(ComputerError::ProtocolRejection {
+                    code,
+                    message: value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Room join rejected")
+                        .to_string(),
+                    details: value.get("details").cloned(),
+                });
+            }
+        }
+
+        Err(ComputerError::SocketIoError(format!(
+            "Invalid response format from server: {actual_response:?}"
+        )))
     }
 
     /// 获取当前Office ID / Get current Office ID

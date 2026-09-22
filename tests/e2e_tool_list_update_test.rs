@@ -185,6 +185,7 @@ async fn tool_list_update_full_chain_add_rename_remove() {
             &computer_name,
             "set_phase",
             serde_json::json!({ "phase": 1 }),
+            None,
         )
         .await
         .expect("set_phase(1)");
@@ -208,6 +209,7 @@ async fn tool_list_update_full_chain_add_rename_remove() {
             &computer_name,
             "set_phase",
             serde_json::json!({ "phase": 2 }),
+            None,
         )
         .await
         .expect("set_phase(2)");
@@ -234,6 +236,7 @@ async fn tool_list_update_full_chain_add_rename_remove() {
             &computer_name,
             "set_phase",
             serde_json::json!({ "phase": 3 }),
+            None,
         )
         .await
         .expect("set_phase(3)");

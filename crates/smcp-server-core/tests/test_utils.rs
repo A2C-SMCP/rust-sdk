@@ -27,6 +27,26 @@ use tower::{Layer, Service};
 
 use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 
+/// 断言成功 ack 是协议规定的**空 ack**（线格式：**零参** ACK，拆封后为 `[]`）。
+///
+/// 协议依据：error-handling.md —— `server:join_office` / `server:leave_office` 成功回**空 ack**
+/// （v0.5.0 前为 `(bool, str | None)` 元组，已废除）。python-socketio 参考实现在 handler 返回 `None`
+/// 时发出的正是零参 ACK `[]`（`_handle_event_internal`：`if r is None: data = []`），故本断言**钉死
+/// `[]`**——`[null]`（socketioxide `ack.send(&())` 经 `to_value` 包成 1-tuple 的旧形态）逐字节不符，
+/// 属本次要修的跨 SDK 偏差（#226 P1-6）。断言写成 `assert_eq!` 而非「二者皆可」的容忍式，
+/// 正是为了让该偏差再也无法被静默放过。
+///
+/// 2026-09 起 server 侧由 `EmptyAck`（`serialize_tuple(0)`）产出零参 ACK；本助手是测试侧的**单一权威**
+/// 判据（对标 Python `tests/room_acks.py::assert_empty_ack`），避免数十个站点各自手写、各自漂移。
+pub fn assert_empty_ack(payload: &serde_json::Value, action: &str) {
+    assert_eq!(
+        payload,
+        &serde_json::json!([]),
+        "{action} 成功应回零参空 ack `[]`；实得 {payload}。若为 `[null]`，说明服务端仍在用 \
+         ack.send(&())（多出一个 null 实参）；若为 flat ErrorPayload，说明本端把失败当成了成功。"
+    );
+}
+
 /// 测试用的SMCP服务器
 pub struct SmcpTestServer {
     pub addr: SocketAddr,
@@ -243,23 +263,11 @@ pub async fn join_office(
         })
         .unwrap();
 
-    // 验证加入成功
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-
-    if !success {
-        let error = if let Some(arr) = result.as_array() {
-            arr.get(1)
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error")
-        } else {
-            "Invalid response format"
-        };
-        panic!("Failed to join office: {}", error);
+    // 成功回空 ack（线格式为零参 ACK `[]`）；失败回 flat ErrorPayload。
+    if result.get("code").is_some() {
+        panic!("Failed to join office: {}", result);
     }
+    assert_empty_ack(&result, "join_office");
 }
 
 /// 离开办公室的辅助函数

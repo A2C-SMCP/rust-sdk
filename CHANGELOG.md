@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [0.4.1] - 2026-08-28
 
+### Breaking Changes
+
+- *(smcp-agent)* `AsyncSmcpAgent::tool_call` and `SyncSmcpAgent::tool_call` now accept an optional `tokio_util::sync::CancellationToken` and wait for the original tool-call acknowledgement after signaling cancellation; the unusable public `tool_call_cancel(req_id)` methods were removed (#217, #218).
+
 ### Bug Fixes
 
 - *(computer)* #211 旧 transport 迟到 Close 不再清除新会话 membership

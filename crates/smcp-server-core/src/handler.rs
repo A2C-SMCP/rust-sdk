@@ -1,7 +1,9 @@
 //! SMCP 协议处理器 / SMCP protocol handler
 
 use crate::auth::{AuthError, AuthenticationProvider};
-use crate::session::{ClientRole, SessionData, SessionError, SessionManager};
+use crate::session::{
+    ClientRole, JoinDecision, LeaveCommit, SessionData, SessionError, SessionManager,
+};
 use futures_util::StreamExt;
 use serde_json::Value;
 use smcp::*;
@@ -55,16 +57,25 @@ impl HandlerError {
     /// 转换为 flat 错误负载 / Convert to a flat error payload
     ///
     /// 协议 0.2.2：错误负载统一为 flat [`smcp::ErrorPayload`]（顶层 `code`/`message`），禁止嵌套
-    /// `{"error": {...}}` envelope。本方法服务于 `server:*` **管理事件** ack——其码空间是传输/管理层
-    /// [`smcp::error_codes`]（400/401/500/4101…），不受协议谓词约束。
+    /// `{"error": {...}}` envelope；码空间是传输/管理层 [`smcp::error_codes`]（400/401/500/4101…），
+    /// 不受协议谓词约束。
     ///
-    /// ✅ SRV-01 (#47) 已收敛 `client:*` 路径：`client:*` ack **永不**承载裸 `HandlerError`——
-    /// 目标未命中经 [`smcp::build_computer_not_found_error`]（[`smcp::ErrorCode::NotFound`] 404）以
-    /// bare flat ErrorPayload 投递，隔离拒绝则不投递 ack（见 `SmcpHandler::relay_client_call`）。因此
-    /// Agent 端按 [`smcp::is_protocol_error_payload`] 判定的协议级闭集（404/4006–4018）不会被本方法
-    /// 的传输层码污染。
-    pub fn to_error_payload(&self) -> smcp::ErrorPayload {
-        smcp::ErrorPayload::new(i64::from(self.error_code()), self.to_string())
+    /// **调用面**（#226 复审 🟡8 订正旧 doc）：三个房间事件（`server:join_office` /
+    /// `server:leave_office` / `server:list_room`）已改走 [`RoomAckResult`]，其拒绝一律由
+    /// [`smcp::build_room_rejection_error`] 产出 canonical 文案与 `details` 白名单；`client:*` 路由的
+    /// 错误经 [`smcp::build_computer_not_found_error`]（404）或**不投递 ack**（隔离拒绝）表达——SRV-01
+    /// (#47) 已收敛。故本方法在生产路径上**不再**是任何 ack 的构造入口，其唯一读者是
+    /// `impl serde::Serialize for HandlerError`（框架收编处理器错误、需要落日志/诊断时用到）。
+    /// 据此降为**私有**：外部无法把它当成「房间拒绝构造器」而绕过 canonical 文案不变量。
+    fn to_error_payload(&self) -> smcp::ErrorPayload {
+        let message = match self {
+            // A session id is an internal Socket.IO identifier and MUST NOT cross an ack
+            // boundary. Keep it in server logs via the source error, but expose only the
+            // protocol-level category to the caller.
+            HandlerError::Session(SessionError::NotFound(_)) => "Session not found".to_string(),
+            _ => self.to_string(),
+        };
+        smcp::ErrorPayload::new(i64::from(self.error_code()), message)
     }
 }
 
@@ -75,6 +86,49 @@ impl serde::Serialize for HandlerError {
     {
         // 使用 flat 错误负载格式 / Use the flat error payload shape
         self.to_error_payload().serialize(serializer)
+    }
+}
+
+/// Ack handlers return boxed payloads so the error path stays small on the async stack while
+/// preserving the same flat `ErrorPayload` wire shape.
+type RoomAckResult<T> = Result<T, Box<smcp::ErrorPayload>>;
+
+/// **单实参**载荷提取（`(T,)` 1-tuple）。
+///
+/// socketioxide 的解析器按 `T` 是否 tuple-like 分流（`socketioxide-parser-common::value::from_value`）：
+/// 非 tuple-like 走 `FirstElement` seed——`[payload, "extra"]` 会被**静默读成** `payload`，多余实参凭空
+/// 消失；tuple-like 则要求数组里**恰好**一个元素，多一个即反序列化失败。
+///
+/// 协议每个事件只定义**单个**载荷对象（`room-model.md` / `events.md`），Python 参考实现在
+/// `test_valid_payload_plus_extra_argument_is_rejected` 里钉死「有效载荷 + 多余实参 ⇒ `400`」。
+/// 本 SDK 用 1-tuple 把同一严格性前移到提取器层，故 `TryData<SingleArg<T>>` / `Data<SingleArg<T>>`
+/// 的 `Err` 分支**同时**覆盖「载荷畸形」与「实参个数不为 1」两种情形（#226 复审 🟡9）。
+///
+/// Single-argument payload extractor: the 1-tuple makes the parser require *exactly* one argument,
+/// matching the Python reference implementation's rejection of a valid payload plus extra arguments.
+type SingleArg<T> = (T,);
+
+/// 空 ack 的线载荷 / zero-argument Socket.IO ack payload.
+///
+/// 协议把 `server:join_office` / `server:leave_office` 的成功响应定义为**空 ack**；Python 参考实现
+/// （python-socketio `_handle_event_internal`：handler 返回 `None` ⇒ `data = []`）在线上产出
+/// **零参** ACK `[]`。
+///
+/// socketioxide 的 `AckSender::send` 只接受**单个**实参，`send(&())` 会被其 `to_value` 包成 1-tuple
+/// ⇒ 线上成 `[null]`——凭空多出一个 `null` 实参。跨 SDK 逐字节不一致即源于此（#226 P1-6）：
+/// 按「参数个数」判成功的对端（JS `emitWithAck` 回调、字节级 conformance fixture）会把成功读成畸形。
+///
+/// 本类型的 `Serialize` 直接 `serialize_tuple(0)`：socketioxide 的 `is_ser_tuple` 将其判为 tuple-like
+/// ⇒ 其解析器**不再**包一层 ⇒ 序列化结果就是 `[]`，与 Python 逐字节一致。
+///
+/// 不用 `Vec::new()`：serde 把 `Vec` 归为 `seq`（非 tuple-like），同样会被包成 `[[]]`——一个「空数组」
+/// 实参，仍是多一个参数。Emit a zero-argument ack (`[]` on the wire).
+struct EmptyAck;
+
+impl serde::Serialize for EmptyAck {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        serializer.serialize_tuple(0)?.end()
     }
 }
 
@@ -183,6 +237,32 @@ pub struct ServerState {
 pub struct SmcpHandler;
 
 impl SmcpHandler {
+    /// Return the Socket.IO room used for an SMCP office.
+    ///
+    /// Office rooms live in their own `office:` namespace so an attacker-controlled
+    /// `office_id` can never collide with a connection-level room name.
+    ///
+    /// ⚠️ 不要把这件事说成「Socket.IO 为每个连接保留 SID 私房」：**socketioxide 不会**把连接自动加入
+    /// 以其 SID 命名的房（唯一房间写入口是 `Socket::join`，全仓无 `socket.join(sid)`），而
+    /// python-socketio **会**。故本前缀的意义是**跨实现**的确定性：无论宿主栈是否保留 SID 私房，
+    /// 房间名空间都不与它相交。#226 P0-1 记录过一处基于「本栈有 SID 私房」的错误注释与随之而来的
+    /// 死守卫（`room != sid`）。
+    ///
+    /// Do not claim this stacks auto-joins a per-connection SID room: socketioxide does not (only
+    /// python-socketio does). The prefix is what makes the guarantee hold across implementations.
+    fn office_room(office_id: &str) -> String {
+        format!("office:{office_id}")
+    }
+
+    /// Ack a malformed payload without reflecting parser details or input data.
+    ///
+    /// 载荷 schema 校验失败 **MUST** 回 `400`（协议 error-handling.md：具备 ack 通道的事件不得静默
+    /// 不 ack——「挂到客户端自身超时」与「立即收到结构化错误」是两种客户端可感行为）。文案与 Python
+    /// `build_bad_request_error` 对齐。
+    fn ack_bad_request(ack: AckSender) {
+        let _ = ack.send(&smcp::build_bad_request_error());
+    }
+
     /// 注册所有事件处理器
     pub fn register_handlers(io: &SocketIo, state: ServerState) {
         // 注册命名空间和连接处理器
@@ -226,25 +306,58 @@ impl SmcpHandler {
         let state_join = state.clone();
         socket.on(
             smcp::events::SERVER_JOIN_OFFICE,
-            move |socket: SocketRef, Data::<EnterOfficeReq>(data), ack: AckSender| async move {
-                let result = Self::on_server_join_office(socket, data, state_join.clone()).await;
-                let _ = ack.send(&result);
+            move |socket: SocketRef, TryData::<SingleArg<Value>>(data), ack: AckSender| async move {
+                match data {
+                    Ok((value,)) => match serde_json::from_value::<EnterOfficeReq>(value) {
+                        Ok(data) => {
+                            match Self::on_server_join_office(socket, data, state_join.clone())
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = ack.send(&EmptyAck);
+                                }
+                                Err(error) => {
+                                    let _ = ack.send(&error);
+                                }
+                            }
+                        }
+                        Err(_) => Self::ack_bad_request(ack),
+                    },
+                    Err(_) => Self::ack_bad_request(ack),
+                }
             },
         );
 
         let state_leave = state.clone();
         socket.on(
             smcp::events::SERVER_LEAVE_OFFICE,
-            move |socket: SocketRef, Data::<LeaveOfficeReq>(data), ack: AckSender| async move {
-                let result = Self::on_server_leave_office(socket, data, state_leave.clone()).await;
-                let _ = ack.send(&result);
+            move |socket: SocketRef, TryData::<SingleArg<Value>>(data), ack: AckSender| async move {
+                match data {
+                    Ok((value,)) => match serde_json::from_value::<LeaveOfficeReq>(value) {
+                        Ok(data) => {
+                            let result =
+                                Self::on_server_leave_office(socket, data, state_leave.clone())
+                                    .await;
+                            match result {
+                                Ok(()) => {
+                                    let _ = ack.send(&EmptyAck);
+                                }
+                                Err(error) => {
+                                    let _ = ack.send(&error);
+                                }
+                            }
+                        }
+                        Err(_) => Self::ack_bad_request(ack),
+                    },
+                    Err(_) => Self::ack_bad_request(ack),
+                }
             },
         );
 
         let state_tool_call_cancel = state.clone();
         socket.on(
             smcp::events::SERVER_TOOL_CALL_CANCEL,
-            move |socket: SocketRef, Data::<AgentCallData>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<AgentCallData>>((data,))| async move {
                 Self::on_server_tool_call_cancel(socket, data, state_tool_call_cancel.clone()).await
             },
         );
@@ -252,7 +365,7 @@ impl SmcpHandler {
         let state_update_config = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_CONFIG,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_config(socket, data, state_update_config.clone()).await
             },
         );
@@ -260,7 +373,7 @@ impl SmcpHandler {
         let state_update_tool_list = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_TOOL_LIST,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_tool_list(socket, data, state_update_tool_list.clone()).await
             },
         );
@@ -268,13 +381,21 @@ impl SmcpHandler {
         let state_tool_call = state.clone();
         socket.on(
             smcp::events::CLIENT_TOOL_CALL,
-            move |socket: SocketRef, Data::<ToolCallReq>(data), ack: AckSender| async move {
-                match Self::on_client_tool_call(socket, data, state_tool_call.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<ToolCallReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_tool_call(socket, data, state_tool_call.clone()).await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            // 隔离拒绝（发起方非 Agent / 会话已断连）：镜像 Python，不投递协议 ack（发起方侧自行超时）
+                            Err(e) => warn!("client:tool_call relay rejected, no ack: {e}"),
+                        }
                     }
-                    // 隔离拒绝（发起方非 Agent / 会话已断连）：镜像 Python，不投递协议 ack（发起方侧自行超时）
-                    Err(e) => warn!("client:tool_call relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -282,12 +403,20 @@ impl SmcpHandler {
         let state_get_tools = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_TOOLS,
-            move |socket: SocketRef, Data::<GetToolsReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_tools(socket, data, state_get_tools.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetToolsReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_get_tools(socket, data, state_get_tools.clone()).await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_tools relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_tools relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -295,12 +424,21 @@ impl SmcpHandler {
         let state_get_desktop = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_DESKTOP,
-            move |socket: SocketRef, Data::<GetDesktopReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_desktop(socket, data, state_get_desktop.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetDesktopReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_get_desktop(socket, data, state_get_desktop.clone())
+                            .await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_desktop relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_desktop relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -308,12 +446,21 @@ impl SmcpHandler {
         let state_get_config = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_CONFIG,
-            move |socket: SocketRef, Data::<GetComputerConfigReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_config(socket, data, state_get_config.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetComputerConfigReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_get_config(socket, data, state_get_config.clone())
+                            .await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_config relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_config relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -321,7 +468,7 @@ impl SmcpHandler {
         let state_update_desktop = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_DESKTOP,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_desktop(socket, data, state_update_desktop.clone()).await
             },
         );
@@ -329,9 +476,24 @@ impl SmcpHandler {
         let state_list_room = state.clone();
         socket.on(
             smcp::events::SERVER_LIST_ROOM,
-            move |socket: SocketRef, Data::<ListRoomReq>(data), ack: AckSender| async move {
-                let result = Self::on_server_list_room(socket, data, state_list_room.clone()).await;
-                let _ = ack.send(&result);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<ListRoomReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        let result =
+                            Self::on_server_list_room(socket, data, state_list_room.clone()).await;
+                        match result {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                        }
+                    }
+                    Err(_) => Self::ack_bad_request(ack),
+                }
             },
         );
 
@@ -339,12 +501,21 @@ impl SmcpHandler {
         let state_get_skills = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_SKILLS,
-            move |socket: SocketRef, Data::<GetSkillsReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_skills(socket, data, state_get_skills.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetSkillsReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_get_skills(socket, data, state_get_skills.clone())
+                            .await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_skills relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_skills relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -352,12 +523,20 @@ impl SmcpHandler {
         let state_get_skill = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_SKILL,
-            move |socket: SocketRef, Data::<GetSkillReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_skill(socket, data, state_get_skill.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetSkillReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_get_skill(socket, data, state_get_skill.clone()).await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_skill relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_skill relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -365,12 +544,19 @@ impl SmcpHandler {
         let state_get_blob = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_BLOB,
-            move |socket: SocketRef, Data::<GetBlobReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_blob(socket, data, state_get_blob.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetBlobReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_get_blob(socket, data, state_get_blob.clone()).await {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:get_blob relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:get_blob relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -379,12 +565,19 @@ impl SmcpHandler {
         let state_put_blob = state.clone();
         socket.on(
             smcp::events::CLIENT_PUT_BLOB,
-            move |socket: SocketRef, Data::<PutBlobReq>(data), ack: AckSender| async move {
-                match Self::on_client_put_blob(socket, data, state_put_blob.clone()).await {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<PutBlobReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_put_blob(socket, data, state_put_blob.clone()).await {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:put_blob relay rejected, no ack: {e}"),
+                        }
                     }
-                    Err(e) => warn!("client:put_blob relay rejected, no ack: {e}"),
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -392,13 +585,23 @@ impl SmcpHandler {
         let state_get_resources = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_RESOURCES,
-            move |socket: SocketRef, Data::<GetResourcesReq>(data), ack: AckSender| async move {
-                match Self::on_client_get_resources(socket, data, state_get_resources.clone()).await
-                {
-                    Ok(payload) => {
-                        let _ = ack.send(&payload);
-                    }
-                    Err(e) => warn!("client:get_resources relay rejected, no ack: {e}"),
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<GetResourcesReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => match Self::on_client_get_resources(
+                        socket,
+                        data,
+                        state_get_resources.clone(),
+                    )
+                    .await
+                    {
+                        Ok(payload) => {
+                            let _ = ack.send(&payload);
+                        }
+                        Err(e) => warn!("client:get_resources relay rejected, no ack: {e}"),
+                    },
+                    Err(_) => Self::ack_bad_request(ack),
                 }
             },
         );
@@ -406,7 +609,7 @@ impl SmcpHandler {
         let state_update_skills = state.clone();
         socket.on(
             smcp::events::SERVER_UPDATE_SKILLS,
-            move |socket: SocketRef, Data::<UpdateComputerConfigReq>(data)| async move {
+            move |socket: SocketRef, Data::<SingleArg<UpdateComputerConfigReq>>((data,))| async move {
                 Self::on_server_update_skills(socket, data, state_update_skills.clone()).await
             },
         );
@@ -469,7 +672,7 @@ impl SmcpHandler {
                 };
 
                 let _ = socket
-                    .within(office_id)
+                    .within(Self::office_room(&office_id))
                     .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
                     .await;
             }
@@ -491,76 +694,75 @@ impl SmcpHandler {
         socket: SocketRef,
         data: EnterOfficeReq,
         state: ServerState,
-    ) -> (bool, Option<String>) {
+    ) -> RoomAckResult<()> {
         info!("on_server_join_office called with data: {:?}", data);
 
         let sid = socket.id.to_string();
         let requested_role = ClientRole::from(data.role.clone());
         let requested_name = data.name.clone();
 
-        // 获取或创建会话
-        let session = match state.session_manager.get_session(&sid) {
-            Some(s) => {
-                // 检查角色/状态一致性
-                if s.role != requested_role {
-                    return (
-                        false,
-                        Some(format!(
-                            "Role mismatch: existing session has role {:?}, but requested {:?}",
-                            s.role, requested_role
-                        )),
-                    );
-                }
+        // 从握手 URL query 提取协商到的协议版本（仅记录用于诊断/展示，兼容性已由 HTTP 握手中间件
+        // 保证）。提取逻辑对齐 Python `_extract_a2c_version`。
+        //
+        // 时机说明：Python 在 on_connect 即记录 a2c_version；Rust 会话在 join 时才懒建，故在此
+        // （会话创建处）记录。二者 list_room 结果等价——`req_parts().uri.query()` 反映的是该连接的
+        // 握手请求 URI，连接存续期间稳定（已由集成测试 `test_list_room_reports_a2c_version` 固化）。
+        let a2c_version = smcp::utils::handshake::extract_a2c_version(
+            socket.req_parts().uri.query().unwrap_or(""),
+        );
 
-                if s.name != requested_name {
-                    return (
-                        false,
-                        Some(format!(
-                            "Name mismatch: existing session has name '{}', but requested '{}'",
-                            s.name, requested_name
-                        )),
-                    );
-                }
+        // 取或建会话：**原子**且**绝不覆盖**既有记录。历史实现是「先 `get_session` 再
+        // `register_session`」两步式，两个并发 join 会双双看到「查无」并互相覆盖——被覆盖者占下的
+        // name 预留从此无人释放，该 name 在该房内被**永久**占死（#226 P1-4）。
+        let session = state.session_manager.get_or_register_session(
+            sid.clone(),
+            requested_name.clone(),
+            requested_role.clone(),
+            a2c_version,
+        );
 
-                s
-            }
-            None => {
-                // 从握手 URL query 提取协商到的协议版本（仅记录用于诊断/展示，
-                // 兼容性已由 HTTP 握手中间件保证）。提取逻辑对齐 Python `_extract_a2c_version`。
-                //
-                // 时机说明：Python 在 on_connect 即记录 a2c_version；Rust 会话在 join 时才懒建，
-                // 故在此（会话创建处）记录。二者 list_room 结果等价——`req_parts().uri.query()`
-                // 反映的是该连接的握手请求 URI，连接存续期间稳定（已由集成测试
-                // `test_list_room_reports_a2c_version` 固化验证）。
-                let a2c_version = smcp::utils::handshake::extract_a2c_version(
-                    socket.req_parts().uri.query().unwrap_or(""),
-                );
-                // 创建新会话
-                let new_session = SessionData::new(sid.clone(), requested_name, requested_role)
-                    .with_a2c_version(a2c_version);
+        // 身份声明一致性（协议 events.md §server:join_office）：同一 sid 声明了与既有会话不同的
+        // `role` **或** `name` ⇒ 403（**非**房间语义，故走 [§通用错误码] 而不走 4101–4106）。
+        // 身份在一次连接内不可变更：改身份须新建连接（faq.md 给出的补救即「重连或换 sid」）。
+        if session.role != requested_role || session.name != requested_name {
+            warn!(
+                sid = %sid,
+                session_role = %session.role,
+                session_name = %session.name,
+                request_role = %requested_role,
+                request_name = %requested_name,
+                "server:join_office identity claim mismatch with existing session"
+            );
+            // 403 无 code-specific 字段（协议 §各错误码标准字段总表），故三个来源参数均为 `None`。
+            return Err(Box::new(smcp::build_room_rejection_error(
+                smcp::RoomRejectionCode::Forbidden,
+                smcp::RoomRejectionContext::default(),
+            )));
+        }
 
-                if let Err(e) = state.session_manager.register_session(new_session.clone()) {
-                    return (false, Some(format!("Failed to register session: {}", e)));
-                }
-                new_session
+        // 入房事务：**校验 → 预留 → 提交**在单临界区内完成（`reserve_join`）。任何拒绝都在
+        // **零成员关系副作用**时返回，故被拒客户端绝不留在目标房——否则它会持续收到该房的
+        // `notify:*`，而 `list_room` 说它不在任何房（#226 P0-2 / P1-4 的原形成因）。
+        let reservation = match state.session_manager.reserve_join(&sid, &data.office_id) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                error!("server:join_office rejected for sid={}: {}", sid, error);
+                return Err(Box::new(Self::room_rejection(
+                    &error,
+                    &session.role,
+                    &data.office_id,
+                )));
             }
         };
 
-        // 检查并加入房间
-        if let Err(e) =
-            Self::handle_join_room(socket.clone(), &session, &data.office_id, &state).await
-        {
-            error!("handle_join_room failed: {}", e);
-            return (false, Some(format!("Failed to join room: {}", e)));
-        }
-
-        // 更新会话的办公室 ID（在成功加入房间后）
-        if let Err(e) = state
-            .session_manager
-            .update_office_id(&sid, Some(data.office_id.clone()))
-        {
-            return (false, Some(format!("Failed to update office_id: {}", e)));
-        }
+        // 闸门全部通过后才动 Socket.IO 成员关系（含 Computer 的退旧房）。
+        Self::apply_join_room(
+            socket.clone(),
+            &session,
+            &data.office_id,
+            reservation.decision,
+        )
+        .await;
 
         // 构建通知数据
         let session_name = session.name.clone();
@@ -579,7 +781,7 @@ impl SmcpHandler {
         };
 
         let result = socket
-            .to(data.office_id.clone())
+            .to(Self::office_room(&data.office_id))
             .emit(smcp::events::NOTIFY_ENTER_OFFICE, &notification_data)
             .await;
 
@@ -587,7 +789,7 @@ impl SmcpHandler {
             warn!("Failed to broadcast NOTIFY_ENTER_OFFICE: {}", e);
         }
 
-        (true, None)
+        Ok(())
     }
 
     /// 处理离开办公室事件
@@ -595,43 +797,139 @@ impl SmcpHandler {
         socket: SocketRef,
         data: LeaveOfficeReq,
         state: ServerState,
-    ) -> (bool, Option<String>) {
+    ) -> RoomAckResult<()> {
         let sid = socket.id.to_string();
 
-        // 获取会话
-        let session = match state.session_manager.get_session(&sid) {
-            Some(s) => s,
-            None => return (false, Some(format!("Session not found: {}", sid))),
-        };
+        // 会话懒建于 join：无会话的连接与「无房会话」同义——退房在无房时**幂等成功**（回空 ack），
+        // 且**不得**采信载荷里的 office_id 作为广播目标（协议 §房间广播类事件的目标来源）。
+        let session = state.session_manager.get_session(&sid);
+        let broadcast_office = session.as_ref().and_then(|s| s.office_id.clone());
 
-        // 构建离开通知
-        let notification = if session.role == ClientRole::Computer {
-            LeaveOfficeNotification {
-                office_id: data.office_id.clone(),
-                computer: Some(session.name),
-                agent: None,
+        if let (Some(session), Some(current_office)) = (session.as_ref(), broadcast_office.as_ref())
+        {
+            if current_office != &data.office_id {
+                warn!(
+                    sid = %sid,
+                    session_office = %current_office,
+                    payload_office = %data.office_id,
+                    "Ignoring leave_office payload office_id; using session office"
+                );
             }
-        } else {
-            LeaveOfficeNotification {
-                office_id: data.office_id.clone(),
-                computer: None,
-                agent: Some(session.name),
-            }
-        };
 
-        // 广播离开消息
-        let _ = socket
-            .within(data.office_id.clone())
-            .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
-            .await;
+            let notification = if session.role == ClientRole::Computer {
+                LeaveOfficeNotification {
+                    office_id: current_office.clone(),
+                    computer: Some(session.name.clone()),
+                    agent: None,
+                }
+            } else {
+                LeaveOfficeNotification {
+                    office_id: current_office.clone(),
+                    computer: None,
+                    agent: Some(session.name.clone()),
+                }
+            };
 
-        // 更新会话
-        if let Err(e) = state.session_manager.update_office_id(&sid, None) {
-            return (false, Some(format!("Failed to update office_id: {}", e)));
+            let _ = socket
+                .within(Self::office_room(current_office))
+                .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
+                .await;
         }
-        socket.leave(data.office_id.clone());
 
-        (true, None)
+        // 提交点重读（#226 P0-3）：只在会话**仍**位于我刚刚广播的那个房时才清空。若该 `await` 期间
+        // 并发 `join` 已把会话迁到别的房，则本调用**不**改动会话——否则会把新状态倒着覆盖成「无房」，
+        // 而 socket 仍留在新房，成为继续收 `notify:*`、`list_room` 却查不到的幽灵成员。
+        match state
+            .session_manager
+            .commit_leave(&sid, broadcast_office.as_deref())
+        {
+            Ok(LeaveCommit::Superseded { current }) => warn!(
+                sid = %sid,
+                current_office = %current,
+                "leave_office superseded by a concurrent room change; keeping the newer state"
+            ),
+            Ok(_) => {}
+            Err(SessionError::NotFound(_)) => {}
+            Err(e) => warn!(sid = %sid, "leave_office commit failed: {}", e),
+        }
+
+        // 收敛真实成员关系（协议 events.md §server:leave_office：无房时 SHOULD 按真实成员关系收敛一次，
+        // 使漂移态可自愈、操作可重试）。目标取**重读后**的会话状态，故并发的换房会被如实保留。
+        let office_after = state
+            .session_manager
+            .get_session(&sid)
+            .and_then(|s| s.office_id);
+        Self::converge_socket_rooms(&socket, office_after.as_deref());
+
+        Ok(())
+    }
+
+    /// 把 socket 的房间成员关系收敛到权威会话状态：加入该在的房，退出其余全部房间。
+    ///
+    /// 这是「会话说它不在任何房，socket 却还在房里」这类**漂移态**的唯一自愈路径：只增不减或只减不增
+    /// 都只能收敛一半。收敛目标恒为会话状态（服务端权威），**不**取自客户端载荷。
+    ///
+    /// Converge Socket.IO membership onto the authoritative session state (both directions).
+    fn converge_socket_rooms(socket: &SocketRef, office_id: Option<&str>) {
+        let expected = office_id.map(Self::office_room);
+        for room in socket.rooms() {
+            if expected.as_deref() != Some(room.as_ref()) {
+                socket.leave(room.into_owned());
+            }
+        }
+        if let Some(expected) = expected {
+            socket.join(expected);
+        }
+    }
+
+    /// 房间管理拒绝的唯一构造入口：`SessionError` → 协议 canonical flat `ErrorPayload`。
+    ///
+    /// 历史实现把 `SessionError` 的内部 `Display`（外层还套 `HandlerError` 的 `"Session error: "` 前缀）
+    /// 直接序列化上 wire，既与协议 / python-sdk 的 canonical 文案逐字不符，也把内部错误类名泄给对端
+    /// （#226 P1-5）。本函数是「协议码 → 文案 / `details` 白名单」在服务端的唯一出口，调用方无从绕过。
+    ///
+    /// `declared_role` 取自**发起者自己的会话**（4105 的 `details.role` 报的是发起者声明的 role，
+    /// 不是冲突方的），`target_office_id` 取自请求载荷（发起者自己声明的目标房）。
+    fn room_rejection(
+        error: &SessionError,
+        declared_role: &ClientRole,
+        target_office_id: &str,
+    ) -> smcp::ErrorPayload {
+        use smcp::RoomRejectionCode as Code;
+        match error {
+            // 4106：details 报会话**当前**所在房（非被拒的目标房）——该值由 `reserve_join` 在
+            // 临界区内从权威会话读出，故并发下也不会报过期房号。
+            SessionError::AgentAlreadyInRoom(current) => smcp::build_room_rejection_error(
+                Code::AlreadyInRoom,
+                smcp::RoomRejectionContext {
+                    current_office_id: Some(current),
+                    ..Default::default()
+                },
+            ),
+            SessionError::AgentAlreadyExists => smcp::build_room_rejection_error(
+                Code::RoomFull,
+                smcp::RoomRejectionContext {
+                    target_office_id: Some(target_office_id),
+                    ..Default::default()
+                },
+            ),
+            SessionError::NameAlreadyRegistered(_) => smcp::build_room_rejection_error(
+                Code::NameConflict,
+                smcp::RoomRejectionContext {
+                    target_office_id: Some(target_office_id),
+                    declared_role: Some(&declared_role.to_string()),
+                    ..Default::default()
+                },
+            ),
+            // 会话不存在 / 状态非法属**内部**事故，不属房间语义：回笼统 500（协议空档内以通用码承载），
+            // 原文只进日志。绝不把内部错误文本当房间拒绝文案上 wire。
+            SessionError::NotFound(_) | SessionError::InvalidState(_) => {
+                smcp::ErrorPayload::from_error_code(
+                    smcp::ErrorCode::InternalError,
+                    "Internal error",
+                )
+            }
+        }
     }
 
     /// 处理工具调用取消事件
@@ -673,7 +971,7 @@ impl SmcpHandler {
         };
 
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_TOOL_CALL_CANCEL, &data)
             .await
         {
@@ -729,7 +1027,7 @@ impl SmcpHandler {
         );
 
         if let Err(e) = socket
-            .to(office_id.clone())
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_CONFIG, &notification)
             .await
         {
@@ -783,7 +1081,7 @@ impl SmcpHandler {
         };
 
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_TOOL_LIST, &notification)
             .await
         {
@@ -836,7 +1134,7 @@ impl SmcpHandler {
             computer: data.computer,
         };
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_SKILLS, &notification)
             .await
         {
@@ -849,6 +1147,23 @@ impl SmcpHandler {
     fn computer_not_found_value(computer_name: &str) -> Result<Value, HandlerError> {
         Ok(serde_json::to_value(build_computer_not_found_error(
             computer_name,
+        ))?)
+    }
+
+    /// 构造 bare flat `ErrorPayload(4103)`（发起方无房 ⇒ 无从定位任何 Computer）的 ack 负载。
+    ///
+    /// 协议依据 / Protocol: `error-handling.md` §Not In Room（4103）——**触发时机**明列
+    /// 「会话尚无 `office_id`（未成功加入任何房间）时，发起**需要房间上下文**的操作：`client:*`
+    /// 路由请求、`server:list_room` 等」。故无房来源的 `client:*` MUST 回 4103，而**不是**
+    /// 「目标 Computer 不存在」的 404——后者会把「你不在任何房间」这个调用方可自纠的状态
+    /// （先入房再重试）伪装成「这个 Computer 不存在」（换个目标重试也永远不会成功）。
+    ///
+    /// 与 `server:list_room` 共用 [`smcp::build_room_rejection_error`] 这一唯一 choke point，
+    /// 故文案（`Not in any room`）与「无 `details`」两条线上形态天然一致。
+    fn not_in_room_value() -> Result<Value, HandlerError> {
+        Ok(serde_json::to_value(smcp::build_room_rejection_error(
+            smcp::RoomRejectionCode::NotInRoom,
+            smcp::RoomRejectionContext::default(),
         ))?)
     }
 
@@ -891,6 +1206,12 @@ impl SmcpHandler {
     ) -> Result<Value, HandlerError> {
         // 发起方（Agent）会话 / Originator (Agent) session
         let sid = socket.id.to_string();
+        // 无会话记录：连接从未 join 过，或会话已随断连注销（飞行中消失）。
+        //
+        // 这两类**不**回 4103，保持「不投递 ack」的历史语义（协议 0.2.2：Server MAY 不 ack、
+        // 不投 ErrorPayload；镜像 Python `_relay_client_call` 的 raise）：服务端此时连「是谁在问」
+        // 都无从确认，回一个「你不在任何房间」的房间语义拒绝反而是假装知道对方身份。
+        // **有会话、无房**（join 被拒 / 已退房）才是协议 §4103 的触发态，见下方分支。
         let session = state
             .session_manager
             .get_session(&sid)
@@ -904,9 +1225,13 @@ impl SmcpHandler {
             ));
         }
 
-        // 发起方无 office → 无从在任何 office 内定位目标 → flat 404（诚实 + 不泄露 + 不挂起）
+        // 发起方无 office → 无从在任何 office 内定位目标 → flat **4103** `Not in any room`。
+        //
+        // 协议依据：`error-handling.md` §Not In Room 把 `client:*` 路由请求明列为触发场景
+        // （#226 复审 建议项 3 / 本轮按协议接线）。此前回的是「目标 Computer 找不到」的 404，
+        // 把「先入房再重试即可」的可自纠状态误导成「换个目标才有用」。
         let Some(office_id) = session.office_id else {
-            return Self::computer_not_found_value(computer_name);
+            return Self::not_in_room_value();
         };
 
         // office-scoped 解析目标 Computer SID：跨 office 目标天然不可达 → 404（不泄露存在性）
@@ -1198,7 +1523,7 @@ impl SmcpHandler {
         };
 
         if let Err(e) = socket
-            .to(office_id)
+            .to(Self::office_room(&office_id))
             .emit(smcp::events::NOTIFY_UPDATE_DESKTOP, &notification)
             .await
         {
@@ -1211,19 +1536,29 @@ impl SmcpHandler {
         socket: SocketRef,
         data: ListRoomReq,
         state: ServerState,
-    ) -> ListRoomRet {
+    ) -> RoomAckResult<ListRoomRet> {
         // 获取发起者会话信息
         let sid = socket.id.to_string();
         let session = match state.session_manager.get_session(&sid) {
             Some(s) => s,
             None => {
                 warn!("List room from unknown session sid={}", sid);
-                return ListRoomRet {
-                    sessions: vec![],
-                    req_id: data.base.req_id,
-                };
+                // 无会话 == 无房（会话懒建于 join）：协议把「无房却发起需要房间上下文的操作」
+                // 定为 4103 `Not in any room`。canonical 文案由 builder 单点产出。
+                return Err(Box::new(smcp::build_room_rejection_error(
+                    smcp::RoomRejectionCode::NotInRoom,
+                    smcp::RoomRejectionContext::default(),
+                )));
             }
         };
+
+        if session.office_id.is_none() {
+            warn!("List room from session outside an office sid={}", sid);
+            return Err(Box::new(smcp::build_room_rejection_error(
+                smcp::RoomRejectionCode::NotInRoom,
+                smcp::RoomRejectionContext::default(),
+            )));
+        }
 
         // 房间隔离：仅可查询自己所在的 office。判定下沉到纯函数 [`Self::list_room_authorized`]
         // （运行期 `Result`/分支，**非** `debug_assert!`）→ release build 下隔离同样硬化，对标
@@ -1234,10 +1569,13 @@ impl SmcpHandler {
                 "list_room isolation rejected: session {} (office {:?}) requested room {}",
                 sid, session.office_id, data.office_id
             );
-            return ListRoomRet {
-                sessions: vec![],
-                req_id: data.base.req_id,
-            };
+            return Err(Box::new(smcp::build_room_rejection_error(
+                smcp::RoomRejectionCode::CrossRoomAccess,
+                smcp::RoomRejectionContext {
+                    target_office_id: Some(&data.office_id),
+                    ..Default::default()
+                },
+            )));
         }
 
         // 获取指定办公室的所有会话
@@ -1257,35 +1595,50 @@ impl SmcpHandler {
             })
             .collect();
 
-        ListRoomRet {
+        Ok(ListRoomRet {
             sessions: session_infos,
             req_id: data.base.req_id,
-        }
+        })
     }
 
     /// 处理加入房间的逻辑
-    async fn handle_join_room(
+    ///
+    /// 三个分支都以**权威会话状态**为收敛目标（`Noop` 亦收敛，见下），故 `join` 与 `leave` 两条路径
+    /// 对「会话说在房、socket 不在房」这类漂移态的对策**对称**：只增不减或只减不增都只能收敛一半。
+    ///
+    /// ⚠️ **残余窗口（如实标注，不宣称消除）**：`apply_join_room` 操作的是 socketioxide 的成员表，
+    /// 而权威状态在 [`SessionManager`] 里——两者是**双存储**，写入之间没有共同锁。故在
+    /// 「handler 读会话」与「socket.join/leave 生效」之间仍存在一个极窄的残余窗；本 PR 消除的是
+    /// **可观测**的幽灵成员（`leave` 用提交点重读、`join` 用临界区内一次完成校验+提交），把该窗收窄到
+    /// 单次 `await` 的调度粒度，而**不是**把双存储变成单存储。
+    async fn apply_join_room(
         socket: SocketRef,
         session: &SessionData,
         office_id: &str,
-        state: &ServerState,
-    ) -> Result<(), HandlerError> {
+        decision: JoinDecision,
+    ) {
         info!(
             "handle_join_room called: sid={}, office_id={}, role={:?}",
             socket.id, office_id, session.role
         );
 
-        match Self::validate_join_room(session, office_id, state)? {
-            JoinRoomDecision::Noop => {
-                info!("Noop decision for sid={}", socket.id);
-                Ok(())
+        match decision {
+            JoinDecision::Noop => {
+                // 重复入同一房不改变权威状态，但**仍**收敛一次 socket 成员关系：`leave` 会收敛而 `join`
+                // 不收敛会形成不对称——漂移态（如 leave 的「读会话 → 收敛」之间的窄窗，或历史版本
+                // 残留的脏成员关系）只会在一次 `leave` 后才自愈。收敛是幂等的（已在目标房 ⇒
+                // `join` 无副作用；不在 ⇒ 补上），开销可忽略，故没有理由不做。
+                info!(
+                    "Noop decision for sid={}; converging socket rooms",
+                    socket.id
+                );
+                Self::converge_socket_rooms(&socket, Some(office_id));
             }
-            JoinRoomDecision::Join => {
+            JoinDecision::Join => {
                 info!("Joining room '{}' for sid={}", office_id, socket.id);
-                socket.join(office_id.to_string());
-                Ok(())
+                socket.join(Self::office_room(office_id));
             }
-            JoinRoomDecision::LeaveAndJoin { leave_office } => {
+            JoinDecision::LeaveAndJoin { leave_office } => {
                 info!(
                     "Leaving room '{}' and joining '{}' for sid={}",
                     leave_office, office_id, socket.id
@@ -1308,13 +1661,12 @@ impl SmcpHandler {
 
                 // 向旧房间广播离开消息
                 let _ = socket
-                    .within(leave_office.clone())
+                    .within(Self::office_room(&leave_office))
                     .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &leave_notification)
                     .await;
 
-                socket.leave(leave_office);
-                socket.join(office_id.to_string());
-                Ok(())
+                socket.leave(Self::office_room(&leave_office));
+                socket.join(Self::office_room(office_id));
             }
         }
     }
@@ -1327,80 +1679,6 @@ impl SmcpHandler {
     fn list_room_authorized(session_office: Option<&str>, requested_office: &str) -> bool {
         session_office == Some(requested_office)
     }
-
-    fn validate_join_room(
-        session: &SessionData,
-        office_id: &str,
-        state: &ServerState,
-    ) -> Result<JoinRoomDecision, HandlerError> {
-        match session.role {
-            ClientRole::Agent => {
-                if let Some(current_office) = &session.office_id {
-                    if current_office != office_id {
-                        return Err(HandlerError::Session(SessionError::AgentAlreadyInRoom(
-                            current_office.clone(),
-                        )));
-                    }
-                    warn!(
-                        "Agent sid: {} already in room: {}. 正在重复加入房间",
-                        session.sid, current_office
-                    );
-                    return Ok(JoinRoomDecision::Noop);
-                }
-
-                if state
-                    .session_manager
-                    .has_agent_in_office(&office_id.to_string())
-                {
-                    return Err(HandlerError::Session(SessionError::AgentAlreadyExists));
-                }
-            }
-            ClientRole::Computer => {
-                if let Some(current_office) = &session.office_id {
-                    if current_office != office_id {
-                        if state
-                            .session_manager
-                            .has_computer_in_office(&office_id.to_string(), &session.name)
-                        {
-                            return Err(HandlerError::Session(
-                                SessionError::ComputerAlreadyExists(
-                                    session.name.clone(),
-                                    office_id.to_string(),
-                                ),
-                            ));
-                        }
-                        return Ok(JoinRoomDecision::LeaveAndJoin {
-                            leave_office: current_office.clone(),
-                        });
-                    }
-                    warn!(
-                        "Computer sid: {} already in room: {}. 正在重复加入房间",
-                        session.sid, current_office
-                    );
-                    return Ok(JoinRoomDecision::Noop);
-                }
-
-                if state
-                    .session_manager
-                    .has_computer_in_office(&office_id.to_string(), &session.name)
-                {
-                    return Err(HandlerError::Session(SessionError::ComputerAlreadyExists(
-                        session.name.clone(),
-                        office_id.to_string(),
-                    )));
-                }
-            }
-        }
-
-        Ok(JoinRoomDecision::Join)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum JoinRoomDecision {
-    Noop,
-    Join,
-    LeaveAndJoin { leave_office: String },
 }
 
 #[cfg(test)]
@@ -1408,19 +1686,6 @@ mod tests {
     use super::*;
     use crate::auth::DefaultAuthenticationProvider;
     use serde_json;
-
-    fn create_test_state() -> ServerState {
-        let (_layer, io) = SocketIo::builder().build_layer();
-        ServerState {
-            session_manager: Arc::new(SessionManager::new()),
-            auth_provider: Arc::new(DefaultAuthenticationProvider::new(
-                Some("test_secret".to_string()),
-                None,
-            )),
-            io: Arc::new(io),
-            inflight_disconnect: Arc::new(InflightDisconnectRegistry::default()),
-        }
-    }
 
     #[tokio::test]
     async fn test_agent_join_office() {
@@ -1455,6 +1720,15 @@ mod tests {
         assert!(message.contains("Invalid request"));
         assert!(message.contains("bad"));
         assert!(v.get("error").is_none(), "禁止嵌套 envelope"); // 回退到 {"error":{...}} 即失败
+    }
+
+    #[test]
+    fn test_session_identifier_is_not_exposed_in_error_payload() {
+        let err = HandlerError::Session(SessionError::NotFound("private-sid".to_string()));
+        let payload = err.to_error_payload();
+        assert_eq!(payload.code, i64::from(smcp::error_codes::NOT_FOUND));
+        assert_eq!(payload.message, "Session not found");
+        assert!(!payload.message.contains("private-sid"));
     }
 
     // ── #56 SRV-04：在途断连信号注册表 ──────────────────────────────────────────────
@@ -1517,6 +1791,33 @@ mod tests {
         assert!(v.get("error").is_none(), "禁止嵌套 envelope");
     }
 
+    /// #226 复审 🟡7：500 降级路径（`room_rejection` 的 `NotFound | InvalidState → InternalError`）
+    /// 此前零覆盖。Python 有三条对应用例（`test_unknown_exception_is_500_without_echoing_detail` /
+    /// `test_unmapped_rejection_code_degrades_to_500` / `test_non_int_rejection_code_degrades_to_500`）。
+    ///
+    /// 这两类错误属**内部**事故，不属房间语义：必须回笼统 `500 Internal error`，**不得**把内部
+    /// 错误文本（含 `sid` 等标识）当房间拒绝文案上 wire——那既与协议 canonical 文案不符，也是信息泄露。
+    #[test]
+    fn test_room_rejection_internal_failures_degrade_to_generic_500() {
+        for error in [
+            SessionError::NotFound("private-sid".to_string()),
+            SessionError::InvalidState("private internal state".to_string()),
+        ] {
+            let payload = SmcpHandler::room_rejection(&error, &ClientRole::Agent, "office-a");
+            assert_eq!(payload.code, i64::from(smcp::error_codes::INTERNAL_ERROR));
+            assert_eq!(payload.message, "Internal error");
+            assert!(
+                payload.details.is_none(),
+                "内部降级不得携带 details: {payload:?}"
+            );
+            let serialized = serde_json::to_string(&payload).unwrap();
+            assert!(
+                !serialized.contains("private-"),
+                "内部错误文本 MUST NOT 上 wire: {serialized}"
+            );
+        }
+    }
+
     #[test]
     fn test_list_room_authorized_is_runtime_isolation_invariant() {
         // 对标 Python `-O` 回归 test_isolation_hardening：判定是运行期纯函数（**非** debug_assert!），
@@ -1536,119 +1837,10 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_join_room_agent_already_in_other_room() {
-        let state = create_test_state();
-        let session = SessionData::new("sid1".to_string(), "a".to_string(), ClientRole::Agent)
-            .with_office_id("office1".to_string());
-
-        let err = SmcpHandler::validate_join_room(&session, "office2", &state).unwrap_err();
-        assert!(matches!(
-            err,
-            HandlerError::Session(SessionError::AgentAlreadyInRoom(o)) if o == "office1"
-        ));
-    }
-
-    #[test]
-    fn test_validate_join_room_agent_already_exists() {
-        let state = create_test_state();
-        let office_id = "office1".to_string();
-        let existing_agent = SessionData::new(
-            "sid_agent".to_string(),
-            "agent1".to_string(),
-            ClientRole::Agent,
-        )
-        .with_office_id(office_id.clone());
-        state
-            .session_manager
-            .register_session(existing_agent)
-            .unwrap();
-
-        let new_agent = SessionData::new(
-            "sid_new".to_string(),
-            "agent2".to_string(),
-            ClientRole::Agent,
-        );
-        let err = SmcpHandler::validate_join_room(&new_agent, &office_id, &state).unwrap_err();
-        assert!(matches!(
-            err,
-            HandlerError::Session(SessionError::AgentAlreadyExists)
-        ));
-    }
-
-    #[test]
-    fn test_validate_join_room_computer_duplicate_name_in_office() {
-        let state = create_test_state();
-        let office_id = "office1".to_string();
-        let existing = SessionData::new(
-            "sid_c1".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id(office_id.clone());
-        state.session_manager.register_session(existing).unwrap();
-
-        let new_same_name = SessionData::new(
-            "sid_c2".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        );
-        let err = SmcpHandler::validate_join_room(&new_same_name, &office_id, &state).unwrap_err();
-        assert!(matches!(
-            err,
-            HandlerError::Session(SessionError::ComputerAlreadyExists(name, office))
-                if name == "computer1" && office == "office1"
-        ));
-    }
-
-    #[test]
-    fn test_validate_join_room_computer_switch_room() {
-        let state = create_test_state();
-        let session = SessionData::new(
-            "sid_c".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id("office_old".to_string());
-
-        let decision = SmcpHandler::validate_join_room(&session, "office_new", &state).unwrap();
-        assert_eq!(
-            decision,
-            JoinRoomDecision::LeaveAndJoin {
-                leave_office: "office_old".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn test_validate_join_room_same_room_noop() {
-        let state = create_test_state();
-        let session = SessionData::new("sid".to_string(), "c".to_string(), ClientRole::Computer)
-            .with_office_id("office1".to_string());
-
-        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
-        assert_eq!(decision, JoinRoomDecision::Noop);
-    }
-
-    #[test]
-    fn test_validate_join_room_agent_first_time_join() {
-        let state = create_test_state();
-        let session = SessionData::new("sid_agent".to_string(), "a".to_string(), ClientRole::Agent);
-
-        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
-        assert_eq!(decision, JoinRoomDecision::Join);
-    }
-
-    #[test]
-    fn test_validate_join_room_computer_first_time_join() {
-        let state = create_test_state();
-        let session = SessionData::new(
-            "sid_computer".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        );
-
-        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
-        assert_eq!(decision, JoinRoomDecision::Join);
+    fn test_office_room_is_disjoint_from_socket_sid_namespace() {
+        let sid = "abc123";
+        assert_eq!(SmcpHandler::office_room(sid), "office:abc123");
+        assert_ne!(SmcpHandler::office_room(sid), sid);
     }
 
     #[test]
