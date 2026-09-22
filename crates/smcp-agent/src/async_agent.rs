@@ -13,7 +13,7 @@ use crate::{
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
     events::AsyncAgentEventHandler,
-    protocol_error::raise_for_error_payload,
+    protocol_error::{parse_room_ack, raise_for_error_payload},
     request_builders::{
         build_get_blob_request, build_get_config_request, build_get_desktop_request,
         build_get_resources_request, build_get_skill_request, build_get_skills_request,
@@ -265,7 +265,20 @@ impl AsyncSmcpAgent {
         Ok(())
     }
 
-    /// 加入办公室
+    /// 加入办公室（**等 ack**，取得服务端裁决）
+    ///
+    /// 协议 v0.5.0：`server:join_office` 成功回空 ack、失败回 flat `ErrorPayload`
+    /// （`400` / `403` / `4101` / `4105` / `4106`）。历史实现是无 ack 的 `emit` + 直接记
+    /// `"Joined office"`——被 `4101` 拒绝时日志写「入房成功」并返回 `Ok(())`，此后所有 `client:*`
+    /// 调用都从一个**从未进入**的房发起，拿回调用方无法解释的 404（#226 P0-1，本 SDK 主要消费者的
+    /// 契约缺席）。
+    ///
+    /// 故此处改为 `call`：拿到 ack 后由 [`parse_room_ack`] 裁决——空 ack ⇒ `Ok(())`；
+    /// 含 `code` 的 flat ErrorPayload ⇒ [`SmcpAgentError::Protocol`]（带 code / message / details，
+    /// 调用方可按码分流：`4101` / `4105` 是传输层重连后的瞬态冲突，`4106` / `400` 永久不可重试）。
+    /// 形状不认识同样判失败（宁严勿宽），**绝不**把未获裁决读成成功。
+    ///
+    /// Join the office and **await the server's verdict** instead of fire-and-forget.
     pub async fn join_office(&self, agent_name: &str) -> Result<()> {
         let office_id = &self.auth_provider.get_agent_config().office_id;
         let req = EnterOfficeReq {
@@ -276,13 +289,23 @@ impl AsyncSmcpAgent {
 
         let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(req)?;
-        transport.emit(SERVER_JOIN_OFFICE, data).await?;
+        let response = transport
+            .call(SERVER_JOIN_OFFICE, data, self.config.default_timeout)
+            .await?;
+        parse_room_ack(&response)?;
 
         info!("Joined office: {}", office_id);
         Ok(())
     }
 
-    /// 离开办公室
+    /// 离开办公室（**等 ack**，取得服务端裁决）
+    ///
+    /// 协议 v0.5.0：`server:leave_office` 在有无房时均为**幂等成功**（空 ack）；失败只可能是
+    /// 载荷畸形（`400`）。等 ack 的意义不在错误码，而在**时序**：退房是「先退旧房再入新房」的显式
+    /// 两步语义，客户端必须确知旧房已提交（否则紧接着的 join 会撞上 `4106`）。协议自身也要求
+    /// 客户端**不**抢跑——只投递意图、以 ack 为终态。
+    ///
+    /// Await the server's verdict so a follow-up join cannot race the leave's commit.
     pub async fn leave_office(&self) -> Result<()> {
         let office_id = &self.auth_provider.get_agent_config().office_id;
         let req = LeaveOfficeReq {
@@ -291,7 +314,10 @@ impl AsyncSmcpAgent {
 
         let transport = self.resolve_transport().await?;
         let data = serde_json::to_value(req)?;
-        transport.emit(SERVER_LEAVE_OFFICE, data).await?;
+        let response = transport
+            .call(SERVER_LEAVE_OFFICE, data, self.config.default_timeout)
+            .await?;
+        parse_room_ack(&response)?;
 
         info!("Left office: {}", office_id);
         Ok(())
@@ -880,6 +906,12 @@ impl AsyncSmcpAgent {
         let response = transport
             .call(SERVER_LIST_ROOM, data, self.config.default_timeout)
             .await?;
+
+        // flat ErrorPayload → 协议错误（`400` 载荷畸形 / `4103` 无房 / `4104` 跨房）。
+        // **必须先行**于 `req_id` 校验：ErrorPayload 不带 `req_id`，先查 req_id 会把结构化拒绝误报成
+        // 「响应 req_id 不匹配」的内部错误——调用方看到一个无法解释的协议违约，而非「我不在任何房」。
+        // 对标 Python `client.py::get_computers_in_office` 的同款顺序约束（其注释点名了该坑）。
+        raise_for_error_payload(&response)?;
 
         // 验证 req_id（全 crate 单点收敛，见 response::ensure_req_id）
         ensure_req_id(&response, req_id.as_str())?;

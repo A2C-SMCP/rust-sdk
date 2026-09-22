@@ -1,7 +1,9 @@
 //! SMCP 协议处理器 / SMCP protocol handler
 
 use crate::auth::{AuthError, AuthenticationProvider};
-use crate::session::{ClientRole, SessionData, SessionError, SessionManager};
+use crate::session::{
+    ClientRole, JoinDecision, LeaveCommit, SessionData, SessionError, SessionManager,
+};
 use futures_util::StreamExt;
 use serde_json::Value;
 use smcp::*;
@@ -88,6 +90,30 @@ impl serde::Serialize for HandlerError {
 /// Ack handlers return boxed payloads so the error path stays small on the async stack while
 /// preserving the same flat `ErrorPayload` wire shape.
 type RoomAckResult<T> = Result<T, Box<smcp::ErrorPayload>>;
+
+/// 空 ack 的线载荷 / zero-argument Socket.IO ack payload.
+///
+/// 协议把 `server:join_office` / `server:leave_office` 的成功响应定义为**空 ack**；Python 参考实现
+/// （python-socketio `_handle_event_internal`：handler 返回 `None` ⇒ `data = []`）在线上产出
+/// **零参** ACK `[]`。
+///
+/// socketioxide 的 `AckSender::send` 只接受**单个**实参，`send(&())` 会被其 `to_value` 包成 1-tuple
+/// ⇒ 线上成 `[null]`——凭空多出一个 `null` 实参。跨 SDK 逐字节不一致即源于此（#226 P1-6）：
+/// 按「参数个数」判成功的对端（JS `emitWithAck` 回调、字节级 conformance fixture）会把成功读成畸形。
+///
+/// 本类型的 `Serialize` 直接 `serialize_tuple(0)`：socketioxide 的 `is_ser_tuple` 将其判为 tuple-like
+/// ⇒ 其解析器**不再**包一层 ⇒ 序列化结果就是 `[]`，与 Python 逐字节一致。
+///
+/// 不用 `Vec::new()`：serde 把 `Vec` 归为 `seq`（非 tuple-like），同样会被包成 `[[]]`——一个「空数组」
+/// 实参，仍是多一个参数。Emit a zero-argument ack (`[]` on the wire).
+struct EmptyAck;
+
+impl serde::Serialize for EmptyAck {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        serializer.serialize_tuple(0)?.end()
+    }
+}
 
 /// 在途断连信号注册表 / In-flight disconnect signal registry.
 ///
@@ -196,19 +222,28 @@ pub struct SmcpHandler;
 impl SmcpHandler {
     /// Return the Socket.IO room used for an SMCP office.
     ///
-    /// Socket.IO reserves each connection SID as a private room.  Keeping office
-    /// rooms in their own namespace makes an attacker-controlled `office_id`=
-    /// `<peer sid>` harmless: the two room name spaces can never intersect.
+    /// Office rooms live in their own `office:` namespace so an attacker-controlled
+    /// `office_id` can never collide with a connection-level room name.
+    ///
+    /// ⚠️ 不要把这件事说成「Socket.IO 为每个连接保留 SID 私房」：**socketioxide 不会**把连接自动加入
+    /// 以其 SID 命名的房（唯一房间写入口是 `Socket::join`，全仓无 `socket.join(sid)`），而
+    /// python-socketio **会**。故本前缀的意义是**跨实现**的确定性：无论宿主栈是否保留 SID 私房，
+    /// 房间名空间都不与它相交。#226 P0-1 记录过一处基于「本栈有 SID 私房」的错误注释与随之而来的
+    /// 死守卫（`room != sid`）。
+    ///
+    /// Do not claim this stacks auto-joins a per-connection SID room: socketioxide does not (only
+    /// python-socketio does). The prefix is what makes the guarantee hold across implementations.
     fn office_room(office_id: &str) -> String {
         format!("office:{office_id}")
     }
 
     /// Ack a malformed payload without reflecting parser details or input data.
+    ///
+    /// 载荷 schema 校验失败 **MUST** 回 `400`（协议 error-handling.md：具备 ack 通道的事件不得静默
+    /// 不 ack——「挂到客户端自身超时」与「立即收到结构化错误」是两种客户端可感行为）。文案与 Python
+    /// `build_bad_request_error` 对齐。
     fn ack_bad_request(ack: AckSender) {
-        let _ = ack.send(&smcp::ErrorPayload::new(
-            i64::from(smcp::error_codes::BAD_REQUEST),
-            "Invalid request payload",
-        ));
+        let _ = ack.send(&smcp::build_bad_request_error());
     }
 
     /// 注册所有事件处理器
@@ -262,7 +297,7 @@ impl SmcpHandler {
                                 .await
                             {
                                 Ok(()) => {
-                                    let _ = ack.send(&());
+                                    let _ = ack.send(&EmptyAck);
                                 }
                                 Err(error) => {
                                     let _ = ack.send(&error);
@@ -288,7 +323,7 @@ impl SmcpHandler {
                                     .await;
                             match result {
                                 Ok(()) => {
-                                    let _ = ack.send(&());
+                                    let _ = ack.send(&EmptyAck);
                                 }
                                 Err(error) => {
                                     let _ = ack.send(&error);
@@ -625,73 +660,70 @@ impl SmcpHandler {
         let requested_role = ClientRole::from(data.role.clone());
         let requested_name = data.name.clone();
 
-        // 获取或创建会话
-        let session = match state.session_manager.get_session(&sid) {
-            Some(s) => {
-                // 检查角色/状态一致性
-                if s.role != requested_role {
-                    return Err(Box::new(smcp::ErrorPayload::new(
-                        i64::from(smcp::error_codes::FORBIDDEN),
-                        format!(
-                            "Role mismatch: existing session has role {:?}, but requested {:?}",
-                            s.role, requested_role
-                        ),
-                    )));
-                }
+        // 从握手 URL query 提取协商到的协议版本（仅记录用于诊断/展示，兼容性已由 HTTP 握手中间件
+        // 保证）。提取逻辑对齐 Python `_extract_a2c_version`。
+        //
+        // 时机说明：Python 在 on_connect 即记录 a2c_version；Rust 会话在 join 时才懒建，故在此
+        // （会话创建处）记录。二者 list_room 结果等价——`req_parts().uri.query()` 反映的是该连接的
+        // 握手请求 URI，连接存续期间稳定（已由集成测试 `test_list_room_reports_a2c_version` 固化）。
+        let a2c_version = smcp::utils::handshake::extract_a2c_version(
+            socket.req_parts().uri.query().unwrap_or(""),
+        );
 
-                if s.name != requested_name {
-                    return Err(Box::new(smcp::ErrorPayload::new(
-                        i64::from(smcp::error_codes::FORBIDDEN),
-                        format!(
-                            "Name mismatch: existing session has name '{}', but requested '{}'",
-                            s.name, requested_name
-                        ),
-                    )));
-                }
+        // 取或建会话：**原子**且**绝不覆盖**既有记录。历史实现是「先 `get_session` 再
+        // `register_session`」两步式，两个并发 join 会双双看到「查无」并互相覆盖——被覆盖者占下的
+        // name 预留从此无人释放，该 name 在该房内被**永久**占死（#226 P1-4）。
+        let session = state.session_manager.get_or_register_session(
+            sid.clone(),
+            requested_name.clone(),
+            requested_role.clone(),
+            a2c_version,
+        );
 
-                s
-            }
-            None => {
-                // 从握手 URL query 提取协商到的协议版本（仅记录用于诊断/展示，
-                // 兼容性已由 HTTP 握手中间件保证）。提取逻辑对齐 Python `_extract_a2c_version`。
-                //
-                // 时机说明：Python 在 on_connect 即记录 a2c_version；Rust 会话在 join 时才懒建，
-                // 故在此（会话创建处）记录。二者 list_room 结果等价——`req_parts().uri.query()`
-                // 反映的是该连接的握手请求 URI，连接存续期间稳定（已由集成测试
-                // `test_list_room_reports_a2c_version` 固化验证）。
-                let a2c_version = smcp::utils::handshake::extract_a2c_version(
-                    socket.req_parts().uri.query().unwrap_or(""),
-                );
-                // 创建新会话
-                let new_session = SessionData::new(sid.clone(), requested_name, requested_role)
-                    .with_a2c_version(a2c_version);
-
-                if let Err(e) = state.session_manager.register_session(new_session.clone()) {
-                    return Err(Box::new(HandlerError::Session(e).to_error_payload()));
-                }
-                new_session
-            }
-        };
-
-        // Validate and reserve the room-scoped name before touching the
-        // Socket.IO room.  This closes the concurrent same-name join window:
-        // a failed reservation cannot leave a socket as a ghost room member.
-        let decision = match Self::validate_join_room(&session, &data.office_id, &state) {
-            Ok(decision) => decision,
-            Err(e) => {
-                error!("validate_join_room failed: {}", e);
-                return Err(Box::new(e.to_error_payload()));
-            }
-        };
-
-        if let Err(e) = state
-            .session_manager
-            .update_office_id(&sid, Some(data.office_id.clone()))
-        {
-            return Err(Box::new(HandlerError::Session(e).to_error_payload()));
+        // 身份声明一致性（协议 events.md §server:join_office）：同一 sid 声明了与既有会话不同的
+        // `role` **或** `name` ⇒ 403（**非**房间语义，故走 [§通用错误码] 而不走 4101–4106）。
+        // 身份在一次连接内不可变更：改身份须新建连接（faq.md 给出的补救即「重连或换 sid」）。
+        if session.role != requested_role || session.name != requested_name {
+            warn!(
+                sid = %sid,
+                session_role = %session.role,
+                session_name = %session.name,
+                request_role = %requested_role,
+                request_name = %requested_name,
+                "server:join_office identity claim mismatch with existing session"
+            );
+            // 403 无 code-specific 字段（协议 §各错误码标准字段总表），故三个来源参数均为 `None`。
+            return Err(Box::new(smcp::build_room_rejection_error(
+                smcp::RoomRejectionCode::Forbidden,
+                None,
+                None,
+                None,
+            )));
         }
 
-        Self::apply_join_room(socket.clone(), &session, &data.office_id, decision).await;
+        // 入房事务：**校验 → 预留 → 提交**在单临界区内完成（`reserve_join`）。任何拒绝都在
+        // **零成员关系副作用**时返回，故被拒客户端绝不留在目标房——否则它会持续收到该房的
+        // `notify:*`，而 `list_room` 说它不在任何房（#226 P0-2 / P1-4 的原形成因）。
+        let reservation = match state.session_manager.reserve_join(&sid, &data.office_id) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                error!("server:join_office rejected for sid={}: {}", sid, error);
+                return Err(Box::new(Self::room_rejection(
+                    &error,
+                    &session.role,
+                    &data.office_id,
+                )));
+            }
+        };
+
+        // 闸门全部通过后才动 Socket.IO 成员关系（含 Computer 的退旧房）。
+        Self::apply_join_room(
+            socket.clone(),
+            &session,
+            &data.office_id,
+            reservation.decision,
+        )
+        .await;
 
         // 构建通知数据
         let session_name = session.name.clone();
@@ -729,71 +761,126 @@ impl SmcpHandler {
     ) -> RoomAckResult<()> {
         let sid = socket.id.to_string();
 
-        // 获取会话
-        let session = match state.session_manager.get_session(&sid) {
-            Some(s) => s,
-            None => {
-                // Sessions are created lazily on join.  Treat a connection
-                // without one the same as a session with no office: leave is
-                // idempotent and must not trust the payload as a room target.
-                for room in socket.rooms() {
-                    if room.as_ref() != sid {
-                        socket.leave(room.into_owned());
-                    }
-                }
-                return Ok(());
-            }
-        };
+        // 会话懒建于 join：无会话的连接与「无房会话」同义——退房在无房时**幂等成功**（回空 ack），
+        // 且**不得**采信载荷里的 office_id 作为广播目标（协议 §房间广播类事件的目标来源）。
+        let session = state.session_manager.get_session(&sid);
+        let broadcast_office = session.as_ref().and_then(|s| s.office_id.clone());
 
-        let Some(current_office) = session.office_id.clone() else {
-            // `office_id` in the request is redundant and has no authority.  A
-            // stale session may still be present in an office room, so make
-            // this idempotent operation converge the Socket.IO membership
-            // before acknowledging it.
-            for room in socket.rooms() {
-                if room.as_ref() != sid {
-                    socket.leave(room.into_owned());
-                }
+        if let (Some(session), Some(current_office)) = (session.as_ref(), broadcast_office.as_ref())
+        {
+            if current_office != &data.office_id {
+                warn!(
+                    sid = %sid,
+                    session_office = %current_office,
+                    payload_office = %data.office_id,
+                    "Ignoring leave_office payload office_id; using session office"
+                );
             }
-            return Ok(());
-        };
-        if current_office != data.office_id {
-            warn!(
+
+            let notification = if session.role == ClientRole::Computer {
+                LeaveOfficeNotification {
+                    office_id: current_office.clone(),
+                    computer: Some(session.name.clone()),
+                    agent: None,
+                }
+            } else {
+                LeaveOfficeNotification {
+                    office_id: current_office.clone(),
+                    computer: None,
+                    agent: Some(session.name.clone()),
+                }
+            };
+
+            let _ = socket
+                .within(Self::office_room(current_office))
+                .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
+                .await;
+        }
+
+        // 提交点重读（#226 P0-3）：只在会话**仍**位于我刚刚广播的那个房时才清空。若该 `await` 期间
+        // 并发 `join` 已把会话迁到别的房，则本调用**不**改动会话——否则会把新状态倒着覆盖成「无房」，
+        // 而 socket 仍留在新房，成为继续收 `notify:*`、`list_room` 却查不到的幽灵成员。
+        match state
+            .session_manager
+            .commit_leave(&sid, broadcast_office.as_deref())
+        {
+            Ok(LeaveCommit::Superseded { current }) => warn!(
                 sid = %sid,
-                session_office = %current_office,
-                payload_office = %data.office_id,
-                "Ignoring leave_office payload office_id; using session office"
-            );
+                current_office = %current,
+                "leave_office superseded by a concurrent room change; keeping the newer state"
+            ),
+            Ok(_) => {}
+            Err(SessionError::NotFound(_)) => {}
+            Err(e) => warn!(sid = %sid, "leave_office commit failed: {}", e),
         }
 
-        // 构建离开通知
-        let notification = if session.role == ClientRole::Computer {
-            LeaveOfficeNotification {
-                office_id: current_office.clone(),
-                computer: Some(session.name),
-                agent: None,
-            }
-        } else {
-            LeaveOfficeNotification {
-                office_id: current_office.clone(),
-                computer: None,
-                agent: Some(session.name),
-            }
-        };
-
-        // 广播离开消息
-        let _ = socket
-            .within(Self::office_room(&current_office))
-            .emit(smcp::events::NOTIFY_LEAVE_OFFICE, &notification)
-            .await;
-
-        // 更新会话
-        if let Err(e) = state.session_manager.update_office_id(&sid, None) {
-            return Err(Box::new(HandlerError::Session(e).to_error_payload()));
-        }
-        socket.leave(Self::office_room(&current_office));
+        // 收敛真实成员关系（协议 events.md §server:leave_office：无房时 SHOULD 按真实成员关系收敛一次，
+        // 使漂移态可自愈、操作可重试）。目标取**重读后**的会话状态，故并发的换房会被如实保留。
+        let office_after = state
+            .session_manager
+            .get_session(&sid)
+            .and_then(|s| s.office_id);
+        Self::converge_socket_rooms(&socket, office_after.as_deref());
 
         Ok(())
+    }
+
+    /// 把 socket 的房间成员关系收敛到权威会话状态：加入该在的房，退出其余全部房间。
+    ///
+    /// 这是「会话说它不在任何房，socket 却还在房里」这类**漂移态**的唯一自愈路径：只增不减或只减不增
+    /// 都只能收敛一半。收敛目标恒为会话状态（服务端权威），**不**取自客户端载荷。
+    ///
+    /// Converge Socket.IO membership onto the authoritative session state (both directions).
+    fn converge_socket_rooms(socket: &SocketRef, office_id: Option<&str>) {
+        let expected = office_id.map(Self::office_room);
+        for room in socket.rooms() {
+            if expected.as_deref() != Some(room.as_ref()) {
+                socket.leave(room.into_owned());
+            }
+        }
+        if let Some(expected) = expected {
+            socket.join(expected);
+        }
+    }
+
+    /// 房间管理拒绝的唯一构造入口：`SessionError` → 协议 canonical flat `ErrorPayload`。
+    ///
+    /// 历史实现把 `SessionError` 的内部 `Display`（外层还套 `HandlerError` 的 `"Session error: "` 前缀）
+    /// 直接序列化上 wire，既与协议 / python-sdk 的 canonical 文案逐字不符，也把内部错误类名泄给对端
+    /// （#226 P1-5）。本函数是「协议码 → 文案 / `details` 白名单」在服务端的唯一出口，调用方无从绕过。
+    ///
+    /// `declared_role` 取自**发起者自己的会话**（4105 的 `details.role` 报的是发起者声明的 role，
+    /// 不是冲突方的），`target_office_id` 取自请求载荷（发起者自己声明的目标房）。
+    fn room_rejection(
+        error: &SessionError,
+        declared_role: &ClientRole,
+        target_office_id: &str,
+    ) -> smcp::ErrorPayload {
+        use smcp::RoomRejectionCode as Code;
+        match error {
+            // 4106：details 报会话**当前**所在房（非被拒的目标房）——该值由 `reserve_join` 在
+            // 临界区内从权威会话读出，故并发下也不会报过期房号。
+            SessionError::AgentAlreadyInRoom(current) => {
+                smcp::build_room_rejection_error(Code::AlreadyInRoom, None, None, Some(current))
+            }
+            SessionError::AgentAlreadyExists => {
+                smcp::build_room_rejection_error(Code::RoomFull, Some(target_office_id), None, None)
+            }
+            SessionError::NameAlreadyRegistered(_) => smcp::build_room_rejection_error(
+                Code::NameConflict,
+                Some(target_office_id),
+                Some(&declared_role.to_string()),
+                None,
+            ),
+            // 会话不存在 / 状态非法属**内部**事故，不属房间语义：回笼统 500（协议空档内以通用码承载），
+            // 原文只进日志。绝不把内部错误文本当房间拒绝文案上 wire。
+            SessionError::NotFound(_) | SessionError::InvalidState(_) => {
+                smcp::ErrorPayload::from_error_code(
+                    smcp::ErrorCode::InternalError,
+                    "Internal error",
+                )
+            }
+        }
     }
 
     /// 处理工具调用取消事件
@@ -1380,18 +1467,24 @@ impl SmcpHandler {
             Some(s) => s,
             None => {
                 warn!("List room from unknown session sid={}", sid);
-                return Err(Box::new(smcp::ErrorPayload::new(
-                    i64::from(smcp::error_codes::NOT_IN_ROOM),
-                    "Session is not in an office",
+                // 无会话 == 无房（会话懒建于 join）：协议把「无房却发起需要房间上下文的操作」
+                // 定为 4103 `Not in any room`。canonical 文案由 builder 单点产出。
+                return Err(Box::new(smcp::build_room_rejection_error(
+                    smcp::RoomRejectionCode::NotInRoom,
+                    None,
+                    None,
+                    None,
                 )));
             }
         };
 
         if session.office_id.is_none() {
             warn!("List room from session outside an office sid={}", sid);
-            return Err(Box::new(smcp::ErrorPayload::new(
-                i64::from(smcp::error_codes::NOT_IN_ROOM),
-                "Session is not in an office",
+            return Err(Box::new(smcp::build_room_rejection_error(
+                smcp::RoomRejectionCode::NotInRoom,
+                None,
+                None,
+                None,
             )));
         }
 
@@ -1404,13 +1497,12 @@ impl SmcpHandler {
                 "list_room isolation rejected: session {} (office {:?}) requested room {}",
                 sid, session.office_id, data.office_id
             );
-            return Err(Box::new(
-                smcp::ErrorPayload::new(
-                    i64::from(smcp::error_codes::CROSS_ROOM_ACCESS),
-                    "Cross-room access denied",
-                )
-                .with_details(serde_json::json!({ "office_id": data.office_id })),
-            ));
+            return Err(Box::new(smcp::build_room_rejection_error(
+                smcp::RoomRejectionCode::CrossRoomAccess,
+                Some(&data.office_id),
+                None,
+                None,
+            )));
         }
 
         // 获取指定办公室的所有会话
@@ -1441,7 +1533,7 @@ impl SmcpHandler {
         socket: SocketRef,
         session: &SessionData,
         office_id: &str,
-        decision: JoinRoomDecision,
+        decision: JoinDecision,
     ) {
         info!(
             "handle_join_room called: sid={}, office_id={}, role={:?}",
@@ -1449,14 +1541,14 @@ impl SmcpHandler {
         );
 
         match decision {
-            JoinRoomDecision::Noop => {
+            JoinDecision::Noop => {
                 info!("Noop decision for sid={}", socket.id);
             }
-            JoinRoomDecision::Join => {
+            JoinDecision::Join => {
                 info!("Joining room '{}' for sid={}", office_id, socket.id);
                 socket.join(Self::office_room(office_id));
             }
-            JoinRoomDecision::LeaveAndJoin { leave_office } => {
+            JoinDecision::LeaveAndJoin { leave_office } => {
                 info!(
                     "Leaving room '{}' and joining '{}' for sid={}",
                     leave_office, office_id, socket.id
@@ -1497,82 +1589,6 @@ impl SmcpHandler {
     fn list_room_authorized(session_office: Option<&str>, requested_office: &str) -> bool {
         session_office == Some(requested_office)
     }
-
-    fn validate_join_room(
-        session: &SessionData,
-        office_id: &str,
-        state: &ServerState,
-    ) -> Result<JoinRoomDecision, HandlerError> {
-        match session.role {
-            ClientRole::Agent => {
-                if let Some(current_office) = &session.office_id {
-                    if current_office != office_id {
-                        return Err(HandlerError::Session(SessionError::AgentAlreadyInRoom(
-                            current_office.clone(),
-                        )));
-                    }
-                    warn!(
-                        "Agent sid: {} already in room: {}. 正在重复加入房间",
-                        session.sid, current_office
-                    );
-                    return Ok(JoinRoomDecision::Noop);
-                }
-
-                if state
-                    .session_manager
-                    .has_agent_in_office(&office_id.to_string())
-                {
-                    return Err(HandlerError::Session(SessionError::AgentAlreadyExists));
-                }
-            }
-            ClientRole::Computer => {
-                if let Some(current_office) = &session.office_id {
-                    if current_office != office_id {
-                        if state.session_manager.has_computer_in_office_except(
-                            &office_id.to_string(),
-                            &session.name,
-                            &session.sid,
-                        ) {
-                            return Err(HandlerError::Session(
-                                SessionError::ComputerAlreadyExists(
-                                    session.name.clone(),
-                                    office_id.to_string(),
-                                ),
-                            ));
-                        }
-                        return Ok(JoinRoomDecision::LeaveAndJoin {
-                            leave_office: current_office.clone(),
-                        });
-                    }
-                    warn!(
-                        "Computer sid: {} already in room: {}. 正在重复加入房间",
-                        session.sid, current_office
-                    );
-                    return Ok(JoinRoomDecision::Noop);
-                }
-
-                if state.session_manager.has_computer_in_office_except(
-                    &office_id.to_string(),
-                    &session.name,
-                    &session.sid,
-                ) {
-                    return Err(HandlerError::Session(SessionError::ComputerAlreadyExists(
-                        session.name.clone(),
-                        office_id.to_string(),
-                    )));
-                }
-            }
-        }
-
-        Ok(JoinRoomDecision::Join)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum JoinRoomDecision {
-    Noop,
-    Join,
-    LeaveAndJoin { leave_office: String },
 }
 
 #[cfg(test)]
@@ -1580,19 +1596,6 @@ mod tests {
     use super::*;
     use crate::auth::DefaultAuthenticationProvider;
     use serde_json;
-
-    fn create_test_state() -> ServerState {
-        let (_layer, io) = SocketIo::builder().build_layer();
-        ServerState {
-            session_manager: Arc::new(SessionManager::new()),
-            auth_provider: Arc::new(DefaultAuthenticationProvider::new(
-                Some("test_secret".to_string()),
-                None,
-            )),
-            io: Arc::new(io),
-            inflight_disconnect: Arc::new(InflightDisconnectRegistry::default()),
-        }
-    }
 
     #[tokio::test]
     async fn test_agent_join_office() {
@@ -1721,168 +1724,6 @@ mod tests {
         let sid = "abc123";
         assert_eq!(SmcpHandler::office_room(sid), "office:abc123");
         assert_ne!(SmcpHandler::office_room(sid), sid);
-    }
-
-    #[test]
-    fn test_validate_join_room_agent_already_in_other_room() {
-        let state = create_test_state();
-        let session = SessionData::new("sid1".to_string(), "a".to_string(), ClientRole::Agent)
-            .with_office_id("office1".to_string());
-
-        let err = SmcpHandler::validate_join_room(&session, "office2", &state).unwrap_err();
-        assert!(matches!(
-            err,
-            HandlerError::Session(SessionError::AgentAlreadyInRoom(o)) if o == "office1"
-        ));
-    }
-
-    #[test]
-    fn test_validate_join_room_agent_already_exists() {
-        let state = create_test_state();
-        let office_id = "office1".to_string();
-        let existing_agent = SessionData::new(
-            "sid_agent".to_string(),
-            "agent1".to_string(),
-            ClientRole::Agent,
-        )
-        .with_office_id(office_id.clone());
-        state
-            .session_manager
-            .register_session(existing_agent)
-            .unwrap();
-
-        let new_agent = SessionData::new(
-            "sid_new".to_string(),
-            "agent2".to_string(),
-            ClientRole::Agent,
-        );
-        let err = SmcpHandler::validate_join_room(&new_agent, &office_id, &state).unwrap_err();
-        assert!(matches!(
-            err,
-            HandlerError::Session(SessionError::AgentAlreadyExists)
-        ));
-    }
-
-    #[test]
-    fn test_validate_join_room_same_agent_name_allowed_in_other_office() {
-        let state = create_test_state();
-        state
-            .session_manager
-            .register_session(
-                SessionData::new(
-                    "sid_agent_1".to_string(),
-                    "same_name".to_string(),
-                    ClientRole::Agent,
-                )
-                .with_office_id("office1".to_string()),
-            )
-            .unwrap();
-
-        let new_agent = SessionData::new(
-            "sid_agent_2".to_string(),
-            "same_name".to_string(),
-            ClientRole::Agent,
-        );
-        assert_eq!(
-            SmcpHandler::validate_join_room(&new_agent, "office2", &state).unwrap(),
-            JoinRoomDecision::Join
-        );
-    }
-
-    #[test]
-    fn test_validate_join_room_computer_duplicate_name_in_office() {
-        let state = create_test_state();
-        let office_id = "office1".to_string();
-        let existing = SessionData::new(
-            "sid_c1".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id(office_id.clone());
-        state.session_manager.register_session(existing).unwrap();
-
-        let new_same_name = SessionData::new(
-            "sid_c2".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        );
-        let err = SmcpHandler::validate_join_room(&new_same_name, &office_id, &state).unwrap_err();
-        assert!(matches!(
-            err,
-            HandlerError::Session(SessionError::ComputerAlreadyExists(name, office))
-                if name == "computer1" && office == "office1"
-        ));
-    }
-
-    #[test]
-    fn test_validate_join_room_computer_switch_room() {
-        let state = create_test_state();
-        let session = SessionData::new(
-            "sid_c".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id("office_old".to_string());
-
-        let decision = SmcpHandler::validate_join_room(&session, "office_new", &state).unwrap();
-        assert_eq!(
-            decision,
-            JoinRoomDecision::LeaveAndJoin {
-                leave_office: "office_old".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn test_validate_join_room_same_room_noop() {
-        let state = create_test_state();
-        let session = SessionData::new("sid".to_string(), "c".to_string(), ClientRole::Computer)
-            .with_office_id("office1".to_string());
-
-        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
-        assert_eq!(decision, JoinRoomDecision::Noop);
-    }
-
-    #[test]
-    fn test_validate_join_room_computer_same_session_is_noop() {
-        let state = create_test_state();
-        let session = SessionData::new(
-            "sid".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id("office1".to_string());
-        state
-            .session_manager
-            .register_session(session.clone())
-            .unwrap();
-
-        assert_eq!(
-            SmcpHandler::validate_join_room(&session, "office1", &state).unwrap(),
-            JoinRoomDecision::Noop
-        );
-    }
-
-    #[test]
-    fn test_validate_join_room_agent_first_time_join() {
-        let state = create_test_state();
-        let session = SessionData::new("sid_agent".to_string(), "a".to_string(), ClientRole::Agent);
-
-        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
-        assert_eq!(decision, JoinRoomDecision::Join);
-    }
-
-    #[test]
-    fn test_validate_join_room_computer_first_time_join() {
-        let state = create_test_state();
-        let session = SessionData::new(
-            "sid_computer".to_string(),
-            "computer1".to_string(),
-            ClientRole::Computer,
-        );
-
-        let decision = SmcpHandler::validate_join_room(&session, "office1", &state).unwrap();
-        assert_eq!(decision, JoinRoomDecision::Join);
     }
 
     #[test]

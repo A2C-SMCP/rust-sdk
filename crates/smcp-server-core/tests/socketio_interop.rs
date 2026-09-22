@@ -644,7 +644,8 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(join_payload, serde_json::json!([null]));
+    // 成功 = 空 ack（**零参** ACK，逐字节 `[]`；对齐 python-socketio 参考实现与 #226 P1-6）。
+    assert_eq!(join_payload, serde_json::json!([]));
 
     let (list_tx, list_rx) = oneshot::channel::<serde_json::Value>();
     client
@@ -748,7 +749,8 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(leave_payload, serde_json::json!([null]));
+    // 成功 = 空 ack（零参 ACK `[]`）。
+    assert_eq!(leave_payload, serde_json::json!([]));
 
     client.disconnect().await.expect("Failed to disconnect");
     server.shutdown();

@@ -554,12 +554,10 @@ async fn test_computer_duplicate_name_rejected() {
         .expect("join_office ack timeout")
         .unwrap();
 
-    // 失败回 flat ErrorPayload，冲突码为 4105。
+    // 失败回 flat ErrorPayload，冲突码为 4105，文案为协议 canonical（逐字对齐 error-handling.md
+    // §Name Conflict 与 python-sdk `_ROOM_REJECTION_MESSAGES`）。
     assert_eq!(result["code"], smcp::error_codes::NAME_CONFLICT);
-    assert!(result["message"]
-        .as_str()
-        .unwrap_or("")
-        .contains("already exists"));
+    assert_eq!(result["message"], "Name already taken in room");
 
     // 清理
     computer1_client.disconnect().await.unwrap();
@@ -619,11 +617,8 @@ async fn test_computer_different_name_allowed() {
         .expect("join_office ack timeout")
         .unwrap();
 
-    // 成功回空 ack。
-    assert!(
-        result == serde_json::json!([null]) || result.is_null(),
-        "join success must be an empty ack: {result}"
-    );
+    // 成功回空 ack（零参 ACK `[]`）。
+    assert_empty_ack(&result, "join_office");
 
     // 清理
     computer1_client.disconnect().await.unwrap();
@@ -683,11 +678,8 @@ async fn test_computer_switch_room_with_same_name_allowed() {
         .expect("join_office ack timeout")
         .unwrap();
 
-    // 成功回空 ack。
-    assert!(
-        result == serde_json::json!([null]) || result.is_null(),
-        "join success must be an empty ack: {result}"
-    );
+    // 成功回空 ack（零参 ACK `[]`）。
+    assert_empty_ack(&result, "join_office");
 
     // 清理
     computer_client.disconnect().await.unwrap();
