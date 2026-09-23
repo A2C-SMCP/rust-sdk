@@ -17,13 +17,67 @@ use std::sync::Arc;
 use std::time::Duration;
 use tf_rust_socketio::{
     asynchronous::{Client, ClientBuilder},
-    Event, Payload, TransportType,
+    CloseReason, Event, Payload, TransportType,
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tracing::{debug, error, info, warn};
 
 /// 事件处理器类型
 pub type EventHandler = Box<dyn FnMut(Payload, Client) + Send + Sync>;
+
+/// 传输层（namespace）生命周期事件——Agent 侧重连回房的**触发源**（#219）。
+///
+/// 为什么单独成通道而不复用 [`SocketIoTransport::call`] 的断连位：回房决策需要**两类**信息，
+/// 断连位两者都不带——
+///
+/// 1. **断开原因**：只有「传输层断线且底层会自动重连」（`transport close`）才保留入房意图；
+///    服务端踢出（`io server disconnect`）与手工断开（`io client disconnect`）必须清空意图，
+///    否则会把用户主动退出 / 被踢掉的房在下次重连时**自动加回去**。
+/// 2. **会话 epoch**：迟到的 Close 可能属于**已被取代的旧 transport**（#211），须凭
+///    `Client::session_epoch` 判定并丢弃，否则旧会话的 Close 会清掉新会话的成员关系。
+///
+/// 事件按投递顺序经无界通道交给持有者；`Event::Connect` 与 `on_close_with_session` 两条注册路径均由
+/// 内核在 namespace 生命周期节点实际派发（`on_any` **不**接收这两类事件）。
+#[derive(Debug, Clone)]
+pub enum TransportLifecycle {
+    /// namespace 连接建立（含自动重连后的新会话）。`epoch` = [`Client::session_epoch`]。
+    Connected {
+        /// 本次会话的内核 epoch / the kernel session epoch of this session.
+        epoch: u64,
+    },
+    /// namespace 断开。`epoch` 为该会话的内核 epoch（供陈旧 Close 判定）。
+    Closed {
+        /// 关闭原因 / the socket.io close reason.
+        reason: CloseReason,
+        /// 断开会话的内核 epoch / the dying session's kernel epoch.
+        epoch: u64,
+    },
+}
+
+/// 从 `on_close_with_session` 的线载荷解析关闭原因 / parse the close reason from the wire payload.
+///
+/// 内核在 `callback_close` 处以 `CloseReason::as_str()` 的三选一常量投递原因。解析失败**按
+/// `TransportClose` 兜底**：三个常量由内核集中投递，实际不可解析属理论上不可达；而兜底方向取
+/// 「保留意图」——丢意图会让用户在静默断线后失去自愈能力（须手工重入），多保留一次意图最多在
+/// 下次重连时多一次幂等重放。
+fn close_reason_from_payload(payload: &Payload) -> CloseReason {
+    let as_text = |value: &str| match value {
+        "io server disconnect" => Some(CloseReason::IOServerDisconnect),
+        "io client disconnect" => Some(CloseReason::IOClientDisconnect),
+        "transport close" => Some(CloseReason::TransportClose),
+        _ => None,
+    };
+    match payload {
+        Payload::Text(values, _) => values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .find_map(as_text)
+            .unwrap_or(CloseReason::TransportClose),
+        #[allow(deprecated)]
+        Payload::String(value, _) => as_text(value).unwrap_or(CloseReason::TransportClose),
+        Payload::Binary(_, _) => CloseReason::TransportClose,
+    }
+}
 
 /// 通知事件消息
 #[derive(Debug, Clone)]
@@ -102,12 +156,29 @@ impl SocketIoTransport {
         ))
     }
 
-    /// 创建新的传输层实例并注册事件处理器
+    /// 创建新的传输层实例并注册事件处理器（不订阅生命周期事件）。
+    ///
+    /// 等价于 `lifecycle = None` 的
+    /// [`connect_with_handlers_and_lifecycle`](Self::connect_with_handlers_and_lifecycle)。
     pub async fn connect_with_handlers(
         url: &str,
         namespace: &str,
         auth: Option<Value>,
         headers: HashMap<String, String>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
+        Self::connect_with_handlers_and_lifecycle(url, namespace, auth, headers, None).await
+    }
+
+    /// 创建新的传输层实例并注册事件处理器，**同时订阅 namespace 生命周期事件**（#219）。
+    ///
+    /// `lifecycle` 为 `None` 时不注册任何额外回调，行为与
+    /// [`connect_with_handlers`](Self::connect_with_handlers) 逐字相同。
+    pub async fn connect_with_handlers_and_lifecycle(
+        url: &str,
+        namespace: &str,
+        auth: Option<Value>,
+        headers: HashMap<String, String>,
+        lifecycle: Option<mpsc::UnboundedSender<TransportLifecycle>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<NotificationMessage>)> {
         info!(
             "Connecting to SMCP server at {} with namespace {}",
@@ -284,6 +355,35 @@ impl SocketIoTransport {
                 }
             })
         });
+
+        // #219：namespace 生命周期订阅。⚠️ 必须走 `on(Event::Connect)` + `on_close_with_session`——
+        // 内核 `callback()` 只对 `Message` / `Custom` 事件派发 `on_any`，故生命周期信号**不可能**从上面
+        // 那个 on_any 闭包取到（其 `Event::Close | Event::Error | Event::Connect` 分支因此恒不命中）。
+        if let Some(lifecycle_tx) = lifecycle {
+            let connect_tx = lifecycle_tx.clone();
+            builder = builder.on(Event::Connect, move |_payload, client| {
+                let tx = connect_tx.clone();
+                async move {
+                    // Connect 回调没有 epoch 载体（内核未提供 `on_connect_with_session`），按 Computer
+                    // 侧同款做法就地读当前会话 epoch。
+                    let _ = tx.send(TransportLifecycle::Connected {
+                        epoch: client.session_epoch(),
+                    });
+                }
+                .boxed()
+            });
+
+            builder = builder.on_close_with_session(move |payload, epoch, _client| {
+                let tx = lifecycle_tx.clone();
+                async move {
+                    let _ = tx.send(TransportLifecycle::Closed {
+                        reason: close_reason_from_payload(&payload),
+                        epoch,
+                    });
+                }
+                .boxed()
+            });
+        }
 
         // 设置命名空间
         if !namespace.is_empty() {

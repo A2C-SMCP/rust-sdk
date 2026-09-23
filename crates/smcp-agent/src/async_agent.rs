@@ -13,7 +13,11 @@ use crate::{
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
     events::AsyncAgentEventHandler,
-    protocol_error::{parse_room_ack, raise_for_error_payload},
+    office::{
+        backoff_delay, classify_rejoin_error, retry_fits_budget, AttemptCommit, OfficeIntent,
+        OfficeMembership, OfficeMembershipState, RejoinVerdict,
+    },
+    protocol_error::{parse_room_ack, raise_for_error_payload, SmcpProtocolError},
     request_builders::{
         build_get_blob_request, build_get_config_request, build_get_desktop_request,
         build_get_resources_request, build_get_skill_request, build_get_skills_request,
@@ -25,7 +29,7 @@ use crate::{
         parse_get_resources_response,
     },
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
-    transport::{NotificationMessage, SocketIoTransport},
+    transport::{NotificationMessage, SocketIoTransport, TransportLifecycle},
 };
 use smcp::utils::blob::{
     pump_blob, BlobChunkFailure, PumpBlobOptions, PutBlobChunkRequest, PutBlobResult,
@@ -37,9 +41,45 @@ use smcp::{
     SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tf_rust_socketio::CloseReason;
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// 等待 namespace 连接建立（首个 `Connected` 生命周期事件）的上限。
+///
+/// [`AsyncSmcpAgent::connect`] 的**后置条件**是「返回时 namespace 已在册并落到成员状态」（与 Computer
+/// 侧 `connect_socketio` 等待 Connect 回调同款）：否则调用方紧接着的 `join_office` 会用到尚未绑定的
+/// 会话标识（合法 ack 被会话校验丢弃，或在 `connected == false` 时落账成员关系）。
+///
+/// 超时即视为连接不可用：`connect` **如实返回错误**并回滚本次装载的 transport 槽位与后台 task，绝不
+/// 留下「可继续使用的半初始化状态」。传输层 HTTP 握手此时**已完成**（服务端可达且在讲 Socket.IO），
+/// 故对「namespace CONNECT 帧」而言 10s 已极宽松——真超时说明对端没有建立 namespace 会话。
+const NAMESPACE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 锁定成员状态。毒化锁按内值恢复：状态字段全是纯数据，不存在「被毒化即不可信」的跨字段不变量
+/// （与 Computer 侧 `lock_office_membership` 同款处理）。
+fn lock_office(office: &StdMutex<OfficeMembership>) -> std::sync::MutexGuard<'_, OfficeMembership> {
+    office.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// 本地构造 `4106 Already In Room` 拒绝（#219：Agent 换房须先显式退房）。
+///
+/// 复用 [`smcp::build_room_rejection_error`] 作为「协议码 → canonical 文案 / `details` 键集」的单一
+/// choke point：本地拒绝与服务端拒绝在**线上字节层面**一致，调用方无需按来源分流。`details.office_id`
+/// 取会话**当前**所在房（协议 §错误码总表：`4106` 报当前房，**非**被拒的目标房）。
+fn already_in_room_error(current_office_id: &str) -> SmcpAgentError {
+    let payload = smcp::build_room_rejection_error(
+        smcp::RoomRejectionCode::AlreadyInRoom,
+        smcp::RoomRejectionContext {
+            current_office_id: Some(current_office_id),
+            ..Default::default()
+        },
+    );
+    SmcpAgentError::Protocol(Box::new(SmcpProtocolError::from_error_payload(&payload)))
+}
 
 /// 异步SMCP Agent
 pub struct AsyncSmcpAgent {
@@ -51,6 +91,17 @@ pub struct AsyncSmcpAgent {
     config: SmcpAgentConfig,
     tools_cache: Arc<RwLock<HashMap<String, Vec<SMCPTool>>>>,
     notification_task: Option<tokio::task::JoinHandle<()>>,
+    /// #219：Office 成员关系（意图 + 服务端已确认 + 世代）。`std::sync::Mutex` 与 Computer 侧同款——
+    /// 守卫只覆盖纯状态提交，**绝不跨 await 持有**。
+    office: Arc<StdMutex<OfficeMembership>>,
+    /// #219：Office 操作串行化门——显式 `join_office` / `leave_office` 与自动回房逐次尝试互斥，
+    /// 使「显式退房」能作为回房循环的抢占点（而非与它竞争）。
+    office_operation: Arc<Mutex<()>>,
+    /// #219：namespace 生命周期消费 task（连接 / 断开 → 回房调度）。
+    office_lifecycle_task: Option<tokio::task::JoinHandle<()>>,
+    /// #219：连接序号发号器。**成员关系属于连接**——只有「已提交连接」的生命周期事件才允许改写成员
+    /// 状态；序号是这一归属判据（各连接的 `session_epoch` 各自从 1 起算，不能单独标识连接）。
+    office_connection_seq: Arc<AtomicU64>,
 }
 
 impl AsyncSmcpAgent {
@@ -63,6 +114,10 @@ impl AsyncSmcpAgent {
             config,
             tools_cache: Arc::new(RwLock::new(HashMap::new())),
             notification_task: None,
+            office: Arc::new(StdMutex::new(OfficeMembership::default())),
+            office_operation: Arc::new(Mutex::new(())),
+            office_lifecycle_task: None,
+            office_connection_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -89,9 +144,71 @@ impl AsyncSmcpAgent {
         let auth = self.auth_provider.get_connection_auth();
         let headers = self.auth_provider.get_connection_headers();
 
-        // 创建transport并获取通知接收器
+        // #219：本次连接尝试的序号——成员状态只接受「已提交连接」的事件。
+        let connection_id = self.office_connection_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // #219：namespace 生命周期通道（连接建立 / 断开）——回房调度与「是否保留意图」的唯一信息源。
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+
+        // #219 **事务性连接**：在「新连接完全满足后置条件」之前，既有状态（transport 槽位、两个后台
+        // task 句柄、成员状态）**一律不动**。故失败路径（握手失败 / namespace 未建立）只需丢弃本次新建的
+        // 资源即可，既有连接原封不动——而不是先把旧连接拆掉、再发现新连接不可用。
+        //
+        // 认领本次尝试的槽位：必须早于起生命周期 task，否则「Closed 先于首个 Connected 到达」时会因槽位
+        // 为空而丢掉该断开记录，随后被 Connected 写成「待提交」（评审 B3''① 残余路径）。
+        lock_office(&self.office).begin_attempt(connection_id);
+
+        // 创建transport并获取通知接收器（失败即返回，此时尚未触碰任何既有状态）。
         let (transport, mut notification_rx) =
-            SocketIoTransport::connect_with_handlers(url, SMCP_NAMESPACE, auth, headers).await?;
+            SocketIoTransport::connect_with_handlers_and_lifecycle(
+                url,
+                SMCP_NAMESPACE,
+                auth,
+                headers,
+                Some(lifecycle_tx),
+            )
+            .await?;
+        let transport = Arc::new(transport);
+
+        // #219：生命周期消费 task **直接持有本连接的 transport 句柄**——不依赖共享槽位，故无需提前装载
+        // 槽位（「提前装载」正是「回滚误伤既有连接」的成因），也让回房始终发在**发起它的那条连接**上。
+        let (namespace_ready_tx, namespace_ready_rx) = oneshot::channel::<u64>();
+        let office_lifecycle_task = {
+            let agent_clone = self.clone();
+            let transport = Arc::clone(&transport);
+            tokio::spawn(async move {
+                let mut namespace_ready_tx = Some(namespace_ready_tx);
+                while let Some(event) = lifecycle_rx.recv().await {
+                    match event {
+                        TransportLifecycle::Connected { epoch } => {
+                            // 本连接尚未被 `connect()` 提交 ⇒ 只**记录**待提交状态并把 epoch 交给
+                            // `connect()`（不触碰既有连接的状态，事务性）；已提交连接的重连事件则走常规路径。
+                            let already_committed = {
+                                let mut membership = lock_office(&agent_clone.office);
+                                if membership.committed_connection() == Some(connection_id) {
+                                    true
+                                } else {
+                                    membership.record_attempt_connected(connection_id, epoch);
+                                    false
+                                }
+                            };
+                            if already_committed {
+                                agent_clone
+                                    .on_office_namespace_connected(&transport, connection_id, epoch)
+                                    .await;
+                            } else if let Some(tx) = namespace_ready_tx.take() {
+                                let _ = tx.send(epoch);
+                            }
+                        }
+                        TransportLifecycle::Closed { reason, epoch } => {
+                            agent_clone
+                                .on_office_namespace_closed(connection_id, reason, epoch)
+                                .await;
+                        }
+                    }
+                }
+            })
+        };
 
         // 启动通知处理任务
         let event_handler = self.event_handler.clone();
@@ -258,8 +375,70 @@ impl AsyncSmcpAgent {
             }
         });
 
-        self.notification_task = Some(notification_task);
-        *self.transport.write().await = Some(Arc::new(transport));
+        // 有界等待 namespace 会话建立（见 NAMESPACE_READY_TIMEOUT 的说明）。此刻生命周期 task 只把
+        // epoch 交回（**不触碰**共享状态），故失败路径无需任何回滚：既有连接与成员状态自始至终未变。
+        let Ok(Ok(epoch)) = tokio::time::timeout(NAMESPACE_READY_TIMEOUT, namespace_ready_rx).await
+        else {
+            // 后置条件未达成 ⇒ 丢弃**本次**新建的资源并如实失败。既有状态（槽位 / 两个 task 句柄 /
+            // 成员状态）自始至终未被触碰，故不构成「破坏既有连接」。
+            office_lifecycle_task.abort();
+            notification_task.abort();
+            warn!(
+                "Namespace connect was not observed within {:?}; connection rolled back",
+                NAMESPACE_READY_TIMEOUT
+            );
+            return Err(SmcpAgentError::connection(format!(
+                "namespace connect was not observed within {:?}",
+                NAMESPACE_READY_TIMEOUT
+            )));
+        };
+
+        // 提交点：**一次加锁**完成「裁决（提交前是否已断开）+ 连接归属 + 会话绑定 + 世代推进」。这是与
+        // 生命周期 task 唯一的裁决交点，故不存在「检查之后、提交之前」的窗口——已到达的 Close 要么在此
+        // 被采信为「提交前已断开」（拒绝提交），要么发生在提交之后（按已提交连接的普通断开处理，状态机
+        // 据此重连 / 回房）。详见 `OfficeMembership::commit_attempt`。
+        let replay = match lock_office(&self.office).commit_attempt(connection_id) {
+            AttemptCommit::ClosedBeforeCommit => {
+                // 提交前已断开（或状态不可信）⇒ 丢弃本次新建资源并如实失败，绝不把死连接报成「已连接」。
+                office_lifecycle_task.abort();
+                notification_task.abort();
+                warn!(
+                    "Namespace closed before the connection was committed; connection rolled back"
+                );
+                return Err(SmcpAgentError::connection(
+                    "namespace closed before the connection was committed".to_string(),
+                ));
+            }
+            AttemptCommit::Committed {
+                previous_rejoin,
+                replay,
+            } => {
+                if let Some(task) = previous_rejoin {
+                    task.abort();
+                }
+                replay
+            }
+        };
+
+        // 资源替换：原子替换槽位与两个后台 task 句柄，随后停掉旧 task（旧 transport 被 drop ⇒ 其通道
+        // 关闭，旧通知 task 即便未被 abort 也会自然退出）。
+        let previous_transport = self.transport.write().await.replace(Arc::clone(&transport));
+        if let Some(task) = self.office_lifecycle_task.replace(office_lifecycle_task) {
+            task.abort();
+        }
+        if let Some(task) = self.notification_task.replace(notification_task) {
+            task.abort();
+        }
+        drop(previous_transport);
+
+        // 意图仍在 ⇒ 以**本连接**为归属派生回房（重放）；结果受世代与连接归属双重约束。
+        if let Some((generation, intent)) = replay {
+            info!(
+                "Namespace connected (epoch {}); replaying office join for {}",
+                epoch, intent.office_id
+            );
+            self.spawn_office_rejoin(Arc::clone(&transport), connection_id, generation, intent);
+        }
 
         info!("Connected to SMCP server at {}", url);
         Ok(())
@@ -278,23 +457,67 @@ impl AsyncSmcpAgent {
     /// 调用方可按码分流：`4101` / `4105` 是传输层重连后的瞬态冲突，`4106` / `400` 永久不可重试）。
     /// 形状不认识同样判失败（宁严勿宽），**绝不**把未获裁决读成成功。
     ///
-    /// Join the office and **await the server's verdict** instead of fire-and-forget.
+    /// # 兼作意图声明点（#219）
+    ///
+    /// 成功入房后记住 `(office_id, agent_name)`——Socket.IO 房间成员关系属于**会话**，传输层自动重连
+    /// 后新 SID 不在房里；SDK 必须据此在重连后重放 `server:join_office`，否则会「看起来还在房间、
+    /// 实际收不到任何房间流量」。注意 `agent_name` 只在本次调用实参里（`auth_provider` 只给
+    /// `office_id`），故必须随意图一起记住。
+    ///
+    /// # 换房须先显式退房（协议 room-model §Agent 加入规则 1）
+    ///
+    /// Agent 已在**其它**房又请求入新房时，本方法**本地**即以 canonical `4106 Already In Room`
+    /// 快速失败（`details.office_id` = **当前**所在房），不发请求：Computer 的自动换房规则**不适用**
+    /// 于 Agent，先显式 [`Self::leave_office`] 再入新房才是协议规定的两步语义。本地判定同时避免在
+    /// 服务端裁决前覆写本地意图。
+    ///
+    /// Join the office, **await the server's verdict**, and record the join intent so a later
+    /// transport reconnect can replay it.
     pub async fn join_office(&self, agent_name: &str) -> Result<()> {
-        let office_id = &self.auth_provider.get_agent_config().office_id;
+        let office_id = self.auth_provider.get_agent_config().office_id.clone();
+        let intent = OfficeIntent {
+            office_id: office_id.clone(),
+            agent_name: agent_name.to_string(),
+        };
+
+        // 与自动回房逐次尝试互斥：保证「意图校验 → 入房 → 落账」是一个不可交错的单元。
+        let _operation = self.office_operation.lock().await;
+
+        if let Some(current) = lock_office(&self.office).conflicting_office(&office_id) {
+            return Err(already_in_room_error(&current));
+        }
+
+        // 发起前捕获会话标识：ack 只在**同一会话**仍在册时才算数（见 `OfficeSessionToken`）。
+        let session = lock_office(&self.office).session_token();
+
         let req = EnterOfficeReq {
             role: Role::Agent,
             name: agent_name.to_string(),
-            office_id: office_id.clone(),
+            office_id,
         };
-
-        let transport = self.resolve_transport().await?;
-        let data = serde_json::to_value(req)?;
-        let response = transport
-            .call(SERVER_JOIN_OFFICE, data, self.config.default_timeout)
+        self.call_room_event(SERVER_JOIN_OFFICE, &req, self.config.default_timeout)
             .await?;
-        parse_room_ack(&response)?;
 
-        info!("Joined office: {}", office_id);
+        let (committed, pending) = lock_office(&self.office).commit_join(session, intent);
+        if let Some(task) = pending {
+            task.abort();
+        }
+        if !committed {
+            // ACK 属**已死会话**：传输层回调与 ack 分发是各自独立的 task（无顺序契约），故等待 ack 期间
+            // 可能夹进 Close / Connect / 显式退房。此时「入房成功」陈述的是已失效会话的事实，落账会
+            // 造成「namespace 已断开却报 JoinedOffice」（违反「不静默假装在线」）。既不落账已确认，
+            // 也不落账意图（否则会把期间被显式退房清掉的意图复活），如实报错、由调用方自行重试。
+            warn!(
+                "Discarding office join verdict for {}: the namespace session was replaced while awaiting the ack",
+                req.office_id
+            );
+            return Err(SmcpAgentError::connection(
+                "office join ack arrived after the namespace session was replaced; verdict discarded"
+                    .to_string(),
+            ));
+        }
+
+        info!("Joined office: {}", req.office_id);
         Ok(())
     }
 
@@ -307,20 +530,337 @@ impl AsyncSmcpAgent {
     ///
     /// Await the server's verdict so a follow-up join cannot race the leave's commit.
     pub async fn leave_office(&self) -> Result<()> {
-        let office_id = &self.auth_provider.get_agent_config().office_id;
+        let office_id = self.auth_provider.get_agent_config().office_id.clone();
+
+        // ⚠️ 清意图**必须在操作门之内**：若在取门前清（旧写法），并发的 `join_office` 可抢先取门并成功
+        // 落账，随后本方法再把 leave 发到服务端 ⇒ 服务端已退房而本地仍报 `JoinedOffice`（且下次重连
+        // 还会自动重回）——本地状态与服务端事实相反，正是「不静默假装在线」要杜绝的形态。置于门内后，
+        // leave 与 join 全序化：谁后进临界区谁的最后一次服务端操作与本地状态一致。
+        let _operation = self.office_operation.lock().await;
+
+        // 显式退房是调用方对入房意图的**权威撤销**：清意图 + 作废在途回房，再发请求。清在请求之前
+        // 不可颠倒——若请求在传输层失败而意图仍在，下一次自动重连会把用户刚主动退出的房**重新加入**
+        // （与调用方刚表达的意图相反）。清空后即使请求失败，SDK 也只是「未宣称在房」（如实报错）。
+        let pending = lock_office(&self.office).clear_intent();
+        if let Some(task) = pending {
+            task.abort();
+        }
+
         let req = LeaveOfficeReq {
             office_id: office_id.clone(),
         };
-
-        let transport = self.resolve_transport().await?;
-        let data = serde_json::to_value(req)?;
-        let response = transport
-            .call(SERVER_LEAVE_OFFICE, data, self.config.default_timeout)
+        self.call_room_event(SERVER_LEAVE_OFFICE, &req, self.config.default_timeout)
             .await?;
-        parse_room_ack(&response)?;
 
         info!("Left office: {}", office_id);
         Ok(())
+    }
+
+    /// 当前 Office 成员关系（只读快照）。
+    ///
+    /// 返回值区分 `Connected`（已连接但**不在任何房**，含回房失败后的回退态）与
+    /// `JoinedOffice`——SDK 绝不静默假装仍在房（#219）。
+    pub fn office_membership(&self) -> OfficeMembershipState {
+        lock_office(&self.office).state()
+    }
+
+    /// 服务端**已确认**的房间号；不在房（含回房失败后的回退态）时为 `None`。
+    ///
+    /// 注意与 `auth_provider` 配置里的 `office_id` 区分：后者是**意图**，前者是服务端裁决后的**事实**。
+    pub fn confirmed_office_id(&self) -> Option<String> {
+        lock_office(&self.office).confirmed_office_id()
+    }
+
+    /// 发送房间事件（`server:join_office` / `server:leave_office`）并等 ack，按协议三分歧裁决。
+    ///
+    /// 空 ack ⇒ `Ok(())`；含 `code` 的 flat ErrorPayload ⇒ [`SmcpAgentError::Protocol`]；形状不认识
+    /// ⇒ 同样判失败（宁严勿宽）。见 [`parse_room_ack`]。
+    ///
+    /// 走**当前槽位**的连接（显式 `join_office` / `leave_office` 即此语义）。
+    async fn call_room_event<T: serde::Serialize>(
+        &self,
+        event: &str,
+        payload: &T,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        let transport = self.resolve_transport().await?;
+        Self::call_room_event_on(&transport, event, payload, timeout_secs).await
+    }
+
+    /// 在**指定**连接上发送房间事件并等 ack。
+    ///
+    /// 自动回房走本入口并显式传入「派生该回房的连接」：不依赖共享槽位，既保证回房发在正确的连接上，
+    /// 也让 [`Self::connect`] 无需提前装载槽位即可被做成事务（见其注释）。
+    ///
+    /// ⚠️ 外层**自带**真超时：`tf-rust-socketio` 的 ack 超时只在「ack 到达」时才被判过期（其
+    /// `outstanding_acks` 仅在收到对应 ack 时才移除条目），故对**根本不 ack** 的对端，
+    /// [`SocketIoTransport::call`] 的 `timeout_secs` 形同虚设、会一直挂住。房间事件是回房循环的
+    /// 承重路径——「有界等待」是本特性的硬要求（#219 裁决），故此处补一层真 deadline。
+    async fn call_room_event_on<T: serde::Serialize>(
+        transport: &SocketIoTransport,
+        event: &str,
+        payload: &T,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        let data = serde_json::to_value(payload)?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            transport.call(event, data, timeout_secs),
+        )
+        .await
+        .map_err(|_| {
+            warn!(
+                "Room event {} received no ack within {}s",
+                event, timeout_secs
+            );
+            SmcpAgentError::Timeout
+        })??;
+        parse_room_ack(&response)?;
+        Ok(())
+    }
+
+    /// namespace 连接建立（含自动重连后的新会话）：绑定会话，并按待重放的入房意图派生回房 task。
+    ///
+    /// 只采信**已提交连接**（`connection_id` 与成员状态登记的连接一致）的事件：未提交连接的 Connected
+    /// 由 `connect()` 在提交点亲自绑定，旧连接的迟到事件则被 `None` 丢弃。
+    async fn on_office_namespace_connected(
+        &self,
+        transport: &Arc<SocketIoTransport>,
+        connection_id: u64,
+        epoch: u64,
+    ) {
+        let Some((previous, replay)) =
+            lock_office(&self.office).bind_connected(connection_id, epoch)
+        else {
+            debug!(
+                "Ignoring namespace connect of uncommitted/superseded connection {}",
+                connection_id
+            );
+            return;
+        };
+        if let Some(task) = previous {
+            task.abort();
+        }
+
+        let Some((generation, intent)) = replay else {
+            debug!(
+                "Namespace connected (epoch {}); no office intent to restore",
+                epoch
+            );
+            return;
+        };
+        info!(
+            "Namespace connected (epoch {}); replaying office join for {}",
+            epoch, intent.office_id
+        );
+        self.spawn_office_rejoin(Arc::clone(transport), connection_id, generation, intent);
+    }
+
+    /// namespace 断开：按**关闭原因**决定意图去留，并作废在途回房。
+    async fn on_office_namespace_closed(
+        &self,
+        connection_id: u64,
+        reason: CloseReason,
+        epoch: u64,
+    ) {
+        // 只有「传输层断线且底层会自动重连」（`transport close`）才保留意图；服务端踢出 / 手工断开
+        // 一律清空——否则会把用户主动退出、或被服务端踢掉的房在下次重连时**自动加回去**。
+        let retain_intent = matches!(reason, CloseReason::TransportClose);
+        // **一次加锁**完成两件事，二者不可分割：① 记录「该尝试在提交前已断开」（供提交点裁决）；
+        // ② 若该连接**已提交**，按常规断开处理。分开做会留下「检查-使用」窗口。
+        let applied = {
+            let mut membership = lock_office(&self.office);
+            membership.record_attempt_closed(connection_id);
+            membership.bind_closed(connection_id, epoch, retain_intent)
+        };
+        let Some((applied, pending)) = applied else {
+            debug!(
+                "Ignoring namespace close of uncommitted/superseded connection {}",
+                connection_id
+            );
+            return;
+        };
+        if let Some(task) = pending {
+            task.abort();
+        }
+
+        match (applied, retain_intent) {
+            (false, _) => debug!(
+                "Ignoring namespace close of superseded session (epoch {})",
+                epoch
+            ),
+            (true, true) => info!(
+                "Namespace transport closed (epoch {}); office intent retained for rejoin",
+                epoch
+            ),
+            (true, false) => info!(
+                "Namespace closed ({:?}); office intent cleared (no automatic rejoin)",
+                reason
+            ),
+        }
+    }
+
+    /// 派生 generation-bound 回房 task 并登记其 abort 句柄；登记失败（世代/意图已不新鲜）即刻 abort。
+    fn spawn_office_rejoin(
+        &self,
+        transport: Arc<SocketIoTransport>,
+        connection_id: u64,
+        generation: u64,
+        intent: OfficeIntent,
+    ) {
+        let agent = self.clone();
+        let task_intent = intent.clone();
+        let task = tokio::spawn(async move {
+            agent
+                .recover_office(&transport, connection_id, generation, task_intent)
+                .await;
+        });
+        let handle = task.abort_handle();
+        if !lock_office(&self.office).set_rejoin_task(connection_id, generation, &intent, handle) {
+            task.abort();
+        }
+    }
+
+    /// 重连恢复路径：在**有界预算**内重放 `server:join_office`。
+    ///
+    /// 与显式 [`Self::join_office`] 的关键差异是**允许对瞬态冲突退避重试**：静默断线后服务端仍可能
+    /// 持有本客户端的旧会话（回收时刻由传输层心跳决定，socket.io 默认最长 45s），此时重放会撞上
+    /// `4101` / `4105` 被拒。协议 error-handling.md §建议的重试策略要求客户端在**恢复路径**上做有界
+    /// 退避重试（单次尝试为下限、预算可配）。
+    ///
+    /// **为什么不是事件驱动**：协议明确禁止服务端收编 / 驱逐旧会话（room-model.md §静默断线与
+    /// 会话回收——服务端仅凭 `(role, name)` 无法区分僵尸会话与真实同名客户端），故不存在
+    /// 「旧会话已回收」事件可供等待；唯一机器可判的信号就是这两个拒绝码本身。
+    ///
+    /// 结果只在**世代仍新鲜**时落账；失败一律清空成员状态（回退到 `Connected`）并报错，绝不静默假装
+    /// 在线。
+    async fn recover_office(
+        &self,
+        transport: &Arc<SocketIoTransport>,
+        connection_id: u64,
+        generation: u64,
+        intent: OfficeIntent,
+    ) {
+        let budget = Duration::from_secs(self.config.office_rejoin_budget_secs);
+        let started = tokio::time::Instant::now();
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+            // 操作门按**单次尝试**粒度持有：使显式 join / leave 能在两次尝试之间抢占回房循环，
+            // 而不与之竞争（若整段循环都持门，用户退房会被最长一个预算挡住）。
+            let verdict = {
+                let _operation = self.office_operation.lock().await;
+                if !lock_office(&self.office).is_current(connection_id, generation, &intent) {
+                    return;
+                }
+                self.replay_join(transport, &intent).await
+            };
+
+            // 每个 await 之后复核新鲜度（Close / 显式操作可能已接管）；落账侧还有同一守卫的二次检查，
+            // 覆盖「复核之后、落账之前」的窗口。
+            if !lock_office(&self.office).is_current(connection_id, generation, &intent) {
+                return;
+            }
+
+            match verdict {
+                Ok(()) => {
+                    if lock_office(&self.office).commit_rejoin(connection_id, generation, &intent) {
+                        info!(
+                            "Automatically rejoined office {} after reconnect (attempt {})",
+                            intent.office_id, attempt
+                        );
+                    }
+                    return;
+                }
+                Err(error) => match classify_rejoin_error(&error) {
+                    RejoinVerdict::TransientConflict => {
+                        let delay = backoff_delay(attempt);
+                        if !retry_fits_budget(started.elapsed(), delay, budget) {
+                            self.abandon_office_rejoin(
+                                connection_id,
+                                generation,
+                                &intent,
+                                format!(
+                                    "still rejected by transient conflict after {attempt} attempt(s) \
+                                     within the {}s rejoin budget: {error}",
+                                    self.config.office_rejoin_budget_secs
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                        warn!(
+                            "Office rejoin hit a transient conflict (attempt {attempt}): {error}; \
+                             retrying in {delay:?}"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    RejoinVerdict::Permanent => {
+                        self.abandon_office_rejoin(
+                            connection_id,
+                            generation,
+                            &intent,
+                            format!("office rejoin rejected: {error}"),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
+    /// 重放一次 `server:join_office`（等 ack，用
+    /// [`SmcpAgentConfig::office_rejoin_timeout`](crate::config::SmcpAgentConfig::office_rejoin_timeout)
+    /// 作单次有界等待）。
+    async fn replay_join(
+        &self,
+        transport: &Arc<SocketIoTransport>,
+        intent: &OfficeIntent,
+    ) -> Result<()> {
+        let req = EnterOfficeReq {
+            role: Role::Agent,
+            name: intent.agent_name.clone(),
+            office_id: intent.office_id.clone(),
+        };
+        Self::call_room_event_on(
+            transport,
+            SERVER_JOIN_OFFICE,
+            &req,
+            self.config.office_rejoin_timeout,
+        )
+        .await
+    }
+
+    /// 回房放弃：清空成员状态（如实回退到 `Connected`）+ error 日志 + 派发
+    /// [`AsyncAgentEventHandler::on_office_membership_lost`]（默认 no-op）。
+    async fn abandon_office_rejoin(
+        &self,
+        connection_id: u64,
+        generation: u64,
+        intent: &OfficeIntent,
+        reason: String,
+    ) {
+        if !lock_office(&self.office).abandon_rejoin(connection_id, generation, intent) {
+            // 已被更新的操作 / 断连接管：既不改状态也不再派发（避免误报「失去」）。
+            return;
+        }
+        error!(
+            "Office membership lost for {} (state falls back to Connected): {}",
+            intent.office_id, reason
+        );
+        if let Some(handler) = &self.event_handler {
+            if let Err(hook_error) = handler
+                .on_office_membership_lost(&intent.office_id, &reason, self)
+                .await
+            {
+                error!(
+                    "on_office_membership_lost hook raised for office {}: {}",
+                    intent.office_id, hook_error
+                );
+            }
+        }
     }
 
     /// 获取指定Computer的工具列表
@@ -967,6 +1507,12 @@ impl Clone for AsyncSmcpAgent {
             config: self.config.clone(),
             tools_cache: self.tools_cache.clone(),
             notification_task: None, // Note: 任务句柄不克隆，因为它是特定于实例的
+            // 成员状态与操作门**是**共享的（回房 task 跑在克隆体上，必须看到同一份状态）；
+            // 生命周期 task 句柄同 notification_task：不克隆（特定于实例）。
+            office: self.office.clone(),
+            office_operation: self.office_operation.clone(),
+            office_lifecycle_task: None,
+            office_connection_seq: self.office_connection_seq.clone(),
         }
     }
 }

@@ -28,6 +28,23 @@ pub struct SmcpAgentConfig {
     pub max_retries: u32,
     /// 重连间隔（毫秒）
     pub reconnect_interval: u64,
+    /// 「重连后回房」单次 `server:join_office` 重放的 **ack 等待上限（秒）**。
+    ///
+    /// 默认 `10`——与 python 参考实现 `OFFICE_REJOIN_TIMEOUT` 及本仓 Computer 侧重放所用的 `10`
+    /// 同值（跨端时序可比）。回房用**等 ack**（`call`）而非 emit，故本值即单次尝试的耗时上界。
+    ///
+    /// Per-attempt ack timeout (seconds) for the automatic office rejoin.
+    pub office_rejoin_timeout: u64,
+    /// 「重连后回房」有界退避重试的**总预算（秒）**。
+    ///
+    /// 默认 `60`——须覆盖部署方的会话回收窗口：socket.io 默认 `ping_interval(25) + ping_timeout(20)`
+    /// ⇒ 最长 45s（协议 room-model §静默断线与会话回收 的 SHOULD 级部署约束），故默认预算须显著大于
+    /// 该窗口。预算约束**下一次尝试的起始时刻**，总耗时上界 ≈ 预算 + [`Self::office_rejoin_timeout`]。
+    ///
+    /// `0` ⇒ 仅单次尝试（协议规定的下限：首次入房撞上冲突视为永久冲突，不重试）。
+    ///
+    /// Total budget (seconds) for the bounded backoff retries of the automatic office rejoin.
+    pub office_rejoin_budget_secs: u64,
 }
 
 impl Default for SmcpAgentConfig {
@@ -40,6 +57,8 @@ impl Default for SmcpAgentConfig {
             auto_fetch_tools: true,
             max_retries: 3,
             reconnect_interval: 1000,
+            office_rejoin_timeout: 10,
+            office_rejoin_budget_secs: 60,
         }
     }
 }
@@ -84,6 +103,19 @@ impl SmcpAgentConfig {
         self.reconnect_interval = interval;
         self
     }
+
+    /// 设置回房单次重放的 ack 等待上限（秒）。默认 10s。
+    pub fn with_office_rejoin_timeout(mut self, timeout_secs: u64) -> Self {
+        self.office_rejoin_timeout = timeout_secs;
+        self
+    }
+
+    /// 设置回房有界退避重试的总预算（秒）。默认 60s（覆盖 socket.io 默认 45s 回收窗口）；
+    /// 传 `0` ⇒ 仅单次尝试。
+    pub fn with_office_rejoin_budget_secs(mut self, budget_secs: u64) -> Self {
+        self.office_rejoin_budget_secs = budget_secs;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +130,9 @@ mod tests {
             .with_auto_fetch_desktop(false)
             .with_auto_fetch_tools(false)
             .with_max_retries(5)
-            .with_reconnect_interval(2000);
+            .with_reconnect_interval(2000)
+            .with_office_rejoin_timeout(3)
+            .with_office_rejoin_budget_secs(20);
 
         assert_eq!(config.default_timeout, 10);
         assert_eq!(config.tool_call_timeout, 30);
@@ -106,6 +140,8 @@ mod tests {
         assert!(!config.auto_fetch_tools);
         assert_eq!(config.max_retries, 5);
         assert_eq!(config.reconnect_interval, 2000);
+        assert_eq!(config.office_rejoin_timeout, 3);
+        assert_eq!(config.office_rejoin_budget_secs, 20);
     }
 
     #[test]
@@ -121,5 +157,13 @@ mod tests {
         assert!(config.auto_fetch_tools); // 默认开启 / Default enabled
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.reconnect_interval, 1000);
+        // 回房默认：单次 ack 等待 10s（对齐 python `OFFICE_REJOIN_TIMEOUT` 与本仓 Computer 侧），
+        // 总预算 60s ⇒ 覆盖 socket.io 默认最长回收窗口 45s（#219 裁决）。
+        assert_eq!(config.office_rejoin_timeout, 10);
+        assert_eq!(
+            config.office_rejoin_budget_secs, 60,
+            "默认回房预算 MUST 覆盖 socket.io 默认最长回收窗口 45s"
+        );
+        assert!(config.office_rejoin_budget_secs > 45);
     }
 }

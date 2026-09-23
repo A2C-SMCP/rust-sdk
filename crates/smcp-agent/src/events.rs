@@ -113,6 +113,31 @@ pub trait AsyncAgentEventHandler: Send + Sync {
         );
         Ok(())
     }
+
+    /// 自动回房**最终失败**时触发（#219）/ Triggered when automatic office rejoin gives up。
+    ///
+    /// 触发时机 / Trigger：传输层重连后重放 `server:join_office` 未能恢复成员关系，且 SDK 已按策略
+    /// 停止重试（重试预算耗尽，或被 `4106` / `400` / `403` 等永久性拒绝）。此刻本地成员关系**已被
+    /// 清空**——[`crate::AsyncSmcpAgent::office_membership`] 回退到
+    /// [`crate::office::OfficeMembershipState::Connected`]，绝不静默假装仍在房。消费方据此清理依赖该
+    /// 房间的本地视图（工具 / 桌面 / SKILL 缓存等）。
+    ///
+    /// 不触发的情形 / Not triggered：
+    ///
+    /// - 传输层断线但会自动重连、且回房仍在预算内——SDK 正在自愈，尚不构成「失去」；
+    /// - 服务端踢出与调用方显式退房——那是**调用方自己表达的意图**（或协议明确的终态），不属意外失去；
+    /// - 传输层彻底放弃重连（`tf-rust-socketio` 未提供「重连耗尽」事件，见 `docs/agent/office-rejoin.md`）。
+    ///
+    /// 向后兼容 / Backward-compat：默认实现仅记录 error 日志，旧处理器无需改动即编译通过。
+    async fn on_office_membership_lost(
+        &self,
+        office_id: &str,
+        reason: &str,
+        _agent: &AsyncSmcpAgent,
+    ) -> Result<(), crate::error::SmcpAgentError> {
+        tracing::error!("Office membership lost for {}: {}", office_id, reason);
+        Ok(())
+    }
 }
 
 /// 同步事件处理器trait

@@ -111,6 +111,23 @@ impl SmcpProtocolError {
             reason: None,
         }
     }
+
+    /// 由**本端主动构造**的 flat [`smcp::ErrorPayload`] 产出协议错误。
+    ///
+    /// 用途：SDK 在**本地前置校验**阶段产生的拒绝（如 Agent 换房时的 `4106 Already In Room`）必须与
+    /// 「服务端经 ack 回传的拒绝」对调用方**同形**——同一个 [`SmcpProtocolError`]、同一套字段提取、
+    /// 同一份 canonical 文案（文案由 [`smcp::build_room_rejection_error`] 提供）。故此处复用内部的
+    /// `from_value` 而非另写字段映射，避免两条构造路径漂移。
+    ///
+    /// Build a protocol error from a locally constructed flat payload, reusing the same field
+    /// extraction as the ack-parsing path so the two cannot drift apart.
+    pub fn from_error_payload(payload: &smcp::ErrorPayload) -> Self {
+        match serde_json::to_value(payload) {
+            Ok(value) => Self::from_value(&value),
+            // `ErrorPayload` 恒可序列化；万一失败则退化为「无法判定」（`code = -1`），绝不 panic。
+            Err(_) => Self::indeterminate(),
+        }
+    }
 }
 
 /// 解析**房间事件 ack**（`server:join_office` / `server:leave_office`）→ 裁决。
