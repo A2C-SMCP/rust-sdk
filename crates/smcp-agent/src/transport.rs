@@ -359,6 +359,7 @@ impl SocketIoTransport {
         // #219：namespace 生命周期订阅。⚠️ 必须走 `on(Event::Connect)` + `on_close_with_session`——
         // 内核 `callback()` 只对 `Message` / `Custom` 事件派发 `on_any`，故生命周期信号**不可能**从上面
         // 那个 on_any 闭包取到（其 `Event::Close | Event::Error | Event::Connect` 分支因此恒不命中）。
+        let observes_lifecycle = lifecycle.is_some();
         if let Some(lifecycle_tx) = lifecycle {
             let connect_tx = lifecycle_tx.clone();
             builder = builder.on(Event::Connect, move |_payload, client| {
@@ -420,9 +421,11 @@ impl SocketIoTransport {
             }
         };
 
-        // 等待一小段时间确保 Socket.IO namespace 连接完全建立
-        // Wait for Socket.IO namespace connection to be fully established
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // 订阅生命周期的 Agent 自行等 namespace 就绪。此路径必须立即移交 Client，不能在
+        // 创建成功和交给未提交连接守卫之间留下可取消的等待窗口。
+        if !observes_lifecycle {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
 
         info!(
             "Connected to SMCP server at {} with namespace {} and handlers",

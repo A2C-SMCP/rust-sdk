@@ -288,15 +288,17 @@ struct TcpProxy {
     url: String,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     active_connections: Arc<AtomicUsize>,
+    connection_closed: Arc<tokio::sync::Notify>,
     shutdown_tx: oneshot::Sender<()>,
 }
 
 /// 跟踪真实 TCP 存活数：取消任务、EOF、错误三种退出均计入连接释放。
-struct ActiveConnection(Arc<AtomicUsize>);
+struct ActiveConnection(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
 
 impl Drop for ActiveConnection {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        self.1.notify_one();
     }
 }
 
@@ -307,6 +309,8 @@ async fn start_tcp_proxy(backend_addr: std::net::SocketAddr) -> TcpProxy {
     let task_handles = Arc::clone(&connection_tasks);
     let active_connections = Arc::new(AtomicUsize::new(0));
     let active = Arc::clone(&active_connections);
+    let connection_closed = Arc::new(tokio::sync::Notify::new());
+    let closed = Arc::clone(&connection_closed);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         loop {
@@ -314,7 +318,7 @@ async fn start_tcp_proxy(backend_addr: std::net::SocketAddr) -> TcpProxy {
                 accepted = listener.accept() => {
                     if let Ok((mut downstream, _)) = accepted {
                         active.fetch_add(1, Ordering::SeqCst);
-                        let connection = ActiveConnection(Arc::clone(&active));
+                        let connection = ActiveConnection(Arc::clone(&active), Arc::clone(&closed));
                         let task = tokio::spawn(async move {
                             let _connection = connection;
                             if let Ok(mut upstream) = TcpStream::connect(backend_addr).await {
@@ -332,8 +336,145 @@ async fn start_tcp_proxy(backend_addr: std::net::SocketAddr) -> TcpProxy {
         url: format!("http://{addr}"),
         connection_tasks,
         active_connections,
+        connection_closed,
         shutdown_tx,
     }
+}
+
+/// 外层取消发生在 namespace 等待期时，也必须释放此次尝试的真实 TCP 连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_namespace_connect_releases_uncommitted_transport() {
+    let mut agent = agent_for("agent-cancel", "office-cancel", default_config());
+    cancel_stalled_connect(&mut agent).await;
+    assert_eq!(
+        agent.office_membership(),
+        OfficeMembershipState::Disconnected
+    );
+}
+
+async fn cancel_stalled_connect(agent: &mut AsyncSmcpAgent) {
+    let (proxy, _shutdown, entered) = start_stalled_namespace_server_with_signal().await;
+    {
+        let connecting = agent.connect(&proxy.url);
+        tokio::pin!(connecting);
+        tokio::select! {
+            _ = entered.notified() => {},
+            result = &mut connecting => panic!("stalled namespace unexpectedly completed: {result:?}"),
+            _ = sleep(Duration::from_secs(120)) => panic!("namespace middleware was never reached"),
+        }
+        // 从已到达 namespace 中间件开始计时，避免启动/握手延迟导致尚未分配资源就取消的假绿。
+        assert!(timeout(Duration::from_secs(1), &mut connecting)
+            .await
+            .is_err());
+    }
+    timeout(Duration::from_secs(2), async {
+        while proxy.active_connections.load(Ordering::SeqCst) != 0 {
+            proxy.connection_closed.notified().await;
+        }
+    })
+    .await
+    .expect("cancelled connect must release all uncommitted TCP streams");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_replacement_keeps_the_committed_connection_and_membership() {
+    let server = start_rejoin_capture_server(policy(|_| JoinOutcome::Accept), None).await;
+    let mut agent = agent_for("agent-keep-cancel", "office-keep-cancel", default_config());
+    agent.connect(&server.url).await.unwrap();
+    agent.join_office("agent-keep-cancel").await.unwrap();
+    cancel_stalled_connect(&mut agent).await;
+    assert_eq!(
+        agent.confirmed_office_id().as_deref(),
+        Some("office-keep-cancel")
+    );
+    agent.leave_office().await.unwrap();
+    agent.join_office("agent-keep-cancel").await.unwrap();
+    assert_eq!(
+        agent.confirmed_office_id().as_deref(),
+        Some("office-keep-cancel")
+    );
+    server.shutdown();
+}
+
+struct LeaveOnMembershipLoss(mpsc::UnboundedSender<Result<(), SmcpAgentError>>);
+
+#[async_trait::async_trait]
+impl AsyncAgentEventHandler for LeaveOnMembershipLoss {
+    async fn on_office_membership_lost(
+        &self,
+        _office: &str,
+        _reason: &str,
+        agent: &AsyncSmcpAgent,
+    ) -> Result<(), SmcpAgentError> {
+        let _ = self.0.send(agent.leave_office().await);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_budget_attempts_once_and_loss_hook_can_reenter_office_operations() {
+    let mut server = start_rejoin_capture_server(
+        policy(|attempt| {
+            if attempt == 1 {
+                JoinOutcome::Accept
+            } else {
+                JoinOutcome::Reject(4101)
+            }
+        }),
+        None,
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut agent = agent_for(
+        "agent-hook",
+        "office-hook",
+        default_config().with_office_rejoin_budget_secs(0),
+    )
+    .with_event_handler(LeaveOnMembershipLoss(tx));
+    agent.connect(&server.url).await.unwrap();
+    agent.join_office("agent-hook").await.unwrap();
+    server.next_join().await;
+    server.force_network_disconnect();
+    server.next_join().await;
+    timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("loss callback must not hold the office operation lock")
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.office_membership(), OfficeMembershipState::Connected);
+    server.assert_no_join_for(Duration::from_millis(1200)).await;
+    server.shutdown();
+}
+
+/// 显式入房等 ACK 占用操作门期间，恢复预算到期后不能继续发起重试。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejoin_retry_does_not_start_after_budget_spent_waiting_for_join() {
+    let mut server = start_rejoin_capture_server(
+        policy(|attempt| {
+            if attempt == 1 {
+                JoinOutcome::Accept
+            } else {
+                JoinOutcome::Reject(4101)
+            }
+        }),
+        Some((3, Duration::from_secs(3))),
+    )
+    .await;
+    let config = default_config().with_office_rejoin_budget_secs(2);
+    let mut agent = agent_for("agent-deadline", "office-deadline", config);
+    agent.connect(&server.url).await.unwrap();
+    agent.join_office("agent-deadline").await.unwrap();
+    server.next_join().await;
+    server.force_network_disconnect();
+    server.next_join().await; // 首次恢复被拒，进入 1s 退避。
+    let explicit = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.join_office("agent-deadline").await })
+    };
+    server.next_join().await; // 显式入房等 3s 后被拒，generation 不变。
+    assert!(explicit.await.unwrap().is_err());
+    server.assert_no_join_for(Duration::from_millis(500)).await;
+    server.shutdown();
 }
 
 /// 轮询直到状态满足谓词（替代固定 sleep，时序一就绪即返回）。
@@ -341,13 +482,26 @@ async fn start_tcp_proxy(backend_addr: std::net::SocketAddr) -> TcpProxy {
 /// 另起一台「transport 可达、但 `/smcp` namespace 中间件**永不完成**」的服务端，用于验证
 /// `connect()` 的后置条件失败路径（namespace 会话未建立 ⇒ 如实报错并回滚）。
 async fn start_stalled_namespace_server() -> (TcpProxy, oneshot::Sender<()>) {
+    let (proxy, shutdown, _) = start_stalled_namespace_server_with_signal().await;
+    (proxy, shutdown)
+}
+
+async fn start_stalled_namespace_server_with_signal(
+) -> (TcpProxy, oneshot::Sender<()>, Arc<tokio::sync::Notify>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let (layer, io) = SocketIo::new_layer();
     // namespace 中间件挂起 ⇒ 服务端永不下发 namespace CONNECT 帧 ⇒ 客户端 `Event::Connect` 不触发。
-    let middleware =
-        || async { std::future::pending::<Result<(), std::convert::Infallible>>().await };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let middleware_entered = Arc::clone(&entered);
+    let middleware = move || {
+        let entered = Arc::clone(&middleware_entered);
+        async move {
+            entered.notify_one();
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
+        }
+    };
     io.ns("/smcp", (|| {}).with(middleware));
 
     let fallback = tower::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
@@ -376,7 +530,7 @@ async fn start_stalled_namespace_server() -> (TcpProxy, oneshot::Sender<()>) {
         }
     });
 
-    (start_tcp_proxy(addr).await, shutdown_tx)
+    (start_tcp_proxy(addr).await, shutdown_tx, entered)
 }
 
 /// 轮询直到状态满足谓词（替代固定 sleep，时序一就绪即返回）。

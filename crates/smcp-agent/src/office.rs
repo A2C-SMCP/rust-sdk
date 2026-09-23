@@ -210,6 +210,17 @@ impl OfficeMembership {
         self.pending_attempt = Some((connection_id, AttemptState::Pending));
     }
 
+    /// 只撤销属于本次尝试的记录，取消清理不得触碰后继尝试。
+    pub(crate) fn cancel_attempt(&mut self, connection_id: u64) {
+        if self
+            .pending_attempt
+            .as_ref()
+            .is_some_and(|(id, _)| *id == connection_id)
+        {
+            self.pending_attempt = None;
+        }
+    }
+
     /// 记录「未提交连接报告了 namespace 建立」（生命周期 task 调用）。
     ///
     /// 两条**单调性**纪律（否则提交点会漏判已到达的断开）：
@@ -540,6 +551,23 @@ mod tests {
         assert_eq!(membership.state(), OfficeMembershipState::Disconnected);
         assert_eq!(membership.confirmed_office_id(), None);
         assert_eq!(membership.conflicting_office("office-a"), None);
+    }
+
+    #[test]
+    fn cancelling_an_attempt_does_not_remove_its_successor() {
+        let mut membership = OfficeMembership::default();
+        membership.begin_attempt(1);
+        membership.begin_attempt(2);
+        membership.cancel_attempt(1);
+        membership.record_attempt_connected(2, 1);
+        assert!(matches!(
+            membership.commit_attempt(2),
+            AttemptCommit::Committed { .. }
+        ));
+        membership.begin_attempt(3);
+        membership.cancel_attempt(3);
+        assert!(membership.pending_attempt.is_none());
+        assert_eq!(membership.committed_connection(), Some(2));
     }
 
     /// Connect 把状态推进到 `Connected`；无意图时不产生重放计划。
