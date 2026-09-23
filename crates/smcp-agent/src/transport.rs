@@ -562,7 +562,13 @@ impl SocketIoTransport {
 
     /// 断开连接
     pub async fn disconnect(self) -> Result<()> {
+        self.close().await
+    }
+
+    /// 关闭共享 transport。释放 Arc 不会停止底层持有 Client 克隆的轮询任务。
+    pub(crate) async fn close(&self) -> Result<()> {
         debug!("Disconnecting from server");
+        let _ = self.disconnect_tx.send(true);
         self.client.disconnect().await.map_err(SmcpAgentError::from)
     }
 

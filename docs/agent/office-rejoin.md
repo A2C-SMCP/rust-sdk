@@ -25,7 +25,7 @@ Socket.IO 的 room 成员关系挂在**namespace 会话**上。传输层断线�
 | `desired` | **客户端表达的入房意图** `(office_id, agent_name)`：`join_office` 成功后落账，显式退房 / 服务端踢出 / 回房放弃即清除 |
 | `confirmed` | **服务端已确认**的成员关系；断连或回房失败即清空 |
 | `generation` | 世代号：Connect / Close / 显式 join / 显式 leave 均使其前进，作废在途回房结果 |
-| `transport_epoch` | 已确认连接的 namespace 会话 epoch（`tf-rust-socketio::Client::session_epoch`），陈旧 Close 的判据 |
+| `transport_epoch` | 当前连接已观察到的最大 namespace epoch（包括先到的 Close），同 epoch 的关闭不可逆 |
 | `connected` | namespace 是否在册 |
 
 `agent_name` 必须随意图一起记住：Agent 侧它只出现在 `join_office` 的**调用实参**里
@@ -42,7 +42,9 @@ Socket.IO 的 room 成员关系挂在**namespace 会话**上。传输层断线�
 | namespace `Connected` | 绑定 `transport_epoch`、`connected = true`、`confirmed = None`（**新会话未经确认**）；若意图仍在 ⇒ 派生 generation-bound 回房 task 重放 `server:join_office` |
 | namespace `Closed`（`transport close`） | 作废在途回房；`connected = false`、`confirmed = None`；**保留意图**（底层会自动重连） |
 | namespace `Closed`（`io server disconnect` / `io client disconnect`） | 同上，但**清空意图**——否则会把用户主动退出、或被服务端踢掉的房在下次重连时自动加回去 |
-| 陈旧 Close（epoch 与当前会话不符） | 整个事件丢弃（#211：旧 transport 的迟到 Close 不得清掉新会话的成员关系） |
+| 陈旧 Close（epoch 小于已观察到的 epoch） | 整个事件丢弃（#211：旧 transport 的迟到 Close 不得清掉新会话的成员关系） |
+| 更新 epoch 的 Close 先于 Connect 到达 | 记录该 epoch 并置断开；迟到的同 epoch Connect 不得复活会话，只有更大的 epoch 才能重新建立 |
+| 重复或陈旧 Connect | 忽略，不清空已确认成员关系，不产生重复回房 |
 
 ### 2.2 可观测状态
 
@@ -73,7 +75,7 @@ Socket.IO 的 room 成员关系挂在**namespace 会话**上。传输层断线�
 > `connected == false` 时落账成员关系）。若 10s 内仍未观察到该事件，`connect()` **如实返回错误**。
 >
 > `connect()` 是**事务性**的：在满足上述后置条件之前，它不触碰任何既有状态（transport 槽位、生命周期
-> / 通知两个后台 task 的句柄、成员状态），失败时只丢弃本次新建的资源——因此**对已连接的 agent 再次
+> / 通知两个后台 task 的句柄、成员状态），失败时停止本次后台任务并显式关闭本次新建连接——因此**对已连接的 agent 再次
 > `connect()` 失败不会破坏既有连接**（既有连接仍可发房间请求，其生命周期事件仍被消费、仍会自动回房）。
 
 **成员关系属于连接**：每次 `connect()` 分配一个连接序号，成员状态只接受**该序号与已提交连接一致**的
@@ -86,6 +88,12 @@ Socket.IO 的 room 成员关系挂在**namespace 会话**上。传输层断线�
 `connect()` 的提交点是一次加锁的 `commit_attempt`：在同一临界区内裁决「提交前是否已断开」并完成连接
 归属 + 会话绑定 + 世代推进；判为「提交前已断开」即丢弃本次资源并返回错误。于是「检查」与「提交」不再
 分离——**已到达的 Close 不可能被提交点漏判**，且不会把死连接报成「已连接」。
+
+**连接发布与清理**：所有 Agent 克隆共享连接尝试门与后台任务归属，避免同时覆盖尝试槽位。
+新连接就绪后，提交身份与替换 transport 在房间操作门内完成，且两步之间没有 await；显式入退房
+因此不会捕获新身份却使用旧连接。成功替换会停止旧任务并显式关闭旧 transport，再让回房执行。
+仅 drop transport 不会终止底层持有 Client 克隆的轮询任务，不能作为连接清理手段。关闭旧连接也会
+唤醒仍在该连接上等待 ACK 的调用，使其返回连接错误。
 
 **房间操作全序**：显式 `join_office` / `leave_office` 与自动回房的**逐次尝试**共用同一把操作门；
 `leave_office` 的「清意图 + 作废在途回房」也在门内执行，使 leave 与 join 全序化——否则并发退房会插进

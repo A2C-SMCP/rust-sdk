@@ -123,8 +123,8 @@ pub(crate) struct OfficeMembership {
     confirmed: Option<OfficeIntent>,
     /// 世代号：Connect / Close / 显式 join / 显式 leave 均使其前进，作废在途回房结果。
     generation: u64,
-    /// 已确认连接的 namespace 会话 epoch（`tf-rust-socketio::Client::session_epoch`）；
-    /// 陈旧 Close 的判据（#211）：已被取代的 transport 的迟到 Close 不得动新会话的状态。
+    /// 当前连接已观察到的最大 namespace epoch，包括先于 Connect 到达的 Close。
+    /// 同 epoch 的关闭是终态；只有更大的 epoch 才能重新置为 connected。
     transport_epoch: u64,
     /// namespace 是否在册（Connect 按 epoch 置真、同 epoch 的 Close 置假）。
     connected: bool,
@@ -341,13 +341,13 @@ impl OfficeMembership {
 
     /// namespace 连接建立（含自动重连后的新会话）：绑定 epoch、置在册、作废上一世代，
     /// 并按「意图是否仍在」交出待重放的 `(generation, intent)`。
-    /// 返回 `None` 表示该事件**不属于已提交的连接**（未提交或已被替换）⇒ 调用方须原样忽略。
+    /// 返回 `None` 表示连接归属不符或 epoch 不比已观察到的更新（陈旧、重复或已关闭）。
     pub(crate) fn bind_connected(
         &mut self,
         connection_id: u64,
         epoch: u64,
     ) -> Option<ConnectedBinding> {
-        if self.connection != Some(connection_id) {
+        if self.connection != Some(connection_id) || epoch <= self.transport_epoch {
             return None;
         }
         let previous = self.rejoin_task.take();
@@ -360,8 +360,9 @@ impl OfficeMembership {
         Some((previous, replay))
     }
 
-    /// namespace 断开：仅当 `epoch` 仍是**当前**会话的 epoch 且仍在册时生效（陈旧 Close 一律丢弃，
-    /// #211）。`retain_intent` 为真时保留意图供下一次 Connect 重放（传输层断线且会自动重连）。
+    /// namespace 断开：接受当前或更新 epoch 的 Close（它可能先于 Connect 到达）。
+    /// 陈旧及重复 Close 丢弃；记录关闭 epoch，阻止迟到 Connect 复活该会话。
+    /// `retain_intent` 为真时保留意图供下一次 Connect 重放。
     ///
     /// 返回 `None` 表示该事件**不属于已提交的连接** ⇒ 调用方须原样忽略（未提交连接的断开不得动
     /// 既有连接的状态）；`Some((是否生效, 在途回房句柄))` 见上。
@@ -374,10 +375,11 @@ impl OfficeMembership {
         if self.connection != Some(connection_id) {
             return None;
         }
-        if epoch != self.transport_epoch || !self.connected {
+        if epoch < self.transport_epoch || (epoch == self.transport_epoch && !self.connected) {
             return Some((false, None));
         }
         self.next_generation();
+        self.transport_epoch = epoch;
         self.connected = false;
         self.confirmed = None;
         if !retain_intent {
@@ -674,6 +676,43 @@ mod tests {
         assert!(applied);
         let (_, replay) = bind_connected(&mut membership, 3);
         assert!(replay.is_none(), "服务端踢出后 MUST NOT 自动重回该房");
+    }
+
+    /// 自动重连的 Close 先于 Connect 到达：关闭 epoch 是终态，不能被迟到事件复活。
+    #[test]
+    fn reconnect_close_before_connect_is_terminal_for_that_epoch() {
+        for retain_intent in [true, false] {
+            let mut membership = OfficeMembership::default();
+            bind_connected(&mut membership, 1);
+            assert!(join_here(&mut membership, "office-a", "agent-1"));
+            assert!(membership.bind_closed(CONN, 2, retain_intent).unwrap().0);
+            assert!(membership.bind_connected(CONN, 2).is_none());
+            assert!(membership.bind_connected(CONN, 1).is_none());
+            assert_eq!(membership.state(), OfficeMembershipState::Disconnected);
+            assert_eq!(membership.confirmed_office_id(), None);
+
+            // 后续真正的新会话仍可建立；服务端踢出则不得恢复旧意图。
+            let (_, replay) = membership.bind_connected(CONN, 3).unwrap();
+            assert_eq!(replay.is_some(), retain_intent);
+            assert_eq!(membership.state(), OfficeMembershipState::Connected);
+            assert!(!membership.bind_closed(CONN, 2, false).unwrap().0);
+            assert_eq!(membership.state(), OfficeMembershipState::Connected);
+        }
+    }
+
+    #[test]
+    fn duplicate_connect_does_not_clear_confirmed_membership() {
+        let mut membership = OfficeMembership::default();
+        bind_connected(&mut membership, 1);
+        assert!(join_here(&mut membership, "office-a", "agent-1"));
+        assert!(membership.bind_connected(CONN, 1).is_none());
+        assert_eq!(
+            membership.confirmed_office_id().as_deref(),
+            Some("office-a")
+        );
+        assert!(membership.bind_closed(CONN, 1, true).unwrap().0);
+        assert!(membership.bind_connected(CONN, 1).is_none());
+        assert_eq!(membership.state(), OfficeMembershipState::Disconnected);
     }
 
     /// 换房判据：目标房与既有成员关系不一致 ⇒ 报**当前**房号（Agent 须先显式退房）。

@@ -80,6 +80,7 @@ struct RejoinCaptureServer {
     url: String,
     auth_rx: mpsc::UnboundedReceiver<Value>,
     join_rx: mpsc::UnboundedReceiver<Value>,
+    calls_rx: mpsc::UnboundedReceiver<()>,
     /// 房间事件到达顺序（`"join"` / `"leave"`）——用于断言并发 join/leave 与服务端的全序一致。
     room_events_rx: mpsc::UnboundedReceiver<&'static str>,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -144,10 +145,20 @@ async fn start_rejoin_capture_server(
     policy: JoinPolicy,
     delay_attempt: Option<(usize, Duration)>,
 ) -> RejoinCaptureServer {
+    start_capture_server(policy, delay_attempt, false).await
+}
+
+async fn start_capture_server(
+    policy: JoinPolicy,
+    delay_attempt: Option<(usize, Duration)>,
+    disconnect_on_reconnect: bool,
+) -> RejoinCaptureServer {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
     let (join_tx, join_rx) = mpsc::unbounded_channel();
+    let (calls_tx, calls_rx) = mpsc::unbounded_channel();
+    let connections = Arc::new(AtomicUsize::new(0));
     let (room_events_tx, room_events_rx) = mpsc::unbounded_channel();
     let join_attempts = Arc::new(AtomicUsize::new(0));
 
@@ -156,6 +167,8 @@ async fn start_rejoin_capture_server(
         "/smcp",
         move |_socket: SocketRef, TryData(auth): TryData<Value>| {
             let auth_tx = auth_tx.clone();
+            let calls_tx = calls_tx.clone();
+            let connections = connections.clone();
             let join_tx = join_tx.clone();
             let room_events_tx = room_events_tx.clone();
             let join_attempts = Arc::clone(&join_attempts);
@@ -164,6 +177,17 @@ async fn start_rejoin_capture_server(
                 if let Ok(value) = auth {
                     let _ = auth_tx.send(value);
                 }
+                if disconnect_on_reconnect && connections.fetch_add(1, Ordering::SeqCst) > 0 {
+                    _socket.disconnect().unwrap();
+                    return;
+                }
+                // 故意不返回 ACK：用于验证旧连接关闭时在途调用被唤醒。
+                _socket.on("client:get_tools", move || {
+                    let calls_tx = calls_tx.clone();
+                    async move {
+                        let _ = calls_tx.send(());
+                    }
+                });
                 // 房间事件顺序记录器的**独立副本**：下面两个 handler 各持一份（互不移动对方）。
                 let leave_events_tx = room_events_tx.clone();
                 _socket.on(
@@ -247,19 +271,52 @@ async fn start_rejoin_capture_server(
         }
     });
 
-    // 客户端只连 TCP proxy：中止 copy_bidirectional 任务即同时关闭 client/backend socket，
-    // 制造真实网络断开，而服务端仍可立即接受自动重连。
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy = start_tcp_proxy(backend_addr).await;
+    RejoinCaptureServer {
+        url: proxy.url,
+        auth_rx,
+        join_rx,
+        calls_rx,
+        room_events_rx,
+        connection_tasks: proxy.connection_tasks,
+        backend_shutdown_tx,
+        proxy_shutdown_tx: proxy.shutdown_tx,
+    }
+}
+
+struct TcpProxy {
+    url: String,
+    connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    active_connections: Arc<AtomicUsize>,
+    shutdown_tx: oneshot::Sender<()>,
+}
+
+/// 跟踪真实 TCP 存活数：取消任务、EOF、错误三种退出均计入连接释放。
+struct ActiveConnection(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn start_tcp_proxy(backend_addr: std::net::SocketAddr) -> TcpProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let connection_tasks = Arc::new(Mutex::new(Vec::new()));
     let task_handles = Arc::clone(&connection_tasks);
-    let (proxy_shutdown_tx, mut proxy_shutdown_rx) = oneshot::channel::<()>();
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let active = Arc::clone(&active_connections);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                accepted = proxy_listener.accept() => {
+                accepted = listener.accept() => {
                     if let Ok((mut downstream, _)) = accepted {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let connection = ActiveConnection(Arc::clone(&active));
                         let task = tokio::spawn(async move {
+                            let _connection = connection;
                             if let Ok(mut upstream) = TcpStream::connect(backend_addr).await {
                                 let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
                             }
@@ -267,19 +324,15 @@ async fn start_rejoin_capture_server(
                         task_handles.lock().unwrap().push(task.abort_handle());
                     }
                 }
-                _ = &mut proxy_shutdown_rx => break,
+                _ = &mut shutdown_rx => break,
             }
         }
     });
-
-    RejoinCaptureServer {
-        url: format!("http://{proxy_addr}"),
-        auth_rx,
-        join_rx,
-        room_events_rx,
+    TcpProxy {
+        url: format!("http://{addr}"),
         connection_tasks,
-        backend_shutdown_tx,
-        proxy_shutdown_tx,
+        active_connections,
+        shutdown_tx,
     }
 }
 
@@ -287,7 +340,7 @@ async fn start_rejoin_capture_server(
 ///
 /// 另起一台「transport 可达、但 `/smcp` namespace 中间件**永不完成**」的服务端，用于验证
 /// `connect()` 的后置条件失败路径（namespace 会话未建立 ⇒ 如实报错并回滚）。
-async fn start_stalled_namespace_server() -> (String, oneshot::Sender<()>) {
+async fn start_stalled_namespace_server() -> (TcpProxy, oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -323,7 +376,7 @@ async fn start_stalled_namespace_server() -> (String, oneshot::Sender<()>) {
         }
     });
 
-    (format!("http://{addr}"), shutdown_tx)
+    (start_tcp_proxy(addr).await, shutdown_tx)
 }
 
 /// 轮询直到状态满足谓词（替代固定 sleep，时序一就绪即返回）。
@@ -655,17 +708,23 @@ async fn in_flight_rejoin_is_aborted_by_the_next_disconnect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn namespace_connect_timeout_fails_and_rolls_back() {
     let _ = tracing_subscriber::fmt::try_init();
-    let (url, _shutdown) = start_stalled_namespace_server().await;
+    let (proxy, _shutdown) = start_stalled_namespace_server().await;
     let mut agent = agent_for("agent-stalled", "office-stalled", default_config());
 
     let error = agent
-        .connect(&url)
+        .connect(&proxy.url)
         .await
         .expect_err("namespace 会话未建立时 connect MUST 失败，而非放行半初始化状态");
     assert!(
         matches!(error, SmcpAgentError::Connection(_)),
         "必须是连接类错误: {error:?}"
     );
+
+    wait_until(
+        || proxy.active_connections.load(Ordering::SeqCst) == 0,
+        "failed connection must close all TCP streams",
+    )
+    .await;
 
     // 回滚：成员状态为 Disconnected，且槽位已清空（后续房间操作如实报「未连接」）。
     assert_eq!(
@@ -745,9 +804,9 @@ async fn namespace_timeout_on_reconnect_keeps_the_existing_connection_usable() {
     let _ = server.next_join().await;
 
     // transport 可达、但 namespace 永不建立 ⇒ 新尝试超时失败；既有连接与成员状态必须原封不动。
-    let (stalled_url, _stalled_shutdown) = start_stalled_namespace_server().await;
+    let (stalled_proxy, _stalled_shutdown) = start_stalled_namespace_server().await;
     agent
-        .connect(&stalled_url)
+        .connect(&stalled_proxy.url)
         .await
         .expect_err("namespace 未建立时新的 connect MUST 失败");
     assert_eq!(
@@ -924,5 +983,87 @@ async fn room_switch_requires_an_explicit_leave_first() {
     assert_eq!(server.next_join().await["office_id"], "office-two");
     assert_eq!(agent.confirmed_office_id().as_deref(), Some("office-two"));
 
+    server.shutdown();
+}
+
+/// 在途首次入房与连接替换必须全序：先取得的操作门覆盖请求、ACK 和落账。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_replacement_waits_for_in_flight_join() {
+    let mut server = start_rejoin_capture_server(
+        policy(|_| JoinOutcome::Accept),
+        Some((1, Duration::from_millis(700))),
+    )
+    .await;
+    let mut agent = agent_for("agent-publish", "office-publish", default_config());
+    agent.connect(&server.url).await.unwrap();
+    server.next_auth().await;
+    let joining = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.join_office("agent-publish").await })
+    };
+    server.next_join().await; // join 已发出，仍在等待 ACK
+    agent.connect(&server.url).await.unwrap();
+    joining
+        .await
+        .unwrap()
+        .expect("replacement must not invalidate an in-flight join");
+    let replay = server.next_join().await;
+    assert_eq!(replay["office_id"], "office-publish");
+    wait_until(
+        || agent.confirmed_office_id().is_some(),
+        "replacement membership",
+    )
+    .await;
+    server.shutdown();
+}
+
+/// 主动关闭旧连接应立即唤醒在途非房间调用，不能继续等待永不到达的 ACK。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_connection_interrupts_old_in_flight_calls() {
+    let mut server = start_rejoin_capture_server(policy(|_| JoinOutcome::Accept), None).await;
+    let mut agent = agent_for("agent-call", "office-call", default_config());
+    agent.connect(&server.url).await.unwrap();
+    let calling = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.get_tools("computer").await })
+    };
+    timeout(Duration::from_secs(5), server.calls_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    agent.connect(&server.url).await.unwrap();
+    let error = timeout(Duration::from_secs(1), calling)
+        .await
+        .expect("retired connection must wake in-flight calls")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, SmcpAgentError::Connection(_)), "{error:?}");
+    server.shutdown();
+}
+
+/// 真实 Socket.IO 重连后立即被服务端断开，最终必须保持 Disconnected。
+/// 回调乱序的确定性排列由状态机单测补充，避免靠调度概率验证守卫。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_disconnect_on_reconnect_does_not_leave_a_connected_session() {
+    let mut server = start_capture_server(policy(|_| JoinOutcome::Accept), None, true).await;
+    let mut agent = agent_for("agent-kicked", "office-kicked", default_config());
+    agent.connect(&server.url).await.unwrap();
+    server.next_auth().await;
+    agent.join_office("agent-kicked").await.unwrap();
+    server.next_join().await;
+    server.force_network_disconnect();
+    server.next_auth().await;
+    wait_until(
+        || agent.office_membership() == OfficeMembershipState::Disconnected,
+        "server disconnect must be reflected",
+    )
+    .await;
+    // 给已经派生的生命周期回调执行机会，检查没有迟到 Connect 复活状态。
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        agent.office_membership(),
+        OfficeMembershipState::Disconnected
+    );
+    assert_eq!(agent.confirmed_office_id(), None);
     server.shutdown();
 }
