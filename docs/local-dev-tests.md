@@ -63,6 +63,44 @@
    `cargo-sweep sweep --maxsize 40GB <project>` 或不得已时 `cargo clean`（全量冷启动后：
    基线 ≤ 60 分钟）。
 
+### macOS：HTTP 连接超时也可能来自产物目录扫描（#229）
+
+2026-09-24 的 v0.5.0 验收中，`test_mcp_integration` 的 HTTP 连接超时用例和
+`window_enumeration_diagnostics` 两项用例在原目录连续失败。窗口测试的采样显示请求尚未发出：
+`reqwest::ClientBuilder::build` → 系统代理读取 → `SCDynamicStoreCreateWithOptions` →
+`CFBundleGetMainBundle` → `_CFIterateDirectory`。同步目录扫描阻塞测试的 Tokio 线程，
+外层异步 timeout 也无法及时得到调度。
+
+当时 `target/debug/deps` 有 982,596 个条目，仅枚举目录就耗时 24.46 秒。将**相同二进制**
+复制到空临时目录，保持工作目录、参数和环境不变后，窗口用例 2/2 通过（0.13 秒），
+HTTP 超时用例也在 30.54 秒按原有断言通过（客户端内部连接超时为 30 秒，45 秒是外层
+异步守卫，并非严格墙钟上限）。这是该本地环境的证据，不能据此把其他 HTTP
+超时一律归因为缓存，也不能靠放宽断言或禁用系统代理掩盖问题。
+
+长期维护仍采用上面的 target 卫生措施。暂不清理缓存时，可用一次性的 Cargo runner
+隔离测试可执行文件目录，验证当前构建产物；无需修改仓库默认 runner 或生产网络配置：
+
+```bash
+cat > /tmp/rust-sdk-isolated-test-runner.py <<'PY'
+import pathlib, shutil, subprocess, sys, tempfile
+
+source = pathlib.Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix="rust-sdk-test-") as directory:
+    target = pathlib.Path(directory) / source.name
+    shutil.copy2(source, target)
+    result = subprocess.run([str(target), *sys.argv[2:]])
+    sys.exit(result.returncode if result.returncode >= 0 else 128 - result.returncode)
+PY
+CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="python3 /tmp/rust-sdk-isolated-test-runner.py" \
+  cargo test --workspace --all-features --no-fail-fast
+```
+
+Intel macOS 将环境变量名改为 `CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER`。runner 会在每个
+测试进程结束后清理自己创建的临时目录，并透传失败退出码；不改变测试参数、代理或
+TLS 配置。此命令针对 Cargo 原生测试，不能推定 nextest 或 doctest 也使用这个 runner。
+依赖可执行文件旁资源或相对动态库路径的其他项目需另行验证，不能直接照搬。
+
 ## 并行注意
 
 smcp-server-core 的 Socket.IO 集成测试对固定端口有依赖（CI 侧就是

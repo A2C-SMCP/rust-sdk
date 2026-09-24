@@ -164,3 +164,36 @@ async fn test_join_office_surfaces_server_rejection_and_empty_ack_success() {
         "4103 必须是 canonical 文案，而不是 `Missing req_id in response`: {list_error}"
     );
 }
+
+/// 成功替换已有连接必须主动释放旧 SID 的房间，否则自动回房会持续撞上自身的 4101。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_a_joined_connection_releases_the_old_room_member() {
+    let url = spawn_smcp_server().await;
+    let mut original = agent_for("agent-replace", "office-replace");
+    original.connect(&url).await.unwrap();
+    original.join_office("agent-replace").await.unwrap();
+    let before = original.list_room("office-replace").await.unwrap();
+    assert_eq!(before.len(), 1);
+
+    // 从克隆体替换也必须关闭原实例创建的连接及后台任务。
+    let mut replacement = original.clone();
+    replacement.connect(&url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while replacement.confirmed_office_id().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement must rejoin after closing the old connection");
+    let after = replacement.list_room("office-replace").await.unwrap();
+    assert_eq!(after.len(), 1, "old SID must no longer occupy the office");
+    assert_ne!(
+        before[0].sid, after[0].sid,
+        "replacement must be a new session"
+    );
+    assert_eq!(
+        original.confirmed_office_id().as_deref(),
+        Some("office-replace")
+    );
+    replacement.leave_office().await.unwrap();
+}

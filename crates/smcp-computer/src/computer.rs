@@ -484,7 +484,7 @@ struct RawMcpServerEntry {
 
 pub struct Computer<S: Session> {
     /// 计算机名称 / Computer name
-    name: String,
+    name: Arc<String>,
     /// MCP服务器管理器 / MCP server manager
     mcp_manager: Arc<RwLock<Option<MCPServerManager>>>,
     /// 输入定义映射 / Input definitions map (id -> input)
@@ -919,7 +919,7 @@ impl<S: Session> Computer<S> {
         auto_connect: bool,
         auto_reconnect: bool,
     ) -> Self {
-        let name = name.into();
+        let name = Arc::new(name.into());
         let inputs = inputs.unwrap_or_default();
         let raw_mcp_servers = mcp_servers.unwrap_or_default();
         // #147/S14：frozen embed 声明快照 = 构造入参**原样**（存储层不折叠，保留同 display 名异显式 bundle_id
@@ -2180,11 +2180,45 @@ impl<S: Session> Computer<S> {
         &self.name
     }
 
+    /// CLI naming requires exclusive ownership. Check before leaving the old office.
+    #[cfg(feature = "cli")]
+    pub(crate) fn ensure_exclusive_name(&mut self) -> ComputerResult<()> {
+        Arc::get_mut(&mut self.name).ok_or_else(|| {
+            ComputerError::InvalidState(
+                "Cannot rename while another Computer handle exists; release its clones first"
+                    .to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// CLI-only identity replacement, after disconnect and with no public clones.
+    #[cfg(feature = "cli")]
+    pub(crate) async fn set_name(&mut self, name: impl Into<String>) -> ComputerResult<()> {
+        self.ensure_exclusive_name()?;
+        let _gate = self.socketio_lifecycle_gate.lock().await;
+        if self.socketio_client.read().await.is_some() {
+            return Err(ComputerError::InvalidState(
+                "Disconnect Socket.IO before changing the computer name".to_string(),
+            ));
+        }
+        self.name = Arc::new(name.into());
+        Ok(())
+    }
+
     /// 获取 Socket.IO 客户端引用 / Get Socket.IO client reference
     /// 返回 Arc 包装的客户端，确保其生命周期
     /// Returns Arc-wrapped client, ensuring its lifetime
     pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Arc<SmcpComputerClient>>>> {
         self.socketio_client.clone()
+    }
+
+    /// 当前是否装有 Socket.IO 连接 / Whether a Socket.IO client is installed.
+    ///
+    /// 即 `status` 命令与 [`Self::join_office`] 的「未连接」分支所依据的口径（连接槽内置否）；
+    /// CLI `socket join` / `socket join` 改名路径的前置判据复用本方法。
+    pub async fn has_socketio_client(&self) -> bool {
+        self.socketio_client.read().await.is_some()
     }
 
     /// #178：解析当前 MCP 管理器——读锁内仅克隆 `MCPServerManager`（全 Arc 字段，克隆廉价），
@@ -4524,7 +4558,8 @@ impl<S: Session> Computer<S> {
         let detached_socketio: Arc<RwLock<Option<Arc<SmcpComputerClient>>>> =
             Arc::new(RwLock::new(None));
         Self {
-            name: self.name.clone(),
+            // Detached handlers own a fixed identity snapshot, not a public naming handle.
+            name: Arc::new(self.name.as_ref().clone()),
             mcp_manager: Arc::clone(&self.mcp_manager),
             inputs: Arc::clone(&self.inputs),
             mcp_servers: Arc::clone(&self.mcp_servers),
@@ -4622,7 +4657,7 @@ impl<S: Session> Computer<S> {
         let mut builder = SmcpComputerClientBuilder::new(
             url,
             self.mcp_manager.clone(),
-            self.name.clone(),
+            self.name.as_ref().clone(),
             self.inputs.clone(),
         )
         .namespace(options.namespace)
@@ -4696,13 +4731,15 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
-    /// 加入办公室 / Join office
-    pub async fn join_office(&self, office_id: &str, _computer_name: &str) -> ComputerResult<()> {
+    /// Join using the specified identity, rejecting a name different from the connection's.
+    /// To use a different identity, create a Computer and connection with that name.
+    /// The CLI manages connection replacement when `socket join` changes the name.
+    pub async fn join_office(&self, office_id: &str, computer_name: &str) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
         if let Some(ref client) = *socketio_ref {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
-            client.join_office(office_id).await?;
+            client.join_office_as(office_id, computer_name).await?;
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -5344,7 +5381,7 @@ mod tests {
         let session = SilentSession::new("test");
         let computer = Computer::new("test_computer", session, None, None, true, true);
 
-        assert_eq!(computer.name, "test_computer");
+        assert_eq!(computer.name(), "test_computer");
         assert!(computer.auto_connect);
         assert!(computer.auto_reconnect);
     }

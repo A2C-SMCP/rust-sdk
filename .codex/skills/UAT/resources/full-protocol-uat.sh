@@ -25,10 +25,9 @@ MCP="$ROOT/tests/v022-mcp-server/index.js"            # echo + sleep + gen_image
 MCP_NORES="$ROOT/tests/no-resources-mcp-server/index.js"  # 无 resources 能力（R-04 4015 用）
 SEED="$ROOT/.codex/skills/UAT/resources/seeds/_common/valid-skill-pkg"
 OFFICE="proto-uat-office"
-# Computer 在 office 内的注册名。`smcp-computer run` 无 --name flag，注册名恒为
-# REPL 内置默认 "friday_hands"（cli/mod.rs:539，REPL `socket join` 的 name 参数对注册名无效）。
-# Agent 必须用此真实注册名路由 client:* 请求，否则 server 返回 404 computer-not-found。
-COMPUTER_NAME="friday_hands"
+# 使用非默认名字，验证 socket join 的身份参数生效（#224）。
+# Agent 使用同一个名字路由 client:* 请求。
+COMPUTER_NAME="uat_computer"
 SKILL_NAME="valid-skill-pkg"
 
 U="$(mktemp -d -t a2c-uat-fp.XXXXXX)"
