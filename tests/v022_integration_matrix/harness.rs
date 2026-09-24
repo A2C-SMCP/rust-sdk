@@ -377,14 +377,12 @@ pub async fn join(client: &Client, role: Role, office: &str, name: &str) {
         .await
         .expect("join ack timeout")
         .expect("join ack channel");
-    let ok = v
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    assert!(
-        ok,
-        "join_office 失败 role={role:?} office={office} name={name}: {v}"
+    // Protocol 0.5.0: a successful room join has a zero-argument ACK.
+    // Reject the retired boolean tuple as well as any structured error payload.
+    assert_eq!(
+        v,
+        json!([]),
+        "join_office must return an empty ACK: role={role:?} office={office} name={name}"
     );
 }
 

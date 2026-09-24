@@ -1088,10 +1088,31 @@ impl SmcpComputerClient {
         })
     }
 
-    /// 加入Office（Socket.IO Room）
-    /// Join an Office (Socket.IO Room)
+    /// Join an office using this connection's identity.
     pub async fn join_office(&self, office_id: &str) -> ComputerResult<()> {
-        debug!("Joining office: {}", office_id);
+        self.join_office_as(office_id, &self.computer_name).await
+    }
+
+    /// Validate the high-level API's requested identity before sending the join.
+    pub(crate) async fn join_office_as(
+        &self,
+        office_id: &str,
+        computer_name: &str,
+    ) -> ComputerResult<()> {
+        if computer_name != self.computer_name {
+            warn!(
+                connection_name = %self.computer_name,
+                requested_name = %computer_name,
+                office_id = %office_id,
+                "join_office identity mismatch: a connection cannot re-declare a different name"
+            );
+            return Err(ComputerError::IdentityMismatch {
+                current: self.computer_name.clone(),
+                requested: computer_name.to_string(),
+            });
+        }
+
+        debug!("Joining office: {} as {}", office_id, computer_name);
         let _operation = self.office_operation.lock().await;
         let (generation, previous_desired, previous_confirmed) = {
             let mut membership = lock_office_membership(&self.office_membership);
@@ -1107,8 +1128,7 @@ impl SmcpComputerClient {
             (generation, previous_desired, previous_confirmed)
         };
 
-        let result =
-            Self::join_office_with_client(&self.client, &self.computer_name, office_id).await;
+        let result = Self::join_office_with_client(&self.client, computer_name, office_id).await;
         let mut membership = lock_office_membership(&self.office_membership);
         if !membership.is_current(generation, office_id) {
             return Err(ComputerError::SocketIoError(

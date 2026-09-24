@@ -207,7 +207,7 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
             ("socket connect [<url>]", "连接 Socket.IO / connect"),
             (
                 "socket join <office_id> <computer_name>",
-                "加入房间 / join office",
+                "加入房间（改名会自动重建连接）/ join office (rename reconnects)",
             ),
             ("socket leave", "离开房间 / leave office"),
         ],

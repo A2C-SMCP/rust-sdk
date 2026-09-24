@@ -1221,3 +1221,67 @@ async fn server_disconnect_on_reconnect_does_not_leave_a_connected_session() {
     assert_eq!(agent.confirmed_office_id(), None);
     server.shutdown();
 }
+
+/// The synchronous facade must keep its runtime alive while idle, replay membership
+/// after a real transport loss, and allow explicit leave to cancel recovery intent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_facade_replays_and_leave_cancels_recovery() {
+    for reject_replay in [false, true] {
+        let mut server = start_rejoin_capture_server(
+            policy(move |attempt| {
+                if reject_replay && attempt > 1 {
+                    JoinOutcome::Reject(4101)
+                } else {
+                    JoinOutcome::Accept
+                }
+            }),
+            None,
+        )
+        .await;
+        let url = server.url.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (leave_tx, leave_rx) = oneshot::channel();
+        let (left_tx, left_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let auth = DefaultAuthProvider::new("sync-rejoin".into(), "sync-office".into());
+            let mut agent = smcp_agent::SyncSmcpAgent::new(auth, default_config()).unwrap();
+            agent.connect(&url).unwrap();
+            agent.join_office("sync-rejoin").unwrap();
+            assert_eq!(agent.confirmed_office_id().as_deref(), Some("sync-office"));
+            ready_tx.send(()).unwrap();
+            // No active block_on: background recovery must still run on the owned runtime.
+            leave_rx.blocking_recv().unwrap();
+            agent.leave_office().unwrap();
+            assert_eq!(agent.office_membership(), OfficeMembershipState::Connected);
+            left_tx.send(()).unwrap();
+            finish_rx.blocking_recv().unwrap();
+        });
+        timeout(Duration::from_secs(10), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        server.next_auth().await;
+        server.next_join().await;
+        assert_eq!(server.next_room_event().await, "join");
+        server.force_network_disconnect();
+        server.next_auth().await;
+        let replay = server.next_join().await;
+        assert_eq!(replay["office_id"], "sync-office");
+        assert_eq!(replay["name"], "sync-rejoin");
+        assert_eq!(server.next_room_event().await, "join");
+        leave_tx.send(()).unwrap();
+        timeout(Duration::from_secs(10), left_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.next_room_event().await, "leave");
+        server.assert_no_join_for(Duration::from_secs(1)).await;
+        finish_tx.send(()).unwrap();
+        timeout(Duration::from_secs(10), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        server.shutdown();
+    }
+}

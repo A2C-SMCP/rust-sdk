@@ -132,6 +132,18 @@ pub enum ComputerError {
         details: Option<serde_json::Value>,
     },
 
+    /// The requested name differs from the immutable connection identity.
+    #[error(
+        "Connection identity is immutable: this connection declares `{current}`, not `{requested}` \
+         — create a new connection to change the name"
+    )]
+    IdentityMismatch {
+        /// 本连接身份（建立该 Socket.IO 连接时声明的名字）。
+        current: String,
+        /// 本次请求要声明的名字。
+        requested: String,
+    },
+
     #[error("Socket.IO error: {0}")]
     /// Socket.IO错误 / Socket.IO error
     SocketIoError(String),
@@ -230,6 +242,8 @@ impl ComputerError {
             ComputerError::ProtocolError(_) => 500, // INTERNAL_ERROR
             // 对端结构化拒绝：码空间就是协议码本身（4101/4105/4106…），原样透出以便按码分流。
             ComputerError::ProtocolRejection { code, .. } => *code as i32,
+            // 本地身份不变量（#224）：与对端对同一违约的裁决同码，消费方分流口径不变。
+            ComputerError::IdentityMismatch { .. } => 403, // FORBIDDEN
 
             // 状态错误 / State errors
             ComputerError::InvalidState(_) => 400, // BAD_REQUEST

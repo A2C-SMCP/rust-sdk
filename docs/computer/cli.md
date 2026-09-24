@@ -181,6 +181,18 @@ a2c> socket connect http://localhost:3000
 a2c> socket join <office_id> <computer_name>
 ```
 
+`computer_name` 是实际入房身份。例如 `socket join office-a alice` 成功后，房内名字就是
+`alice`。同名重复加入幂等，同名换房由服务端处理；与当前连接名字不同则自动退旧房、断开、
+以新名重连并加入目标房。重连复用最近一次成功连接的 URL、namespace、auth 和 headers，
+包括交互式 `socket connect <url>` 覆盖的地址。
+
+只有收到成功 ACK 才显示“已加入房间”。退房失败会告警并尝试断开；断开失败即停止改名。
+重连失败会恢复原名字，此时需重新 `socket connect`；重连成功但入房被拒则保留新连接和新名字，
+可换房重试（再次换名仍会重新连接）。ACK 超时表示入房结果未确认，不能据此断言服务端没有入房。
+
+库集成若自行构造 `CommandHandler`，改名时必须独占 Computer 的命名句柄：仍持有
+`Computer::clone()` 的调用方会在退房前收到错误，释放克隆后可重试。普通 REPL 不受此限制。
+
 离开房间：
 
 ```text
