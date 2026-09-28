@@ -1269,6 +1269,26 @@ async fn sync_facade_replays_and_leave_cancels_recovery() {
             ready_tx.send(()).unwrap();
             // No active block_on: background recovery must still run on the owned runtime.
             leave_rx.blocking_recv().unwrap();
+            if !reject_replay {
+                // The server has observed the replay request, but its ACK may still
+                // be in flight. Verify the synchronous facade commits recovery
+                // before leave can erase the evidence of a missing state update.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while agent.confirmed_office_id().as_deref() != Some("sync-office") {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "successful replay must restore the synchronous facade's confirmed office"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(agent.confirmed_office_id().as_deref(), Some("sync-office"));
+                assert_eq!(
+                    agent.office_membership(),
+                    OfficeMembershipState::JoinedOffice {
+                        office_id: "sync-office".into(),
+                    }
+                );
+            }
             agent.leave_office().unwrap();
             assert_eq!(agent.office_membership(), OfficeMembershipState::Connected);
             left_tx.send(()).unwrap();
