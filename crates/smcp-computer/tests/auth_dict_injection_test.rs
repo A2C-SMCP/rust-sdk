@@ -1444,10 +1444,12 @@ async fn replacement_retires_old_client_already_inside_reconnect_backoff() {
         .expect("join replacement client");
     let _ = server.next_join().await;
 
-    // 0.8.1's already-entered retry loop will make one late CONNECT despite Manual. The retiring
-    // callback closes it inline and the server converges back to the replacement only.
-    let _ = server.next_auth().await;
+    // Teardown cancels the old reconnect owner. An attempt that completed before
+    // replacement may already have queued auth, but a late CONNECT is not required.
+    // Assert the lifecycle contract rather than depending on the old transport bug.
     server.wait_for_active_connections(1).await;
+    while server.auth_rx.try_recv().is_ok() {}
+    server.assert_no_additional_auth_after_convergence().await;
     assert_eq!(computer.lifecycle_state(), LifecycleState::JoinedOffice);
 
     computer.shutdown().await.expect("shutdown computer");

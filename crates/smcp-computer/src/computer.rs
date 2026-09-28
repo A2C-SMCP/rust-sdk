@@ -107,7 +107,7 @@ type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> b
 /// Process-unique tokens fence stale Socket.IO clients from publishing Computer lifecycle changes.
 static NEXT_SOCKETIO_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Private dependency boundary for the Socket.IO slot installation transaction.
+/// Private dependency boundary for Socket.IO slot lifecycle operations.
 ///
 /// Keeping transport teardown and lifecycle ownership behind one interface makes the failure
 /// invariants deterministic to test without weakening the public client API or adding production
@@ -133,7 +133,9 @@ trait SocketIoInstallClient: Send + Sync {
 
     fn deactivate_runtime_lifecycle(&self);
 
-    async fn disconnect_for_install(&self) -> ComputerResult<()>;
+    /// Completion is terminal even on a wire-send error; cancellation may leave
+    /// the caller's slot populated until another teardown attempt completes.
+    async fn disconnect_transport(&self) -> ComputerResult<()>;
 }
 
 #[async_trait]
@@ -167,9 +169,25 @@ impl SocketIoInstallClient for SmcpComputerClient {
         self.deactivate_runtime_lifecycle();
     }
 
-    async fn disconnect_for_install(&self) -> ComputerResult<()> {
+    async fn disconnect_transport(&self) -> ComputerResult<()> {
         self.disconnect().await
     }
+}
+
+/// Retire a slot while its write lock and the Computer lifecycle gate are held.
+/// A completed disconnect has stopped the transport even if its CLOSE frame failed.
+async fn retire_socketio_slot<C: SocketIoInstallClient>(
+    slot: &mut Option<Arc<C>>,
+) -> ComputerResult<()> {
+    let result = if let Some(client) = slot.as_ref() {
+        let result = client.disconnect_transport().await;
+        client.deactivate_runtime_lifecycle();
+        result
+    } else {
+        Ok(())
+    };
+    *slot = None;
+    result
 }
 
 /// Install one already-connected client while the Computer Socket.IO lifecycle gate is held.
@@ -216,7 +234,7 @@ where
     // Claim before cleanup so a shut-down Computer cannot disconnect a candidate currently owned
     // by another Computer. An unowned candidate is still retired before the rejection returns.
     if status.state() == LifecycleState::Shutdown {
-        let cleanup = client.disconnect_for_install().await;
+        let cleanup = client.disconnect_transport().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         cleanup?;
         return Err(ComputerError::InvalidState(
@@ -225,28 +243,21 @@ where
     }
 
     // A tf-rust-socketio reader owns an internal Client clone, so dropping the old public Arc does
-    // not close it. Retire it before publishing the replacement; if 0.8.1 is already in reconnect
-    // backoff, the retiring event gate closes its next namespace before any app handler can run.
-    if let Some(previous) = socketio_ref.as_ref() {
-        if let Err(error) = previous.disconnect_for_install().await {
-            if let Err(cleanup_error) = client.disconnect_for_install().await {
-                warn!(
-                    error = %cleanup_error,
-                    "replacement Socket.IO client cleanup failed after old teardown error"
-                );
-            }
-            client.release_runtime_lifecycle_claim(lifecycle_token);
-            return Err(error);
+    // not close it. Teardown stops its reconnect owner before publishing a replacement.
+    // Even a failed CLOSE send is terminal: never retain a retired Arc as the current slot.
+    if let Err(error) = retire_socketio_slot(&mut socketio_ref).await {
+        if let Err(cleanup_error) = client.disconnect_transport().await {
+            warn!(
+                error = %cleanup_error,
+                "replacement Socket.IO client cleanup failed after old teardown error"
+            );
         }
-        previous.deactivate_runtime_lifecycle();
-        // The old transport is now permanently retired. Remove it before candidate activation so
-        // a concurrent direct disconnect that invalidates the candidate cannot leave a dead old
-        // Arc masquerading as the current slot value.
-        socketio_ref.take();
+        client.release_runtime_lifecycle_claim(lifecycle_token);
+        return Err(error);
     }
 
     if !client.activate_runtime_lifecycle(lifecycle_token) {
-        let _ = client.disconnect_for_install().await;
+        let _ = client.disconnect_transport().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         return Err(ComputerError::RuntimeError(
             "Socket.IO lifecycle ownership was lost during installation".to_string(),
@@ -4705,19 +4716,13 @@ impl<S: Session> Computer<S> {
     /// 取写锁；若槽内有 client，先调底层 transport disconnect（发 Socket.IO DISCONNECT 包并关 transport；
     /// 持写锁跨 await，与 `join_office`/`leave_office` 持读锁跨 await 同构——`tf-rust-socketio` 的 `Client`
     /// 背后 reader 后台任务持克隆，仅 Drop 用户句柄**不会**关 transport，必须显式 `disconnect()`），
-    /// 成功后再置 `None`。幂等：槽已空 → no-op。
+    /// 完成后置 `None`，包括关闭帧发送失败。幂等：槽已空 → no-op。
     ///
-    /// 失败上抛 Err 且**不**清槽，槽内 client 保留可重试。membership/lifecycle 会在底层 await 前失效，
-    /// 这是 disconnect Future 的取消安全边界。若底层 0.8.1 已进入 reconnect backoff，`Ok` 表示该
-    /// client 已逻辑退役：业务 handler 已同步闸断，晚到 namespace 会在 Connect callback 内立即关闭。
+    /// 发送失败仍上抛 Err，但底层已终止 reader/重连任务，不能把已退役 client 留作当前连接。
+    /// membership/lifecycle 在底层 await 前失效；若调用方在 await 期间取消，槽仍保留供重试清理。
     async fn close_socketio_transport(&self) -> ComputerResult<()> {
         let mut socketio_ref = self.socketio_client.write().await;
-        if let Some(client) = socketio_ref.as_ref() {
-            client.disconnect().await?;
-            client.deactivate_runtime_lifecycle();
-        }
-        *socketio_ref = None;
-        Ok(())
+        retire_socketio_slot(&mut socketio_ref).await
     }
 
     /// 断开Socket.IO连接 / Disconnect Socket.IO
@@ -5288,7 +5293,7 @@ mod tests {
             self.deactivated.store(true, Ordering::Release);
         }
 
-        async fn disconnect_for_install(&self) -> ComputerResult<()> {
+        async fn disconnect_transport(&self) -> ComputerResult<()> {
             self.disconnect_calls.fetch_add(1, Ordering::AcqRel);
             if self.disconnect_fails {
                 Err(ComputerError::RuntimeError(
@@ -5325,7 +5330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socketio_install_teardown_failure_retains_previous_and_releases_candidate() {
+    async fn socketio_install_teardown_failure_clears_retired_slot_and_releases_candidate() {
         let previous = Arc::new(FakeSocketIoInstallClient {
             disconnect_fails: true,
             ..FakeSocketIoInstallClient::new(true)
@@ -5342,12 +5347,8 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(slot
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &previous)));
-        assert!(!previous.deactivated.load(Ordering::Acquire));
+        assert!(slot.read().await.is_none());
+        assert!(previous.deactivated.load(Ordering::Acquire));
         assert_eq!(candidate.disconnect_calls.load(Ordering::Acquire), 1);
         assert!(candidate.released.load(Ordering::Acquire));
     }

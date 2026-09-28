@@ -23,7 +23,7 @@
 * 错误码接线，这边钉**恢复路径的状态机**。
 */
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,6 +84,8 @@ struct RejoinCaptureServer {
     /// 房间事件到达顺序（`"join"` / `"leave"`）——用于断言并发 join/leave 与服务端的全序一致。
     room_events_rx: mpsc::UnboundedReceiver<&'static str>,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    reject_connections: Arc<AtomicBool>,
+    rejected_connection: Arc<tokio::sync::Notify>,
     backend_shutdown_tx: oneshot::Sender<()>,
     proxy_shutdown_tx: oneshot::Sender<()>,
 }
@@ -279,6 +281,8 @@ async fn start_capture_server(
         calls_rx,
         room_events_rx,
         connection_tasks: proxy.connection_tasks,
+        reject_connections: proxy.reject_connections,
+        rejected_connection: proxy.rejected_connection,
         backend_shutdown_tx,
         proxy_shutdown_tx: proxy.shutdown_tx,
     }
@@ -286,6 +290,8 @@ async fn start_capture_server(
 
 struct TcpProxy {
     url: String,
+    reject_connections: Arc<AtomicBool>,
+    rejected_connection: Arc<tokio::sync::Notify>,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     active_connections: Arc<AtomicUsize>,
     connection_closed: Arc<tokio::sync::Notify>,
@@ -311,12 +317,21 @@ async fn start_tcp_proxy(backend_addr: std::net::SocketAddr) -> TcpProxy {
     let active = Arc::clone(&active_connections);
     let connection_closed = Arc::new(tokio::sync::Notify::new());
     let closed = Arc::clone(&connection_closed);
+    let reject_connections = Arc::new(AtomicBool::new(false));
+    let reject = Arc::clone(&reject_connections);
+    let rejected_connection = Arc::new(tokio::sync::Notify::new());
+    let rejected = Arc::clone(&rejected_connection);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     if let Ok((mut downstream, _)) = accepted {
+                        if reject.load(Ordering::SeqCst) {
+                            drop(downstream);
+                            rejected.notify_one();
+                            continue;
+                        }
                         active.fetch_add(1, Ordering::SeqCst);
                         let connection = ActiveConnection(Arc::clone(&active), Arc::clone(&closed));
                         let task = tokio::spawn(async move {
@@ -334,6 +349,8 @@ async fn start_tcp_proxy(backend_addr: std::net::SocketAddr) -> TcpProxy {
     });
     TcpProxy {
         url: format!("http://{addr}"),
+        reject_connections,
+        rejected_connection,
         connection_tasks,
         active_connections,
         connection_closed,
@@ -1284,4 +1301,47 @@ async fn sync_facade_replays_and_leave_cancels_recovery() {
             .unwrap();
         server.shutdown();
     }
+}
+
+/// Replacing an offline connection must stop its reconnect owner, including an
+/// already-entered retry loop. Restoring the old endpoint must not resurrect it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_offline_connection_does_not_resurrect_retired_transport() {
+    let mut old = start_rejoin_capture_server(policy(|_| JoinOutcome::Accept), None).await;
+    let mut new = start_rejoin_capture_server(policy(|_| JoinOutcome::Accept), None).await;
+    let mut agent = agent_for("agent-retirement", "office-retirement", default_config());
+    agent.connect(&old.url).await.unwrap();
+    old.next_auth().await;
+    agent.join_office("agent-retirement").await.unwrap();
+    old.next_join().await;
+
+    old.reject_connections.store(true, Ordering::SeqCst);
+    old.force_network_disconnect();
+    timeout(Duration::from_secs(5), old.rejected_connection.notified())
+        .await
+        .expect("old client must actually attempt to reconnect while offline");
+    agent.connect(&new.url).await.unwrap();
+    new.next_auth().await;
+    new.next_join().await;
+    wait_until(
+        || agent.confirmed_office_id().is_some(),
+        "replacement membership",
+    )
+    .await;
+    old.reject_connections.store(false, Ordering::SeqCst);
+    // Negative observation window exceeds the dependency's 5s maximum backoff
+    // plus its jitter; no polling is used to establish the broken behavior.
+    assert!(
+        timeout(Duration::from_secs(8), old.auth_rx.recv())
+            .await
+            .is_err(),
+        "retired transport reconnected to the old endpoint"
+    );
+    assert_eq!(
+        agent.confirmed_office_id().as_deref(),
+        Some("office-retirement")
+    );
+    agent.leave_office().await.unwrap();
+    old.shutdown();
+    new.shutdown();
 }
