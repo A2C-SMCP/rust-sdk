@@ -537,14 +537,14 @@ impl SocketIoTransport {
                     event, Payload::from(vec![data]), Duration::from_secs(timeout_secs), callback,
                 ).await?;
                 rx.await.map_err(|_| SmcpAgentError::Timeout)
-            } => response?,
+            } => response,
         };
         // ACK and lifecycle callbacks run concurrently. Never publish an old-session ACK
         // merely because its receiver became ready before the close callback ran.
         if state.borrow().invalidates(epoch) || self.client.session_epoch() != epoch {
             return Err(lost());
         }
-        match response {
+        match response? {
             Payload::Text(values, _) => extract_ack_value(values),
             #[allow(deprecated)]
             Payload::String(value, _) => serde_json::from_str(&value)

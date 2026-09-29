@@ -452,17 +452,22 @@ impl OfficeMembership {
 pub(crate) enum RejoinVerdict {
     /// 瞬态冲突（`4101` / `4105`）：服务端可能尚未回收旧会话，可在**预算内**退避重试。
     TransientConflict,
-    /// 永久失败：其它协议码、未获裁决（形状不认识）或传输层错误——重试不改变结果。
+    /// The bound call's namespace was invalidated. Close/Connect owns the next state;
+    /// this attempt must neither retry nor erase the intent awaiting that lifecycle event.
+    Interrupted,
+    /// 永久失败：其它协议码、未获裁决（形状不认识）或普通发送错误。
     Permanent,
 }
 
 /// 判定单次回房失败是否值得重试。
 ///
-/// 只有 [`TRANSIENT_ROOM_CONFLICT_CODES`] 可重试；其余一律永久失败——包括**未获裁决**
-/// （`SmcpProtocolError::indeterminate`，`code = -1`）与传输层错误。「宁严勿宽」：把不确定读成
-/// 「可重试」会把一次真拒绝放大成整段预算的无效重放，而读成「永久」最多让用户手工重入一次。
+/// Only [`TRANSIENT_ROOM_CONFLICT_CODES`] permit retry in the same session. A bound
+/// replay call's Connection error denotes session invalidation, not a server rejection:
+/// leave intent handling to the reason-bearing lifecycle event. Unknown ACKs, timeouts,
+/// and ordinary send failures remain permanent failures for this attempt.
 pub(crate) fn classify_rejoin_error(error: &SmcpAgentError) -> RejoinVerdict {
     match error {
+        SmcpAgentError::Connection(_) => RejoinVerdict::Interrupted,
         SmcpAgentError::Protocol(protocol)
             if TRANSIENT_ROOM_CONFLICT_CODES.contains(&protocol.code) =>
         {
@@ -814,7 +819,7 @@ mod tests {
     }
 
     /// 拒绝码分类：仅 `4101` / `4105` 可重试；`4106` / `400` / `403` / 未知码 / 未获裁决 /
-    /// 传输层错误一律永久失败。
+    /// 超时仍判失败；会话失效不重试也不清意图，交给生命周期事件处理。
     #[test]
     fn only_transient_room_conflicts_are_retryable() {
         for code in TRANSIENT_ROOM_CONFLICT_CODES {
@@ -831,14 +836,15 @@ mod tests {
                 "code {code} 重试不改变结果，必须判定为永久失败"
             );
         }
-        // 传输层错误（超时 / 断连）同样不重试：调用方须如实报错，由下一次 Connect 钩子接管。
+        // Neither timeout nor session invalidation retries here, but only lifecycle
+        // invalidation preserves intent for the next Connect callback.
         assert_eq!(
             classify_rejoin_error(&SmcpAgentError::Timeout),
             RejoinVerdict::Permanent
         );
         assert_eq!(
             classify_rejoin_error(&SmcpAgentError::connection("lost")),
-            RejoinVerdict::Permanent
+            RejoinVerdict::Interrupted
         );
     }
 

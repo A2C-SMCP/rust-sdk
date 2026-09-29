@@ -1486,12 +1486,21 @@ async fn natural_disconnect_cancels_calls_without_membership_subscription() {
             .unwrap()
             .unwrap_err();
         assert!(matches!(error, SmcpAgentError::Connection(_)), "{error:?}");
-        Arc::try_unwrap(transport)
-            .ok()
-            .unwrap()
-            .disconnect()
-            .await
-            .unwrap();
+        // The measured call must fail with Connection above. Cleanup after a forced
+        // TCP break may additionally report a failed CLOSE write; retirement still runs.
+        let cleanup = timeout(
+            Duration::from_secs(3),
+            Arc::try_unwrap(transport).ok().unwrap().disconnect(),
+        )
+        .await
+        .expect("transport retirement must finish");
+        match cleanup {
+            Ok(()) => {}
+            Err(SmcpAgentError::Network(error)) => {
+                eprintln!("CLOSE write after forced disconnect: {error}")
+            }
+            Err(error) => panic!("unexpected cleanup failure: {error}"),
+        }
         server.shutdown();
     }
 }
