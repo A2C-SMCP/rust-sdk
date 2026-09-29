@@ -166,6 +166,7 @@ struct ReconnectCaptureServer {
     auth_rx: mpsc::UnboundedReceiver<Value>,
     join_rx: mpsc::UnboundedReceiver<Value>,
     join_ack_rx: mpsc::UnboundedReceiver<usize>,
+    update_rx: mpsc::UnboundedReceiver<(String, Value)>,
     active_connections: Arc<AtomicUsize>,
     namespace_socket: Arc<Mutex<Option<SocketRef>>>,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -274,9 +275,18 @@ async fn start_reconnect_capture_server(
     reject_join_attempt: Option<usize>,
     delayed_join_attempt: Option<usize>,
 ) -> ReconnectCaptureServer {
+    start_reconnect_capture_server_with_gate(reject_join_attempt, delayed_join_attempt, None).await
+}
+
+async fn start_reconnect_capture_server_with_gate(
+    reject_join_attempt: Option<usize>,
+    delayed_join_attempt: Option<usize>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+) -> ReconnectCaptureServer {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
+    let (update_tx, update_rx) = mpsc::unbounded_channel();
     let (join_tx, join_rx) = mpsc::unbounded_channel();
     let (join_ack_tx, join_ack_rx) = mpsc::unbounded_channel();
     let join_attempts = Arc::new(AtomicUsize::new(0));
@@ -290,12 +300,25 @@ async fn start_reconnect_capture_server(
         "/smcp",
         move |socket: SocketRef, TryData(auth): TryData<Value>| {
             let auth_tx = auth_tx.clone();
+            let update_tx = update_tx.clone();
+            let gate = gate.clone();
             let join_tx = join_tx.clone();
             let join_ack_tx = join_ack_tx.clone();
             let join_attempts = Arc::clone(&join_attempts);
             let active_connections = Arc::clone(&namespace_active_connections);
             let namespace_socket = Arc::clone(&connected_namespace_socket);
             async move {
+                for event in [
+                    smcp::events::SERVER_UPDATE_CONFIG,
+                    smcp::events::SERVER_UPDATE_TOOL_LIST,
+                    smcp::events::SERVER_UPDATE_SKILLS,
+                    smcp::events::SERVER_UPDATE_DESKTOP,
+                ] {
+                    let update_tx = update_tx.clone();
+                    socket.on(event, move |Data::<Value>(value)| {
+                        let _ = update_tx.send((event.to_string(), value));
+                    });
+                }
                 active_connections.fetch_add(1, Ordering::SeqCst);
                 *namespace_socket.lock().unwrap() = Some(socket.clone());
                 socket.on_disconnect({
@@ -314,13 +337,18 @@ async fn start_reconnect_capture_server(
                     "server:join_office",
                     move |_socket: SocketRef, Data::<Value>(data), ack: AckSender| {
                         let join_tx = join_tx.clone();
+                        let gate = gate.clone();
                         let join_ack_tx = join_ack_tx.clone();
                         let join_attempts = Arc::clone(&join_attempts);
                         async move {
                             let attempt = join_attempts.fetch_add(1, Ordering::SeqCst) + 1;
                             let _ = join_tx.send(data);
                             if delayed_join_attempt == Some(attempt) {
-                                sleep(Duration::from_millis(750)).await;
+                                if let Some(gate) = gate {
+                                    gate.notified().await;
+                                } else {
+                                    sleep(Duration::from_millis(750)).await;
+                                }
                             }
                             // v0.5.0 房间 ack 契约：成功 = **空 ack**（零参 ACK `[]`），失败 = flat
                             // ErrorPayload（顶层 `code`）。旧 `(success, message)` 元组形态已废除——
@@ -400,6 +428,7 @@ async fn start_reconnect_capture_server(
         auth_rx,
         join_rx,
         join_ack_rx,
+        update_rx,
         active_connections,
         namespace_socket,
         connection_tasks,
@@ -1444,10 +1473,12 @@ async fn replacement_retires_old_client_already_inside_reconnect_backoff() {
         .expect("join replacement client");
     let _ = server.next_join().await;
 
-    // 0.8.1's already-entered retry loop will make one late CONNECT despite Manual. The retiring
-    // callback closes it inline and the server converges back to the replacement only.
-    let _ = server.next_auth().await;
+    // Teardown cancels the old reconnect owner. An attempt that completed before
+    // replacement may already have queued auth, but a late CONNECT is not required.
+    // Assert the lifecycle contract rather than depending on the old transport bug.
     server.wait_for_active_connections(1).await;
+    while server.auth_rx.try_recv().is_ok() {}
+    server.assert_no_additional_auth_after_convergence().await;
     assert_eq!(computer.lifecycle_state(), LifecycleState::JoinedOffice);
 
     computer.shutdown().await.expect("shutdown computer");
@@ -1467,4 +1498,178 @@ fn connect_options_debug_redacts_auth_material() {
     assert!(rendered.contains("<provider>"));
     assert!(rendered.contains("<redacted>"));
     assert!(!rendered.contains("must-not-leak"));
+}
+
+/// #230: a real namespace handshake/ACK window must not lose any of the four dirty event types.
+#[tokio::test]
+async fn pending_updates_coalesce_until_join_confirmation_and_clear_on_leave() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut server =
+        start_reconnect_capture_server_with_gate(None, Some(1), Some(gate.clone())).await;
+    let client = Arc::new(
+        SmcpComputerClientBuilder::new(&server.url, empty_manager(), "dirty", empty_inputs())
+            .auth_payload(json!({"token":"dirty"}))
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let joining = {
+        let client = client.clone();
+        tokio::spawn(async move { client.join_office("office-dirty").await })
+    };
+    server.next_join().await;
+    for _ in 0..3 {
+        client.emit_update_config().await.unwrap();
+        client.emit_update_tool_list().await.unwrap();
+        client.emit_update_skills().await.unwrap();
+        client.emit_update_desktop().await.unwrap();
+    }
+    assert!(
+        server.update_rx.try_recv().is_err(),
+        "unconfirmed membership must not emit"
+    );
+    gate.notify_one();
+    joining.await.unwrap().unwrap();
+    let mut events = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let (event, payload) = timeout(Duration::from_secs(3), server.update_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload["computer"], "dirty");
+        assert!(events.insert(event), "updates must coalesce");
+    }
+    assert!(timeout(Duration::from_millis(100), server.update_rx.recv())
+        .await
+        .is_err());
+    client.leave_office("office-dirty").await.unwrap();
+    client.emit_update_config().await.unwrap();
+    client.join_office("office-new").await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), server.update_rx.recv())
+            .await
+            .is_err(),
+        "old intent leaked into new office"
+    );
+    client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pending_updates_flush_after_real_transport_rejoin() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut server =
+        start_reconnect_capture_server_with_gate(None, Some(2), Some(gate.clone())).await;
+    let client = SmcpComputerClientBuilder::new(
+        &server.url,
+        empty_manager(),
+        "rejoin-dirty",
+        empty_inputs(),
+    )
+    .auth_payload(json!({"token":"dirty"}))
+    .connect()
+    .await
+    .unwrap();
+    client.join_office("office-dirty").await.unwrap();
+    server.next_join().await;
+    server.force_network_disconnect();
+    server.next_join().await;
+    client.emit_update_config().await.unwrap();
+    client.emit_update_tool_list().await.unwrap();
+    client.emit_update_skills().await.unwrap();
+    client.emit_update_desktop().await.unwrap();
+    assert!(server.update_rx.try_recv().is_err());
+    gate.notify_one();
+    let mut events = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let (event, _) = timeout(Duration::from_secs(3), server.update_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(events.insert(event));
+    }
+    assert_eq!(
+        client.get_office_id().await.as_deref(),
+        Some("office-dirty")
+    );
+    client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pending_updates_survive_rejected_same_office_join() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut server =
+        start_reconnect_capture_server_with_gate(Some(2), Some(2), Some(gate.clone())).await;
+    let client = Arc::new(
+        SmcpComputerClientBuilder::new(&server.url, empty_manager(), "same-office", empty_inputs())
+            .auth_payload(json!({"token":"dirty"}))
+            .connect()
+            .await
+            .unwrap(),
+    );
+    client.join_office("office-dirty").await.unwrap();
+    server.next_join().await;
+    let joining = {
+        let client = client.clone();
+        tokio::spawn(async move { client.join_office("office-dirty").await })
+    };
+    server.next_join().await;
+    client.emit_update_config().await.unwrap();
+    client.emit_update_skills().await.unwrap();
+    gate.notify_one();
+    assert!(joining.await.unwrap().is_err());
+    for _ in 0..2 {
+        timeout(Duration::from_secs(3), server.update_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(
+        client.get_office_id().await.as_deref(),
+        Some("office-dirty")
+    );
+    client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn cancelled_join_retains_updates_for_next_confirmation() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut server =
+        start_reconnect_capture_server_with_gate(None, Some(1), Some(gate.clone())).await;
+    let client = Arc::new(
+        SmcpComputerClientBuilder::new(
+            &server.url,
+            empty_manager(),
+            "cancel-dirty",
+            empty_inputs(),
+        )
+        .connect()
+        .await
+        .unwrap(),
+    );
+    let joining = {
+        let client = client.clone();
+        tokio::spawn(async move { client.join_office("office-dirty").await })
+    };
+    server.next_join().await;
+    client.emit_update_config().await.unwrap();
+    joining.abort();
+    assert!(joining.await.unwrap_err().is_cancelled());
+    assert_eq!(client.get_office_id().await, None);
+    client.emit_update_skills().await.unwrap();
+    assert!(server.update_rx.try_recv().is_err());
+    gate.notify_one();
+    client.join_office("office-dirty").await.unwrap();
+    let mut events = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let (event, _) = timeout(Duration::from_secs(3), server.update_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(events.insert(event));
+    }
+    client.disconnect().await.unwrap();
+    server.shutdown();
 }

@@ -45,8 +45,9 @@ tool_call_cancel、leave_office。
 }}
 ```
 
-Computer 启动后在其 REPL 内 `socket join proto-uat-office friday_hands`；CLI 当前注册名为
-`friday_hands`，Agent 必须设置 `SMCP_COMPUTER=friday_hands`。
+Computer 启动后在其 REPL 内 `socket join proto-uat-office friday_hands`；该命令声明身份
+`friday_hands`，Agent 必须设置 `SMCP_COMPUTER=friday_hands`。也可指定其他名字，Agent 路由名须同步修改；
+换名会自动重建连接。一键编排使用非默认名字 `uat_computer` 验证此行为。
 
 ## 测试用例
 

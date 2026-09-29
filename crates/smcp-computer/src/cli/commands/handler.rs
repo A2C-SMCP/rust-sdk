@@ -14,6 +14,7 @@ use crate::inventory::{McpOwnership, McpServerWithMetadata};
 use crate::mcp_clients::model::{
     BundleId, MCPServerActivationState, MCPServerConfig, MCPServerConnectionState, MCPServerInput,
 };
+use console::style;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,6 +27,15 @@ pub struct CliConfig {
     pub namespace: String,
     pub auth: Option<String>,
     pub headers: Option<String>,
+}
+
+/// Parameters of the last successful connection, including an interactive URL override.
+#[derive(Clone)]
+struct ConnectionArgs {
+    url: String,
+    namespace: String,
+    auth: Option<String>,
+    headers: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -45,6 +55,8 @@ pub enum CommandError {
 pub struct CommandHandler {
     pub computer: Computer<SilentSession>,
     pub cli_config: CliConfig,
+    /// 当前连接的建连参数；`None` = 本次会话从未连接成功（改名路径据此拒绝，绝不静默改身份）。
+    connection: Option<ConnectionArgs>,
 }
 
 impl CommandHandler {
@@ -52,6 +64,7 @@ impl CommandHandler {
         Self {
             computer,
             cli_config,
+            connection: None,
         }
     }
 
@@ -88,7 +101,7 @@ impl CommandHandler {
         println!("  desktop [size] [uri]      获取当前桌面窗口组合 / get current desktop");
         println!("  history [n]               显示最近的工具调用历史 / show recent history");
         println!("  socket connect [url]      连接 Socket.IO / connect to Socket.IO");
-        println!("  socket join <office> <name>  加入房间 / join office");
+        println!("  socket join <office> <name>  加入房间（改名会重建连接）/ join office (rename reconnects)");
         println!("  socket leave              离开房间 / leave office");
         println!("  notify update             触发配置更新通知 / emit config updated");
         println!("  render <json|@file>       测试渲染（占位符解析）");
@@ -587,6 +600,24 @@ impl CommandHandler {
         auth: &Option<String>,
         headers: &Option<String>,
     ) -> Result<(), CommandError> {
+        self.connect_with_args(url, namespace, auth, headers)
+            .await?;
+        println!("✅ 已连接到 Socket.IO: {url} / Connected to Socket.IO");
+        Ok(())
+    }
+
+    /// 建连（**无输出**）/ Connect without printing.
+    ///
+    /// 与 [`Self::connect_socketio`] 同一实现，只是不打印成功行——`socket join` 的改名路径要按自己的
+    /// 分步进度（`3/4 以新名 X 重连`）叙述，避免同一动作出现两行成功提示。成功即记录
+    /// [`ConnectionArgs`]，供后续改名重放。
+    async fn connect_with_args(
+        &mut self,
+        url: &str,
+        namespace: &str,
+        auth: &Option<String>,
+        headers: &Option<String>,
+    ) -> Result<(), CommandError> {
         let auth_payload = auth
             .clone()
             .map(|token| serde_json::json!({ "token": token }));
@@ -603,7 +634,12 @@ impl CommandHandler {
                 },
             )
             .await?;
-        println!("✅ 已连接到 Socket.IO: {} / Connected to Socket.IO", url);
+        self.connection = Some(ConnectionArgs {
+            url: url.to_string(),
+            namespace: namespace.to_string(),
+            auth: auth.clone(),
+            headers: headers.clone(),
+        });
         Ok(())
     }
 
@@ -834,15 +870,116 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// 加入 Socket.IO 房间 / Join Socket.IO room
+    /// Join as the requested name; changing identity requires a new connection.
     pub async fn join_socket_room(
-        &self,
+        &mut self,
         office_id: &str,
         computer_name: &str,
     ) -> Result<(), CommandError> {
-        self.computer.join_office(office_id, computer_name).await?;
-        println!("✅ 已加入房间 / Joined office: {}", office_id);
-        Ok(())
+        if !self.computer.has_socketio_client().await {
+            return Err(CommandError::InvalidCommand(
+                "未连接 Socket.IO，请先 `socket connect <url>` / Not connected to Socket.IO; run \
+                 `socket connect <url>` first"
+                    .to_string(),
+            ));
+        }
+
+        if self.computer.name() == computer_name {
+            self.computer.join_office(office_id, computer_name).await?;
+            println!("✅ 已加入房间 / Joined office: {office_id}");
+            return Ok(());
+        }
+
+        println!("改名将重新连接 / Reconnecting to change name");
+        self.rename_and_join(office_id, computer_name).await
+    }
+
+    /// Leave and retire the old connection before installing the new identity.
+    /// A failed connect restores the old name; a rejected join keeps the new connection.
+    async fn rename_and_join(
+        &mut self,
+        office_id: &str,
+        new_name: &str,
+    ) -> Result<(), CommandError> {
+        let Some(connection) = self.connection.clone() else {
+            // 绝不静默改 `computer.name`：那会让名字停在一个从未生效的值上，后续 join 全 403。
+            return Err(CommandError::InvalidCommand(format!(
+                "改名（{new_name}）需要重建连接，但本次会话未记录建连参数——请先 `socket connect <url>` \
+                 再改名 / renaming to `{new_name}` needs a new connection but no connection parameters \
+                 were recorded; run `socket connect <url>` first"
+            )));
+        };
+        self.computer.ensure_exclusive_name()?;
+        let old_name = self.computer.name().to_string();
+
+        match self.current_office_id().await {
+            Some(office) => {
+                println!("{}", style(format!("  1/4 离开旧房 {office}")).dim());
+                if let Err(error) = self.computer.leave_office().await {
+                    println!(
+                        "{}",
+                        style(format!(
+                            "  ⚠ 离开旧房失败，将尝试断开连接 / leave_office failed: {error}"
+                        ))
+                        .yellow()
+                    );
+                }
+            }
+            None => println!("{}", style("  1/4 未在房间，跳过离开").dim()),
+        }
+
+        println!("{}", style("  2/4 断开当前连接").dim());
+        self.computer.disconnect_socketio().await?;
+
+        println!("{}", style(format!("  3/4 以新名 {new_name} 重连")).dim());
+        self.computer.set_name(new_name).await?;
+        if let Err(error) = self
+            .connect_with_args(
+                &connection.url,
+                &connection.namespace,
+                &connection.auth,
+                &connection.headers,
+            )
+            .await
+        {
+            self.computer.set_name(old_name).await?;
+            return Err(error);
+        }
+
+        println!(
+            "{}",
+            style(format!("  4/4 加入 {office_id}（{new_name}）")).dim()
+        );
+        match self.computer.join_office(office_id, new_name).await {
+            Ok(()) => {
+                println!("✅ 已加入房间 / Joined office: {office_id}（{new_name}）");
+                Ok(())
+            }
+            Err(error) => {
+                println!(
+                    "{}",
+                    style(format!(
+                        "  ⚠ 连接已重建（身份 {new_name}），但入房未确认 / reconnected as {new_name} but \
+                         office membership was not confirmed"
+                    ))
+                    .yellow()
+                );
+                Err(error.into())
+            }
+        }
+    }
+
+    /// 本连接**已确认**在册的房号；未连接 / 未入房 ⇒ `None`。
+    ///
+    /// 用「服务端确认过的房号」而非客户端意图（`desired`）：重连窗口内意图会刻意保留，此时并没有真的
+    /// 在房里，据此退房会对一个并不在的房间发 `leave`。
+    async fn current_office_id(&self) -> Option<String> {
+        let socketio = self.computer.get_socketio_client();
+        let guard = socketio.read().await;
+        match guard.as_ref() {
+            Some(client) => client.get_office_id().await,
+            None => None,
+        }
     }
 
     /// 离开 Socket.IO 房间 / Leave Socket.IO room

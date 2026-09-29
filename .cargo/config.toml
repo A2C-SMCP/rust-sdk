@@ -61,3 +61,7 @@ incompatible-rust-versions = "fallback"
 # docs/local-dev-tests.md (linker acceleration section).
 
 
+# #229: CFBundle system-proxy discovery must not scan target/debug/deps.
+# A path (rather than `python3 relative/script.py`) resolves from the workspace for crate-local cwd.
+[target.'cfg(target_os = "macos")']
+runner = ".cargo/macos-runner.py"

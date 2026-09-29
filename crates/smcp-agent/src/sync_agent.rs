@@ -12,6 +12,7 @@ use crate::{
     auth::AuthProvider,
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
+    office::OfficeMembershipState,
     AsyncSmcpAgent,
 };
 use smcp::{
@@ -57,6 +58,20 @@ impl SyncSmcpAgent {
     /// 离开办公室
     pub fn leave_office(&self) -> Result<()> {
         self.runtime.block_on(self.async_agent.leave_office())
+    }
+
+    /// 当前 Office 成员关系（只读快照）。
+    ///
+    /// 语义同 [`AsyncSmcpAgent::office_membership`]：区分「已连接但不在房」与「服务端已确认在房」——
+    /// 自动回房失败后状态回退到前者，SDK 绝不静默假装仍在房（#219）。
+    pub fn office_membership(&self) -> OfficeMembershipState {
+        self.async_agent.office_membership()
+    }
+
+    /// 服务端**已确认**的房间号；不在房时为 `None`（语义同
+    /// [`AsyncSmcpAgent::confirmed_office_id`]）。
+    pub fn confirmed_office_id(&self) -> Option<String> {
+        self.async_agent.confirmed_office_id()
     }
 
     /// 获取指定Computer的工具列表

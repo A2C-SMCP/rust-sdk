@@ -164,13 +164,25 @@ pub async fn create_test_client(
     server_url: &str,
     namespace: &str,
 ) -> tf_rust_socketio::asynchronous::Client {
-    ClientBuilder::new(server_url)
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let signal = ready.clone();
+    let client = ClientBuilder::new(server_url)
+        .on(tf_rust_socketio::Event::Connect, move |_, _| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                signal.notify_one();
+            })
+        })
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
         .auth(serde_json::json!({"token": "test_secret"}))
         .connect()
         .await
-        .expect("Failed to connect client")
+        .expect("Failed to connect client");
+    tokio::time::timeout(Duration::from_secs(5), ready.notified())
+        .await
+        .expect("namespace connect timeout");
+    client
 }
 
 /// 创建带事件处理器的测试客户端
@@ -190,14 +202,26 @@ where
         + Send
         + Sync,
 {
-    ClientBuilder::new(server_url)
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let signal = ready.clone();
+    let client = ClientBuilder::new(server_url)
+        .on(tf_rust_socketio::Event::Connect, move |_, _| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                signal.notify_one();
+            })
+        })
         .transport_type(TransportType::Websocket)
         .namespace(namespace)
         .auth(serde_json::json!({"token": "test_secret"}))
         .on(event, handler)
         .connect()
         .await
-        .expect("Failed to connect client")
+        .expect("Failed to connect client");
+    tokio::time::timeout(Duration::from_secs(5), ready.notified())
+        .await
+        .expect("namespace connect timeout");
+    client
 }
 
 /// 创建原子布尔标记的处理器

@@ -294,7 +294,7 @@ async fn handle_command(
                 "join" => {
                     if parts.len() < 4 {
                         return Err(CommandError::InvalidCommand(
-                            "用法: socket join <office_id> <computer_name> / Usage: socket join <office_id> <computer_name>".to_string(),
+                            "用法: socket join <office_id> <computer_name>（改名会自动重建连接）/ Usage: socket join <office_id> <computer_name> (rename reconnects)".to_string(),
                         ));
                     }
                     handler.join_socket_room(parts[2], parts[3]).await?;

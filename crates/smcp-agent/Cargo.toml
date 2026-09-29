@@ -35,3 +35,14 @@ tf-rust-socketio.workspace = true
 smcp-server-core.workspace = true
 smcp-server-hyper.workspace = true
 tokio = { workspace = true }
+# #219：真设施「自动重连后回房」测试的 capture server —— 裸 socketioxide + hyper + TCP proxy，用
+# **可控的房间裁决语义**在真实 Socket.IO 栈与真实 TCP 中断下驱动自动重连、回房重放与退避重试。
+# capture-server harness for the real-facility office-rejoin tests.
+socketioxide.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true

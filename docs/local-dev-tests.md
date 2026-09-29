@@ -63,6 +63,39 @@
    `cargo-sweep sweep --maxsize 40GB <project>` 或不得已时 `cargo clean`（全量冷启动后：
    基线 ≤ 60 分钟）。
 
+### macOS：HTTP 连接超时也可能来自产物目录扫描（#229）
+
+2026-09-24 的 v0.5.0 验收中，`test_mcp_integration` 的 HTTP 连接超时用例和
+`window_enumeration_diagnostics` 两项用例在原目录连续失败。窗口测试的采样显示请求尚未发出：
+`reqwest::ClientBuilder::build` → 系统代理读取 → `SCDynamicStoreCreateWithOptions` →
+`CFBundleGetMainBundle` → `_CFIterateDirectory`。同步目录扫描阻塞测试的 Tokio 线程，
+外层异步 timeout 也无法及时得到调度。
+
+当时 `target/debug/deps` 有 982,596 个条目，仅枚举目录就耗时 24.46 秒。将**相同二进制**
+复制到空临时目录，保持工作目录、参数和环境不变后，窗口用例 2/2 通过（0.13 秒），
+HTTP 超时用例也在 30.54 秒按原有断言通过（客户端内部连接超时为 30 秒，45 秒是外层
+异步守卫，并非严格墙钟上限）。这是该本地环境的证据，不能据此把其他 HTTP
+超时一律归因为缓存，也不能靠放宽断言或禁用系统代理掩盖问题。
+
+仓库现在通过 `.cargo/config.toml` 的 macOS target runner 默认调用
+`.cargo/macos-runner.py`；`cargo test`、`cargo test-all` 与 `cargo test-ws`（nextest）
+均使用此入口，无需设置一次性环境变量。runner 需要 Python 3，并保留 cwd、环境、参数、
+退出码与终止信号，在退出后清理自己的临时目录。CI 的 macOS job 同时运行 runner 契约测试
+和上述真实 HTTP 回归；`dev-0.5.0` 的推送/PR 也触发测试。
+
+Cargo runner 同样作用于 `cargo run` 和基准可执行文件。正常 Rust doctest 由 rustdoc 执行，
+不承诺经过 target runner；直接运行二进制或集成测试自行启动的子程序也不经过它。
+现有项目通过 cwd/显式路径访问资源，环境中的动态库搜索路径原样保留；未来引入依赖
+可执行文件相邻资源或 `@executable_path` 动态库的程序时，须为此新增覆盖。
+SIGKILL 无法执行清理；其它正常退出和可处理终止信号都清理临时目录。
+
+此措施隔离系统代理初始化的目录扫描，不解决 rustc/链接器本身对巨大 target 目录的扫描。
+长期仍需维护 target 卫生。需要调试原始可执行路径时可显式覆盖 runner，例如
+`CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=env cargo test ...`（Intel 改用 X86_64）。
+
+配置行为参考 [Cargo runner](https://doc.rust-lang.org/cargo/reference/config.html#targettriplerunner)
+及 [nextest target runners](https://nexte.st/docs/features/target-runners/)。
+
 ## 并行注意
 
 smcp-server-core 的 Socket.IO 集成测试对固定端口有依赖（CI 侧就是
@@ -103,3 +136,24 @@ smcp-server-core 的 Socket.IO 集成测试对固定端口有依赖（CI 侧就�
   `--features agent,computer,server`，与 test-all 变体近似）。
 - 迭代中别让 IDE 的 rust-analyzer 与 cargo 同时打同一个 target/：RA 已隔离，
   命令行随意跑。
+
+## v0.5.0 工具观测与重连通知验收
+
+结构提交（启动/停止/配置更新）复用同一可用 MCP 会话的原始工具列表；alias、forbidden、
+工具 meta 仍按当前配置重算。公开 `refresh_tool_routes`/`refresh_tool_mapping` 强制重读所有
+上游。未发送 `tools/list_changed` 的静默变化，只在该 bundle 重读或强制刷新时检出，
+与 [Python SDK #222](https://github.com/A2C-SMCP/python-sdk/issues/222) 的通知时机对齐。
+失败 bundle 保留旧投影用于差异比较，读取失败不伪装成工具删除；新读取失败不会写入缓存。
+所有 bundle 均读取失败时仍返回错误；其它 bundle 有有效观测时可以提交其变化。
+
+Computer 在有入房意图但未确认成员关系时合并 config/tools/skills/desktop 更新；成功入房
+或自动回房后各补发一次。显式退房（包括发送失败）撤销意图及待发集合，换房不继承旧房
+事件。通知无 ACK，补发保证尝试发送，不声称对端确认送达。可运行真实设施回归：
+
+```sh
+cargo test -p smcp-server-core --test security_boundary_test -- --test-threads=1
+cargo test -p smcp-computer --test auth_dict_injection_test pending_updates -- --test-threads=1
+cargo test -p smcp-computer --test mcp_change_notifications -- --ignored --test-threads=1
+```
+
+最后一项需要 Node.js，含 6/20 个真实 MCP 子进程的 `tools/list` 计数及动态工具投影回归。

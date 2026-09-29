@@ -282,3 +282,56 @@ async fn tools_list_changed_bumps_runtime_only_when_projection_changes() {
 
     computer.shutdown().await.expect("shutdown");
 }
+
+/// #227: count actual JSON-RPC requests received by independent MCP subprocesses.
+#[tokio::test]
+#[ignore] // Requires Node.js; explicitly run in the feature acceptance suite.
+async fn batch_start_tool_observation_rpc_count_is_linear() {
+    for count in [6, 20] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut configs = Vec::new();
+        let mut logs = Vec::new();
+        for index in 0..count {
+            let log = directory.path().join(format!("server{index}.log"));
+            let mut config = stdio_config(&format!("server{index}"));
+            if let MCPServerConfig::Stdio(ref mut config) = config {
+                config.server_parameters.env.insert(
+                    "SMCP_TEST_TOOL_LIST_LOG".into(),
+                    log.to_string_lossy().into_owned(),
+                );
+            }
+            logs.push(log);
+            configs.push(config);
+        }
+        let manager = MCPServerManager::new();
+        manager.initialize(configs).await.unwrap();
+        let started = Instant::now();
+        manager.start_all().await.unwrap();
+        let count_calls = || {
+            logs.iter()
+                .map(|path| std::fs::read_to_string(path).unwrap().lines().count())
+                .sum::<usize>()
+        };
+        assert_eq!(
+            count_calls(),
+            count,
+            "each startup must read only its new upstream"
+        );
+        eprintln!(
+            "#227 {count} real MCP servers: {count} tools/list RPCs in {:?}",
+            started.elapsed()
+        );
+        manager.refresh_tool_routes().await.unwrap();
+        assert_eq!(
+            count_calls(),
+            count * 2,
+            "public force refresh must re-read every upstream"
+        );
+        manager.stop_all().await.unwrap();
+        assert_eq!(
+            count_calls(),
+            count * 2,
+            "stopping must not re-read remaining upstreams"
+        );
+    }
+}

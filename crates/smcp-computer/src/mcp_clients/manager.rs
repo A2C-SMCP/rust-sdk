@@ -74,6 +74,15 @@ pub(crate) struct ToolProjectionRefreshOutcome {
     pub(crate) projection_changed: bool,
 }
 
+/// Raw upstream observation; configuration projection is deliberately recomputed each refresh.
+#[derive(Clone)]
+struct CachedToolList {
+    client: Weak<dyn MCPClientProtocol>,
+    generation: u64,
+    session_epoch: u64,
+    tools: Vec<Tool>,
+}
+
 fn bump_active_client_generation(generations: &mut HashMap<BundleId, u64>, bundle_id: &BundleId) {
     let generation = generations.entry(bundle_id.clone()).or_default();
     *generation = generation.wrapping_add(1);
@@ -88,29 +97,30 @@ async fn withdraw_bundle_tool_routes(
     tool_routes: &RwLock<HashMap<ExposedToolName, ExposedToolRoute>>,
     disabled_tools: &RwLock<HashSet<ExposedToolName>>,
     tool_projection: &RwLock<HashMap<ExposedToolName, Value>>,
+    tool_owners: &RwLock<HashMap<ExposedToolName, BundleId>>,
     bundle_id: &BundleId,
 ) -> bool {
-    let routes_changed = {
-        let mut routes = tool_routes.write().await;
-        let before = routes.len();
-        routes.retain(|_, route| route.bundle_id != *bundle_id);
-        routes.len() != before
-    };
-    let disabled_changed = {
-        let exposed_prefix = format!("{}__", bundle_id.as_str());
-        let mut disabled = disabled_tools.write().await;
-        let before = disabled.len();
-        disabled.retain(|tool| !tool.starts_with(&exposed_prefix));
-        disabled.len() != before
-    };
-    let projection_changed = {
-        let exposed_prefix = format!("{}__", bundle_id.as_str());
-        let mut projection = tool_projection.write().await;
-        let before = projection.len();
-        projection.retain(|name, _| !name.starts_with(&exposed_prefix));
-        projection.len() != before
-    };
-    routes_changed || disabled_changed || projection_changed
+    let mut routes = tool_routes.write().await;
+    let mut disabled = disabled_tools.write().await;
+    let mut projection = tool_projection.write().await;
+    let mut owners = tool_owners.write().await;
+    let names: HashSet<_> = owners
+        .iter()
+        .filter(|(_, owner)| *owner == bundle_id)
+        .map(|(name, _)| name.clone())
+        .chain(
+            routes
+                .iter()
+                .filter(|(_, route)| route.bundle_id == *bundle_id)
+                .map(|(name, _)| name.clone()),
+        )
+        .collect();
+    let before = (routes.len(), disabled.len(), projection.len());
+    routes.retain(|_, route| route.bundle_id != *bundle_id);
+    disabled.retain(|name| !names.contains(name));
+    projection.retain(|name, _| !names.contains(name));
+    owners.retain(|_, owner| owner != bundle_id);
+    before != (routes.len(), disabled.len(), projection.len())
 }
 
 /// client factory 类型（#152 测试接缝）/ client factory type（test seam）。
@@ -174,10 +184,15 @@ pub struct MCPServerManager {
     /// obtains fresh definitions from each active MCP server. Keeping the complete serialized Tool
     /// catches schema/description/meta changes that route-name or count comparisons miss.
     tool_projection: Arc<RwLock<HashMap<ExposedToolName, Value>>>,
+    /// Explicit ownership for projection and disabled names; exposed names are not reversible IDs.
+    tool_owners: Arc<RwLock<HashMap<ExposedToolName, BundleId>>>,
     /// 禁用工具集合（键 = `exposed_tool_name`）/ Disabled tools set keyed by exposed_tool_name。
     disabled_tools: Arc<RwLock<HashSet<ExposedToolName>>>,
     /// Serialize full projection rebuilds; lifecycle revocation never takes this lock.
     tool_route_refresh_lock: Arc<Mutex<()>>,
+    tool_list_cache: Arc<Mutex<HashMap<BundleId, CachedToolList>>>,
+    // Synchronous state callbacks fence in-flight observations before returning to the transport.
+    tool_session_epochs: Arc<std::sync::Mutex<HashMap<BundleId, u64>>>,
     /// 自动重连标志 / Auto reconnect flag
     auto_reconnect: Arc<RwLock<bool>>,
     /// 自动连接标志 / Auto connect flag
@@ -269,8 +284,11 @@ impl MCPServerManager {
             connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
             tool_projection: Arc::new(RwLock::new(HashMap::new())),
+            tool_owners: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
             tool_route_refresh_lock: Arc::new(Mutex::new(())),
+            tool_list_cache: Arc::new(Mutex::new(HashMap::new())),
+            tool_session_epochs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             auto_reconnect: Arc::new(RwLock::new(true)),
             auto_connect: Arc::new(RwLock::new(false)),
             state_notifier: state_tx,
@@ -305,8 +323,11 @@ impl MCPServerManager {
             connection_states: Arc::new(RwLock::new(HashMap::new())),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
             tool_projection: Arc::new(RwLock::new(HashMap::new())),
+            tool_owners: Arc::new(RwLock::new(HashMap::new())),
             disabled_tools: Arc::new(RwLock::new(HashSet::new())),
             tool_route_refresh_lock: Arc::new(Mutex::new(())),
+            tool_list_cache: Arc::new(Mutex::new(HashMap::new())),
+            tool_session_epochs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             auto_reconnect: Arc::new(RwLock::new(reconnect_policy.enabled)),
             auto_connect: Arc::new(RwLock::new(false)),
             state_notifier: state_tx,
@@ -467,7 +488,7 @@ impl MCPServerManager {
         }
 
         // 刷新工具路由 / Refresh tool routes
-        self.refresh_tool_routes().await?;
+        self.refresh_structural_tool_routes().await?;
 
         // 更新状态 / Update state
         self.update_state(ManagerState::Initialized).await;
@@ -550,7 +571,7 @@ impl MCPServerManager {
         self.fire_projected_if_changed(&bundle_id).await;
 
         // 刷新工具路由 / Refresh tool routes
-        self.refresh_tool_routes().await?;
+        self.refresh_structural_tool_routes().await?;
 
         Ok(())
     }
@@ -572,7 +593,7 @@ impl MCPServerManager {
             .contains_key(bundle_id)
             || self.servers_config.read().await.contains_key(bundle_id);
         if !exists {
-            self.refresh_tool_routes().await?;
+            self.refresh_structural_tool_routes().await?;
             return Ok(false);
         }
 
@@ -598,7 +619,7 @@ impl MCPServerManager {
         self.server_declarations.write().await.remove(bundle_id);
         self.connection_states.write().await.remove(bundle_id);
         // 刷新工具路由 / Refresh tool routes
-        self.refresh_tool_routes().await?;
+        self.refresh_structural_tool_routes().await?;
 
         Ok(true)
     }
@@ -835,15 +856,20 @@ impl MCPServerManager {
             _ => self.make_client(config, notify),
         };
 
-        // #186：live 状态变化（进程自退 / 传输断连等）→ 统一投影发布。回调内**仅** spawn（不持锁、
-        // 不等锁），fire 在独立任务里读执行时刻投影；重复投影由 RuntimeStatus 去重吸收。
+        // #186：live 状态变化先在同步短临界区推进观测世代，隔离旧 tools/list；
+        // 投影发布仍 spawn 到独立任务，读取执行时刻投影，RuntimeStatus 去重吸收。
         // 回调只持**弱锚点集**（#106 Weak 断环先例的字段级形态）：manager → client → callback 的
         // 强引用环在回调侧断开，异常路径（未 shutdown）不再整图泄漏；spawn 任务 upgrade 失败
         // （manager 已 drop）即 no-op。
         {
             let owner = bundle_id.clone();
             let anchors = self.projection_anchors();
+            let epochs = Arc::downgrade(&self.tool_session_epochs);
             client.set_state_change_callback(Box::new(move |_from, _to| {
+                if let Some(epochs) = epochs.upgrade() {
+                    let mut epochs = epochs.lock().unwrap_or_else(|e| e.into_inner());
+                    bump_active_client_generation(&mut epochs, &owner);
+                }
                 let anchors = anchors.clone();
                 let owner = owner.clone();
                 tokio::spawn(async move {
@@ -898,7 +924,7 @@ impl MCPServerManager {
         self.fire_projected_if_changed(bundle_id).await;
 
         // 刷新工具路由 / Refresh tool routes
-        self.refresh_tool_routes().await?;
+        self.refresh_structural_tool_routes().await?;
 
         info!(
             "Client {} (bundle_id={}) started successfully",
@@ -965,7 +991,7 @@ impl MCPServerManager {
         }
 
         // 刷新工具路由（幂等，无论是否停到都保持路由一致）/ Refresh tool routes
-        self.refresh_tool_routes().await?;
+        self.refresh_structural_tool_routes().await?;
 
         Ok(was_active)
     }
@@ -1136,6 +1162,13 @@ impl MCPServerManager {
         self.connection_states.write().await.clear();
         self.tool_routes.write().await.clear();
         self.disabled_tools.write().await.clear();
+        self.tool_projection.write().await.clear();
+        self.tool_owners.write().await.clear();
+        // Revocation must not wait for an upstream RPC. A refresh already in flight
+        // validates the now-empty authority snapshot and evicts its obsolete weak entries.
+        if let Ok(mut cache) = self.tool_list_cache.try_lock() {
+            cache.clear();
+        }
         let oauth_clients = {
             let mut clients = self.oauth_clients.write().await;
             clients
@@ -1215,8 +1248,26 @@ impl MCPServerManager {
     async fn refresh_tool_routes_with_outcome(
         &self,
     ) -> Result<ToolProjectionRefreshOutcome, ComputerError> {
-        let _refresh_guard = self.tool_route_refresh_lock.lock().await;
+        self.refresh_tool_routes_observations(true).await
+    }
 
+    async fn refresh_structural_tool_routes(&self) -> Result<(), ComputerError> {
+        self.refresh_tool_routes_observations(false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn refresh_tool_routes_observations(
+        &self,
+        force: bool,
+    ) -> Result<ToolProjectionRefreshOutcome, ComputerError> {
+        let _refresh_guard = self.tool_route_refresh_lock.lock().await;
+        let mut cache = self.tool_list_cache.lock().await;
+        // Invalidate once per invocation, not per snapshot retry: successful observations from
+        // an unchanged session can be reused while another bundle is concurrently committed.
+        if force {
+            cache.clear();
+        }
         loop {
             let mut routes: HashMap<ExposedToolName, ExposedToolRoute> = HashMap::new();
             let mut projection: HashMap<ExposedToolName, Value> = HashMap::new();
@@ -1258,6 +1309,14 @@ impl MCPServerManager {
                 (snapshot_generations, snapshot_clients, entries)
             };
 
+            let snapshot_epochs = self
+                .tool_session_epochs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            cache.retain(|id, _| snapshot_clients.contains_key(id));
+            let mut failed = HashSet::new();
+            let mut first_error = None;
             for (bundle_id, client, config) in &entries {
                 let server_name = config.name().to_string();
 
@@ -1278,9 +1337,32 @@ impl MCPServerManager {
                     );
                 }
 
-                // 获取工具列表 / Get tool list
-                match client.list_tools().await {
+                let generation = snapshot_generations[bundle_id];
+                let session_epoch = snapshot_epochs.get(bundle_id).copied().unwrap_or_default();
+                let reusable = cache.get(bundle_id).filter(|entry| {
+                    client.state() == ClientState::Connected
+                        && Weak::ptr_eq(&entry.client, &StdArc::downgrade(client))
+                        && entry.generation == generation
+                        && entry.session_epoch == session_epoch
+                });
+                let observation = match reusable {
+                    Some(entry) => Ok(entry.tools.clone()),
+                    None => {
+                        cache.remove(bundle_id);
+                        client.list_tools().await
+                    }
+                };
+                match observation {
                     Ok(tools) => {
+                        cache.insert(
+                            bundle_id.clone(),
+                            CachedToolList {
+                                client: StdArc::downgrade(client),
+                                generation,
+                                session_epoch,
+                                tools: tools.clone(),
+                            },
+                        );
                         for tool in tools {
                             let original_tool_name = tool.name.to_string();
 
@@ -1338,13 +1420,12 @@ impl MCPServerManager {
                             "Error listing tools for {} (bundle_id={}): {}",
                             server_name, bundle_id, e
                         );
-                        // A failed invalidation refresh is not an empty tools/list response. Keep
-                        // the last committed routes/disabled/projection transaction intact so a
-                        // transient transport error cannot masquerade as a real tool removal or
-                        // publish a false capability revision.
-                        return Err(ComputerError::ConnectionError(format!(
-                            "failed to refresh tools for server '{server_name}' \
-                             (bundle_id={bundle_id}): {e}"
+                        // Carry this bundle's committed projection without interpreting a read
+                        // failure as a removal. Other healthy bundles can still make progress.
+                        failed.insert(bundle_id.clone());
+                        cache.remove(bundle_id);
+                        first_error.get_or_insert_with(|| ComputerError::ConnectionError(format!(
+                            "failed to refresh tools for server '{server_name}' (bundle_id={bundle_id}): {e}"
                         )));
                     }
                 }
@@ -1356,9 +1437,26 @@ impl MCPServerManager {
             let mut tool_routes = self.tool_routes.write().await;
             let mut disabled_tools = self.disabled_tools.write().await;
             let mut committed_projection = self.tool_projection.write().await;
+            let mut committed_owners = self.tool_owners.write().await;
             let active_clients = self.active_clients.read().await;
             let active_generations = self.active_client_generations.read().await;
-            let snapshot_is_current = active_clients.len() == snapshot_clients.len()
+            let configs = self.servers_config.read().await;
+            let epochs = self
+                .tool_session_epochs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let snapshot_is_current = entries
+                .iter()
+                .all(|(id, _, config)| configs.get(id) == Some(config))
+                && entries.len()
+                    == active_clients
+                        .keys()
+                        .filter(|id| configs.contains_key(*id))
+                        .count()
+                && snapshot_clients
+                    .keys()
+                    .all(|id| epochs.get(id) == snapshot_epochs.get(id))
+                && active_clients.len() == snapshot_clients.len()
                 && snapshot_clients.iter().all(|(bundle_id, snapshot)| {
                     active_clients
                         .get(bundle_id)
@@ -1373,22 +1471,79 @@ impl MCPServerManager {
                                 .unwrap_or_default()
                 });
             if !snapshot_is_current {
+                drop(epochs);
+                drop(configs);
                 drop(active_generations);
                 drop(active_clients);
+                drop(committed_owners);
                 drop(committed_projection);
                 drop(disabled_tools);
                 drop(tool_routes);
                 continue;
             }
-            let disabled: HashSet<ExposedToolName> = disabled.into_keys().collect();
-            let projection_changed = *committed_projection != projection;
+            let mut owners: HashMap<_, _> = routes
+                .iter()
+                .map(|(name, route)| (name.clone(), route.bundle_id.clone()))
+                .chain(
+                    disabled
+                        .iter()
+                        .map(|(name, owner)| (name.clone(), owner.clone())),
+                )
+                .collect();
+            let mut disabled: HashSet<ExposedToolName> = disabled.into_keys().collect();
+            // Compare only successfully observed bundles on both sides. Then carry failed
+            // bundles verbatim, including disabled names with no route entry.
+            let is_failed = |name: &String| {
+                committed_owners
+                    .get(name)
+                    .is_some_and(|owner| failed.contains(owner))
+            };
+            // HashMap iteration order is not meaningful.
+            let projection_changed = if failed.is_empty() {
+                *committed_projection != projection
+            } else {
+                let old: HashMap<_, _> = committed_projection
+                    .iter()
+                    .filter(|(n, _)| !is_failed(n))
+                    .collect();
+                let new: HashMap<_, _> = projection.iter().collect();
+                old != new
+            };
+            for (name, route) in tool_routes
+                .iter()
+                .filter(|(_, route)| failed.contains(&route.bundle_id))
+            {
+                routes.insert(name.clone(), route.clone());
+            }
+            disabled.extend(
+                disabled_tools
+                    .iter()
+                    .filter(|name| is_failed(name))
+                    .cloned(),
+            );
+            projection.extend(
+                committed_projection
+                    .iter()
+                    .filter(|(name, _)| is_failed(name))
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+            if failed.len() == entries.len() && !failed.is_empty() {
+                return Err(first_error.expect("failed observations have an error"));
+            }
 
             // Commit routes, disabled set, and the comparison snapshot from the same tools/list
             // generation. Readers of each table see either its old or new whole value; the
             // refresh mutex serializes competing full rebuilds.
             *tool_routes = routes;
             *disabled_tools = disabled;
+            owners.extend(
+                committed_owners
+                    .iter()
+                    .filter(|(_, owner)| failed.contains(*owner))
+                    .map(|(name, owner)| (name.clone(), owner.clone())),
+            );
             *committed_projection = projection;
+            *committed_owners = owners;
             drop(active_generations);
             drop(active_clients);
 
@@ -2784,6 +2939,7 @@ impl MCPServerManager {
         let lifecycle_locks = self.lifecycle_locks.clone();
         let connection_states = self.connection_states.clone();
         let tool_routes = self.tool_routes.clone();
+        let tool_owners = self.tool_owners.clone();
         let tool_projection = self.tool_projection.clone();
         let disabled_tools = self.disabled_tools.clone();
         // #186 health 重连状态变化也须走统一事件发布（manager.clone 为全 Arc 浅拷贝）。
@@ -2926,6 +3082,7 @@ impl MCPServerManager {
                                             &tool_routes,
                                             &disabled_tools,
                                             &tool_projection,
+                                            &tool_owners,
                                             &bundle_id,
                                         )
                                         .await;
@@ -3245,6 +3402,7 @@ impl MCPServerManager {
             &self.tool_routes,
             &self.disabled_tools,
             &self.tool_projection,
+            &self.tool_owners,
             bundle_id,
         )
         .await;
@@ -4035,12 +4193,17 @@ pub(crate) mod test_support {
     pub(crate) struct CountingToolsClient {
         pub(crate) tools: Vec<Tool>,
         pub(crate) calls: StdArc<std::sync::atomic::AtomicUsize>,
+        pub(crate) connected: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl MCPClientProtocol for CountingToolsClient {
         fn state(&self) -> ClientState {
-            ClientState::Connected
+            if self.connected.load(std::sync::atomic::Ordering::SeqCst) {
+                ClientState::Connected
+            } else {
+                ClientState::Disconnected
+            }
         }
         async fn connect(&self) -> Result<(), MCPClientError> {
             Ok(())
@@ -4050,6 +4213,9 @@ pub(crate) mod test_support {
         }
         async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.state() != ClientState::Connected {
+                return Err(MCPClientError::ConnectionError("disconnected".into()));
+            }
             Ok(self.tools.clone())
         }
         async fn call_tool(
@@ -4142,6 +4308,7 @@ pub(crate) mod test_support {
             StdArc::new(CountingToolsClient {
                 tools,
                 calls: calls.clone(),
+                connected: std::sync::atomic::AtomicBool::new(true),
             }),
         );
         calls
@@ -4400,6 +4567,10 @@ mod tests {
             .write()
             .await
             .insert("oauth-clear-outcome__disabled".to_string());
+        manager.tool_owners.write().await.insert(
+            "oauth-clear-outcome__disabled".to_string(),
+            bundle_id.clone(),
+        );
 
         let first = manager.clear_oauth_with_outcome(&bundle_id).await.unwrap();
         assert!(first.capability_changed);
@@ -5960,6 +6131,11 @@ mod tests {
             .await
             .insert("health-oauth__disabled".to_string());
         manager
+            .tool_owners
+            .write()
+            .await
+            .insert("health-oauth__disabled".to_string(), bundle_id.clone());
+        manager
             .set_health_check_config(HealthCheckConfig {
                 interval_secs: 3600,
                 timeout_secs: 5,
@@ -6582,6 +6758,203 @@ mod tests {
             manager.servers_config.write().await.insert(bid, cfg);
         }
         manager.refresh_tool_routes().await
+    }
+
+    #[tokio::test]
+    async fn tool_observation_cache_scales_linearly_and_force_still_reads_all() {
+        for count in [6, 20] {
+            let manager = MCPServerManager::new();
+            let mut counters = Vec::new();
+            for index in 0..count {
+                let name = format!("server{index}");
+                counters
+                    .push(inject_counting_tools(&manager, &name, vec![tool_named("tool")]).await);
+                manager
+                    .servers_config
+                    .write()
+                    .await
+                    .insert(bid(&name), stdio_cfg(&name, vec![], HashMap::new()));
+                manager.refresh_structural_tool_routes().await.unwrap();
+            }
+            assert_eq!(
+                counters
+                    .iter()
+                    .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+                    .sum::<usize>(),
+                count
+            );
+            assert_eq!(manager.tool_routes.read().await.len(), count);
+            manager.refresh_tool_routes().await.unwrap();
+            assert!(counters
+                .iter()
+                .all(|c| c.load(std::sync::atomic::Ordering::SeqCst) == 2));
+            manager.active_clients.write().await.clear();
+            manager.refresh_structural_tool_routes().await.unwrap();
+            assert!(manager.tool_list_cache.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_observation_cache_reprojects_config_and_rejects_session_and_client_changes() {
+        let manager = MCPServerManager::new();
+        let calls = inject_counting_tools(&manager, "srv", vec![tool_named("tool")]).await;
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bid("srv"), stdio_cfg("srv", vec![], HashMap::new()));
+        manager.refresh_structural_tool_routes().await.unwrap();
+        manager.servers_config.write().await.insert(
+            bid("srv"),
+            stdio_cfg("srv", vec![], meta_with_alias("tool", "alias")),
+        );
+        manager.refresh_structural_tool_routes().await.unwrap();
+        assert!(manager.tool_routes.read().await.contains_key("srv__alias"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        bump_active_client_generation(
+            &mut manager.tool_session_epochs.lock().unwrap(),
+            &bid("srv"),
+        );
+        manager.refresh_structural_tool_routes().await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        bump_active_client_generation(
+            &mut *manager.active_client_generations.write().await,
+            &bid("srv"),
+        );
+        manager.refresh_structural_tool_routes().await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let replacement = inject_counting_tools(&manager, "srv", vec![tool_named("new")]).await;
+        manager.refresh_structural_tool_routes().await.unwrap();
+        assert_eq!(replacement.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(manager.tool_routes.read().await.contains_key("srv__new"));
+        assert!(!manager.tool_routes.read().await.contains_key("srv__alias"));
+    }
+
+    #[tokio::test]
+    async fn tool_observation_cache_never_masks_a_dead_session() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let manager = MCPServerManager::new();
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let client = StdArc::new(super::test_support::CountingToolsClient {
+            tools: vec![tool_named("tool")],
+            calls: calls.clone(),
+            connected: AtomicBool::new(true),
+        });
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bid("srv"), client.clone());
+        manager
+            .servers_config
+            .write()
+            .await
+            .insert(bid("srv"), stdio_cfg("srv", vec![], HashMap::new()));
+        manager.refresh_structural_tool_routes().await.unwrap();
+        client.connected.store(false, Ordering::SeqCst);
+        assert!(manager.refresh_structural_tool_routes().await.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "unavailable sessions must attempt a real read, never reuse old data"
+        );
+        assert!(manager.tool_list_cache.lock().await.is_empty());
+        assert!(manager.list_available_tools().await.is_empty());
+        client.connected.store(true, Ordering::SeqCst);
+        manager.refresh_structural_tool_routes().await.unwrap();
+        assert_eq!(manager.tool_routes.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_observation_failed_bundle_does_not_capture_prefix_neighbor() {
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![
+                (
+                    "a",
+                    vec![tool_named("stable")],
+                    stdio_cfg("a", vec![], HashMap::new()),
+                ),
+                (
+                    "a_",
+                    vec![tool_named("old")],
+                    stdio_cfg_with_bundle("a_", Some("a_")),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bid("a"), StdArc::new(ErrToolsClient));
+        inject_tools(&manager, &bid("a_"), vec![tool_named("new")]).await;
+        assert!(
+            manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .unwrap()
+                .projection_changed
+        );
+        assert!(!manager.tool_projection.read().await.contains_key("a___old"));
+        assert!(manager.tool_projection.read().await.contains_key("a___new"));
+        withdraw_bundle_tool_routes(
+            &manager.tool_routes,
+            &manager.disabled_tools,
+            &manager.tool_projection,
+            &manager.tool_owners,
+            &bid("a"),
+        )
+        .await;
+        assert!(manager.tool_projection.read().await.contains_key("a___new"));
+    }
+
+    #[tokio::test]
+    async fn tool_observation_failure_carries_one_bundle_while_other_bundles_progress() {
+        let manager = MCPServerManager::new();
+        setup_and_refresh(
+            &manager,
+            vec![
+                (
+                    "a",
+                    vec![tool_named("old")],
+                    stdio_cfg("a", vec![], HashMap::new()),
+                ),
+                (
+                    "b",
+                    vec![tool_named("stable")],
+                    stdio_cfg("b", vec![], HashMap::new()),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bid("b"), StdArc::new(ErrToolsClient));
+        inject_tools(&manager, &bid("a"), vec![tool_named("new")]).await;
+        assert!(
+            manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .unwrap()
+                .projection_changed
+        );
+        assert!(manager.tool_routes.read().await.contains_key("b__stable"));
+        assert!(manager.tool_routes.read().await.contains_key("a__new"));
+        assert!(!manager.tool_list_cache.lock().await.contains_key(&bid("b")));
+        inject_tools(&manager, &bid("b"), vec![tool_named("stable")]).await;
+        assert!(
+            !manager
+                .refresh_tool_mapping_with_outcome()
+                .await
+                .unwrap()
+                .projection_changed
+        );
     }
 
     #[tokio::test]
