@@ -283,6 +283,21 @@ async fn start_reconnect_capture_server_with_gate(
     delayed_join_attempt: Option<usize>,
     gate: Option<Arc<tokio::sync::Notify>>,
 ) -> ReconnectCaptureServer {
+    start_reconnect_capture_server_with_rejection(
+        reject_join_attempt,
+        delayed_join_attempt,
+        gate,
+        4101,
+    )
+    .await
+}
+
+async fn start_reconnect_capture_server_with_rejection(
+    reject_join_attempt: Option<usize>,
+    delayed_join_attempt: Option<usize>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+    rejection_code: i64,
+) -> ReconnectCaptureServer {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
@@ -356,8 +371,8 @@ async fn start_reconnect_capture_server_with_gate(
                             // （#226 假绿清单第 5 条）。
                             if reject_join_attempt == Some(attempt) {
                                 let _ = ack.send(&json!({
-                                    "code": 4101,
-                                    "message": "Room already has an agent",
+                                    "code": rejection_code,
+                                    "message": if rejection_code == 4105 { "Name already registered" } else { "Room already has an agent" },
                                     "details": { "office_id": "office-rejoin-rejected" }
                                 }));
                             } else {
@@ -1670,6 +1685,61 @@ async fn cancelled_join_retains_updates_for_next_confirmation() {
             .unwrap();
         assert!(events.insert(event));
     }
+    client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn pending_updates_survive_rejected_cross_office_join() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut server =
+        start_reconnect_capture_server_with_rejection(Some(2), Some(2), Some(gate.clone()), 4105)
+            .await;
+    let client = Arc::new(
+        SmcpComputerClientBuilder::new(
+            &server.url,
+            empty_manager(),
+            "cross-office",
+            empty_inputs(),
+        )
+        .auth_payload(json!({"token":"dirty"}))
+        .connect()
+        .await
+        .unwrap(),
+    );
+    client.join_office("office-dirty").await.unwrap();
+    server.next_join().await;
+    let joining = {
+        let client = client.clone();
+        tokio::spawn(async move { client.join_office("office-conflict").await })
+    };
+    server.next_join().await;
+    client.emit_update_config().await.unwrap();
+    client.emit_update_skills().await.unwrap();
+    client.emit_update_tool_list().await.unwrap();
+    client.emit_update_desktop().await.unwrap();
+    client.emit_update_config().await.unwrap();
+    assert!(server.update_rx.try_recv().is_err());
+    gate.notify_one();
+    assert!(matches!(
+        joining.await.unwrap(),
+        Err(ComputerError::ProtocolRejection { code: 4105, .. })
+    ));
+    let mut events = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let (event, _) = timeout(Duration::from_secs(3), server.update_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(events.insert(event), "updates must coalesce");
+    }
+    assert!(timeout(Duration::from_millis(100), server.update_rx.recv())
+        .await
+        .is_err());
+    assert_eq!(
+        client.get_office_id().await.as_deref(),
+        Some("office-dirty")
+    );
     client.disconnect().await.unwrap();
     server.shutdown();
 }

@@ -81,6 +81,8 @@ struct RejoinCaptureServer {
     auth_rx: mpsc::UnboundedReceiver<Value>,
     join_rx: mpsc::UnboundedReceiver<Value>,
     calls_rx: mpsc::UnboundedReceiver<()>,
+    sockets_rx: mpsc::UnboundedReceiver<SocketRef>,
+    ack_tools: Arc<AtomicBool>,
     /// 房间事件到达顺序（`"join"` / `"leave"`）——用于断言并发 join/leave 与服务端的全序一致。
     room_events_rx: mpsc::UnboundedReceiver<&'static str>,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -160,6 +162,9 @@ async fn start_capture_server(
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
     let (join_tx, join_rx) = mpsc::unbounded_channel();
     let (calls_tx, calls_rx) = mpsc::unbounded_channel();
+    let (sockets_tx, sockets_rx) = mpsc::unbounded_channel();
+    let ack_tools = Arc::new(AtomicBool::new(false));
+    let handler_ack_tools = ack_tools.clone();
     let connections = Arc::new(AtomicUsize::new(0));
     let (room_events_tx, room_events_rx) = mpsc::unbounded_channel();
     let join_attempts = Arc::new(AtomicUsize::new(0));
@@ -170,6 +175,8 @@ async fn start_capture_server(
         move |_socket: SocketRef, TryData(auth): TryData<Value>| {
             let auth_tx = auth_tx.clone();
             let calls_tx = calls_tx.clone();
+            let sockets_tx = sockets_tx.clone();
+            let ack_tools = handler_ack_tools.clone();
             let connections = connections.clone();
             let join_tx = join_tx.clone();
             let room_events_tx = room_events_tx.clone();
@@ -184,12 +191,20 @@ async fn start_capture_server(
                     return;
                 }
                 // 故意不返回 ACK：用于验证旧连接关闭时在途调用被唤醒。
-                _socket.on("client:get_tools", move || {
-                    let calls_tx = calls_tx.clone();
-                    async move {
-                        let _ = calls_tx.send(());
-                    }
-                });
+                _socket.on(
+                    "client:get_tools",
+                    move |Data(data): Data<Value>, ack: AckSender| {
+                        let calls_tx = calls_tx.clone();
+                        let ack_tools = ack_tools.clone();
+                        async move {
+                            let _ = calls_tx.send(());
+                            if ack_tools.load(Ordering::SeqCst) {
+                                ack.send(&json!({"req_id": data["req_id"], "tools": []}))
+                                    .unwrap();
+                            }
+                        }
+                    },
+                );
                 // 房间事件顺序记录器的**独立副本**：下面两个 handler 各持一份（互不移动对方）。
                 let leave_events_tx = room_events_tx.clone();
                 _socket.on(
@@ -243,6 +258,7 @@ async fn start_capture_server(
                         }
                     },
                 );
+                let _ = sockets_tx.send(_socket);
             }
         },
     );
@@ -279,6 +295,8 @@ async fn start_capture_server(
         auth_rx,
         join_rx,
         calls_rx,
+        sockets_rx,
+        ack_tools,
         room_events_rx,
         connection_tasks: proxy.connection_tasks,
         reject_connections: proxy.reject_connections,
@@ -1364,4 +1382,116 @@ async fn replacing_offline_connection_does_not_resurrect_retired_transport() {
     agent.leave_office().await.unwrap();
     old.shutdown();
     new.shutdown();
+}
+
+#[tokio::test]
+async fn natural_disconnect_unblocks_auto_tools_and_later_notifications() {
+    struct ToolsReceived(mpsc::UnboundedSender<String>);
+    #[async_trait::async_trait]
+    impl AsyncAgentEventHandler for ToolsReceived {
+        async fn on_tools_received(
+            &self,
+            computer: &str,
+            _tools: Vec<smcp::SMCPTool>,
+            _agent: &AsyncSmcpAgent,
+        ) -> Result<(), SmcpAgentError> {
+            self.0.send(computer.to_string()).unwrap();
+            Ok(())
+        }
+    }
+    let mut server = start_rejoin_capture_server(policy(|_| JoinOutcome::Accept), None).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut config = default_config();
+    config.auto_fetch_tools = true;
+    config.get_timeout = 60; // Completion must come from disconnect, not the ACK timeout.
+    let mut agent =
+        agent_for("agent-natural", "office-natural", config).with_event_handler(ToolsReceived(tx));
+    agent.connect(&server.url).await.unwrap();
+    agent.join_office("agent-natural").await.unwrap();
+    server.next_join().await;
+    let socket = timeout(Duration::from_secs(3), server.sockets_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    socket
+        .emit(
+            "notify:update_tool_list",
+            &json!({"computer":"computer-old"}),
+        )
+        .unwrap();
+    timeout(Duration::from_secs(3), server.calls_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    server.force_network_disconnect();
+    server.next_join().await;
+    wait_until(
+        || agent.office_membership() == joined("office-natural"),
+        "automatic rejoin",
+    )
+    .await;
+    server.ack_tools.store(true, Ordering::SeqCst);
+    let socket = timeout(Duration::from_secs(3), server.sockets_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    socket
+        .emit(
+            "notify:update_tool_list",
+            &json!({"computer":"computer-new"}),
+        )
+        .unwrap();
+    let received = timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("old ACK wait blocked the notification consumer after rejoin")
+        .unwrap();
+    assert_eq!(received, "computer-new");
+    assert!(
+        rx.try_recv().is_err(),
+        "retired call must not deliver tools"
+    );
+    agent.leave_office().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn natural_disconnect_cancels_calls_without_membership_subscription() {
+    use smcp_agent::transport::SocketIoTransport;
+    for handlers in [false, true] {
+        let mut server = start_rejoin_capture_server(policy(|_| JoinOutcome::Accept), None).await;
+        let (transport, _notifications) = if handlers {
+            SocketIoTransport::connect_with_handlers(&server.url, "/smcp", None, Default::default())
+                .await
+                .unwrap()
+        } else {
+            SocketIoTransport::connect(&server.url, "/smcp", None, Default::default())
+                .await
+                .unwrap()
+        };
+        let transport = Arc::new(transport);
+        let calling = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.call("client:get_tools", json!({}), 60).await })
+        };
+        timeout(Duration::from_secs(3), server.calls_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        server.force_network_disconnect();
+        let error = timeout(Duration::from_secs(3), calling)
+            .await
+            .expect(
+                "natural disconnect must invalidate calls without an Agent lifecycle subscriber",
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, SmcpAgentError::Connection(_)), "{error:?}");
+        Arc::try_unwrap(transport)
+            .ok()
+            .unwrap()
+            .disconnect()
+            .await
+            .unwrap();
+        server.shutdown();
+    }
 }

@@ -1221,7 +1221,20 @@ impl SmcpComputerClient {
                 }
                 Err(error) => {
                     if previous_desired.as_deref() != Some(office_id) {
-                        membership.pending_updates = previous_pending;
+                        if matches!(error, ComputerError::ProtocolRejection { .. })
+                            && previous_confirmed.is_some()
+                        {
+                            // A rejected transfer leaves the server in the original Office.
+                            // Local changes during the ACK wait still describe this Computer;
+                            // keep their newer revisions and carry any previously dirty kinds.
+                            for (pending, previous) in
+                                membership.pending_updates.iter_mut().zip(previous_pending)
+                            {
+                                *pending = pending.or(previous);
+                            }
+                        } else {
+                            membership.pending_updates = previous_pending;
+                        }
                     }
                     membership.desired = previous_desired;
                     membership.confirmed = previous_confirmed;
@@ -1236,8 +1249,8 @@ impl SmcpComputerClient {
             }
         };
         drop(_operation);
-        // Flush after a same-office rollback too: changes made while its ACK was pending
-        // still belong to the restored confirmed intent.
+        // Flush after a rejected join too: changes during its ACK wait still apply
+        // to the restored confirmed Office, including a rejected transfer.
         // Joining succeeded even if a best-effort notification send fails. Failed dirty bits
         // remain available to a subsequent change or membership confirmation.
         if let Err(error) =
