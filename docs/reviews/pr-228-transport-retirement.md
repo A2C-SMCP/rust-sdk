@@ -145,3 +145,20 @@ Clippy（`-D warnings`）通过；workspace 全 features rustdoc（`RUSTDOCFLAGS
 旧发送成功不能清除新 revision/session 的 pending 增加受控竞态覆盖。
 验证结束已恢复原始 registry 0.9.2 锁文件，没有把本地 path patch 纳入交付。
 Cargo 全量测试已构建的三端二进制完成 UAT；后续重复的额外 dev 构建主动停止，不记作额外构建通过。
+
+
+### 2026-09-29 正式发布与 registry 集成
+
+上文候选阶段的发布阻塞已进入正式交付验证阶段。上游 [PR #16](https://github.com/A2C-SMCP/tf-rust-socketio/pull/16) 全部 CI 通过并合并，提交为 `b66ee920157e038823d381f075e23a4280fe2777`。
+[正式 v0.9.3](https://github.com/A2C-SMCP/tf-rust-socketio/releases/tag/v0.9.3) 的
+[发布流水线](https://github.com/A2C-SMCP/tf-rust-socketio/actions/runs/36539538386) 成功。
+
+crates.io 两包均为非撤回的 0.9.3；SDK 最低版本及锁文件已升级，没有 path 覆盖。
+`cargo metadata --locked --all-features` 确认两包均来自 registry；发布包的
+`.cargo_vcs_info.json` 均指向上述合并提交，Engine.IO 的 26 个、Socket.IO 的 21 个 Rust
+源码文件逐字节匹配已验证的上游源码。锁文件仅修改两个包的版本和校验和，保持其他依赖不变。
+
+- Engine.IO SHA-256: `a399999f9ee32189714628d02c3b554ac0a19a7428bf3af383f4b8ec8ceb7c73`
+- Socket.IO SHA-256: `61005cdd79fb705b488f856df35678191f615d34c7f24c0748bfa529c40b5d4a`
+
+正式依赖回归及本 PR 的 Linux/macOS CI 是合并前门禁；最终结果记录于 PR 的交付评论。
