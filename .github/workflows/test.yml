@@ -2,9 +2,9 @@ name: Test
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, dev-0.5.0]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, dev-0.5.0]
 
 env:
   CARGO_TERM_COLOR: always
@@ -103,3 +103,18 @@ jobs:
 
       - name: Test smcp-server-hyper
         run: cargo test -p smcp-server-hyper
+
+  macos-runner:
+    name: macOS default runner and HTTP regressions
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify runner process contract
+        run: python3 .cargo/test_macos_runner.py
+      - name: Verify default Cargo entrypoint
+        run: cargo test -p smcp-computer --test window_enumeration_diagnostics --test test_mcp_integration
+      - uses: taiki-e/install-action@nextest
+      - name: Verify default nextest entrypoint
+        run: cargo nextest run -p smcp-computer --test window_enumeration_diagnostics

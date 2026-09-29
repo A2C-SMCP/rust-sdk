@@ -719,18 +719,19 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         )
         .await
         .expect("get_tools emit_with_ack failed");
-    // 新语义（SRV-01 #47）：非 Agent 调用方（此处 Computer "c1"）发起 client:get_tools → 角色隔离
-    // 拒绝，Server **不投递协议 ack**（镜像 Python raise；不泄露、不造非协议错误码）——发起方侧自行
-    // 超时。
-    //
-    // 断言（#226 复审 🟡10 收紧）：**根本没有** ack 到达，即回调通道必须一直不被唤醒（超时）。
-    // 旧写法只否定「tools 载荷 / 字面串 `"Only agents"`」两种形态——按现在的契约，服务端回一个
-    // flat `ErrorPayload(403/404)` 同样**不会**让它变红，也就是说它测不出自己声称的回归
-    // （「不投递 ack」被悄悄改成「投递一个别的 ack」时它照样绿）。
-    let got = timeout(Duration::from_secs(3), get_tools_rx).await;
-    assert!(
-        got.is_err(),
-        "隔离拒绝 MUST 完全不投递 ack（发起方侧超时）；实得 {got:?}"
+    // #223: a Computer issuing client:* receives the canonical flat 403 ACK.
+    // The Socket.IO callback preserves its argument array; assert the entire payload,
+    // including the absence of details, rather than accepting any error-shaped reply.
+    let got = timeout(Duration::from_secs(3), get_tools_rx)
+        .await
+        .expect("non-Agent rejection must acknowledge")
+        .expect("ACK callback dropped");
+    assert_eq!(
+        got,
+        serde_json::json!([{
+            "code": 403,
+            "message": "Only agents may issue client:* calls"
+        }])
     );
 
     let (leave_tx, leave_rx) = oneshot::channel::<serde_json::Value>();

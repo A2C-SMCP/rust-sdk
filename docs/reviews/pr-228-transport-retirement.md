@@ -82,3 +82,66 @@ TLS 初次回归的 8 项失败来自临时测试证书缺少合适的叶证书�
 使用本地 0.9.3 候选版覆盖两个依赖后，完整 Office 生命周期测试串行执行 20/20 通过，包括 W1 同步恢复断言及 B1 的旧端点不复活用例。验证后还原 SDK 锁文件中的临时 path 来源，正式依赖升级留到包发布后执行。
 
 下一步需要公开发布授权：发布两个 0.9.3 包后，将 SDK 的两个最低依赖版本同步改为 0.9.3，生成注册表来源的 Cargo.lock，并移除本地覆盖复验。B1 在该步骤完成前保持阻塞，不能以候选版验证替代正式接入。
+
+
+## 2026-09-29：完成度核对后的补充验证
+
+本节记录后续工作，不覆盖上面的历史失败记录。SDK 基线为
+`be5e11394470708a0b2c0d84e41d0ae45bf7e4cc`，上游工作树基线为
+`e90544a191a7bd45e2b1dda926a067300ac1949b`。
+
+隔离审查进一步发现：退役中的 polling POST 如果不返回，第二个 disconnect 会一直等待；
+已经安装的 polling GET / WebSocket 还可能被共享流或 client 克隆保留。
+新增真实 TCP 用例先复现 POST 阻塞，再修复发送取消、传输所有权撤销和共享流清理。
+namespace DISCONNECT 与 Engine.IO CLOSE 分别最多等待一秒；这是关闭帧的最佳努力期限，
+本地所有权在发送前撤销。调用方取消不取消后台清理，并发 disconnect 共享串行清理。
+连接建立与退役的 connected 状态在同一所有权锁内提交，避免断开后重新标记为在线。
+
+| 后续验证 | 结果 |
+| --- | --- |
+| 底层真实退役集成测试 | 10/10；新增卡住的关闭 POST、存活克隆下 polling GET 和 WebSocket 的 TCP 关闭 |
+| Engine.IO 库测试（真实 Node fixtures） | 46/46 |
+| Socket.IO 库测试（真实 Node fixtures） | 55/55，本轮包含此前失败的长回调心跳用例；不能据此抹去历史失败 |
+| 上游 workspace all-features Clippy | 零告警 |
+| Engine.IO 0.9.3 publish dry-run | 打包与构建验证通过，未上传 |
+
+SDK 同期完成 #223 的会话身份与 flat 403 补齐、#227 的原始工具观测缓存、#230 的待补发更新，
+以及 #229 的默认 macOS Cargo/nextest runner。真实 MCP 进程验证 N=6/20 启动分别只读 6/20 次工具列表；
+显式强制刷新仍逐 bundle 重读。macOS runner 已覆盖参数、环境、cwd、非零退出、信号转发、
+子进程 SIGKILL 与临时目录清理，并在真实 Cargo 和 nextest 入口验证。
+
+正式发布边界不变：本节的 0.9.3 是本地候选。只有注册表中两个 0.9.3 包正式可用、SDK 清除 path 覆盖并
+升级两个最低版本及锁文件、正式依赖回归通过后，才可解除 #219/#224 与 PR #228 的依赖阻塞。
+
+
+### SDK 候选集成与 UAT 结果
+
+本轮 `cargo test --workspace --all-features --no-fail-fast -- --test-threads=1`
+首轮为 **1935 passed / 4 failed / 37 ignored**，退出 101，不能表述为首轮全绿：
+
+- Agent `connection_replacement_waits_for_in_flight_join` 在首次连接提交前失败，尚未进入替换步骤；
+  同一二进制单独复验通过，完整 Office 生命周期串行复验 20/20 通过。未改断言或期限，保留间歇性结果。
+- `resource_subscription_e2e` 两项在 `npx @playwright/mcp@latest` 初始化 30 秒期限内未完成，
+  尚未执行资源断言；同一二进制原样整组复验 6/6 通过，未修改 Stdio 实现、测试或期限。
+- `socketio_interop` 仍断言非 Agent 的 client:* 请求没有 ACK；这与本次 #223 的明确验收契约冲突。
+  已将该断言改为精确比较 ACK 参数数组内的 flat 403（规定 message、无 details），保持真实协议路径。
+
+Computer 全功能单测 1139/1139、auth 生命周期 24/24（含取消入房后的补发）通过。
+显式执行默认忽略的真实 MCP 通知套件 3/3 和协议矩阵 16/16 通过；它们单独记账，不将其它忽略项算通过。
+真实 MCP 本轮 N=6/20 分别产生 6/20 次 tools/list，强制刷新和停止行为也通过计数断言。
+
+UAT / seed 影响评估：本次涉及 full-protocol 的成员生命周期、工具读取与取消广播；
+新补发和身份边界由真实 Socket.IO 集成测试覆盖，现有 skill 包格式和 seed 无变化。
+`valid-skill-pkg/acceptance.md` 的包体校验当次通过。
+使用本轮候选构建的 Server + Computer + Agent 三个真实进程，运行既有
+`full-protocol-uat.sh` 的临时副本（仅将 ROOT 与二进制路径指向工作区和隔离构建目录），
+10 个 Agent mode、F-05 版本拒绝检查均通过。skill/config 目录使用临时隔离路径并清理，
+没有改动 seed 或放宽 UAT 预期。
+
+
+最后复验与门禁：`socketio_interop` 修订后 5/5 通过；workspace 全 targets / 全 features
+Clippy（`-D warnings`）通过；workspace 全 features rustdoc（`RUSTDOCFLAGS="-D warnings"`）通过。
+最终完整 diff 隔离审查为 APPROVE，无代码阻塞；保留非阻塞测试建议：对单种通知发送失败、
+旧发送成功不能清除新 revision/session 的 pending 增加受控竞态覆盖。
+验证结束已恢复原始 registry 0.9.2 锁文件，没有把本地 path patch 纳入交付。
+Cargo 全量测试已构建的三端二进制完成 UAT；后续重复的额外 dev 构建主动停止，不记作额外构建通过。

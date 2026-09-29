@@ -665,3 +665,102 @@ async fn valid_payload_plus_extra_argument_returns_flat_bad_request() {
     client.disconnect().await.unwrap();
     server.shutdown();
 }
+
+#[tokio::test]
+async fn every_client_call_from_computer_receives_flat_403() {
+    let server = SmcpTestServer::start().await;
+    let client = create_test_client(&server.url(), SMCP_NAMESPACE).await;
+    join_office(&client, Role::Computer, "roles", "computer").await;
+    // A superset of each request's required fields keeps this a role check, not a parser check.
+    let request = json!({"agent":"forged", "computer":"missing", "req_id":"roles",
+        "tool_name":"tool", "params":{}, "timeout":1, "name":"skill", "mcp_server":"bundle",
+        "blob_handle":"handle", "chunk_offset":0, "eof":true, "blob":""});
+    for event in [
+        events::CLIENT_TOOL_CALL,
+        events::CLIENT_GET_TOOLS,
+        events::CLIENT_GET_DESKTOP,
+        events::CLIENT_GET_CONFIG,
+        events::CLIENT_GET_SKILLS,
+        events::CLIENT_GET_SKILL,
+        events::CLIENT_GET_BLOB,
+        events::CLIENT_PUT_BLOB,
+        events::CLIENT_GET_RESOURCES,
+    ] {
+        assert_eq!(
+            emit_with_ack(&client, event, request.clone()).await,
+            json!({"code":403,"message":"Only agents may issue client:* calls"}),
+            "{event}"
+        );
+    }
+    client.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn broadcasts_use_session_identity_instead_of_claimed_identity() {
+    for (sent, received, role, field) in [
+        (
+            events::SERVER_UPDATE_CONFIG,
+            events::NOTIFY_UPDATE_CONFIG,
+            Role::Computer,
+            "computer",
+        ),
+        (
+            events::SERVER_UPDATE_TOOL_LIST,
+            events::NOTIFY_UPDATE_TOOL_LIST,
+            Role::Computer,
+            "computer",
+        ),
+        (
+            events::SERVER_UPDATE_SKILLS,
+            events::NOTIFY_UPDATE_SKILLS,
+            Role::Computer,
+            "computer",
+        ),
+        (
+            events::SERVER_UPDATE_DESKTOP,
+            events::NOTIFY_UPDATE_DESKTOP,
+            Role::Computer,
+            "computer",
+        ),
+        (
+            events::SERVER_TOOL_CALL_CANCEL,
+            events::NOTIFY_TOOL_CALL_CANCEL,
+            Role::Agent,
+            "agent",
+        ),
+    ] {
+        let server = SmcpTestServer::start().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let recipient = create_client_with_handler(
+            &server.url(),
+            SMCP_NAMESPACE,
+            received,
+            move |payload, _| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(ack_value(payload));
+                })
+            },
+        )
+        .await;
+        join_office(&recipient, Role::Computer, "identities", "recipient").await;
+        let sender = create_test_client(&server.url(), SMCP_NAMESPACE).await;
+        join_office(&sender, role, "identities", "actual").await;
+        sender
+            .emit(sent, json!({field:"forged", "req_id":"cancel-id"}))
+            .await
+            .unwrap();
+        let payload = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload[field], "actual", "{received}: {payload}");
+        if field == "agent" {
+            assert_eq!(payload["req_id"], "cancel-id");
+        }
+        sender.disconnect().await.unwrap();
+        recipient.disconnect().await.unwrap();
+        server.shutdown();
+    }
+}

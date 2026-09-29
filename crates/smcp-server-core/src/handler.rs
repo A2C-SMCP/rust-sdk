@@ -34,8 +34,8 @@ pub enum HandlerError {
     ///
     /// 对标 Python `SMCPNamespaceError`（见 `server/namespace.py`）。属安全不变量——以**运行期**
     /// `Result` 表达（**非** `debug_assert!`），故 release build（无 `debug_assert!`）下隔离同样硬化。
-    /// 投递语义：`client:*` 路由命中此变体时**不投递协议 ack**（镜像 Python `raise`，发起方侧自行超时，
-    /// 不泄露 Computer 存在性、不造非协议错误码），见 `SmcpHandler::relay_client_call`。
+    /// Internal diagnostic variant. Live non-Agent `client:*` callers receive a flat 403 ACK
+    /// directly from `SmcpHandler::relay_client_call`.
     #[error("Isolation rejected: {0}")]
     Isolation(String),
 }
@@ -391,7 +391,7 @@ impl SmcpHandler {
                             Ok(payload) => {
                                 let _ = ack.send(&payload);
                             }
-                            // 隔离拒绝（发起方非 Agent / 会话已断连）：镜像 Python，不投递协议 ack（发起方侧自行超时）
+                            // 会话已断连等隔离拒绝维持不投递 ACK；存活非 Agent 的 flat 403 由上方 Ok 路径发送。
                             Err(e) => warn!("client:tool_call relay rejected, no ack: {e}"),
                         }
                     }
@@ -970,9 +970,17 @@ impl SmcpHandler {
             }
         };
 
+        if data.agent != session.name {
+            warn!(sid = %sid, claimed = %data.agent, actual = %session.name,
+                "Cancel identity differs from authoritative session; using session identity");
+        }
+        let notification = AgentCallData {
+            agent: session.name,
+            req_id: data.req_id,
+        };
         if let Err(e) = socket
             .to(Self::office_room(&office_id))
-            .emit(smcp::events::NOTIFY_TOOL_CALL_CANCEL, &data)
+            .emit(smcp::events::NOTIFY_TOOL_CALL_CANCEL, &notification)
             .await
         {
             warn!("Failed to broadcast NOTIFY_TOOL_CALL_CANCEL: {}", e);
@@ -1003,6 +1011,11 @@ impl SmcpHandler {
             return;
         }
 
+        if data.computer != session.name {
+            warn!(sid = %sid, claimed = %data.computer, actual = %session.name,
+                "Update identity differs from authoritative session; using session identity");
+        }
+
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
@@ -1016,11 +1029,11 @@ impl SmcpHandler {
 
         // 广播配置更新通知（向 office 广播并跳过自己）
         let notification = UpdateMCPConfigNotification {
-            computer: data.computer.clone(),
+            computer: session.name.clone(),
         };
 
         let office_id_clone = office_id.clone();
-        let computer_clone = data.computer.clone();
+        let computer_clone = session.name.clone();
         info!(
             "Broadcasting NOTIFY_UPDATE_CONFIG to room '{}' from computer '{}' (sid: {})",
             office_id_clone, computer_clone, sid
@@ -1064,6 +1077,11 @@ impl SmcpHandler {
             return;
         }
 
+        if data.computer != session.name {
+            warn!(sid = %sid, claimed = %data.computer, actual = %session.name,
+                "Update identity differs from authoritative session; using session identity");
+        }
+
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
@@ -1077,7 +1095,7 @@ impl SmcpHandler {
 
         // 广播工具列表更新通知（向 office 广播并跳过自己）
         let notification = UpdateToolListNotification {
-            computer: data.computer,
+            computer: session.name.clone(),
         };
 
         if let Err(e) = socket
@@ -1118,6 +1136,11 @@ impl SmcpHandler {
             return;
         }
 
+        if data.computer != session.name {
+            warn!(sid = %sid, claimed = %data.computer, actual = %session.name,
+                "Update identity differs from authoritative session; using session identity");
+        }
+
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
@@ -1131,7 +1154,7 @@ impl SmcpHandler {
 
         // 广播 SKILL 更新通知（向 office 广播并跳过自己）；载荷复用 `{computer}` 形态。
         let notification = UpdateMCPConfigNotification {
-            computer: data.computer,
+            computer: session.name.clone(),
         };
         if let Err(e) = socket
             .to(Self::office_room(&office_id))
@@ -1178,12 +1201,13 @@ impl SmcpHandler {
     /// MUST 为 flat ErrorPayload）。
     ///
     /// - 目标 Computer 在**发起方 office 内**未命中（含跨 office：office-scoped 查找天然不可达，
-    ///   不泄露存在性）/ 发起方无 office / 目标 SID 已断连 → 返回 flat `ErrorPayload(404)`（经 ack 投递）。
+    ///   不泄露存在性）/ 目标 SID 已断连 → 返回 flat `ErrorPayload(404)`（经 ack 投递）。
+    /// - 发起方有会话但无 office → flat `ErrorPayload(4103)`。
     /// - 目标 ack 为协议级 flat ErrorPayload（[`smcp::is_protocol_error_payload`]）→ 原样透传；
     ///   成功响应同样 **bare 透传**，**不**剥 `"result"`（旧实现的 `map.remove("result")` 是 bug：
     ///   Computer 发送 bare `CallToolResult`，剥取把成功结果误抹为 `Null`）。
-    /// - 发起方非 Agent → [`HandlerError::Isolation`]（隔离拒绝）；发起方会话已断连 →
-    ///   [`HandlerError::Session`]：两者调用点均**不投递协议 ack**（镜像 Python `raise` 语义，
+    /// - 发起方非 Agent → flat 403 ACK（隔离拒绝）；发起方会话已断连 →
+    ///   [`HandlerError::Session`]：仅无会话分支**不投递协议 ack**（镜像 Python `raise` 语义，
     ///   发起方侧自行超时；不泄露 Computer 存在性、不造非协议错误码）。
     ///
     /// ## 在途断连容错（#56 SRV-04）/ In-flight disconnect tolerance
@@ -1220,9 +1244,10 @@ impl SmcpHandler {
         // 角色隔离：仅 Agent 可发起 client:* 调用 / Role isolation: only Agents issue client:* calls.
         // 运行期 `Result`（**非** `debug_assert!`）→ release build 下隔离不变量同样硬化。
         if session.role != ClientRole::Agent {
-            return Err(HandlerError::Isolation(
-                "only agents may issue client:* calls".to_string(),
-            ));
+            return Ok(serde_json::json!({
+                "code": smcp::error_codes::FORBIDDEN,
+                "message": "Only agents may issue client:* calls"
+            }));
         }
 
         // 发起方无 office → 无从在任何 office 内定位目标 → flat **4103** `Not in any room`。
@@ -1506,6 +1531,11 @@ impl SmcpHandler {
             return;
         }
 
+        if data.computer != session.name {
+            warn!(sid = %sid, claimed = %data.computer, actual = %session.name,
+                "Update identity differs from authoritative session; using session identity");
+        }
+
         let office_id = match session.office_id {
             Some(ref office_id) => office_id.clone(),
             None => {
@@ -1519,7 +1549,7 @@ impl SmcpHandler {
 
         // 广播桌面更新通知（向 office 广播并跳过自己）
         let notification = UpdateMCPConfigNotification {
-            computer: data.computer,
+            computer: session.name.clone(),
         };
 
         if let Err(e) = socket

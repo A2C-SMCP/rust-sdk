@@ -77,29 +77,24 @@ HTTP 超时用例也在 30.54 秒按原有断言通过（客户端内部连接�
 异步守卫，并非严格墙钟上限）。这是该本地环境的证据，不能据此把其他 HTTP
 超时一律归因为缓存，也不能靠放宽断言或禁用系统代理掩盖问题。
 
-长期维护仍采用上面的 target 卫生措施。暂不清理缓存时，可用一次性的 Cargo runner
-隔离测试可执行文件目录，验证当前构建产物；无需修改仓库默认 runner 或生产网络配置：
+仓库现在通过 `.cargo/config.toml` 的 macOS target runner 默认调用
+`.cargo/macos-runner.py`；`cargo test`、`cargo test-all` 与 `cargo test-ws`（nextest）
+均使用此入口，无需设置一次性环境变量。runner 需要 Python 3，并保留 cwd、环境、参数、
+退出码与终止信号，在退出后清理自己的临时目录。CI 的 macOS job 同时运行 runner 契约测试
+和上述真实 HTTP 回归；`dev-0.5.0` 的推送/PR 也触发测试。
 
-```bash
-cat > /tmp/rust-sdk-isolated-test-runner.py <<'PY'
-import pathlib, shutil, subprocess, sys, tempfile
+Cargo runner 同样作用于 `cargo run` 和基准可执行文件。正常 Rust doctest 由 rustdoc 执行，
+不承诺经过 target runner；直接运行二进制或集成测试自行启动的子程序也不经过它。
+现有项目通过 cwd/显式路径访问资源，环境中的动态库搜索路径原样保留；未来引入依赖
+可执行文件相邻资源或 `@executable_path` 动态库的程序时，须为此新增覆盖。
+SIGKILL 无法执行清理；其它正常退出和可处理终止信号都清理临时目录。
 
-source = pathlib.Path(sys.argv[1]).resolve()
-with tempfile.TemporaryDirectory(prefix="rust-sdk-test-") as directory:
-    target = pathlib.Path(directory) / source.name
-    shutil.copy2(source, target)
-    result = subprocess.run([str(target), *sys.argv[2:]])
-    sys.exit(result.returncode if result.returncode >= 0 else 128 - result.returncode)
-PY
-CARGO_BUILD_JOBS=2 \
-CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="python3 /tmp/rust-sdk-isolated-test-runner.py" \
-  cargo test --workspace --all-features --no-fail-fast
-```
+此措施隔离系统代理初始化的目录扫描，不解决 rustc/链接器本身对巨大 target 目录的扫描。
+长期仍需维护 target 卫生。需要调试原始可执行路径时可显式覆盖 runner，例如
+`CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=env cargo test ...`（Intel 改用 X86_64）。
 
-Intel macOS 将环境变量名改为 `CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER`。runner 会在每个
-测试进程结束后清理自己创建的临时目录，并透传失败退出码；不改变测试参数、代理或
-TLS 配置。此命令针对 Cargo 原生测试，不能推定 nextest 或 doctest 也使用这个 runner。
-依赖可执行文件旁资源或相对动态库路径的其他项目需另行验证，不能直接照搬。
+配置行为参考 [Cargo runner](https://doc.rust-lang.org/cargo/reference/config.html#targettriplerunner)
+及 [nextest target runners](https://nexte.st/docs/features/target-runners/)。
 
 ## 并行注意
 
@@ -141,3 +136,24 @@ smcp-server-core 的 Socket.IO 集成测试对固定端口有依赖（CI 侧就�
   `--features agent,computer,server`，与 test-all 变体近似）。
 - 迭代中别让 IDE 的 rust-analyzer 与 cargo 同时打同一个 target/：RA 已隔离，
   命令行随意跑。
+
+## v0.5.0 工具观测与重连通知验收
+
+结构提交（启动/停止/配置更新）复用同一可用 MCP 会话的原始工具列表；alias、forbidden、
+工具 meta 仍按当前配置重算。公开 `refresh_tool_routes`/`refresh_tool_mapping` 强制重读所有
+上游。未发送 `tools/list_changed` 的静默变化，只在该 bundle 重读或强制刷新时检出，
+与 [Python SDK #222](https://github.com/A2C-SMCP/python-sdk/issues/222) 的通知时机对齐。
+失败 bundle 保留旧投影用于差异比较，读取失败不伪装成工具删除；新读取失败不会写入缓存。
+所有 bundle 均读取失败时仍返回错误；其它 bundle 有有效观测时可以提交其变化。
+
+Computer 在有入房意图但未确认成员关系时合并 config/tools/skills/desktop 更新；成功入房
+或自动回房后各补发一次。显式退房（包括发送失败）撤销意图及待发集合，换房不继承旧房
+事件。通知无 ACK，补发保证尝试发送，不声称对端确认送达。可运行真实设施回归：
+
+```sh
+cargo test -p smcp-server-core --test security_boundary_test -- --test-threads=1
+cargo test -p smcp-computer --test auth_dict_injection_test pending_updates -- --test-threads=1
+cargo test -p smcp-computer --test mcp_change_notifications -- --ignored --test-threads=1
+```
+
+最后一项需要 Node.js，含 6/20 个真实 MCP 子进程的 `tools/list` 计数及动态工具投影回归。

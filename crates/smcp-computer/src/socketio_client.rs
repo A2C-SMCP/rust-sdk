@@ -204,7 +204,13 @@ impl RuntimeLifecycle {
 struct OfficeMembership {
     desired: Option<String>,
     confirmed: Option<String>,
+    joining: bool,
     generation: u64,
+    // At most four dirty events, scoped to `desired`; revisions prevent an in-flight send
+    // from clearing a newer local change of the same kind.
+    pending_updates: [Option<u64>; 4],
+    update_revision: u64,
+    update_flush: Arc<tokio::sync::Mutex<()>>,
     /// Kernel session epoch (tf-rust-socketio `session_epoch`) of the transport
     /// that committed `connected` (#211); bound by the Connect callback and
     /// never modified by invalidation. The binding reads `session_epoch()` at
@@ -230,6 +236,10 @@ impl OfficeMembership {
         self.connected && self.generation == generation && self.desired.as_deref() == Some(desired)
     }
 
+    fn is_current_transport(&self, generation: u64, desired: &str, transport_epoch: u64) -> bool {
+        self.is_current(generation, desired) && self.transport_epoch == transport_epoch
+    }
+
     /// Invalidates the membership if `close_epoch` is the current transport
     /// epoch. A Close of an already-superseded transport must not clobber the
     /// newer connection's state (#211): a kernel `on_close_with_session`
@@ -249,8 +259,10 @@ impl OfficeMembership {
         self.next_generation();
         self.connected = false;
         self.confirmed = None;
+        self.joining = false;
         if !retain_desired {
             self.desired = None;
+            self.pending_updates = [None; 4];
         }
         (true, self.rejoin_task.take())
     }
@@ -264,10 +276,33 @@ impl OfficeMembership {
         self.next_generation();
         self.connected = false;
         self.confirmed = None;
+        self.joining = false;
         if !retain_desired {
             self.desired = None;
+            self.pending_updates = [None; 4];
         }
         self.rejoin_task.take()
+    }
+}
+
+/// A cancelled explicit join has no authoritative ACK. Keep recovery intent, but do not
+/// leave a permanent in-flight flag or claim the previous Office is still confirmed.
+struct OfficeJoinGuard {
+    membership: Arc<StdMutex<OfficeMembership>>,
+    status: RuntimeLifecycle,
+    generation: u64,
+}
+
+impl Drop for OfficeJoinGuard {
+    fn drop(&mut self) {
+        let mut membership = lock_office_membership(&self.membership);
+        if membership.generation == self.generation && membership.joining {
+            membership.joining = false;
+            membership.confirmed = None;
+            if membership.connected {
+                self.status.transition(LifecycleState::Connected);
+            }
+        }
     }
 }
 
@@ -689,6 +724,7 @@ impl SmcpComputerClient {
                     let generation = membership.next_generation();
                     membership.connected = true;
                     membership.confirmed = None;
+                    membership.joining = false;
                     let desired = membership.desired.clone();
                     if desired.is_none() {
                         status.transition(LifecycleState::Connected);
@@ -713,34 +749,51 @@ impl SmcpComputerClient {
                     let _operation = operation.lock().await;
                     {
                         let membership = lock_office_membership(&task_membership);
-                        if !membership.is_current(generation, &task_desired) {
+                        if !membership.is_current_transport(
+                            generation,
+                            &task_desired,
+                            client.session_epoch(),
+                        ) {
                             return;
                         }
                     }
 
                     let result =
                         Self::join_office_with_client(&client, &computer_name, &task_desired).await;
-                    let mut membership = lock_office_membership(&task_membership);
-                    if !membership.is_current(generation, &task_desired) {
-                        return;
-                    }
-                    membership.rejoin_task = None;
+                    {
+                        let mut membership = lock_office_membership(&task_membership);
+                        if !membership.is_current_transport(
+                            generation,
+                            &task_desired,
+                            client.session_epoch(),
+                        ) {
+                            return;
+                        }
+                        membership.rejoin_task = None;
 
-                    match result {
-                        Ok(()) => {
-                            membership.confirmed = Some(task_desired.clone());
-                            task_status.transition(LifecycleState::JoinedOffice);
-                            info!("Automatically rejoined office: {}", task_desired);
+                        match result {
+                            Ok(()) => {
+                                membership.confirmed = Some(task_desired.clone());
+                                task_status.transition(LifecycleState::JoinedOffice);
+                                info!("Automatically rejoined office: {}", task_desired);
+                            }
+                            Err(error) => {
+                                membership.pending_updates = [None; 4];
+                                membership.desired = None;
+                                membership.confirmed = None;
+                                task_status.transition(LifecycleState::Connected);
+                                error!(
+                                    "Failed to automatically rejoin office {}: {}",
+                                    task_desired, error
+                                );
+                            }
                         }
-                        Err(error) => {
-                            membership.desired = None;
-                            membership.confirmed = None;
-                            task_status.transition(LifecycleState::Connected);
-                            error!(
-                                "Failed to automatically rejoin office {}: {}",
-                                task_desired, error
-                            );
-                        }
+                    }
+                    drop(_operation);
+                    if let Err(error) =
+                        Self::flush_pending_updates(&client, &computer_name, &task_membership).await
+                    {
+                        warn!(%error, "Rejoined office with pending update notifications");
                     }
                 });
                 let abort_handle = task.abort_handle();
@@ -1114,7 +1167,11 @@ impl SmcpComputerClient {
 
         debug!("Joining office: {} as {}", office_id, computer_name);
         let _operation = self.office_operation.lock().await;
-        let (generation, previous_desired, previous_confirmed) = {
+        let flush = lock_office_membership(&self.office_membership)
+            .update_flush
+            .clone();
+        let sending = flush.lock().await;
+        let (generation, previous_desired, previous_confirmed, previous_pending) = {
             let mut membership = lock_office_membership(&self.office_membership);
             if !membership.connected {
                 return Err(ComputerError::InvalidState(
@@ -1124,37 +1181,72 @@ impl SmcpComputerClient {
             let generation = membership.next_generation();
             let previous_desired = membership.desired.clone();
             let previous_confirmed = membership.confirmed.clone();
+            let previous_pending = membership.pending_updates;
+            if membership.desired.as_deref() != Some(office_id) {
+                membership.pending_updates = [None; 4];
+            }
+            membership.joining = true;
             membership.desired = Some(office_id.to_string());
-            (generation, previous_desired, previous_confirmed)
+            (
+                generation,
+                previous_desired,
+                previous_confirmed,
+                previous_pending,
+            )
         };
 
+        let _join_guard = OfficeJoinGuard {
+            membership: self.office_membership.clone(),
+            status: self.runtime_status.clone(),
+            generation,
+        };
+        drop(sending);
         let result = Self::join_office_with_client(&self.client, computer_name, office_id).await;
-        let mut membership = lock_office_membership(&self.office_membership);
-        if !membership.is_current(generation, office_id) {
-            return Err(ComputerError::SocketIoError(
-                "Socket.IO connection changed while joining office".to_string(),
-            ));
-        }
+        let result = {
+            let mut membership = lock_office_membership(&self.office_membership);
+            if !membership.is_current_transport(generation, office_id, self.client.session_epoch())
+            {
+                return Err(ComputerError::SocketIoError(
+                    "Socket.IO connection changed while joining office".to_string(),
+                ));
+            }
 
-        match result {
-            Ok(()) => {
-                membership.confirmed = Some(office_id.to_string());
-                self.runtime_status.transition(LifecycleState::JoinedOffice);
-                info!("Successfully joined office: {}", office_id);
-                Ok(())
+            membership.joining = false;
+            match result {
+                Ok(()) => {
+                    membership.confirmed = Some(office_id.to_string());
+                    self.runtime_status.transition(LifecycleState::JoinedOffice);
+                    info!("Successfully joined office: {}", office_id);
+                    Ok(())
+                }
+                Err(error) => {
+                    if previous_desired.as_deref() != Some(office_id) {
+                        membership.pending_updates = previous_pending;
+                    }
+                    membership.desired = previous_desired;
+                    membership.confirmed = previous_confirmed;
+                    self.runtime_status
+                        .transition(if membership.confirmed.is_some() {
+                            LifecycleState::JoinedOffice
+                        } else {
+                            LifecycleState::Connected
+                        });
+                    Err(error)
+                }
             }
-            Err(error) => {
-                membership.desired = previous_desired;
-                membership.confirmed = previous_confirmed;
-                self.runtime_status
-                    .transition(if membership.confirmed.is_some() {
-                        LifecycleState::JoinedOffice
-                    } else {
-                        LifecycleState::Connected
-                    });
-                Err(error)
-            }
+        };
+        drop(_operation);
+        // Flush after a same-office rollback too: changes made while its ACK was pending
+        // still belong to the restored confirmed intent.
+        // Joining succeeded even if a best-effort notification send fails. Failed dirty bits
+        // remain available to a subsequent change or membership confirmation.
+        if let Err(error) =
+            Self::flush_pending_updates(&self.client, &self.computer_name, &self.office_membership)
+                .await
+        {
+            warn!(%error, "Joined office with pending update notifications");
         }
+        result
     }
 
     /// Send `server:join_office` over a specific namespace connection and validate its ACK.
@@ -1237,104 +1329,118 @@ impl SmcpComputerClient {
     pub async fn leave_office(&self, office_id: &str) -> ComputerResult<()> {
         debug!("Leaving office: {}", office_id);
         let _operation = self.office_operation.lock().await;
-        let (generation, previous_desired, previous_confirmed) = {
+        let flush = lock_office_membership(&self.office_membership)
+            .update_flush
+            .clone();
+        let _sending = flush.lock().await;
+        {
             let mut membership = lock_office_membership(&self.office_membership);
+            membership.next_generation();
+            membership.desired = None;
+            membership.confirmed = None;
+            membership.joining = false;
+            membership.pending_updates = [None; 4];
+            if let Some(task) = membership.rejoin_task.take() {
+                task.abort();
+            }
             if !membership.connected {
                 return Err(ComputerError::InvalidState(
                     "Socket.IO client not connected".to_string(),
                 ));
             }
-            let generation = membership.next_generation();
-            let previous_desired = membership.desired.take();
-            let previous_confirmed = membership.confirmed.clone();
-            (generation, previous_desired, previous_confirmed)
-        };
-
-        let req_data = serde_json::json!({
-            "office_id": office_id
-        });
-
-        let result = self.emit(SERVER_LEAVE_OFFICE, req_data).await;
-        let mut membership = lock_office_membership(&self.office_membership);
-        if membership.generation != generation || !membership.connected {
-            return Err(ComputerError::SocketIoError(
-                "Socket.IO connection changed while leaving office".to_string(),
-            ));
+            self.runtime_status.transition(LifecycleState::Connected);
         }
-        if let Err(error) = result {
-            membership.desired = previous_desired;
-            membership.confirmed = previous_confirmed;
-            self.runtime_status
-                .transition(if membership.confirmed.is_some() {
-                    LifecycleState::JoinedOffice
-                } else {
-                    LifecycleState::Connected
-                });
-            return Err(error);
-        }
-        membership.confirmed = None;
-        self.runtime_status.transition(LifecycleState::Connected);
-
-        info!("Left office: {}", office_id);
-        Ok(())
+        self.emit(
+            SERVER_LEAVE_OFFICE,
+            serde_json::json!({"office_id":office_id}),
+        )
+        .await
     }
 
-    async fn has_confirmed_office(&self) -> bool {
-        lock_office_membership(&self.office_membership)
-            .confirmed
-            .is_some()
+    async fn emit_update(&self, index: usize) -> ComputerResult<()> {
+        {
+            let mut membership = lock_office_membership(&self.office_membership);
+            if membership.desired.is_none() {
+                return Ok(());
+            }
+            membership.update_revision = membership.update_revision.wrapping_add(1);
+            membership.pending_updates[index] = Some(membership.update_revision);
+        }
+        Self::flush_pending_updates(&self.client, &self.computer_name, &self.office_membership)
+            .await
     }
 
-    /// 发送配置更新通知
-    /// Emit config update notification
+    async fn flush_pending_updates(
+        client: &Client,
+        computer_name: &str,
+        state: &StdMutex<OfficeMembership>,
+    ) -> ComputerResult<()> {
+        let flush = lock_office_membership(state).update_flush.clone();
+        let _flush = flush.lock().await;
+        let mut first_error = None;
+        for (index, event) in [
+            SERVER_UPDATE_CONFIG,
+            SERVER_UPDATE_TOOL_LIST,
+            SERVER_UPDATE_SKILLS,
+            SERVER_UPDATE_DESKTOP,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let snapshot = {
+                let membership = lock_office_membership(state);
+                if !membership.connected
+                    || membership.joining
+                    || membership.desired.is_none()
+                    || membership.confirmed != membership.desired
+                    || membership.transport_epoch != client.session_epoch()
+                {
+                    return first_error.map_or(Ok(()), Err);
+                }
+                membership.pending_updates[index]
+                    .map(|revision| (membership.generation, membership.transport_epoch, revision))
+            };
+            let Some((generation, transport_epoch, revision)) = snapshot else {
+                continue;
+            };
+            match client
+                .emit(event, serde_json::json!({"computer":computer_name}))
+                .await
+            {
+                Ok(()) => {
+                    let mut membership = lock_office_membership(state);
+                    if membership.generation == generation
+                        && membership.transport_epoch == transport_epoch
+                        && client.session_epoch() == transport_epoch
+                        && membership.pending_updates[index] == Some(revision)
+                    {
+                        membership.pending_updates[index] = None;
+                    }
+                }
+                Err(error) => {
+                    first_error
+                        .get_or_insert_with(|| ComputerError::SocketIoError(error.to_string()));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Emit or coalesce a config update until Office membership is confirmed.
     pub async fn emit_update_config(&self) -> ComputerResult<()> {
-        if self.has_confirmed_office().await {
-            let req_data = serde_json::json!({
-                "computer": self.computer_name
-            });
-            self.emit(SERVER_UPDATE_CONFIG, req_data).await?;
-            info!("Emitted config update notification");
-        }
-        Ok(())
+        self.emit_update(0).await
     }
-
-    /// 发送工具列表更新通知
-    /// Emit tool list update notification
+    /// Emit or coalesce a tool-list update until Office membership is confirmed.
     pub async fn emit_update_tool_list(&self) -> ComputerResult<()> {
-        if self.has_confirmed_office().await {
-            let req_data = serde_json::json!({
-                "computer": self.computer_name
-            });
-            self.emit(SERVER_UPDATE_TOOL_LIST, req_data).await?;
-            info!("Emitted tool list update notification");
-        }
-        Ok(())
+        self.emit_update(1).await
     }
-
-    /// 发送 SKILL 集合更新通知（`server:update_skills` → Server 广播 `notify:update_skills`，SRV-02 #50）
-    /// Emit SKILL-set update notification (INT-01 #68; handler/broadcast refined by SRV-02/#72)
+    /// Emit or coalesce a skills update until Office membership is confirmed.
     pub async fn emit_update_skills(&self) -> ComputerResult<()> {
-        if self.has_confirmed_office().await {
-            let req_data = serde_json::json!({
-                "computer": self.computer_name
-            });
-            self.emit(SERVER_UPDATE_SKILLS, req_data).await?;
-            info!("Emitted SKILL update notification");
-        }
-        Ok(())
+        self.emit_update(2).await
     }
-
-    /// 发送桌面更新通知
-    /// Emit desktop update notification
+    /// Emit or coalesce a desktop update until Office membership is confirmed.
     pub async fn emit_update_desktop(&self) -> ComputerResult<()> {
-        if self.has_confirmed_office().await {
-            let req_data = serde_json::json!({
-                "computer": self.computer_name
-            });
-            self.emit(SERVER_UPDATE_DESKTOP, req_data).await?;
-            info!("Emitted desktop update notification");
-        }
-        Ok(())
+        self.emit_update(3).await
     }
 
     /// 发送事件（不等待响应）
@@ -2374,6 +2480,20 @@ mod tests {
     use super::*;
     use crate::mcp_clients::model::{Tool, ToolAnnotations};
     use serde_json::json;
+
+    #[test]
+    fn office_confirmation_rejects_new_transport_before_callbacks_update_membership() {
+        let membership = OfficeMembership {
+            desired: Some("office".into()),
+            connected: true,
+            generation: 7,
+            transport_epoch: 3,
+            ..Default::default()
+        };
+        assert!(membership.is_current_transport(7, "office", 3));
+        assert!(!membership.is_current_transport(7, "office", 4));
+        assert!(!membership.is_current_transport(6, "office", 3));
+    }
 
     #[test]
     fn repro_old_close_after_new_connect_clears_new_office_membership() {
