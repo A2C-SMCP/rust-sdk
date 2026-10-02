@@ -886,6 +886,12 @@ impl AsyncSmcpAgent {
                     // 退避及用户回调不占门，让显式操作能够接管。
                     drop(operation);
                     match classify_rejoin_error(&error) {
+                        RejoinVerdict::Interrupted => {
+                            // Call invalidation can wake us before the lifecycle consumer
+                            // applies Close. It owns intent retention/clearing and will abort
+                            // this generation or schedule the next session's recovery.
+                            return;
+                        }
                         RejoinVerdict::TransientConflict => {
                             let delay = backoff_delay(attempt);
                             if !retry_fits_budget(started.elapsed(), delay, budget) {

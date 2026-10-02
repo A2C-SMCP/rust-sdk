@@ -20,21 +20,17 @@ use tf_rust_socketio::{
     CloseReason, Event, Payload, TransportType,
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// 事件处理器类型
 pub type EventHandler = Box<dyn FnMut(Payload, Client) + Send + Sync>;
 
 /// 传输层（namespace）生命周期事件——Agent 侧重连回房的**触发源**（#219）。
 ///
-/// 为什么单独成通道而不复用 [`SocketIoTransport::call`] 的断连位：回房决策需要**两类**信息，
-/// 断连位两者都不带——
-///
-/// 1. **断开原因**：只有「传输层断线且底层会自动重连」（`transport close`）才保留入房意图；
-///    服务端踢出（`io server disconnect`）与手工断开（`io client disconnect`）必须清空意图，
-///    否则会把用户主动退出 / 被踢掉的房在下次重连时**自动加回去**。
-/// 2. **会话 epoch**：迟到的 Close 可能属于**已被取代的旧 transport**（#211），须凭
-///    `Client::session_epoch` 判定并丢弃，否则旧会话的 Close 会清掉新会话的成员关系。
+/// The ordered lifecycle stream carries the close reason needed for membership recovery:
+/// transport loss retains intent, while explicit disconnect or a server kick clears it.
+/// It is separate from the coalesced call-invalidation snapshot, which only retains session
+/// epochs and retirement. Both are updated by the same real namespace callbacks.
 ///
 /// 事件按投递顺序经无界通道交给持有者；`Event::Connect` 与 `on_close_with_session` 两条注册路径均由
 /// 内核在 namespace 生命周期节点实际派发（`on_any` **不**接收这两类事件）。
@@ -94,15 +90,34 @@ pub enum NotificationMessage {
 pub struct SocketIoTransport {
     client: Client,
     namespace: String,
-    /// 断连信号发送端（AGT-05 #44 in-flight disconnect 容错）。`connect_with_handlers` 的 `on_any`
-    /// 收到底层 `Event::Close`/`Event::Error` 时 `send(true)`，使在途 [`Self::call`] 立即放弃等待——
-    /// 协议 0.2.2：Agent **MUST NOT** 靠 ack 超时判定断连，须用 disconnect/connect_error 事件。
-    /// `Arc` 持有以保活（watch::Sender 非 Clone）：发送端存活则 [`Self::call`] 的 `changed()` 不会因
-    /// 发送端析构而误判断连（`connect` 无处理器路径据此保持惰性而非常断）。仅作 RAII 保活、构造后不再读取。
-    #[allow(dead_code)]
-    disconnect_tx: Arc<watch::Sender<bool>>,
-    /// 断连信号接收端（粘滞：watch 保留最新值，关闭「断连早于 call」竞速窗）/ sticky disconnect receiver。
-    disconnect_rx: watch::Receiver<bool>,
+    /// Persistent session invalidation, shared by all calls and lifecycle callbacks.
+    call_state_tx: Arc<watch::Sender<CallSessionState>>,
+    call_state_rx: watch::Receiver<CallSessionState>,
+}
+
+/// A close remains observable even when reconnect overtakes a waiting call. Recording the
+/// greatest closed epoch also makes delayed old Close callbacks harmless to newer calls.
+#[derive(Clone, Copy, Debug, Default)]
+struct CallSessionState {
+    latest_epoch: u64,
+    closed_through: Option<u64>,
+    retired: bool,
+}
+
+impl CallSessionState {
+    fn connected(&mut self, epoch: u64) {
+        self.latest_epoch = self.latest_epoch.max(epoch);
+    }
+
+    fn closed(&mut self, epoch: u64) {
+        self.closed_through = Some(self.closed_through.map_or(epoch, |old| old.max(epoch)));
+    }
+
+    fn invalidates(&self, epoch: u64) -> bool {
+        self.retired
+            || self.latest_epoch > epoch
+            || self.closed_through.is_some_and(|closed| closed >= epoch)
+    }
 }
 
 impl SocketIoTransport {
@@ -129,8 +144,16 @@ impl SocketIoTransport {
         let (_tx, rx) = mpsc::unbounded_channel();
 
         // 连接服务器（polling-first，分类版本握手错误）
-        let client =
-            Self::connect_polling_first(&handshake_url, namespace, auth, headers, None).await?;
+        let (call_state_tx, call_state_rx) = watch::channel(CallSessionState::default());
+        let call_state_tx = Arc::new(call_state_tx);
+        let client = Self::connect_polling_first(
+            &handshake_url,
+            namespace,
+            auth,
+            headers,
+            call_state_tx.clone(),
+        )
+        .await?;
 
         // 等待一小段时间确保 Socket.IO namespace 连接完全建立
         // Wait for Socket.IO namespace connection to be fully established
@@ -141,16 +164,12 @@ impl SocketIoTransport {
             url, namespace
         );
 
-        // 无处理器路径：断连信号保持惰性（发送端经 Arc 保活、永不 send，call 仅靠 ack/timeout）。
-        // 断连事件容错需 on_any（见 connect_with_handlers），故此路径不提供——agent 走 connect_with_handlers。
-        let (disconnect_tx, disconnect_rx) = watch::channel(false);
-
         Ok((
             Self {
                 client,
                 namespace: namespace.to_string(),
-                disconnect_tx: Arc::new(disconnect_tx),
-                disconnect_rx,
+                call_state_tx,
+                call_state_rx,
             },
             rx,
         ))
@@ -171,8 +190,8 @@ impl SocketIoTransport {
 
     /// 创建新的传输层实例并注册事件处理器，**同时订阅 namespace 生命周期事件**（#219）。
     ///
-    /// `lifecycle` 为 `None` 时不注册任何额外回调，行为与
-    /// [`connect_with_handlers`](Self::connect_with_handlers) 逐字相同。
+    /// Call invalidation is always registered; `lifecycle` optionally also forwards events
+    /// to the Agent membership state machine.
     pub async fn connect_with_handlers_and_lifecycle(
         url: &str,
         namespace: &str,
@@ -204,25 +223,10 @@ impl SocketIoTransport {
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = Arc::new(tx);
 
-        // AGT-05 #44：断连信号。on_any 收到底层 Event::Close/Error → send(true)，使在途 call 立即
-        // 放弃等待（不靠 ack 超时）。watch 粘滞保留最新值，关闭「断连早于 call」竞速窗。
-        let (disconnect_tx, disconnect_rx) = watch::channel(false);
-        let disconnect_tx = Arc::new(disconnect_tx);
-        let handler_disconnect_tx = disconnect_tx.clone();
+        let (call_state_tx, call_state_rx) = watch::channel(CallSessionState::default());
+        let call_state_tx = Arc::new(call_state_tx);
 
         builder = builder.on_any(move |event, payload, _client| {
-            // 断连信号随底层连接状态翻转（协议 0.2.2 in-flight disconnect 容错——MUST NOT 靠 ack 超时）：
-            // Close/Error → true（断连）；Connect → false（重连恢复，清除粘滞断连位，避免重连后 call 误判）。
-            // call() 用 wait_for(|v| *v) 只认 true，故 Connect→false 的中间值不会误触发在途 call。
-            match &event {
-                Event::Close | Event::Error => {
-                    let _ = handler_disconnect_tx.send(true);
-                }
-                Event::Connect => {
-                    let _ = handler_disconnect_tx.send(false);
-                }
-                _ => {}
-            }
             let event_str = match event {
                 Event::Custom(s) => s,
                 _ => return Box::pin(async {}),
@@ -356,35 +360,8 @@ impl SocketIoTransport {
             })
         });
 
-        // #219：namespace 生命周期订阅。⚠️ 必须走 `on(Event::Connect)` + `on_close_with_session`——
-        // 内核 `callback()` 只对 `Message` / `Custom` 事件派发 `on_any`，故生命周期信号**不可能**从上面
-        // 那个 on_any 闭包取到（其 `Event::Close | Event::Error | Event::Connect` 分支因此恒不命中）。
         let observes_lifecycle = lifecycle.is_some();
-        if let Some(lifecycle_tx) = lifecycle {
-            let connect_tx = lifecycle_tx.clone();
-            builder = builder.on(Event::Connect, move |_payload, client| {
-                let tx = connect_tx.clone();
-                async move {
-                    // Connect 回调没有 epoch 载体（内核未提供 `on_connect_with_session`），按 Computer
-                    // 侧同款做法就地读当前会话 epoch。
-                    let _ = tx.send(TransportLifecycle::Connected {
-                        epoch: client.session_epoch(),
-                    });
-                }
-                .boxed()
-            });
-
-            builder = builder.on_close_with_session(move |payload, epoch, _client| {
-                let tx = lifecycle_tx.clone();
-                async move {
-                    let _ = tx.send(TransportLifecycle::Closed {
-                        reason: close_reason_from_payload(&payload),
-                        epoch,
-                    });
-                }
-                .boxed()
-            });
-        }
+        builder = Self::with_call_lifecycle(builder, call_state_tx.clone(), lifecycle);
 
         // 设置命名空间
         if !namespace.is_empty() {
@@ -436,8 +413,8 @@ impl SocketIoTransport {
             Self {
                 client,
                 namespace: namespace.to_string(),
-                disconnect_tx,
-                disconnect_rx,
+                call_state_tx,
+                call_state_rx,
             },
             rx,
         ))
@@ -445,16 +422,17 @@ impl SocketIoTransport {
 
     /// polling-first 连接（无事件处理器）/ polling-first connect (no event handlers)。
     ///
-    /// 构建 builder（namespace/auth/headers + [`TransportType::Any`]），交由 [`finish_connect`] 完成
-    /// 连接与版本握手错误分类。`_handlers` 占位保留扩展位（当前无处理器）。
+    /// Installs the same call-lifetime callbacks as the notification-enabled constructor,
+    /// then performs the shared version-handshake classification.
     async fn connect_polling_first(
         handshake_url: &str,
         namespace: &str,
         auth: Option<Value>,
         headers: HashMap<String, String>,
-        _handlers: Option<()>,
+        call_state: Arc<watch::Sender<CallSessionState>>,
     ) -> Result<Client> {
-        let mut builder = ClientBuilder::new(handshake_url);
+        let mut builder =
+            Self::with_call_lifecycle(ClientBuilder::new(handshake_url), call_state, None);
 
         // HS-02 #22: polling-first（见 [`connect_with_handlers`] 注释）。⚠️ 不可 WS-only。
         builder = builder.transport_type(TransportType::Any);
@@ -488,6 +466,37 @@ impl SocketIoTransport {
         }
     }
 
+    /// Subscribe to actual namespace callbacks; on_any receives only application events.
+    /// Update call invalidation before forwarding membership events so recovery cannot
+    /// strand the notification consumer on a call from the previous session.
+    fn with_call_lifecycle(
+        builder: ClientBuilder,
+        state: Arc<watch::Sender<CallSessionState>>,
+        lifecycle: Option<mpsc::UnboundedSender<TransportLifecycle>>,
+    ) -> ClientBuilder {
+        let connect_state = state.clone();
+        let connect_lifecycle = lifecycle.clone();
+        builder
+            .on(Event::Connect, move |_payload, client| {
+                let epoch = client.session_epoch();
+                connect_state.send_modify(|state| state.connected(epoch));
+                if let Some(tx) = &connect_lifecycle {
+                    let _ = tx.send(TransportLifecycle::Connected { epoch });
+                }
+                async {}.boxed()
+            })
+            .on_close_with_session(move |payload, epoch, _client| {
+                state.send_modify(|state| state.closed(epoch));
+                if let Some(tx) = &lifecycle {
+                    let _ = tx.send(TransportLifecycle::Closed {
+                        reason: close_reason_from_payload(&payload),
+                        epoch,
+                    });
+                }
+                async {}.boxed()
+            })
+    }
+
     /// 发送事件（不等待响应）
     pub async fn emit(&self, event: &str, data: Value) -> Result<()> {
         debug!("Emitting event: {}", event);
@@ -512,54 +521,36 @@ impl SocketIoTransport {
             async {}.boxed()
         };
 
-        self.client
-            .emit_with_ack(
-                event,
-                Payload::from(vec![data]),
-                Duration::from_secs(timeout_secs),
-                callback,
-            )
-            .await?;
-
-        // AGT-05 #44：把 ack 等待与断连信号竞速——Agent MUST NOT 靠 ack 超时判定断连（协议 0.2.2
-        // in-flight disconnect 容错）。`wait_for(|v| *v)` 只在断连位为 true 时就绪：粘滞——若进入前已断连
-        // 立即就绪（关闭「断连早于 call」竞速窗）；且忽略重连时 Connect→false 的中间值，不误触发。
-        //
-        // 测试覆盖说明：本竞速逻辑依赖真实 socket 事件（Event::Close/Error），按项目"无 mock transport"
-        // 约定（SocketIoTransport 为具体 struct）无法单测；其端到端覆盖（mid-call 杀连接）随 #72 socketio
-        // 接线一并补 e2e。逻辑正确性：粘滞读 + Err（发送端析构=传输析构）亦视为断连。
-        let mut disconnect_rx = self.disconnect_rx.clone();
-
-        tokio::select! {
-            // biased：ack 与断连同时就绪时优先取真实响应（避免已到达的结果被误判为断连）。
+        let epoch = self.client.session_epoch();
+        let mut state = self.call_state_rx.clone();
+        let lost = || SmcpAgentError::connection("connection lost during call");
+        if state.borrow().invalidates(epoch) {
+            return Err(lost());
+        }
+        // The fence covers both sending and waiting for ACK. A boolean reset on Connect
+        // could miss Close -> Connect while this future was not scheduled.
+        let response = tokio::select! {
             biased;
-            recv = rx => match recv {
-                // 从响应中提取 JSON 数据（拆 socket.io ack 外层 args 数组，见 extract_ack_value）。
-                Ok(Payload::Text(values, _)) => extract_ack_value(values),
-                #[allow(deprecated)]
-                Ok(Payload::String(s, _)) => {
-                    // 尝试解析字符串为 JSON（deprecated 路径；ack 实际走 Payload::Text）。同样拆一层
-                    // args 数组（对对象是 no-op，安全）。
-                    serde_json::from_str(&s)
-                        .map(flatten_ack_arg)
-                        .map_err(SmcpAgentError::from)
-                }
-                Ok(Payload::Binary(_, _)) => {
-                    Err(SmcpAgentError::internal("Binary response not supported"))
-                }
-                Err(_) => {
-                    error!("Timeout while calling event: {}", event);
-                    Err(SmcpAgentError::Timeout)
-                }
-            },
-            // 底层 socket 断连 / 连接错误（on_any 收到 Event::Close/Error 置 true）→ 立即判定断连，
-            // 不空等满 ack 超时。`wait_for` 返回 Err（发送端析构 = 传输析构）同样视为断连。
-            _ = disconnect_rx.wait_for(|disconnected| *disconnected) => {
-                warn!("Connection lost during in-flight call: {}", event);
-                Err(SmcpAgentError::connection(
-                    "connection lost (disconnect/connect_error) during call",
-                ))
-            }
+            _ = state.wait_for(|state| state.invalidates(epoch)) => return Err(lost()),
+            response = async {
+                self.client.emit_with_ack(
+                    event, Payload::from(vec![data]), Duration::from_secs(timeout_secs), callback,
+                ).await?;
+                rx.await.map_err(|_| SmcpAgentError::Timeout)
+            } => response,
+        };
+        // ACK and lifecycle callbacks run concurrently. Never publish an old-session ACK
+        // merely because its receiver became ready before the close callback ran.
+        if state.borrow().invalidates(epoch) || self.client.session_epoch() != epoch {
+            return Err(lost());
+        }
+        match response? {
+            Payload::Text(values, _) => extract_ack_value(values),
+            #[allow(deprecated)]
+            Payload::String(value, _) => serde_json::from_str(&value)
+                .map(flatten_ack_arg)
+                .map_err(SmcpAgentError::from),
+            Payload::Binary(_, _) => Err(SmcpAgentError::internal("Binary response not supported")),
         }
     }
 
@@ -571,7 +562,7 @@ impl SocketIoTransport {
     /// 关闭共享 transport。释放 Arc 不会停止底层持有 Client 克隆的轮询任务。
     pub(crate) async fn close(&self) -> Result<()> {
         debug!("Disconnecting from server");
-        let _ = self.disconnect_tx.send(true);
+        self.call_state_tx.send_modify(|state| state.retired = true);
         self.client.disconnect().await.map_err(SmcpAgentError::from)
     }
 
@@ -622,6 +613,46 @@ mod tests {
     use super::*;
     use crate::response::{classify_tool_call_outcome, ensure_req_id, ToolCallOutcome};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn call_session_fence_survives_coalesced_reconnect_and_late_close() {
+        let (tx, mut old_call) = watch::channel(CallSessionState::default());
+        tx.send_modify(|state| state.connected(1));
+        old_call.borrow_and_update();
+        // Both transitions happen before the old waiter is polled: watch exposes only
+        // the latest snapshot, so a resettable boolean would lose this disconnect.
+        tx.send_modify(|state| state.closed(1));
+        tx.send_modify(|state| state.connected(2));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            old_call.wait_for(|s| s.invalidates(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut new_call = tx.subscribe();
+        tx.send_modify(|state| state.closed(1));
+        tx.send_modify(|state| state.connected(1));
+        assert!(
+            !new_call.borrow().invalidates(2),
+            "old callbacks cancelled a new call"
+        );
+        tx.send_modify(|state| state.closed(2));
+        tx.send_modify(|state| state.connected(2));
+        assert!(
+            new_call.borrow().invalidates(2),
+            "late Connect reopened a closed session"
+        );
+        tx.send_modify(|state| state.retired = true);
+        tx.send_modify(|state| state.connected(3));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            new_call.wait_for(|s| s.invalidates(3)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
 
     // #82：socket.io ack 数据在网线上恒以 args 数组 `[<value>]` 投递——tf-rust-socketio `handle_ack`
     // 用 `Payload::from(String)` 把整帧 args 数组 JSON 文本解析成**单元素** `Vec<Value>`，其唯一元素
