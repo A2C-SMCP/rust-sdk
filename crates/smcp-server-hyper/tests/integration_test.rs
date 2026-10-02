@@ -497,14 +497,11 @@ async fn test_agent_computer_join_office() {
 async fn test_list_room_sessions() {
     let server = TestServer::new().await;
 
-    // 创建多个客户端
+    // 创建客户端（protocol#66：一房一 Agent + 至多一台 Computer）
     let agent1 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
     let computer1 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
-    // 等待连接建立
-    sleep(Duration::from_millis(100)).await;
-    let computer2 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
 
@@ -518,7 +515,7 @@ async fn test_list_room_sessions() {
         .await
         .unwrap();
 
-    // Computers 加入办公室
+    // Computer 加入办公室
     let comp1_data = json!({
         "role": "computer",
         "name": "computer-1",
@@ -526,16 +523,6 @@ async fn test_list_room_sessions() {
     });
     let _response =
         emit_event_with_ack_validation(&computer1, "server:join_office", comp1_data, true)
-            .await
-            .unwrap();
-
-    let comp2_data = json!({
-        "role": "computer",
-        "name": "computer-2",
-        "office_id": "office-list-test"
-    });
-    let _response =
-        emit_event_with_ack_validation(&computer2, "server:join_office", comp2_data, true)
             .await
             .unwrap();
 
@@ -560,8 +547,8 @@ async fn test_list_room_sessions() {
     if let Some(response_array) = list_response.as_array() {
         if let Some(list_room_ret) = response_array.first() {
             if let Some(sessions) = list_room_ret.get("sessions").and_then(|s| s.as_array()) {
-                // 验证包含2个computer和1个agent
-                assert_eq!(sessions.len(), 3, "Should have 3 sessions in the room");
+                // 验证包含1个computer和1个agent（protocol#66 每 role 一席）
+                assert_eq!(sessions.len(), 2, "Should have 2 sessions in the room");
 
                 let computer_count = sessions
                     .iter()
@@ -572,7 +559,7 @@ async fn test_list_room_sessions() {
                     .filter(|s| s.get("role").and_then(|r| r.as_str()) == Some("agent"))
                     .count();
 
-                assert_eq!(computer_count, 2, "Should have 2 computers");
+                assert_eq!(computer_count, 1, "Should have 1 computer");
                 assert_eq!(agent_count, 1, "Should have 1 agent");
             } else {
                 panic!("Response should contain sessions array");
@@ -650,7 +637,7 @@ async fn test_list_room_reports_a2c_version() {
 }
 
 #[tokio::test]
-async fn test_computer_name_conflict() {
+async fn test_computer_seat_taken() {
     let server = TestServer::new().await;
 
     // 第一个 Computer 加入
@@ -682,7 +669,7 @@ async fn test_computer_name_conflict() {
         "office_id": "office-conflict-test"
     });
 
-    // 第二个 Computer 应该因为名称冲突而失败
+    // 第二个 Computer 应该因为**席位已占**而失败（protocol#66：每 role 一席 ⇒ 4101，不再有 4105）。
     let response2 =
         emit_event_with_ack_validation(&computer2, "server:join_office", join_data2, false)
             .await
@@ -692,10 +679,14 @@ async fn test_computer_name_conflict() {
         .as_array()
         .and_then(|args| args.first())
         .unwrap_or(&response2);
-    assert_eq!(response2["code"], smcp::error_codes::NAME_CONFLICT);
-    assert!(response2["message"].is_string());
+    assert_eq!(response2["code"], smcp::error_codes::ROOM_FULL);
+    assert_eq!(response2["message"], "Room already has a computer");
+    assert_eq!(
+        response2["details"],
+        json!({"office_id": "office-conflict-test", "role": "computer"})
+    );
 
-    // 不同名称应该可以加入
+    // 不同名称的第二台 Computer：同样回 4101（一房至多一台 Computer，与名字无关）。
     let computer3 = create_managed_client(server.addr, SMCP_NAMESPACE).await;
     // 等待连接建立
     sleep(Duration::from_millis(100)).await;
@@ -705,13 +696,20 @@ async fn test_computer_name_conflict() {
         "office_id": "office-conflict-test"
     });
 
-    // 不同名称应该可以成功加入
     let response3 =
-        emit_event_with_ack_validation(&computer3, "server:join_office", join_data3, true)
+        emit_event_with_ack_validation(&computer3, "server:join_office", join_data3, false)
             .await
             .unwrap();
-    // 成功回**零参**空 ack `[]`。
-    assert_eq!(response3, serde_json::json!([]));
+    let response3 = response3
+        .as_array()
+        .and_then(|args| args.first())
+        .unwrap_or(&response3);
+    assert_eq!(
+        response3["code"],
+        smcp::error_codes::ROOM_FULL,
+        "不同名第二台也必须被席位规则拒绝，实得 {response3}"
+    );
+    assert_eq!(response3["message"], "Room already has a computer");
 }
 
 #[tokio::test]

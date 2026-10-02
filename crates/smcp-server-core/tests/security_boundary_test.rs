@@ -120,8 +120,8 @@ async fn join_room_conflicts_return_distinct_flat_codes() {
     join_office(&moving_agent, Role::Agent, "office-b", "moving").await;
     join_office(&first_computer, Role::Computer, "office-a", "shared").await;
 
-    // 4101：目标房已有 Agent。文案与 details **逐字**对齐协议 error-handling.md §Room Full 与
-    // python-sdk `_ROOM_REJECTION_MESSAGES` / `build_room_rejection_error`（#226 P1-5）。
+    // 4101（Agent 席）：目标房已有 Agent。文案与 details **逐字**对齐协议 error-handling.md
+    // §Room Full（protocol#66 泛化后含 `role`）与 python-sdk `build_room_rejection_error`。
     let full = emit_with_ack(
         &second_agent,
         events::SERVER_JOIN_OFFICE,
@@ -130,7 +130,10 @@ async fn join_room_conflicts_return_distinct_flat_codes() {
     .await;
     assert_eq!(full["code"], 4101);
     assert_eq!(full["message"], "Room already has an agent");
-    assert_eq!(full["details"], json!({"office_id": "office-a"}));
+    assert_eq!(
+        full["details"],
+        json!({"office_id": "office-a", "role": "agent"})
+    );
 
     // 4106：Agent 已在其它房。`details.office_id` 报的是会话**当前**所在房（office-b），
     // **不是**被拒的目标房（office-c）——报错目标房会让客户端误判自己身在何处。
@@ -144,23 +147,24 @@ async fn join_room_conflicts_return_distinct_flat_codes() {
     assert_eq!(already_in_room["message"], "Agent already in another room");
     assert_eq!(already_in_room["details"], json!({"office_id": "office-b"}));
 
-    // 4105：房内已有**同 role 同名**会话（跨 role 同名是允许的，故此处用两台 Computer）。
-    let name_conflict = emit_with_ack(
+    // 4101（Computer 席，protocol#66）：目标房已有 Computer——**同 role 席位**语义，与 name 无关
+    // （`4105` 已转预留码，MUST NOT 产出；这里用**不同名**第二台，进一步证明与名字无关）。
+    let computer_seat = emit_with_ack(
         &second_computer,
         events::SERVER_JOIN_OFFICE,
-        json!({"role": "computer", "name": "shared", "office_id": "office-a"}),
+        json!({"role": "computer", "name": "another", "office_id": "office-a"}),
     )
     .await;
-    assert_eq!(name_conflict["code"], 4105);
-    assert_eq!(name_conflict["message"], "Name already taken in room");
+    assert_eq!(computer_seat["code"], 4101);
+    assert_eq!(computer_seat["message"], "Room already has a computer");
     assert_eq!(
-        name_conflict["details"],
+        computer_seat["details"],
         json!({"office_id": "office-a", "role": "computer"})
     );
 
     // 拒绝载荷**只**含 canonical 文案与自身上下文：不得出现内部错误类名 / `"Session error: "` 前缀
     // （历史实现直接序列化 `SessionError` 的 Display 上 wire）。
-    for payload in [&full, &already_in_room, &name_conflict] {
+    for payload in [&full, &already_in_room, &computer_seat] {
         let serialized = payload.to_string();
         assert!(
             !serialized.contains("Session error"),
@@ -531,7 +535,7 @@ async fn identity_claim_mismatch_returns_flat_403_without_details() {
     assert!(name_mismatch.get("details").is_none());
 
     // ③ 对照：身份**完全一致**的重复入房 MUST 幂等成功（空 ack）——证明 403 不是「重复 join 就拒」，
-    // 也证明前两次拒绝没有污染会话状态（否则这里会因 name 预留冲突而 4105）。
+    // 也证明前两次拒绝没有污染会话状态（否则这里会因房占用/席位判定误伤自会话）。
     let same_identity = emit_with_ack(
         &client,
         events::SERVER_JOIN_OFFICE,
@@ -744,7 +748,13 @@ async fn broadcasts_use_session_identity_instead_of_claimed_identity() {
             },
         )
         .await;
-        join_office(&recipient, Role::Computer, "identities", "recipient").await;
+        // 每 role 一席（protocol#66）：接收方必须取与发送方**相对**的角色
+        // （update_* 由 Computer 发、Agent 收；tool_call_cancel 由 Agent 发、Computer 收）。
+        let recipient_role = match role {
+            Role::Computer => Role::Agent,
+            Role::Agent => Role::Computer,
+        };
+        join_office(&recipient, recipient_role, "identities", "recipient").await;
         let sender = create_test_client(&server.url(), SMCP_NAMESPACE).await;
         join_office(&sender, role, "identities", "actual").await;
         sender

@@ -333,80 +333,94 @@ async fn test_get_tools_cross_office_permission_denied() {
     server.shutdown();
 }
 
+/// protocol#66：一房至多一台 Computer——Agent 只能查询**本房**那一台。
+///
+/// 旧版「Agent 同房分别查两台 Computer」在「每 role 一席」下不可再构造（第二台入房即 4101）。
+/// 本用例改为钉两条边界：
+/// ① 本房在册 Computer 的请求正常转发——以**可应答桩**（`create_computer_stub`）作 target，
+///    断言拿到桩的真实回包（无条件断言；「没收到 404」不作为通过判据）；
+/// ② 存在于**其它房**的 Computer 名在本房解析不到 ⇒ 统一 flat `404`（不得因它存在于别处而改码，
+///    否则可被用来探测其它房的成员）。
 #[tokio::test]
-async fn test_get_tools_multiple_computers() {
+async fn test_get_tools_single_computer_per_room() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let server = SmcpTestServer::start().await;
     let server_url = server.url();
 
-    // 创建多个Computer客户端
-    let computer1_client = create_test_client(&server_url, "smcp").await;
-
-    // 等待确保第一个Computer客户端连接完全建立
+    // 本房 Computer 用可应答桩（真实证明「可达」）；他房 Computer 用普通客户端即可。
+    let computer1_client = create_computer_stub(&server_url).await;
     sleep(Duration::from_millis(200)).await;
-
     let computer2_client = create_test_client(&server_url, "smcp").await;
-
-    // 等待确保第二个Computer客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
 
-    // Computers加入同一办公室
+    // 两台 Computer 分居两房（一房至多一台）。
     join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
-    join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
+    join_office(&computer2_client, Role::Computer, "office2", "computer2").await;
 
-    // 创建Agent客户端
     let agent_client = create_test_client(&server_url, "smcp").await;
-
-    // 等待确保Agent客户端连接完全建立
     sleep(Duration::from_millis(200)).await;
-
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
 
-    // Agent分别获取两个Computer的工具列表
-    for computer_name in ["computer1", "computer2"] {
-        let get_tools_req = GetToolsReq {
-            base: AgentCallData {
-                agent: "agent1".to_string(),
-                req_id: ReqId(format!("req_{}", computer_name)),
-            },
-            computer: computer_name.to_string(),
-        };
+    // ① 本房 computer1：请求必须被路由到桩并拿到其真实应答（req_id 回显 + tools 透传）。
+    let get_tools_req = GetToolsReq {
+        base: AgentCallData {
+            agent: "agent1".to_string(),
+            req_id: ReqId("req_computer1".to_string()),
+        },
+        computer: "computer1".to_string(),
+    };
+    let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
+    agent_client
+        .emit_with_ack(
+            "client:get_tools",
+            json!(get_tools_req),
+            Duration::from_secs(5),
+            ack_to_sender(result_tx, normalize_ack),
+        )
+        .await
+        .expect("get_tools emit_with_ack failed");
+    let response = tokio::time::timeout(Duration::from_secs(5), result_rx)
+        .await
+        .expect("本房 Computer 必须可路由并应答，不得超时")
+        .unwrap();
+    assert!(
+        response.get("code").is_none(),
+        "本房 Computer 必须可路由（不得回任何协议错误），实得 {response}"
+    );
+    assert_eq!(
+        response["req_id"], "req_computer1",
+        "桩应答应原样回显 req_id，实得 {response}"
+    );
+    assert_eq!(response["tools"], json!([]));
 
-        // 创建channel接收响应
-        let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
-
-        // 发送请求
-        agent_client
-            .emit_with_ack(
-                "client:get_tools",
-                json!(get_tools_req),
-                Duration::from_secs(5),
-                ack_to_sender(result_tx, |p| match p {
-                    Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
-                    _ => serde_json::Value::Null,
-                }),
-            )
-            .await
-            .expect("get_tools emit_with_ack failed");
-
-        // 等待响应
-        let result = tokio::time::timeout(Duration::from_secs(5), result_rx).await;
-
-        // 验证收到了响应（即使Computer没有实际返回工具列表）
-        // tf_rust_socketio 客户端无法在 on 回调中发送 ACK 响应，所以超时是预期的
-        match result {
-            Ok(Ok(_response)) => {
-                // 如果意外收到响应，那也可以
-            }
-            Ok(Err(_e)) => {
-                // 超时错误是预期的
-            }
-            Err(_) => {
-                // 超时是预期的
-            }
-        }
-    }
+    // ② 他房 computer2：本房解析不到 ⇒ flat 404（统一形态，不泄露存在性）。
+    let cross_room_req = GetToolsReq {
+        base: AgentCallData {
+            agent: "agent1".to_string(),
+            req_id: ReqId("req_computer2".to_string()),
+        },
+        computer: "computer2".to_string(),
+    };
+    let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
+    agent_client
+        .emit_with_ack(
+            "client:get_tools",
+            json!(cross_room_req),
+            Duration::from_secs(5),
+            ack_to_sender(result_tx, normalize_ack),
+        )
+        .await
+        .expect("cross-room get_tools emit_with_ack failed");
+    let reject = tokio::time::timeout(Duration::from_secs(5), result_rx)
+        .await
+        .expect("cross-room get_tools must be answered immediately (404), not hang")
+        .unwrap();
+    assert_eq!(
+        reject["code"],
+        smcp::error_codes::NOT_FOUND,
+        "存在于其它房的 Computer 必须按 404 统一处理，实得 {reject}"
+    );
 
     // 清理
     computer1_client.disconnect().await.unwrap();
