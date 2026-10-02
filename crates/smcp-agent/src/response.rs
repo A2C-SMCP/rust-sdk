@@ -20,6 +20,32 @@ use smcp::{GetBlobRet, GetComputerConfigRet, GetResourcesRet};
 use crate::error::{Result, SmcpAgentError};
 use crate::protocol_error::raise_for_error_payload;
 
+/// 从 `server:list_room` 会话表投影出「房内唯一 Computer」（纯函数；protocol#66）。
+///
+/// 「每 role 一席」下任一时刻房内至多一台 Computer；`>1` 属服务端违反协议不变量 ⇒ 判协议违规
+/// 如实失败（**不**挑第一台——把不变量违背冻结进调用方本地状态是最坏的静默降级）。
+///
+/// Project the room's single Computer out of a `list_room` session table; more than one is a
+/// protocol violation, reported loudly rather than silently picking the first.
+pub(crate) fn parse_single_computer(
+    sessions: Vec<smcp::SessionInfo>,
+    office_id: &str,
+) -> Result<Option<smcp::SessionInfo>> {
+    let mut computers: Vec<smcp::SessionInfo> = sessions
+        .into_iter()
+        .filter(|session| session.role == smcp::Role::Computer)
+        .collect();
+
+    match computers.len() {
+        0 => Ok(None),
+        1 => Ok(computers.pop()),
+        count => Err(SmcpAgentError::TooManyComputersInOffice {
+            office_id: office_id.to_string(),
+            count,
+        }),
+    }
+}
+
 /// 校验响应回显的 `req_id` 与请求一致 / validate the echoed `req_id` matches the request。
 ///
 /// 缺失 → [`SmcpAgentError::internal`]；不一致 → [`SmcpAgentError::ReqIdMismatch`]。语义对标
@@ -420,6 +446,60 @@ mod tests {
         assert!(
             matches!(err, SmcpAgentError::ReqIdMismatch { .. }),
             "got {err:?}"
+        );
+    }
+
+    /// protocol#66：`get_computer_in_office` 的投影纯函数 —— 0 台 ⇒ `None`、恰 1 台 ⇒ `Some`、
+    /// **多于 1 台 ⇒ 协议违规错误**（不挑第一台）。
+    #[test]
+    fn parse_single_computer_projects_zero_one_or_violation() {
+        use smcp::{Role, SessionInfo};
+
+        fn session(name: &str, role: Role) -> SessionInfo {
+            SessionInfo {
+                sid: format!("sid-{name}"),
+                name: name.to_string(),
+                role,
+                office_id: "office-a".to_string(),
+                a2c_version: None,
+            }
+        }
+
+        // 空房 / 只有 Agent ⇒ None（SessionInfo 无 PartialEq，按 is_none 断言）。
+        assert!(
+            parse_single_computer(vec![], "office-a").unwrap().is_none(),
+            "空房应返回 None"
+        );
+        assert!(
+            parse_single_computer(vec![session("a", Role::Agent)], "office-a")
+                .unwrap()
+                .is_none(),
+            "只有 Agent 的房间也应返回 None"
+        );
+
+        // 恰一台 Computer（混有 Agent）⇒ Some(该 Computer)。
+        let one = parse_single_computer(
+            vec![session("a", Role::Agent), session("c", Role::Computer)],
+            "office-a",
+        )
+        .unwrap()
+        .expect("应投影出唯一 Computer");
+        assert_eq!(one.name, "c");
+        assert_eq!(one.role, Role::Computer);
+
+        // 多于一台 ⇒ 协议违规（响亮失败，绝不挑第一台）。
+        let err = parse_single_computer(
+            vec![session("c1", Role::Computer), session("c2", Role::Computer)],
+            "office-a",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SmcpAgentError::TooManyComputersInOffice { ref office_id, count: 2 }
+                    if office_id == "office-a"
+            ),
+            "多于一台 Computer 必须判协议违规，got {err:?}"
         );
     }
 }

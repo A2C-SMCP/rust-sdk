@@ -528,15 +528,16 @@ impl AsyncSmcpAgent {
     /// 加入办公室（**等 ack**，取得服务端裁决）
     ///
     /// 协议 v0.5.0：`server:join_office` 成功回空 ack、失败回 flat `ErrorPayload`
-    /// （`400` / `403` / `4101` / `4105` / `4106`）。历史实现是无 ack 的 `emit` + 直接记
+    /// （`400` / `403` / `4101` / `4106`）。历史实现是无 ack 的 `emit` + 直接记
     /// `"Joined office"`——被 `4101` 拒绝时日志写「入房成功」并返回 `Ok(())`，此后所有 `client:*`
     /// 调用都从一个**从未进入**的房发起，拿回调用方无法解释的 404（#226 P0-1，本 SDK 主要消费者的
     /// 契约缺席）。
     ///
     /// 故此处改为 `call`：拿到 ack 后由 [`parse_room_ack`] 裁决——空 ack ⇒ `Ok(())`；
     /// 含 `code` 的 flat ErrorPayload ⇒ [`SmcpAgentError::Protocol`]（带 code / message / details，
-    /// 调用方可按码分流：`4101` / `4105` 是传输层重连后的瞬态冲突，`4106` / `400` 永久不可重试）。
-    /// 形状不认识同样判失败（宁严勿宽），**绝不**把未获裁决读成成功。
+    /// 调用方可按码分流：`4101`（本 role 席位被占）是传输层重连后的瞬态冲突，`4106` / `400`
+    /// 永久不可重试；`4105` 为预留码，收到按协议违规记录）。形状不认识同样判失败（宁严勿宽），
+    /// **绝不**把未获裁决读成成功。
     ///
     /// # 兼作意图声明点（#219）
     ///
@@ -806,12 +807,12 @@ impl AsyncSmcpAgent {
     ///
     /// 与显式 [`Self::join_office`] 的关键差异是**允许对瞬态冲突退避重试**：静默断线后服务端仍可能
     /// 持有本客户端的旧会话（回收时刻由传输层心跳决定，socket.io 默认最长 45s），此时重放会撞上
-    /// `4101` / `4105` 被拒。协议 error-handling.md §建议的重试策略要求客户端在**恢复路径**上做有界
-    /// 退避重试（单次尝试为下限、预算可配）。
+    /// `4101`（本 role 席位被占，protocol#66 泛化后含 Computer 席）被拒。协议 error-handling.md
+    /// §建议的重试策略要求客户端在**恢复路径**上做有界退避重试（单次尝试为下限、预算可配）。
     ///
     /// **为什么不是事件驱动**：协议明确禁止服务端收编 / 驱逐旧会话（room-model.md §静默断线与
     /// 会话回收——服务端仅凭 `(role, name)` 无法区分僵尸会话与真实同名客户端），故不存在
-    /// 「旧会话已回收」事件可供等待；唯一机器可判的信号就是这两个拒绝码本身。
+    /// 「旧会话已回收」事件可供等待；唯一机器可判的信号就是这个拒绝码本身。
     ///
     /// 结果只在**世代仍新鲜**时落账；失败一律清空成员状态（回退到 `Connected`）并报错，绝不静默假装
     /// 在线。
@@ -1586,6 +1587,21 @@ impl AsyncSmcpAgent {
             office_id
         );
         Ok(sessions)
+    }
+
+    /// 获取房内**唯一**的 Computer（protocol#66 单数便捷方法）。
+    ///
+    /// 「每 role 一席」下任一时刻房内至多一台 Computer（协议 room-model.md §成员类型），故调用方
+    /// 不再需要「遍历 / gather 房内全部 Computer」——工具聚合 / SKILL / Desktop 均按单台处理；
+    /// 换绑 Computer 由 `notify:leave_office` → `notify:enter_office` 表达，本方法随时反映当前值。
+    ///
+    /// 返回 `Ok(None)` = 房内暂无 Computer。服务端报告**多于一台** ⇒ 判服务端协议违规（与
+    /// [`SmcpAgentError::ReqIdMismatch`] 同口径，**不**挑第一台——详见错误变体文档）。
+    ///
+    /// Get the room's single Computer (at most one under protocol#66); `None` when the room has none.
+    pub async fn get_computer_in_office(&self, office_id: &str) -> Result<Option<SessionInfo>> {
+        let sessions = self.list_room(office_id).await?;
+        crate::response::parse_single_computer(sessions, office_id)
     }
 }
 

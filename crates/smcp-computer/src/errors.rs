@@ -116,15 +116,16 @@ pub enum ComputerError {
     ///
     /// 与 [`Self::ProtocolError`] 的分工（#226 复审 🟡4）：`ProtocolError(String)` 是**本端**发现的
     /// 协议违约（字符串描述即可，没有对端码）；本变体承载**对端裁决**，故必须让消费方**按码分流**——
-    /// 协议 §建议的重试策略把 `4101` / `4105` 定为传输层重连后的瞬态冲突（可有界退避重试），
-    /// `4106` / `400` 为永久失败。历史实现把整包 `format!` 成 `"room join rejected (4101): …"`，
+    /// 协议 §建议的重试策略把 `4101`（本 role 席位被占，protocol#66 泛化后含 Computer 席）定为
+    /// 传输层重连后的瞬态冲突（可有界退避重试），`4106` / `400` 为永久失败；`4105` 已转预留码
+    /// （收到即协议违规，绝不重试）。历史实现把整包 `format!` 成 `"room join rejected (4101): …"`，
     /// 消费方只能靠字符串解析（#219 的按码退避因此无从实现）。
     ///
     /// Carries the peer's structured rejection verbatim so consumers can dispatch on `code` instead of
     /// parsing a formatted string.
     #[error("Protocol rejection ({code}): {message}")]
     ProtocolRejection {
-        /// 对端 flat `ErrorPayload.code`（如 `4101` / `4105` / `4106`）。
+        /// 对端 flat `ErrorPayload.code`（如 `4101` / `4106`；`4105` 为预留码，仅可能来自违规对端）。
         code: i64,
         /// 对端 `message`（协议 canonical 文案）。
         message: String,
@@ -240,7 +241,7 @@ impl ComputerError {
 
             // 协议错误 / Protocol errors
             ComputerError::ProtocolError(_) => 500, // INTERNAL_ERROR
-            // 对端结构化拒绝：码空间就是协议码本身（4101/4105/4106…），原样透出以便按码分流。
+            // 对端结构化拒绝：码空间就是协议码本身（4101/4102/4105/4106…），原样透出以便按码分流。
             ComputerError::ProtocolRejection { code, .. } => *code as i32,
             // 本地身份不变量（#224）：与对端对同一违约的裁决同码，消费方分流口径不变。
             ComputerError::IdentityMismatch { .. } => 403, // FORBIDDEN
@@ -336,8 +337,8 @@ mod tests {
     use super::*;
 
     /// #226 复审 🟡4：对端结构化拒绝 MUST 保留 `code` / `details`，使消费方**按码分流**
-    /// （瞬态 `4101` / `4105` vs 永久 `4106` / `400`），而不是解析 `"room join rejected (4101): …"`
-    /// 这类格式化字符串。
+    /// （瞬态 `4101` vs 永久 `4106` / `400`；`4105` 为预留码，收到即协议违规、绝不重试），
+    /// 而不是解析 `"room join rejected (4101): …"` 这类格式化字符串。
     #[test]
     fn protocol_rejection_preserves_code_message_and_details() {
         let err = ComputerError::ProtocolRejection {

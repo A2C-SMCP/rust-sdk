@@ -85,6 +85,8 @@ pub mod error_codes {
     pub const TOOL_REQUIRES_CONFIRMATION: i32 = 4005;
 
     // 房间管理错误码 / Room management error codes
+    /// 加入时目标房**该 role 的席位**已被其它会话占据（每 role 一席：一房 ≤1 Agent、≤1 Computer）。
+    /// Room-scoped **per-role seat** already taken (at most one Agent and one Computer per room)。
     pub const ROOM_FULL: i32 = 4101;
     /// **预留码**：协议当前任何路径都不产生（房间由首次 `server:join_office` 隐式创建）。
     /// SDK **MUST NOT** 主动返回；[`super::RoomRejectionCode`] 在类型层面排除了它。
@@ -92,8 +94,26 @@ pub mod error_codes {
     pub const ROOM_NOT_FOUND: i32 = 4102;
     pub const NOT_IN_ROOM: i32 = 4103;
     pub const CROSS_ROOM_ACCESS: i32 = 4104;
+    /// **预留码（v0.5.0 起）**：仅存在于 0.5.0-dev 草案（Discussion#61）；「每 role 一席」使同 role 的
+    /// 第二个会话无论是否同名都先撞 [`ROOM_FULL`]（4101），本码再无可达路径。房内名字唯一不变量
+    /// **`(office_id, role, name)`** 仍成立，由席位规则蕴含。SDK **MUST NOT** 主动返回；
+    /// [`super::RoomRejectionCode`] 在类型层面排除了它。收到时按协议违规记录并放弃。
+    ///
+    /// Reserved since v0.5.0: implied by the per-role seat rule; SDKs MUST NOT return it.
     pub const NAME_CONFLICT: i32 = 4105;
     pub const ALREADY_IN_ROOM: i32 = 4106;
+
+    /// 预留码判定（当前协议版本**无任何路径产出**）：`4102 Room Not Found` / `4105 Name Conflict`。
+    ///
+    /// 消费方（Agent / Computer 客户端的房间 ack 解析）收到任一预留码即判对端**协议违规**：
+    /// 记录告警并放弃（照常按拒绝处理，绝不重试）。本谓词是跨 SDK 的**单一权威**——新增预留码时
+    /// 只改此处，两侧客户端自动同步（避免各写一份 `==` 比较而漏改一端）。取 `i64` 以直接承接
+    /// ack / `ErrorPayload.code` 的线格式宽度。
+    ///
+    /// Is this code reserved (never producible by a conforming peer)? Single source for clients.
+    pub const fn is_reserved(code: i64) -> bool {
+        code == ROOM_NOT_FOUND as i64 || code == NAME_CONFLICT as i64
+    }
 }
 
 /// WebSocket 握手版本拒绝的 close code（RFC 6455 私有段 4000–4999）。
@@ -135,7 +155,7 @@ pub const WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: i32 = 4900;
 ///   但「有 ack 通道 ⇒ 失败必须产出 ack」是硬约束，故以通用码承载；文案笼统，原文只进日志。
 /// - [`ErrorCode::RoomFull`] 等 `4101`–`4106`（v0.5.0）：三个房间事件 ack 的业务拒绝码。构造入口为
 ///   [`build_room_rejection_error`]（canonical 文案 + `details` 白名单的单一 choke point）；
-///   `4102` 为预留码，[`RoomRejectionCode`] 在类型层面排除，SDK **MUST NOT** 主动返回。
+///   `4102` / `4105` 为**预留码**，[`RoomRejectionCode`] 均在类型层面排除，SDK **MUST NOT** 主动返回。
 /// - [`ErrorCode::McpServerNotFound`]（`4014`）：v0.2.1 复用——SKILL `name` **格式合法但不存在**
 ///   （未注册 / 已卸载 / 孤儿）复用此码；`name` 格式非法 → [`ErrorCode::SkillNameInvalid`]（`4016`）；
 ///   `name` 有效但 `rel_path` 不可达 → [`ErrorCode::SkillResourceNotAccessible`]（`4017`）。
@@ -185,7 +205,9 @@ pub enum ErrorCode {
     ///
     /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.INTERNAL_ERROR`）。
     InternalError = 500,
-    /// `server:join_office` 拒绝：目标房已有 Agent（一房一 Agent）/ Target room already has an agent。
+    /// `server:join_office` 拒绝：目标房**该 role 的席位**已被其它会话占据（每 role 一席，v0.5.0 起
+    /// 覆盖 Computer，见 [`ErrorCode`] 头注）。`details.role` 标明被占席位（= 发起者自己声明的 role）。
+    /// Target room's **per-role seat** already taken (`details.role` carries the seat's role)。
     RoomFull = 4101,
     /// **预留码**：协议当前无任何路径产生；保留号码以维持 `4101`–`4106` 语义连续。
     /// 本枚举**识别**它（用于解析对端违规报文），但 [`RoomRejectionCode`] 在类型层面阻止本 SDK 产出它。
@@ -195,7 +217,11 @@ pub enum ErrorCode {
     NotInRoom = 4103,
     /// 调用方**显式指定**了非自己所在房的操作（如 `server:list_room` 查询他房）/ Explicit cross-room access。
     CrossRoomAccess = 4104,
-    /// 房内已有同 role 同名会话（`name` 是 `client:*` 的路由地址）/ Room-scoped `(office, role, name)` conflict。
+    /// **预留码（v0.5.0 起）**：仅存在于 0.5.0-dev 草案（Discussion#61），表示过「房内同 role 同名」。
+    /// 「每 role 一席」使其再无可达路径（同 role 第二个会话先撞 `4101`）——房内名字唯一不变量
+    /// `(office_id, role, name)` 仍成立，由席位规则蕴含。本枚举**识别**它（用于把对端违规报文解析成
+    /// 可记录的结构化错误），但 [`RoomRejectionCode`] 在类型层面阻止本 SDK 产出它。
+    /// Reserved since v0.5.0; recognized on the wire, never produced by this SDK。
     NameConflict = 4105,
     /// **Agent** 已在其它房又请求加入新房间（Computer 自动换房，不产生本码）/ Agent is already in another room。
     AlreadyInRoom = 4106,
@@ -441,22 +467,21 @@ pub fn build_computer_not_found_error(computer_name: &str) -> ErrorPayload {
 /// 由三个具备 ack 通道的房间事件（`server:join_office` / `server:leave_office` /
 /// `server:list_room`）产出，一律以 flat [`ErrorPayload`] 承载（protocol#61）。
 ///
-/// **类型层面排除 `4102`**：协议把它定义为预留码（「房间不存在」这一失败态在隐式建房模型下不可达），
-/// 任何 SDK 路径都 **MUST NOT** 主动返回。Python 参考实现把这条约束放在 `build_room_rejection_error`
-/// 的运行时 `ValueError`；本 SDK 把它前移到**类型**——调用方连表达「回 4102」的能力都没有，故无需
-/// 依赖调用方自觉。Type-level exclusion of the reserved code `4102`.
+/// **类型层面排除预留码 `4102` / `4105`**：协议定义二者为预留码（「房间不存在」在隐式建房模型下
+/// 不可达；「房内同 role 同名」被「每 role 一席」蕴含而不可达），任何 SDK 路径都 **MUST NOT** 主动
+/// 返回。Python 参考实现把这条约束放在 `build_room_rejection_error` 的运行时 `ValueError`；本 SDK 把它
+/// 前移到**类型**——调用方连表达「回 4105」的能力都没有，故无需依赖调用方自觉。
+/// Type-level exclusion of the reserved codes `4102` / `4105`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoomRejectionCode {
     /// `403`：同一 sid 的 `role` / `name` 声明与既有会话不符（身份声明冲突，非房间语义）。
     Forbidden,
-    /// `4101`：目标房已有 Agent。
+    /// `4101`：目标房**该 role 的席位**已被其它会话占据（每 role 一席；`details.role` 标明席位）。
     RoomFull,
     /// `4103`：会话无 `office_id` 却发起需要房间上下文的操作。
     NotInRoom,
     /// `4104`：调用方显式指定了非自己所在房的目标。
     CrossRoomAccess,
-    /// `4105`：房内已有同 role 同名会话。
-    NameConflict,
     /// `4106`：Agent 已在其它房。
     AlreadyInRoom,
 }
@@ -469,7 +494,6 @@ impl RoomRejectionCode {
             Self::RoomFull => ErrorCode::RoomFull as i32,
             Self::NotInRoom => ErrorCode::NotInRoom as i32,
             Self::CrossRoomAccess => ErrorCode::CrossRoomAccess as i32,
-            Self::NameConflict => ErrorCode::NameConflict as i32,
             Self::AlreadyInRoom => ErrorCode::AlreadyInRoom as i32,
         }
     }
@@ -477,17 +501,28 @@ impl RoomRejectionCode {
     /// 协议标准文案（与 `error-handling.md` / `room-model.md` 的响应示例、Python
     /// `_ROOM_REJECTION_MESSAGES` **逐字一致**）。
     ///
+    /// `4101` 的文案随**被占席位**二选一（`"Room already has an agent"` / `"Room already has a
+    /// computer"`，逐字取自 protocol#66 后的 error-handling.md 示例），`role` 须与同一 context 的
+    /// `declared_role` 同源传入——[`build_room_rejection_error`] 从单一局部变量取用，二者结构上不可漂移。
+    /// `role` 缺省时按 `agent` 席文案（防御性兜底；正常路径恒有 role）。
+    ///
     /// `403` 例外：协议未给该码示例文案，本仓与 Python 参考实现自拟
     /// `"Role or name mismatch with existing session"`，须同时覆盖 role 与 name 两半。
     /// 文案**恒为常量**——调用方无法拼接自身上下文，也就无法把内部错误类名或对端标识泄到线上。
     /// Canonical message; constant by construction.
-    pub const fn message(self) -> &'static str {
+    ///
+    /// `role` 为**类型化**的 [`Role`]（而非裸字符串）：只有 `Some(Computer)` 走 computer 席文案，
+    /// `None`/`Some(Agent)` 走 agent 席——不存在「大小写/拼写不匹配却仍回退 agent 文案」而与
+    /// `details.role` 自相矛盾的路径。
+    pub const fn message(self, role: Option<Role>) -> &'static str {
         match self {
             Self::Forbidden => "Role or name mismatch with existing session",
-            Self::RoomFull => "Room already has an agent",
+            Self::RoomFull => match role {
+                Some(Role::Computer) => "Room already has a computer",
+                _ => "Room already has an agent",
+            },
             Self::NotInRoom => "Not in any room",
             Self::CrossRoomAccess => "Cross-room access denied",
-            Self::NameConflict => "Name already taken in room",
             Self::AlreadyInRoom => "Agent already in another room",
         }
     }
@@ -506,10 +541,14 @@ impl RoomRejectionCode {
 /// with keyword-only arguments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoomRejectionContext<'a> {
-    /// 发起者自己声明的**目标房**：`4101` / `4104` / `4105` 的 `details.office_id`。
+    /// 发起者自己声明的**目标房**：`4101` / `4104` 的 `details.office_id`。
     pub target_office_id: Option<&'a str>,
-    /// 发起者**自己声明**的 role：仅 `4105` 的 `details.role`（报发起方，**非**冲突方）。
-    pub declared_role: Option<&'a str>,
+    /// 发起者**自己声明**的 role：仅 `4101` 的 `details.role`（= 被占席位的 role；即发起方自己声明的
+    /// role，**非**冲突方对端的 role——报对端会泄露对端信息）。
+    ///
+    /// **类型化**（非裸字符串）：文案选择（[`RoomRejectionCode::message`]）与 `details.role` 写入
+    /// 由同一枚 [`Role`] 派生，结构上无「文案与实际 role 不一致」的形态。
+    pub declared_role: Option<Role>,
     /// 会话**当前**所在房：仅 `4106` 的 `details.office_id`（**非**被拒的目标房）。
     pub current_office_id: Option<&'a str>,
 }
@@ -525,10 +564,9 @@ pub struct RoomRejectionContext<'a> {
 /// | `code` | `details` 键 | 取值来源（[`RoomRejectionContext`] 字段）|
 /// |---|---|---|
 /// | `403` | — | 无 code-specific 字段 |
-/// | `4101` | `office_id` | `target_office_id`：发起者自己声明的**目标房** |
+/// | `4101` | `office_id` / `role` | `target_office_id` + `declared_role`：被占席位的 role（= 发起者**自己声明**的 role，非冲突方）|
 /// | `4103` | — | 会话自身无房可报 |
 /// | `4104` | `office_id` | `target_office_id`：被拒的**目标**房 |
-/// | `4105` | `office_id` / `role` | `target_office_id` + `declared_role`：发起者**自己声明**的 role（非冲突方） |
 /// | `4106` | `office_id` | `current_office_id`：会话**当前**所在房（**非**被拒的目标房） |
 ///
 /// 无可写字段时**不产出** `details` 键，故 403 / 4103 的线上报文不含 `details`（对齐 Python）。
@@ -542,21 +580,23 @@ pub fn build_room_rejection_error(
 ) -> ErrorPayload {
     let protocol_code = ErrorCode::from_code(code.code())
         .expect("every RoomRejectionCode maps to a protocol ErrorCode");
-    let mut payload = ErrorPayload::from_error_code(protocol_code, code.message());
+    // `4101` 的文案与被占席位（`declared_role`）同源，从**同一局部变量**取用，二者结构上不可漂移。
+    let declared_role = context.declared_role;
+    let mut payload = ErrorPayload::from_error_code(protocol_code, code.message(declared_role));
     match code {
         // 403 / 4103 无 code-specific 字段（协议 §各错误码标准字段总表：details 列为「—」）。
         RoomRejectionCode::Forbidden | RoomRejectionCode::NotInRoom => {}
-        RoomRejectionCode::RoomFull | RoomRejectionCode::CrossRoomAccess => {
+        RoomRejectionCode::RoomFull => {
             if let Some(office_id) = context.target_office_id {
                 payload = payload.with_detail("office_id", office_id);
+            }
+            if let Some(role) = declared_role {
+                payload = payload.with_detail("role", role.to_string());
             }
         }
-        RoomRejectionCode::NameConflict => {
+        RoomRejectionCode::CrossRoomAccess => {
             if let Some(office_id) = context.target_office_id {
                 payload = payload.with_detail("office_id", office_id);
-            }
-            if let Some(role) = context.declared_role {
-                payload = payload.with_detail("role", role);
             }
         }
         RoomRejectionCode::AlreadyInRoom => {
@@ -666,7 +706,7 @@ impl Default for ReqId {
 }
 
 /// 角色类型
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Agent,
@@ -2631,5 +2671,91 @@ mod tests {
             neither.resource().unwrap_err(),
             SkillRetError::NeitherPresent
         );
+    }
+
+    // ── protocol#66 房间拒绝载荷（4101 泛化）────────────────────────────
+
+    /// 4101 载荷**字节级**稳定：`{"code":4101,"message":…,"details":{"office_id":…,"role":…}}`。
+    ///
+    /// 顶层顺序 = [`ErrorPayload`] 结构体字段序（code → message → details），`details` 内
+    /// `office_id` < `role`（serde_json 默认 BTreeMap 字典序）。该串即与对称 SDK 对拍的
+    /// canonical 形态——接线（文案 / 键集 / 顺序 / 空格）任一处漂移都会在这里变红。
+    #[test]
+    fn room_rejection_payload_is_byte_stable() {
+        let computer_seat = build_room_rejection_error(
+            RoomRejectionCode::RoomFull,
+            RoomRejectionContext {
+                target_office_id: Some("office-a"),
+                declared_role: Some(Role::Computer),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&computer_seat).unwrap(),
+            r#"{"code":4101,"message":"Room already has a computer","details":{"office_id":"office-a","role":"computer"}}"#
+        );
+
+        let agent_seat = build_room_rejection_error(
+            RoomRejectionCode::RoomFull,
+            RoomRejectionContext {
+                target_office_id: Some("office-a"),
+                declared_role: Some(Role::Agent),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&agent_seat).unwrap(),
+            r#"{"code":4101,"message":"Room already has an agent","details":{"office_id":"office-a","role":"agent"}}"#
+        );
+    }
+
+    /// 4101 的文案必须随**被占席位**选择，且与 `details.role` 同源——`role` 缺失时按 agent 席
+    /// 兜底（正常路径恒有 role；该分支仅防御）。`role` 为类型化 [`Role`]，不存在大小写/拼写漂移。
+    #[test]
+    fn room_full_message_follows_seat_role() {
+        assert_eq!(
+            RoomRejectionCode::RoomFull.message(Some(Role::Computer)),
+            "Room already has a computer"
+        );
+        assert_eq!(
+            RoomRejectionCode::RoomFull.message(Some(Role::Agent)),
+            "Room already has an agent"
+        );
+        assert_eq!(
+            RoomRejectionCode::RoomFull.message(None),
+            "Room already has an agent"
+        );
+    }
+
+    /// `4105` 预留码：`RoomRejectionCode` **类型层面**不可表达（与 `4102` 同款排除）；
+    /// `ErrorCode` 仍可识别它（解析对端违规报文），但本 SDK 无产出路径。
+    #[test]
+    fn name_conflict_is_reserved_not_constructible() {
+        // ErrorCode 侧：解析仍识别 4105；预留码谓词为两侧客户端的单一权威。
+        assert_eq!(ErrorCode::from_code(4105), Some(ErrorCode::NameConflict));
+        assert!(error_codes::is_reserved(i64::from(
+            error_codes::NAME_CONFLICT
+        )));
+        assert!(error_codes::is_reserved(i64::from(
+            error_codes::ROOM_NOT_FOUND
+        )));
+        assert!(!error_codes::is_reserved(i64::from(error_codes::ROOM_FULL)));
+
+        // 构造侧：**编译期护栏**在 `RoomRejectionCode::code()` 与 `build_room_rejection_error` 的
+        // 两处**无 wildcard 穷举 match**（新增变体即编译失败，强制在评审中核对 4102/4105 预留约束）。
+        // 本测试钉住**现有**变体的码值映射：防「把既有变体改映射到预留码」这类不触发编译错误的回归。
+        for (code, expected) in [
+            (RoomRejectionCode::Forbidden, 403),
+            (RoomRejectionCode::RoomFull, 4101),
+            (RoomRejectionCode::NotInRoom, 4103),
+            (RoomRejectionCode::CrossRoomAccess, 4104),
+            (RoomRejectionCode::AlreadyInRoom, 4106),
+        ] {
+            assert_eq!(code.code(), expected, "{code:?} 码值映射漂移");
+            assert!(
+                !error_codes::is_reserved(i64::from(code.code())),
+                "{code:?} 不得映射到预留码 4102 / 4105"
+            );
+        }
     }
 }

@@ -698,7 +698,7 @@ impl SmcpHandler {
         info!("on_server_join_office called with data: {:?}", data);
 
         let sid = socket.id.to_string();
-        let requested_role = ClientRole::from(data.role.clone());
+        let requested_role = ClientRole::from(data.role);
         let requested_name = data.name.clone();
 
         // 从握手 URL query 提取协商到的协议版本（仅记录用于诊断/展示，兼容性已由 HTTP 握手中间件
@@ -747,13 +747,14 @@ impl SmcpHandler {
             Ok(reservation) => reservation,
             Err(error) => {
                 error!("server:join_office rejected for sid={}: {}", sid, error);
-                return Err(Box::new(Self::room_rejection(
-                    &error,
-                    &session.role,
-                    &data.office_id,
-                )));
+                return Err(Box::new(Self::room_rejection(&error, &data.office_id)));
             }
         };
+
+        // 幂等重入（协议 §server:join_office：会话已在目标房再次 join ⇒ 空 ack，**MUST NOT** 重复广播
+        // `notify:enter_office`——一致性场景 #3）。`apply_join_room` 仍执行（收敛 socket 成员关系，
+        // 幂等自愈），只是**不重广播**。
+        let broadcast_enter = reservation.decision != JoinDecision::Noop;
 
         // 闸门全部通过后才动 Socket.IO 成员关系（含 Computer 的退旧房）。
         Self::apply_join_room(
@@ -763,6 +764,10 @@ impl SmcpHandler {
             reservation.decision,
         )
         .await;
+
+        if !broadcast_enter {
+            return Ok(());
+        }
 
         // 构建通知数据
         let session_name = session.name.clone();
@@ -888,13 +893,10 @@ impl SmcpHandler {
     /// 直接序列化上 wire，既与协议 / python-sdk 的 canonical 文案逐字不符，也把内部错误类名泄给对端
     /// （#226 P1-5）。本函数是「协议码 → 文案 / `details` 白名单」在服务端的唯一出口，调用方无从绕过。
     ///
-    /// `declared_role` 取自**发起者自己的会话**（4105 的 `details.role` 报的是发起者声明的 role，
-    /// 不是冲突方的），`target_office_id` 取自请求载荷（发起者自己声明的目标房）。
-    fn room_rejection(
-        error: &SessionError,
-        declared_role: &ClientRole,
-        target_office_id: &str,
-    ) -> smcp::ErrorPayload {
+    /// `target_office_id` 取自请求载荷（发起者自己声明的目标房）；`4101` 的 `details.role` 取自
+    /// [`SessionError::SeatTaken`] 携带的**会话权威 role**——经 403 身份校验后它与发起者声明一致，
+    /// 且是「被占席位」的 role 本身，不含对端信息（协议 §Room Full）。
+    fn room_rejection(error: &SessionError, target_office_id: &str) -> smcp::ErrorPayload {
         use smcp::RoomRejectionCode as Code;
         match error {
             // 4106：details 报会话**当前**所在房（非被拒的目标房）——该值由 `reserve_join` 在
@@ -906,18 +908,13 @@ impl SmcpHandler {
                     ..Default::default()
                 },
             ),
-            SessionError::AgentAlreadyExists => smcp::build_room_rejection_error(
+            // 4101 泛化（protocol#66）：被占席位随 `SeatTaken` 携带（Agent / Computer 同码同形）。
+            // `ClientRole → smcp::Role` 类型化转入，文案与 `details.role` 由同一枚 Role 派生。
+            SessionError::SeatTaken(role) => smcp::build_room_rejection_error(
                 Code::RoomFull,
                 smcp::RoomRejectionContext {
                     target_office_id: Some(target_office_id),
-                    ..Default::default()
-                },
-            ),
-            SessionError::NameAlreadyRegistered(_) => smcp::build_room_rejection_error(
-                Code::NameConflict,
-                smcp::RoomRejectionContext {
-                    target_office_id: Some(target_office_id),
-                    declared_role: Some(&declared_role.to_string()),
+                    declared_role: Some(role.clone().into()),
                     ..Default::default()
                 },
             ),
@@ -1833,7 +1830,7 @@ mod tests {
             SessionError::NotFound("private-sid".to_string()),
             SessionError::InvalidState("private internal state".to_string()),
         ] {
-            let payload = SmcpHandler::room_rejection(&error, &ClientRole::Agent, "office-a");
+            let payload = SmcpHandler::room_rejection(&error, "office-a");
             assert_eq!(payload.code, i64::from(smcp::error_codes::INTERNAL_ERROR));
             assert_eq!(payload.message, "Internal error");
             assert!(

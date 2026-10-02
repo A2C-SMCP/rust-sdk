@@ -21,15 +21,17 @@ use std::time::Duration;
 
 use crate::error::SmcpAgentError;
 
-/// 恢复路径上**可退避重试**的协议码：`4101 Room Full` / `4105 Name Conflict`。
+/// 恢复路径上**可退避重试**的协议码：`4101 Room Full`（本 role 席位被占）。
 ///
-/// 这两个码的**瞬态**成因只可能出现在「传输层重连后的恢复路径」上——静默断线使服务端仍持有本客户端
-/// 的旧会话，新会话必然撞上「一房一 Agent」/「同名唯一」检查（协议 error-handling.md §4101/§4105、
-/// room-model.md §静默断线与会话回收）。首次入房不存在这一窗口（此前本客户端无会话）。
+/// 该码的**瞬态**成因只可能出现在「传输层重连后的恢复路径」上——静默断线使服务端仍持有本客户端的
+/// 旧会话，新会话必然撞上「每 role 一席」检查（协议 error-handling.md §4101、room-model.md §静默
+/// 断线与会话回收）。首次入房不存在这一窗口（此前本客户端无会话）。
 ///
-/// `4106 Already In Room` **不在**此列：重连产生的是新会话（服务端侧 `office_id` 为空），不可能
-/// 「已在其它房」；它只由客户端自身状态错误产生，须先显式退房再入新房。
-pub(crate) const TRANSIENT_ROOM_CONFLICT_CODES: [i64; 2] = [4101, 4105];
+/// **`4105 Name Conflict` 已于 protocol#66 转预留码**（房内同名唯一由席位规则蕴含），不在可重试集：
+/// 收到即按**协议违规**处理（记录并放弃，见 [`parse_room_ack`](crate::protocol_error::parse_room_ack)
+/// 的违规告警），绝不臆断重试。`4106 Already In Room` 同理不在此列：重连产生的是新会话（服务端侧
+/// `office_id` 为空），不可能「已在其它房」；它只由客户端自身状态错误产生，须先显式退房再入新房。
+pub(crate) const TRANSIENT_ROOM_CONFLICT_CODES: [i64; 1] = [4101];
 
 /// 回房重试的**初始退避间隔**（1s）。
 pub(crate) const OFFICE_REJOIN_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -450,7 +452,7 @@ impl OfficeMembership {
 /// 回房单次重放的裁决分类 / verdict classification of a single rejoin replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejoinVerdict {
-    /// 瞬态冲突（`4101` / `4105`）：服务端可能尚未回收旧会话，可在**预算内**退避重试。
+    /// 瞬态冲突（仅 `4101`）：服务端可能尚未回收旧会话，可在**预算内**退避重试。
     TransientConflict,
     /// The bound call's namespace was invalidated. Close/Connect owns the next state;
     /// this attempt must neither retry nor erase the intent awaiting that lifecycle event.
@@ -818,8 +820,8 @@ mod tests {
         ));
     }
 
-    /// 拒绝码分类：仅 `4101` / `4105` 可重试；`4106` / `400` / `403` / 未知码 / 未获裁决 /
-    /// 超时仍判失败；会话失效不重试也不清意图，交给生命周期事件处理。
+    /// 拒绝码分类：仅 `4101` 可重试；**`4105`（预留码，收到即协议违规）**、`4106` / `400` / `403` /
+    /// 未知码 / 未获裁决 / 超时仍判失败；会话失效不重试也不清意图，交给生命周期事件处理。
     #[test]
     fn only_transient_room_conflicts_are_retryable() {
         for code in TRANSIENT_ROOM_CONFLICT_CODES {
@@ -829,7 +831,8 @@ mod tests {
                 "code {code} 是重连恢复路径上的瞬态冲突，必须可重试"
             );
         }
-        for code in [400, 403, 4103, 4104, 4106, 4299, -1] {
+        // `4105` 已转预留码（protocol#66）：收到按协议违规处理——判永久失败，绝不臆断重试。
+        for code in [400, 403, 4103, 4104, 4105, 4106, 4299, -1] {
             assert_eq!(
                 classify_rejoin_error(&protocol_error(code)),
                 RejoinVerdict::Permanent,
