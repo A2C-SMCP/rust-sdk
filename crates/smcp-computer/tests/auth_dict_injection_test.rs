@@ -372,8 +372,8 @@ async fn start_reconnect_capture_server_with_rejection(
                             if reject_join_attempt == Some(attempt) {
                                 let _ = ack.send(&json!({
                                     "code": rejection_code,
-                                    "message": if rejection_code == 4105 { "Name already registered" } else { "Room already has an agent" },
-                                    "details": { "office_id": "office-rejoin-rejected" }
+                                    "message": if rejection_code == 4101 { "Room already has a computer" } else { "Room already has an agent" },
+                                    "details": { "office_id": "office-rejoin-rejected", "role": "computer" }
                                 }));
                             } else {
                                 let _ = ack.send(&ZeroArgAck);
@@ -1692,8 +1692,9 @@ async fn cancelled_join_retains_updates_for_next_confirmation() {
 #[tokio::test]
 async fn pending_updates_survive_rejected_cross_office_join() {
     let gate = Arc::new(tokio::sync::Notify::new());
+    // 跨房换房被拒：protocol#66 下目标房席位被占的现实拒绝码是 4101（4105 已转预留码）。
     let mut server =
-        start_reconnect_capture_server_with_rejection(Some(2), Some(2), Some(gate.clone()), 4105)
+        start_reconnect_capture_server_with_rejection(Some(2), Some(2), Some(gate.clone()), 4101)
             .await;
     let client = Arc::new(
         SmcpComputerClientBuilder::new(
@@ -1723,7 +1724,7 @@ async fn pending_updates_survive_rejected_cross_office_join() {
     gate.notify_one();
     assert!(matches!(
         joining.await.unwrap(),
-        Err(ComputerError::ProtocolRejection { code: 4105, .. })
+        Err(ComputerError::ProtocolRejection { code: 4101, .. })
     ));
     let mut events = std::collections::HashSet::new();
     for _ in 0..4 {

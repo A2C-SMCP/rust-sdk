@@ -18,6 +18,7 @@
 //! 传输/调用层错误，[`SmcpProtocolError`] 是从对端 ack 解析出的**协议级**错误。
 
 use serde_json::Value;
+use tracing::warn;
 
 /// 「无法判定」时的兜底文案（既非空 ack、也非可识别 flat ErrorPayload）。
 ///
@@ -161,7 +162,17 @@ pub fn parse_room_ack(response: &Value) -> Result<(), SmcpProtocolError> {
         return Ok(());
     }
     if response.get("code").is_some() {
-        return Err(SmcpProtocolError::from_value(response));
+        let error = SmcpProtocolError::from_value(response);
+        // 预留码（4102 / 4105）：协议当前无任何路径产出，收到即对端协议违规——按协议
+        // 「记录并放弃」：告警留痕，然后照常按拒绝返回（分类为不可重试）。
+        // 谓词取 `smcp::error_codes::is_reserved` 单一权威（与 Computer 侧同源，预留码演进不漏改一端）。
+        if smcp::error_codes::is_reserved(error.code) {
+            warn!(
+                code = error.code,
+                "room ack carried a reserved protocol code (protocol violation); rejecting without retry"
+            );
+        }
+        return Err(error);
     }
     Err(SmcpProtocolError::indeterminate())
 }

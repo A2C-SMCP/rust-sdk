@@ -1304,11 +1304,26 @@ impl SmcpComputerClient {
             return Ok(());
         }
 
-        // 结构化拒绝：码 + 文案 + `details` **原样保留**（不再 `format!` 成字符串）。
-        // 消费方（如 #219 的有界退避）据此按码分流 `4101` / `4105`（瞬态）与 `4106` / `400`（永久），
-        // 无需解析字符串（#226 复审 🟡4）。
+        // 结构化拒绝：码 + 文案 + `details` **原样保留**（不再 `format!` 成字符串），消费方据此
+        // **按码分流**、无需解析字符串（#226 复审 🟡4）：`4101`（本 role 席位被占）是协议
+        // §建议的重试策略里传输层重连后的**瞬态**冲突（可有界退避重试）；`4106` / `400` 永久失败；
+        // `4105` 已随 protocol#66 转预留码（收到即协议违规，不得重试）。
+        //
+        // ⚠️ 现状如实标注：Computer 侧**自动回房**（Connect 生命周期回调里的重放）目前为**单次尝试**
+        // ——被拒即清空 desired 并回退 `Connected`，**尚未**实现协议迁移指南 §Computer 要求的
+        // 「仅在刚经历传输层重连时做有界退避重试」（跨 SDK 缺口，另行跟踪）。显式 `join_office`
+        // 的调用方据此按码自行决定重试策略。
         if let Some(value) = actual_response.first() {
             if let Some(code) = value.get("code").and_then(Value::as_i64) {
+                // 预留码（4102 / 4105）：协议当前无任何路径产出，收到即对端协议违规——按协议
+                // 「记录并放弃」：告警留痕后照常按拒绝返回（任何消费方都不得对其重试）。
+                // 谓词取 `smcp::error_codes::is_reserved` 单一权威（与 Agent 侧同源）。
+                if smcp::error_codes::is_reserved(code) {
+                    warn!(
+                        code,
+                        "room join ack carried a reserved protocol code (protocol violation); rejecting without retry"
+                    );
+                }
                 return Err(ComputerError::ProtocolRejection {
                     code,
                     message: value

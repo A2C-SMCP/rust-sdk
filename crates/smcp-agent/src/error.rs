@@ -43,6 +43,14 @@ pub enum SmcpAgentError {
     #[error("协议版本不匹配: {0}")]
     ProtocolVersionMismatch(#[from] smcp::ProtocolVersionError),
 
+    /// `server:list_room` 响应违反「一房至多一台 Computer」（protocol#66）。
+    ///
+    /// 「每 role 一席」下任一时刻房内至多一台 Computer；服务端报告**多于一台** ⇒ 对端违反了协议
+    /// 不变量，判协议违规如实失败（与 [`SmcpAgentError::ReqIdMismatch`] 同口径：自相矛盾的响应
+    /// 必须响亮失败，**绝不**挑第一台继续——那会把不变量违背冻结进调用方的本地状态）。
+    #[error("协议错误: 房 {office_id} 报告了 {count} 台 Computer（每 role 一席下至多 1 台）")]
+    TooManyComputersInOffice { office_id: String, count: usize },
+
     /// 对端经 `client:*` ack 回传的协议级 flat ErrorPayload（404 / 4006–4018），由
     /// [`crate::protocol_error::raise_for_error_payload`] 解析。**装箱**以避免 `result_large_err`
     /// 污染所有 `Result<_, SmcpAgentError>`（同 [`Self::Network`] / [`Self::Serialization`] 模式）。

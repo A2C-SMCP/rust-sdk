@@ -189,4 +189,13 @@ impl SyncSmcpAgent {
     pub fn list_room(&self, office_id: &str) -> Result<Vec<SessionInfo>> {
         self.runtime.block_on(self.async_agent.list_room(office_id))
     }
+
+    /// 获取房内**唯一**的 Computer（protocol#66 单数便捷方法；同步版）。
+    ///
+    /// 语义与 [`AsyncSmcpAgent::get_computer_in_office`](crate::AsyncSmcpAgent::get_computer_in_office)
+    /// 完全一致：`Ok(None)` = 房内暂无 Computer；服务端报告多于一台 ⇒ 协议违规错误。
+    pub fn get_computer_in_office(&self, office_id: &str) -> Result<Option<SessionInfo>> {
+        self.runtime
+            .block_on(self.async_agent.get_computer_in_office(office_id))
+    }
 }

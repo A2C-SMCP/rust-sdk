@@ -214,8 +214,10 @@ async fn test_update_config_computer_not_in_office() {
     server.shutdown();
 }
 
+/// protocol#66：一房至多一台 Computer——本用例由「同房两台 Computer 的广播都可达」改写为
+/// 「本房 Computer 广播可达 + **他房** Computer 广播不可达」（房间隔离的两半分）。
 #[tokio::test]
-async fn test_update_config_multiple_computers() {
+async fn test_update_config_single_computer_per_room() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let server = SmcpTestServer::start().await;
@@ -259,12 +261,12 @@ async fn test_update_config_multiple_computers() {
     // Computer1 加入办公室
     join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
 
-    // 创建 Computer2 客户端并等待连接稳定
+    // 创建 Computer2 客户端并等待连接稳定（每 role 一席：它入**另一间**办公室）
     let computer2_client = create_test_client(&server_url, "smcp").await;
     sleep(Duration::from_millis(100)).await;
 
-    // Computer2 加入办公室
-    join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
+    // Computer2 加入**另一间**办公室（每 role 一席）。
+    join_office(&computer2_client, Role::Computer, "office2", "computer2").await;
 
     // 重置通知标记
     notification_count.store(false, Ordering::SeqCst);
@@ -291,7 +293,7 @@ async fn test_update_config_multiple_computers() {
     // 重置通知标记
     notification_count.store(false, Ordering::SeqCst);
 
-    // Computer2触发配置更新
+    // Computer2（他房）触发配置更新
     let update_config_req2 = json!({
         "computer": "computer2"
     });
@@ -304,10 +306,10 @@ async fn test_update_config_multiple_computers() {
     // 等待广播传播
     sleep(Duration::from_millis(500)).await;
 
-    // 验证Agent收到了通知
+    // 他房 Computer 的更新**不得**跨房投递。
     assert!(
-        notification_count.load(Ordering::SeqCst),
-        "Agent should have received update_config notification from computer2"
+        !notification_count.load(Ordering::SeqCst),
+        "Agent must NOT receive update_config notification from a computer in another office"
     );
 
     // 清理

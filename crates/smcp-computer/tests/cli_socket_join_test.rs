@@ -196,7 +196,7 @@ async fn rejected_rename_keeps_new_connection_and_allows_retry() {
     connect(&mut cli, &server).await;
     cli.join_socket_room("old-office", "old").await.unwrap();
     let error = cli.join_socket_room("taken", "alice").await.unwrap_err();
-    assert!(error.to_string().contains("4105"), "{error}");
+    assert!(error.to_string().contains("4101"), "{error}");
     assert!(server.members("old-office").is_empty());
     assert_eq!(server.members("taken").len(), 1);
     assert_eq!(cli.computer.name(), "alice");
@@ -341,7 +341,7 @@ async fn executable_repl_reports_real_identity_and_never_false_join_success() {
         repl.send("socket join taken occupied").await;
         let output = repl.until("命令执行失败").await;
         assert!(!output.contains("Joined office:"), "{output}");
-        assert!(output.contains("4105"), "{output}");
+        assert!(output.contains("4101"), "{output}");
         assert!(server.members("office-b").is_empty());
         assert_eq!(server.members("taken").len(), 1);
         repl.send("socket join retry occupied").await;

@@ -13,7 +13,7 @@
 * ack），从而在同一套真设施上稳定复现四类恢复路径：
 *
 *   ① 重连后重放 `server:join_office` 并恢复已确认成员关系；
-*   ② 撞上瞬态冲突（`4101` / `4105`）⇒ 退避重试后恢复；
+*   ② 撞上瞬态冲突（`4101`；`4105` 已随 protocol#66 转预留码、收到即判协议违规不重试）⇒ 退避重试后恢复；
 *   ③ 预算耗尽 / 永久拒绝（`4106`）⇒ 清空意图、状态回退到 `Connected`、派发 lost 回调，且不再重试；
 *   ④ 在途回房被第二次断连打断 ⇒ 陈旧 ack 不得落账（generation 守卫）。
 *
@@ -740,11 +740,11 @@ async fn transient_conflict_on_replay_is_retried_and_recovers() {
 #[tokio::test]
 async fn exhausted_budget_falls_back_to_connected_and_stops_retrying() {
     let _ = tracing_subscriber::fmt::try_init();
-    // 首次入房接受；此后的每次重放都以 4105 拒绝。
+    // 首次入房接受；此后的每次重放都以 4101（席位冲突，唯一可重试码）拒绝。
     let mut server = start_rejoin_capture_server(
         policy(|attempt| {
             if attempt >= 2 {
-                JoinOutcome::Reject(4105)
+                JoinOutcome::Reject(4101)
             } else {
                 JoinOutcome::Accept
             }

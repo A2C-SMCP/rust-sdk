@@ -14,12 +14,14 @@ pub type SessionId = String;
 pub enum SessionError {
     #[error("Session not found: {0}")]
     NotFound(String),
-    #[error("Name already registered: {0}")]
-    NameAlreadyRegistered(String),
     #[error("Agent already in room: {0}")]
     AgentAlreadyInRoom(OfficeId),
-    #[error("Agent already exists in room")]
-    AgentAlreadyExists,
+    /// 目标房**该 role 的席位**已被其它会话占据（协议 `4101 Room Full`）。
+    ///
+    /// 泛化自旧的 `AgentAlreadyExists`（protocol#66「每 role 一席」）：Agent / Computer 同码同形，
+    /// 由 `details.role`（取自本变体）标明被占席位。[`SessionError::error_code`] 映射为 `4101`。
+    #[error("Seat already taken in room for role {0:?}")]
+    SeatTaken(ClientRole),
     #[error("Invalid session state: {0}")]
     InvalidState(String),
 }
@@ -29,9 +31,8 @@ impl SessionError {
     pub fn error_code(&self) -> i32 {
         match self {
             SessionError::NotFound(_) => smcp::error_codes::NOT_FOUND,
-            SessionError::NameAlreadyRegistered(_) => smcp::error_codes::NAME_CONFLICT,
             SessionError::AgentAlreadyInRoom(_) => smcp::error_codes::ALREADY_IN_ROOM,
-            SessionError::AgentAlreadyExists => smcp::error_codes::ROOM_FULL,
+            SessionError::SeatTaken(_) => smcp::error_codes::ROOM_FULL,
             SessionError::InvalidState(_) => smcp::error_codes::BAD_REQUEST,
         }
     }
@@ -125,7 +126,7 @@ impl SessionData {
 
 /// 入房事务对 Socket.IO 成员关系的裁决 / What the join transaction decided for room membership.
 ///
-/// 由 [`SessionManager::reserve_join`] 产出：会话状态（含 name 预留）已在此刻提交，剩下的
+/// 由 [`SessionManager::reserve_join`] 产出：会话状态（含**席位**提交）已在此刻落定，剩下的
 /// `socket.join` / `socket.leave` / 广播属**表层生效**，按本裁决执行即可。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinDecision {
@@ -135,8 +136,8 @@ pub enum JoinDecision {
     Join,
     /// Computer 换房：先退旧房（并按协议向旧房广播 `notify:leave_office`），再入目标房。
     ///
-    /// 该动作排在**所有**可能失败的闸门之后（协议 room-model.md 注记 3「校验必须先于副作用」）：
-    /// 若先退旧房再查目标房，一旦同名被拒，该 Computer 已离开原房且对端已收到离开通知，
+    /// 该动作排在**所有**可能失败的闸门之后（协议 room-model.md 注记 4「校验必须先于副作用」）：
+    /// 若先退旧房再查目标房，一旦目标房席位被占，该 Computer 已离开原房且对端已收到离开通知，
     /// 落成「无房」中间态却无补救语义。
     LeaveAndJoin {
         /// 需要退出的旧房 / the room being left。
@@ -171,49 +172,33 @@ pub enum LeaveCommit {
 
 /// 会话管理器
 ///
-/// 为什么需要临界区：房间归属转换是「检查-提交」事务，而输入条件分散在多张表上——
-/// 「目标房已有 Agent」（扫描 `sessions`）、「房内同名」（`name_to_sid`）。
+/// 为什么需要临界区：房间归属转换是「检查-提交」事务——「目标房该 role 的席位是否已被其它会话占据」
+/// 的判据是**扫描 `sessions`**（席位即 `(office_id, role)`）。
 ///
-/// 各表自身的原子性（DashMap entry claim）只保证**单键**竞争，覆盖不了跨键不变量：
-/// 两个不同名 Agent 并发加入同一空房时双方都扫描不到对方，于是双双成功（#226 P0-2）；
-/// 同一 sid 的两个并发 `join` 都走「查无则新建」，后写者覆盖前写者，被覆盖者的 name 预留
-/// 从此无人释放（#226 P1-4）。
+/// 单表扫描自身不构成「检查-提交」原子性：两个不同名 Agent / 两台 Computer 并发加入同一空房时
+/// 双方都扫描不到对方，于是双双成功（#226 P0-2）。故：**读**走 DashMap 无锁路径（`client:*` 路由与
+/// `list_room` 每帧查表，热点在读）；**写**（注册 / 入房 / 退房 / 注销）一律经
+/// `SessionManager::transition()` 临界区串行化。临界区**只覆盖同步段**（内含零 `.await`），转换是
+/// 短操作，故用 `std::sync::Mutex`。
 ///
-/// 故：**读**走 DashMap 无锁路径（`client:*` 路由与 `list_room` 每帧查表，热点在读）；
-/// **写**（注册 / 入房 / 退房 / 注销）一律经 `SessionManager::transition()` 临界区串行化。
-/// 临界区**只覆盖同步段**（内含零 `.await`），转换是短操作，故用 `std::sync::Mutex`。
+/// **名字注册表已随 protocol#66 删除**：`(office_id, role, name)` 唯一性由「每 role 一席」蕴含
+/// （房内同 role 至多一个会话），独立的 name → sid 表失去全部生产性消费者，且其自带的
+/// 「预留无人释放 / 残留键永久占死」缺陷类（#226 P1-4）随之整体消失。房内按名解析路由
+/// （[`Self::get_computer_sid_in_office`]）一直走 `sessions` 扫描，不依赖该表。
 ///
 #[derive(Debug)]
 pub struct SessionManager {
     /// sid -> session_data 映射
     sessions: Arc<DashMap<SessionId, SessionData>>,
-    /// name -> sid 映射（用于通过 name 查找 session）
-    name_to_sid: Arc<DashMap<String, SessionId>>,
     /// 房间归属转换的事务锁（见结构体文档；**勿**跨 `.await` 持有）。
     transition: Arc<Mutex<()>>,
 }
 
 impl SessionManager {
-    fn name_key(role: &ClientRole, office_id: Option<&OfficeId>, name: &str) -> Option<String> {
-        let office_id = office_id?;
-        match role {
-            // Prefix the office length so `office_id` and `name` remain an
-            // unambiguous tuple even when either value contains `:`.
-            ClientRole::Agent => Some(format!("agent:{}:{}:{}", office_id.len(), office_id, name)),
-            ClientRole::Computer => Some(format!(
-                "computer:{}:{}:{}",
-                office_id.len(),
-                office_id,
-                name
-            )),
-        }
-    }
-
     /// 创建新的会话管理器
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
-            name_to_sid: Arc::new(DashMap::new()),
             transition: Arc::new(Mutex::new(())),
         }
     }
@@ -228,29 +213,16 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 释放 name 预留，**带归属守卫**：仅当该键仍指向 `sid` 时才删除。
-    ///
-    /// 无守卫的 `remove` 会在并发下替**新占有者**注销预留——这正是 #226 P1-4 里
-    /// `agent:<office>:<name>` 被永久占死的成因之一。对标 Python `namespace.py` 的
-    /// `_name_to_sid_map.get(name) == sid` 守卫。
-    fn release_name_key(&self, key: &str, sid: &str) {
-        let owned = self
-            .name_to_sid
-            .get(key)
-            .map(|owner| owner.as_str() == sid)
-            .unwrap_or(false);
-        if owned {
-            self.name_to_sid.remove(key);
-        }
-    }
-
     /// 注册会话（幂等；**绝不覆盖**既有记录）。
     ///
     /// 同一 sid 重复注册返回 `Ok(())` 且保留原记录：身份（role / name）在一次连接内**不可变更**，
     /// 声明与既有会话不符必须由 handler 判 `403`（协议 events.md §server:join_office），
-    /// 而不是在这里把旧记录悄悄换掉——那会丢下无人释放的 name 预留（#226 P1-4）。
+    /// 而不是在这里把旧记录悄悄换掉。
     ///
     /// Register a session; re-registering the same sid keeps the original record.
+    ///
+    /// ⚠️ 本方法是底层「置入」原语，**不是**入房闸门——席位（每 role 一席）与房间归属**只能**经
+    /// [`Self::reserve_join`] 获得；既有测试用它直接布置房间态。
     pub fn register_session(&self, session: SessionData) -> Result<(), SessionError> {
         let _guard = self.transition();
         if let Some(existing) = self.sessions.get(&session.sid) {
@@ -263,42 +235,16 @@ impl SessionManager {
             return Ok(());
         }
 
-        if let Some(key) = Self::name_key(&session.role, session.office_id.as_ref(), &session.name)
-        {
-            // Name uniqueness is room-scoped; pre-room sessions have no key.
-            match self.name_to_sid.entry(key) {
-                dashmap::mapref::entry::Entry::Occupied(entry) => {
-                    if *entry.get() != session.sid {
-                        return Err(SessionError::NameAlreadyRegistered(session.name));
-                    }
-                    tracing::debug!("Name '{}' re-registered by same sid", session.name);
-                }
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    entry.insert(session.sid.clone());
-                }
-            }
-        }
-
-        // Always retain the sid -> session record, including pre-room sessions.
         self.sessions.insert(session.sid.clone(), session.clone());
 
         tracing::debug!("Registered session: {} -> {}", session.name, session.sid);
         Ok(())
     }
 
-    /// 注销会话（释放其 name 预留，带归属守卫）
+    /// 注销会话（席位随会话记录一并释放）
     pub fn unregister_session(&self, sid: &SessionId) -> Option<SessionData> {
         let _guard = self.transition();
         let session = self.sessions.remove(sid)?;
-
-        // 清理 name 映射
-        if let Some(key) = Self::name_key(
-            &session.1.role,
-            session.1.office_id.as_ref(),
-            &session.1.name,
-        ) {
-            self.release_name_key(&key, sid);
-        }
 
         tracing::debug!("Unregistered session: {} -> {}", session.1.name, sid);
         Some(session.1)
@@ -316,7 +262,7 @@ impl SessionManager {
     /// 一致性判定（不符 ⇒ `403`）。
     ///
     /// 新会话必然无 `office_id`：房间归属**只能**经 [`Self::reserve_join`] 获得。故本方法不触碰
-    /// name 预留（无房会话没有房域键），也就没有「预留了却无人释放」的失败模式。
+    /// 席位（无房会话不占任何 `(office_id, role)`），也就没有「占了却无人释放」的失败模式。
     ///
     /// Atomically get-or-create the session for `sid`; the returned record is authoritative, and a
     /// freshly created session is always room-less because room ownership is granted only by
@@ -338,28 +284,32 @@ impl SessionManager {
         created
     }
 
-    /// 入房事务：**校验 → 预留 → 提交**全部在一次临界区内完成。
+    /// 入房事务：**校验 → 提交**全部在一次临界区内完成。
     ///
-    /// 取代原先「`has_agent_in_office` / `has_computer_in_office_except` 扫描 + `update_office_id`
-    /// 写入」的两步式——两步式在两次调用之间给了并发窗口，使「一房一 Agent」这类跨键不变量可被绕过
-    /// （#226 P0-2）。本方法把闸门与提交放进同一临界区，故检查-提交是原子的。
+    /// 取代原先「扫描既有会话 + `update_office_id` 写入」的两步式——两步式在两次调用之间给了并发
+    /// 窗口，使「每 role 一席」这类跨键不变量可被绕过（#226 P0-2）。本方法把闸门与提交放进同一
+    /// 临界区，故检查-提交是原子的。
     ///
-    /// 闸门按协议 events.md §server:join_office 的规则与顺序：
+    /// 闸门按协议 room-model.md §加入房间 / events.md §server:join_office 的规则与顺序（protocol#66
+    /// 「每 role 一席」）：
     ///
     /// | 角色 | 既有房 | 闸门 | 结果 |
     /// |---|---|---|---|
     /// | Agent | 其它房 | Agent 换房须显式两步 | [`SessionError::AgentAlreadyInRoom`]（`4106`）|
-    /// | Agent | 本房 | 同一会话重复入房幂等 | [`JoinDecision::Noop`] |
-    /// | Agent | 无 | 目标房已有 Agent | [`SessionError::AgentAlreadyExists`]（`4101`）|
-    /// | Computer | 其它房 | 目标房同 role 同名 | 冲突 ⇒ `4105`，否则 [`JoinDecision::LeaveAndJoin`] |
-    /// | Computer | 本房 | 重复入房幂等 | [`JoinDecision::Noop`] |
-    /// | 两者 | 无 | 目标房同 role 同名 | 冲突 ⇒ [`SessionError::NameAlreadyRegistered`]（`4105`）|
+    /// | 两者 | 本房 | 同一会话重复入房幂等 | [`JoinDecision::Noop`] |
+    /// | Agent | 无 | 目标房已有 Agent（非本会话）| [`SessionError::SeatTaken`]（`4101`）|
+    /// | Computer | 其它房 | 目标房已有 Computer（非本会话）| [`SessionError::SeatTaken`]（`4101`），否则 [`JoinDecision::LeaveAndJoin`] |
+    /// | Computer | 无 | 目标房已有 Computer（非本会话）| [`SessionError::SeatTaken`]（`4101`），否则 [`JoinDecision::Join`] |
     ///
-    /// 通过闸门后立即提交：占下目标房的 name 键（`(office_id, role, name)`）、释放旧房键（**带归属
-    /// 守卫**）、写权威 `office_id`。任一步失败都不会留下半提交状态——失败路径在任何写入之前返回。
+    /// **席位检查先于一切副作用**（协议 room-model.md 注记 4「校验必须先于副作用」）：Computer 的
+    /// 席位检查排在「自动离开旧房」**之前**——否则一旦席位被占，该 Computer 已离开原房且原房成员已收到
+    /// `notify:leave_office`，落成「无房」的中间态却无补救语义（场景 #4 / #6）。
     ///
-    /// Validate-then-commit as one atomic step; every gate runs before any write, so a rejected join
-    /// can never leave a half-committed session or a stranded reservation.
+    /// **席位检查 + 占席对同一 `office_id` 原子**（注记 3）：二者同处本次 `transition()` 临界区，故并发
+    /// 加入空房仅一者通过（恰一个 `4101`，场景 #8）。失败路径在任何写入之前返回，绝不留下半提交状态。
+    ///
+    /// Validate-then-commit as one atomic step; the per-role seat check runs before any write and,
+    /// for Computers, before the auto-leave side effect.
     pub fn reserve_join(
         &self,
         sid: &SessionId,
@@ -373,6 +323,17 @@ impl SessionManager {
             .ok_or_else(|| SessionError::NotFound(sid.clone()))?;
         let previous_office = session.office_id.clone();
 
+        // 席位闸门：目标房该 role 的席位已被**其它会话**占据 ⇒ 4101（自会话由 Noop 分支先行短路）。
+        // 判据是「每 role 一席」本身，与 name 无关（protocol#66；`(office_id, role, name)` 唯一性由
+        // 本规则蕴含）——同 role 的第二个会话同名与否都撞此处。
+        let seat_taken = |role: &ClientRole| -> Result<(), SessionError> {
+            if self.role_in_office(office_id, role, Some(sid)) {
+                Err(SessionError::SeatTaken(role.clone()))
+            } else {
+                Ok(())
+            }
+        };
+
         let decision = match session.role {
             ClientRole::Agent => match previous_office.as_deref() {
                 Some(current) if current != office_id => {
@@ -382,31 +343,27 @@ impl SessionManager {
                 }
                 Some(_) => JoinDecision::Noop,
                 None => {
-                    // 一房一 Agent：本次扫描与随后的提交同处一个临界区，故并发不同名的两个 Agent
-                    // 不可能双双通过（恰一个 4101）。
-                    if self.has_agent_in_office_except(&office_id.to_string(), sid) {
-                        return Err(SessionError::AgentAlreadyExists);
-                    }
+                    seat_taken(&ClientRole::Agent)?;
                     JoinDecision::Join
                 }
             },
             ClientRole::Computer => match previous_office.as_deref() {
                 Some(current) if current == office_id => JoinDecision::Noop,
                 Some(current) => {
-                    self.ensure_name_available(&session, office_id)?;
+                    seat_taken(&ClientRole::Computer)?;
                     JoinDecision::LeaveAndJoin {
                         leave_office: current.to_string(),
                     }
                 }
                 None => {
-                    self.ensure_name_available(&session, office_id)?;
+                    seat_taken(&ClientRole::Computer)?;
                     JoinDecision::Join
                 }
             },
         };
 
         if decision != JoinDecision::Noop {
-            self.commit_office(&session, office_id)?;
+            self.commit_office(&session, office_id);
         }
         Ok(JoinReservation {
             decision,
@@ -414,61 +371,22 @@ impl SessionManager {
         })
     }
 
-    /// 目标房 name 键可占用性检查（只读，不写）。
-    fn ensure_name_available(
-        &self,
-        session: &SessionData,
-        office_id: &str,
-    ) -> Result<(), SessionError> {
-        let office_id = office_id.to_string();
-        let Some(key) = Self::name_key(&session.role, Some(&office_id), &session.name) else {
-            return Ok(());
-        };
-        match self.name_to_sid.get(&key) {
-            Some(owner) if owner.as_str() != session.sid => {
-                Err(SessionError::NameAlreadyRegistered(session.name.clone()))
-            }
-            _ => Ok(()),
-        }
-    }
-
     /// 提交房间归属（仅在 [`Self::reserve_join`] 的闸门全部通过后调用）。
-    fn commit_office(&self, session: &SessionData, office_id: &str) -> Result<(), SessionError> {
+    ///
+    /// 席位由 `office_id` 字段蕴含（`(office_id, role)` 即席位），故提交 = 写权威 `office_id`；
+    /// 席位释放 = 该字段置空（[`Self::commit_leave`]）。**无失败路径**：闸门已把全部拒绝条件
+    /// 判完才允许到达这里。
+    fn commit_office(&self, session: &SessionData, office_id: &str) {
         let target_office = office_id.to_string();
-        let new_key = Self::name_key(&session.role, Some(&target_office), &session.name);
-        let old_key = Self::name_key(&session.role, session.office_id.as_ref(), &session.name);
-
-        if let Some(ref new_key) = new_key {
-            match self.name_to_sid.entry(new_key.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(entry) => {
-                    if *entry.get() != session.sid {
-                        return Err(SessionError::NameAlreadyRegistered(session.name.clone()));
-                    }
-                }
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    entry.insert(session.sid.clone());
-                }
-            }
-        }
-
-        // 先落定新键再释放旧键；且**不可**在同一张表上同时持两把 shard 锁（同 shard 会自死锁）。
-        if old_key != new_key {
-            if let Some(ref old_key) = old_key {
-                self.release_name_key(old_key, &session.sid);
-            }
-        }
-
         if let Some(mut record) = self.sessions.get_mut(&session.sid) {
             record.office_id = Some(target_office);
         }
-        Ok(())
     }
 
     /// 退房事务（幂等；对标协议 events.md §server:leave_office）。
     ///
     /// - 会话无房 ⇒ [`LeaveCommit::AlreadyIdle`]：**幂等成功**，不产生错误码；
-    /// - 会话仍在 `broadcast_office` ⇒ [`LeaveCommit::Released`]：释放该房 name 预留并把 `office_id`
-    ///   置空；
+    /// - 会话仍在 `broadcast_office` ⇒ [`LeaveCommit::Released`]：释放该房**席位**（清空 `office_id`）；
     /// - 会话已被并发转换改到**别的房** ⇒ [`LeaveCommit::Superseded`]：**不改动会话**，把新状态如实
     ///   回报给调用方去收敛 Socket.IO 成员关系。
     ///
@@ -497,9 +415,7 @@ impl SessionManager {
             return Ok(LeaveCommit::Superseded { current });
         }
 
-        if let Some(key) = Self::name_key(&session.role, Some(&current), &session.name) {
-            self.release_name_key(&key, sid);
-        }
+        // 释放席位 = 清空 `office_id`（席位由 `(office_id, role)` 蕴含，无独立名表可清）。
         if let Some(mut record) = self.sessions.get_mut(sid) {
             record.office_id = None;
         }
@@ -517,26 +433,24 @@ impl SessionManager {
 
     /// 检查房间内是否已有 Agent
     pub fn has_agent_in_office(&self, office_id: &OfficeId) -> bool {
-        self.agent_in_office(office_id, None)
+        self.role_in_office(office_id, &ClientRole::Agent, None)
     }
 
-    /// 检查房间内是否已有 Agent，**排除**指定 sid（同一会话重复入房不算占用）。
+    /// 检查房间内是否已有指定 role 的会话，**排除**指定 sid（同一会话重复入房不算占用）。
     ///
-    /// 只读扫描。**并发安全**依赖调用点：需要「检查-提交」原子性的场景必须在
-    /// [`Self::reserve_join`] 的临界区内调用，单独调用本方法不构成闸门（#226 P0-2 的原形成因）。
-    pub fn has_agent_in_office_except(
+    /// 席位 = `(office_id, role)`：本扫描即「每 role 一席」的判据本身。只读扫描，**并发安全**依赖
+    /// 调用点：需要「检查-提交」原子性的场景必须在 [`Self::reserve_join`] 的临界区内调用，单独调用
+    /// 本方法不构成闸门（#226 P0-2 的原形成因）。
+    fn role_in_office(
         &self,
-        office_id: &OfficeId,
-        excluded_sid: &SessionId,
+        office_id: &str,
+        role: &ClientRole,
+        excluded_sid: Option<&SessionId>,
     ) -> bool {
-        self.agent_in_office(office_id, Some(excluded_sid.as_str()))
-    }
-
-    fn agent_in_office(&self, office_id: &OfficeId, excluded_sid: Option<&str>) -> bool {
         self.sessions.iter().any(|s| {
-            Some(s.sid.as_str()) != excluded_sid
-                && s.office_id.as_ref() == Some(office_id)
-                && s.role == ClientRole::Agent
+            excluded_sid.map(|sid| sid.as_str()) != Some(s.sid.as_str())
+                && s.office_id.as_deref() == Some(office_id)
+                && &s.role == role
         })
     }
 
@@ -627,61 +541,73 @@ mod tests {
         assert_eq!(manager.get_all_sessions().len(), 1);
     }
 
+    /// protocol#66（场景 #2 的单元版）：**同 role 同名**的第二个会话入房撞的是**席位规则**
+    /// （`4101 SeatTaken`），不是名字冲突——`(office_id, role, name)` 唯一性由「每 role 一席」蕴含，
+    /// 独立的同名判定（旧 `4105`）已随名字注册表一并删除。
+    ///
+    /// 「跨 role 同名允许」同场覆盖：先入房的 Computer 与后入房的 Agent 同名不冲突（路由地址由 role
+    /// 字段区分），佐证席位键是 `(office_id, role)` 而非名字。
     #[test]
-    fn test_duplicate_name_registration() {
+    fn test_same_name_second_session_hits_seat_rule_not_name_conflict() {
         let manager = SessionManager::new();
-        let sid1 = Uuid::new_v4().to_string();
-        let sid2 = Uuid::new_v4().to_string();
-        let sid3 = Uuid::new_v4().to_string();
-        let sid4 = Uuid::new_v4().to_string();
 
-        let session1 = SessionData::new(
-            sid1.clone(),
-            "duplicate_name".to_string(),
-            ClientRole::Agent,
-        )
-        .with_office_id("office1".to_string());
-        let session2 = SessionData::new(
-            sid2.clone(),
-            "duplicate_name".to_string(),
-            ClientRole::Agent,
+        // 第一台 Computer 入房。
+        manager
+            .register_session(
+                SessionData::new(
+                    "sid-c1".to_string(),
+                    "duplicate_name".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_office_id("office1".to_string()),
+            )
+            .unwrap();
+
+        // 第二台 **同名** Computer 入房：席位被占 ⇒ 4101（SeatTaken(Computer)），不得是 4105。
+        manager
+            .register_session(SessionData::new(
+                "sid-c2".to_string(),
+                "duplicate_name".to_string(),
+                ClientRole::Computer,
+            ))
+            .unwrap();
+        assert!(
+            matches!(
+                manager.reserve_join(&"sid-c2".to_string(), "office1"),
+                Err(SessionError::SeatTaken(ClientRole::Computer))
+            ),
+            "同 role 第二个会话（同名与否）都必须被席位规则以 4101 拒绝"
         );
 
-        let session3 = SessionData::new(
-            sid3.clone(),
-            "duplicate_name".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id("office1".to_string());
+        // 跨 role 同名允许：同名 Agent 入同一房成功（席位键是 (office_id, role)，不是名字）。
+        manager
+            .register_session(SessionData::new(
+                "sid-a1".to_string(),
+                "duplicate_name".to_string(),
+                ClientRole::Agent,
+            ))
+            .unwrap();
+        assert!(
+            manager
+                .reserve_join(&"sid-a1".to_string(), "office1")
+                .is_ok(),
+            "同房内跨 role 同名必须允许（一个 Computer 与一个 Agent 可以同名）"
+        );
 
-        let session4 = SessionData::new(
-            sid4.clone(),
-            "duplicate_name".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id("office2".to_string());
-
-        // 第一个注册成功
-        assert!(manager.register_session(session1).is_ok());
-
-        // Agent names are unique only within an office.
-        let session2 = session2.with_office_id("office2".to_string());
-        assert!(manager.register_session(session2).is_ok());
-
-        // Computer 名称按 office 唯一：同 office 冲突
-        assert!(manager.register_session(session3.clone()).is_ok());
-        assert!(manager.register_session(session3).is_ok());
-
-        let dup_same_office = SessionData::new(
-            Uuid::new_v4().to_string(),
-            "duplicate_name".to_string(),
-            ClientRole::Computer,
-        )
-        .with_office_id("office1".to_string());
-        assert!(manager.register_session(dup_same_office).is_err());
-
-        // 不同 office 允许同名
-        assert!(manager.register_session(session4).is_ok());
+        // 跨房同名也允许：另一台同名 Computer 入另一空房成功。
+        manager
+            .register_session(SessionData::new(
+                "sid-c3".to_string(),
+                "duplicate_name".to_string(),
+                ClientRole::Computer,
+            ))
+            .unwrap();
+        assert!(
+            manager
+                .reserve_join(&"sid-c3".to_string(), "office2")
+                .is_ok(),
+            "跨房同名必须允许——名字唯一性是房内的，SDK MUST NOT 施加全局名字空间"
+        );
     }
 
     #[test]
@@ -702,15 +628,15 @@ mod tests {
         assert!(manager.register_session(second).is_ok());
     }
 
-    /// #226 P0-2：**两个不同名 Agent 并发加入同一空房 ⇒ 恰一个成功**。
+    /// #226 P0-2 / protocol#66 场景 #8 的 Agent 版：**两个不同名 Agent 并发加入同一空房 ⇒ 恰一个成功**。
     ///
-    /// 这是「一房一 Agent」真正的判别性测试。被替换掉的旧版
+    /// 这是「每 role 一席」真正的判别性测试。被替换掉的旧版
     /// `test_concurrent_pre_room_same_name_is_not_a_conflict` 让两条线程注册**无房**同名会话——
-    /// 无房会话根本没有 name 键、也完全不触碰房占用扫描，故把 entry-claim 回退成 get-then-insert、
-    /// 甚至删掉整张 `name_to_sid` 都照样绿：它测的是「注册」而不是「入房」（零判别力）。
+    /// 无房会话根本不触碰房占用扫描，故把闸门回退成 get-then-insert 照样绿：它测的是「注册」而不是
+    /// 「入房」（零判别力）。
     ///
     /// 本测试让两个线程同时调 [`SessionManager::reserve_join`] 抢同一空房，断言**恰一个**
-    /// `AgentAlreadyExists`（4101）而另一个成功。回归（去掉临界区）会实测出 2/2 成功 ⇒ 红。
+    /// `SeatTaken`（4101）而另一个成功。回归（去掉临界区）会实测出 2/2 成功 ⇒ 红。
     #[test]
     fn test_concurrent_distinct_agents_cannot_share_one_room() {
         const ROUNDS: usize = 200;
@@ -750,7 +676,7 @@ mod tests {
             let accepted = outcomes.iter().filter(|result| result.is_ok()).count();
             let rejected = outcomes
                 .iter()
-                .filter(|result| matches!(result, Err(SessionError::AgentAlreadyExists)))
+                .filter(|result| matches!(result, Err(SessionError::SeatTaken(ClientRole::Agent))))
                 .count();
             assert_eq!(
                 (accepted, rejected),
@@ -761,10 +687,11 @@ mod tests {
         }
     }
 
-    /// #226 P0-2：**同房同 role 同名并发 join ⇒ 恰一个 `4105`**。
+    /// #226 P0-2 / protocol#66 场景 #8+#2 的 Computer 版：**两台（同名）Computer 并发加入同一空房
+    /// ⇒ 恰一个 `4101 SeatTaken(Computer)`**。
     ///
-    /// 与上一条同因（跨键不变量缺原子闸门），但落到 name 键而非房占用；用 Computer（Agent 侧会
-    /// 先被 4101 挡下，故同名冲突在 Agent 上不可达）。
+    /// 「同名」不再是独立判定维度（`4105` 已转预留）：场景 #2 要求同名第二台也回 `4101`，本测试把
+    /// 「同名 + 并发」压到极值——两条线程同名抢房，仍恰一个席位码。
     #[test]
     fn test_concurrent_same_name_computers_collide_exactly_once() {
         const ROUNDS: usize = 200;
@@ -804,13 +731,13 @@ mod tests {
             let rejected = outcomes
                 .iter()
                 .filter(|result| {
-                    matches!(result, Err(SessionError::NameAlreadyRegistered(name)) if name == "shared")
+                    matches!(result, Err(SessionError::SeatTaken(ClientRole::Computer)))
                 })
                 .count();
             assert_eq!(
                 (outcomes.iter().filter(|r| r.is_ok()).count(), rejected),
                 (1, 1),
-                "round {round}: 房内同名唯一必须原子生效（实得 {outcomes:?}）"
+                "round {round}: 每 role 一席必须原子生效，同名第二台也回 4101（实得 {outcomes:?}）"
             );
         }
     }
@@ -950,21 +877,21 @@ mod tests {
         assert_eq!(session.extra, extra);
     }
 
-    /// #226 P1-4：**同一 socket 并发双 join 后断连，原 name 预留必须可被合法复用**。
+    /// 席位随会话生命周期释放：**断连（注销）前旧会话占住席位、断连后同房同名可复用**。
     ///
-    /// 旧实现的失败链：同一 sid 的两个 join 都走「查无则新建」⇒ `register_session` 后者覆盖前者；
-    /// 断连时只按**当前**记录（office 已被清或 role 已换）推导 name 键 ⇒ 前一条记录占下的
-    /// `agent:<office>:<name>` 永不释放，之后任何合法 Agent 以该名字进该房**永久 4105**，直到进程重启。
+    /// 俯视语义：席位 = `(office_id, role)`，由会话记录的 `office_id` 蕴含。静默断线期间旧会话仍在，
+    /// 新会话（新 sid，同名与否）撞 `4101`——这正是协议 §静默断线与会话回收描述的瞬态冲突窗口
+    /// （客户端补偿=有界退避重试）；传输层回收旧会话（`unregister_session`）后席位即释放。
     ///
-    /// 本测试不依赖任何竞态的时序，只依赖「覆盖会发生」这一旧实现事实：先让 sid 入房占下 name 键，
-    /// 再用另一身份对它重复注册（旧实现会覆盖并留下孤儿键），随后断连，最后断言另一个 sid 能用
-    /// 同一 name 正常入房。
+    /// 另覆盖 `register_session` 的身份不可变性：既有会话不可被重复注册路径悄悄换掉身份
+    /// （身份变更须新连接 + 403）——旧实现的无条件覆盖曾造成 name 预留泄漏（#226 P1-4，
+    /// 该缺陷类随名字注册表删除整体消失，此处钉住防回归的注册语义）。
     #[test]
-    fn name_reservation_is_released_after_overwrite_and_disconnect() {
+    fn seat_is_held_until_disconnect_then_reusable() {
         let manager = SessionManager::new();
         let sid = "sid-owner".to_string();
 
-        // 1) 原会话以 Agent/agent-1 入房 ⇒ 占下 agent:8:office-A:agent-1。
+        // 1) 原会话以 Agent/agent-1 入房 ⇒ 占下 (office-A, agent) 席位。
         let owner = manager.get_or_register_session(
             sid.clone(),
             "agent-1".to_string(),
@@ -980,7 +907,7 @@ mod tests {
             Some("office-A")
         );
 
-        // 2) 同一 sid 以**另一身份**重复注册：旧实现无条件覆盖（留下孤儿 name 键），新实现保留原记录。
+        // 2) 同一 sid 以**另一身份**重复注册：保留原记录（身份不可被注册路径替换）。
         manager
             .register_session(SessionData::new(
                 sid.clone(),
@@ -994,10 +921,7 @@ mod tests {
             "既有会话的身份不可被注册路径悄悄替换（身份变更须新连接 + 403）"
         );
 
-        // 3) 断连 ⇒ 必须释放 agent 键与房占用。
-        assert!(manager.unregister_session(&sid).is_some());
-
-        // 4) 另一个合法 Agent 用同一名字进同一房：MUST 成功（旧实现此处永久 4105）。
+        // 3) 旧会话未回收期间：另一个（**同名**）Agent 入同一房 ⇒ 撞席位（4101，瞬态冲突窗口）。
         manager
             .register_session(SessionData::new(
                 "sid-next".to_string(),
@@ -1006,10 +930,20 @@ mod tests {
             ))
             .unwrap();
         assert!(
+            matches!(
+                manager.reserve_join(&"sid-next".to_string(), "office-A"),
+                Err(SessionError::SeatTaken(ClientRole::Agent))
+            ),
+            "旧会话未回收时席位仍被占据（同名与否一律 4101）——瞬态冲突窗口"
+        );
+
+        // 4) 断连（传输层回收）⇒ 席位释放；同房同名复用 MUST 成功。
+        assert!(manager.unregister_session(&sid).is_some());
+        assert!(
             manager
                 .reserve_join(&"sid-next".to_string(), "office-A")
                 .is_ok(),
-            "断连后原 name 预留必须已释放，同房同名方可复用"
+            "断连后席位必须已释放，同房同名方可复用"
         );
     }
 
@@ -1080,13 +1014,14 @@ mod tests {
 
     #[test]
     fn test_room_error_codes_follow_protocol_contract() {
+        // protocol#66：4101 泛化为「本 role 席位已占」，Agent / Computer 同码。
         assert_eq!(
-            SessionError::AgentAlreadyExists.error_code(),
+            SessionError::SeatTaken(ClientRole::Agent).error_code(),
             smcp::error_codes::ROOM_FULL
         );
         assert_eq!(
-            SessionError::NameAlreadyRegistered("agent".to_string()).error_code(),
-            smcp::error_codes::NAME_CONFLICT
+            SessionError::SeatTaken(ClientRole::Computer).error_code(),
+            smcp::error_codes::ROOM_FULL
         );
         assert_eq!(
             SessionError::AgentAlreadyInRoom("office".to_string()).error_code(),
@@ -1095,6 +1030,11 @@ mod tests {
         assert_ne!(
             SessionError::AgentAlreadyInRoom("office".to_string()).error_code(),
             smcp::error_codes::ROOM_NOT_FOUND
+        );
+        // 4105 为预留码：会话层不再存在可映射到它的错误变体（类型层面已排除产出）。
+        assert_ne!(
+            SessionError::SeatTaken(ClientRole::Computer).error_code(),
+            smcp::error_codes::NAME_CONFLICT
         );
     }
 }
