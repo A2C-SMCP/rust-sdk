@@ -1,10 +1,16 @@
 //! #140：input 环境变量命名（ENV_SEGMENT）**跨 SDK 一致性对拍**（P0 硬门槛）/ ENV_SEGMENT conformance.
 //!
-//! [`fixtures/env_segment_conformance_vectors.json`] 是**跨语言契约**——python-sdk 对拍同一份文件
-//! （python 首版提供，rust 逐字节 vendored；协议仓收口后改为 vendored 副本，同 bundle_id 方式同步）。
+//! [`fixtures/env_segment_conformance_vectors.json`] 是**跨语言契约**，唯一源为协议仓
+//! `docs/specification/fixtures/env_segment_conformance_vectors.json`（[protocol#68]）。本文件是
+//! **vendored 逐字节副本**（`include_str!` 编译期嵌入），同步靠人手 `git show`——没有任何构建期校验；
+//! 漂移由下方向量条数与 `algorithm` 块完整性门禁兜底，重新同步时须整文件覆盖。
+//! python-sdk 对拍同一份协议夹具（python 侧跟进 [python-sdk#232]）。
 //!
 //! 含义：任一 SDK 的 `env_var_name(input_id, bundle_id, tool_name)` MUST 对每条向量产出
 //! `expected_env_var_name` 方为合规（PROTO-5 / Discussion #23 F4-F5）。
+//!
+//! [protocol#68]: https://github.com/A2C-SMCP/a2c-smcp-protocol/issues/68
+//! [python-sdk#232]: https://github.com/A2C-SMCP/python-sdk/issues/232
 
 use smcp::utils::env_segment::env_var_name;
 
