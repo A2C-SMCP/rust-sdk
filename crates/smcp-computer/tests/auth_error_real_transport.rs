@@ -34,11 +34,13 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use rmcp::model::CallToolResult;
 use smcp::ErrorCode;
 use smcp_computer::mcp_clients::auth_error::classify_auth_error;
 use smcp_computer::mcp_clients::http_client::HttpMCPClient;
 use smcp_computer::mcp_clients::model::*;
 use smcp_computer::mcp_clients::sse_client::SseMCPClient;
+use smcp_computer::mcp_clients::MCPServerManager;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -84,6 +86,82 @@ async fn call_and_capture_err(
     }
 }
 
+/// 断言最终协议形状 `CallToolResult` 满足 4006 向量的全部 expected 字段
+/// （core-governance §6 全字段口径：`error_code` + `isError`；「不挂起」由调用方 time-box 断言）。
+fn assert_auth_4006_result(result: &CallToolResult, what: &str) {
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "{}: 授权失败 MUST 是 isError 结果",
+        what
+    );
+    let meta = result
+        .meta
+        .as_ref()
+        .unwrap_or_else(|| panic!("{}: MUST 携带结果级 meta", what));
+    assert_eq!(
+        meta.get(smcp::tool_meta::AUTH_ERROR_CODE_KEY)
+            .and_then(|v| v.as_i64()),
+        Some(i64::from(ErrorCode::ToolAuthorizationRequired.code())),
+        "{}: 上游 401 MUST 分类为 4006",
+        what
+    );
+}
+
+/// 经真实 [`MCPServerManager`] 驱动一次 `tools/call`，返回最终协议形状结果。
+///
+/// 与直接调客户端的 [`call_and_capture_err`] 互补：分类器断言看保型 `MCPClientError`，本函数看
+/// `finalize_tool_result` 分流后的 `CallToolResult`（§4.8 的 surfacing 判据）。time-box 兼作「不挂起」断言。
+async fn manager_call_and_capture_result(cfg: MCPServerConfig, bundle_id: &str) -> CallToolResult {
+    let manager = MCPServerManager::new();
+    manager
+        .initialize(vec![cfg])
+        .await
+        .expect("manager initialize must pass");
+
+    tokio::time::timeout(Duration::from_secs(60), manager.start_all())
+        .await
+        .expect("HANG: manager.start_all did not finish within 60s")
+        .expect("manager start_all must pass (handshake allowed)");
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.call_tool(bundle_id, "protected", serde_json::json!({}), None),
+    )
+    .await;
+
+    match outcome {
+        Err(_) => panic!("HANG: manager.call_tool did not resolve within 10s for {bundle_id}"),
+        Ok(Err(e)) => panic!("expected protocol-shaped auth CallToolResult, got Err: {e}"),
+        Ok(Ok(r)) => r,
+    }
+}
+
+/// HTTP（streamable）manager 场景：握手放行、仅 `tools/call` 按给定状态拒绝。
+async fn manager_call_and_capture_result_http(
+    reject_status: StatusCode,
+    with_www_authenticate: bool,
+) -> CallToolResult {
+    let port = spawn_streamable_mock(MockOpts {
+        reject_status,
+        with_www_authenticate,
+        expose_resources: false,
+        ..Default::default()
+    })
+    .await;
+    let mut cfg = MCPServerConfig::Http(HttpServerConfig::new(
+        "auth_http_mgr",
+        HttpServerParameters {
+            url: format!("http://127.0.0.1:{}", port),
+            headers: HashMap::new(),
+        },
+    ));
+    cfg.set_bundle_id(Some(
+        BundleId::try_from("auth_http_mgr".to_string()).expect("fixture bundle_id"),
+    ));
+    manager_call_and_capture_result(cfg, "auth_http_mgr").await
+}
+
 /// 403 → Display 携 `403 Forbidden` → 分类 4007。真实传输下**可达**。
 #[tokio::test]
 async fn test_http_real_403_reaches_4007() {
@@ -124,6 +202,11 @@ async fn test_http_real_401_without_www_authenticate_reaches_4006() {
         "bare 401 must classify as 4006, got none for: {}",
         msg
     );
+
+    // 全字段口径（core-governance §6）：同一用例内再断言最终 CallToolResult 的 isError/error_code；
+    // manager 级 time-box 保证不挂起。
+    let result = manager_call_and_capture_result_http(StatusCode::UNAUTHORIZED, false).await;
+    assert_auth_4006_result(&result, "bare 401");
 }
 
 /// 401 + `WWW-Authenticate`（RFC 6750/9728 要求的标准形态）→ rmcp 短路成
@@ -159,6 +242,10 @@ async fn test_http_real_401_with_www_authenticate_reaches_4006() {
         "401 + WWW-Authenticate must classify as 4006 via structured downcast, got: {}",
         msg
     );
+
+    // 全字段口径（core-governance §6）：结构化判定必须在最终 CallToolResult 上兑现 isError/4006。
+    let result = manager_call_and_capture_result_http(StatusCode::UNAUTHORIZED, true).await;
+    assert_auth_4006_result(&result, "401 + WWW-Authenticate");
 }
 
 // ============================================================
@@ -298,6 +385,22 @@ async fn sse_call_and_capture_err(reject_status: StatusCode) -> MCPClientError {
     }
 }
 
+/// SSE（手写客户端经 manager 装配）manager 场景：GET /sse 放行、POST `tools/call` 按给定状态拒绝。
+async fn manager_call_and_capture_result_sse(reject_status: StatusCode) -> CallToolResult {
+    let port = spawn_sse_auth_mock(reject_status).await;
+    let mut cfg = MCPServerConfig::Sse(SseServerConfig::new(
+        "auth_sse_mgr",
+        SseServerParameters {
+            url: format!("http://127.0.0.1:{}/sse", port),
+            headers: HashMap::new(),
+        },
+    ));
+    cfg.set_bundle_id(Some(
+        BundleId::try_from("auth_sse_mgr".to_string()).expect("fixture bundle_id"),
+    ));
+    manager_call_and_capture_result(cfg, "auth_sse_mgr").await
+}
+
 /// SSE（手写客户端）：401 即便带 `WWW-Authenticate` 也自建错误串携状态码 → 4006 可达。
 /// 与 HTTP 传输的 rmcp 短路形成对照——同一部署形态下两传输**分类结果不一致**。
 #[tokio::test]
@@ -312,6 +415,10 @@ async fn test_sse_real_401_reaches_4006() {
         "SSE 401 must classify as 4006, got none for: {}",
         msg
     );
+
+    // 全字段口径（core-governance §6）：SSE 景同样断言最终 CallToolResult 的 isError/4006。
+    let result = manager_call_and_capture_result_sse(StatusCode::UNAUTHORIZED).await;
+    assert_auth_4006_result(&result, "SSE 401");
 }
 
 /// SSE：403 → 4007 可达。
