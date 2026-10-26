@@ -906,7 +906,19 @@ impl CommandHandler {
         }
 
         if self.computer.name() == computer_name {
-            self.computer.join_office(office_id, computer_name).await?;
+            if let Err(error) = self.computer.join_office(office_id, computer_name).await {
+                if self.computer.take_rejoin_intent_cancelled().await {
+                    println!(
+                        "{}",
+                        style(
+                            "  ⚠ 此前的自动回房意图已取消 / the previous pending automatic rejoin \
+                             intent was cancelled"
+                        )
+                        .yellow()
+                    );
+                }
+                return Err(error.into());
+            }
             println!("✅ 已加入房间 / Joined office: {office_id}");
             return Ok(());
         }
@@ -985,6 +997,16 @@ impl CommandHandler {
                     ))
                     .yellow()
                 );
+                if self.computer.take_rejoin_intent_cancelled().await {
+                    println!(
+                        "{}",
+                        style(
+                            "  ⚠ 此前的自动回房意图已取消 / the previous pending automatic rejoin \
+                             intent was cancelled"
+                        )
+                        .yellow()
+                    );
+                }
                 Err(error.into())
             }
         }

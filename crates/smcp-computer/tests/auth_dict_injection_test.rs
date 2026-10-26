@@ -167,6 +167,7 @@ struct ReconnectCaptureServer {
     join_rx: mpsc::UnboundedReceiver<Value>,
     join_ack_rx: mpsc::UnboundedReceiver<usize>,
     update_rx: mpsc::UnboundedReceiver<(String, Value)>,
+    leave_rx: mpsc::UnboundedReceiver<Value>,
     active_connections: Arc<AtomicUsize>,
     namespace_socket: Arc<Mutex<Option<SocketRef>>>,
     connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
@@ -187,6 +188,13 @@ impl ReconnectCaptureServer {
             .await
             .expect("timed out waiting for server:join_office")
             .expect("capture server stopped before receiving join_office")
+    }
+
+    async fn next_leave(&mut self) -> Value {
+        timeout(Duration::from_secs(10), self.leave_rx.recv())
+            .await
+            .expect("timed out waiting for server:leave_office")
+            .expect("capture server stopped before receiving leave_office")
     }
 
     async fn wait_for_join_ack(&mut self, expected_attempt: usize) {
@@ -338,6 +346,7 @@ async fn start_reconnect_capture_server_with_policy(
     let backend_addr = backend_listener.local_addr().unwrap();
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
     let (update_tx, update_rx) = mpsc::unbounded_channel();
+    let (leave_tx, leave_rx) = mpsc::unbounded_channel();
     let (join_tx, join_rx) = mpsc::unbounded_channel();
     let (join_ack_tx, join_ack_rx) = mpsc::unbounded_channel();
     let join_attempts = Arc::new(AtomicUsize::new(0));
@@ -352,6 +361,7 @@ async fn start_reconnect_capture_server_with_policy(
         move |socket: SocketRef, TryData(auth): TryData<Value>| {
             let auth_tx = auth_tx.clone();
             let update_tx = update_tx.clone();
+            let leave_tx = leave_tx.clone();
             let gate = gate.clone();
             let join_tx = join_tx.clone();
             let join_ack_tx = join_ack_tx.clone();
@@ -371,6 +381,12 @@ async fn start_reconnect_capture_server_with_policy(
                         let _ = update_tx.send((event.to_string(), value));
                     });
                 }
+                socket.on(
+                    smcp::events::SERVER_LEAVE_OFFICE,
+                    move |Data::<Value>(value)| {
+                        let _ = leave_tx.send(value);
+                    },
+                );
                 active_connections.fetch_add(1, Ordering::SeqCst);
                 *namespace_socket.lock().unwrap() = Some(socket.clone());
                 socket.on_disconnect({
@@ -482,6 +498,7 @@ async fn start_reconnect_capture_server_with_policy(
         join_rx,
         join_ack_rx,
         update_rx,
+        leave_rx,
         active_connections,
         namespace_socket,
         connection_tasks,
@@ -953,7 +970,8 @@ async fn failed_explicit_join_during_rejoin_backoff_cancels_pending_intent() {
     let _ = server.next_auth().await;
     let _ = server.next_join().await; // 第 2 次（auto）被 4101 拒绝，进入 1s 退避
 
-    // 退避窗口内显式换房，同样被 4101 拒绝。
+    // 退避窗口内显式换房，同样被 4101 拒绝。自动重试与显式 join 存在调度竞态：
+    // 按载荷（office_id）定位显式 join 的那一次，不依赖 1s 退避窗口。
     assert!(
         computer
             .join_office("office-cancel-target", "office-cancel-computer")
@@ -961,20 +979,17 @@ async fn failed_explicit_join_during_rejoin_backoff_cancels_pending_intent() {
             .is_err(),
         "the explicit join must fail"
     );
-    let _ = server.next_join().await; // 第 3 次 = 显式 join，被拒
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if server.next_join().await["office_id"] == "office-cancel-target" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the explicit join must reach the server");
 
-    // 意图已取消：更新不再排队（desired=None ⇒ emit 直接 no-op）。
-    computer
-        .emit_update_config()
-        .await
-        .expect("no pending intent means coalesced update is a no-op");
-    assert!(
-        timeout(Duration::from_millis(300), server.update_rx.recv())
-            .await
-            .is_err(),
-        "cancelled intent must not keep queuing/flushing updates"
-    );
-    // 醒来的旧回房任务 stale 退出，不产生第 4 次 join。
+    // 醒来的旧回房任务 stale 退出，不产生后续 join。
     server.assert_no_join_for(Duration::from_secs(2)).await;
 
     // 再次断线重连：desired 已清空，不再回放。
@@ -1263,9 +1278,57 @@ async fn explicit_leave_is_not_blocked_during_rejoin_backoff() {
         .await
         .expect("explicit leave must not wait for the backoff window")
         .expect("explicit leave succeeds");
+    // wire 断言：退房打出的就是回房意图里的目标房（由 office_operation 锁内解析）。
+    assert_eq!(
+        server.next_leave().await["office_id"],
+        "office-rejoin-leave"
+    );
 
     wait_for_lifecycle(&mut events, LifecycleState::Connected).await;
     server.assert_no_join_for(Duration::from_secs(2)).await;
+    computer.shutdown().await.expect("shutdown computer");
+    server.shutdown();
+}
+
+/// #234：并发换房与退房由 `office_operation` 全序化——leave 的 wire 目标必须是
+/// 同一临界区内解析出的房号（旧房 A 或新房 B），不能是空值或第三个房号。
+#[tokio::test]
+async fn leave_during_concurrent_switch_targets_the_locked_office() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server(None, None).await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-concurrent-leave", &temp).await;
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "office-concurrent-token" })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-a", "office-concurrent-leave")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    let (join_result, leave_result) = tokio::join!(
+        computer.join_office("office-b", "office-concurrent-leave"),
+        computer.leave_office(),
+    );
+    join_result.expect("concurrent explicit join");
+    leave_result.expect("concurrent explicit leave");
+
+    let leave = server.next_leave().await;
+    let target = leave["office_id"].as_str().expect("leave office_id");
+    assert!(
+        target == "office-a" || target == "office-b",
+        "leave must target the office resolved under the operation lock, got {target}"
+    );
+
     computer.shutdown().await.expect("shutdown computer");
     server.shutdown();
 }

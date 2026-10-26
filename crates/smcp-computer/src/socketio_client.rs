@@ -235,6 +235,9 @@ struct OfficeMembership {
     transport_epoch: u64,
     connected: bool,
     rejoin_task: Option<tokio::task::AbortHandle>,
+    /// #234：最近一次显式 join 失败取消了无属主回房意图（一次性，供 CLI 展示）。
+    #[cfg(feature = "cli")]
+    rejoin_intent_cancelled: bool,
 }
 
 impl OfficeMembership {
@@ -327,27 +330,24 @@ fn lock_office_membership(
 ///
 /// 仅 `server:join_office` 的分类路径使用；错误在 `JoinOfficeFailure` / `ComputerError`
 /// 两侧保持原有文案，其它 `emit_with_ack` 处理器不经过本分类（无全局语义漂移）。
+#[derive(Debug)]
 enum AckCallError {
     /// 发送失败 / ACK 通道随传输层关闭：绑定会话已失效，回房必须保留重放意图。
+    ///
+    /// 注：当前 tf-rust-socketio 0.9.3 在断线时**不清空** `outstanding_acks`，因此
+    /// 「ACK 通道关闭」近乎不可达；实际可达路径是**发送时传输已关闭**（`send` 失败）。
     Interrupted(ComputerError),
     /// 普通失败（ACK 超时、坏形状、解析失败等）。
     Failed(ComputerError),
 }
 
 /// 自动回房单次 `server:join_office` 的失败分类（#234）。
+#[derive(Debug)]
 enum JoinOfficeFailure {
     /// 绑定传输层失效：由 Close/Connect 生命周期接管，保留重放意图且不重试。
     Interrupted(ComputerError),
     /// 对端裁决或普通失败：按错误码分类决定退避重试或终态。
     Verdict(ComputerError),
-}
-
-impl JoinOfficeFailure {
-    fn into_error(self) -> ComputerError {
-        match self {
-            Self::Interrupted(error) | Self::Verdict(error) => error,
-        }
-    }
 }
 
 /// SMCP Computer Socket.IO客户端 Builder /
@@ -1199,6 +1199,11 @@ impl SmcpComputerClient {
             }
             membership.joining = true;
             membership.desired = Some(office_id.to_string());
+            // 本次尝试重新开始：清掉上一次失败留下的一次性取消提示，避免 CLI 误报。
+            #[cfg(feature = "cli")]
+            {
+                membership.rejoin_intent_cancelled = false;
+            }
             (
                 generation,
                 previous_desired,
@@ -1213,7 +1218,8 @@ impl SmcpComputerClient {
             generation,
         };
         drop(sending);
-        let result = Self::join_office_with_client(&self.client, computer_name, office_id).await;
+        let result =
+            Self::join_office_with_client_classified(&self.client, computer_name, office_id).await;
         let result = {
             let mut membership = lock_office_membership(&self.office_membership);
             if !membership.is_current_transport(generation, office_id, self.client.session_epoch())
@@ -1231,7 +1237,19 @@ impl SmcpComputerClient {
                     info!("Successfully joined office: {}", office_id);
                     Ok(())
                 }
-                Err(error) => {
+                Err(JoinOfficeFailure::Interrupted(error)) => {
+                    // #234：连接级中断不撤销用户刚刚表达的入房意图。保留 join 开始时写入的
+                    // 新 `desired` 与 `pending_updates`，由下一次 Connect 重放；新会话尚未
+                    // 确认任何成员关系，故 `confirmed = None`，lifecycle 交给 Close/Connect。
+                    membership.confirmed = None;
+                    debug!(
+                        office = %office_id,
+                        %error,
+                        "Explicit join interrupted by transport loss; keeping the new intent for the next session"
+                    );
+                    Err(error)
+                }
+                Err(JoinOfficeFailure::Verdict(error)) => {
                     if previous_desired.as_deref() != Some(office_id) {
                         if matches!(error, ComputerError::ProtocolRejection { .. })
                             && previous_confirmed.is_some()
@@ -1251,10 +1269,14 @@ impl SmcpComputerClient {
                     if previous_confirmed.is_none() && previous_desired.is_some() {
                         // #234：显式 join 已推进世代，旧自动回房 task 因 stale 退出；若再把
                         // 旧 desired 挂回去，它会成为一条**没有属主**的意图（get_office_id=None，
-                        // 更新永远排队）。明确取消，并在日志中告知用户，避免静默失效。
+                        // 更新永远排队）。明确取消，并在日志/CLI 中告知用户，避免静默失效。
                         membership.desired = None;
                         membership.confirmed = None;
                         membership.pending_updates = [None; 4];
+                        #[cfg(feature = "cli")]
+                        {
+                            membership.rejoin_intent_cancelled = true;
+                        }
                         self.runtime_status.transition(LifecycleState::Connected);
                         warn!(
                             requested_office = %office_id,
@@ -1569,17 +1591,6 @@ impl SmcpComputerClient {
         )))
     }
 
-    /// Send `server:join_office` over a specific namespace connection and validate its ACK.
-    async fn join_office_with_client(
-        client: &Client,
-        computer_name: &str,
-        office_id: &str,
-    ) -> ComputerResult<()> {
-        Self::join_office_with_client_classified(client, computer_name, office_id)
-            .await
-            .map_err(JoinOfficeFailure::into_error)
-    }
-
     /// 获取当前Office ID / Get current Office ID
     pub async fn get_current_office_id(&self) -> ComputerResult<String> {
         let membership = lock_office_membership(&self.office_membership);
@@ -1589,6 +1600,13 @@ impl SmcpComputerClient {
                 "Not currently in any office".to_string(),
             )),
         }
+    }
+
+    /// #234：取出「显式 join 失败已取消待回放意图」的一次性提示（供 CLI 输出）。
+    #[cfg(feature = "cli")]
+    pub(crate) async fn take_rejoin_intent_cancelled(&self) -> bool {
+        let mut membership = lock_office_membership(&self.office_membership);
+        std::mem::take(&mut membership.rejoin_intent_cancelled)
     }
 
     /// 离开Office
@@ -3819,5 +3837,131 @@ mod tests {
         promote_result_meta_to_meta(&mut bad);
         assert_eq!(bad["_meta"], json!("i-am-a-string"));
         assert!(bad.get("meta").is_none());
+    }
+
+    /// 最小裸 socketioxide 服务：仅接受 `/smcp` namespace 连接，用于制造「已连接再断开」。
+    async fn start_bare_socketio_server() -> (String, tokio::sync::oneshot::Sender<()>) {
+        use http_body_util::Full;
+        use hyper::body::Bytes;
+        use socketioxide::extract::SocketRef;
+        use socketioxide::SocketIo;
+        use tokio::net::TcpListener;
+        use tower::Layer;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (layer, io) = SocketIo::new_layer();
+        io.ns("/smcp", |_socket: SocketRef| async {});
+        let fallback =
+            tower::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::<Bytes>::new(
+                    Bytes::new(),
+                )))
+            });
+        let service = layer.layer(fallback);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        if let Ok((stream, _)) = accepted {
+                            let svc = service.clone();
+                            tokio::spawn(async move {
+                                let tio = hyper_util::rt::TokioIo::new(stream);
+                                let svc = hyper_util::service::TowerToHyperService::new(svc);
+                                let _ = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(tio, svc)
+                                    .with_upgrades()
+                                    .await;
+                            });
+                        }
+                    }
+                    _ = &mut shutdown_rx => break,
+                }
+            }
+        });
+        (format!("http://{addr}"), shutdown_tx)
+    }
+
+    async fn connect_bare_client(url: &str) -> SmcpComputerClient {
+        SmcpComputerClient::connect_internal(
+            url.to_string(),
+            Arc::new(RwLock::new(None)),
+            "bare-client".to_string(),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            None,
+            "/smcp".to_string(),
+            Duration::from_secs(10),
+            DEFAULT_OFFICE_REJOIN_BUDGET,
+            None,
+            None,
+        )
+        .await
+        .expect("connect bare client")
+    }
+
+    /// #234（分支级）：传输已关闭时发送 join 必须判为 `Interrupted`，而不是永久拒绝。
+    #[tokio::test]
+    async fn classified_join_reports_interrupted_when_transport_is_closed() {
+        let (url, _shutdown) = start_bare_socketio_server().await;
+        let client = connect_bare_client(&url).await;
+        client.disconnect().await.expect("disconnect transport");
+
+        let outcome = SmcpComputerClient::join_office_with_client_classified(
+            &client.client,
+            "bare-client",
+            "office-interrupted",
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(JoinOfficeFailure::Interrupted(_))),
+            "expected Interrupted, got {outcome:?}"
+        );
+    }
+
+    /// #234（分支级）：`Interrupted` 必须保留 desired/pending_updates，由下一次 Connect 重放。
+    ///
+    /// 自证：把 `rejoin_office_after_reconnect` 的 `Interrupted` 分支改为终态提交，
+    /// 本用例会在 desired/pending 断言处失败（见提交回报）。
+    #[tokio::test]
+    async fn interrupted_rejoin_preserves_intent_and_pending_updates() {
+        let (url, _shutdown) = start_bare_socketio_server().await;
+        let client = connect_bare_client(&url).await;
+        client.disconnect().await.expect("disconnect transport");
+        // 断开后再取 epoch，保证守卫通过（本用例要走到 join 的 Interrupted 分支）。
+        let transport_epoch = client.client.session_epoch();
+
+        let membership = Arc::new(StdMutex::new(OfficeMembership {
+            desired: Some("office-interrupted".to_string()),
+            connected: true,
+            generation: 7,
+            transport_epoch,
+            pending_updates: [Some(1), None, None, None],
+            ..Default::default()
+        }));
+        let operation = Arc::new(Mutex::new(()));
+        let status = RuntimeLifecycle::default();
+
+        SmcpComputerClient::rejoin_office_after_reconnect(
+            client.client.clone(),
+            "bare-client".to_string(),
+            "office-interrupted".to_string(),
+            Arc::clone(&membership),
+            operation,
+            status,
+            7,
+            DEFAULT_OFFICE_REJOIN_BUDGET,
+        )
+        .await;
+
+        let membership = lock_office_membership(&membership);
+        assert_eq!(membership.desired.as_deref(), Some("office-interrupted"));
+        assert_eq!(membership.pending_updates, [Some(1), None, None, None]);
+        assert_eq!(membership.confirmed, None);
+        assert!(
+            membership.connected,
+            "Interrupted must not clear membership"
+        );
     }
 }

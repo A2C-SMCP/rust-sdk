@@ -4798,6 +4798,16 @@ impl<S: Session> Computer<S> {
         ))
     }
 
+    /// #234：一次性提示——最近一次显式 join 失败是否取消了待回放的自动回房意图。
+    #[cfg(feature = "cli")]
+    pub(crate) async fn take_rejoin_intent_cancelled(&self) -> bool {
+        let socketio = self.socketio_client.read().await;
+        match socketio.as_ref() {
+            Some(client) => client.take_rejoin_intent_cancelled().await,
+            None => false,
+        }
+    }
+
     /// 发送配置更新通知 / Emit config update notification
     pub async fn emit_update_config(&self) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;

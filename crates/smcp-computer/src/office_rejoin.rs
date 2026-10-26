@@ -55,6 +55,8 @@ pub(crate) enum RejoinVerdict {
 /// - `4105` 为预留码、`4106` 是客户端状态错误、ACK 超时/坏形状等重试不改变结果——永久失败。
 pub(crate) fn classify_rejoin_error(error: &ComputerError) -> RejoinVerdict {
     match error {
+        // 当前生产路径**不可达**：连接级失败已由 `JoinOfficeFailure::Interrupted` 在进入
+        // 本函数前分流（`classify_rejoin_error` 只接收 `Verdict`）。保留映射供防御与单测。
         ComputerError::ConnectionError(_) => RejoinVerdict::Interrupted,
         ComputerError::ProtocolRejection { code, .. } if *code == TRANSIENT_ROOM_CONFLICT_CODE => {
             RejoinVerdict::TransientConflict
