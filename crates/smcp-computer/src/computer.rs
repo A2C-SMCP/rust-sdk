@@ -4788,14 +4788,9 @@ impl<S: Session> Computer<S> {
         if let Some(ref client) = *socketio_ref {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
-            // #234：重连回房退避期间 `confirmed` 为空，但 `desired` 仍在；显式退房必须用它
-            // 取消重试，否则退房会报「不在任何房」，随后重试又把成员关系加回去。
-            let Some(current_office_id) = client.get_office_id_for_leave().await else {
-                return Err(ComputerError::InvalidState(
-                    "Not currently in any office".to_string(),
-                ));
-            };
-            client.leave_office(&current_office_id).await?;
+            // #234：目标在 client 的 office_operation 临界区内解析（confirmed → desired），
+            // 重连回房退避期间退房可取消重试，且不会被并发换房带偏到错误房号。
+            client.leave_current_office().await?;
             return Ok(());
         }
         Err(ComputerError::InvalidState(

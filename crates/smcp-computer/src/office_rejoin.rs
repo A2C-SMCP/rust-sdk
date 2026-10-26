@@ -36,15 +36,31 @@ pub(crate) fn retry_fits_budget(elapsed: Duration, delay: Duration, budget: Dura
     elapsed.saturating_add(delay) <= budget
 }
 
-/// 仅 `4101` 是重连恢复路径上的瞬态冲突。
+/// 回房单次失败的裁决分类（与 `smcp-agent::office::RejoinVerdict` 同构）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejoinVerdict {
+    /// 连接级失效（发送失败 / ACK 通道随传输层关闭）：由 Close/Connect 生命周期接管，
+    /// 当前任务必须保留重放意图、不重试也不落失败终态。
+    Interrupted,
+    /// 瞬态冲突（仅 `4101`）：预算内可退避重试。
+    TransientConflict,
+    /// 永久失败：其它协议码、ACK 超时/坏形状或普通失败。
+    Permanent,
+}
+
+/// 判定单次回房失败属于哪一种裁决。
 ///
-/// `4105` 已转预留码（收到即协议违规）、`4106` 是客户端状态错误、其余码与传输错误
-/// 重试不改变结果——一律不可重试。
-pub(crate) fn is_transient_room_conflict(error: &ComputerError) -> bool {
-    matches!(
-        error,
-        ComputerError::ProtocolRejection { code, .. } if *code == TRANSIENT_ROOM_CONFLICT_CODE
-    )
+/// - 只有 `4101` 是重连恢复路径上的瞬态冲突可重试；
+/// - `ConnectionError` 表示绑定会话已失效（不是服务端裁决），保留意图交给生命周期；
+/// - `4105` 为预留码、`4106` 是客户端状态错误、ACK 超时/坏形状等重试不改变结果——永久失败。
+pub(crate) fn classify_rejoin_error(error: &ComputerError) -> RejoinVerdict {
+    match error {
+        ComputerError::ConnectionError(_) => RejoinVerdict::Interrupted,
+        ComputerError::ProtocolRejection { code, .. } if *code == TRANSIENT_ROOM_CONFLICT_CODE => {
+            RejoinVerdict::TransientConflict
+        }
+        _ => RejoinVerdict::Permanent,
+    }
 }
 
 #[cfg(test)]
@@ -110,26 +126,39 @@ mod tests {
 
     #[test]
     fn only_4101_is_transient() {
-        assert!(is_transient_room_conflict(&rejection(
-            smcp::error_codes::ROOM_FULL as i64
-        )));
+        assert_eq!(
+            classify_rejoin_error(&rejection(smcp::error_codes::ROOM_FULL as i64)),
+            RejoinVerdict::TransientConflict
+        );
         for code in [400, 4008, 4102, 4103, 4104, 4105, 4106, 4019, 9999] {
-            assert!(
-                !is_transient_room_conflict(&rejection(code)),
+            assert_eq!(
+                classify_rejoin_error(&rejection(code)),
+                RejoinVerdict::Permanent,
                 "code {code} must not be retried"
             );
         }
-        assert!(!is_transient_room_conflict(
-            &ComputerError::ConnectionError("reset".to_string())
-        ));
-        assert!(!is_transient_room_conflict(&ComputerError::SocketIoError(
-            "closed".to_string()
-        )));
-        assert!(!is_transient_room_conflict(&ComputerError::TimeoutError(
-            "timeout".to_string()
-        )));
-        assert!(!is_transient_room_conflict(&ComputerError::ProtocolError(
-            "unrecognized ack".to_string()
-        )));
+    }
+
+    #[test]
+    fn connection_errors_are_interrupted() {
+        assert_eq!(
+            classify_rejoin_error(&ComputerError::ConnectionError("reset".to_string())),
+            RejoinVerdict::Interrupted
+        );
+        // ACK 超时 / 坏形状 / 普通 Socket.IO 错误仍是永久失败（与 Agent 同口径）。
+        assert_eq!(
+            classify_rejoin_error(&ComputerError::SocketIoError("closed".to_string())),
+            RejoinVerdict::Permanent
+        );
+        assert_eq!(
+            classify_rejoin_error(&ComputerError::TimeoutError("timeout".to_string())),
+            RejoinVerdict::Permanent
+        );
+        assert_eq!(
+            classify_rejoin_error(&ComputerError::ProtocolError(
+                "unrecognized ack".to_string()
+            )),
+            RejoinVerdict::Permanent
+        );
     }
 }

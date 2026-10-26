@@ -40,6 +40,27 @@ struct ConnectionArgs {
     headers: Option<String>,
 }
 
+/// #234：CLI 连接参数 → [`ConnectOptions`] 的唯一构造点。
+///
+/// `office_rejoin_budget_secs`：`None` = SDK 默认 60s，`0` = 单次尝试。
+fn build_connect_options(
+    namespace: &str,
+    auth_payload: Option<serde_json::Value>,
+    headers: Option<String>,
+    office_rejoin_budget_secs: Option<u64>,
+) -> ConnectOptions {
+    ConnectOptions {
+        auth_provider: None,
+        auth_payload,
+        headers,
+        namespace: namespace.to_string(),
+        namespace_connect_timeout: crate::socketio_client::DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+        office_rejoin_budget: office_rejoin_budget_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET),
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum CommandError {
     #[error("Invalid command: {0}")]
@@ -626,19 +647,12 @@ impl CommandHandler {
         self.computer
             .connect_socketio(
                 url,
-                ConnectOptions {
-                    auth_provider: None,
+                build_connect_options(
+                    namespace,
                     auth_payload,
-                    headers: headers.clone(),
-                    namespace: namespace.to_string(),
-                    namespace_connect_timeout:
-                        crate::socketio_client::DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
-                    office_rejoin_budget: self
-                        .cli_config
-                        .office_rejoin_budget_secs
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or(crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET),
-                },
+                    headers.clone(),
+                    self.cli_config.office_rejoin_budget_secs,
+                ),
             )
             .await?;
         self.connection = Some(ConnectionArgs {
@@ -1776,6 +1790,22 @@ mod tests {
         // rm 仍可解析已声明未挂载的目标（双空间语义）。
         let id = handler.resolve_target("rm_me").await.unwrap();
         assert_eq!(id.as_str(), "rm_me");
+    }
+
+    /// #234：`--office-rejoin-budget` 的秒数必须**实际到达** `ConnectOptions`（0 = 单次尝试）。
+    #[test]
+    fn office_rejoin_budget_reaches_connect_options_234() {
+        let zero = build_connect_options("/smcp", None, None, Some(0));
+        assert_eq!(zero.office_rejoin_budget, std::time::Duration::ZERO);
+
+        let two = build_connect_options("/smcp", None, None, Some(2));
+        assert_eq!(two.office_rejoin_budget, std::time::Duration::from_secs(2));
+
+        let default = build_connect_options("/smcp", None, None, None);
+        assert_eq!(
+            default.office_rejoin_budget,
+            crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET
+        );
     }
 
     /// #175：`start_user_not_mounted_receipt` 纯函数可断言——文案不含内部错误措辞。

@@ -14,7 +14,9 @@ use crate::desktop::{organize_desktop, WindowInfo};
 use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
 use crate::mcp_clients::model::MCPServerInput;
-use crate::office_rejoin::{backoff_delay, is_transient_room_conflict, retry_fits_budget};
+use crate::office_rejoin::{
+    backoff_delay, classify_rejoin_error, retry_fits_budget, RejoinVerdict,
+};
 use crate::skills::naming::parse_skill_name;
 use crate::status::{LifecycleState, RuntimeStatus};
 use base64::Engine as _;
@@ -319,6 +321,33 @@ fn lock_office_membership(
     membership: &StdMutex<OfficeMembership>,
 ) -> std::sync::MutexGuard<'_, OfficeMembership> {
     membership.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// ACK 调用的连接级失败分类（#234）。
+///
+/// 仅 `server:join_office` 的分类路径使用；错误在 `JoinOfficeFailure` / `ComputerError`
+/// 两侧保持原有文案，其它 `emit_with_ack` 处理器不经过本分类（无全局语义漂移）。
+enum AckCallError {
+    /// 发送失败 / ACK 通道随传输层关闭：绑定会话已失效，回房必须保留重放意图。
+    Interrupted(ComputerError),
+    /// 普通失败（ACK 超时、坏形状、解析失败等）。
+    Failed(ComputerError),
+}
+
+/// 自动回房单次 `server:join_office` 的失败分类（#234）。
+enum JoinOfficeFailure {
+    /// 绑定传输层失效：由 Close/Connect 生命周期接管，保留重放意图且不重试。
+    Interrupted(ComputerError),
+    /// 对端裁决或普通失败：按错误码分类决定退避重试或终态。
+    Verdict(ComputerError),
+}
+
+impl JoinOfficeFailure {
+    fn into_error(self) -> ComputerError {
+        match self {
+            Self::Interrupted(error) | Self::Verdict(error) => error,
+        }
+    }
 }
 
 /// SMCP Computer Socket.IO客户端 Builder /
@@ -1219,14 +1248,29 @@ impl SmcpComputerClient {
                             membership.pending_updates = previous_pending;
                         }
                     }
-                    membership.desired = previous_desired;
-                    membership.confirmed = previous_confirmed;
-                    self.runtime_status
-                        .transition(if membership.confirmed.is_some() {
-                            LifecycleState::JoinedOffice
-                        } else {
-                            LifecycleState::Connected
-                        });
+                    if previous_confirmed.is_none() && previous_desired.is_some() {
+                        // #234：显式 join 已推进世代，旧自动回房 task 因 stale 退出；若再把
+                        // 旧 desired 挂回去，它会成为一条**没有属主**的意图（get_office_id=None，
+                        // 更新永远排队）。明确取消，并在日志中告知用户，避免静默失效。
+                        membership.desired = None;
+                        membership.confirmed = None;
+                        membership.pending_updates = [None; 4];
+                        self.runtime_status.transition(LifecycleState::Connected);
+                        warn!(
+                            requested_office = %office_id,
+                            previous_office = %previous_desired.as_deref().unwrap_or_default(),
+                            "Explicit join failed; the pending automatic rejoin intent was cancelled"
+                        );
+                    } else {
+                        membership.desired = previous_desired;
+                        membership.confirmed = previous_confirmed;
+                        self.runtime_status
+                            .transition(if membership.confirmed.is_some() {
+                                LifecycleState::JoinedOffice
+                            } else {
+                                LifecycleState::Connected
+                            });
+                    }
                     Err(error)
                 }
             }
@@ -1299,7 +1343,8 @@ impl SmcpComputerClient {
             }
 
             attempts += 1;
-            let result = Self::join_office_with_client(&client, &computer_name, &desired).await;
+            let result =
+                Self::join_office_with_client_classified(&client, &computer_name, &desired).await;
 
             match result {
                 Ok(()) => {
@@ -1330,7 +1375,19 @@ impl SmcpComputerClient {
                     }
                     return;
                 }
-                Err(error) => {
+                Err(JoinOfficeFailure::Interrupted(error)) => {
+                    // 连接级失效：Close/Connect 生命周期接管。保留 desired/pending_updates，
+                    // 不重试、不迁移 lifecycle——下一次 Connect 会重放同一意图（#234 / 镜像
+                    // Agent `RejoinVerdict::Interrupted`）。
+                    drop(operation_guard);
+                    debug!(
+                        "Automatic rejoin of office {} interrupted by transport loss ({}); \
+                         keeping the intent for the next session",
+                        desired, error
+                    );
+                    return;
+                }
+                Err(JoinOfficeFailure::Verdict(error)) => {
                     {
                         let membership = lock_office_membership(&membership);
                         if !membership.is_current_transport(
@@ -1345,29 +1402,32 @@ impl SmcpComputerClient {
                     // 退避与分类都不占用操作门，让显式 join/leave 抢占。
                     drop(operation_guard);
 
-                    if !is_transient_room_conflict(&error) {
-                        break StopReason::Permanent(error);
-                    }
-
-                    let delay = backoff_delay(attempts);
-                    if !retry_fits_budget(started.elapsed(), delay, budget) {
-                        break if budget.is_zero() {
-                            StopReason::SingleAttempt(error)
-                        } else {
-                            StopReason::BudgetExhausted {
-                                attempts,
-                                last: error,
+                    match classify_rejoin_error(&error) {
+                        // `Verdict` 不携带连接级错误；保留分支以穷尽三态（防御性）。
+                        RejoinVerdict::Interrupted => return,
+                        RejoinVerdict::Permanent => break StopReason::Permanent(error),
+                        RejoinVerdict::TransientConflict => {
+                            let delay = backoff_delay(attempts);
+                            if !retry_fits_budget(started.elapsed(), delay, budget) {
+                                break if budget.is_zero() {
+                                    StopReason::SingleAttempt(error)
+                                } else {
+                                    StopReason::BudgetExhausted {
+                                        attempts,
+                                        last: error,
+                                    }
+                                };
                             }
-                        };
-                    }
 
-                    warn!(
-                        attempt = attempts,
-                        delay = ?delay,
-                        "Automatic rejoin of office {} hit transient 4101; retrying",
-                        desired
-                    );
-                    tokio::time::sleep(delay).await;
+                            warn!(
+                                attempt = attempts,
+                                delay = ?delay,
+                                "Automatic rejoin of office {} hit transient 4101; retrying",
+                                desired
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
                 }
             }
         };
@@ -1422,15 +1482,25 @@ impl SmcpComputerClient {
         })
     }
 
-    /// Send `server:join_office` over a specific namespace connection and validate its ACK.
-    async fn join_office_with_client(
+    /// `server:join_office` 的分类版本（#234）：自动回房据此区分传输层中断与对端裁决。
+    async fn join_office_with_client_classified(
         client: &Client,
         computer_name: &str,
         office_id: &str,
-    ) -> ComputerResult<()> {
+    ) -> Result<(), JoinOfficeFailure> {
         let req_data = Self::join_office_request(computer_name, office_id);
         let response =
-            Self::call_with_client(client, SERVER_JOIN_OFFICE, req_data, Some(10)).await?;
+            match Self::call_with_client_outcome(client, SERVER_JOIN_OFFICE, req_data, Some(10))
+                .await
+            {
+                Ok(response) => response,
+                Err(AckCallError::Interrupted(error)) => {
+                    return Err(JoinOfficeFailure::Interrupted(error));
+                }
+                Err(AckCallError::Failed(error)) => {
+                    return Err(JoinOfficeFailure::Verdict(error));
+                }
+            };
         debug!("Join office response: {:?}", response);
 
         // 成功 = **空 ack**：零参 ACK（`[]`，python-socketio 参考实现与 v0.5.0 Rust 服务端的线格式），
@@ -1467,8 +1537,8 @@ impl SmcpComputerClient {
         //
         // Computer 侧**自动回房**（Connect 生命周期回调里的重放）自 #234 起仅对 `4101` 做
         // 有界退避重试（预算见 `ConnectOptions::office_rejoin_budget`，默认 60s，0=单次尝试，
-        // 退避 1→2→4→8s 封顶）；其它码与传输错误不重试。显式 `join_office` 仍即时返回，
-        // 由调用方按码自行决定重试策略。
+        // 退避 1→2→4→8s 封顶）；其它码不重试，连接级中断保留重放意图交给 Close/Connect
+        // 生命周期。显式 `join_office` 仍即时返回，由调用方按码自行决定重试策略。
         if let Some(value) = actual_response.first() {
             if let Some(code) = value.get("code").and_then(Value::as_i64) {
                 // 预留码（4102 / 4105）：协议当前无任何路径产出，收到即对端协议违规——按协议
@@ -1480,21 +1550,34 @@ impl SmcpComputerClient {
                         "room join ack carried a reserved protocol code (protocol violation); rejecting without retry"
                     );
                 }
-                return Err(ComputerError::ProtocolRejection {
-                    code,
-                    message: value
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Room join rejected")
-                        .to_string(),
-                    details: value.get("details").cloned(),
-                });
+                return Err(JoinOfficeFailure::Verdict(
+                    ComputerError::ProtocolRejection {
+                        code,
+                        message: value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Room join rejected")
+                            .to_string(),
+                        details: value.get("details").cloned(),
+                    },
+                ));
             }
         }
 
-        Err(ComputerError::SocketIoError(format!(
-            "Invalid response format from server: {actual_response:?}"
+        Err(JoinOfficeFailure::Verdict(ComputerError::SocketIoError(
+            format!("Invalid response format from server: {actual_response:?}"),
         )))
+    }
+
+    /// Send `server:join_office` over a specific namespace connection and validate its ACK.
+    async fn join_office_with_client(
+        client: &Client,
+        computer_name: &str,
+        office_id: &str,
+    ) -> ComputerResult<()> {
+        Self::join_office_with_client_classified(client, computer_name, office_id)
+            .await
+            .map_err(JoinOfficeFailure::into_error)
     }
 
     /// 获取当前Office ID / Get current Office ID
@@ -1508,25 +1591,45 @@ impl SmcpComputerClient {
         }
     }
 
-    /// 显式退房的目标解析：已确认的 Office 优先，回房退避期间回退到 `desired`。
-    ///
-    /// 传输层重连后 `confirmed` 会被清空（新会话未经确认），但客户端仍持有重放意图。
-    /// 用户显式退房必须能取消这次重试——否则退房报「不在任何房」而重试随后又把成员关系加回去。
-    /// Resolve the office to leave: confirmed membership first, falling back to the desired
-    /// intent while a reconnect rejoin is still pending.
-    pub(crate) async fn get_office_id_for_leave(&self) -> Option<String> {
-        let membership = lock_office_membership(&self.office_membership);
-        membership
-            .confirmed
-            .clone()
-            .or_else(|| membership.desired.clone())
-    }
-
     /// 离开Office
     /// Leave an Office
     pub async fn leave_office(&self, office_id: &str) -> ComputerResult<()> {
+        let operation = self.office_operation.lock().await;
+        self.leave_office_with_operation(office_id, operation).await
+    }
+
+    /// #234：显式退房**当前**意图。
+    ///
+    /// 目标在 `office_operation` 临界区内解析（`confirmed` → 回房退避期间的 `desired`），
+    /// 与显式 join/leave 全序化，避免并发换房时打到错误房号；断线时取消待回放意图，
+    /// 错误文案明确告知用户。
+    /// Leave the current office; resolve the target inside the office-operation critical
+    /// section so a concurrent switch cannot make us leave the wrong room.
+    pub(crate) async fn leave_current_office(&self) -> ComputerResult<()> {
+        let operation = self.office_operation.lock().await;
+        let office_id = {
+            let membership = lock_office_membership(&self.office_membership);
+            membership
+                .confirmed
+                .clone()
+                .or_else(|| membership.desired.clone())
+        };
+        let Some(office_id) = office_id else {
+            return Err(ComputerError::InvalidState(
+                "Not currently in any office".to_string(),
+            ));
+        };
+        self.leave_office_with_operation(&office_id, operation)
+            .await
+    }
+
+    /// [`Self::leave_office`] / [`Self::leave_current_office`] 的共享实现（已持操作门）。
+    async fn leave_office_with_operation(
+        &self,
+        office_id: &str,
+        _operation: tokio::sync::MutexGuard<'_, ()>,
+    ) -> ComputerResult<()> {
         debug!("Leaving office: {}", office_id);
-        let _operation = self.office_operation.lock().await;
         let flush = lock_office_membership(&self.office_membership)
             .update_flush
             .clone();
@@ -1543,7 +1646,7 @@ impl SmcpComputerClient {
             }
             if !membership.connected {
                 return Err(ComputerError::InvalidState(
-                    "Socket.IO client not connected".to_string(),
+                    "Socket.IO client not connected; pending rejoin intent cancelled".to_string(),
                 ));
             }
             self.runtime_status.transition(LifecycleState::Connected);
@@ -1662,21 +1765,22 @@ impl SmcpComputerClient {
             .map_err(|e| ComputerError::SocketIoError(format!("Failed to emit {}: {}", event, e)))
     }
 
-    /// Send an event with ACK over the supplied namespace connection.
-    async fn call_with_client(
+    /// 发送带 ACK 的事件并返回响应，同时保留连接级失败分类（#234）。
+    ///
+    /// 仅 `server:join_office` 使用；`get_blob` / `put_blob` / `tool_call` 等处理器各自
+    /// 直接 `emit_with_ack`，不经本辅助函数，故错误语义不变。
+    async fn call_with_client_outcome(
         client: &Client,
         event: &str,
         data: Value,
         timeout_secs: Option<u64>,
-    ) -> ComputerResult<Vec<Value>> {
+    ) -> Result<Vec<Value>, AckCallError> {
         // 检查事件名 policy / Check event name policy
         if event.starts_with("notify:") || event.starts_with("client:") {
-            return Err(ComputerError::InvalidState(
-                format!(
-                    "Computer 不允许发送 notify:* 或 client:* 事件 / Computer cannot send notify:* or client:* events: {}",
-                    event
-                )
-            ));
+            return Err(AckCallError::Failed(ComputerError::InvalidState(format!(
+                "Computer 不允许发送 notify:* 或 client:* 事件 / Computer cannot send notify:* or client:* events: {}",
+                event
+            ))));
         }
 
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
@@ -1696,7 +1800,11 @@ impl SmcpComputerClient {
             .emit_with_ack(event, Payload::Text(vec![data], None), timeout, callback)
             .await
             .map_err(|e| {
-                ComputerError::SocketIoError(format!("Failed to call {}: {}", event, e))
+                // #234：发送失败是连接级失效；回房路径不得把它当作对端永久拒绝。
+                AckCallError::Interrupted(ComputerError::SocketIoError(format!(
+                    "Failed to call {}: {}",
+                    event, e
+                )))
             })?;
 
         // 使用 tokio::time::timeout 来确保 rx.await 不会无限期等待
@@ -1714,27 +1822,31 @@ impl SmcpComputerClient {
                         // 尝试解析字符串为JSON数组
                         // Try to parse string as JSON array
                         let parsed: Vec<Value> = serde_json::from_str(&s).map_err(|e| {
-                            ComputerError::SocketIoError(format!("Failed to parse response: {}", e))
+                            AckCallError::Failed(ComputerError::SocketIoError(format!(
+                                "Failed to parse response: {}",
+                                e
+                            )))
                         })?;
                         debug!("Received parsed response: {:?}", parsed);
                         Ok(parsed)
                     }
-                    Payload::Binary(_, _) => Err(ComputerError::SocketIoError(
-                        "Binary response not supported".to_string(),
+                    Payload::Binary(_, _) => Err(AckCallError::Failed(
+                        ComputerError::SocketIoError("Binary response not supported".to_string()),
                     )),
                 }
             }
             Ok(Err(_)) => {
                 error!("Channel closed while calling event: {}", event);
-                Err(ComputerError::SocketIoError(
+                // #234：ACK 通道随传输层失效而关闭（回调被丢弃），属连接级中断。
+                Err(AckCallError::Interrupted(ComputerError::SocketIoError(
                     "Channel closed while waiting for response".to_string(),
-                ))
+                )))
             }
             Err(_) => {
                 error!("Timeout while calling event: {}", event);
-                Err(ComputerError::SocketIoError(
+                Err(AckCallError::Failed(ComputerError::SocketIoError(
                     "Timeout while waiting for response".to_string(),
-                ))
+                )))
             }
         }
     }
