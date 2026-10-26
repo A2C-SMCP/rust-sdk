@@ -19,6 +19,7 @@ pub mod inventory;
 pub mod mcp_clients;
 mod mcp_start_gate;
 pub mod oauth;
+mod office_rejoin;
 pub mod settings;
 pub mod skills;
 pub mod socketio_client;

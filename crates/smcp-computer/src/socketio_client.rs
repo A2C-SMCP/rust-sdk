@@ -14,6 +14,7 @@ use crate::desktop::{organize_desktop, WindowInfo};
 use crate::errors::{ComputerError, ComputerResult};
 use crate::mcp_clients::manager::MCPServerManager;
 use crate::mcp_clients::model::MCPServerInput;
+use crate::office_rejoin::{backoff_delay, is_transient_room_conflict, retry_fits_budget};
 use crate::skills::naming::parse_skill_name;
 use crate::status::{LifecycleState, RuntimeStatus};
 use base64::Engine as _;
@@ -44,6 +45,14 @@ use tracing::{debug, error, info, warn};
 
 /// Default deadline for the initial Socket.IO namespace CONNECT handshake.
 pub const DEFAULT_NAMESPACE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 自动回房 `4101` 有界退避的默认总预算（#234）。
+///
+/// 60s 覆盖 socket.io 默认最长回收窗口（`ping_interval 25 + ping_timeout 20 = 45s`）并留一次
+/// 尝试余量；`Duration::ZERO` = 单次尝试。仅作用于传输层重连后的自动回放，显式 `join_office`
+/// 从不重试。
+/// Default total budget for bounded backoff retries when an automatic rejoin hits `4101`.
+pub const DEFAULT_OFFICE_REJOIN_BUDGET: Duration = Duration::from_secs(60);
 
 const NAMESPACE_CONNECT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -333,6 +342,8 @@ pub struct SmcpComputerClientBuilder {
     auth_provider: Option<SocketIoAuthProvider>,
     namespace: Option<String>,
     namespace_connect_timeout: Duration,
+    /// #234：自动回房 4101 有界退避总预算；`Duration::ZERO` = 单次尝试。
+    office_rejoin_budget: Duration,
     headers: Option<HashMap<String, String>>,
     /// INT-03 #72：Computer 操作句柄（socketio-detached），供 blob/skill/cancel/tool_call handler 调用。
     /// `Option`：兼容旧入口（`SmcpComputerClient::new` / 不接 Computer 的测试）——缺省时 blob/skill/cancel
@@ -357,6 +368,7 @@ impl SmcpComputerClientBuilder {
             auth_provider: None,
             namespace: None,
             namespace_connect_timeout: DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+            office_rejoin_budget: DEFAULT_OFFICE_REJOIN_BUDGET,
             headers: None,
             computer_ops: None,
         }
@@ -417,6 +429,17 @@ impl SmcpComputerClientBuilder {
         self
     }
 
+    /// #234：自动回房遇到 `4101`（本 role 席位被占）时的有界退避总预算。
+    ///
+    /// 预算约束**下一次尝试的起始时刻**；`Duration::ZERO` = 单次尝试。只作用于传输层重连后的
+    /// 自动回放，显式 `join_office` 仍即时返回。默认 [`DEFAULT_OFFICE_REJOIN_BUDGET`]（60s）。
+    /// Total budget for bounded backoff retries when an automatic rejoin hits `4101`;
+    /// `Duration::ZERO` disables retries (single attempt).
+    pub fn office_rejoin_budget(mut self, budget: Duration) -> Self {
+        self.office_rejoin_budget = budget;
+        self
+    }
+
     /// 附加任意 HTTP upgrade header（路由用，如 TF 生态 `X-TF-RobotId`；**非鉴权信道**）。
     /// Attach arbitrary HTTP upgrade headers (routing, e.g. TF ecosystem headers; NOT for auth).
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
@@ -436,6 +459,7 @@ impl SmcpComputerClientBuilder {
             self.auth_provider,
             namespace,
             self.namespace_connect_timeout,
+            self.office_rejoin_budget,
             self.headers,
             self.computer_ops,
         )
@@ -563,6 +587,7 @@ impl SmcpComputerClient {
         auth_provider: Option<SocketIoAuthProvider>,
         namespace: String,
         namespace_connect_timeout: Duration,
+        office_rejoin_budget: Duration,
         headers: Option<HashMap<String, String>>,
         computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
     ) -> ComputerResult<Self> {
@@ -699,6 +724,7 @@ impl SmcpComputerClient {
         let connect_status = runtime_status.clone();
         let connect_retiring = Arc::clone(&retiring);
         let connect_ready = Arc::clone(&namespace_ready);
+        let connect_rejoin_budget = office_rejoin_budget;
         builder = builder.on(Event::Connect, move |_payload, client| {
             let membership = Arc::clone(&connect_membership);
             let operation = Arc::clone(&connect_operation);
@@ -742,60 +768,17 @@ impl SmcpComputerClient {
 
                 // The reader awaits event callbacks, so waiting for an ACK inline would self-block.
                 // The detached task is generation-bound and aborted by Close/manual disconnect.
-                let task_membership = Arc::clone(&membership);
-                let task_status = status.clone();
-                let task_desired = desired.clone();
-                let task = tokio::spawn(async move {
-                    let _operation = operation.lock().await;
-                    {
-                        let membership = lock_office_membership(&task_membership);
-                        if !membership.is_current_transport(
-                            generation,
-                            &task_desired,
-                            client.session_epoch(),
-                        ) {
-                            return;
-                        }
-                    }
-
-                    let result =
-                        Self::join_office_with_client(&client, &computer_name, &task_desired).await;
-                    {
-                        let mut membership = lock_office_membership(&task_membership);
-                        if !membership.is_current_transport(
-                            generation,
-                            &task_desired,
-                            client.session_epoch(),
-                        ) {
-                            return;
-                        }
-                        membership.rejoin_task = None;
-
-                        match result {
-                            Ok(()) => {
-                                membership.confirmed = Some(task_desired.clone());
-                                task_status.transition(LifecycleState::JoinedOffice);
-                                info!("Automatically rejoined office: {}", task_desired);
-                            }
-                            Err(error) => {
-                                membership.pending_updates = [None; 4];
-                                membership.desired = None;
-                                membership.confirmed = None;
-                                task_status.transition(LifecycleState::Connected);
-                                error!(
-                                    "Failed to automatically rejoin office {}: {}",
-                                    task_desired, error
-                                );
-                            }
-                        }
-                    }
-                    drop(_operation);
-                    if let Err(error) =
-                        Self::flush_pending_updates(&client, &computer_name, &task_membership).await
-                    {
-                        warn!(%error, "Rejoined office with pending update notifications");
-                    }
-                });
+                // #234：任务内部对瞬态 4101 做有界退避重试。
+                let task = tokio::spawn(Self::rejoin_office_after_reconnect(
+                    client,
+                    computer_name,
+                    desired.clone(),
+                    Arc::clone(&membership),
+                    operation,
+                    status.clone(),
+                    generation,
+                    connect_rejoin_budget,
+                ));
                 let abort_handle = task.abort_handle();
                 let mut current = lock_office_membership(&membership);
                 if current.is_current(generation, &desired) {
@@ -1262,17 +1245,190 @@ impl SmcpComputerClient {
         result
     }
 
+    /// 传输层重连后的自动回房（#234）：仅对瞬态 `4101` 做有界退避重试。
+    ///
+    /// 首次尝试立即执行；预算约束**下一次尝试的起始时刻**（含退避与锁等待）。退避与终态
+    /// 提交都不占用 `office_operation` 锁，显式 join/leave 可在退避窗口内抢占。每次尝试前后
+    /// 都以 `(generation, desired, session_epoch)` 复核会话新鲜度（#211）；结果被 Close /
+    /// 显式操作 / 新 Connect 接管时安静退出，不触碰状态。
+    #[allow(clippy::too_many_arguments)]
+    async fn rejoin_office_after_reconnect(
+        client: Client,
+        computer_name: String,
+        desired: String,
+        membership: Arc<StdMutex<OfficeMembership>>,
+        operation: Arc<Mutex<()>>,
+        status: RuntimeLifecycle,
+        generation: u64,
+        budget: Duration,
+    ) {
+        /// 终态失败原因（仅用于区分日志口径）。
+        enum StopReason {
+            Permanent(ComputerError),
+            SingleAttempt(ComputerError),
+            BudgetExhausted { attempts: u32, last: ComputerError },
+            BudgetExhaustedWaitingForLock,
+        }
+
+        let started = tokio::time::Instant::now();
+        let mut attempts: u32 = 0;
+
+        let stop_reason: StopReason = loop {
+            // 首次尝试是协议下限：无预算界地等锁；后续尝试的锁等待受剩余预算约束。
+            let operation_guard = if attempts == 0 {
+                operation.lock().await
+            } else {
+                let remaining = budget.saturating_sub(started.elapsed());
+                match tokio::time::timeout(remaining, operation.lock()).await {
+                    Ok(guard) => guard,
+                    Err(_) => break StopReason::BudgetExhaustedWaitingForLock,
+                }
+            };
+
+            // `timeout` 与锁同时就绪时仍可能拿到锁；按实际墙钟复核「下一次尝试起点」在预算内。
+            if attempts > 0 && started.elapsed() > budget {
+                drop(operation_guard);
+                break StopReason::BudgetExhaustedWaitingForLock;
+            }
+
+            {
+                let membership = lock_office_membership(&membership);
+                if !membership.is_current_transport(generation, &desired, client.session_epoch()) {
+                    return;
+                }
+            }
+
+            attempts += 1;
+            let result = Self::join_office_with_client(&client, &computer_name, &desired).await;
+
+            match result {
+                Ok(()) => {
+                    let committed = {
+                        let mut membership = lock_office_membership(&membership);
+                        if !membership.is_current_transport(
+                            generation,
+                            &desired,
+                            client.session_epoch(),
+                        ) {
+                            false
+                        } else {
+                            membership.rejoin_task = None;
+                            membership.confirmed = Some(desired.clone());
+                            status.transition(LifecycleState::JoinedOffice);
+                            true
+                        }
+                    };
+                    if !committed {
+                        return;
+                    }
+                    drop(operation_guard);
+                    info!("Automatically rejoined office: {}", desired);
+                    if let Err(error) =
+                        Self::flush_pending_updates(&client, &computer_name, &membership).await
+                    {
+                        warn!(%error, "Rejoined office with pending update notifications");
+                    }
+                    return;
+                }
+                Err(error) => {
+                    {
+                        let membership = lock_office_membership(&membership);
+                        if !membership.is_current_transport(
+                            generation,
+                            &desired,
+                            client.session_epoch(),
+                        ) {
+                            return;
+                        }
+                    }
+
+                    // 退避与分类都不占用操作门，让显式 join/leave 抢占。
+                    drop(operation_guard);
+
+                    if !is_transient_room_conflict(&error) {
+                        break StopReason::Permanent(error);
+                    }
+
+                    let delay = backoff_delay(attempts);
+                    if !retry_fits_budget(started.elapsed(), delay, budget) {
+                        break if budget.is_zero() {
+                            StopReason::SingleAttempt(error)
+                        } else {
+                            StopReason::BudgetExhausted {
+                                attempts,
+                                last: error,
+                            }
+                        };
+                    }
+
+                    warn!(
+                        attempt = attempts,
+                        delay = ?delay,
+                        "Automatic rejoin of office {} hit transient 4101; retrying",
+                        desired
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        };
+
+        // 终态失败：重新取得操作门（等显式事务结束），在同一临界区内复核世代后再清状态，
+        // 避免作废退避窗口内已完整提交的显式 join/leave。
+        let operation_guard = operation.lock().await;
+        let committed = {
+            let mut membership = lock_office_membership(&membership);
+            if !membership.is_current_transport(generation, &desired, client.session_epoch()) {
+                false
+            } else {
+                membership.rejoin_task = None;
+                membership.pending_updates = [None; 4];
+                membership.desired = None;
+                membership.confirmed = None;
+                status.transition(LifecycleState::Connected);
+                true
+            }
+        };
+        drop(operation_guard);
+        if !committed {
+            return;
+        }
+
+        match stop_reason {
+            StopReason::Permanent(error) => error!(
+                "Failed to automatically rejoin office {}: {}",
+                desired, error
+            ),
+            StopReason::SingleAttempt(error) => error!(
+                "Failed to automatically rejoin office {} (single attempt, budget 0): {}",
+                desired, error
+            ),
+            StopReason::BudgetExhausted { attempts, last } => error!(
+                "Failed to automatically rejoin office {} after {} attempt(s) within the {:?} rejoin budget: {}",
+                desired, attempts, budget, last
+            ),
+            StopReason::BudgetExhaustedWaitingForLock => error!(
+                "Failed to automatically rejoin office {}: rejoin budget exhausted while waiting for an office operation",
+                desired
+            ),
+        }
+    }
+
+    /// `server:join_office` 请求载荷的唯一构造点（显式 join 与自动回房重试共用）。
+    fn join_office_request(computer_name: &str, office_id: &str) -> Value {
+        serde_json::json!({
+            "office_id": office_id,
+            "role": "computer",
+            "name": computer_name
+        })
+    }
+
     /// Send `server:join_office` over a specific namespace connection and validate its ACK.
     async fn join_office_with_client(
         client: &Client,
         computer_name: &str,
         office_id: &str,
     ) -> ComputerResult<()> {
-        let req_data = serde_json::json!({
-            "office_id": office_id,
-            "role": "computer",
-            "name": computer_name
-        });
+        let req_data = Self::join_office_request(computer_name, office_id);
         let response =
             Self::call_with_client(client, SERVER_JOIN_OFFICE, req_data, Some(10)).await?;
         debug!("Join office response: {:?}", response);
@@ -1309,10 +1465,10 @@ impl SmcpComputerClient {
         // §建议的重试策略里传输层重连后的**瞬态**冲突（可有界退避重试）；`4106` / `400` 永久失败；
         // `4105` 已随 protocol#66 转预留码（收到即协议违规，不得重试）。
         //
-        // ⚠️ 现状如实标注：Computer 侧**自动回房**（Connect 生命周期回调里的重放）目前为**单次尝试**
-        // ——被拒即清空 desired 并回退 `Connected`，**尚未**实现协议迁移指南 §Computer 要求的
-        // 「仅在刚经历传输层重连时做有界退避重试」（跨 SDK 缺口，另行跟踪）。显式 `join_office`
-        // 的调用方据此按码自行决定重试策略。
+        // Computer 侧**自动回房**（Connect 生命周期回调里的重放）自 #234 起仅对 `4101` 做
+        // 有界退避重试（预算见 `ConnectOptions::office_rejoin_budget`，默认 60s，0=单次尝试，
+        // 退避 1→2→4→8s 封顶）；其它码与传输错误不重试。显式 `join_office` 仍即时返回，
+        // 由调用方按码自行决定重试策略。
         if let Some(value) = actual_response.first() {
             if let Some(code) = value.get("code").and_then(Value::as_i64) {
                 // 预留码（4102 / 4105）：协议当前无任何路径产出，收到即对端协议违规——按协议
@@ -1350,6 +1506,20 @@ impl SmcpComputerClient {
                 "Not currently in any office".to_string(),
             )),
         }
+    }
+
+    /// 显式退房的目标解析：已确认的 Office 优先，回房退避期间回退到 `desired`。
+    ///
+    /// 传输层重连后 `confirmed` 会被清空（新会话未经确认），但客户端仍持有重放意图。
+    /// 用户显式退房必须能取消这次重试——否则退房报「不在任何房」而重试随后又把成员关系加回去。
+    /// Resolve the office to leave: confirmed membership first, falling back to the desired
+    /// intent while a reconnect rejoin is still pending.
+    pub(crate) async fn get_office_id_for_leave(&self) -> Option<String> {
+        let membership = lock_office_membership(&self.office_membership);
+        membership
+            .confirmed
+            .clone()
+            .or_else(|| membership.desired.clone())
     }
 
     /// 离开Office

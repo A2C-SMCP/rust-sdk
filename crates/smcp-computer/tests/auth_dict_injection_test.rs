@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -206,6 +206,14 @@ impl ReconnectCaptureServer {
         .unwrap_or_else(|_| panic!("timed out waiting for join ACK attempt {expected_attempt}"));
     }
 
+    /// 负向断言：在窗口内不得再出现 `server:join_office`（预算耗尽 / 永久拒绝后不再重试）。
+    async fn assert_no_join_for(&mut self, window: Duration) {
+        assert!(
+            timeout(window, self.join_rx.recv()).await.is_err(),
+            "expected no further server:join_office attempts"
+        );
+    }
+
     async fn wait_for_active_connections(&self, expected: usize) {
         timeout(Duration::from_secs(10), async {
             loop {
@@ -298,6 +306,34 @@ async fn start_reconnect_capture_server_with_rejection(
     gate: Option<Arc<tokio::sync::Notify>>,
     rejection_code: i64,
 ) -> ReconnectCaptureServer {
+    start_reconnect_capture_server_with_policy(
+        reject_attempt(reject_join_attempt, rejection_code),
+        delayed_join_attempt,
+        gate,
+    )
+    .await
+}
+
+/// 单次 join 裁决：`Some(code)` = flat ErrorPayload 拒绝；`None` = 零参 ACK 接受。
+/// 次数按服务端收到的 `server:join_office` 递增（含显式 join 与自动回放）。
+type JoinVerdict = Arc<dyn Fn(usize) -> Option<i64> + Send + Sync>;
+
+fn join_verdict<F>(verdict: F) -> JoinVerdict
+where
+    F: Fn(usize) -> Option<i64> + Send + Sync + 'static,
+{
+    Arc::new(verdict)
+}
+
+fn reject_attempt(attempt: Option<usize>, code: i64) -> JoinVerdict {
+    join_verdict(move |n| (attempt == Some(n)).then_some(code))
+}
+
+async fn start_reconnect_capture_server_with_policy(
+    verdict: JoinVerdict,
+    delayed_join_attempt: Option<usize>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+) -> ReconnectCaptureServer {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
@@ -320,6 +356,7 @@ async fn start_reconnect_capture_server_with_rejection(
             let join_tx = join_tx.clone();
             let join_ack_tx = join_ack_tx.clone();
             let join_attempts = Arc::clone(&join_attempts);
+            let verdict = Arc::clone(&verdict);
             let active_connections = Arc::clone(&namespace_active_connections);
             let namespace_socket = Arc::clone(&connected_namespace_socket);
             async move {
@@ -355,6 +392,7 @@ async fn start_reconnect_capture_server_with_rejection(
                         let gate = gate.clone();
                         let join_ack_tx = join_ack_tx.clone();
                         let join_attempts = Arc::clone(&join_attempts);
+                        let verdict = Arc::clone(&verdict);
                         async move {
                             let attempt = join_attempts.fetch_add(1, Ordering::SeqCst) + 1;
                             let _ = join_tx.send(data);
@@ -369,7 +407,7 @@ async fn start_reconnect_capture_server_with_rejection(
                             // ErrorPayload（顶层 `code`）。旧 `(success, message)` 元组形态已废除——
                             // 保留它会让客户端走**已删除**的兼容分支，使新增的 flat 拒绝路径零覆盖
                             // （#226 假绿清单第 5 条）。
-                            if reject_join_attempt == Some(attempt) {
+                            if let Some(rejection_code) = verdict(attempt) {
                                 let _ = ack.send(&json!({
                                     "code": rejection_code,
                                     "message": if rejection_code == 4101 { "Room already has a computer" } else { "Room already has an agent" },
@@ -718,9 +756,12 @@ async fn automatic_network_reconnect_rejoins_office_and_restores_lifecycle() {
     server.shutdown();
 }
 
-/// #204：自动重加入被服务端拒绝时，不得保留 `JoinedOffice` 或旧 Office ID。
+/// #234：自动回房撞瞬态 4101 时有界退避重试后恢复成员关系（镜像 python#212）。
+///
+/// 服务端只拒绝第 2 次 join（重连回放）；第 3 次（1s 退避后的重试）接受。断言重试载荷
+/// 与回放逐字节一致，且首档退避间隔真实生效。
 #[tokio::test]
-async fn rejected_automatic_rejoin_clears_confirmed_office_state() {
+async fn transient_conflict_on_automatic_rejoin_is_retried_and_recovers() {
     let _ = tracing_subscriber::fmt::try_init();
     let mut server = start_reconnect_capture_server(Some(2), None).await;
     let temp = tempfile::TempDir::new().unwrap();
@@ -751,20 +792,405 @@ async fn rejected_automatic_rejoin_clears_confirmed_office_state() {
         .join_office("office-rejoin-rejected", "office-rejoin-rejected")
         .await
         .expect("initial join");
+    let initial_join = server.next_join().await;
+
+    let mut events = computer.subscribe_events();
+    server.force_network_disconnect();
+    wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
+    let _ = server.next_auth().await;
+
+    // 第 2 次 join = 重连自动回放，被服务端以 4101 拒绝；第 3 次 = 有界退避后的重试。
+    let rejected_join = server.next_join().await;
+    let rejected_at = Instant::now();
+    // #231：退避窗口内标脏——重试路径不得清空 pending_updates，恢复后应补发一次。
+    computer
+        .emit_update_config()
+        .await
+        .expect("coalesce config update during rejoin backoff");
+    // 未确认成员关系前不得提前 flush（负向断言；否则恢复后的断言会被提前发送掩盖）。
+    assert!(
+        timeout(Duration::from_millis(200), server.update_rx.recv())
+            .await
+            .is_err(),
+        "pending updates must not flush before membership is confirmed"
+    );
+    let retried_join = server.next_join().await;
+    let retry_delay = rejected_at.elapsed();
+
+    assert_eq!(rejected_join, initial_join);
+    assert_eq!(retried_join, rejected_join);
+    // 下界锁定「确实退避过」；上界(3s) 容忍测试任务调度延迟，曲线的精确值由纯函数单测锁定。
+    assert!(
+        retry_delay >= Duration::from_millis(900) && retry_delay < Duration::from_secs(3),
+        "first retry must respect the 1s backoff, got {retry_delay:?}"
+    );
+
+    wait_for_lifecycle(&mut events, LifecycleState::JoinedOffice).await;
+    let socketio = computer.get_socketio_client();
+    let socketio = socketio.read().await;
+    assert_eq!(
+        socketio.as_ref().unwrap().get_office_id().await.as_deref(),
+        Some("office-rejoin-rejected")
+    );
+    drop(socketio);
+
+    // #231：恢复后补发退避期间合并的配置更新（只发一次，载荷是本 Computer）。
+    let (event, payload) = timeout(Duration::from_secs(2), server.update_rx.recv())
+        .await
+        .expect("rejoin must flush the coalesced update")
+        .expect("capture server stopped before update");
+    assert_eq!(event, smcp::events::SERVER_UPDATE_CONFIG);
+    assert_eq!(payload["computer"], "office-rejoin-rejected");
+
+    computer.shutdown().await.expect("shutdown computer");
+    server.shutdown();
+}
+
+/// 启动带隔离 SKILL/blob/config 目录的 Computer（#234 回房矩阵共用）。
+async fn boot_rejoin_computer(name: &str, temp: &tempfile::TempDir) -> Computer<SilentSession> {
+    let computer = Computer::new(
+        name,
+        SilentSession::new(format!("{name}-session")),
+        None,
+        None,
+        false,
+        false,
+    )
+    .with_skill_home(temp.path().join("skills"))
+    .with_blob_cache_root(temp.path().join("blob"))
+    .with_config_dir(temp.path().join("config"));
+    computer.boot_up().await.expect("boot computer");
+    computer
+}
+
+/// #234：预算耗尽后回退 `Connected`，且不再发送重试（负向断言）。
+#[tokio::test]
+async fn exhausted_rejoin_budget_falls_back_to_connected_and_stops_retrying() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server_with_policy(
+        join_verdict(|attempt| (attempt >= 2).then_some(4101)),
+        None,
+        None,
+    )
+    .await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-rejoin-budget", &temp).await;
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "office-rejoin-budget-token" })),
+                office_rejoin_budget: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-rejoin-budget", "office-rejoin-budget")
+        .await
+        .expect("initial join");
     let _ = server.next_join().await;
 
     let mut events = computer.subscribe_events();
     server.force_network_disconnect();
     wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
     let _ = server.next_auth().await;
+    // 第 2 次（回放）被拒；在退避中标脏待发更新，终态失败必须清空而绝不补发。
     let _ = server.next_join().await;
-    wait_for_lifecycle(&mut events, LifecycleState::Connected).await;
+    computer
+        .emit_update_config()
+        .await
+        .expect("coalesce config update during exhausted backoff");
+    // 第 3 次（1s 退避后）也被拒；下一档 2s 超出 2s 预算。
+    let _ = server.next_join().await;
 
+    wait_for_lifecycle(&mut events, LifecycleState::Connected).await;
     let socketio = computer.get_socketio_client();
     let socketio = socketio.read().await;
     assert_eq!(socketio.as_ref().unwrap().get_office_id().await, None);
     drop(socketio);
 
+    server.assert_no_join_for(Duration::from_secs(2)).await;
+    assert!(
+        timeout(Duration::from_millis(500), server.update_rx.recv())
+            .await
+            .is_err(),
+        "terminal rejoin failure must clear pending updates without flushing"
+    );
+    computer.shutdown().await.expect("shutdown computer");
+    server.shutdown();
+}
+
+/// #234：`4106` 是永久失败，按码立即回退且不重试（默认 60s 预算下也一样）。
+#[tokio::test]
+async fn permanent_rejection_is_not_retried() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server_with_policy(
+        join_verdict(|attempt| (attempt == 2).then_some(4106)),
+        None,
+        None,
+    )
+    .await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-rejoin-permanent", &temp).await;
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "office-rejoin-permanent-token" })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-rejoin-permanent", "office-rejoin-permanent")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    let mut events = computer.subscribe_events();
+    server.force_network_disconnect();
+    wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 第 2 次 join 回 4106
+
+    wait_for_lifecycle(&mut events, LifecycleState::Connected).await;
+    let socketio = computer.get_socketio_client();
+    let socketio = socketio.read().await;
+    assert_eq!(socketio.as_ref().unwrap().get_office_id().await, None);
+    drop(socketio);
+
+    server.assert_no_join_for(Duration::from_secs(2)).await;
+    computer.shutdown().await.expect("shutdown computer");
+    server.shutdown();
+}
+
+/// #234：`Duration::ZERO` = 单次尝试（Builder setter 链路）。
+#[tokio::test]
+async fn zero_budget_makes_automatic_rejoin_single_attempt() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server(Some(2), None).await;
+    let client = SmcpComputerClientBuilder::new(
+        &server.url,
+        empty_manager(),
+        "office-rejoin-zero",
+        empty_inputs(),
+    )
+    .office_rejoin_budget(Duration::ZERO)
+    .connect()
+    .await
+    .expect("connect builder client");
+    let _ = server.next_auth().await;
+    client
+        .join_office("office-rejoin-zero")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    server.force_network_disconnect();
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 第 2 次 join 被 4101 拒绝
+
+    server.assert_no_join_for(Duration::from_secs(2)).await;
+    assert_eq!(client.get_office_id().await, None);
+    client.disconnect().await.expect("disconnect");
+    server.shutdown();
+}
+
+/// #234：退避窗口内显式 `join_office` 不被阻塞（op-lock 分次持有）。
+#[tokio::test]
+async fn explicit_join_is_not_blocked_during_rejoin_backoff() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server(Some(2), None).await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-rejoin-explicit", &temp).await;
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "office-rejoin-explicit-token" })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-rejoin-explicit", "office-rejoin-explicit")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    let mut events = computer.subscribe_events();
+    server.force_network_disconnect();
+    wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 自动回放被 4101 拒绝，进入 1s 退避
+
+    timeout(
+        Duration::from_millis(750),
+        computer.join_office("office-explicit", "office-rejoin-explicit"),
+    )
+    .await
+    .expect("explicit join must not wait for the backoff window")
+    .expect("explicit join succeeds");
+    let _ = server.next_join().await; // 显式 join（第 3 次）
+
+    wait_for_lifecycle(&mut events, LifecycleState::JoinedOffice).await;
+    let socketio = computer.get_socketio_client();
+    let socketio = socketio.read().await;
+    assert_eq!(
+        socketio.as_ref().unwrap().get_office_id().await.as_deref(),
+        Some("office-explicit")
+    );
+    drop(socketio);
+
+    server.assert_no_join_for(Duration::from_secs(2)).await;
+    computer.shutdown().await.expect("shutdown computer");
+    server.shutdown();
+}
+
+/// #234：`Computer::with_office_rejoin_budget` 覆盖优先于 `ConnectOptions`。
+///
+/// `ConnectOptions` 传 ZERO（单次），覆盖传 2s：若覆盖失效，只会有第 2 次 join，
+/// 第 3 次（1s 退避后）不会出现——本用例会超时失败。
+#[tokio::test]
+async fn computer_override_takes_precedence_over_connect_options() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server_with_policy(
+        join_verdict(|attempt| (attempt >= 2).then_some(4101)),
+        None,
+        None,
+    )
+    .await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-rejoin-override", &temp)
+        .await
+        .with_office_rejoin_budget(Duration::from_secs(2));
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "office-rejoin-override-token" })),
+                office_rejoin_budget: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-rejoin-override", "office-rejoin-override")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    let mut events = computer.subscribe_events();
+    server.force_network_disconnect();
+    wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 第 2 次（回放）被拒
+                                      // 覆盖生效才会出现的第 3 次 join（1s 退避后）；ConnectOptions 的 ZERO 若胜出则此步超时。
+    let _ = server.next_join().await;
+
+    wait_for_lifecycle(&mut events, LifecycleState::Connected).await;
+    server.assert_no_join_for(Duration::from_secs(2)).await;
+    computer.shutdown().await.expect("shutdown computer");
+    server.shutdown();
+}
+
+/// #234：退避窗口内显式 `leave_office` 不被阻塞，且取走 abort 句柄后不再回放。
+/// 走高层 `Computer::leave_office`（CLI `socket leave` 的入口），锁定退避期间退房可取消重试。
+#[tokio::test]
+async fn explicit_leave_is_not_blocked_during_rejoin_backoff() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server(Some(2), None).await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-rejoin-leave", &temp).await;
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "office-rejoin-leave-token" })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-rejoin-leave", "office-rejoin-leave")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    let mut events = computer.subscribe_events();
+    server.force_network_disconnect();
+    wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 自动回放被 4101 拒绝，进入 1s 退避
+
+    timeout(Duration::from_millis(750), computer.leave_office())
+        .await
+        .expect("explicit leave must not wait for the backoff window")
+        .expect("explicit leave succeeds");
+
+    wait_for_lifecycle(&mut events, LifecycleState::Connected).await;
+    server.assert_no_join_for(Duration::from_secs(2)).await;
+    computer.shutdown().await.expect("shutdown computer");
+    server.shutdown();
+}
+
+/// #211 回归：退避窗口内二次断线——旧 task 被 Close abort，新会话重新回放并恢复。
+#[tokio::test]
+async fn second_disconnect_during_rejoin_backoff_rebinds_on_new_session() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server(Some(2), None).await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-rejoin-rebind", &temp).await;
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "office-rejoin-rebind-token" })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-rejoin-rebind", "office-rejoin-rebind")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    let mut events = computer.subscribe_events();
+    server.force_network_disconnect();
+    wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 第 2 次 join 被 4101 拒绝，进入 1s 退避
+
+    // 在退避窗口内再次制造真实断网：旧世代不得产生重复加入（Close 的 abort 或世代守卫），
+    // 新会话重新回放并恢复。abort 与世代守卫在本观测下不可区分，故只断言「无重复加入」。
+    server.force_network_disconnect();
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 第 3 次 join 在新会话上被接受
+
+    wait_for_lifecycle(&mut events, LifecycleState::JoinedOffice).await;
+    let socketio = computer.get_socketio_client();
+    let socketio = socketio.read().await;
+    assert_eq!(
+        socketio.as_ref().unwrap().get_office_id().await.as_deref(),
+        Some("office-rejoin-rebind")
+    );
+    drop(socketio);
+
+    server.assert_no_join_for(Duration::from_secs(2)).await;
     computer.shutdown().await.expect("shutdown computer");
     server.shutdown();
 }

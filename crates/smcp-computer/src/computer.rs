@@ -98,6 +98,7 @@ use crate::mcp_clients::{
 use crate::oauth::{InMemoryOAuthCredentialStore, OAuthCredentialStore};
 use crate::socketio_client::{
     SmcpComputerClient, SmcpComputerClientBuilder, DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+    DEFAULT_OFFICE_REJOIN_BUDGET,
 };
 use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
@@ -322,6 +323,13 @@ pub struct ConnectOptions {
     /// Maximum total wait for initial Engine.IO establishment and Socket.IO namespace readiness.
     /// Defaults to 30 seconds.
     pub namespace_connect_timeout: std::time::Duration,
+    /// #234：自动回房遇到 `4101`（本 role 席位被占）时的有界退避总预算。
+    ///
+    /// 缺省 [`DEFAULT_OFFICE_REJOIN_BUDGET`]（60s）；`Duration::ZERO` = 单次尝试。只作用于传输层
+    /// 重连后的自动回放，显式 `join_office` 从不重试。若通过
+    /// [`Computer::with_office_rejoin_budget`] 注入了覆盖，则以覆盖为准。
+    /// Total budget for bounded backoff retries when an automatic rejoin hits `4101`.
+    pub office_rejoin_budget: std::time::Duration,
 }
 
 impl Default for ConnectOptions {
@@ -332,6 +340,7 @@ impl Default for ConnectOptions {
             headers: None,
             namespace: smcp::SMCP_NAMESPACE.to_string(),
             namespace_connect_timeout: DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+            office_rejoin_budget: DEFAULT_OFFICE_REJOIN_BUDGET,
         }
     }
 }
@@ -350,6 +359,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("headers", &self.headers)
             .field("namespace", &self.namespace)
             .field("namespace_connect_timeout", &self.namespace_connect_timeout)
+            .field("office_rejoin_budget", &self.office_rejoin_budget)
             .finish()
     }
 }
@@ -576,6 +586,8 @@ pub struct Computer<S: Session> {
     socketio_lifecycle_gate: Arc<Mutex<()>>,
     /// Active Socket.IO client's lifecycle publication token.
     socketio_lifecycle_owner: Arc<StdMutex<u64>>,
+    /// #234：自动回房预算覆盖（`Some` 时优先于 `ConnectOptions::office_rejoin_budget`）。
+    office_rejoin_budget_override: Option<std::time::Duration>,
     /// 确认回调函数 / Confirmation callback function
     confirm_callback: Option<ConfirmCallbackType>,
 
@@ -990,6 +1002,7 @@ impl<S: Session> Computer<S> {
             socketio_client,
             socketio_lifecycle_gate: Arc::new(Mutex::new(())),
             socketio_lifecycle_owner: Arc::new(StdMutex::new(0)),
+            office_rejoin_budget_override: None,
             confirm_callback: None,
             skill_registry,
             skill_home,
@@ -1036,6 +1049,18 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_landing_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.landing_root_override = Some(root.into());
+        self
+    }
+
+    /// #234：注入自动回房 `4101` 有界退避的预算覆盖。
+    ///
+    /// 优先于 [`ConnectOptions::office_rejoin_budget`]（与其它 `with_*` 注入覆盖语义一致）；
+    /// `Duration::ZERO` = 单次尝试。仅作用于传输层重连后的自动回放，显式 `join_office` 从不重试。
+    /// Override the bounded backoff budget for automatic rejoin after `4101`; takes precedence
+    /// over `ConnectOptions::office_rejoin_budget`. `Duration::ZERO` disables retries.
+    #[must_use]
+    pub fn with_office_rejoin_budget(mut self, budget: std::time::Duration) -> Self {
+        self.office_rejoin_budget_override = Some(budget);
         self
     }
 
@@ -4595,6 +4620,7 @@ impl<S: Session> Computer<S> {
             socketio_client: detached_socketio.clone(),
             socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
             socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
+            office_rejoin_budget_override: self.office_rejoin_budget_override,
             confirm_callback: self.confirm_callback.clone(),
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
@@ -4665,6 +4691,9 @@ impl<S: Session> Computer<S> {
         // 能调 resolve_blob / get_skill* / mint / execute_tool_cancellable / acancel_tool。
         // Create Socket.IO client via Builder (threading namespace through).
         let ops: Arc<dyn ComputerHandlerOps> = Arc::new(self.clone_for_handlers());
+        let office_rejoin_budget = self
+            .office_rejoin_budget_override
+            .unwrap_or(options.office_rejoin_budget);
         let mut builder = SmcpComputerClientBuilder::new(
             url,
             self.mcp_manager.clone(),
@@ -4673,6 +4702,7 @@ impl<S: Session> Computer<S> {
         )
         .namespace(options.namespace)
         .namespace_connect_timeout(options.namespace_connect_timeout)
+        .office_rejoin_budget(office_rejoin_budget)
         .computer_ops(ops);
         // #201：动态 Provider 优先；未配置时保留 #86 静态 auth dict 行为。
         if let Some(provider) = options.auth_provider {
@@ -4758,7 +4788,13 @@ impl<S: Session> Computer<S> {
         if let Some(ref client) = *socketio_ref {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
-            let current_office_id = client.get_current_office_id().await?;
+            // #234：重连回房退避期间 `confirmed` 为空，但 `desired` 仍在；显式退房必须用它
+            // 取消重试，否则退房会报「不在任何房」，随后重试又把成员关系加回去。
+            let Some(current_office_id) = client.get_office_id_for_leave().await else {
+                return Err(ComputerError::InvalidState(
+                    "Not currently in any office".to_string(),
+                ));
+            };
             client.leave_office(&current_office_id).await?;
             return Ok(());
         }
@@ -4870,6 +4906,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
             socketio_client: Arc::clone(&self.socketio_client),
             socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
             socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
+            office_rejoin_budget_override: self.office_rejoin_budget_override,
             confirm_callback: self.confirm_callback.clone(),
             // Public Clone is another handle to the same Computer lifecycle. All resources that
             // boot creates and shutdown tears down must therefore share the exact cleanup handles.
@@ -5233,6 +5270,17 @@ mod tests {
         PromptStringInput, StdioServerConfig, StdioServerParameters,
     };
     use std::sync::atomic::AtomicBool;
+
+    /// #234：默认预算 60s（覆盖 socket.io 45s 回收窗口并留一次尝试余量），且 Debug 暴露字段。
+    #[test]
+    fn connect_options_default_office_rejoin_budget_is_60s() {
+        let options = ConnectOptions::default();
+        assert_eq!(
+            options.office_rejoin_budget,
+            std::time::Duration::from_secs(60)
+        );
+        assert!(format!("{options:?}").contains("office_rejoin_budget"));
+    }
 
     struct FakeSocketIoInstallClient {
         active: AtomicBool,

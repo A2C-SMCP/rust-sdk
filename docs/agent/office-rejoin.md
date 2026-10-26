@@ -211,5 +211,7 @@ cargo test -p smcp-agent --test office_rejoin_test
 
 - 镜像来源：python-sdk#203、python-sdk#212；协议裁决
   [Discussion#61](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/61)
-- Computer 侧同源实现：#204（`05dfdc7`）、#211（陈旧 Close 守卫）
+- Computer 侧同源实现：#204（`05dfdc7`）、#211（陈旧 Close 守卫）、
+  #234（自动回房 4101 有界退避，预算经 `ConnectOptions::office_rejoin_budget` /
+  `Computer::with_office_rejoin_budget` / CLI `--office-rejoin-budget` 暴露）
 - 房间 ack 契约：#225 / #226（`server:join_office` 等三事件成功 = 空 ack、失败 = flat `ErrorPayload`）

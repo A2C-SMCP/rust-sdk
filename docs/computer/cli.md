@@ -56,6 +56,10 @@ cargo build -p smcp-computer --features cli
   - 是否自动连接（默认 `true`）
 - `--auto-reconnect <bool>`
   - 是否自动重连（默认 `true`）
+- `--office-rejoin-budget <SECS>`
+  - 传输层自动重连后，自动回房撞 `4101`（本 role 席位被占）时的有界退避总预算（秒）
+  - 缺省用 SDK 默认 `60`（覆盖 socket.io 默认最长回收窗口 45s 并留余量）；`0` = 单次尝试
+  - 仅作用于自动回放；显式 `socket join` 失败仍立即返回错误
 - `--url <string>`
   - Socket.IO 服务器 URL（可选），例如 `http://localhost:3000`
 - `--namespace <string>`

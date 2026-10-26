@@ -57,6 +57,12 @@ pub struct Args {
     #[arg(long, default_value = "true")]
     pub auto_reconnect: bool,
 
+    /// 自动回房遇到 4101（本 role 席位被占）时的有界退避总预算（秒）；0 = 单次尝试。
+    /// 缺省用 SDK 默认 60s（覆盖 socket.io 默认最长回收窗口 45s 并留余量）。
+    /// Bounded backoff budget (seconds) for automatic rejoin after 4101; 0 = single attempt.
+    #[arg(long, value_name = "SECS")]
+    pub office_rejoin_budget: Option<u64>,
+
     /// Socket.IO 服务器URL，例如 https://host:port
     #[arg(long)]
     pub url: Option<String>,
@@ -554,6 +560,7 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
         namespace: args.namespace.clone(),
         auth: args.auth.clone(),
         headers: args.headers.clone(),
+        office_rejoin_budget_secs: args.office_rejoin_budget,
     };
 
     // 启动前缀（boot_up 子系统装配 → 治理重挂 → socket.io 连接）抽出为可测 helper。
@@ -660,6 +667,7 @@ mod tests {
             namespace: "/smcp".to_string(),
             auth: None,
             headers: None,
+            office_rejoin_budget_secs: None,
         };
         let handler = prepare_handler(computer, cli_config, None).await;
 
@@ -696,6 +704,29 @@ mod tests {
         assert!(
             Args::try_parse_from(["smcp-computer", "run", "--inputs", "i.json"]).is_err(),
             "--inputs 应已删除（并入 --mcp-config 文件 inputs 段）"
+        );
+    }
+
+    /// #234：`--office-rejoin-budget` 可选；`0` = 单次尝试，非法值解析失败。
+    #[test]
+    fn office_rejoin_budget_flag_is_optional_and_parses_234() {
+        use clap::Parser;
+        let default = Args::try_parse_from(["smcp-computer", "run"]).unwrap();
+        assert_eq!(default.office_rejoin_budget, None);
+
+        // 与 `--url` / `--namespace` 等启动参数一致：位于子命令之前。
+        let zero =
+            Args::try_parse_from(["smcp-computer", "--office-rejoin-budget", "0", "run"]).unwrap();
+        assert_eq!(zero.office_rejoin_budget, Some(0));
+
+        let two =
+            Args::try_parse_from(["smcp-computer", "--office-rejoin-budget", "2", "run"]).unwrap();
+        assert_eq!(two.office_rejoin_budget, Some(2));
+
+        assert!(
+            Args::try_parse_from(["smcp-computer", "--office-rejoin-budget", "nope", "run"])
+                .is_err(),
+            "非数字预算必须解析失败"
         );
     }
 

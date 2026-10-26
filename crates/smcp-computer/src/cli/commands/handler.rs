@@ -27,6 +27,8 @@ pub struct CliConfig {
     pub namespace: String,
     pub auth: Option<String>,
     pub headers: Option<String>,
+    /// #234：自动回房重试预算（秒）；`None` = SDK 默认 60s，`0` = 单次尝试。
+    pub office_rejoin_budget_secs: Option<u64>,
 }
 
 /// Parameters of the last successful connection, including an interactive URL override.
@@ -631,6 +633,11 @@ impl CommandHandler {
                     namespace: namespace.to_string(),
                     namespace_connect_timeout:
                         crate::socketio_client::DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+                    office_rejoin_budget: self
+                        .cli_config
+                        .office_rejoin_budget_secs
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or(crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET),
                 },
             )
             .await?;
@@ -1151,6 +1158,7 @@ mod tests {
             namespace: "/smcp".to_string(),
             auth: None,
             headers: None,
+            office_rejoin_budget_secs: None,
         };
         CommandHandler::new(computer, cli_config)
     }
