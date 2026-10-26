@@ -997,16 +997,7 @@ impl CommandHandler {
                     ))
                     .yellow()
                 );
-                if self.computer.take_rejoin_intent_cancelled().await {
-                    println!(
-                        "{}",
-                        style(
-                            "  ⚠ 此前的自动回房意图已取消 / the previous pending automatic rejoin \
-                             intent was cancelled"
-                        )
-                        .yellow()
-                    );
-                }
+                // 新连接没有 previous_desired，取消语义不会在这里触发（flag 恒 false）。
                 Err(error.into())
             }
         }

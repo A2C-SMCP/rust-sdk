@@ -1290,14 +1290,17 @@ async fn explicit_leave_is_not_blocked_during_rejoin_backoff() {
     server.shutdown();
 }
 
-/// #234：并发换房与退房由 `office_operation` 全序化——leave 的 wire 目标必须是
-/// 同一临界区内解析出的房号（旧房 A 或新房 B），不能是空值或第三个房号。
+/// #234：并发换房与退房由 `office_operation` 全序化。用 gate 扣住换房 ACK，使 leave
+/// 必然排队；严格断言 leave 的 wire 目标是新房 B，且终态为退房后的 `Connected`。
 #[tokio::test]
 async fn leave_during_concurrent_switch_targets_the_locked_office() {
     let _ = tracing_subscriber::fmt::try_init();
-    let mut server = start_reconnect_capture_server(None, None).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    // attempt 1 = 初始 join A；attempt 2 = 并发换房 B，ACK 由 gate 扣住。
+    let mut server =
+        start_reconnect_capture_server_with_gate(None, Some(2), Some(gate.clone())).await;
     let temp = tempfile::TempDir::new().unwrap();
-    let computer = boot_rejoin_computer("office-concurrent-leave", &temp).await;
+    let computer = Arc::new(boot_rejoin_computer("office-concurrent-leave", &temp).await);
     computer
         .connect_socketio(
             &server.url,
@@ -1315,19 +1318,42 @@ async fn leave_during_concurrent_switch_targets_the_locked_office() {
         .expect("initial join");
     let _ = server.next_join().await;
 
-    let (join_result, leave_result) = tokio::join!(
-        computer.join_office("office-b", "office-concurrent-leave"),
-        computer.leave_office(),
-    );
-    join_result.expect("concurrent explicit join");
-    leave_result.expect("concurrent explicit leave");
+    let join_task = tokio::spawn({
+        let computer = Arc::clone(&computer);
+        async move {
+            computer
+                .join_office("office-b", "office-concurrent-leave")
+                .await
+        }
+    });
+    // join B 已到达服务端但 ACK 被 gate 扣住：join 持有 office_operation，leave 必然排队。
+    let join_payload = server.next_join().await;
+    assert_eq!(join_payload["office_id"], "office-b");
+    let leave_task = tokio::spawn({
+        let computer = Arc::clone(&computer);
+        async move { computer.leave_office().await }
+    });
+
+    gate.notify_one(); // 放行 join B 的 ACK
+    join_task
+        .await
+        .expect("join task")
+        .expect("concurrent explicit join");
+    leave_task
+        .await
+        .expect("leave task")
+        .expect("concurrent explicit leave");
 
     let leave = server.next_leave().await;
-    let target = leave["office_id"].as_str().expect("leave office_id");
-    assert!(
-        target == "office-a" || target == "office-b",
-        "leave must target the office resolved under the operation lock, got {target}"
+    assert_eq!(
+        leave["office_id"], "office-b",
+        "leave must target the office committed under the operation lock"
     );
+    assert_eq!(computer.lifecycle_state(), LifecycleState::Connected);
+    let socketio = computer.get_socketio_client();
+    let socketio = socketio.read().await;
+    assert_eq!(socketio.as_ref().unwrap().get_office_id().await, None);
+    drop(socketio);
 
     computer.shutdown().await.expect("shutdown computer");
     server.shutdown();

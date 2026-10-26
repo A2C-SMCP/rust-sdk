@@ -332,12 +332,12 @@ fn lock_office_membership(
 /// 两侧保持原有文案，其它 `emit_with_ack` 处理器不经过本分类（无全局语义漂移）。
 #[derive(Debug)]
 enum AckCallError {
-    /// 发送失败 / ACK 通道随传输层关闭：绑定会话已失效，回房必须保留重放意图。
+    /// **发送时**传输已关闭（`emit_with_ack` 返回 Err）：绑定会话已失效，回房必须保留重放意图。
     ///
-    /// 注：当前 tf-rust-socketio 0.9.3 在断线时**不清空** `outstanding_acks`，因此
-    /// 「ACK 通道关闭」近乎不可达；实际可达路径是**发送时传输已关闭**（`send` 失败）。
+    /// 注意：ACK 通道关闭（`Ok(Err(_))`）**不**属于此类——kernel 可能对迟到的 ACK 静默
+    /// 丢弃回调（传输健康），故归入 `Failed`。
     Interrupted(ComputerError),
-    /// 普通失败（ACK 超时、坏形状、解析失败等）。
+    /// 普通失败（ACK 超时/迟到、坏形状、解析失败等）。
     Failed(ComputerError),
 }
 
@@ -1855,8 +1855,14 @@ impl SmcpComputerClient {
             }
             Ok(Err(_)) => {
                 error!("Channel closed while calling event: {}", event);
-                // #234：ACK 通道随传输层失效而关闭（回调被丢弃），属连接级中断。
-                Err(AckCallError::Interrupted(ComputerError::SocketIoError(
+                // #234：`Ok(Err(_))` **不能**判为连接级中断。kernel 对「已匹配但已超时」的
+                // ACK 会静默丢弃且不调用回调（tf-rust-socketio `handle_ack`），回调里的
+                // oneshot Sender 随之 drop——此时传输可能完全健康，只是 ACK 恰好迟到。
+                // 真实断线由发送失败（`emit_with_ack` 返回 Err）覆盖，已归 Interrupted。
+                // 此处按「本次尝试失败（超时类）」处理，避免 lifecycle 无事件接管而永久停在
+                // Connecting。The kernel may drop an expired ACK without invoking the callback,
+                // so a closed ACK channel is a timeout-like failure, not a transport interruption.
+                Err(AckCallError::Failed(ComputerError::SocketIoError(
                     "Channel closed while waiting for response".to_string(),
                 )))
             }
@@ -3963,5 +3969,42 @@ mod tests {
             membership.connected,
             "Interrupted must not clear membership"
         );
+    }
+
+    /// #234：显式 join 在传输中断时保留**新** desired（不撤销用户意图），`confirmed=None`。
+    #[tokio::test]
+    async fn explicit_join_interrupted_keeps_new_intent() {
+        let (url, _shutdown) = start_bare_socketio_server().await;
+        let client = connect_bare_client(&url).await;
+        client.disconnect().await.expect("disconnect transport");
+        // 模拟「Close 尚未执行」的窗口：传输已死，但本地仍视为已连接。
+        {
+            let mut membership = lock_office_membership(&client.office_membership);
+            membership.connected = true;
+            membership.transport_epoch = client.client.session_epoch();
+        }
+
+        let result = client.join_office_as("office-new", "bare-client").await;
+        assert!(result.is_err(), "join must fail after transport loss");
+
+        let membership = lock_office_membership(&client.office_membership);
+        assert_eq!(membership.desired.as_deref(), Some("office-new"));
+        assert_eq!(membership.confirmed, None);
+        assert!(!membership.joining);
+    }
+
+    /// #234（cli）：取消提示是一次性的——首次 take 为 true，再次为 false。
+    #[cfg(feature = "cli")]
+    #[tokio::test]
+    async fn rejoin_intent_cancel_notice_is_one_shot() {
+        let (url, _shutdown) = start_bare_socketio_server().await;
+        let client = connect_bare_client(&url).await;
+        {
+            let mut membership = lock_office_membership(&client.office_membership);
+            membership.rejoin_intent_cancelled = true;
+        }
+        assert!(client.take_rejoin_intent_cancelled().await);
+        assert!(!client.take_rejoin_intent_cancelled().await);
+        client.disconnect().await.expect("disconnect");
     }
 }
