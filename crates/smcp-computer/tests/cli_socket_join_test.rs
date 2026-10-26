@@ -117,6 +117,7 @@ fn handler(name: &str, home: &TempDir) -> CommandHandler {
             namespace: "/smcp".into(),
             auth: Some("join-test-secret".into()),
             headers: Some("x-cli-join:preserved".into()),
+            office_rejoin_budget_secs: None,
         },
     )
 }

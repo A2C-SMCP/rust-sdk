@@ -170,6 +170,7 @@ pub async fn create_command_handler() -> CommandHandler {
         namespace: "test_namespace".to_string(),
         auth: None,
         headers: None,
+        office_rejoin_budget_secs: None,
     };
     CommandHandler::new(computer, cli_config)
 }
@@ -194,6 +195,7 @@ pub async fn create_uninitialized_command_handler() -> CommandHandler {
         namespace: "test_namespace".to_string(),
         auth: None,
         headers: None,
+        office_rejoin_budget_secs: None,
     };
     CommandHandler::new(computer, cli_config)
 }
