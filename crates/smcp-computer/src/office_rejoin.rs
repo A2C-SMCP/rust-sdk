@@ -39,7 +39,7 @@ pub(crate) fn retry_fits_budget(elapsed: Duration, delay: Duration, budget: Dura
 /// 回房单次失败的裁决分类（与 `smcp-agent::office::RejoinVerdict` 同构）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejoinVerdict {
-    /// 连接级失效（发送失败 / ACK 通道随传输层关闭）：由 Close/Connect 生命周期接管，
+    /// 发送时传输失效（`emit_with_ack` 返回 Err，绑定会话已失效）：由 Close/Connect 生命周期接管，
     /// 当前任务必须保留重放意图、不重试也不落失败终态。
     Interrupted,
     /// 瞬态冲突（仅 `4101`）：预算内可退避重试。
