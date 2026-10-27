@@ -1858,10 +1858,16 @@ impl SmcpComputerClient {
                 // #234：`Ok(Err(_))` **不能**判为连接级中断。kernel 对「已匹配但已超时」的
                 // ACK 会静默丢弃且不调用回调（tf-rust-socketio `handle_ack`），回调里的
                 // oneshot Sender 随之 drop——此时传输可能完全健康，只是 ACK 恰好迟到。
-                // 真实断线由发送失败（`emit_with_ack` 返回 Err）覆盖，已归 Interrupted。
+                // ACK 等待期间的真实断线不会走发送失败：`emit_with_ack` 此时已返回 Ok，
+                // 发送那一刻是成功的。断线要么等满本函数的 10s 外层 timeout（→Failed），
+                // 要么由 Close/epoch 守卫在结果落账前取消/丢弃本次尝试；两者都不是
+                // Interrupted——Interrupted 仅保留给发送时传输失效（`emit_with_ack` 返回 Err）。
                 // 此处按「本次尝试失败（超时类）」处理，避免 lifecycle 无事件接管而永久停在
-                // Connecting。The kernel may drop an expired ACK without invoking the callback,
-                // so a closed ACK channel is a timeout-like failure, not a transport interruption.
+                // Connecting. A real disconnect during the ACK wait surfaces as this outer
+                // timeout or the Close/epoch guard — never as a send failure; `Interrupted`
+                // is reserved for a send-time transport failure (`emit_with_ack` Err).
+                // The kernel may drop an expired ACK without invoking the callback, so a
+                // closed ACK channel is a timeout-like failure, not a transport interruption.
                 Err(AckCallError::Failed(ComputerError::SocketIoError(
                     "Channel closed while waiting for response".to_string(),
                 )))

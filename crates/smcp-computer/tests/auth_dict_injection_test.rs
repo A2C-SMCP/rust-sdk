@@ -1334,6 +1334,10 @@ async fn leave_during_concurrent_switch_targets_the_locked_office() {
         async move { computer.leave_office().await }
     });
 
+    // 固定调度：让 leave 任务在 gate 放行前完成首次轮询并阻塞在 `office_operation`
+    // 队首；旧「锁外解析 confirmed」实现会在这一步读到 office-a，使下方 office-b
+    // 断言成为有效回归判别。确定性依赖本测试保持 current-thread `#[tokio::test]`。
+    tokio::task::yield_now().await;
     gate.notify_one(); // 放行 join B 的 ACK
     join_task
         .await

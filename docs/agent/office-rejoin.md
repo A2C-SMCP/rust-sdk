@@ -180,6 +180,12 @@ Agent 已在**其它**房又请求入新房时，**MUST** 先显式 `server:leav
 
 ## 5. 已知边界与跨端差异
 
+- **预算/曲线与 python 的差异（有意为之）**：python 默认 `45s` 预算、`5s` 封顶；Rust
+  （Agent #219 与 Computer #234 同一曲线与口径，Computer 侧为镜像实现、需手动同步）为
+  `60s` 预算、`8s` 封顶。60s 在覆盖 socket.io 默认最长回收窗口 `45s` 之外仍留一次尝试的
+  余量；8s 与 Rust Agent 线对齐。协议把是否重试、退避曲线与预算大小留给 SDK 自治
+  （room-model.md §静默断线与会话回收 / error-handling.md §建议的重试策略），故这是有意的
+  跨 SDK 差异，不是遗漏 mirror。
 - **无 `disconnect_final` 信号**：python 侧用 engineio 的 `__disconnect_final` 在「重连彻底放弃」时
   清空意图；`tf-rust-socketio` **不提供**该事件（重连次数耗尽后其内部循环静默 `break`）。后果：意图
   在传输层彻底失联后**保留**，但因不再有 Connect 事件，不会产生任何重放动作；若调用方之后重新
