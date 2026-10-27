@@ -662,12 +662,14 @@ impl SmcpHandler {
                         office_id: office_id.clone(),
                         computer: Some(session.name),
                         agent: None,
+                        computer_id: None,
                     }
                 } else {
                     LeaveOfficeNotification {
                         office_id: office_id.clone(),
                         computer: None,
                         agent: Some(session.name),
+                        computer_id: None,
                     }
                 };
 
@@ -776,12 +778,14 @@ impl SmcpHandler {
                 office_id: data.office_id.clone(),
                 computer: Some(session_name.clone()),
                 agent: None,
+                computer_id: None,
             }
         } else {
             EnterOfficeNotification {
                 office_id: data.office_id.clone(),
                 computer: None,
                 agent: Some(session_name.clone()),
+                computer_id: None,
             }
         };
 
@@ -826,12 +830,14 @@ impl SmcpHandler {
                     office_id: current_office.clone(),
                     computer: Some(session.name.clone()),
                     agent: None,
+                    computer_id: None,
                 }
             } else {
                 LeaveOfficeNotification {
                     office_id: current_office.clone(),
                     computer: None,
                     agent: Some(session.name.clone()),
+                    computer_id: None,
                 }
             };
 
@@ -1619,6 +1625,7 @@ impl SmcpHandler {
                 role: s.role.into(),
                 office_id: s.office_id.unwrap_or_default(),
                 a2c_version: s.a2c_version,
+                computer_id: None,
             })
             .collect();
 
@@ -1677,12 +1684,14 @@ impl SmcpHandler {
                         office_id: leave_office.clone(),
                         computer: Some(session.name.clone()),
                         agent: None,
+                        computer_id: None,
                     }
                 } else {
                     LeaveOfficeNotification {
                         office_id: leave_office.clone(),
                         computer: None,
                         agent: Some(session.name.clone()),
+                        computer_id: None,
                     }
                 };
 
@@ -1879,6 +1888,7 @@ mod tests {
             office_id: office_id.clone(),
             computer: Some(computer_name.clone()),
             agent: None,
+            computer_id: None,
         };
 
         assert_eq!(notification.office_id, office_id);
@@ -1895,6 +1905,7 @@ mod tests {
             office_id: office_id.clone(),
             computer: None,
             agent: Some(agent_name.clone()),
+            computer_id: None,
         };
 
         assert_eq!(notification.office_id, office_id);
@@ -1911,6 +1922,7 @@ mod tests {
             office_id: office_id.clone(),
             computer: Some(computer_name.clone()),
             agent: None,
+            computer_id: None,
         };
 
         assert_eq!(notification.office_id, office_id);

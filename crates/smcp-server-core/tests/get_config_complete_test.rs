@@ -179,6 +179,7 @@ async fn test_get_config_complete_flow() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
+        computer_id: None,
     };
     computer_client
         .emit("server:join_office", json!(computer_join_req))
@@ -202,6 +203,7 @@ async fn test_get_config_complete_flow() {
         office_id: "office1".to_string(),
         role: Role::Agent,
         name: "agent1".to_string(),
+        computer_id: None,
     };
     agent_client
         .emit("server:join_office", json!(agent_join_req))
@@ -279,6 +281,7 @@ async fn test_get_config_computer_not_found() {
         office_id: "office1".to_string(),
         role: Role::Agent,
         name: "agent1".to_string(),
+        computer_id: None,
     };
     agent_client
         .emit("server:join_office", json!(agent_join_req))

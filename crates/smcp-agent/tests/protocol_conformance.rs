@@ -83,6 +83,7 @@ async fn test_notification_message_json_format() {
                 office_id: "office-001".to_string(),
                 computer: Some("computer-001".to_string()),
                 agent: Some("agent-001".to_string()),
+                computer_id: None,
             }),
             "EnterOffice notification",
         ),
@@ -91,6 +92,7 @@ async fn test_notification_message_json_format() {
                 office_id: "office-001".to_string(),
                 computer: Some("computer-001".to_string()),
                 agent: Some("agent-001".to_string()),
+                computer_id: None,
             }),
             "LeaveOffice notification",
         ),
@@ -251,6 +253,7 @@ async fn test_protocol_field_names() {
         office_id: "office1".to_string(),
         computer: Some("comp1".to_string()),
         agent: Some("agent1".to_string()),
+        computer_id: None,
     };
 
     let json = serde_json::to_string(&enter_office).unwrap();
@@ -315,12 +318,14 @@ async fn test_python_compatibility_checklist() {
         office_id: "test".to_string(),
         computer: None,
         agent: None,
+        computer_id: None,
     };
 
     let _ = LeaveOfficeNotification {
         office_id: "test".to_string(),
         computer: None,
         agent: None,
+        computer_id: None,
     };
 
     let _ = UpdateMCPConfigNotification {

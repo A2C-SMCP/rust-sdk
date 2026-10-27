@@ -659,7 +659,13 @@ async fn transport_reconnect_replays_join_and_restores_membership() {
         .join_office("agent-rejoin")
         .await
         .expect("initial join");
-    assert_eq!(server.next_join().await["office_id"], "office-rejoin");
+    let initial = server.next_join().await;
+    assert_eq!(initial["office_id"], "office-rejoin");
+    // protocol#64：Agent 入房 MUST NOT 携带 computer_id 键——断言真实生产载荷，而非结构体形状。
+    assert!(
+        initial.get("computer_id").is_none(),
+        "Agent 显式 join 的 server:join_office 载荷 MUST NOT 含 computer_id，实际: {initial}"
+    );
     assert_eq!(agent.office_membership(), joined("office-rejoin"));
     assert_eq!(
         agent.confirmed_office_id().as_deref(),
@@ -674,6 +680,11 @@ async fn transport_reconnect_replays_join_and_restores_membership() {
     assert_eq!(replay["office_id"], "office-rejoin");
     assert_eq!(replay["name"], "agent-rejoin");
     assert_eq!(replay["role"], "agent");
+    // 重放走的是另一处生产构造（`replay_join`），同样不得携带该键。
+    assert!(
+        replay.get("computer_id").is_none(),
+        "Agent 自动回房重放的 server:join_office 载荷 MUST NOT 含 computer_id，实际: {replay}"
+    );
     wait_until(
         || agent.office_membership() == joined("office-rejoin"),
         "office membership restored after reconnect",

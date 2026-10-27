@@ -576,6 +576,7 @@ impl AsyncSmcpAgent {
             role: Role::Agent,
             name: agent_name.to_string(),
             office_id,
+            computer_id: None,
         };
         self.call_room_event(SERVER_JOIN_OFFICE, &req, self.config.default_timeout)
             .await?;
@@ -942,6 +943,7 @@ impl AsyncSmcpAgent {
             role: Role::Agent,
             name: intent.agent_name.clone(),
             office_id: intent.office_id.clone(),
+            computer_id: None,
         };
         Self::call_room_event_on(
             transport,

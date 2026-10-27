@@ -343,6 +343,7 @@ async fn test_get_config_event_forwarded() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
+        computer_id: None,
     };
 
     computer_client
@@ -367,6 +368,7 @@ async fn test_get_config_event_forwarded() {
         office_id: "office1".to_string(),
         role: Role::Agent,
         name: "agent1".to_string(),
+        computer_id: None,
     };
 
     agent_client
@@ -426,6 +428,7 @@ async fn test_get_config_computer_not_found_integration() {
         office_id: "office1".to_string(),
         role: Role::Agent,
         name: "agent1".to_string(),
+        computer_id: None,
     };
 
     agent_client
@@ -482,6 +485,7 @@ async fn test_get_config_unauthorized_role_integration() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
+        computer_id: None,
     };
 
     computer_client

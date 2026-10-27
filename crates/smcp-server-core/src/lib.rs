@@ -46,6 +46,7 @@ mod tests {
             office_id: "office1".to_string(),
             computer: Some("c1".to_string()),
             agent: None,
+            computer_id: None,
         });
         let json = serde_json::to_string(&n).unwrap();
         let de: smcp::Notification = serde_json::from_str(&json).unwrap();

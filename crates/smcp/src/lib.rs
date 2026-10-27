@@ -997,6 +997,23 @@ pub struct EnterOfficeReq {
     pub role: Role,
     pub name: String,
     pub office_id: String,
+    /// Computer 稳定身份（v0.5.0 起，protocol#64）：`role="computer"` 时 MUST 携带，
+    /// `role="agent"` 时 MUST NOT 出现该键（包含 `null`）。Agent 侧生产构造恒为 `None`，
+    /// 序列化即省略键；服务端强制校验由后续 PR 引入。
+    ///
+    /// **实现约束（Server 侧）**：`Option<String>` 反序列化会把「键缺失」与「键存在且为
+    /// `null`」都塌缩成 `None`，本字段无法区分两者。对 `role="agent"` 携带该键（含 `null`）
+    /// 回 `400` 的校验必须在原始 `Value` 上判 `contains_key`，不能依赖 `is_some()`。
+    ///
+    /// Stable Computer identity (v0.5.0, protocol#64): MUST be carried when `role="computer"`;
+    /// MUST NOT appear for `role="agent"` (including `null`). Agent producers always set `None`,
+    /// which omits the key. Server-side enforcement lands in a later PR.
+    ///
+    /// Implementation constraint: `Option<String>` collapses key-absent and key-present-null into
+    /// `None`. The agent-side `400` check MUST test key presence on the raw `Value`
+    /// (`contains_key`), not `is_some()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
 }
 
 /// 离开办公室请求
@@ -1158,6 +1175,19 @@ pub struct SessionInfo {
     /// serialization when absent (legacy connections that did not negotiate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2c_version: Option<String>,
+    /// Computer 稳定身份（v0.5.0 起，protocol#64）：`role="computer"` 时由 Server 保证存在，
+    /// `role="agent"` 时省略该键。与展示名 `name` 解耦。
+    ///
+    /// 分阶段落地：Rust Server 在 PR1 阶段对所有会话恒填 `None`（缺键）；自 PR3 起才按会话
+    /// 记录填充。在此之前下游不应把缺键解读为服务端违约。
+    ///
+    /// Stable Computer identity (v0.5.0, protocol#64): guaranteed present for `role="computer"`,
+    /// omitted for `role="agent"`. Decoupled from the display name `name`.
+    ///
+    /// Staged rollout: the in-repo Server emits `None` (key absent) for every session during PR1;
+    /// it starts filling the field from the session record in PR3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
 }
 
 /// 列出房间返回
@@ -1173,6 +1203,10 @@ pub struct EnterOfficeNotification {
     pub office_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub computer: Option<String>,
+    /// 加入的 Computer 稳定身份（仅成员为 Computer 时出现，v0.5.0 起）/ stable identity of the
+    /// joining Computer (present only when the member is a Computer, since v0.5.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }
@@ -1183,6 +1217,10 @@ pub struct LeaveOfficeNotification {
     pub office_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub computer: Option<String>,
+    /// 离开的 Computer 稳定身份（仅成员为 Computer 时出现，v0.5.0 起）/ stable identity of the
+    /// leaving Computer (present only when the member is a Computer, since v0.5.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }
@@ -1618,6 +1656,7 @@ mod tests {
             role: Role::Agent,
             office_id: "office-1".to_string(),
             a2c_version: Some("0.2.0".to_string()),
+            computer_id: None,
         };
         let json = serde_json::to_value(&with_ver).unwrap();
         assert_eq!(json["a2c_version"], "0.2.0");
@@ -1629,6 +1668,7 @@ mod tests {
             role: Role::Computer,
             office_id: "office-1".to_string(),
             a2c_version: None,
+            computer_id: None,
         };
         let json_none = serde_json::to_value(&without_ver).unwrap();
         assert!(
@@ -1652,6 +1692,7 @@ mod tests {
             office_id: "office1".to_string(),
             computer: Some("c1".to_string()),
             agent: None,
+            computer_id: None,
         });
 
         let json = serde_json::to_string(&n).unwrap();
