@@ -217,6 +217,7 @@ mod tests {
                     office_id: "test_office".to_string(),
                     computer: Some("test_computer".to_string()),
                     agent: None,
+                    computer_id: None,
                 },
                 &smcp_agent::AsyncSmcpAgent::new(
                     smcp_agent::DefaultAuthProvider::new("agent".to_string(), "office".to_string()),

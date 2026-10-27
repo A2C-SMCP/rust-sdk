@@ -462,6 +462,7 @@ mod tests {
                 role,
                 office_id: "office-a".to_string(),
                 a2c_version: None,
+                computer_id: None,
             }
         }
 
