@@ -63,7 +63,7 @@ pub const LOCAL_SETTINGS_FILENAME: &str = "settings.local.json";
 pub const USER_SETTINGS_FILENAME: &str = "settings.json";
 
 /// user config dir 的 a2c 子目录名（`$XDG_CONFIG_HOME/a2c` 或 `~/.config/a2c`）/ a2c subdir。
-const A2C_CONFIG_SUBDIR: &str = "a2c";
+pub(crate) const A2C_CONFIG_SUBDIR: &str = "a2c";
 
 /// 环境映射（注入式，便于确定性测试）/ Injectable env mapping for deterministic tests。
 pub type EnvMap = std::collections::HashMap<String, String>;

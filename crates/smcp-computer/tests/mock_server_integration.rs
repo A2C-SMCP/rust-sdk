@@ -1,4 +1,4 @@
-/**
+/*!
 * 文件名: mock_server_integration
 * 作者: Claude Code
 * 创建日期: 2026-03-03
@@ -7,6 +7,30 @@
 * 覆盖 happy path: connect → initialize → list_tools → call_tool → disconnect
 * 无需 feature gate 或 #[ignore]，随 `cargo test` 正常运行。
 */
+
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// PR3 统一抽共享 helper；此前 `#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::Write;
@@ -39,6 +63,7 @@ use smcp_computer::oauth::{
     OAuthCancellationReason, OAuthCredentialKey, OAuthCredentialRecordKind, OAuthCredentialStore,
     OAuthCredentialStoreError, OAuthError, OAuthFlowOutcome, OAuthProtocolError, OAuthStatus,
 };
+
 use smcp_computer::ComputerEvent;
 use tempfile::TempDir;
 
@@ -2118,7 +2143,8 @@ async fn configure_authorization_code_computer(
     .with_confirm_callback(|_, _, _, _| true)
     .with_skill_home(temp_dir.path().join("skills"))
     .with_blob_cache_root(temp_dir.path().join("blob"))
-    .with_config_dir(temp_dir.path().join("config"));
+    .with_config_dir(temp_dir.path().join("config"))
+    .with_config_env(isolated_config_env(temp_dir.path()));
     computer.boot_up().await.unwrap();
     for bundle_id in bundle_ids {
         match computer.start_mcp_client(bundle_id).await {

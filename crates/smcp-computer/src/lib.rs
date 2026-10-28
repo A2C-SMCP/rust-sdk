@@ -14,6 +14,7 @@ pub mod desktop;
 pub mod diagnostics;
 pub mod errors;
 pub mod governance;
+pub mod identity;
 pub mod inputs;
 pub mod inventory;
 pub mod mcp_clients;

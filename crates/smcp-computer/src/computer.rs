@@ -1107,6 +1107,9 @@ impl<S: Session> Computer<S> {
     ///
     /// #113 S6：`add_or_update_server` / `remove_server` 落盘经此目录的 project/local scope（#98 project 锚点）。
     /// 测试/部署据此定向落盘目录，避免污染真实进程 cwd。**只碰 project 含 local、不碰 home**。
+    ///
+    /// **不隔离 `computer_id`**：user-scope（含 `a2c/computer-id`）只由 [`Self::with_config_env`]
+    /// 或进程环境决定；仅设置本方法不会改变身份落盘位置。
     #[must_use]
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config_dir = Some(dir.into());
@@ -1119,6 +1122,17 @@ impl<S: Session> Computer<S> {
     /// `add_or_update_server` / `remove_server` 的来源解析与写目标、`list_mcp_servers_with_metadata` 的归属门控、
     /// 以及 boot 的 `reconcile_governance` 恢复，全部锚定**本实例** User config，**不**回退宿主进程 `$HOME`/`$XDG`。
     /// 缺省（未注入）→ `None` → 走进程环境（CLI / ambient，行为与今日一致，守 #121 DoD「未注入保持 ambient」）。
+    ///
+    /// **protocol#64**：该 env 同时决定持久化 `computer_id` 的位置（`<config>/a2c/computer-id`）。若宿主
+    /// 为每次会话注入不同的临时 env，每次启动都会得到**新身份**，基于 `computer://<computer_id>/…` 的
+    /// 持久引用会静默失效——需要稳定身份时请对同一宿主复用同一 env。
+    ///
+    /// 注入映射必须包含**绝对** `HOME` 或**绝对** `XDG_CONFIG_HOME`：否则 `connect_socketio` 以
+    /// [`ComputerError::IdentityStore`] 拒绝（绝不回退宿主进程 `$HOME`）。
+    /// The injected map MUST contain an absolute `HOME` or `XDG_CONFIG_HOME`; otherwise
+    /// `connect_socketio` fails with `IdentityStore` instead of falling back to the host `$HOME`.
+    /// This env also anchors the persisted `computer_id`; per-session env maps silently change the
+    /// identity every start. Reuse one env per host when identity stability matters.
     #[must_use]
     pub fn with_config_env(mut self, env: impl Into<EnvMap>) -> Self {
         self.config_env = Some(env.into());
@@ -4557,7 +4571,11 @@ impl<S: Session> Computer<S> {
 
     /// 设置Socket.IO客户端 / Set Socket.IO client
     /// 此方法会替换现有的 client（如果有）并保持强引用
-    /// This method replaces existing client (if any) and keeps strong reference
+    ///
+    /// **protocol#64**：本方法不校验、也不注入 `computer_id`——传入的 client 若未携带身份，
+    /// 入房载荷会省略该键（Server 自 PR3 起对 Computer 入房强制校验，届时会以 `400` 拒绝）。
+    /// 正常路径请用 [`Self::connect_socketio`]，由它物化并注入稳定身份；本入口的收口留待 PR3。
+    /// This setter neither validates nor injects `computer_id`; use `connect_socketio` instead.
     pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) -> ComputerResult<()> {
         let gate = Arc::clone(&self.socketio_lifecycle_gate);
         let socketio_client = Arc::clone(&self.socketio_client);
@@ -4660,10 +4678,31 @@ impl<S: Session> Computer<S> {
     /// 建立 Socket.IO 连接 / Establish the Socket.IO connection.
     ///
     /// #86：连接面鉴权唯一走 `options.auth_payload`（Socket.IO auth dict）；`options.headers` 仅路由。
+    ///
+    /// **protocol#64 副作用与错误**：首次连接会物化 / 复用持久化身份 `computer_id`
+    /// （写 `$XDG_CONFIG_HOME/a2c/computer-id`，回退 `~/.config/a2c/computer-id`；见
+    /// [`crate::identity`]），并在每次 `server:join_office` 原样携带。身份文件损坏 / 不可读 /
+    /// 无法创建时返回 [`ComputerError::IdentityStore`]——这是**本地**错误（不上 wire），且重试
+    /// 不会自愈；嵌入式宿主应将其视为启动致命错误，而非可重试的传输层瞬态错误。
+    /// Protocol #64 side effect and error: the first connect materializes/reuses the persisted
+    /// `computer_id` and every join carries it. A corrupt/unreadable identity yields a local
+    /// [`ComputerError::IdentityStore`] — treat it as fatal, not as a retryable transport error.
     pub async fn connect_socketio(&self, url: &str, options: ConnectOptions) -> ComputerResult<()>
     where
         S: Clone + 'static,
     {
+        // protocol#64（v0.5.0）：首次连接物化 / 复用稳定身份 `computer_id`。
+        // 持久化不可读 / 损坏 / 无法创建 ⇒ fail-fast（`IdentityStore`），**不**回落临时值——
+        // CLI 据此以非零退出码终止启动。
+        //
+        // 必须先于 manager 前置检查：`boot_up` 失败时 manager 可能仍为 None，若先检查 manager
+        // 就会以 `InvalidState` 掩盖身份存储的启动致命错误。
+        let computer_id = crate::identity::load_or_create_computer_id(self.config_env()).await?;
+        info!(
+            identity_path = %crate::identity::computer_id_path(self.config_env()).display(),
+            "Using persisted Computer identity"
+        );
+
         // 确保管理器已初始化 / Ensure manager is initialized
         let _manager_check = {
             let manager_guard = self.current_manager().await;
@@ -4703,7 +4742,8 @@ impl<S: Session> Computer<S> {
         .namespace(options.namespace)
         .namespace_connect_timeout(options.namespace_connect_timeout)
         .office_rejoin_budget(office_rejoin_budget)
-        .computer_ops(ops);
+        .computer_ops(ops)
+        .computer_id(computer_id);
         // #201：动态 Provider 优先；未配置时保留 #86 静态 auth dict 行为。
         if let Some(provider) = options.auth_provider {
             builder = builder.auth_provider(provider);

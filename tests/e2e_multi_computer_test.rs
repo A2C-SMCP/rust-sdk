@@ -2,6 +2,29 @@
 //
 // Tests scenarios with multiple computers in the same office
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// PR3 统一抽共享 helper；此前 `#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 mod e2e;
 
 use e2e::*;
@@ -53,7 +76,10 @@ async fn test_second_computer_rejected_then_rebind_succeeds() {
 
     // Create and connect computer 1
     let session1 = SilentSession::new("session1");
-    let computer1 = Computer::new(computer1_name.clone(), session1, None, None, true, true);
+    let computer1 = Computer::new(computer1_name.clone(), session1, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
 
     computer1.boot_up().await.expect("Failed to boot computer1");
 
@@ -78,7 +104,10 @@ async fn test_second_computer_rejected_then_rebind_succeeds() {
 
     // Create and connect computer 2 — its join to the same office MUST be rejected.
     let session2 = SilentSession::new("session2");
-    let computer2 = Computer::new(computer2_name.clone(), session2, None, None, true, true);
+    let computer2 = Computer::new(computer2_name.clone(), session2, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
 
     computer2.boot_up().await.expect("Failed to boot computer2");
 
@@ -164,7 +193,10 @@ async fn test_computer_leave_notification() {
     let office_id = generate_office_id();
 
     let session = SilentSession::new("test_session");
-    let computer = Computer::new(computer_name.clone(), session, None, None, true, true);
+    let computer = Computer::new(computer_name.clone(), session, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
 
     computer.boot_up().await.expect("Failed to boot");
 
@@ -239,7 +271,10 @@ async fn test_list_room_sessions() {
     let office_id = generate_office_id();
 
     let session = SilentSession::new("test_session");
-    let computer = Computer::new("test_computer".to_string(), session, None, None, true, true);
+    let computer = Computer::new("test_computer".to_string(), session, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
 
     computer.boot_up().await.expect("Failed to boot");
 

@@ -7,6 +7,29 @@
 //! suite verifies delivery and the tool-call/cancel causal boundary rather than
 //! imposing a cross-event completion order.
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// PR3 统一抽共享 helper；此前 `#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -25,6 +48,7 @@ use smcp_computer::mcp_clients::model::{
     CancellableCallOutcome, ClientState, Content, MCPClientError, MCPClientProtocol,
     MCPServerConfig, StdioServerConfig, StdioServerParameters,
 };
+
 use socketioxide::extract::{AckSender, Data, SocketRef};
 use socketioxide::SocketIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -514,7 +538,8 @@ async fn make_computer(
     .with_client_factory(factory)
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
 
     computer.boot_up().await.expect("boot");
     computer

@@ -173,6 +173,25 @@ pub enum ComputerError {
     /// 值**（落盘的是原始 `${input:*}` 引用，D1/§4.6.6）。runtime mutate（add_or_update/remove_server）经此报错。
     /// Config-layer persistence failure surfaced from `update_config`; carries no secret values。
     ConfigPersist(String),
+
+    /// protocol#64：Computer 稳定身份持久化失败（不可读 / 损坏 / 空 / 无法创建）。
+    ///
+    /// **本地**错误（`error_code` 500），不上 wire：身份文件损坏时必须 fail-fast，不得静默重生成
+    /// 或覆写（重置身份是显式入口）。`reason` 只含路径与原因，不含任何 secret。
+    /// Local-only identity-store failure (HTTP-500 analogue); never sent on the wire. Corrupt or
+    /// unreadable identity MUST fail fast — never silently regenerate or overwrite.
+    ///
+    /// 处置指引由**具体原因**决定（写在 `reason` 里）：只有「文件内容无效」才提示删除文件重建；
+    /// 非绝对路径 / 权限 / 路径是目录等重试或删文件都无效，不能给同一句 hint（否则用户会照抄
+    /// 未展开的哨兵路径去删真实身份文件）。
+    /// Remediation belongs to the specific `reason`, not to every identity-store error.
+    #[error("Computer identity store error at {path}: {reason}")]
+    IdentityStore {
+        /// 身份文件路径 / identity file path.
+        path: String,
+        /// 失败原因 / failure reason.
+        reason: String,
+    },
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {
@@ -261,6 +280,9 @@ impl ComputerError {
 
             // #113 S6：config 落盘错误（只读 origin / synthesized / I/O）/ config persistence errors
             ComputerError::ConfigPersist(_) => 400, // BAD_REQUEST（写目标不可写 / 非法实体）
+
+            // protocol#64：本地身份存储错误（不上 wire）/ local identity-store error (never on the wire)
+            ComputerError::IdentityStore { .. } => 500, // INTERNAL_ERROR
         }
     }
 }

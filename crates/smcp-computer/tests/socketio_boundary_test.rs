@@ -13,6 +13,29 @@
 //! Problem 2 需 Node.js（`tests/echo-mcp-server`），故 `#[ignore]`：
 //!   cargo test --package smcp-computer --test socketio_boundary_test -- --ignored --nocapture
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// PR3 统一抽共享 helper；此前 `#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +57,7 @@ use smcp_computer::mcp_clients::bundle_id::resolve_bundle_id;
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, StdioServerConfig, StdioServerParameters,
 };
+
 use smcp_computer::mcp_clients::{HttpServerConfig, HttpServerParameters};
 use smcp_computer::LifecycleState;
 
@@ -298,7 +322,11 @@ async fn disconnect_socketio_closes_transport_relay_observes() {
 
     let td = TempDir::new().unwrap();
     let computer = isolate(
-        Computer::new("c1", SilentSession::new("s"), None, None, false, false),
+        Computer::new("c1", SilentSession::new("s"), None, None, false, false).with_config_env(
+            isolated_config_env(
+                std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+            ),
+        ),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -361,7 +389,11 @@ async fn shutdown_closes_transport_relay_observes() {
 
     let td = TempDir::new().unwrap();
     let computer = isolate(
-        Computer::new("c2", SilentSession::new("s"), None, None, false, false),
+        Computer::new("c2", SilentSession::new("s"), None, None, false, false).with_config_env(
+            isolated_config_env(
+                std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+            ),
+        ),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -423,7 +455,10 @@ async fn start_stop_mcp_syncs_tool_list_when_joined() {
             Some(servers),
             false,
             false,
-        ),
+        )
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        )),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -481,7 +516,10 @@ async fn start_stop_mcp_no_sync_when_not_joined() {
             Some(servers),
             false,
             false,
-        ),
+        )
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        )),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -564,7 +602,10 @@ async fn setup_pending_computer() -> (
             Some(servers),
             false,
             false,
-        ),
+        )
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        )),
         &td,
     );
     computer.boot_up().await.expect("boot");
