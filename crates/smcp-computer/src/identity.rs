@@ -45,20 +45,24 @@ pub fn computer_id_path(env: Option<&EnvMap>) -> PathBuf {
 
 /// 解析身份所在 user-config 目录（`<base>/a2c`）。
 ///
-/// - **注入 `env`**：必须自带 `HOME` 或绝对 `XDG_CONFIG_HOME`；否则返回相对路径哨兵，由
-///   [`require_absolute`] 转成明确错误——**绝不**静默回退宿主进程 `$HOME`（否则嵌入式实例会把
-///   身份写进真实用户目录，违背 `with_config_env` 的隔离承诺）。
+/// - **注入 `env`**：必须自带**绝对** `HOME` 或**绝对** `XDG_CONFIG_HOME`；否则返回相对路径哨兵，
+///   由 [`require_absolute`] 转成明确错误——**绝不**静默回退宿主进程 `$HOME`。仅检查键存在是不够的：
+///   `HOME="~"` / `"~/x"` 会经 `expanduser` 用**宿主进程** HOME 展开，仍会把身份写进真实用户目录。
 /// - **ambient（`env = None`）**：无 `HOME` 时（Windows 原生 / systemd 守护进程）底层解析会给出
 ///   字面 `~` 相对路径，这里改用 `dirs::home_dir()`（USERPROFILE / getpwuid）兜底。
 fn resolve_identity_config_dir(env: Option<&EnvMap>) -> PathBuf {
     if let Some(map) = env {
-        // 环境变量名与 settings 模块保持一致（`HOME` / `XDG_CONFIG_HOME`）。
-        let has_home = map.contains_key("HOME");
+        // 环境变量名与 settings 模块保持一致（`HOME` / `XDG_CONFIG_HOME`）。两者都必须是绝对路径：
+        // `~` 前缀由 `expanduser` 展开，而它读的是**进程**环境，不是注入映射。
+        let has_absolute_home = map
+            .get("HOME")
+            .map(|value| Path::new(value).is_absolute())
+            .unwrap_or(false);
         let has_absolute_xdg = map
             .get(crate::settings::XDG_CONFIG_HOME_ENV)
             .map(|value| Path::new(value).is_absolute())
             .unwrap_or(false);
-        if !has_home && !has_absolute_xdg {
+        if !has_absolute_home && !has_absolute_xdg {
             return PathBuf::from("~").join(".config").join(A2C_CONFIG_SUBDIR);
         }
         return resolve_user_config_dir(Some(map));
@@ -77,14 +81,15 @@ fn resolve_identity_config_dir(env: Option<&EnvMap>) -> PathBuf {
 /// 错误一律为 [`ComputerError::IdentityStore`]，且**不修改**既有文件（损坏值原样保留）。
 /// 文件 I/O（含 fsync）在阻塞线程池执行，不占用 Tokio worker。
 pub async fn load_or_create_computer_id(env: Option<&EnvMap>) -> ComputerResult<String> {
+    let path = computer_id_path(env);
     let env = env.cloned();
+    // 阻塞池 join 失败（任务 panic / 运行时关闭）同样是**身份不可用**：统一映射为
+    // `IdentityStore`，让 CLI 的启动致命分类与 `error_code() == 500` 口径保持一致。
     tokio::task::spawn_blocking(move || {
         load_or_create_computer_id_blocking(env.as_ref(), READ_RETRY_WINDOW)
     })
     .await
-    .map_err(|error| {
-        ComputerError::RuntimeError(format!("computer identity task failed: {error}"))
-    })?
+    .map_err(|error| identity_error(&path, format!("identity task failed: {error}")))?
 }
 
 /// 可注入重试窗口的同步实现（单元测试用毫秒级窗口，避免每条损坏向量都白等满生产窗口）。
@@ -178,7 +183,9 @@ fn is_canonical_lowercase_uuid(value: &str) -> bool {
 ///
 /// 写/同步失败时**清理自己刚创建的文件**并上抛：该文件由本进程以 `O_EXCL` 新建，绝不可能
 /// 属于既有持久值，删掉是安全的；若留着会让后续每次启动都读到半写内容而报 IdentityStore。
-/// 崩溃窗口里目录项可能尚未落盘，因此成功后对父目录 fsync（best-effort）。
+/// 崩溃窗口里目录项可能尚未落盘，因此成功后必须对父目录 fsync；该步失败同样上抛（协议要求
+/// 持久化失败必须终止启动），但**不删除**已写入的文件——文件内容有效，下次启动会复用它，
+/// 删除反而会造成静默换身份。
 fn create_computer_id(path: &Path) -> std::io::Result<String> {
     let computer_id = uuid::Uuid::new_v4().to_string();
     if let Some(dir) = path.parent() {
@@ -191,7 +198,7 @@ fn create_computer_id(path: &Path) -> std::io::Result<String> {
         let _ = std::fs::remove_file(path);
         return Err(error);
     }
-    sync_parent_dir(path);
+    sync_parent_dir(path)?;
     Ok(computer_id)
 }
 
@@ -203,15 +210,15 @@ fn write_identity(file: &mut std::fs::File, computer_id: &str) -> std::io::Resul
 }
 
 /// 首次创建后同步父目录，保证目录项在崩溃后仍可见（POSIX：文件 fsync 不保证目录项持久）。
-fn sync_parent_dir(path: &Path) {
+/// 失败向上传播——静默吞掉会让「身份已持久化」成为未兑现的承诺。
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
-        if let Ok(handle) = std::fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
+        std::fs::File::open(dir)?.sync_all()?;
     }
     #[cfg(not(unix))]
     let _ = path;
+    Ok(())
 }
 
 fn open_private_new_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -335,22 +342,36 @@ mod tests {
         }
     }
 
-    /// 注入 env 缺 HOME / 绝对 XDG ⇒ 拒绝（绝不静默回退进程 HOME，把身份写进真实用户目录）。
+    /// 注入 env 缺 HOME / 绝对 XDG，或 HOME 非绝对（`~` / `~/x` / 相对路径）⇒ 拒绝。
+    ///
+    /// 关键：`HOME="~"` 键**存在**但非绝对——旧实现只看键存在性，会经 `expanduser` 用宿主
+    /// **进程** HOME 展开，把身份写进真实 `~/.config/a2c`。本用例锁定该回归。
     #[test]
-    fn test_injected_env_without_home_or_xdg_is_rejected() {
-        let env = HashMap::new();
-        let path = computer_id_path(Some(&env));
-        assert!(
-            require_absolute(&path).is_err(),
-            "注入 env 缺 HOME/XDG 时必须拒绝，实得 {}",
-            path.display()
-        );
-        if let Ok(process_home) = std::env::var("HOME") {
+    fn test_injected_env_without_absolute_home_or_xdg_is_rejected() {
+        for home in [
+            None,
+            Some(""),
+            Some("~"),
+            Some("~/x"),
+            Some("relative/home"),
+        ] {
+            let mut env = HashMap::new();
+            if let Some(home) = home {
+                env.insert("HOME".to_string(), home.to_string());
+            }
+            let path = computer_id_path(Some(&env));
             assert!(
-                !path.starts_with(&process_home),
-                "注入 env 不得回退进程 HOME：{}",
+                require_absolute(&path).is_err(),
+                "HOME={home:?} 必须拒绝（不得回退进程 HOME），实得 {}",
                 path.display()
             );
+            if let Ok(process_home) = std::env::var("HOME") {
+                assert!(
+                    !path.starts_with(&process_home),
+                    "HOME={home:?} 不得解析到进程 HOME：{}",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -363,7 +384,11 @@ mod tests {
             }
             other => panic!("相对路径必须 fail-fast，实得 {other:?}"),
         }
-        assert!(require_absolute(Path::new("/tmp/abs/computer-id")).is_ok());
+        // 平台无关的绝对路径（Windows 上 `/tmp/...` 非绝对）。
+        let absolute = std::env::temp_dir()
+            .join("smcp-abs-check")
+            .join("computer-id");
+        assert!(require_absolute(&absolute).is_ok());
     }
 
     /// 确定性读错误（身份路径是目录）不得白等重试窗口。

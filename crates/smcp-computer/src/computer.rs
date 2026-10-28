@@ -1107,6 +1107,9 @@ impl<S: Session> Computer<S> {
     ///
     /// #113 S6：`add_or_update_server` / `remove_server` 落盘经此目录的 project/local scope（#98 project 锚点）。
     /// 测试/部署据此定向落盘目录，避免污染真实进程 cwd。**只碰 project 含 local、不碰 home**。
+    ///
+    /// **不隔离 `computer_id`**：user-scope（含 `a2c/computer-id`）只由 [`Self::with_config_env`]
+    /// 或进程环境决定；仅设置本方法不会改变身份落盘位置。
     #[must_use]
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config_dir = Some(dir.into());
@@ -1123,6 +1126,11 @@ impl<S: Session> Computer<S> {
     /// **protocol#64**：该 env 同时决定持久化 `computer_id` 的位置（`<config>/a2c/computer-id`）。若宿主
     /// 为每次会话注入不同的临时 env，每次启动都会得到**新身份**，基于 `computer://<computer_id>/…` 的
     /// 持久引用会静默失效——需要稳定身份时请对同一宿主复用同一 env。
+    ///
+    /// 注入映射必须包含**绝对** `HOME` 或**绝对** `XDG_CONFIG_HOME`：否则 `connect_socketio` 以
+    /// [`ComputerError::IdentityStore`] 拒绝（绝不回退宿主进程 `$HOME`）。
+    /// The injected map MUST contain an absolute `HOME` or `XDG_CONFIG_HOME`; otherwise
+    /// `connect_socketio` fails with `IdentityStore` instead of falling back to the host `$HOME`.
     /// This env also anchors the persisted `computer_id`; per-session env maps silently change the
     /// identity every start. Reuse one env per host when identity stability matters.
     #[must_use]
@@ -4563,7 +4571,11 @@ impl<S: Session> Computer<S> {
 
     /// 设置Socket.IO客户端 / Set Socket.IO client
     /// 此方法会替换现有的 client（如果有）并保持强引用
-    /// This method replaces existing client (if any) and keeps strong reference
+    ///
+    /// **protocol#64**：本方法不校验、也不注入 `computer_id`——传入的 client 若未携带身份，
+    /// 入房载荷会省略该键（Server 自 PR3 起对 Computer 入房强制校验，届时会以 `400` 拒绝）。
+    /// 正常路径请用 [`Self::connect_socketio`]，由它物化并注入稳定身份；本入口的收口留待 PR3。
+    /// This setter neither validates nor injects `computer_id`; use `connect_socketio` instead.
     pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) -> ComputerResult<()> {
         let gate = Arc::clone(&self.socketio_lifecycle_gate);
         let socketio_client = Arc::clone(&self.socketio_client);

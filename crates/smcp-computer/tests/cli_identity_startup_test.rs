@@ -12,10 +12,13 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
-fn run_with_corrupt_identity(home: &Path) -> std::process::Output {
+/// 预置身份文件内容（`None` = 不预置，由 CLI 首建），跑一次 `smcp-computer run`。
+fn run_cli(home: &Path, identity: Option<&str>) -> std::process::Output {
     let config_dir = home.join("config").join("a2c");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(config_dir.join("computer-id"), "not-a-uuid\n").unwrap();
+    if let Some(identity) = identity {
+        std::fs::write(config_dir.join("computer-id"), identity).unwrap();
+    }
 
     Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
         .args(["--no-color", "--url", "http://127.0.0.1:9", "run"])
@@ -33,7 +36,7 @@ fn run_with_corrupt_identity(home: &Path) -> std::process::Output {
 #[test]
 fn run_exits_nonzero_on_corrupt_computer_identity_without_overwriting() {
     let home = TempDir::new().unwrap();
-    let output = run_with_corrupt_identity(home.path());
+    let output = run_cli(home.path(), Some("not-a-uuid\n"));
 
     assert_eq!(
         output.status.code(),
@@ -51,4 +54,25 @@ fn run_exits_nonzero_on_corrupt_computer_identity_without_overwriting() {
     // 不得静默重生成或覆写损坏值。
     let persisted = std::fs::read_to_string(home.path().join("config/a2c/computer-id")).unwrap();
     assert_eq!(persisted, "not-a-uuid\n");
+}
+
+/// 身份正常、仅连接失败 ⇒ **非致命**（既有非阻塞语义）：进 REPL 后 EOF 退出，退出码 0。
+#[test]
+fn run_with_valid_identity_and_unreachable_url_stays_nonfatal() {
+    let home = TempDir::new().unwrap();
+    let identity = "7c9e6679-7425-40de-944b-e07fc1f90ae7\n";
+    let output = run_cli(home.path(), Some(identity));
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "普通连接失败不得使启动致命，实得 status={:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // 身份文件保持不变（连接失败不得触发重新生成）。
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("config/a2c/computer-id")).unwrap(),
+        identity
+    );
 }

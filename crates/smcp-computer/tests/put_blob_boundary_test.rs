@@ -10,6 +10,8 @@
 //! {chunk_offset, landing_path, req_id, sha256, total_size, upload_id}；落盘字节 == 上传字节。
 
 /// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// PR3 统一抽共享 helper；此前 `#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
 fn isolated_config_env(
     base: impl AsRef<std::path::Path>,
 ) -> std::collections::HashMap<String, String> {
