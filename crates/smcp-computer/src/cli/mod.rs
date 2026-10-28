@@ -308,14 +308,8 @@ async fn dispatch(mut args: Args) -> i32 {
         Some(Commands::Plugin { action }) => dispatch_plugin(action, &root).await,
         Some(Commands::Settings { action }) => dispatch_settings(action, &root),
         Some(Commands::Skill { action }) => dispatch_skill(action).await,
-        Some(Commands::Run { mcp_config }) => {
-            run_repl(&args, &root, mcp_config).await;
-            0
-        }
-        None => {
-            run_repl(&args, &root, None).await;
-            0
-        }
+        Some(Commands::Run { mcp_config }) => run_repl(&args, &root, mcp_config).await,
+        None => run_repl(&args, &root, None).await,
     }
 }
 
@@ -532,7 +526,8 @@ async fn dispatch_skill(action: SkillCmd) -> i32 {
 }
 
 // ── REPL 运行模式 / REPL run mode ─────────────────────────────────────────────
-async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
+/// 返回进程退出码：身份存储等**启动致命**错误非零（protocol#64），其余保持既有非阻塞行为。
+async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) -> i32 {
     let session = SilentSession::new("cli-session");
     let mut computer = Computer::new(
         "friday_hands",
@@ -566,7 +561,13 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
     // 启动前缀（boot_up 子系统装配 → 治理重挂 → socket.io 连接）抽出为可测 helper。
     // #137：`--mcp-config` 不再走此处（旧 `--config` 的持久化加载已退役）——改为 flag 层喂启动期批准框
     // （见下方 `run_mcp_approval`），flag scope 次高、受信直挂、不落盘。
-    let handler = prepare_handler(computer, cli_config, root.flag_path.clone()).await;
+    let handler = match prepare_handler(computer, cli_config, root.flag_path.clone()).await {
+        Ok(handler) => handler,
+        Err(error) => {
+            eprintln!("启动失败 / Startup failed: {error}");
+            return commands::EXIT_USER_ERROR;
+        }
+    };
 
     // 启动 banner（版本 / 协议版本 / home）。
     let home = handler.computer.skill_home();
@@ -593,19 +594,22 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) {
     if let Err(e) = interactive::run_interactive_loop(handler, root.flag_path.clone()).await {
         eprintln!("交互模式错误: {e}");
     }
+    commands::EXIT_OK
 }
 
 /// 装配 REPL handler：加载 inputs/config → `boot_up`（SKILL/blob/watcher 子系统）→ 连接 Socket.IO。
 ///
 /// 从 [`run_repl`] 抽出的启动前缀，使「`run` 模式必须 boot SKILL/blob 子系统」可被回归测试覆盖
-/// （`run_repl` 末尾进交互循环、不可直接测）。各步失败均**非阻塞**告警，与 Python `a2c-computer run`
+/// （`run_repl` 末尾进交互循环、不可直接测）。除**启动致命**错误（protocol#64 的
+/// [`ComputerError::IdentityStore`](crate::errors::ComputerError::IdentityStore)：身份文件损坏/不可读，
+/// 重试不会自愈且不得回落临时身份）外，各步失败均**非阻塞**告警，与 Python `a2c-computer run`
 /// 的非阻塞隔离策略一致（修 #83：此前 `run` 全程不调 `boot_up`，致 `get_skills` 恒空 / `get_skill`
 /// 恒 4014 / blob mint `NotBooted`）。
 async fn prepare_handler(
     computer: Computer<SilentSession>,
     cli_config: commands::CliConfig,
     flag_path: Option<PathBuf>,
-) -> CommandHandler {
+) -> Result<CommandHandler, commands::CommandError> {
     let url = cli_config.url.clone();
     let namespace = cli_config.namespace.clone();
     let auth = cli_config.auth.clone();
@@ -628,15 +632,25 @@ async fn prepare_handler(
     commands::run_governance_remount(&handler.computer, flag_path.as_deref()).await;
 
     if let Some(url) = &url {
-        if let Err(e) = handler
+        if let Err(error) = handler
             .connect_socketio(url, &namespace, &auth, &headers)
             .await
         {
-            eprintln!("连接 SocketIO 失败: {e}");
+            // protocol#64：身份存储失败是**启动致命**错误（重试不会自愈，也不得回落临时身份），
+            // 上抛给 `run_repl` 转非零退出码；其余连接失败保持既有非阻塞告警语义。
+            if matches!(
+                &error,
+                commands::CommandError::ComputerError(
+                    crate::errors::ComputerError::IdentityStore { .. }
+                )
+            ) {
+                return Err(error);
+            }
+            eprintln!("连接 SocketIO 失败: {error}");
         }
     }
 
-    handler
+    Ok(handler)
 }
 
 #[cfg(test)]
@@ -669,10 +683,91 @@ mod tests {
             headers: None,
             office_rejoin_budget_secs: None,
         };
-        let handler = prepare_handler(computer, cli_config, None).await;
+        let handler = prepare_handler(computer, cli_config, None)
+            .await
+            .expect("prepare_handler 不应因 boot 告警失败");
 
         // 修复后：prepare_handler 内 boot_up 已发现 user 源 SKILL。
         assert_eq!(handler.computer.get_skills().await.len(), 1);
+        handler.computer.shutdown().await.unwrap();
+    }
+
+    /// protocol#64：身份文件损坏 ⇒ `prepare_handler` 上抛 `IdentityStore`（`run_repl` 据此非零退出），
+    /// 且损坏值原样保留（不静默重生成 / 不覆写）。
+    #[tokio::test]
+    async fn prepare_handler_fails_fast_on_corrupt_identity() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let identity_path = xdg.join("a2c").join(crate::identity::COMPUTER_ID_FILENAME);
+        std::fs::create_dir_all(identity_path.parent().unwrap()).unwrap();
+        std::fs::write(&identity_path, "not-a-uuid\n").unwrap();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), home.display().to_string());
+        env.insert("XDG_CONFIG_HOME".to_string(), xdg.display().to_string());
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_config_env(env);
+
+        let cli_config = commands::CliConfig {
+            // 身份校验先于网络连接：该地址不可达也不影响本用例。
+            url: Some("http://127.0.0.1:1".to_string()),
+            namespace: "/smcp".to_string(),
+            auth: None,
+            headers: None,
+            office_rejoin_budget_secs: None,
+        };
+        let error = match prepare_handler(computer, cli_config, None).await {
+            Ok(_) => panic!("损坏的身份文件必须使启动失败"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            commands::CommandError::ComputerError(
+                crate::errors::ComputerError::IdentityStore { .. }
+            )
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&identity_path).unwrap(),
+            "not-a-uuid\n",
+            "损坏值不得被覆写"
+        );
+    }
+
+    /// protocol#64：只有 `IdentityStore` 是启动致命错误——身份正常时，普通连接失败仍保持
+    /// 既有的**非阻塞**告警语义（用户仍可进 REPL 手动重连）。
+    #[tokio::test]
+    async fn prepare_handler_keeps_non_identity_connect_failures_non_fatal() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), home.display().to_string());
+        env.insert("XDG_CONFIG_HOME".to_string(), xdg.display().to_string());
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_config_env(env);
+
+        let cli_config = commands::CliConfig {
+            // 端口 1 无监听：传输层立即拒绝（身份文件此时正常）。
+            url: Some("http://127.0.0.1:1".to_string()),
+            namespace: "/smcp".to_string(),
+            auth: None,
+            headers: None,
+            office_rejoin_budget_secs: None,
+        };
+        let handler = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            prepare_handler(computer, cli_config, None),
+        )
+        .await
+        .expect("连接失败必须快速返回（非阻塞）")
+        .expect("非身份类连接失败必须非阻塞");
         handler.computer.shutdown().await.unwrap();
     }
 

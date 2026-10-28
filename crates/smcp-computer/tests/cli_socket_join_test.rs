@@ -1,6 +1,27 @@
 //! #224: real server membership and the executable REPL must agree on identity.
 #![cfg(feature = "cli")]
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use std::{process::Stdio, sync::Arc, time::Duration};
 
 use http_body_util::Full;
@@ -10,6 +31,7 @@ use smcp_computer::{
     computer::{Computer, SilentSession},
     errors::ComputerError,
 };
+
 use smcp_server_core::{SessionManager, SmcpServerBuilder};
 use smcp_server_hyper::{VersionHandshakeConfig, VersionHandshakeService};
 use tempfile::TempDir;
@@ -110,7 +132,8 @@ fn handler(name: &str, home: &TempDir) -> CommandHandler {
         )
         .with_config_dir(home.path().join(name).join("config"))
         .with_skill_home(home.path().join(name).join("skills"))
-        .with_blob_cache_root(home.path().join(name).join("blob")),
+        .with_blob_cache_root(home.path().join(name).join("blob"))
+        .with_config_env(isolated_config_env(home.path().join(name))),
         CliConfig {
             // A rename must reuse the actual interactive URL, not this startup default.
             url: Some("http://127.0.0.1:1".into()),

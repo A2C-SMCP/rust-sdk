@@ -75,6 +75,8 @@ pub use scope::{
     ResolvedSettings, WriteValue, LOCAL_SETTINGS_FILENAME, PROJECT_SETTINGS_FILENAME,
     TFROBOT_DIRNAME, USER_SETTINGS_FILENAME, XDG_CONFIG_HOME_ENV,
 };
+// protocol#64：`identity` 与 settings 共用同一 user-config 子目录常量（避免两处字面量漂移）。
+pub(crate) use scope::A2C_CONFIG_SUBDIR;
 // #142（隔离审查 🟡10）：补 `update_installed_plugins_intent` —— 它与 `update_installed_plugins` 是同族
 // **孪生**写入口，此前漏 re-export ⇒ 外部只能绕 `settings::store::` 模块路径取用，两者可见形状不一致。
 // 纯 re-export，零行为变更。

@@ -8,6 +8,27 @@
 //!
 //! 端口均取 `127.0.0.1:0` 临时口；每测试独立 server + Computer + TempDir，可并行。
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -35,6 +56,7 @@ use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, StdioServerConfig, StdioServerParameters,
 };
+
 use smcp_server_core::{DefaultAuthenticationProvider, SmcpServerBuilder};
 use smcp_server_hyper::HyperServerBuilder;
 
@@ -223,7 +245,8 @@ pub async fn spawn_computer(
         true,
     )
     .with_skill_home(td.path().join("skills"))
-    .with_blob_cache_root(td.path().join("blob"));
+    .with_blob_cache_root(td.path().join("blob"))
+    .with_config_env(isolated_config_env(td.path()));
     if let Some(t) = thresholds {
         computer = computer.with_blob_thresholds(t);
     }
@@ -293,7 +316,8 @@ pub async fn spawn_computer_with_landing(
     )
     .with_skill_home(td.path().join("skills"))
     .with_blob_cache_root(td.path().join("blob"))
-    .with_config_dir(td.path().join("config"));
+    .with_config_dir(td.path().join("config"))
+    .with_config_env(isolated_config_env(td.path()));
     if let Some(t) = thresholds {
         computer = computer.with_blob_thresholds(t);
     }

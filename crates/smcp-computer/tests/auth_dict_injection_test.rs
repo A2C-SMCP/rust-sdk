@@ -12,6 +12,27 @@
  * 真实 SMCP server 读 auth dict 的回归由 server-core / e2e 套件覆盖；此处聚焦 on-wire 负载本身。
  */
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -283,6 +304,7 @@ struct ZeroArgAck;
 impl serde::Serialize for ZeroArgAck {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
+
         serializer.serialize_tuple(0)?.end()
     }
 }
@@ -683,7 +705,8 @@ async fn dynamic_auth_provider_refreshes_each_real_network_reconnect_serially() 
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(
@@ -729,7 +752,8 @@ async fn automatic_network_reconnect_rejoins_office_and_restores_lifecycle() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(
@@ -773,6 +797,118 @@ async fn automatic_network_reconnect_rejoins_office_and_restores_lifecycle() {
     server.shutdown();
 }
 
+/// protocol#64（v0.5.0）：Computer 在首次 `connect_socketio` 物化持久化身份；显式 join 与
+/// 自动回房重放都必须携带**同一** `computer_id`（真实 socket 捕获，而非结构体形状断言）。
+#[tokio::test]
+async fn persisted_computer_id_is_carried_on_explicit_join_and_auto_rejoin() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server(None, None).await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let env = isolated_config_env(temp.path());
+    let computer = Computer::new(
+        "cid-computer",
+        SilentSession::new("cid-session"),
+        None,
+        None,
+        false,
+        false,
+    )
+    .with_skill_home(temp.path().join("skills"))
+    .with_blob_cache_root(temp.path().join("blob"))
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(env.clone());
+    computer.boot_up().await.expect("boot computer");
+    computer
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "cid-token" })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect computer");
+
+    // 连接时物化的身份必须已落盘（小写规范 UUID + 换行）。
+    let expected = smcp_computer::identity::load_or_create_computer_id(Some(&env))
+        .await
+        .expect("persisted identity");
+    let persisted =
+        std::fs::read_to_string(smcp_computer::identity::computer_id_path(Some(&env))).unwrap();
+    assert_eq!(persisted, format!("{expected}\n"));
+
+    let _ = server.next_auth().await;
+    computer
+        .join_office("office-cid", "cid-computer")
+        .await
+        .expect("join office");
+    let join = server.next_join().await;
+    assert_eq!(join["role"], "computer");
+    assert_eq!(
+        join["computer_id"],
+        expected.as_str(),
+        "显式 join 必须携带持久化身份"
+    );
+
+    server.force_network_disconnect();
+    let _ = server.next_auth().await;
+    let replay = server.next_join().await;
+    assert_eq!(
+        replay["computer_id"],
+        expected.as_str(),
+        "自动回房重放必须携带同一身份"
+    );
+
+    computer.shutdown().await.expect("shutdown first computer");
+
+    // 「重启」：新 Computer 实例 + 同一 user-config 目录 ⇒ 同一身份；connect 不得重新生成/覆写。
+    let restarted = Computer::new(
+        "cid-computer",
+        SilentSession::new("cid-session-2"),
+        None,
+        None,
+        false,
+        false,
+    )
+    .with_skill_home(temp.path().join("skills"))
+    .with_blob_cache_root(temp.path().join("blob"))
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(env.clone());
+    restarted.boot_up().await.expect("boot restarted computer");
+    restarted
+        .connect_socketio(
+            &server.url,
+            ConnectOptions {
+                auth_payload: Some(json!({ "token": "cid-token-2" })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("reconnect computer");
+    let _ = server.next_auth().await;
+    restarted
+        .join_office("office-cid-2", "cid-computer")
+        .await
+        .expect("join after restart");
+    let restarted_join = server.next_join().await;
+    assert_eq!(
+        restarted_join["computer_id"],
+        expected.as_str(),
+        "重启后必须复用同一 computer_id"
+    );
+    assert_eq!(
+        std::fs::read_to_string(smcp_computer::identity::computer_id_path(Some(&env))).unwrap(),
+        format!("{expected}\n"),
+        "connect 不得覆写身份文件"
+    );
+
+    restarted
+        .shutdown()
+        .await
+        .expect("shutdown restarted computer");
+    server.shutdown();
+}
+
 /// #234：自动回房撞瞬态 4101 时有界退避重试后恢复成员关系（镜像 python#212）。
 ///
 /// 服务端只拒绝第 2 次 join（重连回放）；第 3 次（1s 退避后的重试）接受。断言重试载荷
@@ -792,7 +928,8 @@ async fn transient_conflict_on_automatic_rejoin_is_retried_and_recovers() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(
@@ -875,7 +1012,8 @@ async fn boot_rejoin_computer(name: &str, temp: &tempfile::TempDir) -> Computer<
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
 }
@@ -1429,7 +1567,8 @@ async fn rejected_explicit_office_switch_preserves_last_confirmed_membership() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())
@@ -1477,7 +1616,8 @@ async fn consecutive_disconnects_ignore_stale_rejoin_ack() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())
@@ -1537,7 +1677,8 @@ async fn disconnect_aborts_inflight_rejoin_and_clears_retained_client_state() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())
@@ -1593,7 +1734,8 @@ async fn stale_client_disconnect_is_idempotent_and_cannot_overwrite_new_connecti
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())
@@ -1669,7 +1811,8 @@ async fn public_set_socketio_client_binds_standalone_lifecycle_and_retires_previ
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())
@@ -1752,7 +1895,8 @@ async fn cancelled_install_future_completes_owned_transaction_without_orphan_tra
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
 
     let candidate = Arc::new(
@@ -1804,7 +1948,8 @@ async fn public_set_rejects_cross_computer_client_aliasing_without_touching_owne
     )
     .with_skill_home(temp_a.path().join("skills"))
     .with_blob_cache_root(temp_a.path().join("blob"))
-    .with_config_dir(temp_a.path().join("config"));
+    .with_config_dir(temp_a.path().join("config"))
+    .with_config_env(isolated_config_env(temp_a.path()));
     let computer_b = Computer::new(
         "office-owner-b",
         SilentSession::new("office-owner-b-session"),
@@ -1815,7 +1960,8 @@ async fn public_set_rejects_cross_computer_client_aliasing_without_touching_owne
     )
     .with_skill_home(temp_b.path().join("skills"))
     .with_blob_cache_root(temp_b.path().join("blob"))
-    .with_config_dir(temp_b.path().join("config"));
+    .with_config_dir(temp_b.path().join("config"))
+    .with_config_env(isolated_config_env(temp_b.path()));
     computer_a.boot_up().await.expect("boot computer A");
     computer_b.boot_up().await.expect("boot computer B");
 
@@ -1875,7 +2021,8 @@ async fn concurrent_cross_computer_install_atomically_claims_exactly_one_owner()
     )
     .with_skill_home(temp_a.path().join("skills"))
     .with_blob_cache_root(temp_a.path().join("blob"))
-    .with_config_dir(temp_a.path().join("config"));
+    .with_config_dir(temp_a.path().join("config"))
+    .with_config_env(isolated_config_env(temp_a.path()));
     let computer_b = Computer::new(
         "office-claim-b",
         SilentSession::new("office-claim-b-session"),
@@ -1886,7 +2033,8 @@ async fn concurrent_cross_computer_install_atomically_claims_exactly_one_owner()
     )
     .with_skill_home(temp_b.path().join("skills"))
     .with_blob_cache_root(temp_b.path().join("blob"))
-    .with_config_dir(temp_b.path().join("config"));
+    .with_config_dir(temp_b.path().join("config"))
+    .with_config_env(isolated_config_env(temp_b.path()));
     computer_a.boot_up().await.expect("boot computer A");
     computer_b.boot_up().await.expect("boot computer B");
 
@@ -1962,7 +2110,8 @@ async fn replacement_closes_transport_after_server_namespace_disconnect() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())
@@ -2018,7 +2167,8 @@ async fn public_set_after_shutdown_rejects_and_retires_candidate() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
 
     let candidate = Arc::new(
@@ -2057,7 +2207,8 @@ async fn same_client_set_is_rejected_after_cancelled_shutdown_leaves_slot_popula
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())
@@ -2105,7 +2256,8 @@ async fn replacement_retires_old_client_already_inside_reconnect_backoff() {
     )
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
-    .with_config_dir(temp.path().join("config"));
+    .with_config_dir(temp.path().join("config"))
+    .with_config_env(isolated_config_env(temp.path()));
     computer.boot_up().await.expect("boot computer");
     computer
         .connect_socketio(&server.url, ConnectOptions::default())

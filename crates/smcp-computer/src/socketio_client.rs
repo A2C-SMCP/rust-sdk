@@ -378,6 +378,11 @@ pub struct SmcpComputerClientBuilder {
     /// `Option`：兼容旧入口（`SmcpComputerClient::new` / 不接 Computer 的测试）——缺省时 blob/skill/cancel
     /// handler 回 InvalidState、tool_call 回退旧 `manager.execute_tool`（无取消/铸造）。
     computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
+    /// protocol#64：Computer 稳定身份，随每次 `server:join_office` 携带；`None` 时省略该键
+    /// （仅低层 transport 测试会缺省；`Computer::connect_socketio` 恒以持久化身份注入）。
+    /// Stable Computer identity carried on every `server:join_office`; `None` omits the key
+    /// (low-level transport tests only — `Computer::connect_socketio` always injects it).
+    computer_id: Option<String>,
 }
 
 impl SmcpComputerClientBuilder {
@@ -400,7 +405,15 @@ impl SmcpComputerClientBuilder {
             office_rejoin_budget: DEFAULT_OFFICE_REJOIN_BUDGET,
             headers: None,
             computer_ops: None,
+            computer_id: None,
         }
+    }
+
+    /// protocol#64：注入 Computer 稳定身份（持久化 UUID）；每次 `server:join_office` 原样携带。
+    /// Inject the stable Computer identity; carried verbatim on every `server:join_office`.
+    pub fn computer_id(mut self, computer_id: impl Into<String>) -> Self {
+        self.computer_id = Some(computer_id.into());
+        self
     }
 
     /// 注入 Computer 操作句柄（INT-03 #72）/ inject the Computer ops handle for blob/skill/cancel handlers。
@@ -491,6 +504,7 @@ impl SmcpComputerClientBuilder {
             self.office_rejoin_budget,
             self.headers,
             self.computer_ops,
+            self.computer_id,
         )
         .await
     }
@@ -503,6 +517,8 @@ pub struct SmcpComputerClient {
     client: Client,
     /// Computer名称 / Computer name
     computer_name: String,
+    /// protocol#64：稳定身份（每次 `server:join_office` 原样携带）/ stable identity carried on every join.
+    computer_id: Option<String>,
     /// Desired and server-confirmed Office plus the current namespace connection generation.
     office_membership: Arc<StdMutex<OfficeMembership>>,
     /// Serialize explicit join/leave and automatic rejoin wire operations.
@@ -581,6 +597,14 @@ impl SmcpComputerClient {
     /// 内部委托给 [`SmcpComputerClientBuilder`]（默认 `namespace = "/smcp"`）。
     /// `auth_payload`：Socket.IO CONNECT `auth` 负载（连接面鉴权唯一信道，#86）；
     /// `headers`：路由 HTTP headers（非鉴权）。
+    ///
+    /// **低层 transport 入口，不携带 protocol#64 身份**：本构造器不读 `computer_id` 持久化存储，
+    /// 使用它建立的连接入房时不发该键（服务端 PR3 起会以 `400` 拒绝 Computer 入房）。协议正确的
+    /// 连接请走 [`crate::computer::Computer::connect_socketio`]，由它物化并注入稳定身份。
+    /// Low-level transport entrypoint: does NOT load the persisted `computer_id`, so joins omit the
+    /// key (the server will reject Computer joins once PR3 enforces it). Use
+    /// [`crate::computer::Computer::connect_socketio`] for protocol-correct connections.
+    ///
     /// Delegates to [`SmcpComputerClientBuilder`]; `auth_payload` is the Socket.IO CONNECT
     /// `auth` payload (sole connection-auth channel), `headers` are routing-only.
     pub async fn new(
@@ -619,6 +643,7 @@ impl SmcpComputerClient {
         office_rejoin_budget: Duration,
         headers: Option<HashMap<String, String>>,
         computer_ops: Option<Arc<dyn ComputerHandlerOps>>,
+        computer_id: Option<String>,
     ) -> ComputerResult<Self> {
         let office_membership = Arc::new(StdMutex::new(OfficeMembership::default()));
         let office_operation = Arc::new(Mutex::new(()));
@@ -750,6 +775,8 @@ impl SmcpComputerClient {
         let connect_membership = Arc::clone(&office_membership);
         let connect_operation = Arc::clone(&office_operation);
         let connect_name = computer_name.clone();
+        // protocol#64：自动回房任务与显式 join 共用同一稳定身份。
+        let connect_computer_id = computer_id.clone();
         let connect_status = runtime_status.clone();
         let connect_retiring = Arc::clone(&retiring);
         let connect_ready = Arc::clone(&namespace_ready);
@@ -758,6 +785,7 @@ impl SmcpComputerClient {
             let membership = Arc::clone(&connect_membership);
             let operation = Arc::clone(&connect_operation);
             let computer_name = connect_name.clone();
+            let computer_id = connect_computer_id.clone();
             let status = connect_status.clone();
             let retiring = Arc::clone(&connect_retiring);
             let ready = Arc::clone(&connect_ready);
@@ -801,6 +829,7 @@ impl SmcpComputerClient {
                 let task = tokio::spawn(Self::rejoin_office_after_reconnect(
                     client,
                     computer_name,
+                    computer_id,
                     desired.clone(),
                     Arc::clone(&membership),
                     operation,
@@ -1144,6 +1173,7 @@ impl SmcpComputerClient {
         Ok(Self {
             client,
             computer_name,
+            computer_id,
             office_membership,
             office_operation,
             inputs,
@@ -1218,8 +1248,13 @@ impl SmcpComputerClient {
             generation,
         };
         drop(sending);
-        let result =
-            Self::join_office_with_client_classified(&self.client, computer_name, office_id).await;
+        let result = Self::join_office_with_client_classified(
+            &self.client,
+            computer_name,
+            office_id,
+            self.computer_id.as_deref(),
+        )
+        .await;
         let result = {
             let mut membership = lock_office_membership(&self.office_membership);
             if !membership.is_current_transport(generation, office_id, self.client.session_epoch())
@@ -1321,6 +1356,7 @@ impl SmcpComputerClient {
     async fn rejoin_office_after_reconnect(
         client: Client,
         computer_name: String,
+        computer_id: Option<String>,
         desired: String,
         membership: Arc<StdMutex<OfficeMembership>>,
         operation: Arc<Mutex<()>>,
@@ -1365,8 +1401,13 @@ impl SmcpComputerClient {
             }
 
             attempts += 1;
-            let result =
-                Self::join_office_with_client_classified(&client, &computer_name, &desired).await;
+            let result = Self::join_office_with_client_classified(
+                &client,
+                &computer_name,
+                &desired,
+                computer_id.as_deref(),
+            )
+            .await;
 
             match result {
                 Ok(()) => {
@@ -1496,12 +1537,22 @@ impl SmcpComputerClient {
     }
 
     /// `server:join_office` 请求载荷的唯一构造点（显式 join 与自动回房重试共用）。
-    fn join_office_request(computer_name: &str, office_id: &str) -> Value {
-        serde_json::json!({
+    fn join_office_request(
+        computer_name: &str,
+        office_id: &str,
+        computer_id: Option<&str>,
+    ) -> Value {
+        let mut payload = serde_json::json!({
             "office_id": office_id,
             "role": "computer",
             "name": computer_name
-        })
+        });
+        // protocol#64：Computer 入房 MUST 携带稳定身份；低层 transport 测试客户端可缺省
+        // （服务端强制由 PR3 引入）。
+        if let Some(computer_id) = computer_id {
+            payload["computer_id"] = Value::String(computer_id.to_string());
+        }
+        payload
     }
 
     /// `server:join_office` 的分类版本（#234）：自动回房据此区分传输层中断与对端裁决。
@@ -1509,8 +1560,9 @@ impl SmcpComputerClient {
         client: &Client,
         computer_name: &str,
         office_id: &str,
+        computer_id: Option<&str>,
     ) -> Result<(), JoinOfficeFailure> {
-        let req_data = Self::join_office_request(computer_name, office_id);
+        let req_data = Self::join_office_request(computer_name, office_id, computer_id);
         let response =
             match Self::call_with_client_outcome(client, SERVER_JOIN_OFFICE, req_data, Some(10))
                 .await
@@ -3908,9 +3960,25 @@ mod tests {
             DEFAULT_OFFICE_REJOIN_BUDGET,
             None,
             None,
+            None,
         )
         .await
         .expect("connect bare client")
+    }
+
+    /// protocol#64：`join_office_request` 是唯一载荷构造点——身份缺省时**不得**出现该键
+    /// （锁住低层 transport 测试客户端的文档意图），有值时原样携带。
+    #[test]
+    fn join_office_request_carries_identity_only_when_present() {
+        let without = SmcpComputerClient::join_office_request("c", "o", None);
+        assert_eq!(without["office_id"], "o");
+        assert_eq!(without["role"], "computer");
+        assert_eq!(without["name"], "c");
+        assert!(without.get("computer_id").is_none());
+
+        let identity = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        let with = SmcpComputerClient::join_office_request("c", "o", Some(identity));
+        assert_eq!(with["computer_id"], identity);
     }
 
     /// #234（分支级）：传输已关闭时发送 join 必须判为 `Interrupted`，而不是永久拒绝。
@@ -3924,6 +3992,7 @@ mod tests {
             &client.client,
             "bare-client",
             "office-interrupted",
+            None,
         )
         .await;
         assert!(
@@ -3958,6 +4027,7 @@ mod tests {
         SmcpComputerClient::rejoin_office_after_reconnect(
             client.client.clone(),
             "bare-client".to_string(),
+            None,
             "office-interrupted".to_string(),
             Arc::clone(&membership),
             operation,
