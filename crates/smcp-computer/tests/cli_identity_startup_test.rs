@@ -50,6 +50,10 @@ fn run_exits_nonzero_on_corrupt_computer_identity_without_overwriting() {
         stderr.contains("Computer identity store error") && stderr.contains("computer-id"),
         "stderr 应明确指出身份存储错误与文件路径，实际:\n{stderr}"
     );
+    assert!(
+        stderr.contains("delete this file to regenerate the identity"),
+        "内容损坏应给出删除重建指引，实际:\n{stderr}"
+    );
 
     // 不得静默重生成或覆写损坏值。
     let persisted = std::fs::read_to_string(home.path().join("config/a2c/computer-id")).unwrap();

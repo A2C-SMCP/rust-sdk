@@ -139,7 +139,8 @@ fn require_absolute(path: &Path) -> ComputerResult<()> {
     }
     Err(identity_error(
         path,
-        "resolved identity path is not absolute (HOME/XDG_CONFIG_HOME missing or relative)",
+        "resolved identity path is not absolute — check the injected env HOME/XDG_CONFIG_HOME \
+         (both must be absolute); deleting the file will not help",
     ))
 }
 
@@ -162,7 +163,8 @@ fn parse_computer_id(content: &str) -> Option<String> {
 
 fn describe_invalid(content: &str) -> String {
     format!(
-        "invalid identity content (expected lowercase canonical UUID, non-nil/max; got {} bytes)",
+        "invalid identity content (expected lowercase canonical UUID, non-nil/max; got {} bytes) \
+         — delete this file to regenerate the identity",
         content.len()
     )
 }
@@ -332,8 +334,16 @@ mod tests {
                 continue;
             }
             match result {
-                Err(ComputerError::IdentityStore { path: reported, .. }) => {
+                Err(ComputerError::IdentityStore {
+                    path: reported,
+                    reason,
+                }) => {
                     assert_eq!(reported, path.display().to_string());
+                    // 仅「内容无效」分支给删除重建的处置指引。
+                    assert!(
+                        reason.contains("delete this file to regenerate the identity"),
+                        "{reason}"
+                    );
                 }
                 other => panic!("损坏内容 {corrupt:?} 应返回 IdentityStore，实得 {other:?}"),
             }
@@ -342,37 +352,96 @@ mod tests {
         }
     }
 
-    /// 注入 env 缺 HOME / 绝对 XDG，或 HOME 非绝对（`~` / `~/x` / 相对路径）⇒ 拒绝。
+    /// 注入 env 的 OR 语义与端到端拒绝：
     ///
-    /// 关键：`HOME="~"` 键**存在**但非绝对——旧实现只看键存在性，会经 `expanduser` 用宿主
-    /// **进程** HOME 展开，把身份写进真实 `~/.config/a2c`。本用例锁定该回归。
+    /// (a) `HOME` 缺省 + **绝对** `XDG_CONFIG_HOME` ⇒ 接受；
+    /// (b) `HOME` 缺省/相对/空 + `XDG` 缺省/相对/空 ⇒ 拒绝（绝不复用进程 HOME）；
+    /// (c) 端到端：无效 env 返回 `IdentityStore` 且**不产生任何落盘**（CWD 哨兵目录与进程
+    ///     HOME 身份文件均不变）——锁住「先 require_absolute 再碰文件系统」的顺序。
+    ///
+    /// 关键回归：`HOME="~"` 键**存在**但非绝对，旧实现只看键存在性，会经 `expanduser` 用宿主
+    /// 进程 HOME 展开，把身份写进真实 `~/.config/a2c`。
     #[test]
-    fn test_injected_env_without_absolute_home_or_xdg_is_rejected() {
-        for home in [
-            None,
-            Some(""),
-            Some("~"),
-            Some("~/x"),
-            Some("relative/home"),
+    fn test_injected_env_home_xdg_or_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs_xdg = tmp.path().join("xdg");
+
+        // (a) 绝对 XDG 单独即可（HOME 缺省）。
+        let mut env = HashMap::new();
+        env.insert("XDG_CONFIG_HOME".to_string(), abs_xdg.display().to_string());
+        let path = computer_id_path(Some(&env));
+        assert!(require_absolute(&path).is_ok(), "{}", path.display());
+        assert!(path.starts_with(&abs_xdg));
+
+        // (b) 两端都不满足 ⇒ 拒绝。
+        for (home, xdg) in [
+            (None, None),
+            (None, Some("")),
+            (None, Some("relative/xdg")),
+            (Some(""), None),
+            (Some("~"), None),
+            (Some("~/x"), Some("")),
+            (Some("relative/home"), Some("relative/xdg")),
         ] {
             let mut env = HashMap::new();
             if let Some(home) = home {
                 env.insert("HOME".to_string(), home.to_string());
             }
+            if let Some(xdg) = xdg {
+                env.insert(
+                    crate::settings::XDG_CONFIG_HOME_ENV.to_string(),
+                    xdg.to_string(),
+                );
+            }
             let path = computer_id_path(Some(&env));
             assert!(
                 require_absolute(&path).is_err(),
-                "HOME={home:?} 必须拒绝（不得回退进程 HOME），实得 {}",
+                "HOME={home:?} XDG={xdg:?} 必须拒绝，实得 {}",
                 path.display()
             );
             if let Ok(process_home) = std::env::var("HOME") {
                 assert!(
                     !path.starts_with(&process_home),
-                    "HOME={home:?} 不得解析到进程 HOME：{}",
+                    "HOME={home:?} XDG={xdg:?} 不得解析到进程 HOME：{}",
                     path.display()
                 );
             }
         }
+
+        // (c) 端到端：拒绝且不落盘。
+        let sentinel = Path::new("~")
+            .join(".config")
+            .join("a2c")
+            .join(COMPUTER_ID_FILENAME);
+        let sentinel_existed = sentinel.exists();
+        let process_identity = std::env::var("HOME").ok().map(|home| {
+            Path::new(&home)
+                .join(".config")
+                .join("a2c")
+                .join(COMPUTER_ID_FILENAME)
+        });
+        let before = process_identity
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok());
+
+        let mut invalid = HashMap::new();
+        invalid.insert("HOME".to_string(), "~".to_string());
+        match load_or_create_computer_id_blocking(Some(&invalid), Duration::from_millis(20)) {
+            Err(ComputerError::IdentityStore { reason, .. }) => {
+                assert!(reason.contains("not absolute"), "{reason}");
+            }
+            other => panic!("无效注入 env 必须返回 IdentityStore，实得 {other:?}"),
+        }
+
+        assert_eq!(
+            sentinel.exists(),
+            sentinel_existed,
+            "不得在 CWD 创建字面 `~` 目录"
+        );
+        let after = process_identity
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok());
+        assert_eq!(before, after, "不得改写进程 HOME 的身份文件");
     }
 
     /// 相对身份路径必须 fail-fast（不得在 CWD 建字面 `~` 目录、更不得静默换身份）。
@@ -400,7 +469,13 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap(); // 路径是目录 ⇒ 读取失败（非瞬态）
         let started = Instant::now();
         let result = load_or_create_computer_id_blocking(Some(&env), READ_RETRY_WINDOW);
-        assert!(matches!(result, Err(ComputerError::IdentityStore { .. })));
+        match &result {
+            Err(ComputerError::IdentityStore { reason, .. }) => {
+                // 确定性错误不属于「内容无效」，不得给出删除重建的误导性指引。
+                assert!(!reason.contains("delete this file"), "{reason}");
+            }
+            other => panic!("确定性错误必须返回 IdentityStore，实得 {other:?}"),
+        }
         assert!(
             started.elapsed() < READ_RETRY_WINDOW / 2,
             "确定性错误不得等满重试窗口（实际 {:?}）",

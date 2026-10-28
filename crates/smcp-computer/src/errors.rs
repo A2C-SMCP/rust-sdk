@@ -181,11 +181,11 @@ pub enum ComputerError {
     /// Local-only identity-store failure (HTTP-500 analogue); never sent on the wire. Corrupt or
     /// unreadable identity MUST fail fast — never silently regenerate or overwrite.
     ///
-    /// 文案带处置指引：损坏身份不会自愈，用户需**删除该文件**以重建身份（后续版本会提供
-    /// `identity reset` 入口）。/ The message carries remediation: delete the file to regenerate.
-    #[error(
-        "Computer identity store error at {path}: {reason} — delete this file to regenerate the identity"
-    )]
+    /// 处置指引由**具体原因**决定（写在 `reason` 里）：只有「文件内容无效」才提示删除文件重建；
+    /// 非绝对路径 / 权限 / 路径是目录等重试或删文件都无效，不能给同一句 hint（否则用户会照抄
+    /// 未展开的哨兵路径去删真实身份文件）。
+    /// Remediation belongs to the specific `reason`, not to every identity-store error.
+    #[error("Computer identity store error at {path}: {reason}")]
     IdentityStore {
         /// 身份文件路径 / identity file path.
         path: String,
