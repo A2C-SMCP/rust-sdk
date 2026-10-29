@@ -73,6 +73,62 @@ impl fmt::Display for InvalidPathError {
 
 impl std::error::Error for InvalidPathError {}
 
+/// 非严格 realpath 失败 / Non-strict realpath failure.
+///
+/// 协议 `blob-transfer.md` §Computer 处理流程第 4–5 步：realpath 围栏通过前的任何文件系统错误一律归
+/// **`forbidden`**（不是 `invalid_path`）——本类型 [`reason`](Self::reason) 恒为 `forbidden`，避免调用方
+/// 把符号链接环 / readlink 失败 / 非 Unicode 统一误映射成铸造期 `4020 invalid_path`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RealpathError {
+    /// canonical 形态非法 / 无法转宿主原生形态（输入契约错误）。
+    InvalidPath(InvalidPathError),
+    /// 符号链接环（跳数超限）/ symlink loop (hop limit exceeded).
+    SymlinkLoop {
+        /// 原始 canonical 路径 / original canonical path.
+        path: String,
+    },
+    /// `readlink` / 文件系统错误 / readlink or filesystem error.
+    Io {
+        /// 解析中的路径 / path being resolved.
+        path: String,
+        /// 底层错误 / underlying error.
+        message: String,
+    },
+    /// 结果无法以 Unicode 表示 / result is not representable as Unicode.
+    NotUnicode {
+        /// 原始 canonical 路径 / original canonical path.
+        path: String,
+    },
+}
+
+impl RealpathError {
+    /// 协议错误原因（恒为 `forbidden`）/ Protocol error reason (always `forbidden`).
+    pub const fn reason(&self) -> &'static str {
+        "forbidden"
+    }
+}
+
+impl fmt::Display for RealpathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPath(error) => write!(f, "{error}"),
+            Self::SymlinkLoop { path } => {
+                write!(f, "too many levels of symbolic links: {path:?}")
+            }
+            Self::Io { path, message } => write!(f, "cannot resolve {path:?}: {message}"),
+            Self::NotUnicode { path } => write!(f, "path is not valid Unicode: {path:?}"),
+        }
+    }
+}
+
+impl std::error::Error for RealpathError {}
+
+impl From<InvalidPathError> for RealpathError {
+    fn from(error: InvalidPathError) -> Self {
+        Self::InvalidPath(error)
+    }
+}
+
 /// 把路径规范化为 `canonical_path` 形态 / Normalize a path to the `canonical_path` form.
 ///
 /// `input` 为原始路径（POSIX 绝对路径；Windows 原生 `C:\...` 或 canonical `/C:/...`）。
@@ -109,18 +165,21 @@ pub fn to_native_path(canonical: &str, platform: PathPlatform) -> Result<String,
 /// Non-strict realpath: resolve symlinks (including dangling ones), keep missing components.
 ///
 /// `canonical` 为 `canonical_path` 形态；经 [`to_native_path`] 转宿主原生形态后解析。等价
-/// Python `os.path.realpath(..., strict=False)`；**不**以跟随链接的 `stat` / `exists()` 判定
-/// 存在性。返回宿主原生路径，调用方再经 [`normalize_path`] 归一。
+/// Python `os.path.realpath(..., strict=False)`：逐分量维护已解析前缀，符号链接（含悬空）经
+/// `readlink` 展开；`ENOENT` / `ENOTDIR` 的**缺失分量照常追加并继续处理后续分量**（后续 `..` 可回到
+/// 已存在目录、余下分量仍可能是符号链接）；其余 `lstat` / `readlink` 错误 → [`RealpathError`]
+/// （协议归 `forbidden`）。**不**以跟随链接的 `stat` / `exists()` 判定存在性。返回宿主原生路径，
+/// 调用方再经 [`normalize_path`] 归一。
 pub fn realpath_nonstrict(
     canonical: &str,
     platform: PathPlatform,
-) -> Result<String, InvalidPathError> {
+) -> Result<String, RealpathError> {
     let native = to_native_path(canonical, platform)?;
     let path = Path::new(&native);
     if !path.is_absolute() {
-        return Err(InvalidPathError::new(format!(
+        return Err(RealpathError::InvalidPath(InvalidPathError::new(format!(
             "realpath requires an absolute path: {native:?}"
-        )));
+        ))));
     }
 
     let mut comps = path.components().peekable();
@@ -149,15 +208,13 @@ pub fn realpath_nonstrict(
             Ok(meta) if meta.file_type().is_symlink() => {
                 hops += 1;
                 if hops > MAX_SYMLINK_HOPS {
-                    return Err(InvalidPathError::new(format!(
-                        "too many levels of symbolic links: {native:?}"
-                    )));
+                    return Err(RealpathError::SymlinkLoop {
+                        path: native.clone(),
+                    });
                 }
-                let target = std::fs::read_link(&candidate).map_err(|e| {
-                    InvalidPathError::new(format!(
-                        "cannot read symbolic link {}: {e}",
-                        candidate.display()
-                    ))
+                let target = std::fs::read_link(&candidate).map_err(|e| RealpathError::Io {
+                    path: candidate.display().to_string(),
+                    message: e.to_string(),
                 })?;
                 if target.is_absolute() {
                     let mut target_comps = target.components().peekable();
@@ -181,12 +238,23 @@ pub fn realpath_nonstrict(
             }
             // 普通文件 / 目录（或其它已存在类型）：按分量推进。
             Ok(_) => resolved.push(&component),
-            // 第一个不存在的分量起，其余原样拼接（不再访问文件系统）。
-            Err(_) => {
-                resolved.push(&component);
-                for c in pending.drain(..) {
-                    resolved.push(&c);
-                }
+            // ENOENT / ENOTDIR：保留该分量并**继续处理后续分量**——后续 `..` 可能回到已存在目录，
+            // 且余下分量仍可能是符号链接；在此停止会让 realpath 围栏误判（越界读）。等价 CPython
+            // `realpath(strict=False)`。
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                resolved.push(&component)
+            }
+            // 其余 lstat 错误 → forbidden（协议处理流程第 4 步订正）。
+            Err(err) => {
+                return Err(RealpathError::Io {
+                    path: candidate.display().to_string(),
+                    message: err.to_string(),
+                })
             }
         }
     }
@@ -195,7 +263,9 @@ pub fn realpath_nonstrict(
     resolved
         .to_str()
         .map(str::to_string)
-        .ok_or_else(|| InvalidPathError::new(format!("path is not valid Unicode: {native:?}")))
+        .ok_or_else(|| RealpathError::NotUnicode {
+            path: native.clone(),
+        })
 }
 
 // ── 内部实现 / Internal implementation ───────────────────────────────────

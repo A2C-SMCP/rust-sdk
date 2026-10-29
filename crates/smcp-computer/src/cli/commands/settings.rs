@@ -250,6 +250,14 @@ pub fn settings_set(
     // #245 / protocol#65：`readRoots` 仅受信 scope 可设；project scope 写入期丢弃 + 诊断（不落盘、不硬报错）。
     // 放在 `writable_path` 之后：anchor 不可解析时与其他键同样返回用户错误（不静默成功）。
     if scope == "project" && key == FIELD_READ_ROOTS {
+        // 盘上若已有旧版本写入的该键，一并清掉（不只跳过本次写入）。
+        if let Err(e) = drop_project_read_roots_from_file(&path) {
+            return err(
+                &format!("readRoots cleanup failed: {e}"),
+                json_output,
+                EXIT_USER_ERROR,
+            );
+        }
         return drop_project_read_roots(json_output);
     }
 
@@ -646,6 +654,32 @@ mod tests {
                 "scope={scope}"
             );
         }
+    }
+
+    #[test]
+    fn set_read_roots_in_project_scope_cleans_existing_old_key() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"readRoots":["/old"],"keep":1}"#).unwrap();
+        let share = dir.path().join("share");
+        let value = serde_json::to_string(&vec![share.to_str().unwrap()]).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                FIELD_READ_ROOTS,
+                &value,
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["keep"], json!(1), "其他键须保留");
     }
 
     #[test]

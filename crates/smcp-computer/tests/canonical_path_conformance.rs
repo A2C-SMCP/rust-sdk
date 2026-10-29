@@ -8,9 +8,22 @@
 //! 含义：任一 SDK 的 `normalize_path(input, platform)` MUST 对每条向量产出 `expected`，或在向量给出
 //! `error` 时以 `invalid_path` 失败；Windows 形态在任意 OS 上以纯函数测试（conformance-tests §2.8）。
 
+use smcp::utils::hash::sha256_hex;
 use smcp::utils::path_norm::{normalize_path, PathPlatform};
 
 const VECTORS: &str = include_str!("fixtures/canonical_path_conformance_vectors.json");
+
+/// vendored 副本的 sha256（协议 develop `ce39f63`，PR#72 版本）。协议更新 vendored 文件时**有意**改此常量。
+const FIXTURE_SHA256: &str = "176582498b4b09b6603a418f352eecd552e23efc44fea4b552d3576fa02d4cb7";
+
+#[test]
+fn fixture_bytes_are_pinned() {
+    assert_eq!(
+        sha256_hex(VECTORS.as_bytes()),
+        FIXTURE_SHA256,
+        "vendored fixture 漂移：从协议 develop 重新 `git show` 整文件覆盖，并有意更新本常量"
+    );
+}
 
 #[test]
 fn canonical_path_conformance_vectors() {

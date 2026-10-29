@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use smcp::utils::path_norm::{native_platform, normalize_path, realpath_nonstrict, PathPlatform};
+use smcp::utils::path_norm::{native_platform, normalize_path, realpath_nonstrict, RealpathError};
 use tracing::warn;
 
 use crate::settings::policy::resolve_policy_settings;
@@ -38,10 +38,7 @@ pub struct ReadRoot {
 /// 非法项（非绝对 / `normalize_path` 失败）丢弃；按**配置形态规范化后**去重（首次出现胜出）；
 /// realpath 失败只保留配置形态。空输入 = 空列表 = 不可读（fail-closed）。
 pub fn build_read_roots(raw: &[String]) -> Vec<ReadRoot> {
-    build_read_roots_for(raw, native_platform())
-}
-
-fn build_read_roots_for(raw: &[String], platform: PathPlatform) -> Vec<ReadRoot> {
+    let platform = native_platform();
     let mut roots: Vec<ReadRoot> = Vec::new();
     for item in raw {
         let configured = match normalize_path(item, platform) {
@@ -55,23 +52,18 @@ fn build_read_roots_for(raw: &[String], platform: PathPlatform) -> Vec<ReadRoot>
         if roots.iter().any(|root| root.configured == configured) {
             continue;
         }
-        // 非宿主平台无法做真实 realpath（向量只在纯函数层跨平台测试）。
-        let real = if platform == native_platform() {
-            match realpath_nonstrict(&configured, platform)
-                .and_then(|realpath| normalize_path(&realpath, platform))
-            {
-                Ok(real) => Some(real),
-                Err(err) => {
-                    warn!(
-                        root = %configured,
-                        error = %err,
-                        "readRoots: realpath 失败，仅保留配置形态 / realpath failed, keeping configured form"
-                    );
-                    None
-                }
+        let real = match realpath_nonstrict(&configured, platform)
+            .and_then(|realpath| normalize_path(&realpath, platform).map_err(RealpathError::from))
+        {
+            Ok(real) => Some(real),
+            Err(err) => {
+                warn!(
+                    root = %configured,
+                    error = %err,
+                    "readRoots: realpath 失败，仅保留配置形态 / realpath failed, keeping configured form"
+                );
+                None
             }
-        } else {
-            None
         };
         roots.push(ReadRoot { configured, real });
     }
@@ -120,9 +112,13 @@ pub fn realpath_fence(canonical: &str, roots: &[ReadRoot]) -> bool {
 /// 从五层合并 settings 取 `readRoots` 并编译（每次现读，不缓存）。
 /// Read the merged `readRoots` from settings and compile it (no caching).
 ///
-/// 与 `Computer::landing_root` 的 settings 解析同构：`flag_settings_path` 恒 `None`
-/// （rust `Computer` 是库组件，运行态不持有 flag 文件路径）。settings 可能被原子重写，故
-/// 调用方每次请求应重新调用。
+/// # flag scope（**有意分叉**，跟进 rust-sdk#248）
+///
+/// `flag_settings_path` 恒 `None`：rust `Computer` 是库组件，运行态不持有 CLI `--settings <file>` 路径
+/// （与 `Computer::landing_root` 同款）。因此 flag 层声明的 `readRoots` 在 CLI `settings show` 可见、
+/// 运行期不生效——这是 SDK 级差异而非静默忽略（见 rust-sdk#248）。
+///
+/// settings 可能被原子重写，故调用方每次请求应重新调用。
 pub fn resolve_read_roots(config_dir: &Path, env: Option<&EnvMap>) -> Vec<ReadRoot> {
     let policy = resolve_policy_settings(None, None, None);
     let resolved = resolve_settings(ResolveSettingsArgs {
@@ -343,9 +339,12 @@ mod tests {
         std::os::unix::fs::symlink("b", &a).unwrap();
         std::os::unix::fs::symlink("a", &b).unwrap();
         let canonical = normalize_path(a.to_str().unwrap(), native_platform()).unwrap();
-        assert!(
-            realpath_nonstrict(&canonical, native_platform()).is_err(),
-            "符号链接环须报错（跳数上限）"
+        let err = realpath_nonstrict(&canonical, native_platform())
+            .expect_err("符号链接环须报错（跳数上限）");
+        assert_eq!(
+            err.reason(),
+            "forbidden",
+            "realpath 错误不得映射成 invalid_path"
         );
     }
 
@@ -410,6 +409,92 @@ mod tests {
             configured.iter().filter(|root| **root == a_norm).count(),
             1,
             "跨 scope 去重：{configured:?}"
+        );
+    }
+
+    /// 🔴 回归（审查发现）：缺失分量**之后**的符号链接必须继续解析。
+    ///
+    /// `link -> missing/../sub/evil/id`（`missing` 不存在）、`sub/evil -> /outside`。若在首个 `lstat`
+    /// 失败处停止并只做词法折叠，会得到 `/repo/sub/evil/id`（围栏通过），而 open 会跟随 `sub/evil`
+    /// 越界读到 `/outside/id`。修复后必须解析到 `/outside/id`，realpath 围栏拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn realpath_resolves_symlink_after_missing_component_and_dotdot() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("id");
+        fs::write(&outside_file, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("sub").join("evil")).unwrap();
+        let link = repo.join("link");
+        std::os::unix::fs::symlink("missing/../sub/evil/id", &link).unwrap();
+
+        let canonical = normalize_path(link.to_str().unwrap(), native_platform()).unwrap();
+        let resolved = realpath_nonstrict(&canonical, native_platform()).unwrap();
+        let expected = fs::canonicalize(&outside_file).unwrap();
+        assert_eq!(
+            resolved,
+            expected.to_str().unwrap(),
+            "缺失分量后的符号链接必须继续解析"
+        );
+
+        // 词法形态在 root 内（修复前的假通过点），realpath 形态越界必须拒绝。
+        let roots = build_read_roots(&[repo.to_str().unwrap().to_string()]);
+        let lexical_target = normalize_path(
+            repo.join("sub/evil/id").to_str().unwrap(),
+            native_platform(),
+        )
+        .unwrap();
+        assert!(lexical_fence(&lexical_target, &roots));
+        assert!(
+            !realpath_fence(&resolved, &roots),
+            "realpath 围栏须拒绝越界目标"
+        );
+    }
+
+    /// 根自身 realpath 失败（符号链接环）→ 只保留配置形态（`real=None`），不丢根。
+    #[cfg(unix)]
+    #[test]
+    fn build_read_roots_keeps_configured_when_realpath_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::os::unix::fs::symlink("b", &a).unwrap();
+        std::os::unix::fs::symlink("a", &b).unwrap();
+        let roots = build_read_roots(&[a.to_str().unwrap().to_string()]);
+        assert_eq!(roots.len(), 1, "roots={roots:?}");
+        assert_eq!(roots[0].real, None, "环 → realpath 失败，仅配置形态");
+        let configured = normalize_path(a.to_str().unwrap(), native_platform()).unwrap();
+        assert_eq!(roots[0].configured, configured);
+        assert!(lexical_fence(&configured, &roots));
+        assert!(
+            !realpath_fence(&configured, &roots),
+            "real=None 不得通过 realpath 围栏"
+        );
+    }
+
+    /// 根内悬空链接指向根外：词法围栏通过、realpath 围栏拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn outside_dangling_link_lexical_passes_realpath_rejects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let missing_target = outside.join("missing.txt");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&missing_target, &link).unwrap();
+
+        let roots = build_read_roots(&[root.to_str().unwrap().to_string()]);
+        let canonical = normalize_path(link.to_str().unwrap(), native_platform()).unwrap();
+        assert!(lexical_fence(&canonical, &roots), "词法形态在根内");
+        let resolved = realpath_nonstrict(&canonical, native_platform()).unwrap();
+        assert!(
+            !realpath_fence(&resolved, &roots),
+            "realpath 形态越界须拒绝：{resolved}"
         );
     }
 }

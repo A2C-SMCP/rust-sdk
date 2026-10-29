@@ -48,6 +48,6 @@ pub use mime::{guess_mime, is_text_mime, FALLBACK_MIME};
 pub use path::{is_within, normalize_lexical, resolve_xdg_first};
 pub use path_norm::{
     native_platform, normalize_path, realpath_nonstrict, to_native_path, InvalidPathError,
-    PathPlatform,
+    PathPlatform, RealpathError,
 };
 pub use slice::{plan_slice, SlicePlan};

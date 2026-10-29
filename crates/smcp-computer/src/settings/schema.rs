@@ -369,11 +369,8 @@ fn validate_read_roots(key: &str, value: &Value, scope: SettingsScope) -> Valida
             ));
             continue;
         };
-        if !is_absolute_path(raw) {
-            errors.push(err(scope, field.as_str(), "must be an absolute path"));
-            continue;
-        }
-        // 配置期与运行期同源：用协议 `normalize_path` 预判 `invalid_path`，避免「写得进、读不了」。
+        // 单一判据：`normalize_path` 同时校验绝对性与形态（含 Windows verbatim `\\?\C:\...` 的剥离），
+        // 避免 `is_absolute_path` 与规范化器两套口径分叉（#245 审查）。配置期与运行期同源。
         if let Err(exc) = normalize_path(raw, platform) {
             errors.push(err(scope, field.as_str(), format!("invalid path: {exc}")));
             continue;
@@ -1021,6 +1018,20 @@ mod tests {
         );
         assert!(!cleaned.contains_key("readRoots"));
         assert!(!errors.is_empty());
+    }
+
+    /// Windows verbatim 前缀 `\\?\C:\...`：validator 以 `normalize_path` 为单一判据，须接受（#245 审查）。
+    #[cfg(windows)]
+    #[test]
+    fn test_read_roots_accepts_windows_verbatim_prefix() {
+        let raw = json!({"readRoots": ["\\\\?\\C:\\data\\share"]});
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::User, None);
+        assert_eq!(
+            cleaned["readRoots"],
+            json!(["\\\\?\\C:\\data\\share"]),
+            "verbatim 形态应保留原值"
+        );
+        assert!(errors.is_empty(), "errors={errors:?}");
     }
 
     /// typed round-trip：`readRoots` 以 camelCase 键进出 [`ComputerSettings`]。

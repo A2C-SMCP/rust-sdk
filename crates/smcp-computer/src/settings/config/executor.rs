@@ -166,7 +166,12 @@ fn drop_project_read_roots(
                     "project scope readRoots dropped before persist (trusted-scope-only)"
                 );
             }
-            Some(map)
+            // 剔除后与盘上内容相同 → 无变化，不重写文件。
+            if map == *existing {
+                None
+            } else {
+                Some(map)
+            }
         }
         None if existing.contains_key(FIELD_READ_ROOTS) => {
             let mut map = existing.clone();
@@ -409,6 +414,41 @@ mod tests {
             "project readRoots 须被剔除：{saved}"
         );
         assert_eq!(saved["enabledPlugins"]["p@m"], json!(true));
+    }
+
+    #[test]
+    fn project_settings_read_roots_only_plan_does_not_create_file() {
+        // readRoots-only 计划命中不存在的文件 → 无内容变化，不得凭空建 `{}`。
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        let inner: BTreeMap<String, WriteValue> =
+            std::iter::once(("readRoots".to_string(), WriteValue::Delete)).collect();
+        let plan = WritePlan {
+            scope: crate::settings::schema::SettingsScope::Project,
+            file: path.clone(),
+            op: WriteTargetOp::Value(WriteValue::Object(inner)),
+        };
+        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        assert!(!path.exists(), "readRoots-only plan 不得凭空建文件");
+    }
+
+    #[test]
+    fn project_settings_read_roots_only_plan_clears_key() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        write(&path, r#"{"readRoots":["/data"]}"#);
+        let inner: BTreeMap<String, WriteValue> =
+            std::iter::once(("readRoots".to_string(), WriteValue::Delete)).collect();
+        let plan = WritePlan {
+            scope: crate::settings::schema::SettingsScope::Project,
+            file: path.clone(),
+            op: WriteTargetOp::Value(WriteValue::Object(inner)),
+        };
+        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        let saved = read_json(&path);
+        assert!(saved.get("readRoots").is_none(), "{saved}");
     }
 
     #[test]
