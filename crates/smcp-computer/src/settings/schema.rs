@@ -30,9 +30,9 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use smcp::utils::path_norm::{native_platform, normalize_path};
+use smcp::utils::path_norm::{native_platform, normalize_path, PathPlatform};
 
 /// settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high).
 ///
@@ -346,6 +346,16 @@ fn validate_landing_root(key: &str, value: &Value, scope: SettingsScope) -> Vali
 /// 双形态（配置 / realpath）在运行期由 [`build_read_roots`](crate::blob::path_resolver::build_read_roots)
 /// 编译。
 fn validate_read_roots(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
+    validate_read_roots_for(key, value, scope, native_platform())
+}
+
+/// [`validate_read_roots`] 的平台显式版本（跨平台测试接缝；生产恒用宿主平台）。
+fn validate_read_roots_for(
+    key: &str,
+    value: &Value,
+    scope: SettingsScope,
+    platform: PathPlatform,
+) -> ValidateResult {
     let Some(arr) = value.as_array() else {
         return (
             None,
@@ -356,7 +366,6 @@ fn validate_read_roots(key: &str, value: &Value, scope: SettingsScope) -> Valida
             )],
         );
     };
-    let platform = native_platform();
     let mut cleaned: Vec<Value> = Vec::new();
     let mut errors: Vec<SettingsValidationError> = Vec::new();
     for (idx, item) in arr.iter().enumerate() {
@@ -378,6 +387,22 @@ fn validate_read_roots(key: &str, value: &Value, scope: SettingsScope) -> Valida
         cleaned.push(Value::String(raw.to_string()));
     }
     (Some(Value::Array(cleaned)), errors)
+}
+
+/// #248：flag scope 中**运行期不生效**的键（rust `Computer` 是库组件，不持有 flag settings 路径）。
+///
+/// `readRoots` / `landingRoot` 仅受信 scope 可设，但 flag 层在 rust 运行期不被读取（与
+/// `Computer::landing_root` 同款）；CLI `settings show --scope flag` 可见，故必须响亮诊断而非静默。
+pub const FLAG_SCOPE_INEFFECTIVE_FIELDS: &[&str] = &[FIELD_READ_ROOTS, FIELD_LANDING_ROOT];
+
+/// 返回 `layer` 中命中 [`FLAG_SCOPE_INEFFECTIVE_FIELDS`] 的键（保持常量顺序）。
+#[must_use]
+pub fn flag_scope_ineffective_fields(layer: &Map<String, Value>) -> Vec<&'static str> {
+    FLAG_SCOPE_INEFFECTIVE_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| layer.contains_key(*field))
+        .collect()
 }
 
 fn validate_enabled_plugins(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
@@ -1020,18 +1045,45 @@ mod tests {
         assert!(!errors.is_empty());
     }
 
-    /// Windows verbatim 前缀 `\\?\C:\...`：validator 以 `normalize_path` 为单一判据，须接受（#245 审查）。
-    #[cfg(windows)]
+    /// Windows verbatim 前缀 `\\?\C:\...`：validator 以 `normalize_path` 为单一判据，须接受。
+    /// 经平台显式接缝在**任意 OS** 执行（不加 Windows CI）。
     #[test]
-    fn test_read_roots_accepts_windows_verbatim_prefix() {
-        let raw = json!({"readRoots": ["\\\\?\\C:\\data\\share"]});
-        let (cleaned, errors) = validate_settings(&raw, SettingsScope::User, None);
+    fn test_read_roots_accepts_windows_verbatim_prefix_on_any_host() {
+        let raw = json!(["\\\\?\\C:\\data\\share"]);
+        let (cleaned, errors) = validate_read_roots_for(
+            FIELD_READ_ROOTS,
+            &raw,
+            SettingsScope::User,
+            PathPlatform::Windows,
+        );
         assert_eq!(
-            cleaned["readRoots"],
+            cleaned.expect("cleaned"),
             json!(["\\\\?\\C:\\data\\share"]),
             "verbatim 形态应保留原值"
         );
         assert!(errors.is_empty(), "errors={errors:?}");
+
+        // 对照：同一输入按 POSIX 平台判非法（非 `/` 开头）→ 逐项丢弃并记诊断。
+        let (cleaned, errors) = validate_read_roots_for(
+            FIELD_READ_ROOTS,
+            &raw,
+            SettingsScope::User,
+            PathPlatform::Posix,
+        );
+        assert_eq!(cleaned.expect("cleaned"), json!([]));
+        assert_eq!(errors.len(), 1, "errors={errors:?}");
+    }
+
+    /// #248：flag 层诊断键集——有键→命中（固定顺序），无键→空（不告警）。
+    #[test]
+    fn flag_scope_ineffective_fields_reports_only_present_keys() {
+        let layer = json!({"readRoots": [], "landingRoot": "/x", "other": 1});
+        assert_eq!(
+            flag_scope_ineffective_fields(layer.as_object().unwrap()),
+            vec![FIELD_READ_ROOTS, FIELD_LANDING_ROOT]
+        );
+        let clean = json!({"other": 1});
+        assert!(flag_scope_ineffective_fields(clean.as_object().unwrap()).is_empty());
     }
 
     /// typed round-trip：`readRoots` 以 camelCase 键进出 [`ComputerSettings`]。

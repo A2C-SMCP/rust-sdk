@@ -49,11 +49,12 @@ use serde_json::{Map, Value};
 
 use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig, ServerName};
+use crate::settings::read_roots::{read_raw_map, remove_read_roots_raw};
 use crate::settings::reconciler::{safe_rmtree, InstalledPluginRecord};
-use crate::settings::schema::{is_valid_enabled_plugin_key, SettingsScope, FIELD_READ_ROOTS};
+use crate::settings::schema::{is_valid_enabled_plugin_key, SettingsScope};
 use crate::settings::scope::{
-    apply_write, load_settings_file, user_settings_path, workdir_local_settings_path,
-    workdir_project_settings_path, EnvMap, WriteValue,
+    apply_write, user_settings_path, workdir_local_settings_path, workdir_project_settings_path,
+    EnvMap, WriteValue,
 };
 use crate::settings::store::{
     self, load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
@@ -277,7 +278,8 @@ fn settings_path_for_scope(
 
 /// 对指定 scope 的 `enabledPlugins[<plugin_id>]` 施加一次写更新（持锁原子 RMW）/ apply one enabledPlugins write。
 ///
-/// 复用 store 旁车锁 + 原子写 + scope 的 [`load_settings_file`] / [`apply_write`]（仅改该 key、不毁兄弟）。
+/// 复用 store 旁车锁 + 原子写 + **raw 保真 RMW**（`read_raw_map` + [`apply_write`]，仅改该 key、
+/// 不毁兄弟，也不回写校验视图）。
 /// settings.json 是人编意图层 → 无写保护头（[`store::atomic_write_settings_json`]）。
 fn apply_enabled_plugin_write(
     plugin_id: &str,
@@ -297,31 +299,19 @@ fn apply_enabled_plugin_write(
     // 重复 disable）→ **跳过写盘**（不扰 mtime、无文件 churn），供 Computer 层据「实际写盘结果」
     // **只在真变时** bump config revision + 通知 robot——false-negative 安全（写了就是真变）。
     let changed = store::with_settings_lock(&path, || -> io::Result<bool> {
-        let (existing, _errors) = load_settings_file(&path, scope_enum);
+        // #245 / protocol#65：raw 保真 RMW——写盘不得回写校验视图（会静默删除 landingRoot /
+        // enabledMcpjsonServers / 非法 permissions 等被过滤字段）；project scope 仅额外删除 readRoots。
+        let mut existing = read_raw_map(&path)?.unwrap_or_default();
+        let had_read_roots =
+            scope_enum == SettingsScope::Project && remove_read_roots_raw(&mut existing);
         let updated = apply_write(&existing, &updates);
-        if updated == existing {
-            // #245 / protocol#65：no-op 不写盘，但 project settings 若残留旧版本写入的 `readRoots`，
-            // 借本次机会落一次清洗后的视图（enabledPlugins 未变 → 仍返回 false，不 bump revision）。
-            if scope_enum == SettingsScope::Project
-                && raw_file_contains_key(&path, FIELD_READ_ROOTS)
-            {
-                store::atomic_write_settings_json(&path, &Value::Object(updated))?;
-            }
-            return Ok(false); // 内容未变 → 不触碰文件（除上述清理）。
+        let changed = updated != existing;
+        if changed || had_read_roots {
+            store::atomic_write_settings_json(&path, &Value::Object(updated))?;
         }
-        store::atomic_write_settings_json(&path, &Value::Object(updated))?;
-        Ok(true)
+        Ok(changed)
     })??;
     Ok(changed)
-}
-
-/// #245：原始 settings 文件顶层是否含某键（用于 no-op 分支的旧键清理判定）。
-fn raw_file_contains_key(path: &Path, key: &str) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().map(|map| map.contains_key(key)))
-        .unwrap_or(false)
 }
 
 /// 写 `enabledPlugins[<plugin_id>] = value`（enable/disable 用）/ Write the enable flag。
@@ -345,7 +335,8 @@ fn write_enabled_plugin(
 ///
 /// 清除后避免「uninstall → reinstall」残留 `true` 令新装绕过 `installed_disabled` 直接激活。**仅当该键实际存在
 /// 才写盘**——从未 enable 的 plugin 卸载时不触碰 settings.json（保 Computer 层 `env=None` 卸载对 `~/.config`
-/// 无副作用，见 computer.rs enabledPlugins 测试约定）。
+/// 无副作用，见 computer.rs enabledPlugins 测试约定）。唯一例外：project scope 残留旧 `readRoots` 时顺带
+/// 做 raw 保真清理（#245）。
 fn clear_enabled_plugin(
     plugin_id: &str,
     scope: &str,
@@ -354,20 +345,29 @@ fn clear_enabled_plugin(
 ) -> Result<(), PluginInstallError> {
     let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
     store::with_settings_lock(&path, || -> io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, scope_enum);
+        // #245：raw 保真 RMW（只删 readRoots，其余原始字段保留）。
+        let mut existing = read_raw_map(&path)?.unwrap_or_default();
+        let had_read_roots =
+            scope_enum == SettingsScope::Project && remove_read_roots_raw(&mut existing);
         let present = existing
             .get("enabledPlugins")
             .and_then(|v| v.get(plugin_id))
             .is_some();
         if !present {
-            return Ok(()); // 键不存在 → 无需写盘（不触碰文件）。
+            if had_read_roots {
+                store::atomic_write_settings_json(&path, &Value::Object(existing))?;
+            }
+            return Ok(()); // 键不存在 → 无需写盘（除 readRoots 清理）。
         }
         let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
         inner.insert(plugin_id.to_string(), WriteValue::Delete);
         let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
         updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
         let updated = apply_write(&existing, &updates);
-        store::atomic_write_settings_json(&path, &Value::Object(updated))
+        if updated != existing || had_read_roots {
+            store::atomic_write_settings_json(&path, &Value::Object(updated))?;
+        }
+        Ok(())
     })??;
     Ok(())
 }
@@ -381,12 +381,18 @@ fn set_enabled_true_if_absent(
 ) -> Result<(), PluginInstallError> {
     let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
     store::with_settings_lock(&path, || -> io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, scope_enum);
+        // #245：raw 保真 RMW（只删 readRoots，其余原始字段保留）。
+        let mut existing = read_raw_map(&path)?.unwrap_or_default();
+        let had_read_roots =
+            scope_enum == SettingsScope::Project && remove_read_roots_raw(&mut existing);
         let present = existing
             .get("enabledPlugins")
             .and_then(|v| v.get(plugin_id))
             .is_some();
         if present {
+            if had_read_roots {
+                store::atomic_write_settings_json(&path, &Value::Object(existing))?;
+            }
             return Ok(()); // 已有显式值（true / 用户 disable 的 false）→ 不覆盖。
         }
         let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
@@ -394,7 +400,10 @@ fn set_enabled_true_if_absent(
         let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
         updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
         let updated = apply_write(&existing, &updates);
-        store::atomic_write_settings_json(&path, &Value::Object(updated))
+        if updated != existing || had_read_roots {
+            store::atomic_write_settings_json(&path, &Value::Object(updated))?;
+        }
+        Ok(())
     })??;
     Ok(())
 }
@@ -2158,20 +2167,106 @@ mod tests {
 
     #[test]
     fn project_enable_noop_cleans_existing_read_roots() {
-        // #245：no-op 分支不写盘，但盘上旧 readRoots（旧版本写入）须被清理。
+        // #245：no-op 分支的清理必须 **raw 保真**——只删 readRoots，不得把校验视图整文件回写
+        // （否则会静默删除 project landingRoot / enabledMcpjsonServers / 非法 permissions 等被过滤字段）。
         let tmp = TempDir::new().unwrap();
         let wd = tmp.path().join("wd");
         let path = workdir_project_settings_path(&wd);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{"readRoots":["/data"],"enabledPlugins":{"a@mp":true}}"#,
+            r#"{
+                "readRoots": ["/data"],
+                "landingRoot": "/landing",
+                "enabledMcpjsonServers": ["srv"],
+                "permissions": "invalid-not-object",
+                "keepUnknown": {"k": 1},
+                "enabledPlugins": {"a@mp": true}
+            }"#,
         )
         .unwrap();
         let changed = write_enabled_plugin("a@mp", true, "project", wd.to_str(), None).unwrap();
         assert!(!changed, "同值写 → enabledPlugins 无变化");
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.get("readRoots").is_none(), "{saved}");
+        // 其他字段（含被校验过滤的 project 字段）原值保留。
+        assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
+        assert_eq!(saved["enabledMcpjsonServers"], serde_json::json!(["srv"]));
+        assert_eq!(
+            saved["permissions"],
+            serde_json::json!("invalid-not-object")
+        );
+        assert_eq!(saved["keepUnknown"], serde_json::json!({"k": 1}));
+        assert_eq!(saved["enabledPlugins"]["a@mp"], serde_json::json!(true));
+        // 幂等：再次 enable 无 readRoots、无改动。
+        assert!(!write_enabled_plugin("a@mp", true, "project", wd.to_str(), None).unwrap());
+    }
+
+    #[test]
+    fn project_enable_real_write_preserves_other_filtered_fields() {
+        // #245：真写盘（enabledPlugins 缺目标键）同样必须 raw 保真，不得删除其他被过滤字段。
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "readRoots": ["/data"],
+                "landingRoot": "/landing",
+                "enabledMcpjsonServers": ["srv"],
+                "permissions": "invalid-not-object",
+                "enabledPlugins": {"other@mp": true}
+            }"#,
+        )
+        .unwrap();
+        let changed = write_enabled_plugin("new@mp", true, "project", wd.to_str(), None).unwrap();
+        assert!(changed, "enabledPlugins 缺目标键 → 真写盘");
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
+        assert_eq!(saved["enabledMcpjsonServers"], serde_json::json!(["srv"]));
+        assert_eq!(
+            saved["permissions"],
+            serde_json::json!("invalid-not-object")
+        );
+        assert_eq!(saved["enabledPlugins"]["other@mp"], serde_json::json!(true));
+        assert_eq!(saved["enabledPlugins"]["new@mp"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn project_clear_enabled_plugin_real_write_preserves_filtered_fields() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"readRoots":["/data"],"landingRoot":"/landing","enabledPlugins":{"a@mp":true}}"#,
+        )
+        .unwrap();
+        clear_enabled_plugin("a@mp", "project", wd.to_str(), None).unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
+        assert!(saved["enabledPlugins"].get("a@mp").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn project_set_enabled_if_absent_real_write_preserves_filtered_fields() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"readRoots":["/data"],"landingRoot":"/landing","enabledPlugins":{}}"#,
+        )
+        .unwrap();
+        set_enabled_true_if_absent("a@mp", "project", wd.to_str(), None).unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
         assert_eq!(saved["enabledPlugins"]["a@mp"], serde_json::json!(true));
     }
 

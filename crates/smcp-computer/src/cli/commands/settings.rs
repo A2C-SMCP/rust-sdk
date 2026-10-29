@@ -26,6 +26,7 @@ use serde_json::{json, Map, Value};
 use super::{
     err_flat as err, ok_msg, print_json, resolved_settings_with_errors, EXIT_OK, EXIT_USER_ERROR,
 };
+use crate::settings::read_roots::{drop_read_roots_from_file, read_raw_map, remove_read_roots_raw};
 use crate::settings::scope::{
     apply_write, load_settings_file, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
@@ -176,6 +177,8 @@ pub fn settings_show(
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
     }
+    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
+    super::warn_flag_scope_diagnostics_for(scope, flag_path);
     print_json(&Value::Object(data));
     EXIT_OK
 }
@@ -210,6 +213,8 @@ pub fn settings_get(
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
     }
+    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
+    super::warn_flag_scope_diagnostics_for(scope, flag_path);
     let Some(value) = data.get(key) else {
         return err(
             &format!("key {key:?} not set in scope {scope:?}"),
@@ -251,7 +256,7 @@ pub fn settings_set(
     // 放在 `writable_path` 之后：anchor 不可解析时与其他键同样返回用户错误（不静默成功）。
     if scope == "project" && key == FIELD_READ_ROOTS {
         // 盘上若已有旧版本写入的该键，一并清掉（不只跳过本次写入）。
-        if let Err(e) = drop_project_read_roots_from_file(&path) {
+        if let Err(e) = drop_read_roots_from_file(&path) {
             return err(
                 &format!("readRoots cleanup failed: {e}"),
                 json_output,
@@ -272,8 +277,18 @@ pub fn settings_set(
         BTreeMap::from([(key.to_string(), WriteValue::from(parsed.clone()))]);
 
     let locked = with_settings_lock(&path, || -> std::io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, enum_);
-        atomic_write_settings_json(&path, &apply_write(&existing, &updates))
+        // #245：**raw 保真 RMW**——不回写校验视图（否则会静默删除 landingRoot /
+        // enabledMcpjsonServers / 非法 permissions 等被过滤字段）；project scope 顺带剔除旧
+        // `readRoots`（只删该键）。无变化 → 不重写（不扰 mtime）。
+        let mut existing = read_raw_map(&path)?.unwrap_or_default();
+        let had_read_roots =
+            enum_ == SettingsScope::Project && remove_read_roots_raw(&mut existing);
+        let updated = apply_write(&existing, &updates);
+        // 无变化且无需清理 readRoots → 不重写（不扰 mtime）。
+        if updated == existing && !had_read_roots {
+            return Ok(());
+        }
+        atomic_write_settings_json(&path, &Value::Object(updated))
     });
     match locked {
         Ok(Ok(())) => {}
@@ -321,33 +336,6 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
         "ignored {} in project scope (trusted-scope-only)",
         FIELD_READ_ROOTS
     ))
-}
-
-/// #245 / protocol#65：`settings edit` 成功后从 project settings 文件剔除 `readRoots`。
-///
-/// 返回是否发生剔除；损坏 / 非对象 JSON 不动（交给既有诊断路径）。
-fn drop_project_read_roots_from_file(path: &Path) -> Result<bool, String> {
-    // 读取 / 解析 / 删除 / 回写全部在**同一把 settings 锁内**完成——锁外先读再锁会丢并发写。
-    let written = with_settings_lock(path, || -> std::io::Result<bool> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&text) else {
-            return Ok(false);
-        };
-        if map.remove(FIELD_READ_ROOTS).is_none() {
-            return Ok(false);
-        }
-        atomic_write_settings_json(path, &Value::Object(map))?;
-        Ok(true)
-    });
-    match written {
-        Ok(Ok(dropped)) => Ok(dropped),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) => Err(e.to_string()),
-    }
 }
 
 /// 用 `$EDITOR` 打开该层 settings.json（保存后的 reconcile 由 REPL 承担）/ open the scope file in `$EDITOR`。
@@ -412,7 +400,7 @@ pub fn settings_edit(
         Ok(s) if s.success() => {
             // #245：project scope 的 readRoots 写入期丢弃 + 诊断（编辑内容不落盘）。
             if scope == "project" {
-                match drop_project_read_roots_from_file(&path) {
+                match drop_read_roots_from_file(&path) {
                     Ok(true) => {
                         tracing::warn!(
                             field = FIELD_READ_ROOTS,
@@ -683,16 +671,80 @@ mod tests {
     }
 
     #[test]
+    fn set_generic_key_in_project_scope_preserves_filtered_fields() {
+        // F1（终审）：通用 settings set 也是 raw RMW——不得回写校验视图，不得删除被过滤字段。
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "readRoots": ["/data"],
+                "landingRoot": "/landing",
+                "enabledMcpjsonServers": ["srv"],
+                "enableAllProjectMcpServers": true,
+                "permissions": "invalid-not-object"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "maxConcurrency",
+                "7",
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["maxConcurrency"], json!(7));
+        assert_eq!(saved["landingRoot"], json!("/landing"));
+        assert_eq!(saved["enabledMcpjsonServers"], json!(["srv"]));
+        assert_eq!(saved["enableAllProjectMcpServers"], json!(true));
+        assert_eq!(saved["permissions"], json!("invalid-not-object"));
+    }
+
+    #[test]
+    fn set_same_value_in_project_scope_still_cleans_read_roots() {
+        // 写同值（内容无变化）但盘上有旧 readRoots → 仍须落盘清理（changed || had_read_roots）。
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"readRoots":["/data"],"maxConcurrency":7}"#).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "maxConcurrency",
+                "7",
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["maxConcurrency"], json!(7));
+    }
+
+    #[test]
     fn drop_project_read_roots_from_file_removes_only_that_field() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"readRoots":["/data"],"keep":1}"#).unwrap();
-        assert!(drop_project_read_roots_from_file(&path).unwrap());
+        assert!(drop_read_roots_from_file(&path).unwrap());
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.get("readRoots").is_none());
         assert_eq!(saved["keep"], json!(1));
         // 幂等：已无该键 → no-op。
-        assert!(!drop_project_read_roots_from_file(&path).unwrap());
+        assert!(!drop_read_roots_from_file(&path).unwrap());
     }
 
     /// `settings edit` 的真实写入路径：编辑器写入 `readRoots` 后由 post-edit 清理剔除。
