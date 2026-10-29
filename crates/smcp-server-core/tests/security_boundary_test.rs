@@ -92,6 +92,7 @@ async fn malformed_ack_payloads_return_flat_bad_request() {
         events::CLIENT_GET_SKILL,
         events::CLIENT_GET_BLOB,
         events::CLIENT_PUT_BLOB,
+        events::CLIENT_RESOLVE_PATH,
         events::CLIENT_GET_RESOURCES,
     ];
 
@@ -632,7 +633,7 @@ async fn valid_payload_plus_extra_argument_returns_flat_bad_request() {
     let client = create_test_client(&server.url(), SMCP_NAMESPACE).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let cases: [(&str, serde_json::Value); 4] = [
+    let cases: [(&str, serde_json::Value); 5] = [
         (
             events::SERVER_JOIN_OFFICE,
             json!({"role": "agent", "name": "agent", "office_id": "office-a"}),
@@ -648,6 +649,10 @@ async fn valid_payload_plus_extra_argument_returns_flat_bad_request() {
         (
             events::CLIENT_GET_TOOLS,
             json!({"agent": "agent", "req_id": "extra", "computer": "computer"}),
+        ),
+        (
+            events::CLIENT_RESOLVE_PATH,
+            json!({"agent": "agent", "req_id": "extra", "computer": "computer", "path": "/tmp/x"}),
         ),
     ];
 
@@ -678,7 +683,7 @@ async fn every_client_call_from_computer_receives_flat_403() {
     // A superset of each request's required fields keeps this a role check, not a parser check.
     let request = json!({"agent":"forged", "computer":"missing", "req_id":"roles",
         "tool_name":"tool", "params":{}, "timeout":1, "name":"skill", "mcp_server":"bundle",
-        "blob_handle":"handle", "chunk_offset":0, "eof":true, "blob":""});
+        "blob_handle":"handle", "chunk_offset":0, "eof":true, "blob":"", "path":"/tmp/x"});
     for event in [
         events::CLIENT_TOOL_CALL,
         events::CLIENT_GET_TOOLS,
@@ -688,6 +693,7 @@ async fn every_client_call_from_computer_receives_flat_403() {
         events::CLIENT_GET_SKILL,
         events::CLIENT_GET_BLOB,
         events::CLIENT_PUT_BLOB,
+        events::CLIENT_RESOLVE_PATH,
         events::CLIENT_GET_RESOURCES,
     ] {
         assert_eq!(

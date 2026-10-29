@@ -1,10 +1,12 @@
-//! SRV-02 (#50)：四个新 `client:*` relay handler 注册 + 经统一 relay 转发。
-//! Each of client:get_skills/get_skill/get_blob/get_resources is registered and routes through the
-//! unified relay — an unknown Computer yields a flat ErrorPayload(404) ack (proves registration + routing).
+//! SRV-02 (#50) / protocol#65：五个 `client:*` relay handler 注册 + 经统一 relay 转发。
+//! Each of client:get_skills/get_skill/get_blob/resolve_path/get_resources is registered and routes
+//! through the unified relay — an unknown Computer yields a flat ErrorPayload(404) ack (proves
+//! registration + routing).
 
 #[path = "test_utils.rs"]
 mod test_utils;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -113,6 +115,18 @@ async fn test_skill_channel_relays_route_flat_404() {
     )
     .await;
 
+    // client:resolve_path（v0.5.0，protocol#65）
+    assert_flat_404(
+        &agent,
+        "client:resolve_path",
+        json!(ResolvePathReq {
+            base: base(),
+            computer: "nonexistent".to_string(),
+            path: "/tmp/x".to_string(),
+        }),
+    )
+    .await;
+
     // client:get_resources
     assert_flat_404(
         &agent,
@@ -127,5 +141,105 @@ async fn test_skill_channel_relays_route_flat_404() {
     .await;
 
     agent.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// 证明 `on_client_resolve_path` 真正以 `client:resolve_path` 转发（若复制粘贴成 `client:get_blob`
+/// 本用例会红：Computer 桩收不到事件、Agent 拿不到 ack），且请求载荷与 ack 裸透传。
+#[tokio::test]
+async fn test_resolve_path_relay_forwards_event_and_payload() {
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+
+    let received = Arc::new(Mutex::new(None::<Value>));
+    let received_clone = Arc::clone(&received);
+    let computer = create_client_with_handler(
+        &server_url,
+        "smcp",
+        "client:resolve_path",
+        move |payload, client| {
+            let received = Arc::clone(&received_clone);
+            Box::pin(async move {
+                let ack_id = match &payload {
+                    Payload::Text(_, ack_id) => *ack_id,
+                    #[allow(deprecated)]
+                    Payload::String(_, ack_id) => *ack_id,
+                    Payload::Binary(_, _) => None,
+                };
+                let Some(value) = payload_json(&payload) else {
+                    return;
+                };
+                *received.lock().unwrap() = Some(value.clone());
+                if let Some(id) = ack_id {
+                    let _ = client
+                        .ack_with_id(
+                            id,
+                            json!({
+                                "canonical_path": value["path"],
+                                "blob_handle": "opaque-handle",
+                                "mime_type": "text/plain",
+                                "total_size": 0,
+                                "sha256": "abc123",
+                                "mtime": 0,
+                                "req_id": value["req_id"],
+                            }),
+                        )
+                        .await;
+                }
+            })
+        },
+    )
+    .await;
+    join_office(&computer, Role::Computer, "office1", "computer1").await;
+
+    let agent = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(100)).await;
+    join_office(&agent, Role::Agent, "office1", "agent1").await;
+    sleep(Duration::from_millis(100)).await;
+
+    let req = ResolvePathReq {
+        base: AgentCallData {
+            agent: "agent1".to_string(),
+            req_id: ReqId("rp1".to_string()),
+        },
+        computer: "computer1".to_string(),
+        path: "/tmp/authorized.txt".to_string(),
+    };
+    let (tx, rx) = oneshot::channel::<Value>();
+    agent
+        .emit_with_ack(
+            "client:resolve_path",
+            json!(req),
+            Duration::from_secs(5),
+            ack_to_sender(tx, |p| match p {
+                Payload::Text(mut values, _) => values.pop().unwrap_or(Value::Null),
+                _ => Value::Null,
+            }),
+        )
+        .await
+        .expect("emit resolve_path");
+    let ack = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("ack timeout")
+        .unwrap();
+    let body = ack
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(ack);
+    assert_eq!(body["canonical_path"], "/tmp/authorized.txt");
+    assert_eq!(body["req_id"], "rp1");
+
+    let forwarded = received
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("computer stub must receive client:resolve_path");
+    assert_eq!(forwarded["path"], "/tmp/authorized.txt");
+    assert_eq!(forwarded["computer"], "computer1");
+    assert_eq!(forwarded["req_id"], "rp1");
+
+    agent.disconnect().await.unwrap();
+    computer.disconnect().await.unwrap();
     server.shutdown();
 }

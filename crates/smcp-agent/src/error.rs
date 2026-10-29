@@ -51,7 +51,7 @@ pub enum SmcpAgentError {
     #[error("协议错误: 房 {office_id} 报告了 {count} 台 Computer（每 role 一席下至多 1 台）")]
     TooManyComputersInOffice { office_id: String, count: usize },
 
-    /// 对端经 `client:*` ack 回传的协议级 flat ErrorPayload（404 / 4006–4018），由
+    /// 对端经 `client:*` ack 回传的协议级 flat ErrorPayload（404 / 4006–4020），由
     /// [`crate::protocol_error::raise_for_error_payload`] 解析。**装箱**以避免 `result_large_err`
     /// 污染所有 `Result<_, SmcpAgentError>`（同 [`Self::Network`] / [`Self::Serialization`] 模式）。
     #[error("协议错误: {0}")]

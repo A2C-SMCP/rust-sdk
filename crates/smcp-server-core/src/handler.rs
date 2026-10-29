@@ -582,6 +582,33 @@ impl SmcpHandler {
             },
         );
 
+        // v0.5.0 protocol#65：client:resolve_path 按路径读取（与 get_blob 同构：按 computer 透传）。
+        let state_resolve_path = state.clone();
+        socket.on(
+            smcp::events::CLIENT_RESOLVE_PATH,
+            move |socket: SocketRef,
+                  ack: AckSender,
+                  TryData::<SingleArg<ResolvePathReq>>(data)| async move {
+                match data {
+                    Ok((data,)) => {
+                        match Self::on_client_resolve_path(
+                            socket,
+                            data,
+                            state_resolve_path.clone(),
+                        )
+                        .await
+                        {
+                            Ok(payload) => {
+                                let _ = ack.send(&payload);
+                            }
+                            Err(e) => warn!("client:resolve_path relay rejected, no ack: {e}"),
+                        }
+                    }
+                    Err(_) => Self::ack_bad_request(ack),
+                }
+            },
+        );
+
         let state_get_resources = state.clone();
         socket.on(
             smcp::events::CLIENT_GET_RESOURCES,
@@ -1487,6 +1514,25 @@ impl SmcpHandler {
             &data.computer,
             &data,
             smcp::events::CLIENT_PUT_BLOB,
+            &state,
+            tokio::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// 透明转发 `client:resolve_path` 至目标 Computer（Server 不解析路径；Computer 的 4020
+    /// flat ErrorPayload 原样回传，与 `get_blob` 同构）/ relay `client:resolve_path`
+    /// (v0.5.0 protocol#65).
+    async fn on_client_resolve_path(
+        socket: SocketRef,
+        data: ResolvePathReq,
+        state: ServerState,
+    ) -> Result<Value, HandlerError> {
+        Self::relay_client_call(
+            &socket,
+            &data.computer,
+            &data,
+            smcp::events::CLIENT_RESOLVE_PATH,
             &state,
             tokio::time::Duration::from_secs(30),
         )

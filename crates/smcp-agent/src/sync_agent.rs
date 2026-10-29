@@ -17,7 +17,7 @@ use crate::{
 };
 use smcp::{
     utils::blob::PutBlobResult, A2CSkillRef, GetBlobRet, GetComputerConfigRet, GetResourcesRet,
-    GetSkillRet, SMCPTool, SessionInfo,
+    GetSkillRet, ResolvePathRet, SMCPTool, SessionInfo,
 };
 use tokio::runtime::Runtime;
 
@@ -152,6 +152,14 @@ impl SyncSmcpAgent {
             chunk_offset,
             max_chunk_bytes,
         ))
+    }
+
+    /// 按路径读取（v0.5.0，protocol#65，同步）/ Resolve a local path (sync).
+    ///
+    /// 阻塞包装 [`AsyncSmcpAgent::resolve_path`]；错误面与 async 版一致（4020 → 协议错误）。
+    pub fn resolve_path(&self, computer: &str, path: &str) -> Result<ResolvePathRet> {
+        self.runtime
+            .block_on(self.async_agent.resolve_path(computer, path))
     }
 
     /// 上行落盘到 Computer landing root（v0.4.0 #195，同步）/ Upload bytes to the landing root (sync)。
