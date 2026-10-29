@@ -20,6 +20,8 @@ use hyper::body::Bytes;
 use smcp_server_core::{DefaultAuthenticationProvider, SessionManager, SmcpServerBuilder};
 use tower::{Layer, Service};
 
+const TEST_COMPUTER_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
 async fn find_available_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().port()
@@ -344,6 +346,7 @@ async fn test_update_notifications_and_role_checks() {
             smcp::events::SERVER_JOIN_OFFICE,
             serde_json::json!({
                 "role": "computer",
+                "computer_id": TEST_COMPUTER_ID,
                 "name": "comp_a",
                 "office_id": "shared_office"
             }),
@@ -629,6 +632,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             smcp::events::SERVER_JOIN_OFFICE,
             serde_json::json!({
                 "role": "computer",
+                "computer_id": TEST_COMPUTER_ID,
                 "name": "c1",
                 "office_id": "office1"
             }),

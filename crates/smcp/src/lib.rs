@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 /// 基础设施工具模块 / Infrastructure utilities（原子 IO / 环境变量 / 路径；治理层 SET/SKL 共用）。
 pub mod utils;
+/// protocol#64：`computer_id` 规范形态谓词（Server 校验与 Computer 解析的**单一权威**）。
+pub use utils::computer_id::{is_canonical_computer_id, MAX_UUID, NIL_UUID};
 
 /// SKILL name 解析与合成（段数消歧 lexer）/ SKILL name parse & synthesis (segment-count lexer)。
 pub mod skill_name;
@@ -201,9 +203,11 @@ pub enum ErrorCode {
     /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.BAD_REQUEST`）：房间事件与全部 `client:*` 路由在载荷
     /// 畸形时**必须**回本码，而非静默不 ack。
     BadRequest = 400,
-    /// 身份声明冲突：同一 sid 声明的 `role` / `name` 与既有会话不符 / Identity claim mismatch。
+    /// 身份声明冲突：同一 sid 声明的 `role` / `name` / `computer_id` 与既有会话不符 /
+    /// Identity claim mismatch。
     ///
-    /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.FORBIDDEN`）。**不**用于房间冲突——那是 `4101`–`4106`。
+    /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.FORBIDDEN`）。**不**用于房间冲突——那是
+    /// `4101`–`4106`。`computer_id` 自 v0.5.0（protocol#64）起纳入本码的触发条件。
     Forbidden = 403,
     /// 未预期内部异常（文案笼统，原文只进日志）/ Unexpected internal error。
     ///
@@ -479,7 +483,8 @@ pub fn build_computer_not_found_error(computer_name: &str) -> ErrorPayload {
 /// Type-level exclusion of the reserved codes `4102` / `4105`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoomRejectionCode {
-    /// `403`：同一 sid 的 `role` / `name` 声明与既有会话不符（身份声明冲突，非房间语义）。
+    /// `403`：同一 sid 的 `role` / `name` / `computer_id` 声明与既有会话不符
+    /// （身份声明冲突，非房间语义）。
     Forbidden,
     /// `4101`：目标房**该 role 的席位**已被其它会话占据（每 role 一席；`details.role` 标明席位）。
     RoomFull,
@@ -512,7 +517,8 @@ impl RoomRejectionCode {
     /// `role` 缺省时按 `agent` 席文案（防御性兜底；正常路径恒有 role）。
     ///
     /// `403` 例外：协议未给该码示例文案，本仓与 Python 参考实现自拟
-    /// `"Role or name mismatch with existing session"`，须同时覆盖 role 与 name 两半。
+    /// `"Role or name mismatch with existing session"`。该文案**同时承载** `computer_id`
+    /// 不一致（protocol#64 起纳入同一码）——措辞保持不变以维持与 Python 的逐字一致。
     /// 文案**恒为常量**——调用方无法拼接自身上下文，也就无法把内部错误类名或对端标识泄到线上。
     /// Canonical message; constant by construction.
     ///
@@ -1006,18 +1012,18 @@ pub struct EnterOfficeReq {
     pub office_id: String,
     /// Computer 稳定身份（v0.5.0 起，protocol#64）：`role="computer"` 时 MUST 携带，
     /// `role="agent"` 时 MUST NOT 出现该键（包含 `null`）。Agent 侧生产构造恒为 `None`，
-    /// 序列化即省略键；服务端强制校验由后续 PR 引入。
+    /// 序列化即省略键；Server 自 v0.5.0 起强制校验（缺失/形态非法/Agent 携带 ⇒ `400`）。
     ///
     /// **实现约束（Server 侧）**：`Option<String>` 反序列化会把「键缺失」与「键存在且为
-    /// `null`」都塌缩成 `None`，本字段无法区分两者。对 `role="agent"` 携带该键（含 `null`）
-    /// 回 `400` 的校验必须在原始 `Value` 上判 `contains_key`，不能依赖 `is_some()`。
+    /// `null`」都塌缩成 `None`，本字段无法区分两者。服务端对 `role="agent"` 携带该键（含
+    /// `null`）回 `400` 的校验在原始 `Value` 上判键存在性（`contains_key`），不依赖 `is_some()`。
     ///
     /// Stable Computer identity (v0.5.0, protocol#64): MUST be carried when `role="computer"`;
     /// MUST NOT appear for `role="agent"` (including `null`). Agent producers always set `None`,
-    /// which omits the key. Server-side enforcement lands in a later PR.
+    /// which omits the key. Enforcement is server-side since v0.5.0 (rejects with `400`).
     ///
     /// Implementation constraint: `Option<String>` collapses key-absent and key-present-null into
-    /// `None`. The agent-side `400` check MUST test key presence on the raw `Value`
+    /// `None`, so the server-side `400` check MUST test key presence on the raw `Value`
     /// (`contains_key`), not `is_some()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_id: Option<String>,
@@ -1185,14 +1191,12 @@ pub struct SessionInfo {
     /// Computer 稳定身份（v0.5.0 起，protocol#64）：`role="computer"` 时由 Server 保证存在，
     /// `role="agent"` 时省略该键。与展示名 `name` 解耦。
     ///
-    /// 分阶段落地：Rust Server 在 PR1 阶段对所有会话恒填 `None`（缺键）；自 PR3 起才按会话
-    /// 记录填充。在此之前下游不应把缺键解读为服务端违约。
+    /// Rust Server 自 v0.5.0 起对 Computer 会话按连接记录填充该字段；Agent 会话省略键。
     ///
     /// Stable Computer identity (v0.5.0, protocol#64): guaranteed present for `role="computer"`,
     /// omitted for `role="agent"`. Decoupled from the display name `name`.
     ///
-    /// Staged rollout: the in-repo Server emits `None` (key absent) for every session during PR1;
-    /// it starts filling the field from the session record in PR3.
+    /// The in-repo Server fills this from the per-connection record for Computer sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_id: Option<String>,
 }

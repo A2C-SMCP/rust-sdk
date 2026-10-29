@@ -46,6 +46,8 @@ impl AuthenticationProvider for NoAuthProvider {
 /// 测试服务器配置 - 使用 test_server 模块
 use test_server::TestServer;
 
+const TEST_COMPUTER_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
 // 旧的 TestServer 实现 - 已被 test_server 模块替代
 /*
 impl TestServer {
@@ -462,6 +464,7 @@ async fn test_agent_computer_join_office() {
     sleep(Duration::from_millis(100)).await;
     let computer_join_data = json!({
         "role": "computer",
+        "computer_id": TEST_COMPUTER_ID,
         "name": "test-computer",
         "office_id": "test-office-1"
     });
@@ -518,6 +521,7 @@ async fn test_list_room_sessions() {
     // Computer 加入办公室
     let comp1_data = json!({
         "role": "computer",
+        "computer_id": TEST_COMPUTER_ID,
         "name": "computer-1",
         "office_id": "office-list-test"
     });
@@ -594,7 +598,7 @@ async fn test_list_room_reports_a2c_version() {
         .await
         .unwrap();
 
-    let comp_join = json!({"role": "computer", "name": "computer-legacy", "office_id": office});
+    let comp_join = json!({"role": "computer", "name": "computer-legacy", "office_id": office, "computer_id": TEST_COMPUTER_ID});
     emit_event_with_ack_validation(&computer, "server:join_office", comp_join, true)
         .await
         .unwrap();
@@ -646,6 +650,7 @@ async fn test_computer_seat_taken() {
     sleep(Duration::from_millis(100)).await;
     let join_data1 = json!({
         "role": "computer",
+        "computer_id": TEST_COMPUTER_ID,
         "name": "same-name",
         "office_id": "office-conflict-test"
     });
@@ -665,6 +670,7 @@ async fn test_computer_seat_taken() {
     sleep(Duration::from_millis(100)).await;
     let join_data2 = json!({
         "role": "computer",
+        "computer_id": TEST_COMPUTER_ID,
         "name": "same-name",
         "office_id": "office-conflict-test"
     });
@@ -692,6 +698,7 @@ async fn test_computer_seat_taken() {
     sleep(Duration::from_millis(100)).await;
     let join_data3 = json!({
         "role": "computer",
+        "computer_id": TEST_COMPUTER_ID,
         "name": "different-name",
         "office_id": "office-conflict-test"
     });
@@ -756,6 +763,7 @@ async fn test_computer_leave_office_notification() {
     sleep(Duration::from_millis(100)).await;
     let comp_join = json!({
         "role": "computer",
+        "computer_id": TEST_COMPUTER_ID,
         "name": "computer-leave",
         "office_id": "office-leave-test"
     });

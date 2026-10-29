@@ -10,6 +10,30 @@
 
 #[cfg(test)]
 mod tests {
+
+    /// protocol#64：测试用稳定身份（服务端强制校验后，低层 Computer join 必须携带）。
+    const TEST_COMPUTER_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+    /// protocol#64：低层客户端测试构造——注入稳定身份。
+    /// 生产路径请用 `Computer::connect_socketio`（它会物化/复用持久化身份）。
+    async fn connect_low_level(
+        url: &str,
+        manager: Arc<RwLock<Option<MCPServerManager>>>,
+        computer_name: String,
+        auth_payload: Option<serde_json::Value>,
+        inputs: Arc<RwLock<HashMap<String, MCPServerInput>>>,
+        headers: Option<HashMap<String, String>>,
+    ) -> ComputerResult<SmcpComputerClient> {
+        let mut builder = SmcpComputerClientBuilder::new(url, manager, computer_name, inputs)
+            .computer_id(TEST_COMPUTER_ID);
+        if let Some(payload) = auth_payload {
+            builder = builder.auth_payload(payload);
+        }
+        if let Some(headers) = headers {
+            builder = builder.headers(headers);
+        }
+        builder.connect().await
+    }
     use async_trait::async_trait;
     use http_body_util::Full;
     use hyper::body::Bytes;
@@ -17,7 +41,7 @@ mod tests {
     use smcp_computer::errors::ComputerResult;
     use smcp_computer::mcp_clients::manager::MCPServerManager;
     use smcp_computer::mcp_clients::model::MCPServerInput;
-    use smcp_computer::socketio_client::SmcpComputerClient;
+    use smcp_computer::socketio_client::{SmcpComputerClient, SmcpComputerClientBuilder};
     use smcp_server_core::auth::{AuthError, AuthenticationProvider};
     use smcp_server_core::SmcpServerBuilder;
     use std::collections::HashMap;
@@ -152,7 +176,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client = SmcpComputerClient::new(
+        let client = connect_low_level(
             &server_url,
             manager.clone(),
             "test_computer".to_string(),
@@ -190,7 +214,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client = SmcpComputerClient::new(
+        let client = connect_low_level(
             &server_url,
             manager.clone(),
             "test_computer".to_string(),
@@ -239,7 +263,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client = SmcpComputerClient::new(
+        let client = connect_low_level(
             &server_url,
             manager.clone(),
             "test_computer".to_string(),
@@ -285,7 +309,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
 
         // 创建Socket.IO客户端
-        let client = SmcpComputerClient::new(
+        let client = connect_low_level(
             &server_url,
             manager.clone(),
             "test_computer".to_string(),
@@ -333,7 +357,7 @@ mod tests {
             let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
             let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
                 Arc::new(RwLock::new(HashMap::new()));
-            let client = SmcpComputerClient::new(
+            let client = connect_low_level(
                 &server_url,
                 manager,
                 format!("test_computer_{}", i),
@@ -381,7 +405,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
 
         // 创建第一个客户端连接
-        let client1 = SmcpComputerClient::new(
+        let client1 = connect_low_level(
             &server_url,
             manager1.clone(),
             "test_computer".to_string(),
@@ -408,7 +432,7 @@ mod tests {
         let manager2 = Arc::new(RwLock::new(Some(MCPServerManager::new())));
         let inputs2: Arc<RwLock<HashMap<String, MCPServerInput>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let client2 = SmcpComputerClient::new(
+        let client2 = connect_low_level(
             &server_url,
             manager2.clone(),
             "test_computer_reconnected".to_string(),
@@ -523,7 +547,7 @@ mod tests {
         custom_headers.insert("x-tenant-id".to_string(), "test-tenant-123".to_string());
 
         // 使用自定义 headers 创建客户端
-        let client = SmcpComputerClient::new(
+        let client = connect_low_level(
             &server_url,
             manager.clone(),
             "test_computer_headers".to_string(),

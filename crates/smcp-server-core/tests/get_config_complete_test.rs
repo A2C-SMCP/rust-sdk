@@ -179,7 +179,7 @@ async fn test_get_config_complete_flow() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
-        computer_id: None,
+        computer_id: Some("2e0d9b73-4f5c-4d6e-8a7b-9c0d1e2f3a40".to_string()),
     };
     computer_client
         .emit("server:join_office", json!(computer_join_req))

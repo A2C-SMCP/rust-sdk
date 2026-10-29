@@ -263,6 +263,43 @@ impl SmcpHandler {
         let _ = ack.send(&smcp::build_bad_request_error());
     }
 
+    /// protocol#64（v0.5.0）`computer_id` 的入房校验：**键存在性 + 形态**，全部在原始 `Value` 上完成。
+    ///
+    /// 规则（`data-structures.md` §EnterOfficeReq、`events.md` §server:join_office、protocol#74）：
+    /// - `role="computer"`：**MUST** 携带，且必须是**整串**匹配的规范小写 UUID（恰好 36 字符，
+    ///   连字符位于 8/13/18/23，其余为小写十六进制），不得为 nil / max；首尾空白或结尾换行即非法；
+    /// - `role="agent"`：**MUST NOT** 出现该键（出现即非法，**含**值为 `null`）。
+    ///
+    /// 任一违规 ⇒ `400`。缺 `role` / 非法 `role` 不在此判定（交给随后 typed 反序列化统一 `400`）。
+    /// Key presence and shape are validated on the raw JSON: an `Option<String>` collapses
+    /// "absent" and "present but null", which the protocol distinguishes.
+    // `ErrorPayload` 本身体积较大（232B）；此处按仓内约定用局部 `allow`，不装箱（错误出口唯一，
+    // 装箱只会给每次调用加一次分配）。
+    #[allow(clippy::result_large_err)]
+    fn validate_join_computer_id(value: &Value) -> Result<(), smcp::ErrorPayload> {
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+        let declared = object.get("computer_id");
+        match object.get("role").and_then(Value::as_str) {
+            Some("computer") => match declared {
+                Some(Value::String(computer_id)) if smcp::is_canonical_computer_id(computer_id) => {
+                    Ok(())
+                }
+                _ => Err(smcp::build_bad_request_error()),
+            },
+            Some("agent") => {
+                if declared.is_some() {
+                    // 含 `null`：键存在即违规（场景 #11/#20）。
+                    Err(smcp::build_bad_request_error())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// 注册所有事件处理器
     pub fn register_handlers(io: &SocketIo, state: ServerState) {
         // 注册命名空间和连接处理器
@@ -308,21 +345,30 @@ impl SmcpHandler {
             smcp::events::SERVER_JOIN_OFFICE,
             move |socket: SocketRef, TryData::<SingleArg<Value>>(data), ack: AckSender| async move {
                 match data {
-                    Ok((value,)) => match serde_json::from_value::<EnterOfficeReq>(value) {
-                        Ok(data) => {
-                            match Self::on_server_join_office(socket, data, state_join.clone())
-                                .await
-                            {
-                                Ok(()) => {
-                                    let _ = ack.send(&EmptyAck);
-                                }
-                                Err(error) => {
-                                    let _ = ack.send(&error);
+                    Ok((value,)) => {
+                        // protocol#64：`computer_id` 的**键存在性**与形态必须先在原始 `Value` 上判定
+                        // ——`Option<String>` 反序列化无法区分「缺键」与「键存在且为 null」
+                        // （room-model 场景 #10/#11/#20）。
+                        if let Err(payload) = Self::validate_join_computer_id(&value) {
+                            let _ = ack.send(&payload);
+                            return;
+                        }
+                        match serde_json::from_value::<EnterOfficeReq>(value) {
+                            Ok(data) => {
+                                match Self::on_server_join_office(socket, data, state_join.clone())
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        let _ = ack.send(&EmptyAck);
+                                    }
+                                    Err(error) => {
+                                        let _ = ack.send(&error);
+                                    }
                                 }
                             }
+                            Err(_) => Self::ack_bad_request(ack),
                         }
-                        Err(_) => Self::ack_bad_request(ack),
-                    },
+                    }
                     Err(_) => Self::ack_bad_request(ack),
                 }
             },
@@ -689,7 +735,8 @@ impl SmcpHandler {
                         office_id: office_id.clone(),
                         computer: Some(session.name),
                         agent: None,
-                        computer_id: None,
+                        // protocol#64：Computer 断连的 leave 通知回显记录身份；Agent 省略键。
+                        computer_id: session.computer_id,
                     }
                 } else {
                     LeaveOfficeNotification {
@@ -769,6 +816,40 @@ impl SmcpHandler {
             )));
         }
 
+        // protocol#64：`computer_id` 在同一连接内不可变。记录时机 = **首次身份校验通过**——
+        // `400`（形态，dispatcher 已判）与 `403`（role/name，上方）之后、`4106`/`4101`（席位）
+        // 之前；故本次 join 随后被席位拒绝时记录仍然保留。`400` 与 `403` 的先后由上方顺序保证。
+        // 「一致性校验 + 记录」由 `SessionManager` 在同一临界区内完成（协议 MUST 原子）。
+        if let Err(error) = state
+            .session_manager
+            .record_or_verify_computer_id(&sid, data.computer_id.as_deref())
+        {
+            let recorded = state
+                .session_manager
+                .get_session(&sid)
+                .and_then(|session| session.computer_id);
+            warn!(
+                sid = %sid,
+                session_computer_id = ?recorded,
+                request_computer_id = ?data.computer_id,
+                "server:join_office computer_id claim rejected: {}",
+                error
+            );
+            // 错误分类：只有「同一 sid 改值」是协议语义的 `403`；其余（`InvalidState` 等内部
+            // 不变量破坏）走统一出口 ⇒ `500 Internal error`，不得伪装成身份冲突 403。
+            return Err(Box::new(match &error {
+                SessionError::ComputerIdMismatch { .. } => smcp::build_room_rejection_error(
+                    smcp::RoomRejectionCode::Forbidden,
+                    smcp::RoomRejectionContext::default(),
+                ),
+                other => Self::room_rejection(other, &data.office_id),
+            }));
+        }
+
+        // 刷新权威会话快照：上面的 `session` 取自**记录之前**（首次 join 时 `computer_id` 尚未写入），
+        // 直接拿它回显会丢掉刚记录的身份。后续 `apply_join_room` / 通知都以刷新后的快照为准。
+        let session = state.session_manager.get_session(&sid).unwrap_or(session);
+
         // 入房事务：**校验 → 预留 → 提交**在单临界区内完成（`reserve_join`）。任何拒绝都在
         // **零成员关系副作用**时返回，故被拒客户端绝不留在目标房——否则它会持续收到该房的
         // `notify:*`，而 `list_room` 说它不在任何房（#226 P0-2 / P1-4 的原形成因）。
@@ -805,7 +886,9 @@ impl SmcpHandler {
                 office_id: data.office_id.clone(),
                 computer: Some(session_name.clone()),
                 agent: None,
-                computer_id: None,
+                // protocol#64：Computer 成员回显会话记录的身份（`record_or_verify` 已确保存在）；
+                // Agent 成员省略该键（`None` ⇒ 不序列化，不得发 `null`）。
+                computer_id: session.computer_id.clone(),
             }
         } else {
             EnterOfficeNotification {
@@ -857,7 +940,8 @@ impl SmcpHandler {
                     office_id: current_office.clone(),
                     computer: Some(session.name.clone()),
                     agent: None,
-                    computer_id: None,
+                    // protocol#64：显式 leave 回显记录身份；Agent 省略键。
+                    computer_id: session.computer_id.clone(),
                 }
             } else {
                 LeaveOfficeNotification {
@@ -950,6 +1034,12 @@ impl SmcpHandler {
                     declared_role: Some(role.clone().into()),
                     ..Default::default()
                 },
+            ),
+            // protocol#64：`computer_id` 在同一连接内不可变（`403`）。上游 `on_server_join_office`
+            // 已在席位校验前单独映射同码；此处兜底保持错误码口径一致。
+            SessionError::ComputerIdMismatch { .. } => smcp::build_room_rejection_error(
+                Code::Forbidden,
+                smcp::RoomRejectionContext::default(),
             ),
             // 会话不存在 / 状态非法属**内部**事故，不属房间语义：回笼统 500（协议空档内以通用码承载），
             // 原文只进日志。绝不把内部错误文本当房间拒绝文案上 wire。
@@ -1671,7 +1761,8 @@ impl SmcpHandler {
                 role: s.role.into(),
                 office_id: s.office_id.unwrap_or_default(),
                 a2c_version: s.a2c_version,
-                computer_id: None,
+                // protocol#64：Computer 会话回显记录身份；Agent 为 `None`（省略键）。
+                computer_id: s.computer_id,
             })
             .collect();
 
@@ -1730,7 +1821,8 @@ impl SmcpHandler {
                         office_id: leave_office.clone(),
                         computer: Some(session.name.clone()),
                         agent: None,
-                        computer_id: None,
+                        // protocol#64：自动换房的 leave 通知回显记录身份；Agent 省略键。
+                        computer_id: session.computer_id.clone(),
                     }
                 } else {
                     LeaveOfficeNotification {
@@ -1768,6 +1860,52 @@ mod tests {
     use super::*;
     use crate::auth::DefaultAuthenticationProvider;
     use serde_json;
+
+    /// protocol#64：`computer_id` 的**键存在性**在原始 `Value` 上判定——
+    /// Computer 必填，Agent 出现即非法（**含 `null`**），缺 role / 非法 role 交给 typed 反序列化。
+    #[test]
+    fn join_payload_computer_id_presence_rules() {
+        // Computer：缺失 / null / 非字符串 / 形态非法 ⇒ 400。
+        for invalid in [
+            serde_json::json!({"role": "computer", "name": "c", "office_id": "o"}),
+            serde_json::json!({"role": "computer", "name": "c", "office_id": "o", "computer_id": null}),
+            serde_json::json!({"role": "computer", "name": "c", "office_id": "o", "computer_id": 42}),
+            serde_json::json!({"role": "computer", "name": "c", "office_id": "o", "computer_id": "BAD"}),
+        ] {
+            assert!(
+                SmcpHandler::validate_join_computer_id(&invalid).is_err(),
+                "{invalid} 必须 400"
+            );
+        }
+        // Computer：合法值 ⇒ 通过（含无换行的规范值）。
+        let ok = serde_json::json!({
+            "role": "computer", "name": "c", "office_id": "o",
+            "computer_id": "0f8fad5b-d9cb-469f-a165-70867728950e"
+        });
+        assert!(SmcpHandler::validate_join_computer_id(&ok).is_ok());
+
+        // Agent：省略键 ⇒ 通过；出现键（含 null）⇒ 400。
+        let agent_ok = serde_json::json!({"role": "agent", "name": "a", "office_id": "o"});
+        assert!(SmcpHandler::validate_join_computer_id(&agent_ok).is_ok());
+        for invalid in [
+            serde_json::json!({"role": "agent", "name": "a", "office_id": "o", "computer_id": null}),
+            serde_json::json!({"role": "agent", "name": "a", "office_id": "o", "computer_id": "x"}),
+        ] {
+            assert!(
+                SmcpHandler::validate_join_computer_id(&invalid).is_err(),
+                "{invalid} 必须 400"
+            );
+        }
+
+        // 缺 role / 非法 role / 非对象：不在本层判定（typed 反序列化统一 400）。
+        for deferred in [
+            serde_json::json!({"name": "x", "office_id": "o", "computer_id": null}),
+            serde_json::json!({"role": "robot", "name": "x", "office_id": "o"}),
+            serde_json::json!(["not", "an", "object"]),
+        ] {
+            assert!(SmcpHandler::validate_join_computer_id(&deferred).is_ok());
+        }
+    }
 
     #[tokio::test]
     async fn test_agent_join_office() {

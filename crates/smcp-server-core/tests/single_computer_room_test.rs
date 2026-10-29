@@ -169,7 +169,7 @@ async fn scenario_1_second_computer_rejected_members_unchanged() {
 
     let rejection = emit_join_for_ack(
         &computer2,
-        json!({"role": "computer", "name": "C2", "office_id": "R1"}),
+        json!({"role": "computer", "name": "C2", "office_id": "R1", "computer_id": TEST_COMPUTER_ID}),
     )
     .await;
     assert_eq!(rejection["code"], smcp::error_codes::ROOM_FULL);
@@ -213,7 +213,7 @@ async fn scenario_2_same_name_second_computer_returns_4101_not_4105() {
 
     let rejection = emit_join_for_ack(
         &computer2,
-        json!({"role": "computer", "name": "same-name", "office_id": "R1"}),
+        json!({"role": "computer", "name": "same-name", "office_id": "R1", "computer_id": TEST_COMPUTER_ID}),
     )
     .await;
 
@@ -256,7 +256,7 @@ async fn scenario_3_idempotent_rejoin_does_not_rebroadcast() {
     // 同一会话重复 join：空 ack，且不得再广播。
     let ack = emit_join_for_ack(
         &computer1,
-        json!({"role": "computer", "name": "C1", "office_id": "R1"}),
+        json!({"role": "computer", "name": "C1", "office_id": "R1", "computer_id": TEST_COMPUTER_ID}),
     )
     .await;
     assert_empty_ack(&ack, "同一会话重复 server:join_office");
@@ -299,7 +299,7 @@ async fn scenario_4_rejected_switch_keeps_old_room_and_no_leave_broadcast() {
 
     let rejection = emit_join_for_ack(
         &computer2,
-        json!({"role": "computer", "name": "C2", "office_id": "R1"}),
+        json!({"role": "computer", "name": "C2", "office_id": "R1", "computer_id": TEST_COMPUTER_ID}),
     )
     .await;
     assert_eq!(rejection["code"], smcp::error_codes::ROOM_FULL);
@@ -345,7 +345,7 @@ async fn scenario_6_switch_into_occupied_room_keeps_current_membership() {
 
     let rejection = emit_join_for_ack(
         &computer1,
-        json!({"role": "computer", "name": "C1", "office_id": "R2"}),
+        json!({"role": "computer", "name": "C1", "office_id": "R2", "computer_id": TEST_COMPUTER_ID}),
     )
     .await;
     assert_eq!(rejection["code"], smcp::error_codes::ROOM_FULL);
@@ -491,11 +491,11 @@ async fn scenario_8_concurrent_joins_admit_exactly_one_computer() {
     let (ack1, ack2) = tokio::join!(
         emit_join_for_ack(
             &computer1,
-            json!({"role": "computer", "name": "C1", "office_id": "R1"})
+            json!({"role": "computer", "name": "C1", "office_id": "R1", "computer_id": TEST_COMPUTER_ID})
         ),
         emit_join_for_ack(
             &computer2,
-            json!({"role": "computer", "name": "C2", "office_id": "R1"})
+            json!({"role": "computer", "name": "C2", "office_id": "R1", "computer_id": TEST_COMPUTER_ID})
         ),
     );
 
@@ -565,7 +565,7 @@ async fn scenario_9_auto_switch_broadcasts_both_sides() {
 
     let ack = emit_join_for_ack(
         &computer1,
-        json!({"role": "computer", "name": "C1", "office_id": "R2"}),
+        json!({"role": "computer", "name": "C1", "office_id": "R2", "computer_id": TEST_COMPUTER_ID}),
     )
     .await;
     assert_empty_ack(&ack, "Computer 自动换房");

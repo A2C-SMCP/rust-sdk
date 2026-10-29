@@ -40,6 +40,7 @@ async fn test_list_room_permission_validation() {
         "computer_1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office_1".to_string());
 
     // 注册会话
@@ -152,6 +153,7 @@ async fn test_office_id_permissions() {
         "test_computer".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id(office_id.clone());
 
     // 注册会话

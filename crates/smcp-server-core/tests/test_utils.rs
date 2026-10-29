@@ -308,6 +308,9 @@ pub fn create_atomic_handler(
     }
 }
 
+/// protocol#64：测试用稳定 `computer_id`（协议不做重复检测，多个测试 Computer 可共用）。
+pub const TEST_COMPUTER_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
 /// 加入办公室的辅助函数
 pub async fn join_office(
     client: &tf_rust_socketio::asynchronous::Client,
@@ -315,11 +318,15 @@ pub async fn join_office(
     office_id: &str,
     name: &str,
 ) {
-    let join_req = json!({
+    let mut join_req = json!({
         "role": role.to_string(),
         "office_id": office_id,
         "name": name
     });
+    if matches!(role, Role::Computer) {
+        // protocol#64：Computer 入房 MUST 携带 `computer_id`（Agent MUST NOT 携带）。
+        join_req["computer_id"] = json!(TEST_COMPUTER_ID);
+    }
 
     // 使用 emit_with_ack 确保服务器处理了请求
     let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();

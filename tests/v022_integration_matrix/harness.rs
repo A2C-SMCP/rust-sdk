@@ -9,7 +9,7 @@
 //! 端口均取 `127.0.0.1:0` 临时口；每测试独立 server + Computer + TempDir，可并行。
 
 /// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
-/// PR3 统一抽共享 helper；此前 `#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+/// 后续统一抽共享 helper（本批未含）；`#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
 #[allow(dead_code)]
 fn isolated_config_env(
     base: impl AsRef<std::path::Path>,
@@ -387,13 +387,21 @@ fn ack_cb(
     }
 }
 
+/// protocol#64：e2e 测试用稳定 `computer_id`（协议不做重复检测）。
+pub const TEST_COMPUTER_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
 /// join_office（断言成功）。
 pub async fn join(client: &Client, role: Role, office: &str, name: &str) {
+    let mut payload = json!({ "role": role.to_string(), "office_id": office, "name": name });
+    if matches!(role, Role::Computer) {
+        // protocol#64：Computer 入房 MUST 携带 `computer_id`（Agent MUST NOT 携带）。
+        payload["computer_id"] = json!(TEST_COMPUTER_ID);
+    }
     let (tx, rx) = oneshot::channel::<Value>();
     client
         .emit_with_ack(
             "server:join_office",
-            json!({ "role": role.to_string(), "office_id": office, "name": name }),
+            payload,
             Duration::from_secs(15),
             ack_cb(tx),
         )

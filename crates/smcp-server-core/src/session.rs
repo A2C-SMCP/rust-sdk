@@ -22,6 +22,18 @@ pub enum SessionError {
     /// 由 `details.role`（取自本变体）标明被占席位。[`SessionError::error_code`] 映射为 `4101`。
     #[error("Seat already taken in room for role {0:?}")]
     SeatTaken(ClientRole),
+    /// protocol#64：同一 sid 在**同一连接**内声明了不同的 `computer_id`（协议 `403`）。
+    ///
+    /// 记录随连接存续、`leave_office` 不清除——改身份须新建连接。
+    #[error(
+        "computer_id is immutable within a connection: recorded {recorded}, requested {requested}"
+    )]
+    ComputerIdMismatch {
+        /// 会话首次记录的值 / the value recorded for this session.
+        recorded: String,
+        /// 本次 join 声明的值 / the value declared by this join.
+        requested: String,
+    },
     #[error("Invalid session state: {0}")]
     InvalidState(String),
 }
@@ -33,7 +45,10 @@ impl SessionError {
             SessionError::NotFound(_) => smcp::error_codes::NOT_FOUND,
             SessionError::AgentAlreadyInRoom(_) => smcp::error_codes::ALREADY_IN_ROOM,
             SessionError::SeatTaken(_) => smcp::error_codes::ROOM_FULL,
-            SessionError::InvalidState(_) => smcp::error_codes::BAD_REQUEST,
+            SessionError::ComputerIdMismatch { .. } => smcp::error_codes::FORBIDDEN,
+            // 内部不变量破坏（非客户端载荷问题）：与 handler 的 `room_rejection` 口径一致，
+            // 统一为内部错误 500（`BAD_REQUEST` 会误导调用方以为可以改载荷重试）。
+            SessionError::InvalidState(_) => smcp::error_codes::INTERNAL_ERROR,
         }
     }
 }
@@ -88,6 +103,14 @@ pub struct SessionData {
     /// 对齐 Python `session["a2c_version"]`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2c_version: Option<String>,
+    /// protocol#64：Computer 稳定身份。在该会话（sid）**首次 join 通过身份校验**时记录
+    /// （`400`/`403` 之后、`4106`/`4101` 之前），随连接存续、`leave_office` 不清除；
+    /// 同一 sid 之后声明不同值 ⇒ `403`。Agent 会话恒为 `None`。
+    ///
+    /// Stable Computer identity, recorded on the first identity-checked join and immutable for
+    /// the lifetime of the connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
     /// 其他扩展数据
     pub extra: serde_json::Value,
 }
@@ -101,6 +124,7 @@ impl SessionData {
             role,
             office_id: None,
             a2c_version: None,
+            computer_id: None,
             extra: serde_json::Value::Object(Default::default()),
         }
     }
@@ -117,10 +141,46 @@ impl SessionData {
         self
     }
 
+    /// protocol#64：设置 Computer 稳定身份。
+    ///
+    /// 生产路径经 [`SessionManager::record_or_verify_computer_id`] 在首次 join 时记录；
+    /// 本构造器供**测试/内部布置**使用（集成测试亦经此布置房间态；`reserve_join` 会拒绝无身份的
+    /// Computer 会话，`register_session` 拒绝在房无身份的 Computer）。
+    pub fn with_computer_id(mut self, computer_id: impl Into<String>) -> Self {
+        self.computer_id = Some(computer_id.into());
+        self
+    }
+
     /// 设置扩展数据
     pub fn with_extra(mut self, extra: serde_json::Value) -> Self {
         self.extra = extra;
         self
+    }
+
+    /// protocol#64 身份不变量（`register_session` / `reserve_join` 共用）：
+    ///
+    /// - Agent 会话 **MUST NOT** 携带 `computer_id`（`400` 由 dispatcher 前置拒绝，此处是纵深防御）；
+    /// - 任何已记录的值 **MUST** 通过 [`smcp::is_canonical_computer_id`]（单一权威形态）；
+    /// - Computer 会话**在房**、或**即将入房**（`about_to_join`）时 **MUST** 已有 `computer_id`。
+    ///   首次 join 前（无房、未入房）可暂缺——`record_or_verify_computer_id` 会在席位校验前记录。
+    fn validate_identity_invariants(&self, about_to_join: bool) -> Result<(), SessionError> {
+        if let Some(computer_id) = self.computer_id.as_deref() {
+            if self.role == ClientRole::Agent {
+                return Err(SessionError::InvalidState(
+                    "agent session must not carry computer_id".to_string(),
+                ));
+            }
+            if !smcp::is_canonical_computer_id(computer_id) {
+                return Err(SessionError::InvalidState(
+                    "computer_id is not a canonical UUID".to_string(),
+                ));
+            }
+        } else if self.role == ClientRole::Computer && (about_to_join || self.office_id.is_some()) {
+            return Err(SessionError::InvalidState(
+                "computer session joining or in a room must carry computer_id".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -225,6 +285,7 @@ impl SessionManager {
     /// [`Self::reserve_join`] 获得；既有测试用它直接布置房间态。
     pub fn register_session(&self, session: SessionData) -> Result<(), SessionError> {
         let _guard = self.transition();
+        // 幂等优先：同一 sid 重复注册一律 `Ok` 且保留原记录（不校验**新入参**的身份不变量）。
         if let Some(existing) = self.sessions.get(&session.sid) {
             tracing::debug!(
                 "Session {} already registered as {}/{}; keeping the existing identity",
@@ -234,6 +295,9 @@ impl SessionManager {
             );
             return Ok(());
         }
+
+        // protocol#64 结构保证（新记录）：Computer 在房必带规范身份、Agent 不得带身份。
+        session.validate_identity_invariants(false)?;
 
         self.sessions.insert(session.sid.clone(), session.clone());
 
@@ -284,6 +348,63 @@ impl SessionManager {
         created
     }
 
+    /// protocol#64：校验并**原子记录** `computer_id`（同一 sid 一次连接内不可变）。
+    ///
+    /// 调用时机由 handler 保证：`400`（形态）与 `403`（role/name）之后、`4106`/`4101`（席位）之前——
+    /// 因此「本次 join 随后被席位拒绝」时记录仍然保留（协议 room-model #13 注记）。
+    ///
+    /// - 已有记录且本次声明不同 ⇒ [`SessionError::ComputerIdMismatch`]（`403`），记录不变；
+    /// - 无记录且本次带值（Computer 首次通过身份校验）⇒ 写入；
+    /// - Agent（本次 `None`）不写入任何值。
+    ///
+    /// 「一致性校验 + 记录」在同一 `transition` 临界区完成，对同一 sid **原子**
+    /// （协议 MUST：并发同 sid 首写至多一者被记录，其余 `403`）。
+    pub fn record_or_verify_computer_id(
+        &self,
+        sid: &SessionId,
+        computer_id: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let _guard = self.transition();
+        let Some(requested) = computer_id else {
+            // Agent 会话（server 已按 400 拒绝带键的 Agent）不记录任何值。
+            return Ok(());
+        };
+        let Some(mut session) = self.sessions.get(sid).map(|s| s.clone()) else {
+            // 与断连并发：会话已被 `unregister_session` 清除。此时无法记录也不该假装成功——
+            // 打日志供诊断，调用方的 join 随后会因 `reserve_join` 的 `NotFound` 走内部错误路径。
+            tracing::warn!(
+                sid = %sid,
+                "record_or_verify_computer_id: session vanished before identity claim"
+            );
+            return Ok(());
+        };
+        // 写入边界护栏（纵深防御；dispatcher 已按 400 拒绝非法形态、Agent 携带）：
+        // - 只有 Computer 会话可以记录身份；
+        // - 值必须通过 protocol#74 的规范形态（`smcp::is_canonical_computer_id`，单一权威）。
+        if session.role != ClientRole::Computer {
+            return Err(SessionError::InvalidState(
+                "agent session cannot carry computer_id".to_string(),
+            ));
+        }
+        if !smcp::is_canonical_computer_id(requested) {
+            return Err(SessionError::InvalidState(
+                "computer_id is not a canonical UUID".to_string(),
+            ));
+        }
+        match session.computer_id.as_deref() {
+            Some(recorded) if recorded != requested => Err(SessionError::ComputerIdMismatch {
+                recorded: recorded.to_string(),
+                requested: requested.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                session.computer_id = Some(requested.to_string());
+                self.sessions.insert(session.sid.clone(), session);
+                Ok(())
+            }
+        }
+    }
+
     /// 入房事务：**校验 → 提交**全部在一次临界区内完成。
     ///
     /// 取代原先「扫描既有会话 + `update_office_id` 写入」的两步式——两步式在两次调用之间给了并发
@@ -308,8 +429,14 @@ impl SessionManager {
     /// **席位检查 + 占席对同一 `office_id` 原子**（注记 3）：二者同处本次 `transition()` 临界区，故并发
     /// 加入空房仅一者通过（恰一个 `4101`，场景 #8）。失败路径在任何写入之前返回，绝不留下半提交状态。
     ///
+    /// **错误契约（protocol#64）**：`role = Computer` 且会话尚无 `computer_id` ⇒
+    /// [`SessionError::InvalidState`]（内部不变量破坏，`error_code()` 为 `500`）。生产路径先经
+    /// [`Self::record_or_verify_computer_id`] 记录身份再调用本方法，故该分支只会在公开 API 被
+    /// 直接误用时出现。Agent 会话不受影响。
+    ///
     /// Validate-then-commit as one atomic step; the per-role seat check runs before any write and,
-    /// for Computers, before the auto-leave side effect.
+    /// for Computers, before the auto-leave side effect. A Computer session without a recorded
+    /// `computer_id` is an internal invariant violation (`InvalidState`, code 500).
     pub fn reserve_join(
         &self,
         sid: &SessionId,
@@ -322,6 +449,11 @@ impl SessionManager {
             .map(|s| s.clone())
             .ok_or_else(|| SessionError::NotFound(sid.clone()))?;
         let previous_office = session.office_id.clone();
+
+        // protocol#64 结构保证（与 `register_session` 共用同一不变量校验）：Computer 在房必带
+        // 规范身份、Agent 不得带身份、已记录值必须是规范形态。校验从 handler 下沉到本 API——
+        // 公开入口（`register_session` + `reserve_join`）不能再构造违约会话。
+        session.validate_identity_invariants(true)?;
 
         // 席位闸门：目标房该 role 的席位已被**其它会话**占据 ⇒ 4101（自会话由 Noop 分支先行短路）。
         // 判据是「每 role 一席」本身，与 name 无关（protocol#66；`(office_id, role, name)` 唯一性由
@@ -522,6 +654,9 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    /// protocol#64：测试用稳定 `computer_id`（`reserve_join` 要求 Computer 会话已有记录）。
+    const TEST_CID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
     #[test]
     fn test_session_registration() {
         let manager = SessionManager::new();
@@ -539,6 +674,251 @@ mod tests {
         // 房内解析（`get_computer_sid_in_office`）以外的全局按名查找已删除（#226 复审 🟡1）：
         // 名字解析 MUST 限定在会话所在房内，故这里只能断言记录本身。
         assert_eq!(manager.get_all_sessions().len(), 1);
+    }
+
+    /// protocol#64：`computer_id` 首记一次、同 sid 改值 403、同值幂等；Agent 不记录。
+    #[test]
+    fn computer_id_is_recorded_once_and_immutable() {
+        let manager = SessionManager::new();
+        let sid = Uuid::new_v4().to_string();
+        manager.get_or_register_session(sid.clone(), "c".to_string(), ClientRole::Computer, None);
+        let x = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let y = "1d9c8a62-3e4b-4c5d-9f6a-7b8c9d0e1f20";
+
+        manager.record_or_verify_computer_id(&sid, Some(x)).unwrap();
+        assert_eq!(
+            manager.get_session(&sid).unwrap().computer_id.as_deref(),
+            Some(x)
+        );
+
+        // 同值幂等：不报错、记录不变。
+        manager.record_or_verify_computer_id(&sid, Some(x)).unwrap();
+
+        // 改值 ⇒ 403 变体；记录保持首次的值。
+        match manager.record_or_verify_computer_id(&sid, Some(y)) {
+            Err(SessionError::ComputerIdMismatch {
+                recorded,
+                requested,
+            }) => {
+                assert_eq!(recorded, x);
+                assert_eq!(requested, y);
+            }
+            other => panic!("expected ComputerIdMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            manager.get_session(&sid).unwrap().computer_id.as_deref(),
+            Some(x)
+        );
+
+        // Agent 会话：传 None 不写入任何值。
+        let agent_sid = Uuid::new_v4().to_string();
+        manager.get_or_register_session(
+            agent_sid.clone(),
+            "a".to_string(),
+            ClientRole::Agent,
+            None,
+        );
+        manager
+            .record_or_verify_computer_id(&agent_sid, None)
+            .unwrap();
+        assert!(manager
+            .get_session(&agent_sid)
+            .unwrap()
+            .computer_id
+            .is_none());
+    }
+
+    /// protocol#64：`InvalidState`（内部不变量破坏）错误码统一为 500，与 handler 口径一致。
+    #[test]
+    fn invalid_state_maps_to_internal_error() {
+        assert_eq!(
+            SessionError::InvalidState("x".to_string()).error_code(),
+            smcp::error_codes::INTERNAL_ERROR
+        );
+    }
+
+    /// `register_session` 幂等：重复注册同一 sid 一律 `Ok` 且保留原记录（即便新入参本身违约）。
+    #[test]
+    fn register_session_is_idempotent_for_existing_sid() {
+        let manager = SessionManager::new();
+        manager
+            .register_session(
+                SessionData::new("sid-dup".to_string(), "c".to_string(), ClientRole::Computer)
+                    .with_computer_id(TEST_CID),
+            )
+            .unwrap();
+
+        // 重复注册：入参是「在房但无身份」的违约 Computer，仍必须幂等 Ok（保留原记录）。
+        manager
+            .register_session(
+                SessionData::new(
+                    "sid-dup".to_string(),
+                    "other".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_office_id("R1".to_string()),
+            )
+            .expect("重复注册必须幂等 Ok");
+
+        let stored = manager.get_session(&"sid-dup".to_string()).unwrap();
+        assert_eq!(stored.name, "c");
+        assert_eq!(stored.computer_id.as_deref(), Some(TEST_CID));
+    }
+
+    /// protocol#64 结构保证（守卫回归）：`reserve_join` 对「Computer 且无身份」回 `InvalidState`
+    /// 且**无房间副作用**；有身份的 Computer 正常入房；Agent 无身份不受影响（不误伤）。
+    #[test]
+    fn reserve_join_requires_computer_identity() {
+        let manager = SessionManager::new();
+
+        // Computer 无身份 ⇒ InvalidState。
+        manager
+            .register_session(SessionData::new(
+                "sid-c-no-id".to_string(),
+                "c-none".to_string(),
+                ClientRole::Computer,
+            ))
+            .unwrap();
+        match manager.reserve_join(&"sid-c-no-id".to_string(), "R1") {
+            Err(SessionError::InvalidState(reason)) => {
+                assert!(reason.contains("computer_id"), "{reason}");
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+        assert!(
+            manager
+                .get_session(&"sid-c-no-id".to_string())
+                .unwrap()
+                .office_id
+                .is_none(),
+            "守卫拒绝不得产生房间副作用"
+        );
+
+        // Computer 有身份 ⇒ 入房成功。
+        manager
+            .register_session(
+                SessionData::new(
+                    "sid-c-id".to_string(),
+                    "c-ok".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_computer_id(TEST_CID),
+            )
+            .unwrap();
+        manager
+            .reserve_join(&"sid-c-id".to_string(), "R2")
+            .expect("已记录身份的 Computer 必须可入房");
+
+        // Agent 无身份 ⇒ 正常入房（不误伤）。
+        manager
+            .register_session(SessionData::new(
+                "sid-a".to_string(),
+                "a-ok".to_string(),
+                ClientRole::Agent,
+            ))
+            .unwrap();
+        manager
+            .reserve_join(&"sid-a".to_string(), "R3")
+            .expect("Agent 无 computer_id 属于正常状态");
+    }
+
+    /// protocol#64 结构保证：`register_session` 拒绝「在房但无身份」的 Computer 会话；
+    /// 无房 Computer 允许先登记（首次 join 时才记录身份）。
+    #[test]
+    fn register_session_rejects_in_room_computer_without_identity() {
+        let manager = SessionManager::new();
+        let error = manager
+            .register_session(
+                SessionData::new("sid-x".to_string(), "c".to_string(), ClientRole::Computer)
+                    .with_office_id("R1".to_string()),
+            )
+            .expect_err("在房 Computer 无身份必须被拒绝");
+        assert!(matches!(error, SessionError::InvalidState(_)), "{error:?}");
+
+        manager
+            .register_session(SessionData::new(
+                "sid-y".to_string(),
+                "c2".to_string(),
+                ClientRole::Computer,
+            ))
+            .expect("无房 Computer 允许先登记");
+    }
+
+    /// protocol#64 写入边界护栏：`record_or_verify_computer_id` 拒绝 Agent 会话与非法形态
+    /// （纵深防御；dispatcher 已按 400 拒绝）。
+    #[test]
+    fn record_computer_id_rejects_agent_and_bad_shape() {
+        let manager = SessionManager::new();
+        let agent_sid = "sid-agent".to_string();
+        manager.get_or_register_session(
+            agent_sid.clone(),
+            "a".to_string(),
+            ClientRole::Agent,
+            None,
+        );
+        assert!(matches!(
+            manager.record_or_verify_computer_id(&agent_sid, Some(TEST_CID)),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(manager
+            .get_session(&agent_sid)
+            .unwrap()
+            .computer_id
+            .is_none());
+
+        let computer_sid = "sid-computer".to_string();
+        manager.get_or_register_session(
+            computer_sid.clone(),
+            "c".to_string(),
+            ClientRole::Computer,
+            None,
+        );
+        assert!(matches!(
+            manager.record_or_verify_computer_id(&computer_sid, Some("BAD")),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(manager
+            .get_session(&computer_sid)
+            .unwrap()
+            .computer_id
+            .is_none());
+    }
+
+    /// protocol#64：同一 sid 并发首写**原子**——8 个不同值同时首写，至多一者成功，其余全部
+    /// `ComputerIdMismatch`，且最终记录等于胜者。
+    #[test]
+    fn concurrent_computer_id_first_write_is_atomic() {
+        use std::sync::Barrier;
+
+        let manager = Arc::new(SessionManager::new());
+        let sid = Uuid::new_v4().to_string();
+        manager.get_or_register_session(sid.clone(), "c".to_string(), ClientRole::Computer, None);
+
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        let mut ids = Vec::new();
+        for i in 0..8u32 {
+            let id = format!("0000000{i}-1111-4111-8111-11111111111{i}");
+            ids.push(id.clone());
+            let manager = Arc::clone(&manager);
+            let sid = sid.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                manager.record_or_verify_computer_id(&sid, Some(&id))
+            }));
+        }
+
+        let mut winners = Vec::new();
+        for handle in handles {
+            if handle.join().unwrap().is_ok() {
+                winners.push(());
+            }
+        }
+        assert_eq!(winners.len(), 1, "并发首写必须恰有一者成功");
+
+        let recorded = manager.get_session(&sid).unwrap().computer_id.unwrap();
+        assert!(ids.contains(&recorded), "最终记录必须来自某个并发写者");
     }
 
     /// protocol#66（场景 #2 的单元版）：**同 role 同名**的第二个会话入房撞的是**席位规则**
@@ -559,17 +939,21 @@ mod tests {
                     "duplicate_name".to_string(),
                     ClientRole::Computer,
                 )
+                .with_computer_id(TEST_CID)
                 .with_office_id("office1".to_string()),
             )
             .unwrap();
 
         // 第二台 **同名** Computer 入房：席位被占 ⇒ 4101（SeatTaken(Computer)），不得是 4105。
         manager
-            .register_session(SessionData::new(
-                "sid-c2".to_string(),
-                "duplicate_name".to_string(),
-                ClientRole::Computer,
-            ))
+            .register_session(
+                SessionData::new(
+                    "sid-c2".to_string(),
+                    "duplicate_name".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_computer_id(TEST_CID),
+            )
             .unwrap();
         assert!(
             matches!(
@@ -596,11 +980,14 @@ mod tests {
 
         // 跨房同名也允许：另一台同名 Computer 入另一空房成功。
         manager
-            .register_session(SessionData::new(
-                "sid-c3".to_string(),
-                "duplicate_name".to_string(),
-                ClientRole::Computer,
-            ))
+            .register_session(
+                SessionData::new(
+                    "sid-c3".to_string(),
+                    "duplicate_name".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_computer_id(TEST_CID),
+            )
             .unwrap();
         assert!(
             manager
@@ -701,11 +1088,10 @@ mod tests {
             let sids = [format!("sid-a-{round}"), format!("sid-b-{round}")];
             for sid in &sids {
                 manager
-                    .register_session(SessionData::new(
-                        sid.clone(),
-                        "shared".to_string(),
-                        ClientRole::Computer,
-                    ))
+                    .register_session(
+                        SessionData::new(sid.clone(), "shared".to_string(), ClientRole::Computer)
+                            .with_computer_id(TEST_CID),
+                    )
                     .unwrap();
             }
 
@@ -752,6 +1138,7 @@ mod tests {
             "test_computer".to_string(),
             ClientRole::Computer,
         )
+        .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
         .with_office_id(office_id.clone());
 
         manager.register_session(session).unwrap();
@@ -958,11 +1345,10 @@ mod tests {
         let manager = SessionManager::new();
         let sid = "sid-ghost".to_string();
         manager
-            .register_session(SessionData::new(
-                sid.clone(),
-                "c-1".to_string(),
-                ClientRole::Computer,
-            ))
+            .register_session(
+                SessionData::new(sid.clone(), "c-1".to_string(), ClientRole::Computer)
+                    .with_computer_id(TEST_CID),
+            )
             .unwrap();
         manager.reserve_join(&sid, "office-old").unwrap();
 
