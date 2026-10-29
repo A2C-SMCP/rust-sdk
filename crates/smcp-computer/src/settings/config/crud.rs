@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use super::super::mcp_config::{workdir_mcp_config_path, workdir_mcp_local_config_path};
+use super::super::schema::FIELD_READ_ROOTS;
 use super::super::scope::{workdir_local_settings_path, workdir_project_settings_path, EnvMap};
 use super::super::store::{atomic_write_settings_json, with_settings_lock};
 use super::executor::{execute_write_plans, ExecutorError};
@@ -295,14 +296,34 @@ pub fn load_project_config_doc(config_dir: &Path) -> Result<ProjectConfigDoc, Co
 /// 把文档整体写到 `config_dir` 的 project 锚点（每个 `Some` 落盘、`None` 不触碰）/ wholesale-write the doc。
 ///
 /// **整体替换**语义（与 `update_config` 的实体级 fan-out 不同）：`Some(map)` 覆盖该文件、`None` 跳过（不建不删）。
+///
+/// #245 / protocol#65：project settings 层的 `readRoots`（仅受信 scope 可设）在落盘前剔除——本函数是
+/// import / duplicate / SDK 调用等**整体写**路径的单一收口。诊断：import 经 `validate_config` 产出
+/// `ValidationReport`；duplicate 等无报告的路径只记 tracing warn。
 pub fn save_config(config_dir: &Path, doc: &ProjectConfigDoc) -> Result<(), ConfigCrudError> {
+    let mut sanitized = doc.clone();
+    drop_project_read_roots(&mut sanitized);
     let paths = project_anchor_files(config_dir);
-    for (path, slot) in paths.iter().zip(doc.slots()) {
+    for (path, slot) in paths.iter().zip(sanitized.slots()) {
         if let Some(map) = slot {
             write_raw_object(path, map)?;
         }
     }
     Ok(())
+}
+
+/// #245 / protocol#65：project scope 不得持久化 `readRoots`（仅受信 scope 可设）。
+///
+/// 供整体写（[`save_config`]）与面向分享的导出（[`export_config`](super::portability::export_config)）复用。
+pub(crate) fn drop_project_read_roots(doc: &mut ProjectConfigDoc) {
+    if let Some(settings) = doc.settings.as_mut() {
+        if settings.remove(FIELD_READ_ROOTS).is_some() {
+            tracing::warn!(
+                field = FIELD_READ_ROOTS,
+                "project scope readRoots dropped before persist/export (trusted-scope-only)"
+            );
+        }
+    }
 }
 
 // ===========================================================================

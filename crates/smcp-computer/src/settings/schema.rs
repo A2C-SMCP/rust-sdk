@@ -32,6 +32,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use smcp::utils::path_norm::{native_platform, normalize_path};
+
 /// settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high).
 ///
 /// 与 Claude Code 对齐（user/project/local/flag/policy）。`Embed` 为 A2C 特有的**宿主构造挂载层**
@@ -91,6 +93,9 @@ pub const FIELD_DENIED_MCP_SERVERS: &str = "deniedMcpServers";
 pub const FIELD_PERMISSIONS: &str = "permissions";
 /// `client:put_blob` 落盘根（v0.4.0，协议 blob-transfer.md §7 顶层键，camelCase）/ landing root.
 pub const FIELD_LANDING_ROOT: &str = "landingRoot";
+/// `client:resolve_path` 授权读根（v0.5.0，协议 blob-transfer.md §readRoots，camelCase）/
+/// authorized read roots for `client:resolve_path`.
+pub const FIELD_READ_ROOTS: &str = "readRoots";
 
 /// policy-only 字段：出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
 /// Policy-only fields: filtered + recorded if seen outside the policy scope.
@@ -128,11 +133,21 @@ pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIE
 /// 不变量。协议 §7 明文：`landingRoot` 仅受信 scope（`user`/`local`/`flag`/`policy`/`embed`）可设；
 /// **`project` scope 提供该键 MUST 被拒绝**（本列表 + 下方 project 过滤即达成）。
 ///
+/// # 为何**含** `readRoots`（v0.5.0，协议 blob-transfer.md §readRoots）
+///
+/// 那是 `client:resolve_path` 的**读授权**：project settings 入 git、随仓库分发，clone 的仓库不得把
+/// 读授权扩到任意路径（如 `~/.ssh`）——`security.md` §读取通道安全与 `computer-management` §7
+/// 不变量 #7 明定仅受信 scope（`user`/`local`/`flag`/`policy`/`embed`）可设，**`project` scope
+/// 提供该键 MUST 被拒绝**（整字段不生效；写入期亦丢弃不落盘，#245）。
+///
 /// [guide]: https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/develop/docs/guides/mcp-approval-gate-alignment.md
 pub const TRUSTED_SCOPE_ONLY_FIELDS: &[&str] = &[
     FIELD_ENABLED_MCPJSON_SERVERS,
     FIELD_ENABLE_ALL_PROJECT_MCP,
     FIELD_LANDING_ROOT,
+    // #245 / protocol#65：读授权扩张面——project scope（入 git、随仓库分发）不得把
+    // `readRoots` 扩到任意路径（security.md §读取通道安全；computer-management §7 不变量 #7）。
+    FIELD_READ_ROOTS,
 ];
 
 /// 字符串数组字段（读合并：拼接去重；写回：整体替换）/ String-array fields.
@@ -143,6 +158,9 @@ pub const STRING_ARRAY_FIELDS: &[&str] = &[
     FIELD_DISABLED_MCPJSON_SERVERS,
     FIELD_ALLOWED_MCP_SERVERS,
     FIELD_DENIED_MCP_SERVERS,
+    // #245 / protocol#65：跨受信 scope 拼接去重（低 scope 在前）——多来源授权取并集，
+    // 高 scope 不遮蔽低 scope 已授的根（授权只增不减）。
+    FIELD_READ_ROOTS,
 ];
 
 /// 标量布尔字段（读合并：取最高 scope）/ Scalar bool fields (highest scope wins).
@@ -318,6 +336,51 @@ fn validate_landing_root(key: &str, value: &Value, scope: SettingsScope) -> Vali
             )],
         ),
     }
+}
+
+/// `readRoots`（v0.5.0 #245 / protocol#65）：字符串数组，每项须为绝对路径且可 `normalize_path`。
+///
+/// 非法项**逐条过滤**并记诊断（不整字段判废——其余授权根仍然生效）；空数组 = 不可读
+/// （fail-closed，语义由 resolve 管线保证）。**不做** `~` 展开：协议 `normalize_path` 明确
+/// 不展开 `~`，含 `~` 的项在运行期按 `invalid_path` 处理，故此处不视为绝对路径。
+/// 双形态（配置 / realpath）在运行期由 [`build_read_roots`](crate::blob::path_resolver::build_read_roots)
+/// 编译。
+fn validate_read_roots(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
+    let Some(arr) = value.as_array() else {
+        return (
+            None,
+            vec![err(
+                scope,
+                key,
+                format!("expected array, got {}", json_type_name(value)),
+            )],
+        );
+    };
+    let platform = native_platform();
+    let mut cleaned: Vec<Value> = Vec::new();
+    let mut errors: Vec<SettingsValidationError> = Vec::new();
+    for (idx, item) in arr.iter().enumerate() {
+        let field = format!("{key}[{idx}]");
+        let Some(raw) = item.as_str() else {
+            errors.push(err(
+                scope,
+                field.as_str(),
+                format!("expected string, got {}", json_type_name(item)),
+            ));
+            continue;
+        };
+        if !is_absolute_path(raw) {
+            errors.push(err(scope, field.as_str(), "must be an absolute path"));
+            continue;
+        }
+        // 配置期与运行期同源：用协议 `normalize_path` 预判 `invalid_path`，避免「写得进、读不了」。
+        if let Err(exc) = normalize_path(raw, platform) {
+            errors.push(err(scope, field.as_str(), format!("invalid path: {exc}")));
+            continue;
+        }
+        cleaned.push(Value::String(raw.to_string()));
+    }
+    (Some(Value::Array(cleaned)), errors)
 }
 
 fn validate_enabled_plugins(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
@@ -499,6 +562,7 @@ fn dispatch_validator(key: &str, value: &Value, scope: SettingsScope) -> Option<
         | FIELD_DENIED_MCP_SERVERS => validate_string_array,
         FIELD_PERMISSIONS => validate_permissions,
         FIELD_LANDING_ROOT => validate_landing_root,
+        FIELD_READ_ROOTS => validate_read_roots,
         _ => return None,
     };
     Some(validator(key, value, scope))
@@ -560,9 +624,9 @@ pub fn validate_settings(
                 scope,
                 key.as_str(),
                 "trusted-scope-only field not allowed in the project scope (filtered): approval-gate \
-                 inputs are personal decisions and landingRoot is a write target — both are unfit for \
-                 the git-tracked project settings.json; move it to settings.local.json (not \
-                 git-tracked) or the user scope",
+                 inputs, landingRoot (write target) and readRoots (read authorization) are personal \
+                 decisions — unfit for the git-tracked project settings.json; move it to \
+                 settings.local.json (not git-tracked) or the user scope",
             ));
             continue;
         }
@@ -661,6 +725,10 @@ pub struct ComputerSettings {
     pub permissions: Option<PermissionsBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub landing_root: Option<String>,
+    /// `client:resolve_path` 授权读根（v0.5.0 / protocol#65；默认空 = 不可读）/
+    /// authorized read roots for `client:resolve_path` (empty default = unreadable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_roots: Option<Vec<String>>,
     /// 未知顶层字段 passthrough（前向兼容）/ unknown top-level fields passthrough.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -906,6 +974,65 @@ mod tests {
         assert_eq!(v["landingRoot"], json!("/tmp/landing"));
     }
 
+    // ---- #245 readRoots（protocol#65：project MUST 拒绝；非法项逐条丢弃）----
+
+    /// project scope（入 git）供给 `readRoots` → 过滤 + 记错（读授权不得随仓库分发扩张）。
+    #[test]
+    fn test_read_roots_filtered_in_project_scope() {
+        let raw = json!({"readRoots": ["/data/share"]});
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::Project, None);
+        assert!(
+            !cleaned.contains_key("readRoots"),
+            "project scope 提供 readRoots MUST 被拒绝"
+        );
+        assert_eq!(errors.len(), 1, "须记错，实得 {errors:?}");
+        assert!(errors[0].reason.contains("trusted-scope-only"));
+    }
+
+    /// 受信 scope → 保留；非法项逐条丢弃并记诊断（其余根仍生效）；空数组合法 = 不可读。
+    #[test]
+    fn test_read_roots_validation_drops_invalid_items() {
+        // 校验器按宿主平台预判 `normalize_path`：测试路径须随宿主平台取形（Windows 无盘符即非法）。
+        let (root, root_dotdot) = if cfg!(windows) {
+            ("C:/data/share", "C:/data/../share2")
+        } else {
+            ("/data/share", "/data/../share2")
+        };
+        let raw = json!({"readRoots": [root, "relative", 123, root_dotdot]});
+        let (cleaned, errors) = validate_settings(&raw, SettingsScope::User, None);
+        assert_eq!(
+            cleaned["readRoots"],
+            json!([root, root_dotdot]),
+            "合法项保留（运行期再规范化）"
+        );
+        assert_eq!(errors.len(), 2, "errors={errors:?}");
+        assert!(errors.iter().any(|e| e.field == "readRoots[1]"));
+        assert!(errors.iter().any(|e| e.field == "readRoots[2]"));
+
+        let (cleaned, errors) =
+            validate_settings(&json!({"readRoots": []}), SettingsScope::User, None);
+        assert_eq!(cleaned["readRoots"], json!([]));
+        assert!(errors.is_empty(), "空数组 = 不可读，合法；实得 {errors:?}");
+
+        let (cleaned, errors) = validate_settings(
+            &json!({"readRoots": "not-an-array"}),
+            SettingsScope::User,
+            None,
+        );
+        assert!(!cleaned.contains_key("readRoots"));
+        assert!(!errors.is_empty());
+    }
+
+    /// typed round-trip：`readRoots` 以 camelCase 键进出 [`ComputerSettings`]。
+    #[test]
+    fn test_read_roots_typed_roundtrip() {
+        let parsed: ComputerSettings =
+            serde_json::from_str(r#"{"readRoots": ["/data/share"]}"#).unwrap();
+        assert_eq!(parsed.read_roots, Some(vec!["/data/share".to_string()]));
+        let v = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(v["readRoots"], json!(["/data/share"]));
+    }
+
     /// ★**防过度矫正**：`disabledMcpjsonServers` 是 DENY 方向，协议 §2.1 表第 3 行明定**任意 scope 可供给**
     /// （fail-safe）。后人若顺手把它收进 [`TRUSTED_SCOPE_ONLY_FIELDS`]，此测立刻红。
     #[test]
@@ -1125,14 +1252,15 @@ mod tests {
             &[
                 "enabledMcpjsonServers",
                 "enableAllProjectMcpServers",
-                "landingRoot"
+                "landingRoot",
+                "readRoots"
             ]
         );
         assert_eq!(
             BOOL_FIELDS,
             &["strictKnownMarketplaces", "enableAllProjectMcpServers"]
         );
-        assert_eq!(STRING_ARRAY_FIELDS.len(), 6);
+        assert_eq!(STRING_ARRAY_FIELDS.len(), 7);
     }
 
     // ---- ComputerSettings 全字段可选 serde round-trip ----

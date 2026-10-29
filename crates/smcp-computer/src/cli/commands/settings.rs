@@ -33,6 +33,7 @@ use crate::settings::scope::{
 use crate::settings::store::{atomic_write_settings_json, with_settings_lock};
 use crate::settings::{
     resolve_policy_settings, validate_settings, SettingsScope, SettingsValidationError,
+    FIELD_READ_ROOTS,
 };
 
 // 可读 scope（show/get）/ readable scopes；可写 scope（set/edit）/ writable scopes。
@@ -246,6 +247,11 @@ pub fn settings_set(
         Ok(pair) => pair,
         Err(e) => return err(&e, json_output, EXIT_USER_ERROR),
     };
+    // #245 / protocol#65：`readRoots` 仅受信 scope 可设；project scope 写入期丢弃 + 诊断（不落盘、不硬报错）。
+    // 放在 `writable_path` 之后：anchor 不可解析时与其他键同样返回用户错误（不静默成功）。
+    if scope == "project" && key == FIELD_READ_ROOTS {
+        return drop_project_read_roots(json_output);
+    }
 
     // JSON 优先，失败回退字面字符串（对标 Python json.loads + 回退）。
     let parsed: Value =
@@ -278,6 +284,62 @@ pub fn settings_set(
         return EXIT_OK;
     }
     ok_msg(&format!("set {key} in {scope} scope"))
+}
+
+/// #245 / protocol#65：project scope 的 `readRoots` 写入期丢弃（不落盘、不硬报错）。
+///
+/// 协议 `security.md` §读取通道安全：`readRoots` 仅受信 scope 可设；project settings 入 git、随仓库
+/// 分发，clone 的仓库不得把读授权扩到任意路径。读侧过滤（[`validate_settings`]）保留为纵深防御。
+fn drop_project_read_roots(json_output: bool) -> i32 {
+    const REASON: &str = "readRoots is a trusted-scope-only field and is never written to the project \
+                          scope (git-tracked); use settings.local.json (not git-tracked) or the user scope";
+    tracing::warn!(
+        field = FIELD_READ_ROOTS,
+        target_scope = "project",
+        "{}",
+        REASON
+    );
+    if json_output {
+        print_json(&json!({
+            "scope": "project",
+            "key": FIELD_READ_ROOTS,
+            "dropped": true,
+            "reason": REASON,
+        }));
+        return EXIT_OK;
+    }
+    eprintln!("warning: {}", REASON);
+    ok_msg(&format!(
+        "ignored {} in project scope (trusted-scope-only)",
+        FIELD_READ_ROOTS
+    ))
+}
+
+/// #245 / protocol#65：`settings edit` 成功后从 project settings 文件剔除 `readRoots`。
+///
+/// 返回是否发生剔除；损坏 / 非对象 JSON 不动（交给既有诊断路径）。
+fn drop_project_read_roots_from_file(path: &Path) -> Result<bool, String> {
+    // 读取 / 解析 / 删除 / 回写全部在**同一把 settings 锁内**完成——锁外先读再锁会丢并发写。
+    let written = with_settings_lock(path, || -> std::io::Result<bool> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&text) else {
+            return Ok(false);
+        };
+        if map.remove(FIELD_READ_ROOTS).is_none() {
+            return Ok(false);
+        }
+        atomic_write_settings_json(path, &Value::Object(map))?;
+        Ok(true)
+    });
+    match written {
+        Ok(Ok(dropped)) => Ok(dropped),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// 用 `$EDITOR` 打开该层 settings.json（保存后的 reconcile 由 REPL 承担）/ open the scope file in `$EDITOR`。
@@ -339,7 +401,34 @@ pub fn settings_edit(
         .arg(&path)
         .status();
     match status {
-        Ok(s) if s.success() => ok_msg(&format!("edited {scope} settings ({})", path.display())),
+        Ok(s) if s.success() => {
+            // #245：project scope 的 readRoots 写入期丢弃 + 诊断（编辑内容不落盘）。
+            if scope == "project" {
+                match drop_project_read_roots_from_file(&path) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            field = FIELD_READ_ROOTS,
+                            path = %path.display(),
+                            "project scope readRoots dropped after edit"
+                        );
+                        eprintln!(
+                            "warning: dropped {} from project scope \
+                             (trusted-scope-only; use settings.local.json or the user scope)",
+                            FIELD_READ_ROOTS
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        return err(
+                            &format!("post-edit readRoots cleanup failed: {e}"),
+                            json_output,
+                            EXIT_USER_ERROR,
+                        )
+                    }
+                }
+            }
+            ok_msg(&format!("edited {scope} settings ({})", path.display()))
+        }
         Ok(s) => err(&format!("editor failed: {s}"), json_output, EXIT_USER_ERROR),
         Err(e) => err(&format!("editor failed: {e}"), json_output, EXIT_USER_ERROR),
     }
@@ -514,6 +603,99 @@ mod tests {
         let path = user_settings_path(Some(&env));
         assert!(path.exists());
         assert!(std::fs::read_to_string(&path).unwrap().contains('{'));
+    }
+
+    // ── #245 / protocol#65：project scope readRoots 写入期丢弃 ────────────────
+
+    #[test]
+    fn set_read_roots_in_project_scope_is_dropped_not_persisted() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        // 值取宿主原生绝对路径（Windows 宿主用盘符形态，避免被校验器按平台丢弃）。
+        let share = dir.path().join("share");
+        let value = serde_json::to_string(&vec![share.to_str().unwrap()]).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                FIELD_READ_ROOTS,
+                &value,
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_OK
+        );
+        assert!(
+            !workdir_project_settings_path(&wd).exists(),
+            "project scope readRoots MUST NOT be persisted"
+        );
+        // 受信 scope（user / local）仍可写。
+        for (scope, cwd) in [("user", None), ("local", Some(wd.as_path()))] {
+            assert_eq!(
+                settings_set(Some(&env), FIELD_READ_ROOTS, &value, scope, cwd, true),
+                EXIT_OK,
+                "scope={scope}"
+            );
+            assert_eq!(
+                read_scope_with_errors(scope, Some(&env), cwd, None)
+                    .unwrap()
+                    .0
+                    .get(FIELD_READ_ROOTS),
+                Some(&json!([share.to_str().unwrap()])),
+                "scope={scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_project_read_roots_from_file_removes_only_that_field() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"readRoots":["/data"],"keep":1}"#).unwrap();
+        assert!(drop_project_read_roots_from_file(&path).unwrap());
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none());
+        assert_eq!(saved["keep"], json!(1));
+        // 幂等：已无该键 → no-op。
+        assert!(!drop_project_read_roots_from_file(&path).unwrap());
+    }
+
+    /// `settings edit` 的真实写入路径：编辑器写入 `readRoots` 后由 post-edit 清理剔除。
+    #[cfg(unix)]
+    #[test]
+    fn edit_project_scope_drops_read_roots_after_editor() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let script = dir.path().join("editor.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' '{\"readRoots\":[\"/data\"],\"keep\":1}' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            settings_edit(
+                Some(&env),
+                "project",
+                Some(&wd),
+                Some(script.to_str().unwrap()),
+                true
+            ),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(workdir_project_settings_path(&wd)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            saved.get("readRoots").is_none(),
+            "readRoots 不得落盘：{saved}"
+        );
+        assert_eq!(saved["keep"], json!(1));
     }
 
     // ── #166: policy scope validate ──────────────────────────────────────────

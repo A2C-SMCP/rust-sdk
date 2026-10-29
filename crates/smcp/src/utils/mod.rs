@@ -20,6 +20,7 @@ pub mod handshake;
 pub mod hash;
 pub mod mime;
 pub mod path;
+pub mod path_norm;
 pub mod slice;
 
 pub use atomic_io::{atomic_write_bytes, atomic_write_text, unique_tmp_path};
@@ -45,4 +46,8 @@ pub use handshake::{
 pub use hash::{sha256_hex, to_hex};
 pub use mime::{guess_mime, is_text_mime, FALLBACK_MIME};
 pub use path::{is_within, normalize_lexical, resolve_xdg_first};
+pub use path_norm::{
+    native_platform, normalize_path, realpath_nonstrict, to_native_path, InvalidPathError,
+    PathPlatform,
+};
 pub use slice::{plan_slice, SlicePlan};

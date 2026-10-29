@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use super::super::scope::{apply_write, WriteValue};
+use super::super::schema::{SettingsScope, FIELD_READ_ROOTS};
+use super::super::scope::{apply_write, WriteValue, PROJECT_SETTINGS_FILENAME};
 use super::super::store::{atomic_write_settings_json, with_settings_lock};
 use super::write_target::{WritePlan, WriteTargetOp};
 
@@ -120,6 +121,9 @@ fn execute_one(plan: &WritePlan) -> Result<(), ExecutorError> {
                 string_set_remove(&existing, field, value)
             }
         };
+        // #245 / protocol#65：任何写 project settings 的计划都顺带剔除 `readRoots`（受信 scope only）。
+        // 覆盖「升级前已落盘的旧键」与 SDK 调用方自行构造的 plan；读侧过滤仍是纵深防御。
+        let next = drop_project_read_roots(plan.scope, path, &existing, next);
         match next {
             None => Ok(()), // no-change → 不落盘
             Some(updated) => {
@@ -136,6 +140,45 @@ fn execute_one(plan: &WritePlan) -> Result<(), ExecutorError> {
         file: path.to_path_buf(),
         reason: e.to_string(),
     })?
+}
+
+/// #245 / protocol#65：project settings 的原始 RMW 落盘前剔除 `readRoots`。
+///
+/// `next = None`（本次 op 无变化）时，若盘上已有该键仍产出一次写（把它清掉）——保证「project
+/// readRoots 不落盘」在**已存在旧键**的升级场景也成立。
+fn drop_project_read_roots(
+    scope: SettingsScope,
+    path: &Path,
+    existing: &Map<String, Value>,
+    next: Option<Map<String, Value>>,
+) -> Option<Map<String, Value>> {
+    // 仅 project **settings** 文件；mcp.json 计划虽同为 Project scope，不受影响。
+    if scope != SettingsScope::Project
+        || path.file_name().and_then(|name| name.to_str()) != Some(PROJECT_SETTINGS_FILENAME)
+    {
+        return next;
+    }
+    match next {
+        Some(mut map) => {
+            if map.remove(FIELD_READ_ROOTS).is_some() {
+                tracing::warn!(
+                    field = FIELD_READ_ROOTS,
+                    "project scope readRoots dropped before persist (trusted-scope-only)"
+                );
+            }
+            Some(map)
+        }
+        None if existing.contains_key(FIELD_READ_ROOTS) => {
+            let mut map = existing.clone();
+            map.remove(FIELD_READ_ROOTS);
+            tracing::warn!(
+                field = FIELD_READ_ROOTS,
+                "project scope readRoots dropped before persist (trusted-scope-only)"
+            );
+            Some(map)
+        }
+        None => None,
+    }
 }
 
 /// 读**原始** JSON object（无校验）：缺失/空 → 空 map；损坏/非 object → `CorruptTarget`（不覆盖）。
@@ -273,7 +316,9 @@ mod tests {
     use crate::settings::mcp_config::{
         user_mcp_config_path, workdir_mcp_config_path, workdir_mcp_local_config_path,
     };
-    use crate::settings::scope::{workdir_local_settings_path, EnvMap};
+    use crate::settings::scope::{
+        workdir_local_settings_path, workdir_project_settings_path, EnvMap,
+    };
     use serde_json::json;
     use std::path::Path;
     use tempfile::TempDir;
@@ -336,6 +381,57 @@ mod tests {
         execute_write_plans(std::slice::from_ref(&plan)).unwrap();
         let after = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(before, after, "幂等 upsert 应跳过写、不触碰文件");
+    }
+
+    #[test]
+    fn project_scope_write_plan_drops_existing_read_roots() {
+        // #245：升级前已落盘的 project readRoots 在任意 project settings 写计划中顺带剔除。
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        write(
+            &path,
+            r#"{"readRoots":["/data"],"enabledPlugins":{"p@m":false}}"#,
+        );
+        let inner: BTreeMap<String, WriteValue> =
+            std::iter::once(("p@m".to_string(), WriteValue::Set(json!(true)))).collect();
+        let outer: BTreeMap<String, WriteValue> =
+            std::iter::once(("enabledPlugins".to_string(), WriteValue::Object(inner))).collect();
+        let plan = WritePlan {
+            scope: crate::settings::schema::SettingsScope::Project,
+            file: path.clone(),
+            op: WriteTargetOp::Value(WriteValue::Object(outer)),
+        };
+        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        let saved = read_json(&path);
+        assert!(
+            saved.get("readRoots").is_none(),
+            "project readRoots 须被剔除：{saved}"
+        );
+        assert_eq!(saved["enabledPlugins"]["p@m"], json!(true));
+    }
+
+    #[test]
+    fn project_scope_no_change_plan_still_drops_existing_read_roots() {
+        // 本次 op 语义无变化（remove 不存在的成员），但盘上旧 readRoots 仍须被清掉。
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        write(&path, r#"{"readRoots":["/data"]}"#);
+        let plan = WritePlan {
+            scope: crate::settings::schema::SettingsScope::Project,
+            file: path.clone(),
+            op: WriteTargetOp::StringSetRemove {
+                field: "disabledMcpjsonServers".to_string(),
+                value: "absent".to_string(),
+            },
+        };
+        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        let saved = read_json(&path);
+        assert!(
+            saved.get("readRoots").is_none(),
+            "project readRoots 须被剔除：{saved}"
+        );
     }
 
     #[test]

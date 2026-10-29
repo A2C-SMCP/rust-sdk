@@ -17,6 +17,7 @@
 //! [`upload`]（`client:put_blob` 上行写入的有界上传会话，v0.4.0 #195）。
 
 pub mod handle;
+pub mod path_resolver;
 pub mod resolver;
 pub mod thresholds;
 pub mod toolspool;
@@ -26,6 +27,9 @@ pub use handle::{
     decode_blob_handle, encode_skill_handle, encode_toolspool_handle, BlobHandleError,
     BlobTooLargeError, DecodedHandle, SkillHandlePayload, ToolspoolHandlePayload,
     HANDLE_KIND_SKILL, HANDLE_KIND_TOOLSPOOL, HANDLE_VERSION,
+};
+pub use path_resolver::{
+    build_read_roots, lexical_fence, path_within_root, realpath_fence, resolve_read_roots, ReadRoot,
 };
 pub use resolver::{BlobResolver, BlobSlicer, ResolvedBlob, SkillBlobResolver, SkillRootLookup};
 pub use thresholds::{

@@ -1,0 +1,305 @@
+{
+  "$schema_note": "A2C-SMCP 协议 0.5.0 canonical_path 词法规范化一致性测试向量（跨 SDK 逐字节一致锚点，protocol#65）。source of truth = a2c-smcp-protocol docs/specification/blob-transfer.md §「canonical_path 规范化」。任一 SDK 的 normalize_path(input, platform) MUST 对每条向量产出 expected（字符串）或 error（固定为 \"invalid_path\"）方为合规。本向量只覆盖纯函数的词法部分；realpath（符号链接解析）依赖文件系统，由 SDK 自测覆盖。",
+  "algorithm": {
+    "common": "input 为空串或含 U+0000 ⇒ invalid_path。不做 ~ 展开、不做百分号编解码、不做 Unicode 归一（NFC/NFD）、不改变非盘符部分的大小写。",
+    "posix": "MUST 以 '/' 开头，否则 invalid_path。'\\\\' 是普通字符（非分隔符）。按 '/' 切段 → 丢弃空段与 '.' → '..' 弹出上一段（已在根时忽略）→ '/' ‖ join(段, '/')。根即 '/'。",
+    "windows": "① 以 '\\\\\\\\?\\\\' 开头则剥去该前缀；剥后以 'UNC\\\\'（大小写不敏感）开头 ⇒ invalid_path。② 全部 '\\\\' 替换为 '/'。③ 若匹配 ^/[A-Za-z]:(/|$)（canonical 形态），剥去开头 '/'，剥后恰为 'X:' 时补 '/'。④ 此时 MUST 匹配 ^[A-Za-z]:/，否则 invalid_path（覆盖相对路径、原生裸盘符 'C:' 与盘符相对 'C:foo'、无盘符根 '/x'、UNC '//server/share'）。⑤ 盘符转大写；余部按 posix 同法切段归一。⑥ '/' ‖ 盘符 ‖ ':/' ‖ join(段, '/')。盘符根即 '/C:/'。 ⑦ 分量限制：以 '\\\\\\\\.\\\\' 开头 ⇒ invalid_path（于 ① 之前判定）；盘符之后任一分量含 < > : \" | ? * 或 U+0001–U+001F，或以 '.' / ' ' 结尾（'.' 与 '..' 本身除外）⇒ invalid_path（于 ⑤ 切段时判定，先于 '..' 弹出）。",
+    "full_pipeline": "词法 n = normalize_path(input)（'..' 在此词法消解）；Computer 产出 canonical_path = normalize_path(realpath_nonstrict(native(n)))。二者都用本函数，向量钉住二者共同的表示形态。"
+  },
+  "vectors": [
+    {
+      "id": "posix-plain",
+      "platform": "posix",
+      "input": "/home/u/a.txt",
+      "expected": "/home/u/a.txt"
+    },
+    {
+      "id": "posix-dup-slash",
+      "platform": "posix",
+      "input": "//home///u//a.txt",
+      "expected": "/home/u/a.txt"
+    },
+    {
+      "id": "posix-dot",
+      "platform": "posix",
+      "input": "/home/./u/a.txt",
+      "expected": "/home/u/a.txt"
+    },
+    {
+      "id": "posix-dotdot",
+      "platform": "posix",
+      "input": "/home/u/../v/a.txt",
+      "expected": "/home/v/a.txt"
+    },
+    {
+      "id": "posix-dotdot-clamp-root",
+      "platform": "posix",
+      "input": "/../../a.txt",
+      "expected": "/a.txt"
+    },
+    {
+      "id": "posix-trailing-slash",
+      "platform": "posix",
+      "input": "/home/u/dir/",
+      "expected": "/home/u/dir"
+    },
+    {
+      "id": "posix-root",
+      "platform": "posix",
+      "input": "/",
+      "expected": "/"
+    },
+    {
+      "id": "posix-no-percent-decode",
+      "platform": "posix",
+      "input": "/home/u/a%20b.txt",
+      "expected": "/home/u/a%20b.txt"
+    },
+    {
+      "id": "posix-no-percent-encode",
+      "platform": "posix",
+      "input": "/home/u/文件 1.txt",
+      "expected": "/home/u/文件 1.txt"
+    },
+    {
+      "id": "posix-backslash-literal",
+      "platform": "posix",
+      "input": "/home/u/a\\b.txt",
+      "expected": "/home/u/a\\b.txt"
+    },
+    {
+      "id": "posix-drive-like-literal",
+      "platform": "posix",
+      "input": "/C:/x",
+      "expected": "/C:/x"
+    },
+    {
+      "id": "posix-case-preserved",
+      "platform": "posix",
+      "input": "/Home/U/A.TXT",
+      "expected": "/Home/U/A.TXT"
+    },
+    {
+      "id": "posix-relative",
+      "platform": "posix",
+      "input": "home/u/a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "posix-dot-relative",
+      "platform": "posix",
+      "input": "./a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "posix-tilde",
+      "platform": "posix",
+      "input": "~/a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "posix-empty",
+      "platform": "posix",
+      "input": "",
+      "error": "invalid_path"
+    },
+    {
+      "id": "posix-nul",
+      "platform": "posix",
+      "input": "/a\u0000b",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-backslash",
+      "platform": "windows",
+      "input": "C:\\Users\\u\\a.txt",
+      "expected": "/C:/Users/u/a.txt"
+    },
+    {
+      "id": "win-lower-drive",
+      "platform": "windows",
+      "input": "c:\\Users\\u\\a.txt",
+      "expected": "/C:/Users/u/a.txt"
+    },
+    {
+      "id": "win-forward-slash",
+      "platform": "windows",
+      "input": "C:/Users/u/a.txt",
+      "expected": "/C:/Users/u/a.txt"
+    },
+    {
+      "id": "win-canonical-roundtrip",
+      "platform": "windows",
+      "input": "/C:/Users/u/a.txt",
+      "expected": "/C:/Users/u/a.txt"
+    },
+    {
+      "id": "win-canonical-lower-drive",
+      "platform": "windows",
+      "input": "/c:/Users/u/a.txt",
+      "expected": "/C:/Users/u/a.txt"
+    },
+    {
+      "id": "win-mixed-separators",
+      "platform": "windows",
+      "input": "C:\\Users/u\\a.txt",
+      "expected": "/C:/Users/u/a.txt"
+    },
+    {
+      "id": "win-dot-dotdot",
+      "platform": "windows",
+      "input": "C:\\Users\\.\\u\\..\\v\\a.txt",
+      "expected": "/C:/Users/v/a.txt"
+    },
+    {
+      "id": "win-dotdot-clamp-drive",
+      "platform": "windows",
+      "input": "C:\\Users\\..\\..\\a.txt",
+      "expected": "/C:/a.txt"
+    },
+    {
+      "id": "win-dup-separator",
+      "platform": "windows",
+      "input": "C:\\a\\\\b",
+      "expected": "/C:/a/b"
+    },
+    {
+      "id": "win-trailing-separator",
+      "platform": "windows",
+      "input": "C:\\Users\\U\\Docs\\",
+      "expected": "/C:/Users/U/Docs"
+    },
+    {
+      "id": "win-case-preserved",
+      "platform": "windows",
+      "input": "d:\\Data\\ABC.Txt",
+      "expected": "/D:/Data/ABC.Txt"
+    },
+    {
+      "id": "win-drive-root",
+      "platform": "windows",
+      "input": "C:\\",
+      "expected": "/C:/"
+    },
+    {
+      "id": "win-canonical-drive-root-bare",
+      "platform": "windows",
+      "input": "/C:",
+      "expected": "/C:/"
+    },
+    {
+      "id": "win-verbatim-prefix",
+      "platform": "windows",
+      "input": "\\\\?\\C:\\Users\\a.txt",
+      "expected": "/C:/Users/a.txt"
+    },
+    {
+      "id": "win-no-percent-encode",
+      "platform": "windows",
+      "input": "C:\\用户\\a b.txt",
+      "expected": "/C:/用户/a b.txt"
+    },
+    {
+      "id": "win-drive-only",
+      "platform": "windows",
+      "input": "C:",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-drive-relative",
+      "platform": "windows",
+      "input": "C:foo\\a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-rooted-no-drive",
+      "platform": "windows",
+      "input": "\\Users\\a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-posix-style-no-drive",
+      "platform": "windows",
+      "input": "/Users/a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-relative",
+      "platform": "windows",
+      "input": "Users\\a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-unc",
+      "platform": "windows",
+      "input": "\\\\server\\share\\a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-verbatim-unc",
+      "platform": "windows",
+      "input": "\\\\?\\UNC\\server\\share\\a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-empty",
+      "platform": "windows",
+      "input": "",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-nul",
+      "platform": "windows",
+      "input": "C:\\a\u0000b",
+      "error": "invalid_path"
+    },
+    {
+      "id": "posix-triple-dot-is-name",
+      "platform": "posix",
+      "input": "/home/u/...",
+      "expected": "/home/u/..."
+    },
+    {
+      "id": "win-device-prefix",
+      "platform": "windows",
+      "input": "\\\\.\\C:\\a.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-ads-stream",
+      "platform": "windows",
+      "input": "C:\\a\\b.txt:stream",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-trailing-dot-segment",
+      "platform": "windows",
+      "input": "C:\\a\\b.",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-trailing-space-dotdot",
+      "platform": "windows",
+      "input": "C:\\r\\.. \\x",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-triple-dot",
+      "platform": "windows",
+      "input": "C:\\a\\...",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-reserved-char",
+      "platform": "windows",
+      "input": "C:\\a\\b?c.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-control-char",
+      "platform": "windows",
+      "input": "C:\\a\\b\u0001c",
+      "error": "invalid_path"
+    }
+  ]
+}
