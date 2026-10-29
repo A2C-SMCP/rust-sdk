@@ -1080,7 +1080,8 @@ impl CommandHandler {
     /// 顺序：best-effort 退房（在房时）→ 断开 → 重置持久化文件 → 以原参数重连 → 原本在房则回房。
     /// - 退房失败仅告警（重置优先，且断连本身会清理成员关系）；
     /// - 断开失败**中止**（连接中身份不可变，协议 MUST）；
-    /// - 回房复用 #234 的有界退避（仅 `4101` 瞬态可重试，预算取 CLI 配置）；终态失败上抛——
+    /// - 回房复用 #234 的有界退避（仅 `4101` 瞬态可重试，预算取 `effective_rejoin_budget`：
+    ///   Computer 覆盖 > CLI 参数 > 默认）；终态失败上抛——
     ///   身份已更换，调用方必须感知当前未恢复连接，命令不得在「实际未回房」时打印成功。
     pub async fn reset_computer_identity(&mut self) -> Result<(), CommandError> {
         let was_connected = self.computer.has_socketio_client().await;
@@ -1137,7 +1138,8 @@ impl CommandHandler {
         Ok(())
     }
 
-    /// 重置后的回房：复用 #234 的有界退避（**仅 `4101` 瞬态可重试**），预算取 CLI 配置；
+    /// 重置后的回房：复用 #234 的有界退避（**仅 `4101` 瞬态可重试**），预算取
+    /// `effective_rejoin_budget`（Computer 覆盖 > CLI 参数 > 默认 60s）；
     /// 终态失败上抛（命令不得在「实际未回房」时打印成功）。
     async fn rejoin_after_reset(&mut self, office: &str) -> Result<(), CommandError> {
         let budget = self.effective_rejoin_budget();

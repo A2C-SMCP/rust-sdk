@@ -4705,6 +4705,14 @@ impl<S: Session> Computer<S> {
     /// Protocol #64 side effect and error: the first connect materializes/reuses the persisted
     /// `computer_id` and every join carries it. A corrupt/unreadable identity yields a local
     /// [`ComputerError::IdentityStore`] — treat it as fatal, not as a retryable transport error.
+    ///
+    /// **取消语义 / Cancellation**：取消本 future（如宿主用 `timeout` 包裹后超时）**不会**中止
+    /// 后台建连任务——detached 任务仍会继续完成握手 → `install`，并持续持有生命周期门（默认
+    /// 至 [`DEFAULT_NAMESPACE_CONNECT_TIMEOUT`] 即 30s）。期间 `reset_computer_id` /
+    /// `disconnect_socketio` / `shutdown` 可能被阻塞到该时限；取消后是否真的安装成功，只能以
+    /// [`Self::has_socketio_client`] 或后续调用的返回值判定，不能假定已中止。
+    /// Cancelling this future does not abort the detached connect task, which keeps the lifecycle
+    /// gate until it installs (default up to 30s namespace timeout).
     pub async fn connect_socketio(&self, url: &str, options: ConnectOptions) -> ComputerResult<()>
     where
         S: Clone + 'static,

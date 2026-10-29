@@ -2602,7 +2602,9 @@ impl SmcpComputerClient {
 
     /// protocol#64 / #234：本连接的**期望房号**（重连退避期间 `confirmed` 为空但意图被刻意保留）。
     ///
-    /// 供 CLI `identity reset` 在重连窗口内仍按原意图回房；`leave` 仍只针对 `confirmed`。
+    /// 供 CLI `identity reset` 在重连窗口内仍按原意图回房；reset 流程的「是否发 leave」决策
+    /// 仍只认 `confirmed`（`leave_current_office` 自身按 `confirmed → desired` 解析，与本方法的
+    /// 用途不同）。
     /// The desired office retained across reconnect backoff.
     pub async fn get_desired_office_id(&self) -> Option<String> {
         lock_office_membership(&self.office_membership)

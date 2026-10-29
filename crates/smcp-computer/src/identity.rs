@@ -705,10 +705,13 @@ mod tests {
         }
     }
 
-    /// 失败注入（unix）：目录不可写 ⇒ 临时文件创建失败 ⇒ `IdentityStore`，且无残留。
+    /// 失败注入（unix）：目录不可写 ⇒ `IdentityStore` 诊断。
+    ///
+    /// 失败发生在**临时文件创建之前**，不可能产生残留——本用例只锁诊断路径；临时文件清理
+    /// 由 [`test_reset_rename_failure_cleans_temp_file`] 覆盖。
     #[cfg(unix)]
     #[test]
-    fn test_reset_write_failure_leaves_no_temp_file() {
+    fn test_reset_unwritable_directory_reports_identity_store() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let env = xdg_env(tmp.path());
