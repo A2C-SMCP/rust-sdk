@@ -29,9 +29,11 @@ use std::{process::Stdio, sync::Arc, time::Duration};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use smcp_computer::{
-    cli::commands::{CliConfig, CommandHandler},
+    cli::commands::{CliConfig, CommandError, CommandHandler},
     computer::{Computer, SilentSession},
     errors::ComputerError,
+    mcp_clients::manager::MCPServerManager,
+    socketio_client::SmcpComputerClientBuilder,
 };
 
 use smcp_server_core::{SessionManager, SmcpServerBuilder};
@@ -458,4 +460,83 @@ async fn identity_reset_offline_only_updates_file() {
     assert_ne!(after.trim_end(), first, "离线重置也必须换新身份");
     assert!(smcp::is_canonical_computer_id(after.trim_end()), "{after}");
     assert!(!cli.computer.has_socketio_client().await);
+}
+
+/// protocol#64：REPL `identity reset` 分发——命令被识别、身份文件原子轮换并输出确认行。
+#[tokio::test]
+async fn repl_identity_reset_rotates_identity() {
+    let server = Server::start().await;
+    let home = TempDir::new().unwrap();
+    let mut repl = Repl::start(&server, &home, true).await;
+
+    let identity_path = home.path().join("config").join("a2c").join("computer-id");
+    let before = std::fs::read_to_string(&identity_path).unwrap();
+
+    repl.send("identity reset").await;
+    let output = repl.until("Identity reset").await;
+    assert!(output.contains("身份已重置"), "{output}");
+
+    let after = std::fs::read_to_string(&identity_path).unwrap();
+    assert_ne!(
+        before.trim_end(),
+        after.trim_end(),
+        "REPL reset 必须轮换身份"
+    );
+    assert!(smcp::is_canonical_computer_id(after.trim_end()), "{after}");
+
+    repl.send("quit").await;
+}
+
+/// protocol#64：连接不是经 `socket connect` 建立（无保存参数）⇒ `identity reset` 在改动任何
+/// 状态前拒绝：仍在线、仍在房、身份文件不变。
+#[tokio::test]
+async fn identity_reset_without_replayable_args_refuses_before_changes() {
+    const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    let server = Server::start().await;
+    let home = TempDir::new().unwrap();
+    let env = isolated_config_env(home.path().join("ext"));
+    let mut cli = handler_with_env("ext-cli", &home, env.clone());
+
+    // 外部低层 client 直装：不经过 `CommandHandler::connect_socketio` ⇒ 无 `ConnectionArgs`。
+    let client = SmcpComputerClientBuilder::new(
+        &server.url,
+        Arc::new(tokio::sync::RwLock::new(None::<MCPServerManager>)),
+        "ext-cli".to_string(),
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    )
+    .auth_payload(serde_json::json!({"token": "join-test-secret"}))
+    .headers(std::collections::HashMap::from([(
+        "x-cli-join".to_string(),
+        "preserved".to_string(),
+    )]))
+    .computer_id(ID)
+    .connect()
+    .await
+    .unwrap();
+    client.join_office("office-ext").await.unwrap();
+    cli.computer
+        .set_socketio_client(Arc::new(client))
+        .await
+        .unwrap();
+
+    let path = smcp_computer::identity::computer_id_path(Some(&env));
+    let before = std::fs::read(&path).ok();
+
+    let error = cli
+        .reset_computer_identity()
+        .await
+        .expect_err("无保存参数必须拒绝");
+    assert!(
+        matches!(error, CommandError::InvalidCommand(_)),
+        "{error:?}"
+    );
+    assert!(cli.computer.has_socketio_client().await, "拒绝不得断开连接");
+    assert_eq!(std::fs::read(&path).ok(), before, "拒绝不得改动身份文件");
+    assert!(
+        server
+            .members("office-ext")
+            .iter()
+            .any(|session| session.name == "ext-cli"),
+        "拒绝不得退房"
+    );
 }

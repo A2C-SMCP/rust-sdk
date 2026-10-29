@@ -128,17 +128,9 @@ fn reset_computer_id_blocking(path: &Path) -> ComputerResult<String> {
         ));
     }
 
-    // Windows 的 `rename` 不能覆盖已存在目标：先删后换（非原子；文件权限仍 0600）。
-    #[cfg(not(unix))]
-    if path.exists() {
-        if let Err(error) = std::fs::remove_file(path) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(identity_error(
-                path,
-                format!("cannot replace identity file: {error}"),
-            ));
-        }
-    }
+    // `fs::rename` 在 Unix 与 Windows 上均为**替换语义**（Windows 走 MoveFileExW /
+    // SetFileInformationByHandle）——不做「先删后换」：预删会制造「目标消失→并发进程重建」
+    // 的非原子窗口。
     if let Err(error) = std::fs::rename(&temp, path) {
         let _ = std::fs::remove_file(&temp);
         return Err(identity_error(
@@ -146,11 +138,15 @@ fn reset_computer_id_blocking(path: &Path) -> ComputerResult<String> {
             format!("cannot replace identity file: {error}"),
         ));
     }
+    // rename 已成功 ⇒ 磁盘上**已是新身份**。父目录 fsync 失败只影响「崩溃后目录项是否持久」，
+    // 此时返回错误会让调用方在断开后中止（用户离线，却已换身份）。记录告警并按已替换处理，
+    // 让上层继续用新身份重连回房。
     if let Err(error) = sync_parent_dir(path) {
-        return Err(identity_error(
-            path,
-            format!("cannot sync identity directory: {error}"),
-        ));
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "identity file replaced but parent directory sync failed; continuing with the new identity"
+        );
     }
     Ok(computer_id)
 }
@@ -660,5 +656,81 @@ mod tests {
             }
             other => panic!("相对路径重置必须 IdentityStore，实得 {other:?}"),
         }
+    }
+
+    /// 失败注入：目标路径是目录 ⇒ `rename` 失败，临时文件必须清理。
+    #[test]
+    fn test_reset_rename_failure_cleans_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = xdg_env(tmp.path());
+        let path = computer_id_path(Some(&env));
+        std::fs::create_dir_all(&path).unwrap(); // 目标位置是目录 ⇒ rename 失败
+        let leftovers = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".tmp-"))
+                .collect()
+        };
+        assert!(leftovers(path.parent().unwrap()).is_empty());
+
+        let result = reset_computer_id_blocking(&path);
+        assert!(
+            matches!(result, Err(ComputerError::IdentityStore { .. })),
+            "{result:?}"
+        );
+        let after = leftovers(path.parent().unwrap());
+        assert!(after.is_empty(), "rename 失败必须清理临时文件：{after:?}");
+    }
+
+    /// 失败注入：身份目录无法创建（父路径是普通文件）⇒ `IdentityStore`，不产生临时文件。
+    #[test]
+    fn test_reset_directory_creation_failure_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("xdg-is-a-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), tmp.path().display().to_string());
+        env.insert("XDG_CONFIG_HOME".to_string(), blocker.display().to_string());
+        let path = computer_id_path(Some(&env));
+
+        match reset_computer_id_blocking(&path) {
+            Err(ComputerError::IdentityStore { reason, .. }) => {
+                assert!(reason.contains("directory"), "{reason}");
+            }
+            other => panic!("目录创建失败必须 IdentityStore，实得 {other:?}"),
+        }
+    }
+
+    /// 失败注入（unix）：目录不可写 ⇒ 临时文件创建失败 ⇒ `IdentityStore`，且无残留。
+    #[cfg(unix)]
+    #[test]
+    fn test_reset_write_failure_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let env = xdg_env(tmp.path());
+        let path = computer_id_path(Some(&env));
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = reset_computer_id_blocking(&path);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            matches!(result, Err(ComputerError::IdentityStore { .. })),
+            "{result:?}"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "写失败不得留下临时文件：{leftovers:?}"
+        );
     }
 }

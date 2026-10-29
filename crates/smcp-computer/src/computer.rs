@@ -4701,6 +4701,16 @@ impl<S: Session> Computer<S> {
     where
         S: Clone + 'static,
     {
+        // protocol#64：身份读取与连接安装同在**生命周期临界区**内，与 `reset_computer_id` /
+        // `disconnect_socketio` 串行——否则 reset 的「检查槽位为空 → 原子替换」与 connect 读取
+        // 身份之间存在 check-then-act 窗口。
+        let _lifecycle_gate = self.socketio_lifecycle_gate.lock().await;
+        if self.status.state() == LifecycleState::Shutdown {
+            return Err(ComputerError::InvalidState(
+                "Computer is shut down".to_string(),
+            ));
+        }
+
         // protocol#64（v0.5.0）：首次连接物化 / 复用稳定身份 `computer_id`。
         // 持久化不可读 / 损坏 / 无法创建 ⇒ fail-fast（`IdentityStore`），**不**回落临时值——
         // CLI 据此以非零退出码终止启动。
@@ -4763,17 +4773,11 @@ impl<S: Session> Computer<S> {
         if let Some(h) = parsed_headers {
             builder = builder.headers(h);
         }
-        let gate = Arc::clone(&self.socketio_lifecycle_gate);
         let socketio_client = Arc::clone(&self.socketio_client);
         let status = Arc::clone(&self.status);
         let owner = Arc::clone(&self.socketio_lifecycle_owner);
+        // 生命周期临界区由**调用方**持有（跨本 await），任务内不再重复加锁（否则自死锁）。
         tokio::spawn(async move {
-            let _gate = gate.lock().await;
-            if status.state() == LifecycleState::Shutdown {
-                return Err(ComputerError::InvalidState(
-                    "Computer is shut down".to_string(),
-                ));
-            }
             let client = Arc::new(builder.connect().await?);
             install_socketio_client_locked(socketio_client, status, owner, client).await
         })
@@ -4825,6 +4829,9 @@ impl<S: Session> Computer<S> {
     /// Resets the persisted identity. Rejected while connected; the new value only takes effect on
     /// a new connection.
     pub async fn reset_computer_id(&self) -> ComputerResult<String> {
+        // 与 connect / disconnect 共用生命周期临界区：消除「检查槽位为空 → 替换身份」与并发
+        // `connect_socketio` 之间的 check-then-act 窗口（连接读身份在门内，本方法在同一门内）。
+        let _lifecycle_gate = self.socketio_lifecycle_gate.lock().await;
         if self.has_socketio_client().await {
             return Err(ComputerError::InvalidState(
                 "Cannot reset computer identity while connected; disconnect first".to_string(),
