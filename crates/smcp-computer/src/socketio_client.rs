@@ -25,14 +25,15 @@ use serde_json::Value;
 use smcp::{
     events::{
         CLIENT_GET_BLOB, CLIENT_GET_CONFIG, CLIENT_GET_DESKTOP, CLIENT_GET_RESOURCES,
-        CLIENT_GET_SKILL, CLIENT_GET_SKILLS, CLIENT_GET_TOOLS, CLIENT_PUT_BLOB, CLIENT_TOOL_CALL,
-        NOTIFY_TOOL_CALL_CANCEL, SERVER_JOIN_OFFICE, SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG,
-        SERVER_UPDATE_DESKTOP, SERVER_UPDATE_SKILLS, SERVER_UPDATE_TOOL_LIST,
+        CLIENT_GET_SKILL, CLIENT_GET_SKILLS, CLIENT_GET_TOOLS, CLIENT_PUT_BLOB,
+        CLIENT_RESOLVE_PATH, CLIENT_TOOL_CALL, NOTIFY_TOOL_CALL_CANCEL, SERVER_JOIN_OFFICE,
+        SERVER_LEAVE_OFFICE, SERVER_UPDATE_CONFIG, SERVER_UPDATE_DESKTOP, SERVER_UPDATE_SKILLS,
+        SERVER_UPDATE_TOOL_LIST,
     },
     set_content_blob_sideband, AgentCallData, ErrorCode, ErrorPayload, GetBlobReq, GetBlobRet,
     GetComputerConfigReq, GetComputerConfigRet, GetDesktopReq, GetDesktopRet, GetResourcesReq,
     GetResourcesRet, GetSkillReq, GetSkillRet, GetSkillsReq, GetSkillsRet, GetToolsReq,
-    GetToolsRet, PutBlobReq, ToolCallReq, SMCP_NAMESPACE,
+    GetToolsRet, PutBlobReq, ResolvePathReq, ResolvePathRet, ToolCallReq, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1055,6 +1056,25 @@ impl SmcpComputerClient {
                                 }
                             }
                             Err(e) => error!("Error handling put_blob: {}", e),
+                        }
+                    }
+                    .boxed()
+                }
+                // v0.5.0 protocol#65：按路径读取 client:resolve_path（带 ACK；4020 带内回传）。
+                CLIENT_RESOLVE_PATH => {
+                    let ops = computer_ops_clone.clone();
+                    let computer_name = computer_name_clone.clone();
+                    async move {
+                        match Self::handle_resolve_path_with_ack(payload, ops, computer_name).await
+                        {
+                            Ok((ack_id, response)) => {
+                                if let Some(id) = ack_id {
+                                    if let Err(e) = client.ack_with_id(id, response).await {
+                                        error!("Failed to send ack: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => error!("Error handling resolve_path: {}", e),
                         }
                     }
                     .boxed()
@@ -2485,6 +2505,49 @@ impl SmcpComputerClient {
         }
     }
 
+    /// 处理按路径读取事件 `client:resolve_path`（带 ACK，v0.5.0 protocol#65）。
+    ///
+    /// 九步管线由 [`ComputerHandlerOps::resolve_read_path`] 执行；铸造期失败按 flat `4020`
+    /// （`details.reason` ∈ invalid_path / forbidden / not_found / not_a_file，开放枚举）带内回传，
+    /// 解析 / 守卫失败返回 `Err`（无 ack）。对齐 Python `on_resolve_path`。
+    async fn handle_resolve_path_with_ack(
+        payload: Payload,
+        ops: Option<Arc<dyn ComputerHandlerOps>>,
+        computer_name: String,
+    ) -> ComputerResult<(Option<i32>, Value)> {
+        let (ack_id, req) = Self::extract_ack_and_parse::<ResolvePathReq>(payload)?;
+        if computer_name != req.computer {
+            return Err(ComputerError::ValidationError(format!(
+                "Computer name mismatch: expected {}, got {}",
+                computer_name, req.computer
+            )));
+        }
+        let ops = ops.ok_or_else(|| {
+            ComputerError::InvalidState("Computer ops not available for resolve_path".to_string())
+        })?;
+
+        let response = match ops.resolve_read_path(&req.path).await {
+            Ok(resolved) => serde_json::to_value(ResolvePathRet {
+                canonical_path: resolved.canonical_path,
+                blob_handle: resolved.blob_handle,
+                mime_type: resolved.mime_type,
+                total_size: resolved.total_size,
+                sha256: resolved.sha256,
+                mtime: resolved.mtime,
+                req_id: req.base.req_id,
+            })?,
+            Err(error) => {
+                warn!(
+                    "client:resolve_path rejected: reason={}, err={}",
+                    error.reason_str(),
+                    error
+                );
+                serde_json::to_value(path_error_payload(error.reason_str()))?
+            }
+        };
+        Ok((ack_id, response))
+    }
+
     /// 处理取消通知 `notify:tool_call_cancel`（**无 ACK**，fire-and-forget，INT-03 #72 + 取消纵切）。
     ///
     /// 解析广播载体 `{agent, req_id}`（[`AgentCallData`]），fire 对应在途调用的取消令牌
@@ -2720,6 +2783,16 @@ pub(crate) fn convert_tool_to_smcp_tool(
 /// gone/range）/ build a flat 4018 ErrorPayload。供 `client:get_blob` handler 回传（ACK 第一参）。
 fn blob_error_payload(reason: &str) -> ErrorPayload {
     ErrorPayload::from_error_code(ErrorCode::BlobNotAccessible, "Blob not accessible")
+        .with_detail("reason", reason)
+}
+
+/// 构造 `4020 Path Not Accessible` flat ErrorPayload（`details.reason` ∈ invalid_path /
+/// forbidden / not_found / not_a_file，开放枚举）/ build a flat 4020 ErrorPayload。
+///
+/// 供 `client:resolve_path` handler 回传（ACK 第一参）；拉取期撤权/删除仍走 4018
+/// （[`blob_error_payload`]）。
+fn path_error_payload(reason: &str) -> ErrorPayload {
+    ErrorPayload::from_error_code(ErrorCode::PathNotAccessible, "Path not accessible")
         .with_detail("reason", reason)
 }
 
@@ -3619,6 +3692,154 @@ mod tests {
                 .unwrap();
         assert_eq!(resp["code"], json!(4018));
         assert_eq!(resp["details"]["reason"], json!("invalid_handle"));
+    }
+
+    // ── v0.5.0 protocol#65：client:resolve_path handler（4020 flat）────────────
+
+    async fn boot_resolve_path_ops(
+        share: &std::path::Path,
+        tmp: &tempfile::TempDir,
+    ) -> Arc<dyn ComputerHandlerOps> {
+        use crate::computer::{Computer, SilentSession};
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(xdg.join("a2c")).unwrap();
+        std::fs::write(
+            xdg.join("a2c").join("settings.json"),
+            json!({"readRoots": [share.to_str().unwrap()]}).to_string(),
+        )
+        .unwrap();
+        let mut env = crate::settings::EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(tmp.path().join("proj"))
+            .with_config_env(env)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        Arc::new(computer)
+    }
+
+    fn resolve_payload(path: &str, ack: Option<i32>) -> Payload {
+        Payload::Text(
+            vec![json!({
+                "agent": "a", "req_id": "r-resolve", "computer": "c", "path": path
+            })],
+            ack,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_success_and_4020_reasons() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let file = share.join("hello.txt");
+        std::fs::write(&file, b"hello path").unwrap();
+        let ops = boot_resolve_path_ops(&share, &tmp).await;
+
+        // 成功：ResolvePathRet 全字段 + 现铸 path 句柄。
+        let (ack, resp) = SmcpComputerClient::handle_resolve_path_with_ack(
+            resolve_payload(file.to_str().unwrap(), Some(21)),
+            Some(ops.clone()),
+            "c".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ack, Some(21));
+        assert_eq!(resp["req_id"], json!("r-resolve"));
+        assert_eq!(resp["total_size"], json!(10));
+        assert_eq!(resp["mime_type"], json!("text/plain"));
+        assert!(resp["canonical_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("hello.txt"));
+        assert_eq!(
+            resp["sha256"],
+            json!(smcp::utils::hash::sha256_hex(b"hello path"))
+        );
+        assert!(resp["mtime"].is_i64(), "mtime missing: {resp}");
+        // 恰七字段（wire 形状钉死）。
+        let mut keys: Vec<&str> = resp
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "blob_handle",
+                "canonical_path",
+                "mime_type",
+                "mtime",
+                "req_id",
+                "sha256",
+                "total_size"
+            ]
+        );
+        assert!(matches!(
+            crate::blob::decode_blob_handle(resp["blob_handle"].as_str().unwrap()).unwrap(),
+            crate::blob::DecodedHandle::Path(_)
+        ));
+
+        // 4020 四种 reason（带内 ack，开放枚举）。
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        let cases = [
+            (outside.to_str().unwrap().to_string(), "forbidden"),
+            (
+                share.join("missing.txt").to_str().unwrap().to_string(),
+                "not_found",
+            ),
+            (share.to_str().unwrap().to_string(), "not_a_file"),
+            ("relative/path".to_string(), "invalid_path"),
+        ];
+        for (path, reason) in cases {
+            let (ack, resp) = SmcpComputerClient::handle_resolve_path_with_ack(
+                resolve_payload(&path, Some(22)),
+                Some(ops.clone()),
+                "c".to_string(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ack, Some(22), "path={path}");
+            assert_eq!(resp["code"], json!(4020), "path={path}");
+            assert_eq!(resp["message"], json!("Path not accessible"), "path={path}");
+            assert_eq!(resp["details"]["reason"], json!(reason), "path={path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_guard_failures_have_no_ack() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let share = tmp.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let ops = boot_resolve_path_ops(&share, &tmp).await;
+
+        // computer 名不匹配 → Err（无 ack）；无 ops → Err。
+        let mismatch = SmcpComputerClient::handle_resolve_path_with_ack(
+            resolve_payload("/x", Some(1)),
+            Some(ops),
+            "other".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(mismatch, ComputerError::ValidationError(_)));
+
+        let no_ops = SmcpComputerClient::handle_resolve_path_with_ack(
+            resolve_payload("/x", Some(1)),
+            None,
+            "c".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(no_ops, ComputerError::InvalidState(_)));
     }
 
     #[tokio::test]

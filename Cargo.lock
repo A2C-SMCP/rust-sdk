@@ -4820,6 +4820,7 @@ dependencies = [
  "jsonwebtoken",
  "keyring",
  "lazy_static",
+ "libc",
  "notify",
  "percent-encoding",
  "plist",

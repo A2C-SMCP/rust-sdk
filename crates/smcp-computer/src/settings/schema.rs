@@ -343,8 +343,8 @@ fn validate_landing_root(key: &str, value: &Value, scope: SettingsScope) -> Vali
 /// 非法项**逐条过滤**并记诊断（不整字段判废——其余授权根仍然生效）；空数组 = 不可读
 /// （fail-closed，语义由 resolve 管线保证）。**不做** `~` 展开：协议 `normalize_path` 明确
 /// 不展开 `~`，含 `~` 的项在运行期按 `invalid_path` 处理，故此处不视为绝对路径。
-/// 双形态（配置 / realpath）在运行期由 [`build_read_roots`](crate::blob::path_resolver::build_read_roots)
-/// 编译。
+/// 三形态（配置 / realpath / 磁盘 canonical）在运行期由
+/// [`build_read_roots`](crate::blob::path_resolver::build_read_roots) 编译。
 fn validate_read_roots(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
     let Some(arr) = value.as_array() else {
         return (

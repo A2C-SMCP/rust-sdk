@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,10 +27,14 @@ use tracing::{debug, error, info, warn};
 
 // INT-01 #68：SKILL / blob 子系统编排 / SKILL & blob subsystem orchestration。
 use crate::blob::{
-    decode_blob_handle, default_thresholds, encode_toolspool_handle, BlobHandleError, BlobResolver,
-    BlobThresholds, BlobTooLargeError, BlobUploadStore, DecodedHandle, ResolvedBlob,
+    build_protected_paths, decode_blob_handle, default_thresholds, encode_toolspool_handle,
+    resolve_for_pull, resolve_path as resolve_read_path_core, resolve_read_roots,
+    resolve_read_roots_and_landing_root, BlobHandleError, BlobResolver, BlobThresholds,
+    BlobTooLargeError, BlobUploadStore, DecodedHandle, PathAccessPolicy, PathHandlePayload,
+    PathResolveError, ProtectedPaths, ReadRoot, ResolveReason, ResolvedBlob, ResolvedPath,
     SkillBlobResolver, SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
+use smcp::utils::path_norm::{native_platform, PathPlatform};
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
 use crate::governance::{
     resolve_governance_snapshot, GovernanceArgs, GovernanceQueryError, GovernanceRuntimeOverlay,
@@ -2056,7 +2060,122 @@ impl<S: Session> Computer<S> {
                     .map(|r| PathBuf::from(r.path));
                 SkillBlobResolver::new(PreresolvedRoot(root)).resolve(&decoded)
             }
+            // v0.5.0 protocol#65：path 句柄按**当前** readRoots / 文件系统状态重跑第 3–8 步。
+            DecodedHandle::Path(payload) => self.pull_path_blob(payload).await,
         }
+    }
+
+    // ── v0.5.0 protocol#65：按路径读取 / read-by-path ─────────────────────────
+
+    /// `client:resolve_path` 的授权读根（settings 键 `readRoots`，**默认空 = 不可读**）。
+    ///
+    /// 每次请求**现算**（settings 可能被另一进程改写、root 符号链接可能换指向）；空根在
+    /// path core 第 2 步即 `forbidden`，不触碰目标路径。
+    pub async fn read_roots(&self) -> Vec<ReadRoot> {
+        let config_dir = self.config_dir();
+        let env = self.config_env().cloned();
+        tokio::task::spawn_blocking(move || resolve_read_roots(&config_dir, env.as_ref()))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// 一次请求的授权快照（读根 + 固定拒绝集），供 resolve / pull 共用。
+    ///
+    /// 空 `readRoots` 时短路拒绝集构造（fail-closed，且不产生 SKILL Home 副作用）。
+    pub async fn path_access_policy(&self) -> PathAccessPolicy {
+        let config_dir = self.config_dir();
+        let env = self.config_env().cloned();
+        // 一次 settings 解析同时得读根 + landingRoot；空根直接短路，不构造拒绝集。
+        let (roots, settings_landing) = {
+            let config_dir = config_dir.clone();
+            let env = env.clone();
+            tokio::task::spawn_blocking(move || {
+                resolve_read_roots_and_landing_root(&config_dir, env.as_ref())
+            })
+            .await
+            .unwrap_or_default()
+        };
+        if roots.is_empty() {
+            return PathAccessPolicy {
+                roots,
+                protected: ProtectedPaths::default(),
+            };
+        }
+        let skill_home = self.skill_home();
+        let blob_cache_root = self
+            .blob_cache_root_override
+            .clone()
+            .unwrap_or_else(default_blob_cache_root);
+        // 与写入根对齐：override > 进程内已缓存 > 本次 settings 视图（未配置时不缓存 None，
+        // 事后补配置即时生效）。
+        let landing_root = if let Some(root) = self.landing_root_override.clone() {
+            Some(root)
+        } else if let Some(cached) = self.landing_root.read().await.clone() {
+            Some(cached)
+        } else {
+            settings_landing
+        };
+        // `--mcp-config`（flag 层）可含 server 字面量 env / 凭据，必须在拒绝集内。
+        let flag_mcp_config = self.mcp_flag_config.clone();
+        tokio::task::spawn_blocking(move || {
+            build_path_access_policy(
+                roots,
+                &config_dir,
+                env.as_ref(),
+                skill_home,
+                blob_cache_root,
+                landing_root,
+                flag_mcp_config.as_deref(),
+                native_platform(),
+            )
+        })
+        .await
+        // JoinError → 空策略（fail-closed：无根即 forbidden）。
+        .unwrap_or_default()
+    }
+
+    /// 执行协议九步 resolve 管线并铸造 path 句柄（`client:resolve_path` 核心）。
+    ///
+    /// `sha256` 全量流式读取经 [`tokio::task::spawn_blocking`] offload，避免霸占 async 线程。
+    ///
+    /// # Errors
+    /// [`PathResolveError`]（`reason` ∈ invalid_path / forbidden / not_found / not_a_file）→ 4020。
+    pub async fn resolve_read_path(&self, path: &str) -> Result<ResolvedPath, PathResolveError> {
+        let policy = self.path_access_policy().await;
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            resolve_read_path_core(&path, &policy.roots, &policy.protected, native_platform())
+        })
+        .await
+        .map_err(|error| {
+            PathResolveError::new(
+                ResolveReason::Forbidden,
+                format!("resolve task failed: {error}"),
+            )
+        })?
+    }
+
+    /// `client:get_blob` 解析 path 句柄：按当前授权复核并从**同一打开句柄**切片。
+    ///
+    /// # Errors
+    /// [`BlobHandleError`]（4018 `invalid_handle` / `forbidden` / `gone`）。
+    pub async fn pull_path_blob(
+        &self,
+        payload: &PathHandlePayload,
+    ) -> Result<ResolvedBlob, BlobHandleError> {
+        let policy = self.path_access_policy().await;
+        let payload = payload.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_for_pull(
+                &payload,
+                &policy.roots,
+                &policy.protected,
+                native_platform(),
+            )
+            .map(|pull| pull.into_resolved_blob())
+        })
+        .await
+        .map_err(|error| BlobHandleError::Forbidden(format!("path pull task failed: {error}")))?
     }
 
     // ── 编排链：去抖结算 + user 源 watcher（#68，设计 §8）─────────────────────
@@ -5012,8 +5131,10 @@ impl<S: Session + Clone> Clone for Computer<S> {
 pub(crate) trait ComputerHandlerOps: Send + Sync {
     /// Raw desired MCP declarations joined with current runtime status / protocol config view.
     async fn get_computer_config_servers(&self) -> ComputerResult<serde_json::Value>;
-    /// 解析 blob 句柄（toolspool / skill）→ 可切片描述符 / resolve a blob handle。
+    /// 解析 blob 句柄（toolspool / skill / path）→ 可切片描述符 / resolve a blob handle。
     async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError>;
+    /// `client:resolve_path`：九步管线解析并铸造 path 句柄 / resolve a local path（4020 core）。
+    async fn resolve_read_path(&self, path: &str) -> Result<ResolvedPath, PathResolveError>;
     /// 活跃 SKILL 列表（排除孤儿）/ active SKILL refs。
     async fn get_skills(&self) -> Vec<A2CSkillRef>;
     /// 按 name 查活跃 SKILL / lookup an active SKILL by name。
@@ -5053,6 +5174,9 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
     }
     async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError> {
         Computer::resolve_blob(self, handle).await
+    }
+    async fn resolve_read_path(&self, path: &str) -> Result<ResolvedPath, PathResolveError> {
+        Computer::resolve_read_path(self, path).await
     }
     async fn get_skills(&self) -> Vec<A2CSkillRef> {
         Computer::get_skills(self).await
@@ -5121,6 +5245,53 @@ fn resolve_landing_root_settings(
         return None;
     }
     Some(crate::skills::home::expand_home(raw.trim(), env))
+}
+
+/// 构造一次请求的授权快照（读根 + 固定拒绝集）。
+///
+/// 空 `readRoots` 直接返回空策略（fail-closed；第 2 步即 forbidden），不构造拒绝集——避免
+/// `skill_home()` 之外的额外副作用与无谓 stat。非空时把接线层已知位置注入拒绝集：
+/// SKILL Home、blob 缓存根、`.tfrobot` 治理目录及其具体文件（硬链接身份兜底）。
+// 私有策略装配函数：参数即调用点已持有的快照各分量，拆结构体只会多一层搬运。
+#[allow(clippy::too_many_arguments)]
+fn build_path_access_policy(
+    roots: Vec<ReadRoot>,
+    config_dir: &Path,
+    env: Option<&EnvMap>,
+    skill_home: PathBuf,
+    blob_cache_root: PathBuf,
+    landing_root: Option<PathBuf>,
+    flag_mcp_config: Option<&Path>,
+    platform: PathPlatform,
+) -> PathAccessPolicy {
+    if roots.is_empty() {
+        return PathAccessPolicy {
+            roots,
+            protected: ProtectedPaths::default(),
+        };
+    }
+
+    let mut extra = vec![skill_home, blob_cache_root];
+    let governance_dir = config_dir.join(crate::settings::TFROBOT_DIRNAME);
+    extra.push(governance_dir.clone());
+    // 具体文件一并注入：硬链接到 `.tfrobot/mcp.json` 时路径前缀失效，只有文件身份能挡。
+    for name in [
+        crate::settings::PROJECT_SETTINGS_FILENAME,
+        crate::settings::LOCAL_SETTINGS_FILENAME,
+        crate::settings::MCP_CONFIG_FILENAME,
+        crate::settings::MCP_LOCAL_CONFIG_FILENAME,
+    ] {
+        let candidate = governance_dir.join(name);
+        if candidate.exists() {
+            extra.push(candidate);
+        }
+    }
+    if let Some(flag_mcp_config) = flag_mcp_config {
+        extra.push(flag_mcp_config.to_path_buf());
+    }
+
+    let protected = build_protected_paths(&extra, landing_root.as_deref(), env, platform);
+    PathAccessPolicy { roots, protected }
 }
 
 /// MCP 源 SKILL 重物化的共享自由函数（#106）：`Computer::restage_mcp_skills` 与 [`McpChangeReactor`] 共用，
@@ -10992,6 +11163,184 @@ mod tests {
             .await;
         *computer.mcp_manager.write().await = Some(manager);
         computer
+    }
+
+    // ── v0.5.0 protocol#65：path_access_policy / resolve_read_path / pull_path_blob ──────
+
+    #[tokio::test]
+    async fn test_computer_resolve_read_path_and_pull() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let file = share.join("hello.txt");
+        std::fs::write(&file, b"hello path").unwrap();
+        std::fs::write(
+            xdg.join("a2c").join("settings.json"),
+            serde_json::json!({"readRoots": [share.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        assert_eq!(computer.read_roots().await.len(), 1);
+        let resolved = computer
+            .resolve_read_path(file.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resolved.total_size, 10);
+        assert_eq!(resolved.mime_type, "text/plain");
+
+        let payload = match crate::blob::decode_blob_handle(&resolved.blob_handle).unwrap() {
+            crate::blob::DecodedHandle::Path(payload) => payload,
+            other => panic!("unexpected kind {}", other.kind()),
+        };
+        let pulled = computer.pull_path_blob(&payload).await.unwrap();
+        assert_eq!(pulled.sha256, resolved.sha256);
+        assert_eq!(pulled.slice(0, 5).unwrap(), b"hello".to_vec());
+
+        // `resolve_blob` 路由 Path 句柄 → 拉取期复核 + 同一套切片接口（get_blob handler 的入口）。
+        let routed = computer.resolve_blob(&resolved.blob_handle).await.unwrap();
+        assert_eq!(routed.sha256, resolved.sha256);
+        assert_eq!(routed.slice(0, 5).unwrap(), b"hello".to_vec());
+
+        // 经 ComputerHandlerOps（client:resolve_path handler 的接线面）再走一次。
+        let via_ops = ComputerHandlerOps::resolve_read_path(&computer, file.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(via_ops.canonical_path, resolved.canonical_path);
+
+        // 授权根之外 → 4020 forbidden（不泄露存在性）。
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"nope").unwrap();
+        let error = computer
+            .resolve_read_path(outside.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+
+        // 删除后经 get_blob 入口 → 4018 gone（拉取期复核）。
+        std::fs::remove_file(&file).unwrap();
+        let error = computer
+            .resolve_blob(&resolved.blob_handle)
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason(), "gone");
+    }
+
+    #[tokio::test]
+    async fn test_computer_resolve_read_path_without_read_roots_is_forbidden() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(xdg.join("a2c")).unwrap();
+        // 未配置 readRoots（默认空 = 不可读）。
+        let file = tmp.path().join("visible.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        assert!(computer.read_roots().await.is_empty());
+        let error = computer
+            .resolve_read_path(file.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+    }
+
+    /// settings `landingRoot` / `with_landing_root` 都必须把 `.part` 接入固定拒绝集。
+    #[tokio::test]
+    async fn test_computer_landing_part_forbidden_from_settings_and_override() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let landing = tmp.path().join("landing");
+        let override_landing = tmp.path().join("override-landing");
+        let proj = tmp.path().join("proj");
+        for dir in [&home, &share, &landing, &override_landing] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let part = landing.join("upload.part");
+        fs::write(&part, b"partial").unwrap();
+        let override_part = override_landing.join("upload.part");
+        fs::write(&override_part, b"partial").unwrap();
+        fs::write(
+            xdg.join("a2c").join("settings.json"),
+            serde_json::json!({
+                "readRoots": [tmp.path().to_string_lossy()],
+                "landingRoot": landing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env.clone())
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        let error = computer
+            .resolve_read_path(part.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
+
+        // `with_landing_root` 覆盖优先于 settings：`.part` 规则对准实际写入根。
+        let computer_override =
+            Computer::new("c", SilentSession::new("s"), None, None, false, false)
+                .with_config_dir(&proj)
+                .with_config_env(env)
+                .with_skill_home(&home)
+                .with_blob_cache_root(tmp.path().join("blob"))
+                .with_landing_root(&override_landing);
+        let error = computer_override
+            .resolve_read_path(override_part.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
     }
 
     #[tokio::test]
