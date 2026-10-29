@@ -347,18 +347,19 @@ async fn start_reconnect_capture_server_with_rejection(
 }
 
 /// 单次 join 裁决：`Some(code)` = flat ErrorPayload 拒绝；`None` = 零参 ACK 接受。
-/// 次数按服务端收到的 `server:join_office` 递增（含显式 join 与自动回放）。
-type JoinVerdict = Arc<dyn Fn(usize) -> Option<i64> + Send + Sync>;
+/// 次数按服务端收到的 `server:join_office` 递增（含显式 join 与自动回放）；payload 供按
+/// `computer_id` 等字段区分「重置前后」的 join。
+type JoinVerdict = Arc<dyn Fn(usize, &Value) -> Option<i64> + Send + Sync>;
 
 fn join_verdict<F>(verdict: F) -> JoinVerdict
 where
-    F: Fn(usize) -> Option<i64> + Send + Sync + 'static,
+    F: Fn(usize, &Value) -> Option<i64> + Send + Sync + 'static,
 {
     Arc::new(verdict)
 }
 
 fn reject_attempt(attempt: Option<usize>, code: i64) -> JoinVerdict {
-    join_verdict(move |n| (attempt == Some(n)).then_some(code))
+    join_verdict(move |n, _| (attempt == Some(n)).then_some(code))
 }
 
 async fn start_reconnect_capture_server_with_policy(
@@ -435,7 +436,7 @@ async fn start_reconnect_capture_server_with_policy(
                         let verdict = Arc::clone(&verdict);
                         async move {
                             let attempt = join_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                            let _ = join_tx.send(data);
+                            let _ = join_tx.send(data.clone());
                             if delayed_join_attempt == Some(attempt) {
                                 if let Some(gate) = gate {
                                     gate.notified().await;
@@ -447,7 +448,7 @@ async fn start_reconnect_capture_server_with_policy(
                             // ErrorPayload（顶层 `code`）。旧 `(success, message)` 元组形态已废除——
                             // 保留它会让客户端走**已删除**的兼容分支，使新增的 flat 拒绝路径零覆盖
                             // （#226 假绿清单第 5 条）。
-                            if let Some(rejection_code) = verdict(attempt) {
+                            if let Some(rejection_code) = verdict(attempt, &data) {
                                 let _ = ack.send(&json!({
                                     "code": rejection_code,
                                     "message": if rejection_code == 4101 { "Room already has a computer" } else { "Room already has an agent" },
@@ -1074,13 +1075,145 @@ async fn interrupted_rejoin_keeps_intent_for_next_session() {
     server.shutdown();
 }
 
+/// protocol#64 × #234：`identity reset` 在自动回房退避窗口内必须按**保留的 `desired` 意图**
+/// 回房（此时 `confirmed` 为空）。
+///
+/// 服务端按 join payload 的 `computer_id` 裁决：旧身份（自动回放）一律 `4101`，新身份（reset
+/// 后的显式回房）放行。若 reset 退回「只认 confirmed」，重连后不会发显式回房，本用例失败。
+#[cfg(feature = "cli")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_reset_in_rejoin_backoff_rejoins_retained_desired_office() {
+    use smcp_computer::cli::commands::{CliConfig, CommandHandler};
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let temp = tempfile::TempDir::new().unwrap();
+    let env = isolated_config_env(temp.path());
+    let original_id = smcp_computer::identity::load_or_create_computer_id(Some(&env))
+        .await
+        .expect("materialize identity");
+
+    let verdict = join_verdict({
+        let original_id = original_id.clone();
+        move |attempt: usize, payload: &Value| {
+            if attempt == 1 {
+                return None; // 初始显式 join
+            }
+            let rotated = payload
+                .get("computer_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != original_id.as_str());
+            if rotated {
+                None
+            } else {
+                Some(4101)
+            }
+        }
+    });
+    let mut server = start_reconnect_capture_server_with_policy(verdict, None, None).await;
+
+    let computer = Computer::new(
+        "desired-rejoin",
+        SilentSession::new("desired-rejoin-session"),
+        None,
+        None,
+        false,
+        false,
+    )
+    .with_config_dir(temp.path().join("cli-config"))
+    .with_skill_home(temp.path().join("skills"))
+    .with_blob_cache_root(temp.path().join("blob"))
+    .with_config_env(env.clone());
+    let mut handler = CommandHandler::new(
+        computer,
+        CliConfig {
+            url: None,
+            namespace: "/smcp".to_string(),
+            auth: None,
+            headers: None,
+            office_rejoin_budget_secs: Some(30),
+        },
+    );
+    handler.computer.boot_up().await.expect("boot computer");
+    handler
+        .connect_socketio(&server.url, "/smcp", &None, &None)
+        .await
+        .expect("connect through CLI handler");
+    handler
+        .join_socket_room("office-desired", "desired-rejoin")
+        .await
+        .expect("initial join");
+    server.wait_for_join_ack(1).await;
+
+    // 真实网络断开 → 自动回放（旧身份）被 4101 拒绝 → 进入退避：confirmed=None、desired 保留。
+    server.force_network_disconnect();
+    server.wait_for_join_ack(2).await;
+    let old_client = {
+        let slot = handler.computer.get_socketio_client();
+        let guard = slot.read().await;
+        let client = guard.clone().expect("socketio client installed");
+        drop(guard);
+        client
+    };
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if old_client.get_office_id().await.is_none()
+                && old_client.get_desired_office_id().await.as_deref() == Some("office-desired")
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("client must retain desired office while confirmed is cleared");
+
+    // reset：断开 → 轮换身份 → 以原参数重连 → 按保留的 desired 回房（新身份被服务端放行）。
+    handler
+        .reset_computer_identity()
+        .await
+        .expect("reset must rejoin retained desired office");
+
+    let new_client = {
+        let slot = handler.computer.get_socketio_client();
+        let guard = slot.read().await;
+        let client = guard.clone().expect("new socketio client installed");
+        drop(guard);
+        client
+    };
+    assert!(
+        !Arc::ptr_eq(&old_client, &new_client),
+        "reset 必须安装新连接"
+    );
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if new_client.get_office_id().await.as_deref() == Some("office-desired") {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reset must rejoin the retained desired office");
+    let rotated = smcp_computer::identity::load_or_create_computer_id(Some(&env))
+        .await
+        .expect("reload identity");
+    assert_ne!(rotated, original_id, "reset 必须轮换身份");
+
+    handler
+        .computer
+        .shutdown()
+        .await
+        .expect("shutdown computer");
+    server.shutdown();
+}
+
 /// #234：退避窗口内显式 join 失败且此前无 confirmed 成员关系——显式取消无属主的旧意图，
 /// 不留下「get_office_id=None、更新永远排队」的静默状态。
 #[tokio::test]
 async fn failed_explicit_join_during_rejoin_backoff_cancels_pending_intent() {
     let _ = tracing_subscriber::fmt::try_init();
     let mut server = start_reconnect_capture_server_with_policy(
-        join_verdict(|attempt| (attempt >= 2).then_some(4101)),
+        join_verdict(|attempt, _| (attempt >= 2).then_some(4101)),
         None,
         None,
     )
@@ -1146,7 +1279,7 @@ async fn failed_explicit_join_during_rejoin_backoff_cancels_pending_intent() {
 async fn exhausted_rejoin_budget_falls_back_to_connected_and_stops_retrying() {
     let _ = tracing_subscriber::fmt::try_init();
     let mut server = start_reconnect_capture_server_with_policy(
-        join_verdict(|attempt| (attempt >= 2).then_some(4101)),
+        join_verdict(|attempt, _| (attempt >= 2).then_some(4101)),
         None,
         None,
     )
@@ -1207,7 +1340,7 @@ async fn exhausted_rejoin_budget_falls_back_to_connected_and_stops_retrying() {
 async fn permanent_rejection_is_not_retried() {
     let _ = tracing_subscriber::fmt::try_init();
     let mut server = start_reconnect_capture_server_with_policy(
-        join_verdict(|attempt| (attempt == 2).then_some(4106)),
+        join_verdict(|attempt, _| (attempt == 2).then_some(4106)),
         None,
         None,
     )
@@ -1341,7 +1474,7 @@ async fn explicit_join_is_not_blocked_during_rejoin_backoff() {
 async fn computer_override_takes_precedence_over_connect_options() {
     let _ = tracing_subscriber::fmt::try_init();
     let mut server = start_reconnect_capture_server_with_policy(
-        join_verdict(|attempt| (attempt >= 2).then_some(4101)),
+        join_verdict(|attempt, _| (attempt >= 2).then_some(4101)),
         None,
         None,
     )

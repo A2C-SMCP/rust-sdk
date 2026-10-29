@@ -181,9 +181,9 @@ pub enum ComputerError {
     /// Local-only identity-store failure (HTTP-500 analogue); never sent on the wire. Corrupt or
     /// unreadable identity MUST fail fast — never silently regenerate or overwrite.
     ///
-    /// 处置指引由**具体原因**决定（写在 `reason` 里）：只有「文件内容无效」才提示删除文件重建；
-    /// 非绝对路径 / 权限 / 路径是目录等重试或删文件都无效，不能给同一句 hint（否则用户会照抄
-    /// 未展开的哨兵路径去删真实身份文件）。
+    /// 处置指引由**具体原因**决定（写在 `reason` 里）：只有「文件内容无效 / 非 UTF-8」才提示
+    /// 运行 `smcp-computer identity reset`（或删除文件）重建；非绝对路径 / 权限 / 路径是目录等
+    /// 重试或删文件都无效，不能给同一句 hint（否则用户会照抄未展开的哨兵路径去删真实身份文件）。
     /// Remediation belongs to the specific `reason`, not to every identity-store error.
     #[error("Computer identity store error at {path}: {reason}")]
     IdentityStore {

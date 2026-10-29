@@ -310,6 +310,26 @@ async fn handle_command(
                 }
             }
         }
+        "identity" => {
+            if parts.len() < 2 {
+                return Err(CommandError::InvalidCommand(
+                    "identity 子命令缺失（可用: reset）/ missing identity subcommand (available: reset)"
+                        .to_string(),
+                ));
+            }
+            match parts[1] {
+                "reset" => {
+                    // protocol#64：连接中由 handler 编排 退房 → 断开 → 重置 → 重连 → 回房。
+                    handler.reset_computer_identity().await?;
+                }
+                _ => {
+                    return Err(CommandError::InvalidCommand(format!(
+                        "未知的 identity 子命令: {}（可用: reset）",
+                        parts[1]
+                    )));
+                }
+            }
+        }
         "notify" => {
             if parts.len() < 2 {
                 return Err(CommandError::InvalidCommand(

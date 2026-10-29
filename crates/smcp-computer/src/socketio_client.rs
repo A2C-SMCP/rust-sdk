@@ -536,11 +536,17 @@ pub struct SmcpComputerClient {
 }
 
 impl SmcpComputerClient {
-    /// protocol#64：本连接是否携带稳定身份（低层只读观测；`SmcpComputerClient::new` 恒为 `false`）。
+    /// protocol#64：本连接是否携带稳定身份（低层只读观测）。
     ///
-    /// 供 [`crate::computer::Computer::set_socketio_client`] 对「装入无身份 client」告警。
-    /// Whether this connection carries a stable Computer identity.
-    pub(crate) fn has_computer_identity(&self) -> bool {
+    /// `false` 意味着该 client 由未配置 `.computer_id(...)` 的 Builder 或
+    /// [`SmcpComputerClient::new`] 建立：它的 `server:join_office` 载荷**省略** `computer_id`，
+    /// 自 v0.5.0 起会被 Server 以 `400` 拒绝（protocol#64 强制校验）。宿主应在
+    /// [`crate::computer::Computer::set_socketio_client`] 安装前用本方法自检，或直接使用
+    /// [`crate::computer::Computer::connect_socketio`]（恒注入持久化身份）。
+    ///
+    /// Whether this connection carries a stable Computer identity. `false` means a join would omit
+    /// the key and be rejected with `400` by a v0.5.0 server.
+    pub fn has_computer_identity(&self) -> bool {
         self.computer_id.is_some()
     }
 
@@ -2655,6 +2661,18 @@ impl SmcpComputerClient {
             ))),
         };
         result.map(|()| info!("Disconnected from server"))
+    }
+
+    /// protocol#64 / #234：本连接的**期望房号**（重连退避期间 `confirmed` 为空但意图被刻意保留）。
+    ///
+    /// 供 CLI `identity reset` 在重连窗口内仍按原意图回房；reset 流程的「是否发 leave」决策
+    /// 仍只认 `confirmed`（`leave_current_office` 自身按 `confirmed → desired` 解析，与本方法的
+    /// 用途不同）。
+    /// The desired office retained across reconnect backoff.
+    pub async fn get_desired_office_id(&self) -> Option<String> {
+        lock_office_membership(&self.office_membership)
+            .desired
+            .clone()
     }
 
     /// 获取当前office ID

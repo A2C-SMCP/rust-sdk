@@ -737,6 +737,64 @@ mod tests {
         );
     }
 
+    /// protocol#64 不变量（两分支 × 两个上下文）：Agent 携带身份、非规范 UUID 均被拒绝；
+    /// 合法 Computer 身份通过。
+    #[test]
+    fn identity_invariants_reject_agent_carrying_and_bad_shape() {
+        let agent_with_id = SessionData::new("a".to_string(), "a".to_string(), ClientRole::Agent)
+            .with_computer_id(TEST_CID);
+        assert!(matches!(
+            agent_with_id.validate_identity_invariants(false),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(matches!(
+            agent_with_id.validate_identity_invariants(true),
+            Err(SessionError::InvalidState(_))
+        ));
+
+        let bad_shape = SessionData::new("c".to_string(), "c".to_string(), ClientRole::Computer)
+            .with_computer_id("BAD-UUID");
+        assert!(matches!(
+            bad_shape.validate_identity_invariants(false),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(matches!(
+            bad_shape.validate_identity_invariants(true),
+            Err(SessionError::InvalidState(_))
+        ));
+
+        let ok = SessionData::new("c2".to_string(), "c2".to_string(), ClientRole::Computer)
+            .with_computer_id(TEST_CID);
+        assert!(ok.validate_identity_invariants(false).is_ok());
+        assert!(ok.validate_identity_invariants(true).is_ok());
+    }
+
+    /// protocol#64：`register_session` 入口同样执行两分支校验（Agent 携带 / 非规范形态）。
+    ///
+    /// `reserve_join` 入口的两个违约分支在公开 API 下不可达（每次写入都走本校验），其
+    /// 「Computer 无身份」分支另见 `reserve_join_requires_computer_identity`。
+    #[test]
+    fn register_session_enforces_identity_invariants() {
+        let manager = SessionManager::new();
+        assert!(matches!(
+            manager.register_session(
+                SessionData::new("a1".to_string(), "a".to_string(), ClientRole::Agent)
+                    .with_computer_id(TEST_CID)
+            ),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(matches!(
+            manager.register_session(
+                SessionData::new("c1".to_string(), "c".to_string(), ClientRole::Computer)
+                    .with_computer_id("BAD-UUID")
+                    .with_office_id("R1".to_string())
+            ),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(manager.get_session(&"a1".to_string()).is_none());
+        assert!(manager.get_session(&"c1".to_string()).is_none());
+    }
+
     /// `register_session` 幂等：重复注册同一 sid 一律 `Ok` 且保留原记录（即便新入参本身违约）。
     #[test]
     fn register_session_is_idempotent_for_existing_sid() {

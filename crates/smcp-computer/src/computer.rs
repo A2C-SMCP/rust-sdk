@@ -1068,6 +1068,14 @@ impl<S: Session> Computer<S> {
         self
     }
 
+    /// 本实例的回房预算覆盖值（供 CLI 的 `identity reset` 回房复用同一预算口径）。
+    ///
+    /// `None` 表示未覆盖——调用方应回退到 CLI 参数/默认值。crate 内部读取。
+    #[cfg(feature = "cli")]
+    pub(crate) fn office_rejoin_budget_override_value(&self) -> Option<std::time::Duration> {
+        self.office_rejoin_budget_override
+    }
+
     /// 注入 MCP client factory override（#152 测试接缝）/ Inject a client factory override（test seam）。
     ///
     /// 缺省不注入 → manager 用真实 `client_factory`（stdio/sse/http 真实连接）。注入后由内部 `new_manager`
@@ -4816,10 +4824,32 @@ impl<S: Session> Computer<S> {
     /// Protocol #64 side effect and error: the first connect materializes/reuses the persisted
     /// `computer_id` and every join carries it. A corrupt/unreadable identity yields a local
     /// [`ComputerError::IdentityStore`] — treat it as fatal, not as a retryable transport error.
+    ///
+    /// **取消语义 / Cancellation**：取消本 future（如宿主用 `timeout` 包裹后超时）**不会**中止
+    /// 后台建连任务——detached 任务仍会继续完成握手 → `install`，并持续持有生命周期门（默认
+    /// 至 [`DEFAULT_NAMESPACE_CONNECT_TIMEOUT`] 即 30s）。期间 `reset_computer_id` /
+    /// `disconnect_socketio` / `shutdown` 可能被阻塞到该时限；取消后是否真的安装成功，只能以
+    /// [`Self::has_socketio_client`] 或后续调用的返回值判定，不能假定已中止。
+    /// Cancelling this future does not abort the detached connect task, which keeps the lifecycle
+    /// gate until it installs (default up to 30s namespace timeout).
     pub async fn connect_socketio(&self, url: &str, options: ConnectOptions) -> ComputerResult<()>
     where
         S: Clone + 'static,
     {
+        // protocol#64：身份读取与连接安装同在**生命周期临界区**内，与 `reset_computer_id` /
+        // `disconnect_socketio` 串行——否则 reset 的「检查槽位为空 → 原子替换」与 connect 读取
+        // 身份之间存在 check-then-act 窗口。
+        //
+        // **取消安全**：用 `lock_owned` 取得所有权守卫并**移入 spawn 任务**。若守卫留在本函数
+        // 栈上，宿主以 `timeout` 取消外层 future 后门会随之释放，而 detached 的 connect 任务仍会
+        // 读旧身份并 install——期间 reset 可成功并把槽位换成新身份，随后旧 client 被装回。
+        let lifecycle_guard = Arc::clone(&self.socketio_lifecycle_gate).lock_owned().await;
+        if self.status.state() == LifecycleState::Shutdown {
+            return Err(ComputerError::InvalidState(
+                "Computer is shut down".to_string(),
+            ));
+        }
+
         // protocol#64（v0.5.0）：首次连接物化 / 复用稳定身份 `computer_id`。
         // 持久化不可读 / 损坏 / 无法创建 ⇒ fail-fast（`IdentityStore`），**不**回落临时值——
         // CLI 据此以非零退出码终止启动。
@@ -4882,17 +4912,13 @@ impl<S: Session> Computer<S> {
         if let Some(h) = parsed_headers {
             builder = builder.headers(h);
         }
-        let gate = Arc::clone(&self.socketio_lifecycle_gate);
         let socketio_client = Arc::clone(&self.socketio_client);
         let status = Arc::clone(&self.status);
         let owner = Arc::clone(&self.socketio_lifecycle_owner);
+        // 取消安全：所有权守卫**移入任务**，任务存活期间一直持有生命周期门直到 install 完成。
+        // 外层 future 被 `timeout` 取消时门不会随之释放，reset 只能等落后台任务结束再判定。
         tokio::spawn(async move {
-            let _gate = gate.lock().await;
-            if status.state() == LifecycleState::Shutdown {
-                return Err(ComputerError::InvalidState(
-                    "Computer is shut down".to_string(),
-                ));
-            }
+            let _lifecycle_guard = lifecycle_guard;
             let client = Arc::new(builder.connect().await?);
             install_socketio_client_locked(socketio_client, status, owner, client).await
         })
@@ -4933,6 +4959,26 @@ impl<S: Session> Computer<S> {
         self.close_socketio_transport().await?;
         info!("Disconnected from server");
         Ok(())
+    }
+
+    /// protocol#64：重置 Computer 稳定身份（生成新 UUID 并**原子替换**持久化文件）。
+    ///
+    /// 身份在一条连接内不可变（协议 MUST）：**连接中调用返回 [`ComputerError::InvalidState`]**，
+    /// 调用方须先 [`Self::disconnect_socketio`]；重置后以**新连接**入房才会生效。CLI
+    /// `identity reset` 已编排「退房 → 断开 → 重置 → 重连 → 回房」。
+    ///
+    /// Resets the persisted identity. Rejected while connected; the new value only takes effect on
+    /// a new connection.
+    pub async fn reset_computer_id(&self) -> ComputerResult<String> {
+        // 与 connect / disconnect 共用生命周期临界区：消除「检查槽位为空 → 替换身份」与并发
+        // `connect_socketio` 之间的 check-then-act 窗口（连接读身份在门内，本方法在同一门内）。
+        let _lifecycle_gate = self.socketio_lifecycle_gate.lock().await;
+        if self.has_socketio_client().await {
+            return Err(ComputerError::InvalidState(
+                "Cannot reset computer identity while connected; disconnect first".to_string(),
+            ));
+        }
+        crate::identity::reset_computer_id(self.config_env()).await
     }
 
     /// Join using the specified identity, rejecting a name different from the connection's.
