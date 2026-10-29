@@ -13,6 +13,8 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use super::schema::FIELD_READ_ROOTS;
+// 持锁清理仅在 CLI（`settings set/edit`）路径使用；非 cli 构建下不引入。
+#[cfg(feature = "cli")]
 use super::store::{atomic_write_settings_json, with_settings_lock};
 
 /// 读取 settings 原始 JSON object（raw 保真）。
@@ -52,6 +54,7 @@ pub(crate) fn remove_read_roots_raw(map: &mut Map<String, Value>) -> bool {
 /// 持锁 raw 保真删除（读取 / 删除 / 回写在同一把 settings 锁内）。
 ///
 /// 返回是否删除；缺失 / 畸形 → `Ok(false)`；锁 / IO 错误 → `Err(String)`。
+#[cfg(feature = "cli")]
 pub(crate) fn drop_read_roots_from_file(path: &Path) -> Result<bool, String> {
     let written = with_settings_lock(path, || -> std::io::Result<bool> {
         let Some(mut map) = read_raw_map(path)? else {
