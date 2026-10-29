@@ -568,4 +568,34 @@ mod tests {
         client.disconnect().await?;
         Ok(())
     }
+
+    /// protocol#64：不含身份的底层 client（`has_computer_identity() == false`）入房会被
+    /// v0.5.0 Server 以 `400` 拒绝——编程信号与端到端行为一致。
+    #[tokio::test]
+    async fn identity_less_client_join_is_rejected_with_400() {
+        let server_url = start_test_server().await;
+        let manager = Arc::new(RwLock::new(Some(MCPServerManager::new())));
+        let inputs: Arc<RwLock<HashMap<String, MCPServerInput>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let client =
+            SmcpComputerClientBuilder::new(&server_url, manager, "no-identity".to_string(), inputs)
+                .connect()
+                .await
+                .expect("connect identity-less client");
+        assert!(
+            !client.has_computer_identity(),
+            "未注入身份的 client 不应携带身份"
+        );
+
+        let error = client
+            .join_office("office-no-id")
+            .await
+            .expect_err("identity-less join 必须被 Server 拒绝");
+        match error {
+            smcp_computer::errors::ComputerError::ProtocolRejection { code, .. } => {
+                assert_eq!(code, 400, "身份缺失必须回 400，实得 {code}");
+            }
+            other => panic!("expected ProtocolRejection 400, got {other:?}"),
+        }
+    }
 }

@@ -25,6 +25,7 @@ pub const NAMESPACES: &[(&str, &str)] = &[
     ),
     ("skill", "Skills cross-source query (list / info)"),
     ("socket", "Socket.IO connection control"),
+    ("identity", "Computer stable identity (reset)"),
     ("notify", "Send notifications to Agent"),
     (
         "settings",
@@ -44,6 +45,7 @@ pub const ROOT_WORDS: &[&str] = &[
     "plugin",
     "skill",
     "socket",
+    "identity",
     "notify",
     "settings",
     "start",
@@ -94,6 +96,7 @@ pub fn subcommands(ns: &str) -> &'static [&'static str] {
         ],
         "skill" => &["list", "info"],
         "socket" => &["connect", "join", "leave"],
+        "identity" => &["reset"],
         "notify" => &["update"],
         "settings" => &["show", "edit", "get", "set"],
         _ => &[],
@@ -113,6 +116,7 @@ pub fn flags_for(ns: &str, sub: &str) -> &'static [&'static str] {
         ("plugin", "enable" | "disable" | "info" | "gc") => &["--json"],
         ("plugin", "list") => &["--available", "--json"],
         ("settings", "show" | "get" | "set" | "edit") => &["--scope", "--json"],
+        ("identity", "reset") => &["--yes"],
         _ => &[],
     }
 }
@@ -211,6 +215,10 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
             ),
             ("socket leave", "离开房间 / leave office"),
         ],
+        "identity" => &[(
+            "identity reset",
+            "重置 Computer 稳定身份（连接中自动退房→断开→重置→重连→回房）/ reset stable identity",
+        )],
         "notify" => &[(
             "notify update",
             "触发配置更新通知 / emit config updated notification",

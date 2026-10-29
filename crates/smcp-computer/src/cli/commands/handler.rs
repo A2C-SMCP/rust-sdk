@@ -126,6 +126,9 @@ impl CommandHandler {
         println!("  socket connect [url]      连接 Socket.IO / connect to Socket.IO");
         println!("  socket join <office> <name>  加入房间（改名会重建连接）/ join office (rename reconnects)");
         println!("  socket leave              离开房间 / leave office");
+        println!(
+            "  identity reset            重置 Computer 稳定身份（连接中自动退房→断开→重置→重连→回房）/ reset identity"
+        );
         println!("  notify update             触发配置更新通知 / emit config updated");
         println!("  render <json|@file>       测试渲染（占位符解析）");
         println!("  quit | exit               退出 / quit");
@@ -1020,6 +1023,68 @@ impl CommandHandler {
     pub async fn leave_socket_room(&self) -> Result<(), CommandError> {
         self.computer.leave_office().await?;
         println!("✅ 已离开房间 / Left office");
+        Ok(())
+    }
+
+    /// protocol#64：重置稳定身份（连接态编排）/ orchestrated identity reset.
+    ///
+    /// 顺序：best-effort 退房（在房时）→ 断开 → 重置持久化文件 → 以原参数重连 → 原本在房则回房。
+    /// - 退房失败仅告警（重置优先，且断连本身会清理成员关系）；
+    /// - 断开失败**中止**（连接中身份不可变，协议 MUST）；
+    /// - 重置后的重连/回房失败上抛——身份已更换，调用方必须感知当前未恢复连接。
+    pub async fn reset_computer_identity(&mut self) -> Result<(), CommandError> {
+        let was_connected = self.computer.has_socketio_client().await;
+        // 连接中重置必须有可重放参数：否则断开后无法恢复连接，宁可**在改动任何状态前**拒绝。
+        if was_connected && self.connection.is_none() {
+            return Err(CommandError::InvalidCommand(
+                "连接不是经 socket connect 建立，缺少可重放的连接参数；请先手动断开并重连 / \
+                 connection has no replayable args; disconnect and reconnect manually"
+                    .to_string(),
+            ));
+        }
+        let previous_office = if was_connected {
+            let client = self.computer.get_socketio_client();
+            let guard = client.read().await;
+            match guard.as_ref() {
+                Some(client) => client.get_office_id().await,
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        if was_connected {
+            if previous_office.is_some() {
+                if let Err(error) = self.leave_socket_room().await {
+                    eprintln!("退房失败（继续重置）/ leave failed (continuing): {error}");
+                }
+            }
+            self.disconnect_socketio().await?;
+        }
+
+        let computer_id = self.computer.reset_computer_id().await?;
+        println!("✅ 身份已重置 / Identity reset: {computer_id}");
+
+        if was_connected {
+            let connection = self.connection.clone().ok_or_else(|| {
+                CommandError::InvalidCommand(
+                    "无保存的连接参数可重连 / no stored connection args to reconnect".to_string(),
+                )
+            })?;
+            self.connect_with_args(
+                &connection.url,
+                &connection.namespace,
+                &connection.auth,
+                &connection.headers,
+            )
+            .await?;
+            if let Some(office) = previous_office {
+                let name = self.computer.name().to_string();
+                if let Err(error) = self.join_socket_room(&office, &name).await {
+                    eprintln!("重连后回房失败 / rejoin after reconnect failed: {error}");
+                }
+            }
+        }
         Ok(())
     }
 

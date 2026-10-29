@@ -132,6 +132,21 @@ pub enum Commands {
         #[command(subcommand)]
         action: SkillCmd,
     },
+    /// Computer 稳定身份管理（protocol#64）/ Computer identity management
+    Identity {
+        #[command(subcommand)]
+        action: IdentityCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IdentityCmd {
+    /// 重置 Computer 稳定身份（生成新 UUID；持久化文件原子替换）
+    Reset {
+        /// 非交互确认（跳过 y/N 提示）
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -308,8 +323,62 @@ async fn dispatch(mut args: Args) -> i32 {
         Some(Commands::Plugin { action }) => dispatch_plugin(action, &root).await,
         Some(Commands::Settings { action }) => dispatch_settings(action, &root),
         Some(Commands::Skill { action }) => dispatch_skill(action).await,
+        Some(Commands::Identity { action }) => dispatch_identity(action).await,
         Some(Commands::Run { mcp_config }) => run_repl(&args, &root, mcp_config).await,
         None => run_repl(&args, &root, None).await,
+    }
+}
+
+/// `identity` 子命令（protocol#64）。一次性入口**不建连**：仅重置持久化身份。
+///
+/// 连接态编排（退房 → 断开 → 重置 → 重连 → 回房）在 REPL 的 `identity reset` 中提供——
+/// 该路径才持有当次连接的参数与房间上下文。
+async fn dispatch_identity(action: IdentityCmd) -> i32 {
+    match action {
+        IdentityCmd::Reset { yes } => identity_reset_once_shot(yes).await,
+    }
+}
+
+/// 一次性 `smcp-computer identity reset [--yes]`。
+///
+/// 非交互环境（stdin 非 TTY）必须显式 `--yes`，避免脚本里静默换身份；交互环境给 y/N 提示。
+async fn identity_reset_once_shot(yes: bool) -> i32 {
+    use std::io::{BufRead, IsTerminal, Write as _};
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "identity reset 需要 --yes（非交互环境拒绝静默更换身份）/ --yes is required in \
+                 non-interactive mode"
+            );
+            return commands::EXIT_USER_ERROR;
+        }
+        print!(
+            "这将生成新的 computer_id（不可逆，宿主侧持久引用将失效）。继续？ [y/N] \
+             / Reset identity irreversibly? [y/N] "
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line).is_err()
+            || !matches!(line.trim(), "y" | "Y" | "yes")
+        {
+            eprintln!("已取消 / aborted");
+            return commands::EXIT_USER_ERROR;
+        }
+    }
+
+    match crate::identity::reset_computer_id(None).await {
+        Ok(computer_id) => {
+            println!(
+                "✅ 身份已重置 / Identity reset: {computer_id}（{}）",
+                crate::identity::computer_id_path(None).display()
+            );
+            commands::EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("重置身份失败 / identity reset failed: {error}");
+            commands::EXIT_USER_ERROR
+        }
     }
 }
 

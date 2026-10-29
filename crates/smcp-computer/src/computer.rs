@@ -4816,6 +4816,23 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
+    /// protocol#64：重置 Computer 稳定身份（生成新 UUID 并**原子替换**持久化文件）。
+    ///
+    /// 身份在一条连接内不可变（协议 MUST）：**连接中调用返回 [`ComputerError::InvalidState`]**，
+    /// 调用方须先 [`Self::disconnect_socketio`]；重置后以**新连接**入房才会生效。CLI
+    /// `identity reset` 已编排「退房 → 断开 → 重置 → 重连 → 回房」。
+    ///
+    /// Resets the persisted identity. Rejected while connected; the new value only takes effect on
+    /// a new connection.
+    pub async fn reset_computer_id(&self) -> ComputerResult<String> {
+        if self.has_socketio_client().await {
+            return Err(ComputerError::InvalidState(
+                "Cannot reset computer identity while connected; disconnect first".to_string(),
+            ));
+        }
+        crate::identity::reset_computer_id(self.config_env()).await
+    }
+
     /// Join using the specified identity, rejecting a name different from the connection's.
     /// To use a different identity, create a Computer and connection with that name.
     /// The CLI manages connection replacement when `socket join` changes the name.

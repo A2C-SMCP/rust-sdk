@@ -13,9 +13,11 @@
 //! - 首建用 `O_CREAT|O_EXCL`（并发首启先创建者赢）；**新建**目录 0700（既存目录不改权限，
 //!   与 settings 共用 `a2c` 目录时可能已是别的 mode）、文件 0600；
 //! - 文件损坏 / 空 / 半写 ⇒ 短重试（≤1s）后返回 [`ComputerError::IdentityStore`]：
-//!   **不静默重生成、不自动覆写**（重置身份是显式入口，见后续 PR）。
+//!   **不静默重生成、不自动覆写**；重置身份只能走显式入口 [`reset_computer_id`]。
+//! - 重置：生成新 UUID 并**原子替换**持久化文件（同目录临时文件 + rename；Unix 原子，
+//!   非 Unix 先删后换）。空文件 / 半写 / 非 UTF-8 等崩溃窗口残留可经重置直接重建。
 //!
-//! 本模块只做「读取或首建」，不含重置/删除。
+//! 本模块只做「读取或首建」与「显式重置」，其余删除语义不在此处。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -88,6 +90,71 @@ pub async fn load_or_create_computer_id(env: Option<&EnvMap>) -> ComputerResult<
     .map_err(|error| identity_error(&path, format!("identity task failed: {error}")))?
 }
 
+/// 重置身份：生成新 UUID 并**原子替换**持久化文件 / Reset the identity atomically.
+///
+/// - 同目录临时文件（0600）+ `fsync` 后 `rename` 覆盖目标（Unix 原子替换；非 Unix 先删后换）；
+/// - 目标文件缺失 / 空 / 半写 / 非 UTF-8 损坏 ⇒ 直接以新值重建（崩溃窗口恢复路径）；
+/// - 目录不存在 ⇒ 0700 创建；失败一律 [`ComputerError::IdentityStore`]，临时文件会被清理；
+/// - **连接中不可调用**（新身份只能经新连接生效）：由 [`crate::computer::Computer::reset_computer_id`]
+///   与 CLI `identity reset` 在上层拒绝/编排。
+pub async fn reset_computer_id(env: Option<&EnvMap>) -> ComputerResult<String> {
+    let path = computer_id_path(env);
+    let blocking_path = path.clone();
+    tokio::task::spawn_blocking(move || reset_computer_id_blocking(&blocking_path))
+        .await
+        .map_err(|error| identity_error(&path, format!("identity reset task failed: {error}")))?
+}
+
+fn reset_computer_id_blocking(path: &Path) -> ComputerResult<String> {
+    require_absolute(path)?;
+    let computer_id = uuid::Uuid::new_v4().to_string();
+    if let Some(dir) = path.parent() {
+        create_private_dir(dir).map_err(|error| {
+            identity_error(path, format!("cannot create identity directory: {error}"))
+        })?;
+    }
+
+    // 同目录临时文件（隐藏名 + UUID 去重）：写到一半失败时清理，不污染目标文件。
+    let temp = path.with_file_name(format!(".{COMPUTER_ID_FILENAME}.tmp-{computer_id}"));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = open_private_new_file(&temp)?;
+        write_identity(&mut file, &computer_id)
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(identity_error(
+            path,
+            format!("cannot write identity file: {error}"),
+        ));
+    }
+
+    // Windows 的 `rename` 不能覆盖已存在目标：先删后换（非原子；文件权限仍 0600）。
+    #[cfg(not(unix))]
+    if path.exists() {
+        if let Err(error) = std::fs::remove_file(path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(identity_error(
+                path,
+                format!("cannot replace identity file: {error}"),
+            ));
+        }
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(identity_error(
+            path,
+            format!("cannot replace identity file: {error}"),
+        ));
+    }
+    if let Err(error) = sync_parent_dir(path) {
+        return Err(identity_error(
+            path,
+            format!("cannot sync identity directory: {error}"),
+        ));
+    }
+    Ok(computer_id)
+}
+
 /// 可注入重试窗口的同步实现（单元测试用毫秒级窗口，避免每条损坏向量都白等满生产窗口）。
 ///
 /// 只对**可能瞬态**的失败重试：内容暂不完整（并发写者尚未写完）与 `AlreadyExists`
@@ -118,6 +185,14 @@ fn load_or_create_computer_id_blocking(
                     Err(error) => (format!("cannot create identity file: {error}"), false),
                 }
             }
+            // 非 UTF-8 字节（典型：崩溃窗口留下的半写/替换残片）按**内容损坏**处理，
+            // 给出与非法内容一致的处置指引（重置或删除重建），而不是晦涩的 IO 文案。
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => (
+                "invalid identity content (file is not valid UTF-8) — run \
+                 `smcp-computer identity reset` to regenerate the identity"
+                    .to_string(),
+                false,
+            ),
             Err(error) => (format!("cannot read identity file: {error}"), false),
         };
 
@@ -135,8 +210,8 @@ fn require_absolute(path: &Path) -> ComputerResult<()> {
     }
     Err(identity_error(
         path,
-        "resolved identity path is not absolute — check the injected env HOME/XDG_CONFIG_HOME \
-         (both must be absolute); deleting the file will not help",
+        "resolved identity path is not absolute — check HOME / XDG_CONFIG_HOME \
+         (both must be absolute)",
     ))
 }
 
@@ -160,7 +235,7 @@ fn parse_computer_id(content: &str) -> Option<String> {
 fn describe_invalid(content: &str) -> String {
     format!(
         "invalid identity content (expected lowercase canonical UUID, non-nil/max; got {} bytes) \
-         — delete this file to regenerate the identity",
+         — run `smcp-computer identity reset` to regenerate the identity",
         content.len()
     )
 }
@@ -324,10 +399,7 @@ mod tests {
                 }) => {
                     assert_eq!(reported, path.display().to_string());
                     // 仅「内容无效」分支给删除重建的处置指引。
-                    assert!(
-                        reason.contains("delete this file to regenerate the identity"),
-                        "{reason}"
-                    );
+                    assert!(reason.contains("identity reset"), "{reason}");
                 }
                 other => panic!("损坏内容 {corrupt:?} 应返回 IdentityStore，实得 {other:?}"),
             }
@@ -392,12 +464,18 @@ mod tests {
             }
         }
 
-        // (c) 端到端：拒绝且不落盘。
-        let sentinel = Path::new("~")
-            .join(".config")
-            .join("a2c")
-            .join(COMPUTER_ID_FILENAME);
+        // (c) 端到端：拒绝且不落盘。哨兵路径由 `computer_id_path` 派生（而非手工拼），
+        // 并额外检查 CWD 下字面 `~` 目录本身不存在（防止实现往 CWD 建树）。
+        let mut invalid = HashMap::new();
+        invalid.insert("HOME".to_string(), "~".to_string());
+        let sentinel = computer_id_path(Some(&invalid));
+        assert!(
+            !sentinel.is_absolute(),
+            "哨兵必须保持相对：{}",
+            sentinel.display()
+        );
         let sentinel_existed = sentinel.exists();
+        let cwd_tilde_existed = Path::new("~").exists();
         let process_identity = std::env::var("HOME").ok().map(|home| {
             Path::new(&home)
                 .join(".config")
@@ -408,8 +486,6 @@ mod tests {
             .as_ref()
             .and_then(|path| std::fs::read(path).ok());
 
-        let mut invalid = HashMap::new();
-        invalid.insert("HOME".to_string(), "~".to_string());
         match load_or_create_computer_id_blocking(Some(&invalid), Duration::from_millis(20)) {
             Err(ComputerError::IdentityStore { reason, .. }) => {
                 assert!(reason.contains("not absolute"), "{reason}");
@@ -420,6 +496,11 @@ mod tests {
         assert_eq!(
             sentinel.exists(),
             sentinel_existed,
+            "不得在原地创建哨兵身份文件"
+        );
+        assert_eq!(
+            Path::new("~").exists(),
+            cwd_tilde_existed,
             "不得在 CWD 创建字面 `~` 目录"
         );
         let after = process_identity
@@ -454,9 +535,14 @@ mod tests {
         let started = Instant::now();
         let result = load_or_create_computer_id_blocking(Some(&env), READ_RETRY_WINDOW);
         match &result {
-            Err(ComputerError::IdentityStore { reason, .. }) => {
-                // 确定性错误不属于「内容无效」，不得给出删除重建的误导性指引。
-                assert!(!reason.contains("delete this file"), "{reason}");
+            Err(error @ ComputerError::IdentityStore { .. }) => {
+                // 确定性错误不属于「内容无效」，不得给出删除/重置的误导性指引（按 Display 全文断言）。
+                let displayed = error.to_string();
+                assert!(
+                    !displayed.contains("delete this file")
+                        && !displayed.contains("identity reset"),
+                    "确定性错误不得给出处置指引：{displayed}"
+                );
             }
             other => panic!("确定性错误必须返回 IdentityStore，实得 {other:?}"),
         }
@@ -489,5 +575,90 @@ mod tests {
         assert_eq!(ids.len(), 1, "并发首启必须收敛到同一身份，实得 {ids:?}");
         let persisted = std::fs::read_to_string(computer_id_path(Some(&env))).unwrap();
         assert_eq!(persisted.trim_end(), ids.iter().next().unwrap());
+    }
+
+    /// protocol#64：重置生成新 UUID 并**原子替换**文件（新值 ≠ 旧值、单换行、0600、无临时残留）。
+    #[cfg(unix)]
+    #[test]
+    fn test_reset_replaces_identity_atomically() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let env = xdg_env(tmp.path());
+        let old = load_or_create_computer_id_blocking(Some(&env), READ_RETRY_WINDOW).unwrap();
+
+        let new = reset_computer_id_blocking(&computer_id_path(Some(&env))).unwrap();
+        assert!(smcp::is_canonical_computer_id(&new), "{new}");
+        assert_ne!(old, new, "重置必须生成新身份");
+
+        let path = computer_id_path(Some(&env));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{new}\n"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "重置后的文件仍须 0600");
+
+        // 无临时文件残留。
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "原子替换不得留下临时文件：{leftovers:?}"
+        );
+    }
+
+    /// 崩溃窗口恢复：空文件 / 非 UTF-8 残片都可经**重置**直接重建；普通加载则给出重置指引。
+    #[test]
+    fn test_reset_recovers_crash_window_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = xdg_env(tmp.path());
+        let path = computer_id_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // 空文件（O_EXCL 后未写完即 SIGKILL 的典型残留）。
+        std::fs::write(&path, "").unwrap();
+        let empty_reason =
+            match load_or_create_computer_id_blocking(Some(&env), Duration::from_millis(20)) {
+                Err(ComputerError::IdentityStore { reason, .. }) => reason,
+                other => panic!("空文件应 IdentityStore，实得 {other:?}"),
+            };
+        assert!(empty_reason.contains("identity reset"), "{empty_reason}");
+        let recovered = reset_computer_id_blocking(&path).unwrap();
+        assert!(smcp::is_canonical_computer_id(&recovered));
+
+        // 非 UTF-8 残片（读到即 InvalidData）：同样给重置指引，且重置可恢复。
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let non_utf8_reason =
+            match load_or_create_computer_id_blocking(Some(&env), Duration::from_millis(20)) {
+                Err(ComputerError::IdentityStore { reason, .. }) => reason,
+                other => panic!("非 UTF-8 应 IdentityStore，实得 {other:?}"),
+            };
+        assert!(
+            non_utf8_reason.contains("not valid UTF-8")
+                && non_utf8_reason.contains("identity reset"),
+            "{non_utf8_reason}"
+        );
+        let recovered_again = reset_computer_id_blocking(&path).unwrap();
+        assert!(smcp::is_canonical_computer_id(&recovered_again));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{recovered_again}\n")
+        );
+    }
+
+    /// 重置同样要求绝对路径（无效注入 env ⇒ IdentityStore，且不落盘）。
+    #[test]
+    fn test_reset_rejects_relative_path() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "~".to_string());
+        let path = computer_id_path(Some(&env));
+        assert!(!path.is_absolute());
+        match reset_computer_id_blocking(&path) {
+            Err(ComputerError::IdentityStore { reason, .. }) => {
+                assert!(reason.contains("not absolute"), "{reason}");
+            }
+            other => panic!("相对路径重置必须 IdentityStore，实得 {other:?}"),
+        }
     }
 }

@@ -123,6 +123,15 @@ impl Drop for Server {
 }
 
 fn handler(name: &str, home: &TempDir) -> CommandHandler {
+    handler_with_env(name, home, isolated_config_env(home.path().join(name)))
+}
+
+/// 与 [`handler`] 相同，但由调用方持有隔离 env（便于直接读身份文件）。
+fn handler_with_env(
+    name: &str,
+    home: &TempDir,
+    env: std::collections::HashMap<String, String>,
+) -> CommandHandler {
     CommandHandler::new(
         Computer::new(
             name,
@@ -135,7 +144,7 @@ fn handler(name: &str, home: &TempDir) -> CommandHandler {
         .with_config_dir(home.path().join(name).join("config"))
         .with_skill_home(home.path().join(name).join("skills"))
         .with_blob_cache_root(home.path().join(name).join("blob"))
-        .with_config_env(isolated_config_env(home.path().join(name))),
+        .with_config_env(env),
         CliConfig {
             // A rename must reuse the actual interactive URL, not this startup default.
             url: Some("http://127.0.0.1:1".into()),
@@ -376,4 +385,77 @@ async fn executable_repl_reports_real_identity_and_never_false_join_success() {
         repl.child.kill().await.unwrap();
         blocker.disconnect_socketio().await.unwrap();
     }
+}
+
+/// protocol#64：连接态 `identity reset` 编排——退房 → 断开 → 重置 → 重连 → 回房；
+/// 连接中直接调用 `Computer::reset_computer_id` 必须被拒绝（身份在连接内不可变）。
+#[tokio::test]
+async fn identity_reset_orchestrates_disconnect_and_rejoin() {
+    let server = Server::start().await;
+    let home = TempDir::new().unwrap();
+    let env = isolated_config_env(home.path().join("reset-comp"));
+    let mut cli = handler_with_env("reset-comp", &home, env.clone());
+    connect(&mut cli, &server).await;
+
+    cli.join_socket_room("office-reset", "reset-comp")
+        .await
+        .unwrap();
+    let path = smcp_computer::identity::computer_id_path(Some(&env));
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        smcp::is_canonical_computer_id(before.trim_end()),
+        "{before}"
+    );
+
+    // 连接中直接重置被拒。
+    assert!(matches!(
+        cli.computer.reset_computer_id().await,
+        Err(ComputerError::InvalidState(_))
+    ));
+
+    cli.reset_computer_identity().await.unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    let new_id = after.trim_end().to_string();
+    assert!(smcp::is_canonical_computer_id(&new_id), "{after}");
+    assert_ne!(before.trim_end(), new_id, "文件必须换成新身份");
+    assert!(cli.computer.has_socketio_client().await, "编排后必须已重连");
+
+    // 等回房完成后，从 Server 侧确认在房 Computer 使用的是**新**身份。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let members = server.members("office-reset");
+        if let Some(computer) = members.iter().find(|s| s.name == "reset-comp") {
+            assert_eq!(
+                computer.computer_id.as_deref(),
+                Some(new_id.as_str()),
+                "回房后 Server 应记录新身份"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "重连后未回房：{members:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// protocol#64：未连接时 `identity reset` 仅更新持久化值（不建立/改动连接）。
+#[tokio::test]
+async fn identity_reset_offline_only_updates_file() {
+    let home = TempDir::new().unwrap();
+    let env = isolated_config_env(home.path().join("idle"));
+    let mut cli = handler_with_env("idle", &home, env.clone());
+    let path = smcp_computer::identity::computer_id_path(Some(&env));
+
+    let first = smcp_computer::identity::load_or_create_computer_id(Some(&env))
+        .await
+        .unwrap();
+    cli.reset_computer_identity().await.unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_ne!(after.trim_end(), first, "离线重置也必须换新身份");
+    assert!(smcp::is_canonical_computer_id(after.trim_end()), "{after}");
+    assert!(!cli.computer.has_socketio_client().await);
 }
