@@ -348,6 +348,36 @@ mod tests {
         );
     }
 
+    /// 非 UTF-8 符号链接目标：结果无法以 Unicode 表示 → `RealpathError::NotUnicode`（reason=forbidden）。
+    #[cfg(unix)]
+    #[test]
+    fn realpath_non_utf8_link_target_is_forbidden() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("link");
+        let target = std::ffi::OsStr::from_bytes(b"bad\xFFname");
+        std::os::unix::fs::symlink(std::path::Path::new(target), &link).unwrap();
+        let canonical = normalize_path(link.to_str().unwrap(), native_platform()).unwrap();
+        let err =
+            realpath_nonstrict(&canonical, native_platform()).expect_err("非 UTF-8 链接目标须报错");
+        assert_eq!(err.reason(), "forbidden");
+    }
+
+    /// `ENOTDIR`（`file/child`）按"缺失尾"处理：追加分量并继续，不报错（协议处理流程第 4 步）。
+    #[cfg(unix)]
+    #[test]
+    fn realpath_enotdir_is_treated_as_missing_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        let child = file.join("child");
+        let canonical = normalize_path(child.to_str().unwrap(), native_platform()).unwrap();
+        let resolved =
+            realpath_nonstrict(&canonical, native_platform()).expect("ENOTDIR 须按缺失尾继续");
+        let expected = fs::canonicalize(temp.path()).unwrap().join("file/child");
+        assert_eq!(resolved, expected.to_str().unwrap());
+    }
+
     #[test]
     fn resolve_read_roots_merges_trusted_scopes_and_drops_project() {
         let temp = tempfile::tempdir().unwrap();

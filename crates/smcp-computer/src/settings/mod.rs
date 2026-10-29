@@ -63,10 +63,11 @@ pub use recovery::{
 };
 
 pub use schema::{
-    is_valid_enabled_plugin_key, is_valid_git_url, is_valid_marketplace_name, validate_settings,
-    ComputerSettings, GitSource, MarketplaceEntry, PermissionsBlock, SettingsScope,
-    SettingsValidationError, BOOL_FIELDS, FIELD_READ_ROOTS, POLICY_ONLY_FIELDS,
-    STRING_ARRAY_FIELDS, TRUSTED_SCOPE_ONLY_FIELDS,
+    flag_scope_ineffective_fields, is_valid_enabled_plugin_key, is_valid_git_url,
+    is_valid_marketplace_name, validate_settings, ComputerSettings, GitSource, MarketplaceEntry,
+    PermissionsBlock, SettingsScope, SettingsValidationError, BOOL_FIELDS, FIELD_READ_ROOTS,
+    FLAG_SCOPE_INEFFECTIVE_FIELDS, POLICY_ONLY_FIELDS, STRING_ARRAY_FIELDS,
+    TRUSTED_SCOPE_ONLY_FIELDS,
 };
 pub use scope::{
     apply_write, load_settings_file, merge_layers, merge_read, resolve_settings,

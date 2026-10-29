@@ -32,8 +32,8 @@ use crate::mcp_clients::model::{BundleId, MCPServerConfig, ServerName};
 use crate::settings::installer::{McpHookError, McpInstallHooks};
 use crate::settings::scope::EnvMap;
 use crate::settings::{
-    resolve_policy_settings, resolve_settings, FileSkillGovernanceStore, ResolveSettingsArgs,
-    ResolvedSettings,
+    flag_scope_ineffective_fields, resolve_policy_settings, resolve_settings,
+    FileSkillGovernanceStore, ResolveSettingsArgs, ResolvedSettings,
 };
 use crate::skills::manifest::{MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR};
 
@@ -168,6 +168,19 @@ pub fn resolved_settings_with_errors(
         flag_settings_path: flag_path,
         policy_settings: Some(&policy),
     })
+}
+
+/// #248：flag scope 的 `readRoots` / `landingRoot` 在 rust 运行期不生效（fail-closed）。
+///
+/// GA 前不得静默：`settings show --scope flag`、`settings get ... --scope flag` 与启动重挂
+/// （[`run_governance_remount`]）共用本诊断。运行期行为不变（仍不读取 flag 层）。
+pub fn warn_flag_scope_ineffective(layer: &Map<String, Value>) {
+    for field in flag_scope_ineffective_fields(layer) {
+        eprintln!(
+            "⚠ settings.json[flag]: {field} is not applied at runtime (fail-closed); \
+             use user/local/policy settings (rust-sdk#248)"
+        );
+    }
 }
 
 /// 把 settings 校验错误格式化为人读警示行（**纯函数**，供 boot 批准流程与 `settings show` 共用）/ format.
@@ -353,7 +366,16 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
 ///
 /// [`Computer::reconcile_governance`]: crate::computer::Computer::reconcile_governance
 pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: Option<&Path>) {
-    let declared = resolved_settings(None, None, flag_path);
+    let resolved = resolved_settings_with_errors(None, None, flag_path);
+    // #248：启动时若加载了 flag settings，readRoots / landingRoot 在运行期不生效——必须响亮诊断。
+    if let Some((_, layer)) = resolved
+        .scope_layers
+        .iter()
+        .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
+    {
+        warn_flag_scope_ineffective(layer);
+    }
+    let declared = resolved.settings;
     let hooks = CliMcpHooks::new_remount(comp, &declared).await;
     let report = comp
         .reconcile_governance(Some(&hooks), Some(&declared))

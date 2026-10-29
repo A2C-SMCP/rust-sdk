@@ -1,0 +1,3 @@
+# 一致性向量 / 夹具：vendored 逐字节副本，禁止 Git 换行归一。
+# Windows 上 `core.autocrlf=true` 的 CRLF checkout 会破坏 sha256 门禁（canonical_path_conformance.rs）。
+crates/smcp-computer/tests/fixtures/* -text

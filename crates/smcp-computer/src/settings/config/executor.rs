@@ -389,6 +389,29 @@ mod tests {
     }
 
     #[test]
+    fn project_settings_set_read_roots_only_plan_is_not_rewritten() {
+        // 计划只 Set readRoots 且盘上无该键 → 剔除后与盘上一致 → 不重写（mtime/内容不变）。
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        write(&path, r#"{"strictKnownMarketplaces":true}"#);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let inner: BTreeMap<String, WriteValue> =
+            std::iter::once(("readRoots".to_string(), WriteValue::Set(json!(["/data"])))).collect();
+        let plan = WritePlan {
+            scope: crate::settings::schema::SettingsScope::Project,
+            file: path.clone(),
+            op: WriteTargetOp::Value(WriteValue::Object(inner)),
+        };
+        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        let saved = read_json(&path);
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["strictKnownMarketplaces"], json!(true));
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "剔除后无变化 → 不得重写文件");
+    }
+
+    #[test]
     fn project_scope_write_plan_drops_existing_read_roots() {
         // #245：升级前已落盘的 project readRoots 在任意 project settings 写计划中顺带剔除。
         let tmp = TempDir::new().unwrap();

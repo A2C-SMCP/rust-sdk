@@ -176,6 +176,10 @@ pub fn settings_show(
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
     }
+    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr）。
+    if scope == "flag" {
+        super::warn_flag_scope_ineffective(&data);
+    }
     print_json(&Value::Object(data));
     EXIT_OK
 }
@@ -209,6 +213,10 @@ pub fn settings_get(
     // 对齐 settings_show 与 python-sdk#157（emit 置于 key 判空之前）；stdout JSON 契约不变。
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
+    }
+    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr）。
+    if scope == "flag" {
+        super::warn_flag_scope_ineffective(&data);
     }
     let Some(value) = data.get(key) else {
         return err(

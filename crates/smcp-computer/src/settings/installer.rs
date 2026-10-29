@@ -301,13 +301,13 @@ fn apply_enabled_plugin_write(
         let updated = apply_write(&existing, &updates);
         if updated == existing {
             // #245 / protocol#65：no-op 不写盘，但 project settings 若残留旧版本写入的 `readRoots`，
-            // 借本次机会落一次清洗后的视图（enabledPlugins 未变 → 仍返回 false，不 bump revision）。
-            if scope_enum == SettingsScope::Project
-                && raw_file_contains_key(&path, FIELD_READ_ROOTS)
-            {
-                store::atomic_write_settings_json(&path, &Value::Object(updated))?;
+            // 借本次机会做 **raw 保真清理**——只删该键，**不**经校验视图回写（否则会静默删除其他被
+            // 校验过滤的字段：project landingRoot / enabledMcpjsonServers / 非法 permissions 等）。
+            // enabledPlugins 未变 → 仍返回 false，不 bump revision。
+            if scope_enum == SettingsScope::Project {
+                drop_raw_read_roots(&path)?;
             }
-            return Ok(false); // 内容未变 → 不触碰文件（除上述清理）。
+            return Ok(false); // 内容未变 → 不触碰文件（除上述 raw 清理）。
         }
         store::atomic_write_settings_json(&path, &Value::Object(updated))?;
         Ok(true)
@@ -315,13 +315,22 @@ fn apply_enabled_plugin_write(
     Ok(changed)
 }
 
-/// #245：原始 settings 文件顶层是否含某键（用于 no-op 分支的旧键清理判定）。
-fn raw_file_contains_key(path: &Path, key: &str) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().map(|map| map.contains_key(key)))
-        .unwrap_or(false)
+/// #245：raw 保真删除 project settings 顶层的 `readRoots`（只删该键、保留其余原始内容）。
+///
+/// 返回是否发生删除；文件缺失 / 不可读 / 非 JSON 对象 → no-op（错误由既有加载路径处理）。
+fn drop_raw_read_roots(path: &Path) -> io::Result<bool> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return Ok(false),
+    };
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&text) else {
+        return Ok(false);
+    };
+    if map.remove(FIELD_READ_ROOTS).is_none() {
+        return Ok(false);
+    }
+    store::atomic_write_settings_json(path, &Value::Object(map))?;
+    Ok(true)
 }
 
 /// 写 `enabledPlugins[<plugin_id>] = value`（enable/disable 用）/ Write the enable flag。
@@ -2158,21 +2167,39 @@ mod tests {
 
     #[test]
     fn project_enable_noop_cleans_existing_read_roots() {
-        // #245：no-op 分支不写盘，但盘上旧 readRoots（旧版本写入）须被清理。
+        // #245：no-op 分支的清理必须 **raw 保真**——只删 readRoots，不得把校验视图整文件回写
+        // （否则会静默删除 project landingRoot / enabledMcpjsonServers / 非法 permissions 等被过滤字段）。
         let tmp = TempDir::new().unwrap();
         let wd = tmp.path().join("wd");
         let path = workdir_project_settings_path(&wd);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{"readRoots":["/data"],"enabledPlugins":{"a@mp":true}}"#,
+            r#"{
+                "readRoots": ["/data"],
+                "landingRoot": "/landing",
+                "enabledMcpjsonServers": ["srv"],
+                "permissions": "invalid-not-object",
+                "keepUnknown": {"k": 1},
+                "enabledPlugins": {"a@mp": true}
+            }"#,
         )
         .unwrap();
         let changed = write_enabled_plugin("a@mp", true, "project", wd.to_str(), None).unwrap();
         assert!(!changed, "同值写 → enabledPlugins 无变化");
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.get("readRoots").is_none(), "{saved}");
+        // 其他字段（含被校验过滤的 project 字段）原值保留。
+        assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
+        assert_eq!(saved["enabledMcpjsonServers"], serde_json::json!(["srv"]));
+        assert_eq!(
+            saved["permissions"],
+            serde_json::json!("invalid-not-object")
+        );
+        assert_eq!(saved["keepUnknown"], serde_json::json!({"k": 1}));
         assert_eq!(saved["enabledPlugins"]["a@mp"], serde_json::json!(true));
+        // 幂等：再次 enable 无 readRoots、无改动。
+        assert!(!write_enabled_plugin("a@mp", true, "project", wd.to_str(), None).unwrap());
     }
 
     #[tokio::test]
