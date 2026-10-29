@@ -15,7 +15,8 @@
 //! - 文件损坏 / 空 / 半写 ⇒ 短重试（≤1s）后返回 [`ComputerError::IdentityStore`]：
 //!   **不静默重生成、不自动覆写**；重置身份只能走显式入口 [`reset_computer_id`]。
 //! - 重置：生成新 UUID 并**原子替换**持久化文件（同目录临时文件 + rename；Unix 原子，
-//!   非 Unix 先删后换）。空文件 / 半写 / 非 UTF-8 等崩溃窗口残留可经重置直接重建。
+//!   Unix/Windows 均为替换语义）。rename 后父目录 fsync 失败仅告警（身份已替换）。
+//!   空文件 / 半写 / 非 UTF-8 等崩溃窗口残留可经重置直接重建。
 //!
 //! 本模块只做「读取或首建」与「显式重置」，其余删除语义不在此处。
 
@@ -92,7 +93,8 @@ pub async fn load_or_create_computer_id(env: Option<&EnvMap>) -> ComputerResult<
 
 /// 重置身份：生成新 UUID 并**原子替换**持久化文件 / Reset the identity atomically.
 ///
-/// - 同目录临时文件（0600）+ `fsync` 后 `rename` 覆盖目标（Unix 原子替换；非 Unix 先删后换）；
+/// - 同目录临时文件（0600）+ `fsync` 后 `rename` 覆盖目标（Unix/Windows 均为替换语义）；
+///   替换后父目录 fsync 失败只告警并继续（身份已落盘）；
 /// - 目标文件缺失 / 空 / 半写 / 非 UTF-8 损坏 ⇒ 直接以新值重建（崩溃窗口恢复路径）；
 /// - 目录不存在 ⇒ 0700 创建；失败一律 [`ComputerError::IdentityStore`]，临时文件会被清理；
 /// - **连接中不可调用**（新身份只能经新连接生效）：由 [`crate::computer::Computer::reset_computer_id`]
@@ -718,19 +720,13 @@ mod tests {
         let result = reset_computer_id_blocking(&path);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(
-            matches!(result, Err(ComputerError::IdentityStore { .. })),
-            "{result:?}"
-        );
-        let leftovers: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".tmp-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "写失败不得留下临时文件：{leftovers:?}"
-        );
+        // 失败发生在**临时文件创建之前**（目录不可写），不可能产生残留；本用例只锁
+        // 「不可写目录 ⇒ IdentityStore」诊断路径。残留清理由 rename-失败用例覆盖。
+        match result {
+            Err(ComputerError::IdentityStore { reason, .. }) => {
+                assert!(reason.contains("write identity file"), "{reason}");
+            }
+            other => panic!("写失败必须 IdentityStore，实得 {other:?}"),
+        }
     }
 }

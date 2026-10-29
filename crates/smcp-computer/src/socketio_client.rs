@@ -2600,6 +2600,16 @@ impl SmcpComputerClient {
         result.map(|()| info!("Disconnected from server"))
     }
 
+    /// protocol#64 / #234：本连接的**期望房号**（重连退避期间 `confirmed` 为空但意图被刻意保留）。
+    ///
+    /// 供 CLI `identity reset` 在重连窗口内仍按原意图回房；`leave` 仍只针对 `confirmed`。
+    /// The desired office retained across reconnect backoff.
+    pub async fn get_desired_office_id(&self) -> Option<String> {
+        lock_office_membership(&self.office_membership)
+            .desired
+            .clone()
+    }
+
     /// 获取当前office ID
     /// Get current office ID
     pub async fn get_office_id(&self) -> Option<String> {

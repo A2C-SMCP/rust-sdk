@@ -1055,6 +1055,19 @@ impl CommandHandler {
         }
     }
 
+    /// 本连接的回房意图：`confirmed` 优先，其次 `desired`（#234 重连退避窗口保留的意图）。
+    async fn current_office_intent(&self) -> Option<String> {
+        let socketio = self.computer.get_socketio_client();
+        let guard = socketio.read().await;
+        let Some(client) = guard.as_ref() else {
+            return None;
+        };
+        match client.get_office_id().await {
+            Some(office) => Some(office),
+            None => client.get_desired_office_id().await,
+        }
+    }
+
     /// 离开 Socket.IO 房间 / Leave Socket.IO room
     pub async fn leave_socket_room(&self) -> Result<(), CommandError> {
         self.computer.leave_office().await?;
@@ -1079,15 +1092,21 @@ impl CommandHandler {
                     .to_string(),
             ));
         }
-        // 用「服务端已确认的房号」而非客户端意图（重连窗口内 intent 会刻意保留）。
-        let previous_office = if was_connected {
+        // 退房目标只用「服务端已确认的房号」；回房目标用 confirmed.or(desired)——#234 在重连
+        // 退避窗口刻意保留 desired 而清空 confirmed，此时 reset 后仍应按原意图回房。
+        let confirmed_office = if was_connected {
             self.current_office_id().await
+        } else {
+            None
+        };
+        let rejoin_office = if was_connected {
+            self.current_office_intent().await
         } else {
             None
         };
 
         if was_connected {
-            if previous_office.is_some() {
+            if confirmed_office.is_some() {
                 if let Err(error) = self.leave_socket_room().await {
                     eprintln!("退房失败（继续重置）/ leave failed (continuing): {error}");
                 }
@@ -1111,7 +1130,7 @@ impl CommandHandler {
                 &connection.headers,
             )
             .await?;
-            if let Some(office) = previous_office {
+            if let Some(office) = rejoin_office {
                 self.rejoin_after_reset(&office).await?;
             }
         }
@@ -1121,13 +1140,22 @@ impl CommandHandler {
     /// 重置后的回房：复用 #234 的有界退避（**仅 `4101` 瞬态可重试**），预算取 CLI 配置；
     /// 终态失败上抛（命令不得在「实际未回房」时打印成功）。
     async fn rejoin_after_reset(&mut self, office: &str) -> Result<(), CommandError> {
-        let budget = self
-            .cli_config
-            .office_rejoin_budget_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET);
+        let budget = self.effective_rejoin_budget();
         let name = self.computer.name().to_string();
         retry_rejoin(budget, async || self.join_socket_room(office, &name).await).await
+    }
+
+    /// 回房预算优先级（与 `connect_socketio` 同一口径）：
+    /// `Computer::with_office_rejoin_budget` 覆盖 > CLI `--office-rejoin-budget` > 默认 60s。
+    fn effective_rejoin_budget(&self) -> std::time::Duration {
+        self.computer
+            .office_rejoin_budget_override_value()
+            .or_else(|| {
+                self.cli_config
+                    .office_rejoin_budget_secs
+                    .map(std::time::Duration::from_secs)
+            })
+            .unwrap_or(crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET)
     }
 
     /// 发送配置更新通知 / Send config update notification
@@ -1945,6 +1973,7 @@ mod tests {
     #[tokio::test]
     async fn retry_rejoin_retries_4101_then_succeeds() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = std::time::Instant::now();
         let result = retry_rejoin(std::time::Duration::from_secs(5), async || {
             let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if attempt == 1 {
@@ -1962,6 +1991,82 @@ mod tests {
         .await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // 首档退避必须真实发生（删掉 sleep 后本断言会失败）。
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "4101 重试必须经过退避等待，实际 {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 构造仅用于纯逻辑测试的 handler（不连接、不落盘）。
+    fn test_handler() -> CommandHandler {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), tmp.path().display().to_string());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("xdg").display().to_string(),
+        );
+        let computer = crate::computer::Computer::new(
+            "c",
+            crate::computer::SilentSession::new("s"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .with_skill_home(tmp.path().join("skills"))
+        .with_blob_cache_root(tmp.path().join("blob"))
+        .with_config_env(env);
+        CommandHandler::new(
+            computer,
+            CliConfig {
+                url: None,
+                namespace: "/smcp".to_string(),
+                auth: None,
+                headers: None,
+                office_rejoin_budget_secs: None,
+            },
+        )
+    }
+
+    /// protocol#64：回房预算优先级——Computer 覆盖 > CLI 参数 > 默认 60s。
+    #[test]
+    fn effective_rejoin_budget_precedence() {
+        let mut handler = test_handler();
+        assert_eq!(
+            handler.effective_rejoin_budget(),
+            crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET
+        );
+        handler.cli_config.office_rejoin_budget_secs = Some(5);
+        assert_eq!(
+            handler.effective_rejoin_budget(),
+            std::time::Duration::from_secs(5)
+        );
+        handler.computer = handler
+            .computer
+            .clone()
+            .with_office_rejoin_budget(std::time::Duration::from_secs(7));
+        assert_eq!(
+            handler.effective_rejoin_budget(),
+            std::time::Duration::from_secs(7)
+        );
+    }
+
+    /// protocol#64：`rejoin_after_reset` 的非瞬态失败必须上抛（未连接 ⇒ `InvalidCommand`），
+    /// 不得吞掉后让 reset 命令打印成功。
+    #[tokio::test]
+    async fn rejoin_after_reset_propagates_immediate_failure() {
+        let mut handler = test_handler();
+        let error = handler
+            .rejoin_after_reset("office")
+            .await
+            .expect_err("未连接时回房必须立即失败");
+        assert!(
+            matches!(error, CommandError::InvalidCommand(_)),
+            "{error:?}"
+        );
     }
 
     /// protocol#64 / #234：预算 0 ⇒ 单次尝试，终态 `4101` 必须上抛（不得打印成功）。

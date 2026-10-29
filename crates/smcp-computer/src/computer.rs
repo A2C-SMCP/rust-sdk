@@ -1064,6 +1064,14 @@ impl<S: Session> Computer<S> {
         self
     }
 
+    /// 本实例的回房预算覆盖值（供 CLI 的 `identity reset` 回房复用同一预算口径）。
+    ///
+    /// `None` 表示未覆盖——调用方应回退到 CLI 参数/默认值。crate 内部读取。
+    #[cfg(feature = "cli")]
+    pub(crate) fn office_rejoin_budget_override_value(&self) -> Option<std::time::Duration> {
+        self.office_rejoin_budget_override
+    }
+
     /// 注入 MCP client factory override（#152 测试接缝）/ Inject a client factory override（test seam）。
     ///
     /// 缺省不注入 → manager 用真实 `client_factory`（stdio/sse/http 真实连接）。注入后由内部 `new_manager`
@@ -4704,7 +4712,11 @@ impl<S: Session> Computer<S> {
         // protocol#64：身份读取与连接安装同在**生命周期临界区**内，与 `reset_computer_id` /
         // `disconnect_socketio` 串行——否则 reset 的「检查槽位为空 → 原子替换」与 connect 读取
         // 身份之间存在 check-then-act 窗口。
-        let _lifecycle_gate = self.socketio_lifecycle_gate.lock().await;
+        //
+        // **取消安全**：用 `lock_owned` 取得所有权守卫并**移入 spawn 任务**。若守卫留在本函数
+        // 栈上，宿主以 `timeout` 取消外层 future 后门会随之释放，而 detached 的 connect 任务仍会
+        // 读旧身份并 install——期间 reset 可成功并把槽位换成新身份，随后旧 client 被装回。
+        let lifecycle_guard = Arc::clone(&self.socketio_lifecycle_gate).lock_owned().await;
         if self.status.state() == LifecycleState::Shutdown {
             return Err(ComputerError::InvalidState(
                 "Computer is shut down".to_string(),
@@ -4776,8 +4788,10 @@ impl<S: Session> Computer<S> {
         let socketio_client = Arc::clone(&self.socketio_client);
         let status = Arc::clone(&self.status);
         let owner = Arc::clone(&self.socketio_lifecycle_owner);
-        // 生命周期临界区由**调用方**持有（跨本 await），任务内不再重复加锁（否则自死锁）。
+        // 取消安全：所有权守卫**移入任务**，任务存活期间一直持有生命周期门直到 install 完成。
+        // 外层 future 被 `timeout` 取消时门不会随之释放，reset 只能等落后台任务结束再判定。
         tokio::spawn(async move {
+            let _lifecycle_guard = lifecycle_guard;
             let client = Arc::new(builder.connect().await?);
             install_socketio_client_locked(socketio_client, status, owner, client).await
         })

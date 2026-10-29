@@ -520,7 +520,11 @@ async fn identity_reset_without_replayable_args_refuses_before_changes() {
         .unwrap();
 
     let path = smcp_computer::identity::computer_id_path(Some(&env));
-    let before = std::fs::read(&path).ok();
+    // 先物化身份文件，避免 `None == None` 的空断言。
+    let _ = smcp_computer::identity::load_or_create_computer_id(Some(&env))
+        .await
+        .expect("materialize identity");
+    let before = std::fs::read(&path).expect("identity file exists");
 
     let error = cli
         .reset_computer_identity()
@@ -531,7 +535,11 @@ async fn identity_reset_without_replayable_args_refuses_before_changes() {
         "{error:?}"
     );
     assert!(cli.computer.has_socketio_client().await, "拒绝不得断开连接");
-    assert_eq!(std::fs::read(&path).ok(), before, "拒绝不得改动身份文件");
+    assert_eq!(
+        std::fs::read(&path).expect("identity file exists"),
+        before,
+        "拒绝不得改动身份文件"
+    );
     assert!(
         server
             .members("office-ext")
