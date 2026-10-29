@@ -11,7 +11,7 @@
 //! 拒绝 nil / max。首尾空白或结尾换行因长度/字符集不符而非法（协议要求 `400`）。
 //! 接收方 MUST 视为不透明字符串（按字节相等比较，不解析版本位）。
 
-/// 规范 UUID 中的 nil / max：协议禁止 Computer 发出。
+/// 规范 UUID 中的 nil：协议禁止 Computer 发出。
 pub const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
 /// 规范 UUID 中的 max：协议禁止 Computer 发出。
 pub const MAX_UUID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";

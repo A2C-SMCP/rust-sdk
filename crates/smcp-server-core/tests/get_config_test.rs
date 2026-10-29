@@ -69,6 +69,7 @@ async fn test_get_config_unauthorized_role() {
         "computer_1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office_1".to_string());
 
     session_manager.register_session(computer_session).unwrap();
@@ -105,6 +106,7 @@ async fn test_get_config_success() {
         "computer_1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office_1".to_string());
 
     session_manager.register_session(agent_session).unwrap();

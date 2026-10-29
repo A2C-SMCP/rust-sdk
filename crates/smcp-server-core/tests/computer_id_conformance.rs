@@ -630,6 +630,12 @@ async fn identity_record_survives_seat_rejection() {
         rejection["code"], 4101,
         "席位已占必须回 4101，实得 {rejection}"
     );
+    assert_eq!(rejection["message"], "Room already has a computer");
+    assert_eq!(
+        rejection["details"],
+        serde_json::json!({"office_id": "R1", "role": "computer"}),
+        "4101 必须携带被占席位与目标房：{rejection}"
+    );
 
     // 同一会话改值去空房：若记录未保留，这里会成功；协议要求 403。
     let ack = emit_join_for_ack(
@@ -716,6 +722,29 @@ async fn rejected_invalid_shape_leaves_no_session_behind() {
 
     // 同一 sid 以 Agent 身份入房必须成功（无残留会话）。
     join_agent(&client, "A", "R1").await;
+
+    server.shutdown();
+}
+
+/// 顺序 (c)：身份记录发生在 **`403` 之后**——既有 Agent 会话以 `role="computer"` + **合法** `X`
+/// join ⇒ `403`，且该 Agent 的 `SessionInfo` 仍**无** `computer_id` 键。
+/// （若把记录前移到 403 之前，本用例必红。）
+#[tokio::test]
+async fn identity_is_recorded_only_after_identity_check() {
+    let server = SmcpTestServer::start().await;
+    let url = server.url();
+
+    let (agent, _log) = create_recorder(&url).await;
+    join_agent(&agent, "A", "R1").await;
+
+    let ack = emit_join_for_ack(&agent, join_payload("computer", "A", "R1", Some(json!(X)))).await;
+    assert_forbidden(&ack, "既有 Agent 会话改报 computer（合法形态）");
+
+    let sessions = list_sessions(&agent, "A", "R1").await;
+    assert!(
+        session_of(&sessions, "A").get("computer_id").is_none(),
+        "403 之前不得记录身份：A 的 SessionInfo 仍须无 computer_id 键：{sessions:?}"
+    );
 
     server.shutdown();
 }

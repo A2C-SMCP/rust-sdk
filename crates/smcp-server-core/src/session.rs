@@ -46,7 +46,9 @@ impl SessionError {
             SessionError::AgentAlreadyInRoom(_) => smcp::error_codes::ALREADY_IN_ROOM,
             SessionError::SeatTaken(_) => smcp::error_codes::ROOM_FULL,
             SessionError::ComputerIdMismatch { .. } => smcp::error_codes::FORBIDDEN,
-            SessionError::InvalidState(_) => smcp::error_codes::BAD_REQUEST,
+            // 内部不变量破坏（非客户端载荷问题）：与 handler 的 `room_rejection` 口径一致，
+            // 统一为内部错误 500（`BAD_REQUEST` 会误导调用方以为可以改载荷重试）。
+            SessionError::InvalidState(_) => smcp::error_codes::INTERNAL_ERROR,
         }
     }
 }
@@ -142,7 +144,8 @@ impl SessionData {
     /// protocol#64：设置 Computer 稳定身份。
     ///
     /// 生产路径经 [`SessionManager::record_or_verify_computer_id`] 在首次 join 时记录；
-    /// 本构造器供测试/内部布置会话使用（`reserve_join` 会拒绝无身份的 Computer 会话）。
+    /// 本构造器供**测试/内部布置**使用（集成测试亦经此布置房间态；`reserve_join` 会拒绝无身份的
+    /// Computer 会话，`register_session` 拒绝在房无身份的 Computer）。
     pub fn with_computer_id(mut self, computer_id: impl Into<String>) -> Self {
         self.computer_id = Some(computer_id.into());
         self
@@ -255,6 +258,16 @@ impl SessionManager {
     /// ⚠️ 本方法是底层「置入」原语，**不是**入房闸门——席位（每 role 一席）与房间归属**只能**经
     /// [`Self::reserve_join`] 获得；既有测试用它直接布置房间态。
     pub fn register_session(&self, session: SessionData) -> Result<(), SessionError> {
+        // protocol#64 结构保证：Computer 会话**在房**时必须已有稳定身份——否则 `server:list_room`
+        // 会回显缺 MUST 字段的 `SessionInfo`。无房 Computer 会话可先登记、随后由首次 join 记录身份。
+        if session.role == ClientRole::Computer
+            && session.office_id.is_some()
+            && session.computer_id.is_none()
+        {
+            return Err(SessionError::InvalidState(
+                "computer session in a room must carry computer_id".to_string(),
+            ));
+        }
         let _guard = self.transition();
         if let Some(existing) = self.sessions.get(&session.sid) {
             tracing::debug!(
@@ -345,6 +358,19 @@ impl SessionManager {
             );
             return Ok(());
         };
+        // 写入边界护栏（纵深防御；dispatcher 已按 400 拒绝非法形态、Agent 携带）：
+        // - 只有 Computer 会话可以记录身份；
+        // - 值必须通过 protocol#74 的规范形态（`smcp::is_canonical_computer_id`，单一权威）。
+        if session.role != ClientRole::Computer {
+            return Err(SessionError::InvalidState(
+                "agent session cannot carry computer_id".to_string(),
+            ));
+        }
+        if !smcp::is_canonical_computer_id(requested) {
+            return Err(SessionError::InvalidState(
+                "computer_id is not a canonical UUID".to_string(),
+            ));
+        }
         match session.computer_id.as_deref() {
             Some(recorded) if recorded != requested => Err(SessionError::ComputerIdMismatch {
                 recorded: recorded.to_string(),
@@ -383,8 +409,14 @@ impl SessionManager {
     /// **席位检查 + 占席对同一 `office_id` 原子**（注记 3）：二者同处本次 `transition()` 临界区，故并发
     /// 加入空房仅一者通过（恰一个 `4101`，场景 #8）。失败路径在任何写入之前返回，绝不留下半提交状态。
     ///
+    /// **错误契约（protocol#64）**：`role = Computer` 且会话尚无 `computer_id` ⇒
+    /// [`SessionError::InvalidState`]（内部不变量破坏，`error_code()` 为 `500`）。生产路径先经
+    /// [`Self::record_or_verify_computer_id`] 记录身份再调用本方法，故该分支只会在公开 API 被
+    /// 直接误用时出现。Agent 会话不受影响。
+    ///
     /// Validate-then-commit as one atomic step; the per-role seat check runs before any write and,
-    /// for Computers, before the auto-leave side effect.
+    /// for Computers, before the auto-leave side effect. A Computer session without a recorded
+    /// `computer_id` is an internal invariant violation (`InvalidState`, code 500).
     pub fn reserve_join(
         &self,
         sid: &SessionId,
@@ -680,6 +712,125 @@ mod tests {
             .is_none());
     }
 
+    /// protocol#64 结构保证（守卫回归）：`reserve_join` 对「Computer 且无身份」回 `InvalidState`
+    /// 且**无房间副作用**；有身份的 Computer 正常入房；Agent 无身份不受影响（不误伤）。
+    #[test]
+    fn reserve_join_requires_computer_identity() {
+        let manager = SessionManager::new();
+
+        // Computer 无身份 ⇒ InvalidState。
+        manager
+            .register_session(SessionData::new(
+                "sid-c-no-id".to_string(),
+                "c-none".to_string(),
+                ClientRole::Computer,
+            ))
+            .unwrap();
+        match manager.reserve_join(&"sid-c-no-id".to_string(), "R1") {
+            Err(SessionError::InvalidState(reason)) => {
+                assert!(reason.contains("computer_id"), "{reason}");
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+        assert!(
+            manager
+                .get_session(&"sid-c-no-id".to_string())
+                .unwrap()
+                .office_id
+                .is_none(),
+            "守卫拒绝不得产生房间副作用"
+        );
+
+        // Computer 有身份 ⇒ 入房成功。
+        manager
+            .register_session(
+                SessionData::new(
+                    "sid-c-id".to_string(),
+                    "c-ok".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_computer_id(TEST_CID),
+            )
+            .unwrap();
+        manager
+            .reserve_join(&"sid-c-id".to_string(), "R2")
+            .expect("已记录身份的 Computer 必须可入房");
+
+        // Agent 无身份 ⇒ 正常入房（不误伤）。
+        manager
+            .register_session(SessionData::new(
+                "sid-a".to_string(),
+                "a-ok".to_string(),
+                ClientRole::Agent,
+            ))
+            .unwrap();
+        manager
+            .reserve_join(&"sid-a".to_string(), "R3")
+            .expect("Agent 无 computer_id 属于正常状态");
+    }
+
+    /// protocol#64 结构保证：`register_session` 拒绝「在房但无身份」的 Computer 会话；
+    /// 无房 Computer 允许先登记（首次 join 时才记录身份）。
+    #[test]
+    fn register_session_rejects_in_room_computer_without_identity() {
+        let manager = SessionManager::new();
+        let error = manager
+            .register_session(
+                SessionData::new("sid-x".to_string(), "c".to_string(), ClientRole::Computer)
+                    .with_office_id("R1".to_string()),
+            )
+            .expect_err("在房 Computer 无身份必须被拒绝");
+        assert!(matches!(error, SessionError::InvalidState(_)), "{error:?}");
+
+        manager
+            .register_session(SessionData::new(
+                "sid-y".to_string(),
+                "c2".to_string(),
+                ClientRole::Computer,
+            ))
+            .expect("无房 Computer 允许先登记");
+    }
+
+    /// protocol#64 写入边界护栏：`record_or_verify_computer_id` 拒绝 Agent 会话与非法形态
+    /// （纵深防御；dispatcher 已按 400 拒绝）。
+    #[test]
+    fn record_computer_id_rejects_agent_and_bad_shape() {
+        let manager = SessionManager::new();
+        let agent_sid = "sid-agent".to_string();
+        manager.get_or_register_session(
+            agent_sid.clone(),
+            "a".to_string(),
+            ClientRole::Agent,
+            None,
+        );
+        assert!(matches!(
+            manager.record_or_verify_computer_id(&agent_sid, Some(TEST_CID)),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(manager
+            .get_session(&agent_sid)
+            .unwrap()
+            .computer_id
+            .is_none());
+
+        let computer_sid = "sid-computer".to_string();
+        manager.get_or_register_session(
+            computer_sid.clone(),
+            "c".to_string(),
+            ClientRole::Computer,
+            None,
+        );
+        assert!(matches!(
+            manager.record_or_verify_computer_id(&computer_sid, Some("BAD")),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(manager
+            .get_session(&computer_sid)
+            .unwrap()
+            .computer_id
+            .is_none());
+    }
+
     /// protocol#64：同一 sid 并发首写**原子**——8 个不同值同时首写，至多一者成功，其余全部
     /// `ComputerIdMismatch`，且最终记录等于胜者。
     #[test]
@@ -934,6 +1085,7 @@ mod tests {
             "test_computer".to_string(),
             ClientRole::Computer,
         )
+        .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
         .with_office_id(office_id.clone());
 
         manager.register_session(session).unwrap();
