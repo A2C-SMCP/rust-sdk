@@ -21,12 +21,12 @@ use crate::{
     request_builders::{
         build_get_blob_request, build_get_config_request, build_get_desktop_request,
         build_get_resources_request, build_get_skill_request, build_get_skills_request,
-        build_get_tools_request, build_put_blob_request, build_tool_call_cancel,
-        build_tool_call_request,
+        build_get_tools_request, build_put_blob_request, build_resolve_path_request,
+        build_tool_call_cancel, build_tool_call_request,
     },
     response::{
         ensure_req_id, parse_get_blob_response, parse_get_config_response,
-        parse_get_resources_response,
+        parse_get_resources_response, parse_resolve_path_response,
     },
     skill_consume::{parse_get_skill_response, parse_get_skills_response},
     transport::{NotificationMessage, SocketIoTransport, TransportLifecycle},
@@ -37,8 +37,8 @@ use smcp::utils::blob::{
 };
 use smcp::{
     events::*, A2CSkillRef, AgentCallData, EnterOfficeReq, GetBlobRet, GetComputerConfigRet,
-    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, PutBlobRet, ReqId, Role, SMCPTool,
-    SessionInfo, SMCP_NAMESPACE,
+    GetResourcesRet, GetSkillRet, LeaveOfficeReq, ListRoomReq, PutBlobRet, ReqId, ResolvePathRet,
+    Role, SMCPTool, SessionInfo, SMCP_NAMESPACE,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1264,6 +1264,30 @@ impl AsyncSmcpAgent {
             .await?;
 
         let ret = parse_get_blob_response(&response, req_id.as_str())?;
+        Ok(ret)
+    }
+
+    /// 按路径读取（v0.5.0，protocol#65）/ Resolve a local path via `client:resolve_path`.
+    ///
+    /// Computer 端规范化路径、按 `readRoots` 授权围栏校验、stat 并现铸 `blob_handle`；返回
+    /// [`ResolvePathRet`]（canonical_path / mime / total_size / sha256 / mtime / handle）。字节仍经
+    /// [`Self::get_blob`] 拉取。flat ErrorPayload（`4020` invalid_path / forbidden / not_found /
+    /// not_a_file）经 ack 透传为协议错误。对标 Python `a2c_smcp/agent/client.py::resolve_path`。
+    pub async fn resolve_path(&self, computer: &str, path: &str) -> Result<ResolvePathRet> {
+        let agent_config = self.auth_provider.get_agent_config();
+        let req = build_resolve_path_request(&agent_config.agent, computer, path);
+        let req_id = req.base.req_id.clone();
+
+        // 不记录原始路径（可能含用户名/项目名等 PII）；对齐 Python 参考只记 computer。
+        debug!("Resolving path on computer {}", computer);
+
+        let transport = self.resolve_transport().await?;
+        let data = serde_json::to_value(&req)?;
+        let response = transport
+            .call(CLIENT_RESOLVE_PATH, data, self.config.get_timeout)
+            .await?;
+
+        let ret = parse_resolve_path_response(&response, req_id.as_str())?;
         Ok(ret)
     }
 

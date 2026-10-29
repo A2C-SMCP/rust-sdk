@@ -40,7 +40,7 @@ pub const PROTOCOL_VERSION: &str = "0.5.0";
 ///
 /// - 本模块持有**全部**码的数值，含**未进** [`ErrorCode`] 的工具码 `4001`–`4005`——它们只走
 ///   MCP `CallToolResult.isError` 通道，**不**出现在协议 ack 上，故**不得**进入闭集。
-/// - [`ErrorCode`] 是 ack / HTTP 握手层可承载的码：`404`、`4006`–`4019`，以及 v0.5.0 起随房间
+/// - [`ErrorCode`] 是 ack / HTTP 握手层可承载的码：`404`、`4006`–`4020`，以及 v0.5.0 起随房间
 ///   事件 ack 一并纳入的 `400` / `403` / `500` / `4101`–`4106`（对齐 Python `a2c_smcp/smcp.py`
 ///   的 v0.5.0 `ErrorCode`，其同样含这九个值）。
 ///
@@ -135,7 +135,7 @@ pub mod error_codes {
 /// with no structured body. Different namespaces, intentionally different values.
 pub const WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: i32 = 4900;
 
-/// A2C-SMCP 协议错误码（v0.2.0 起；v0.2.1 加性追加 `4016` / `4017` / `4018`）。
+/// A2C-SMCP 协议错误码（v0.2.0 起；v0.2.1 加性追加 `4016` / `4017` / `4018`；v0.4.0 追加 `4019`；v0.5.0 追加 `4020`）。
 ///
 /// 镜像 Python 参考实现 `a2c_smcp/smcp.py::ErrorCode`，**序列化 / 反序列化均为整数**
 /// （与协议 `ErrorPayload.code` 的线格式一致）。协议依据 / Protocol: error-handling.md。
@@ -160,7 +160,7 @@ pub const WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: i32 = 4900;
 ///   （未注册 / 已卸载 / 孤儿）复用此码；`name` 格式非法 → [`ErrorCode::SkillNameInvalid`]（`4016`）；
 ///   `name` 有效但 `rel_path` 不可达 → [`ErrorCode::SkillResourceNotAccessible`]（`4017`）。
 /// - SKILL 通道**不使用** `4015`：未声明 `resources` capability 的 server 在物化阶段即被排除，不上送 Agent。
-/// - `4017` / `4018` 的 `details.reason` 为**开放枚举**：解析方 MUST 容忍未知值并兜底
+/// - `4017` / `4018` / `4019` / `4020` 的 `details.reason` 为**开放枚举**：解析方 MUST 容忍未知值并兜底
 ///   （默认「不重试 + 诊断」），未来可非破坏地新增 reason。
 ///
 /// Mirrors the Python reference `ErrorCode`; serializes to / from an **integer** matching the
@@ -192,6 +192,10 @@ pub enum ErrorCode {
     /// `client:put_blob` 写入期唯一错误码；`details.reason` ∈ invalid_upload / invalid_declaration /
     /// range / too_large / busy / forbidden / integrity / io_error，开放枚举）。
     BlobWriteFailed = 4019,
+    /// 按路径读取的铸造期失败 / Path-based read mint-time failure（v0.5.0，protocol#65，
+    /// `client:resolve_path` 唯一错误码；`details.reason` ∈ invalid_path / forbidden /
+    /// not_found / not_a_file，开放枚举）。拉取期撤权/删除仍走 [`ErrorCode::BlobNotAccessible`]（4018）。
+    PathNotAccessible = 4020,
     /// 通用请求错误：具备 ack 通道的事件载荷 schema 校验失败 / Generic bad request (ack payload invalid)。
     ///
     /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.BAD_REQUEST`）：房间事件与全部 `client:*` 路由在载荷
@@ -246,6 +250,7 @@ impl ErrorCode {
             4017 => Some(Self::SkillResourceNotAccessible),
             4018 => Some(Self::BlobNotAccessible),
             4019 => Some(Self::BlobWriteFailed),
+            4020 => Some(Self::PathNotAccessible),
             400 => Some(Self::BadRequest),
             403 => Some(Self::Forbidden),
             500 => Some(Self::InternalError),
@@ -299,7 +304,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// - 4014（MCP Server 未命中）→ `mcp_server`（值 = **bundle_id**，协议 0.3.0 §身份正交性 #18）；
 ///   4015（能力不支持）→ `mcp_server`（bundle_id）/ `capability`（SRV-01 #47 / AUTH-01 #23；构造见
 ///   [`ErrorPayload::with_mcp_server`] / [`ErrorPayload::with_capability`]）。
-/// - 4016 / 4017 / 4018 的 code-specific 字段下沉到 `details` 子对象（无顶层平铺新字段）。
+/// - 4016 / 4017 / 4018 / 4019 / 4020 的 code-specific 字段下沉到 `details` 子对象（无顶层平铺新字段）。
 ///
 /// 未知顶层字段由 [`ErrorPayload::extra`]（`#[serde(flatten)]`）**捕获并保留**，跨-SDK 往返
 /// 不静默丢字段——镜像 Python `total=False` TypedDict（运行时即 `dict`）的开放语义，避免旧
@@ -641,6 +646,8 @@ pub mod events {
     pub const CLIENT_GET_BLOB: &str = "client:get_blob";
     /// 客户端通用二进制上行写入请求（v0.4.0）/ Generic binary push (v0.4.0)。
     pub const CLIENT_PUT_BLOB: &str = "client:put_blob";
+    /// 客户端按路径读取请求（v0.5.0，protocol#65）/ Path-based read (v0.5.0)。
+    pub const CLIENT_RESOLVE_PATH: &str = "client:resolve_path";
 
     /// 服务器加入办公室请求
     pub const SERVER_JOIN_OFFICE: &str = "server:join_office";
@@ -1496,6 +1503,11 @@ pub struct GetBlobRet {
 /// 对齐 Python `a2c_smcp.smcp.PUT_BLOB_EVENT`。
 pub const PUT_BLOB_EVENT: &str = events::CLIENT_PUT_BLOB;
 
+/// `client:resolve_path` 事件名 / event name（顶层别名，等于 [`events::CLIENT_RESOLVE_PATH`]）。
+///
+/// 对齐 Python `a2c_smcp.smcp.RESOLVE_PATH_EVENT`。
+pub const RESOLVE_PATH_EVENT: &str = events::CLIENT_RESOLVE_PATH;
+
 /// 通用二进制上行写入请求（`client:put_blob`，v0.4.0）。
 ///
 /// [`GetBlobReq`] 的方向镜像：`chunk_offset` / `eof` 由 **Agent 驱动推进**，`sha256` / `total_size`
@@ -1620,6 +1632,46 @@ pub struct PutBlobRet {
     /// 回显的请求 id（可选）/ echoed request id (optional)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub req_id: Option<ReqId>,
+}
+
+/// 按路径读取请求 / Path-based read request（`client:resolve_path`，v0.5.0）。
+///
+/// Agent 给出 Computer 本地绝对路径；Computer 规范化 → `readRoots` 校验 → stat，返回
+/// `canonical_path` 与元数据并现铸 `blob_handle`；字节仍经 `client:get_blob` 拉取。
+/// 协议依据 / Protocol: events.md §client:resolve_path；data-structures.md §ResolvePathReq；
+/// blob-transfer.md §生产者三（protocol#65）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvePathReq {
+    #[serde(flatten)]
+    pub base: AgentCallData,
+    /// 目标 Computer 名 / target Computer name。
+    pub computer: String,
+    /// Computer 本地绝对路径：原生形态或 `canonical_path` 形态 / local absolute path。
+    pub path: String,
+}
+
+/// 按路径读取响应 / Path-based read response（`ResolvePathRet`，v0.5.0）。
+///
+/// 全部字段必填（协议 `total=True`）：`canonical_path` 为 realpath 后经 `normalize_path` 的规范路径；
+/// `blob_handle` 为现铸的不透明句柄；`mtime` 为 Unix epoch 毫秒（1970 前为负，仅作提示）。
+/// 持久引用 = `computer_id` + `canonical_path`，**不是** `blob_handle`。
+/// 协议依据 / Protocol: data-structures.md §ResolvePathRet；blob-transfer.md §生产者三。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvePathRet {
+    /// 规范路径（realpath 后经 `normalize_path`；可直接回用作 `path`）/ canonical path。
+    pub canonical_path: String,
+    /// 现铸的不透明句柄（转 `client:get_blob` 拉字节）/ freshly minted opaque handle。
+    pub blob_handle: BlobHandle,
+    /// 确定性推断的 MIME / deterministic MIME。
+    pub mime_type: String,
+    /// 文件字节数 / file size in bytes。
+    pub total_size: u64,
+    /// 全量 sha256 十六进制（小写）/ full-content sha256 (hex)。
+    pub sha256: String,
+    /// 最后修改时间：Unix epoch 毫秒（1970 前为负；仅作提示）/ mtime in epoch ms。
+    pub mtime: i64,
+    /// 请求 id / request id。
+    pub req_id: ReqId,
 }
 
 #[cfg(test)]
@@ -1833,7 +1885,9 @@ mod tests {
     #[test]
     fn test_is_protocol_error_payload_flat_true() {
         // 顶层 code 为协议 ErrorCode 取值 → true
-        for code in [404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019] {
+        for code in [
+            404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019, 4020,
+        ] {
             let v = serde_json::json!({ "code": code, "message": "x" });
             assert!(
                 is_protocol_error_payload(&v),
@@ -1842,6 +1896,18 @@ mod tests {
         }
         // 构造器产出的 payload 同样应判定为 true
         let v = serde_json::to_value(build_computer_not_found_error("c1")).unwrap();
+        assert!(is_protocol_error_payload(&v));
+    }
+
+    #[test]
+    fn test_is_protocol_error_payload_recognizes_4020_with_reason() {
+        // protocol#65：4020 是 resolve_path 铸造期的结构化拒绝；必须进闭集，
+        // 否则会被误分类为非协议错误（internal / 反序列化失败），丢失结构化 reason。
+        let v = serde_json::json!({
+            "code": 4020,
+            "message": "Path not accessible",
+            "details": { "reason": "forbidden" }
+        });
         assert!(is_protocol_error_payload(&v));
     }
 
@@ -2019,6 +2085,7 @@ mod tests {
         assert_eq!(ErrorCode::SkillResourceNotAccessible.code(), 4017);
         assert_eq!(ErrorCode::BlobNotAccessible.code(), 4018);
         assert_eq!(ErrorCode::BlobWriteFailed.code(), 4019);
+        assert_eq!(ErrorCode::PathNotAccessible.code(), 4020);
     }
 
     #[test]
@@ -2033,6 +2100,10 @@ mod tests {
         // 作为结构体字段时同样是裸整数（对齐 ErrorPayload.code 线格式）
         let v = serde_json::json!({ "code": ErrorCode::BlobNotAccessible });
         assert_eq!(v["code"], serde_json::json!(4018));
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::PathNotAccessible).unwrap(),
+            "4020"
+        );
     }
 
     #[test]
@@ -2041,6 +2112,8 @@ mod tests {
         assert_eq!(c, ErrorCode::McpServerNotFound);
         let c: ErrorCode = serde_json::from_str("4019").unwrap();
         assert_eq!(c, ErrorCode::BlobWriteFailed);
+        let c: ErrorCode = serde_json::from_str("4020").unwrap();
+        assert_eq!(c, ErrorCode::PathNotAccessible);
         // 未知码值必须报错（解析方对已知集合是封闭的）
         assert!(serde_json::from_str::<ErrorCode>("9999").is_err());
         assert_eq!(ErrorCode::from_code(9999), None);
@@ -2059,6 +2132,7 @@ mod tests {
             ErrorCode::SkillResourceNotAccessible,
             ErrorCode::BlobNotAccessible,
             ErrorCode::BlobWriteFailed,
+            ErrorCode::PathNotAccessible,
         ] {
             let json = serde_json::to_string(&code).unwrap();
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
@@ -2180,6 +2254,79 @@ mod tests {
         assert_eq!(v["eof"], true);
         let back: GetBlobRet = serde_json::from_value(v).unwrap();
         assert_eq!(back, last);
+    }
+
+    // ── protocol#65：client:resolve_path ─────────────────────────────────
+
+    #[test]
+    fn test_resolve_path_event_constant() {
+        assert_eq!(RESOLVE_PATH_EVENT, "client:resolve_path");
+        assert_eq!(RESOLVE_PATH_EVENT, events::CLIENT_RESOLVE_PATH);
+    }
+
+    #[test]
+    fn test_resolve_path_req_serde() {
+        let req = ResolvePathReq {
+            base: AgentCallData {
+                agent: "agent-1".to_string(),
+                req_id: ReqId::from_string("r1".to_string()),
+            },
+            computer: "comp-1".to_string(),
+            path: "/home/u/a.txt".to_string(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["agent"], "agent-1");
+        assert_eq!(v["req_id"], "r1");
+        assert_eq!(v["computer"], "comp-1");
+        assert_eq!(v["path"], "/home/u/a.txt");
+        let back: ResolvePathReq = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn test_resolve_path_ret_serde_all_fields_required() {
+        let ret = ResolvePathRet {
+            canonical_path: "/home/u/a.txt".to_string(),
+            blob_handle: "opaque-handle".to_string(),
+            mime_type: "text/plain".to_string(),
+            total_size: 5,
+            sha256: "abc123".to_string(),
+            mtime: -1, // 1970 前可为负
+            req_id: ReqId::from_string("r1".to_string()),
+        };
+        let v = serde_json::to_value(&ret).unwrap();
+        for key in [
+            "canonical_path",
+            "blob_handle",
+            "mime_type",
+            "total_size",
+            "sha256",
+            "mtime",
+            "req_id",
+        ] {
+            assert!(v.get(key).is_some(), "missing required key {key}");
+        }
+        assert_eq!(v["mtime"], -1);
+        let back: ResolvePathRet = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ret);
+
+        // 协议 `total=True`：逐一移除每个必填字段都必须反序列化失败。
+        for key in [
+            "canonical_path",
+            "blob_handle",
+            "mime_type",
+            "total_size",
+            "sha256",
+            "mtime",
+            "req_id",
+        ] {
+            let mut missing = serde_json::to_value(&ret).unwrap();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<ResolvePathRet>(missing).is_err(),
+                "missing required key {key} must fail"
+            );
+        }
     }
 
     // ── #195 client:put_blob 上行写入 / Upstream binary push ──────────────

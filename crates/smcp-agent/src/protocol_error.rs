@@ -39,6 +39,7 @@ pub const NO_RESPONSE_MESSAGE: &str = "服务器未返回结果 / No response fr
 /// - `client:get_skill[s]`：`4014` 复用 / `4016` Invalid Name / `4017` Resource Not Accessible
 ///   （v0.2.1 `details.reason`）。
 /// - `client:get_blob`：`4018 Blob Not Accessible`（v0.2.1 `details.reason`）。
+/// - `client:resolve_path`：`4020 Path Not Accessible`（v0.5.0 `details.reason`）。
 ///
 /// `details` 是诊断容器，Agent **MUST NOT** 透传给最终用户（防泄露）。
 // 不派生 `Eq`：`details` 持 [`serde_json::Value`]（含 `f64`，非 `Eq`）。
@@ -60,8 +61,8 @@ pub struct SmcpProtocolError {
     pub capability: Option<String>,
     /// 诊断容器（4016 / 4017 / 4018 的 code-specific 字段下沉于此）/ diagnostic container。
     pub details: serde_json::Map<String, Value>,
-    /// 4017 / 4018 共用的 `details.reason`（**开放枚举**：未知值原样保留、不 panic）。
-    /// `details.reason` shared by 4017 / 4018; an open enum — unknown values are preserved verbatim.
+    /// 4017 / 4018 / 4019 / 4020 共用的 `details.reason`（**开放枚举**：未知值原样保留、不 panic）。
+    /// `details.reason` shared by 4017 / 4018 / 4019 / 4020; an open enum — unknown values are preserved verbatim.
     pub reason: Option<String>,
 }
 
@@ -210,7 +211,9 @@ mod tests {
 
     #[test]
     fn test_all_protocol_codes_raise() {
-        for code in [404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019] {
+        for code in [
+            404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019, 4020,
+        ] {
             let err = raise_for_error_payload(&json!({"code": code, "message": "boom"}))
                 .expect_err(&format!("code {code} 应判定为协议错误"));
             assert_eq!(err.code, code);
