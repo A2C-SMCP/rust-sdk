@@ -360,6 +360,10 @@ mod tests {
         let canonical = normalize_path(link.to_str().unwrap(), native_platform()).unwrap();
         let err =
             realpath_nonstrict(&canonical, native_platform()).expect_err("非 UTF-8 链接目标须报错");
+        assert!(
+            matches!(&err, RealpathError::NotUnicode { .. }),
+            "须命中 NotUnicode 变体（reason 恒 forbidden 无判别力）：{err:?}"
+        );
         assert_eq!(err.reason(), "forbidden");
     }
 

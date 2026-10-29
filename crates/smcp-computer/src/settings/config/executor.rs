@@ -396,6 +396,7 @@ mod tests {
         let path = workdir_project_settings_path(&wd);
         write(&path, r#"{"strictKnownMarketplaces":true}"#);
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before_bytes = std::fs::read(&path).unwrap();
         let inner: BTreeMap<String, WriteValue> =
             std::iter::once(("readRoots".to_string(), WriteValue::Set(json!(["/data"])))).collect();
         let plan = WritePlan {
@@ -409,6 +410,11 @@ mod tests {
         assert_eq!(saved["strictKnownMarketplaces"], json!(true));
         let after = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(before, after, "剔除后无变化 → 不得重写文件");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before_bytes,
+            "文件字节不得变化"
+        );
     }
 
     #[test]

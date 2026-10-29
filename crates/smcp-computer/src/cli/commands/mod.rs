@@ -183,6 +183,31 @@ pub fn warn_flag_scope_ineffective(layer: &Map<String, Value>) {
     }
 }
 
+/// #248：按 scope 呈现 flag 层诊断——`flag` 直接用该层视图；`merged` 需回看 `scope_layers` 的
+/// flag 层（合并视图丢失来源）。
+pub fn warn_flag_scope_ineffective_for(
+    scope: &str,
+    cwd: Option<&Path>,
+    env: Option<&EnvMap>,
+    flag_path: Option<&Path>,
+    data: &Map<String, Value>,
+) {
+    match scope {
+        "flag" => warn_flag_scope_ineffective(data),
+        "merged" => {
+            let resolved = resolved_settings_with_errors(cwd, env, flag_path);
+            if let Some((_, layer)) = resolved
+                .scope_layers
+                .iter()
+                .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
+            {
+                warn_flag_scope_ineffective(layer);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 把 settings 校验错误格式化为人读警示行（**纯函数**，供 boot 批准流程与 `settings show` 共用）/ format.
 ///
 /// #143：scope 越权过滤（policy-only / 审批门 enable 方向判据）**静默丢弃字段** —— 若连错误也不呈现，用户
@@ -367,13 +392,21 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
 /// [`Computer::reconcile_governance`]: crate::computer::Computer::reconcile_governance
 pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: Option<&Path>) {
     let resolved = resolved_settings_with_errors(None, None, flag_path);
-    // #248：启动时若加载了 flag settings，readRoots / landingRoot 在运行期不生效——必须响亮诊断。
-    if let Some((_, layer)) = resolved
-        .scope_layers
-        .iter()
-        .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
-    {
-        warn_flag_scope_ineffective(layer);
+    // #248：启动时若加载了 flag settings，readRoots / landingRoot 在运行期不生效——以**原始文件**
+    // 为准（畸形值会被校验器丢弃，不能只看校验后视图）；flag 层校验错误同样呈现，不静默。
+    if let Some(path) = flag_path {
+        if let Ok(Some(map)) = crate::settings::read_roots::read_raw_map(path) {
+            warn_flag_scope_ineffective(&map);
+        }
+        let flag_errors: Vec<_> = resolved
+            .errors
+            .iter()
+            .filter(|e| e.scope == crate::settings::SettingsScope::Flag)
+            .cloned()
+            .collect();
+        for line in format_settings_errors(&flag_errors) {
+            eprintln!("{line}");
+        }
     }
     let declared = resolved.settings;
     let hooks = CliMcpHooks::new_remount(comp, &declared).await;

@@ -26,6 +26,7 @@ use serde_json::{json, Map, Value};
 use super::{
     err_flat as err, ok_msg, print_json, resolved_settings_with_errors, EXIT_OK, EXIT_USER_ERROR,
 };
+use crate::settings::read_roots::drop_read_roots_from_file;
 use crate::settings::scope::{
     apply_write, load_settings_file, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
@@ -176,10 +177,8 @@ pub fn settings_show(
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
     }
-    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr）。
-    if scope == "flag" {
-        super::warn_flag_scope_ineffective(&data);
-    }
+    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
+    super::warn_flag_scope_ineffective_for(scope, cwd, env, flag_path, &data);
     print_json(&Value::Object(data));
     EXIT_OK
 }
@@ -214,10 +213,8 @@ pub fn settings_get(
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
     }
-    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr）。
-    if scope == "flag" {
-        super::warn_flag_scope_ineffective(&data);
-    }
+    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
+    super::warn_flag_scope_ineffective_for(scope, cwd, env, flag_path, &data);
     let Some(value) = data.get(key) else {
         return err(
             &format!("key {key:?} not set in scope {scope:?}"),
@@ -259,7 +256,7 @@ pub fn settings_set(
     // 放在 `writable_path` 之后：anchor 不可解析时与其他键同样返回用户错误（不静默成功）。
     if scope == "project" && key == FIELD_READ_ROOTS {
         // 盘上若已有旧版本写入的该键，一并清掉（不只跳过本次写入）。
-        if let Err(e) = drop_project_read_roots_from_file(&path) {
+        if let Err(e) = drop_read_roots_from_file(&path) {
             return err(
                 &format!("readRoots cleanup failed: {e}"),
                 json_output,
@@ -331,33 +328,6 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
     ))
 }
 
-/// #245 / protocol#65：`settings edit` 成功后从 project settings 文件剔除 `readRoots`。
-///
-/// 返回是否发生剔除；损坏 / 非对象 JSON 不动（交给既有诊断路径）。
-fn drop_project_read_roots_from_file(path: &Path) -> Result<bool, String> {
-    // 读取 / 解析 / 删除 / 回写全部在**同一把 settings 锁内**完成——锁外先读再锁会丢并发写。
-    let written = with_settings_lock(path, || -> std::io::Result<bool> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&text) else {
-            return Ok(false);
-        };
-        if map.remove(FIELD_READ_ROOTS).is_none() {
-            return Ok(false);
-        }
-        atomic_write_settings_json(path, &Value::Object(map))?;
-        Ok(true)
-    });
-    match written {
-        Ok(Ok(dropped)) => Ok(dropped),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 /// 用 `$EDITOR` 打开该层 settings.json（保存后的 reconcile 由 REPL 承担）/ open the scope file in `$EDITOR`。
 ///
 /// flag/policy 只读 → 退出码 1。缺文件先建空骨架 `{}`。
@@ -420,7 +390,7 @@ pub fn settings_edit(
         Ok(s) if s.success() => {
             // #245：project scope 的 readRoots 写入期丢弃 + 诊断（编辑内容不落盘）。
             if scope == "project" {
-                match drop_project_read_roots_from_file(&path) {
+                match drop_read_roots_from_file(&path) {
                     Ok(true) => {
                         tracing::warn!(
                             field = FIELD_READ_ROOTS,
@@ -695,12 +665,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"readRoots":["/data"],"keep":1}"#).unwrap();
-        assert!(drop_project_read_roots_from_file(&path).unwrap());
+        assert!(drop_read_roots_from_file(&path).unwrap());
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.get("readRoots").is_none());
         assert_eq!(saved["keep"], json!(1));
         // 幂等：已无该键 → no-op。
-        assert!(!drop_project_read_roots_from_file(&path).unwrap());
+        assert!(!drop_read_roots_from_file(&path).unwrap());
     }
 
     /// `settings edit` 的真实写入路径：编辑器写入 `readRoots` 后由 post-edit 清理剔除。

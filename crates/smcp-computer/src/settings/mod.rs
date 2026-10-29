@@ -14,6 +14,7 @@ pub mod installer;
 pub mod lifecycle;
 pub mod mcp_config;
 pub mod policy;
+pub(crate) mod read_roots;
 pub mod reconciler;
 pub mod recovery;
 pub(crate) mod redaction;
