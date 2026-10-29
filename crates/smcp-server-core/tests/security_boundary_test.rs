@@ -152,7 +152,7 @@ async fn join_room_conflicts_return_distinct_flat_codes() {
     let computer_seat = emit_with_ack(
         &second_computer,
         events::SERVER_JOIN_OFFICE,
-        json!({"role": "computer", "name": "another", "office_id": "office-a"}),
+        json!({"role": "computer", "name": "another", "office_id": "office-a", "computer_id": "0f8fad5b-d9cb-469f-a165-70867728950e"}),
     )
     .await;
     assert_eq!(computer_seat["code"], 4101);
@@ -507,7 +507,7 @@ async fn identity_claim_mismatch_returns_flat_403_without_details() {
     let role_mismatch = emit_with_ack(
         &client,
         events::SERVER_JOIN_OFFICE,
-        json!({"role": "computer", "name": "agent", "office_id": "office-a"}),
+        json!({"role": "computer", "name": "agent", "office_id": "office-a", "computer_id": "0f8fad5b-d9cb-469f-a165-70867728950e"}),
     )
     .await;
     assert_eq!(role_mismatch["code"], 403);

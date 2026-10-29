@@ -519,7 +519,7 @@ async fn test_computer_duplicate_name_rejected_seat_taken() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "duplicate_comp".to_string(),
-        computer_id: None,
+        computer_id: Some("6c41dfb7-8d90-41a2-ce1f-3a4b5c6d7e80".to_string()),
     };
 
     let result = emit_join_for_ack(&computer2_client, json!(join_req)).await;
@@ -578,7 +578,7 @@ async fn test_computer_different_name_also_rejected() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "comp2".to_string(),
-        computer_id: None,
+        computer_id: Some("7d52e0c8-9ea1-42b3-df2a-4b5c6d7e8f90".to_string()),
     };
 
     let result = emit_join_for_ack(&computer2_client, json!(join_req)).await;
@@ -628,7 +628,7 @@ async fn test_computer_switch_room_with_same_name_allowed() {
         office_id: "office2".to_string(),
         role: Role::Computer,
         name: "switching_comp".to_string(),
-        computer_id: None,
+        computer_id: Some(TEST_COMPUTER_ID.to_string()),
     };
 
     // 创建channel接收响应

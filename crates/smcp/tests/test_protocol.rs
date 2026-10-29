@@ -116,9 +116,9 @@ fn test_enter_office_notification() {
 /// protocol#64（v0.5.0）`computer_id` 的 wire 形状：spec 见 `data-structures.md`
 /// §EnterOfficeReq / §EnterOfficeNotification / §LeaveOfficeNotification / §SessionInfo。
 ///
-/// PR1 只保证类型与形状——服务端强制校验、Computer 身份生成/持久化在后续 PR。
 /// 规范要点：`role="computer"` 时 MUST 携带；`role="agent"` 时 MUST NOT 出现该键
-/// （包括 `null`）；成员为 Agent 的通知同样省略键。
+/// （包括 `null`）；成员为 Agent 的通知同样省略键。服务端强制校验见 smcp-server-core
+/// （v0.5.0 起），Computer 身份生成/持久化见 smcp-computer。
 const SAMPLE_COMPUTER_ID: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
 
 #[test]
@@ -245,6 +245,35 @@ fn test_session_info_computer_id_wire_shape() {
     let legacy = r#"{"sid":"sid-3","name":"c2","role":"computer","office_id":"office-1"}"#;
     let de: SessionInfo = serde_json::from_str(legacy).unwrap();
     assert!(de.computer_id.is_none());
+}
+
+/// protocol#64 兼容向：通知**反序列化**对「缺键」与「显式 `null`」都宽容（旧报文 / 违规对端），
+/// 不 panic；重新序列化时 `None` 仍省略键。Agent **生产侧**必须省略键（见上面的序列化用例）。
+#[test]
+fn test_office_notifications_legacy_and_null_computer_id() {
+    // 旧报文（无该键）⇒ None。
+    let legacy_enter = r#"{"office_id":"o","computer":"c1","agent":null}"#;
+    let de: EnterOfficeNotification = serde_json::from_str(legacy_enter).unwrap();
+    assert!(de.computer_id.is_none());
+
+    let legacy_leave = r#"{"office_id":"o","computer":"c1"}"#;
+    let de: LeaveOfficeNotification = serde_json::from_str(legacy_leave).unwrap();
+    assert!(de.computer_id.is_none());
+
+    // 显式 `null`（违规对端）⇒ 反序列化为 None；再序列化仍省略键（不得回吐 null）。
+    let with_null = r#"{"office_id":"o","agent":"a1","computer_id":null}"#;
+    let de: EnterOfficeNotification = serde_json::from_str(with_null).unwrap();
+    assert!(de.computer_id.is_none());
+    let json = serde_json::to_value(&de).unwrap();
+    assert!(
+        json.get("computer_id").is_none(),
+        "反序列化后的 None 必须序列化为缺键，实际: {json}"
+    );
+
+    let de: LeaveOfficeNotification = serde_json::from_str(with_null).unwrap();
+    assert!(de.computer_id.is_none());
+    let json = serde_json::to_value(&de).unwrap();
+    assert!(json.get("computer_id").is_none());
 }
 
 #[test]

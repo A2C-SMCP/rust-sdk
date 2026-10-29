@@ -343,7 +343,7 @@ async fn test_get_config_event_forwarded() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
-        computer_id: None,
+        computer_id: Some("0f8fad5b-d9cb-469f-a165-70867728950e".to_string()),
     };
 
     computer_client
@@ -485,7 +485,7 @@ async fn test_get_config_unauthorized_role_integration() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
-        computer_id: None,
+        computer_id: Some("1d9c8a62-3e4b-4c5d-9f6a-7b8c9d0e1f20".to_string()),
     };
 
     computer_client

@@ -22,6 +22,18 @@ pub enum SessionError {
     /// 由 `details.role`（取自本变体）标明被占席位。[`SessionError::error_code`] 映射为 `4101`。
     #[error("Seat already taken in room for role {0:?}")]
     SeatTaken(ClientRole),
+    /// protocol#64：同一 sid 在**同一连接**内声明了不同的 `computer_id`（协议 `403`）。
+    ///
+    /// 记录随连接存续、`leave_office` 不清除——改身份须新建连接。
+    #[error(
+        "computer_id is immutable within a connection: recorded {recorded}, requested {requested}"
+    )]
+    ComputerIdMismatch {
+        /// 会话首次记录的值 / the value recorded for this session.
+        recorded: String,
+        /// 本次 join 声明的值 / the value declared by this join.
+        requested: String,
+    },
     #[error("Invalid session state: {0}")]
     InvalidState(String),
 }
@@ -33,6 +45,7 @@ impl SessionError {
             SessionError::NotFound(_) => smcp::error_codes::NOT_FOUND,
             SessionError::AgentAlreadyInRoom(_) => smcp::error_codes::ALREADY_IN_ROOM,
             SessionError::SeatTaken(_) => smcp::error_codes::ROOM_FULL,
+            SessionError::ComputerIdMismatch { .. } => smcp::error_codes::FORBIDDEN,
             SessionError::InvalidState(_) => smcp::error_codes::BAD_REQUEST,
         }
     }
@@ -88,6 +101,14 @@ pub struct SessionData {
     /// 对齐 Python `session["a2c_version"]`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2c_version: Option<String>,
+    /// protocol#64：Computer 稳定身份。在该会话（sid）**首次 join 通过身份校验**时记录
+    /// （`400`/`403` 之后、`4106`/`4101` 之前），随连接存续、`leave_office` 不清除；
+    /// 同一 sid 之后声明不同值 ⇒ `403`。Agent 会话恒为 `None`。
+    ///
+    /// Stable Computer identity, recorded on the first identity-checked join and immutable for
+    /// the lifetime of the connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
     /// 其他扩展数据
     pub extra: serde_json::Value,
 }
@@ -101,6 +122,7 @@ impl SessionData {
             role,
             office_id: None,
             a2c_version: None,
+            computer_id: None,
             extra: serde_json::Value::Object(Default::default()),
         }
     }
@@ -282,6 +304,50 @@ impl SessionManager {
         self.sessions.insert(created.sid.clone(), created.clone());
         tracing::debug!("Registered session: {} -> {}", created.name, created.sid);
         created
+    }
+
+    /// protocol#64：校验并**原子记录** `computer_id`（同一 sid 一次连接内不可变）。
+    ///
+    /// 调用时机由 handler 保证：`400`（形态）与 `403`（role/name）之后、`4106`/`4101`（席位）之前——
+    /// 因此「本次 join 随后被席位拒绝」时记录仍然保留（协议 room-model #13 注记）。
+    ///
+    /// - 已有记录且本次声明不同 ⇒ [`SessionError::ComputerIdMismatch`]（`403`），记录不变；
+    /// - 无记录且本次带值（Computer 首次通过身份校验）⇒ 写入；
+    /// - Agent（本次 `None`）不写入任何值。
+    ///
+    /// 「一致性校验 + 记录」在同一 `transition` 临界区完成，对同一 sid **原子**
+    /// （协议 MUST：并发同 sid 首写至多一者被记录，其余 `403`）。
+    pub fn record_or_verify_computer_id(
+        &self,
+        sid: &SessionId,
+        computer_id: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let _guard = self.transition();
+        let Some(requested) = computer_id else {
+            // Agent 会话（server 已按 400 拒绝带键的 Agent）不记录任何值。
+            return Ok(());
+        };
+        let Some(mut session) = self.sessions.get(sid).map(|s| s.clone()) else {
+            // 与断连并发：会话已被 `unregister_session` 清除。此时无法记录也不该假装成功——
+            // 打日志供诊断，调用方的 join 随后会因 `reserve_join` 的 `NotFound` 走内部错误路径。
+            tracing::warn!(
+                sid = %sid,
+                "record_or_verify_computer_id: session vanished before identity claim"
+            );
+            return Ok(());
+        };
+        match session.computer_id.as_deref() {
+            Some(recorded) if recorded != requested => Err(SessionError::ComputerIdMismatch {
+                recorded: recorded.to_string(),
+                requested: requested.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                session.computer_id = Some(requested.to_string());
+                self.sessions.insert(session.sid.clone(), session);
+                Ok(())
+            }
+        }
     }
 
     /// 入房事务：**校验 → 提交**全部在一次临界区内完成。
@@ -539,6 +605,95 @@ mod tests {
         // 房内解析（`get_computer_sid_in_office`）以外的全局按名查找已删除（#226 复审 🟡1）：
         // 名字解析 MUST 限定在会话所在房内，故这里只能断言记录本身。
         assert_eq!(manager.get_all_sessions().len(), 1);
+    }
+
+    /// protocol#64：`computer_id` 首记一次、同 sid 改值 403、同值幂等；Agent 不记录。
+    #[test]
+    fn computer_id_is_recorded_once_and_immutable() {
+        let manager = SessionManager::new();
+        let sid = Uuid::new_v4().to_string();
+        manager.get_or_register_session(sid.clone(), "c".to_string(), ClientRole::Computer, None);
+        let x = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let y = "1d9c8a62-3e4b-4c5d-9f6a-7b8c9d0e1f20";
+
+        manager.record_or_verify_computer_id(&sid, Some(x)).unwrap();
+        assert_eq!(
+            manager.get_session(&sid).unwrap().computer_id.as_deref(),
+            Some(x)
+        );
+
+        // 同值幂等：不报错、记录不变。
+        manager.record_or_verify_computer_id(&sid, Some(x)).unwrap();
+
+        // 改值 ⇒ 403 变体；记录保持首次的值。
+        match manager.record_or_verify_computer_id(&sid, Some(y)) {
+            Err(SessionError::ComputerIdMismatch {
+                recorded,
+                requested,
+            }) => {
+                assert_eq!(recorded, x);
+                assert_eq!(requested, y);
+            }
+            other => panic!("expected ComputerIdMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            manager.get_session(&sid).unwrap().computer_id.as_deref(),
+            Some(x)
+        );
+
+        // Agent 会话：传 None 不写入任何值。
+        let agent_sid = Uuid::new_v4().to_string();
+        manager.get_or_register_session(
+            agent_sid.clone(),
+            "a".to_string(),
+            ClientRole::Agent,
+            None,
+        );
+        manager
+            .record_or_verify_computer_id(&agent_sid, None)
+            .unwrap();
+        assert!(manager
+            .get_session(&agent_sid)
+            .unwrap()
+            .computer_id
+            .is_none());
+    }
+
+    /// protocol#64：同一 sid 并发首写**原子**——8 个不同值同时首写，至多一者成功，其余全部
+    /// `ComputerIdMismatch`，且最终记录等于胜者。
+    #[test]
+    fn concurrent_computer_id_first_write_is_atomic() {
+        use std::sync::Barrier;
+
+        let manager = Arc::new(SessionManager::new());
+        let sid = Uuid::new_v4().to_string();
+        manager.get_or_register_session(sid.clone(), "c".to_string(), ClientRole::Computer, None);
+
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        let mut ids = Vec::new();
+        for i in 0..8u32 {
+            let id = format!("0000000{i}-1111-4111-8111-11111111111{i}");
+            ids.push(id.clone());
+            let manager = Arc::clone(&manager);
+            let sid = sid.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                manager.record_or_verify_computer_id(&sid, Some(&id))
+            }));
+        }
+
+        let mut winners = Vec::new();
+        for handle in handles {
+            if handle.join().unwrap().is_ok() {
+                winners.push(());
+            }
+        }
+        assert_eq!(winners.len(), 1, "并发首写必须恰有一者成功");
+
+        let recorded = manager.get_session(&sid).unwrap().computer_id.unwrap();
+        assert!(ids.contains(&recorded), "最终记录必须来自某个并发写者");
     }
 
     /// protocol#66（场景 #2 的单元版）：**同 role 同名**的第二个会话入房撞的是**席位规则**

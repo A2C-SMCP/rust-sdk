@@ -155,7 +155,7 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
-        computer_id: None,
+        computer_id: Some("0f8fad5b-d9cb-469f-a165-70867728950e".to_string()),
     };
 
     client1
@@ -194,7 +194,7 @@ async fn test_computer_switch_room_broadcasts_leave_notification() {
         office_id: "office2".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
-        computer_id: None,
+        computer_id: Some("0f8fad5b-d9cb-469f-a165-70867728950e".to_string()),
     };
 
     client1
@@ -336,7 +336,7 @@ async fn test_join_office_broadcasts_only_to_room() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "computer1".to_string(),
-        computer_id: None,
+        computer_id: Some("5b30cea6-7c8f-4091-bd0e-2f3a4b5c6d70".to_string()),
     };
 
     // 使用新的客户端连接来发送join请求

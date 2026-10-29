@@ -535,6 +535,14 @@ pub struct SmcpComputerClient {
 }
 
 impl SmcpComputerClient {
+    /// protocol#64：本连接是否携带稳定身份（低层只读观测；`SmcpComputerClient::new` 恒为 `false`）。
+    ///
+    /// 供 [`crate::computer::Computer::set_socketio_client`] 对「装入无身份 client」告警。
+    /// Whether this connection carries a stable Computer identity.
+    pub(crate) fn has_computer_identity(&self) -> bool {
+        self.computer_id.is_some()
+    }
+
     /// Whether this client still owns the active lifecycle lease for the supplied Computer.
     pub(crate) fn has_active_runtime_lifecycle(
         &self,
@@ -599,10 +607,10 @@ impl SmcpComputerClient {
     /// `headers`：路由 HTTP headers（非鉴权）。
     ///
     /// **低层 transport 入口，不携带 protocol#64 身份**：本构造器不读 `computer_id` 持久化存储，
-    /// 使用它建立的连接入房时不发该键（服务端 PR3 起会以 `400` 拒绝 Computer 入房）。协议正确的
+    /// 使用它建立的连接入房时不发该键（服务端自 v0.5.0 起会以 `400` 拒绝 Computer 入房）。协议正确的
     /// 连接请走 [`crate::computer::Computer::connect_socketio`]，由它物化并注入稳定身份。
     /// Low-level transport entrypoint: does NOT load the persisted `computer_id`, so joins omit the
-    /// key (the server will reject Computer joins once PR3 enforces it). Use
+    /// key (the server rejects such joins with `400` since v0.5.0). Use
     /// [`crate::computer::Computer::connect_socketio`] for protocol-correct connections.
     ///
     /// Delegates to [`SmcpComputerClientBuilder`]; `auth_payload` is the Socket.IO CONNECT
@@ -1548,7 +1556,7 @@ impl SmcpComputerClient {
             "name": computer_name
         });
         // protocol#64：Computer 入房 MUST 携带稳定身份；低层 transport 测试客户端可缺省
-        // （服务端强制由 PR3 引入）。
+        // （服务端自 v0.5.0 起强制校验：缺失 ⇒ 400）。
         if let Some(computer_id) = computer_id {
             payload["computer_id"] = Value::String(computer_id.to_string());
         }

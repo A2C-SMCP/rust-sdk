@@ -4573,10 +4573,20 @@ impl<S: Session> Computer<S> {
     /// 此方法会替换现有的 client（如果有）并保持强引用
     ///
     /// **protocol#64**：本方法不校验、也不注入 `computer_id`——传入的 client 若未携带身份，
-    /// 入房载荷会省略该键（Server 自 PR3 起对 Computer 入房强制校验，届时会以 `400` 拒绝）。
-    /// 正常路径请用 [`Self::connect_socketio`]，由它物化并注入稳定身份；本入口的收口留待 PR3。
-    /// This setter neither validates nor injects `computer_id`; use `connect_socketio` instead.
+    /// 入房载荷会省略该键，Server 自 v0.5.0 起会以 `400` 拒绝 Computer 入房。正常路径请用
+    /// [`Self::connect_socketio`]，由它物化并注入稳定身份。装入无身份 client 时会打
+    /// `warn!` 日志（不拒绝，保留既有 API 语义）。
+    /// This setter neither validates nor injects `computer_id`; an identity-less client's join is
+    /// rejected with `400` by the v0.5.0 server (a `warn!` is logged on install). Use
+    /// `connect_socketio` instead.
     pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) -> ComputerResult<()> {
+        if !client.has_computer_identity() {
+            warn!(
+                "set_socketio_client: installed client carries no computer_id; its join_office will \
+                 be rejected with 400 by a v0.5.0 server — production connections must use \
+                 connect_socketio"
+            );
+        }
         let gate = Arc::clone(&self.socketio_lifecycle_gate);
         let socketio_client = Arc::clone(&self.socketio_client);
         let status = Arc::clone(&self.status);
