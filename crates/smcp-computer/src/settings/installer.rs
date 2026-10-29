@@ -50,7 +50,7 @@ use serde_json::{Map, Value};
 use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig, ServerName};
 use crate::settings::reconciler::{safe_rmtree, InstalledPluginRecord};
-use crate::settings::schema::{is_valid_enabled_plugin_key, SettingsScope};
+use crate::settings::schema::{is_valid_enabled_plugin_key, SettingsScope, FIELD_READ_ROOTS};
 use crate::settings::scope::{
     apply_write, load_settings_file, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
@@ -300,12 +300,28 @@ fn apply_enabled_plugin_write(
         let (existing, _errors) = load_settings_file(&path, scope_enum);
         let updated = apply_write(&existing, &updates);
         if updated == existing {
-            return Ok(false); // 内容未变 → 不触碰文件。
+            // #245 / protocol#65：no-op 不写盘，但 project settings 若残留旧版本写入的 `readRoots`，
+            // 借本次机会落一次清洗后的视图（enabledPlugins 未变 → 仍返回 false，不 bump revision）。
+            if scope_enum == SettingsScope::Project
+                && raw_file_contains_key(&path, FIELD_READ_ROOTS)
+            {
+                store::atomic_write_settings_json(&path, &Value::Object(updated))?;
+            }
+            return Ok(false); // 内容未变 → 不触碰文件（除上述清理）。
         }
         store::atomic_write_settings_json(&path, &Value::Object(updated))?;
         Ok(true)
     })??;
     Ok(changed)
+}
+
+/// #245：原始 settings 文件顶层是否含某键（用于 no-op 分支的旧键清理判定）。
+fn raw_file_contains_key(path: &Path, key: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().map(|map| map.contains_key(key)))
+        .unwrap_or(false)
 }
 
 /// 写 `enabledPlugins[<plugin_id>] = value`（enable/disable 用）/ Write the enable flag。
@@ -2138,6 +2154,25 @@ mod tests {
             write_enabled_plugin("a@mp", true, "user", None, Some(&env)).unwrap(),
             "再翻 true → 真变"
         );
+    }
+
+    #[test]
+    fn project_enable_noop_cleans_existing_read_roots() {
+        // #245：no-op 分支不写盘，但盘上旧 readRoots（旧版本写入）须被清理。
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"readRoots":["/data"],"enabledPlugins":{"a@mp":true}}"#,
+        )
+        .unwrap();
+        let changed = write_enabled_plugin("a@mp", true, "project", wd.to_str(), None).unwrap();
+        assert!(!changed, "同值写 → enabledPlugins 无变化");
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["enabledPlugins"]["a@mp"], serde_json::json!(true));
     }
 
     #[tokio::test]
