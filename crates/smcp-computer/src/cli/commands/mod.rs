@@ -174,37 +174,35 @@ pub fn resolved_settings_with_errors(
 ///
 /// GA 前不得静默：`settings show --scope flag`、`settings get ... --scope flag` 与启动重挂
 /// （[`run_governance_remount`]）共用本诊断。运行期行为不变（仍不读取 flag 层）。
-pub fn warn_flag_scope_ineffective(layer: &Map<String, Value>) {
-    for field in flag_scope_ineffective_fields(layer) {
-        eprintln!(
-            "⚠ settings.json[flag]: {field} is not applied at runtime (fail-closed); \
-             use user/local/policy settings (rust-sdk#248)"
-        );
-    }
+/// #248：flag 文件中的运行期不生效键诊断（纯函数；以**原始文件**为准，畸形值也不静默）。
+///
+/// rust `Computer` 运行期不读取 flag settings，故 flag 层的 `readRoots` / `landingRoot` 不生效
+/// （fail-closed）。`settings show/get --scope flag|merged` 与启动重挂共用本诊断。
+#[must_use]
+pub fn flag_scope_diagnostics(flag_path: Option<&Path>) -> Vec<String> {
+    let Some(path) = flag_path else {
+        return Vec::new();
+    };
+    let Ok(Some(map)) = crate::settings::read_roots::read_raw_map(path) else {
+        return Vec::new();
+    };
+    flag_scope_ineffective_fields(&map)
+        .into_iter()
+        .map(|field| {
+            format!(
+                "⚠ settings.json[flag]: {field} is not applied at runtime (fail-closed); \
+                 use user/local/policy settings (rust-sdk#248)"
+            )
+        })
+        .collect()
 }
 
-/// #248：按 scope 呈现 flag 层诊断——`flag` 直接用该层视图；`merged` 需回看 `scope_layers` 的
-/// flag 层（合并视图丢失来源）。
-pub fn warn_flag_scope_ineffective_for(
-    scope: &str,
-    cwd: Option<&Path>,
-    env: Option<&EnvMap>,
-    flag_path: Option<&Path>,
-    data: &Map<String, Value>,
-) {
-    match scope {
-        "flag" => warn_flag_scope_ineffective(data),
-        "merged" => {
-            let resolved = resolved_settings_with_errors(cwd, env, flag_path);
-            if let Some((_, layer)) = resolved
-                .scope_layers
-                .iter()
-                .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
-            {
-                warn_flag_scope_ineffective(layer);
-            }
+/// #248：`settings show/get --scope flag|merged` 的 flag 层诊断（stderr，不污染 stdout JSON）。
+pub fn warn_flag_scope_diagnostics_for(scope: &str, flag_path: Option<&Path>) {
+    if matches!(scope, "flag" | "merged") {
+        for line in flag_scope_diagnostics(flag_path) {
+            eprintln!("{line}");
         }
-        _ => {}
     }
 }
 
@@ -395,8 +393,8 @@ pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: O
     // #248：启动时若加载了 flag settings，readRoots / landingRoot 在运行期不生效——以**原始文件**
     // 为准（畸形值会被校验器丢弃，不能只看校验后视图）；flag 层校验错误同样呈现，不静默。
     if let Some(path) = flag_path {
-        if let Ok(Some(map)) = crate::settings::read_roots::read_raw_map(path) {
-            warn_flag_scope_ineffective(&map);
+        for line in flag_scope_diagnostics(Some(path)) {
+            eprintln!("{line}");
         }
         let flag_errors: Vec<_> = resolved
             .errors
@@ -447,6 +445,41 @@ mod tests {
     use super::*;
     use crate::computer::{Computer, SilentSession};
     use crate::settings::{SettingsScope, SettingsValidationError};
+
+    /// #248：flag 诊断纯函数四态——缺失 / 无键 / 有键（valid）/ 畸形值（仍按原始键告警）。
+    #[test]
+    fn flag_scope_diagnostics_handles_all_states() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(flag_scope_diagnostics(None).is_empty());
+        assert!(flag_scope_diagnostics(Some(&tmp.path().join("missing.json"))).is_empty());
+
+        let clean = tmp.path().join("clean.json");
+        fs::write(&clean, r#"{"strictKnownMarketplaces":true}"#).unwrap();
+        assert!(flag_scope_diagnostics(Some(&clean)).is_empty());
+
+        let valid = tmp.path().join("valid.json");
+        fs::write(
+            &valid,
+            r#"{"readRoots":["/data"],"landingRoot":"/landing"}"#,
+        )
+        .unwrap();
+        let lines = flag_scope_diagnostics(Some(&valid));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("readRoots") && l.contains("not applied at runtime")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("landingRoot") && l.contains("not applied at runtime")));
+
+        // 畸形值：原始键存在即告警（校验器丢弃后不静默）。
+        let malformed = tmp.path().join("malformed.json");
+        fs::write(&malformed, r#"{"readRoots":123}"#).unwrap();
+        let lines = flag_scope_diagnostics(Some(&malformed));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("readRoots"));
+    }
 
     /// #143：`format_settings_errors` 的文案与 scope/field 拼装（呈现半程的可断言守护——`run_mcp_approval`
     /// 是 `Session`-泛型异步副作用函数，无法直接断言其打印；抽纯函数即为此）。

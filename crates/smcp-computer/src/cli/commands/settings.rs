@@ -26,7 +26,7 @@ use serde_json::{json, Map, Value};
 use super::{
     err_flat as err, ok_msg, print_json, resolved_settings_with_errors, EXIT_OK, EXIT_USER_ERROR,
 };
-use crate::settings::read_roots::drop_read_roots_from_file;
+use crate::settings::read_roots::{drop_read_roots_from_file, read_raw_map, remove_read_roots_raw};
 use crate::settings::scope::{
     apply_write, load_settings_file, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
@@ -178,7 +178,7 @@ pub fn settings_show(
         eprintln!("{line}");
     }
     // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
-    super::warn_flag_scope_ineffective_for(scope, cwd, env, flag_path, &data);
+    super::warn_flag_scope_diagnostics_for(scope, flag_path);
     print_json(&Value::Object(data));
     EXIT_OK
 }
@@ -214,7 +214,7 @@ pub fn settings_get(
         eprintln!("{line}");
     }
     // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
-    super::warn_flag_scope_ineffective_for(scope, cwd, env, flag_path, &data);
+    super::warn_flag_scope_diagnostics_for(scope, flag_path);
     let Some(value) = data.get(key) else {
         return err(
             &format!("key {key:?} not set in scope {scope:?}"),
@@ -277,8 +277,18 @@ pub fn settings_set(
         BTreeMap::from([(key.to_string(), WriteValue::from(parsed.clone()))]);
 
     let locked = with_settings_lock(&path, || -> std::io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, enum_);
-        atomic_write_settings_json(&path, &apply_write(&existing, &updates))
+        // #245：**raw 保真 RMW**——不回写校验视图（否则会静默删除 landingRoot /
+        // enabledMcpjsonServers / 非法 permissions 等被过滤字段）；project scope 顺带剔除旧
+        // `readRoots`（只删该键）。无变化 → 不重写（不扰 mtime）。
+        let mut existing = read_raw_map(&path)?.unwrap_or_default();
+        let had_read_roots =
+            enum_ == SettingsScope::Project && remove_read_roots_raw(&mut existing);
+        let updated = apply_write(&existing, &updates);
+        // 无变化且无需清理 readRoots → 不重写（不扰 mtime）。
+        if updated == existing && !had_read_roots {
+            return Ok(());
+        }
+        atomic_write_settings_json(&path, &Value::Object(updated))
     });
     match locked {
         Ok(Ok(())) => {}
@@ -658,6 +668,70 @@ mod tests {
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.get("readRoots").is_none(), "{saved}");
         assert_eq!(saved["keep"], json!(1), "其他键须保留");
+    }
+
+    #[test]
+    fn set_generic_key_in_project_scope_preserves_filtered_fields() {
+        // F1（终审）：通用 settings set 也是 raw RMW——不得回写校验视图，不得删除被过滤字段。
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "readRoots": ["/data"],
+                "landingRoot": "/landing",
+                "enabledMcpjsonServers": ["srv"],
+                "enableAllProjectMcpServers": true,
+                "permissions": "invalid-not-object"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "maxConcurrency",
+                "7",
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["maxConcurrency"], json!(7));
+        assert_eq!(saved["landingRoot"], json!("/landing"));
+        assert_eq!(saved["enabledMcpjsonServers"], json!(["srv"]));
+        assert_eq!(saved["enableAllProjectMcpServers"], json!(true));
+        assert_eq!(saved["permissions"], json!("invalid-not-object"));
+    }
+
+    #[test]
+    fn set_same_value_in_project_scope_still_cleans_read_roots() {
+        // 写同值（内容无变化）但盘上有旧 readRoots → 仍须落盘清理（changed || had_read_roots）。
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"readRoots":["/data"],"maxConcurrency":7}"#).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "maxConcurrency",
+                "7",
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["maxConcurrency"], json!(7));
     }
 
     #[test]

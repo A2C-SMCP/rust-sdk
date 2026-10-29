@@ -1,8 +1,12 @@
-//! #245 / #248：`readRoots` 写入期清理的共享实现（raw 保真）。
+//! #245 / #248：`readRoots` 写入期清理的共享 raw 助手。
 //!
-//! 所有「写 settings 文件」的路径只允许删除 `readRoots` 这一个键，**不得**把校验视图整文件回写
-//! （会静默删除 landingRoot / enabledMcpjsonServers / 非法 permissions 等被过滤字段）。
-//! 供 installer（锁内）、CLI `settings set/edit`（自行持锁）与 config executor（原始 RMW）共用。
+//! 本模块服务于**已迁移**的 writer：installer（锁内 no-op / 真写）、CLI `settings set/edit`
+//! （持锁或复用 [`drop_read_roots_from_file`]）以及 flag 诊断的原始文件读取。写入只删除
+//! `readRoots` 这一个键，不回写校验视图（避免静默删除 landingRoot / enabledMcpjsonServers /
+//! 非法 permissions 等被过滤字段）。
+//!
+//! 其它 writer（config executor / marketplace / mcp_config）仍各自处理校验视图；统一收口见架构师
+//! follow-up Issue，本模块**不**声称覆盖全部写路径。
 
 use std::path::Path;
 
@@ -11,7 +15,10 @@ use serde_json::{Map, Value};
 use super::schema::FIELD_READ_ROOTS;
 use super::store::{atomic_write_settings_json, with_settings_lock};
 
-/// 读取 settings 原始 JSON object（raw 保真）；缺失 / 空 / 畸形 / 非对象 → `None`。
+/// 读取 settings 原始 JSON object（raw 保真）。
+///
+/// 缺失 → `None`；空文件 → `Some(空 map)`；畸形 JSON / 非对象 → `None`（按缺失处理，错误由
+/// 加载 / 校验路径呈现）。
 pub(crate) fn read_raw_map(path: &Path) -> std::io::Result<Option<Map<String, Value>>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
