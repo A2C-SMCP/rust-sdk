@@ -27,10 +27,6 @@ use crate::skills::home::create_private_dir;
 /// 身份文件名（位于 user-config 目录 `<config>/a2c/` 下）。
 pub const COMPUTER_ID_FILENAME: &str = "computer-id";
 
-/// 规范 UUID 中的 nil / max：协议禁止 Computer 发出。
-const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
-const MAX_UUID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
-
 /// 损坏 / 空 / 半写时的短重试窗口（创建者可能刚 `O_CREAT|O_EXCL` 尚未写完）。
 const READ_RETRY_WINDOW: Duration = Duration::from_secs(1);
 const READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -155,7 +151,7 @@ fn identity_error(path: &Path, reason: impl Into<String>) -> ComputerError {
 fn parse_computer_id(content: &str) -> Option<String> {
     let body = content.strip_suffix('\n').unwrap_or(content);
     let body = body.strip_suffix('\r').unwrap_or(body);
-    if !is_canonical_lowercase_uuid(body) || body == NIL_UUID || body == MAX_UUID {
+    if !smcp::is_canonical_computer_id(body) {
         return None;
     }
     Some(body.to_string())
@@ -167,18 +163,6 @@ fn describe_invalid(content: &str) -> String {
          — delete this file to regenerate the identity",
         content.len()
     )
-}
-
-/// 严格形态校验：36 字符、连字符位置固定、其余为小写十六进制。
-fn is_canonical_lowercase_uuid(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() != 36 {
-        return false;
-    }
-    bytes.iter().enumerate().all(|(index, byte)| match index {
-        8 | 13 | 18 | 23 => *byte == b'-',
-        _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
-    })
 }
 
 /// 首建：目录 0700、文件 0600、`O_CREAT|O_EXCL`（先创建者赢）。
@@ -273,9 +257,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let env = xdg_env(tmp.path());
         let first = load_or_create_computer_id_blocking(Some(&env), READ_RETRY_WINDOW).unwrap();
-        assert!(is_canonical_lowercase_uuid(&first), "{first}");
-        assert_ne!(first, NIL_UUID);
-        assert_ne!(first, MAX_UUID);
+        assert!(smcp::is_canonical_computer_id(&first), "{first}");
+        assert_ne!(first, smcp::NIL_UUID);
+        assert_ne!(first, smcp::MAX_UUID);
 
         let path = computer_id_path(Some(&env));
         let raw = std::fs::read_to_string(&path).unwrap();

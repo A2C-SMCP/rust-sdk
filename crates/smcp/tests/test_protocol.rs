@@ -276,6 +276,26 @@ fn test_office_notifications_legacy_and_null_computer_id() {
     assert!(json.get("computer_id").is_none());
 }
 
+/// protocol#64 / protocol#74：`computer_id` 规范形态谓词是 Server 校验（smcp-server-core）与
+/// Computer 解析（smcp-computer）共用的**单一权威**——从公开面确认其接受/拒绝集合。
+#[test]
+fn computer_id_canonical_predicate_matrix() {
+    assert!(smcp::is_canonical_computer_id(
+        "0f8fad5b-d9cb-469f-a165-70867728950e"
+    ));
+    for invalid in [
+        smcp::NIL_UUID,
+        smcp::MAX_UUID,
+        "0F8FAD5B-D9CB-469F-A165-70867728950E",
+        "0f8fad5bd9cb469fa16570867728950e",
+        "not-a-uuid",
+        " 0f8fad5b-d9cb-469f-a165-70867728950e",
+        "0f8fad5b-d9cb-469f-a165-70867728950e\n",
+    ] {
+        assert!(!smcp::is_canonical_computer_id(invalid), "{invalid:?}");
+    }
+}
+
 #[test]
 fn test_all_events_constants() {
     // 验证所有事件常量都已定义

@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 /// 基础设施工具模块 / Infrastructure utilities（原子 IO / 环境变量 / 路径；治理层 SET/SKL 共用）。
 pub mod utils;
+/// protocol#64：`computer_id` 规范形态谓词（Server 校验与 Computer 解析的**单一权威**）。
+pub use utils::computer_id::{is_canonical_computer_id, MAX_UUID, NIL_UUID};
 
 /// SKILL name 解析与合成（段数消歧 lexer）/ SKILL name parse & synthesis (segment-count lexer)。
 pub mod skill_name;

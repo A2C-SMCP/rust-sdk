@@ -139,6 +139,15 @@ impl SessionData {
         self
     }
 
+    /// protocol#64：设置 Computer 稳定身份。
+    ///
+    /// 生产路径经 [`SessionManager::record_or_verify_computer_id`] 在首次 join 时记录；
+    /// 本构造器供测试/内部布置会话使用（`reserve_join` 会拒绝无身份的 Computer 会话）。
+    pub fn with_computer_id(mut self, computer_id: impl Into<String>) -> Self {
+        self.computer_id = Some(computer_id.into());
+        self
+    }
+
     /// 设置扩展数据
     pub fn with_extra(mut self, extra: serde_json::Value) -> Self {
         self.extra = extra;
@@ -389,6 +398,15 @@ impl SessionManager {
             .ok_or_else(|| SessionError::NotFound(sid.clone()))?;
         let previous_office = session.office_id.clone();
 
+        // protocol#64 结构保证：Computer 会话必须有已记录的稳定身份。校验从 handler 下沉到本
+        // API——公开入口（`register_session` + `reserve_join`）不能再构造「在房但无
+        // `computer_id`」的 Computer 会话，否则 `server:list_room` 会漏掉协议 MUST 字段。
+        if session.role == ClientRole::Computer && session.computer_id.is_none() {
+            return Err(SessionError::InvalidState(
+                "computer session has no recorded computer_id".to_string(),
+            ));
+        }
+
         // 席位闸门：目标房该 role 的席位已被**其它会话**占据 ⇒ 4101（自会话由 Noop 分支先行短路）。
         // 判据是「每 role 一席」本身，与 name 无关（protocol#66；`(office_id, role, name)` 唯一性由
         // 本规则蕴含）——同 role 的第二个会话同名与否都撞此处。
@@ -588,6 +606,9 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    /// protocol#64：测试用稳定 `computer_id`（`reserve_join` 要求 Computer 会话已有记录）。
+    const TEST_CID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
     #[test]
     fn test_session_registration() {
         let manager = SessionManager::new();
@@ -714,17 +735,21 @@ mod tests {
                     "duplicate_name".to_string(),
                     ClientRole::Computer,
                 )
+                .with_computer_id(TEST_CID)
                 .with_office_id("office1".to_string()),
             )
             .unwrap();
 
         // 第二台 **同名** Computer 入房：席位被占 ⇒ 4101（SeatTaken(Computer)），不得是 4105。
         manager
-            .register_session(SessionData::new(
-                "sid-c2".to_string(),
-                "duplicate_name".to_string(),
-                ClientRole::Computer,
-            ))
+            .register_session(
+                SessionData::new(
+                    "sid-c2".to_string(),
+                    "duplicate_name".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_computer_id(TEST_CID),
+            )
             .unwrap();
         assert!(
             matches!(
@@ -751,11 +776,14 @@ mod tests {
 
         // 跨房同名也允许：另一台同名 Computer 入另一空房成功。
         manager
-            .register_session(SessionData::new(
-                "sid-c3".to_string(),
-                "duplicate_name".to_string(),
-                ClientRole::Computer,
-            ))
+            .register_session(
+                SessionData::new(
+                    "sid-c3".to_string(),
+                    "duplicate_name".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_computer_id(TEST_CID),
+            )
             .unwrap();
         assert!(
             manager
@@ -856,11 +884,10 @@ mod tests {
             let sids = [format!("sid-a-{round}"), format!("sid-b-{round}")];
             for sid in &sids {
                 manager
-                    .register_session(SessionData::new(
-                        sid.clone(),
-                        "shared".to_string(),
-                        ClientRole::Computer,
-                    ))
+                    .register_session(
+                        SessionData::new(sid.clone(), "shared".to_string(), ClientRole::Computer)
+                            .with_computer_id(TEST_CID),
+                    )
                     .unwrap();
             }
 
@@ -1113,11 +1140,10 @@ mod tests {
         let manager = SessionManager::new();
         let sid = "sid-ghost".to_string();
         manager
-            .register_session(SessionData::new(
-                sid.clone(),
-                "c-1".to_string(),
-                ClientRole::Computer,
-            ))
+            .register_session(
+                SessionData::new(sid.clone(), "c-1".to_string(), ClientRole::Computer)
+                    .with_computer_id(TEST_CID),
+            )
             .unwrap();
         manager.reserve_join(&sid, "office-old").unwrap();
 

@@ -283,7 +283,9 @@ impl SmcpHandler {
         let declared = object.get("computer_id");
         match object.get("role").and_then(Value::as_str) {
             Some("computer") => match declared {
-                Some(Value::String(computer_id)) if is_canonical_computer_id(computer_id) => Ok(()),
+                Some(Value::String(computer_id)) if smcp::is_canonical_computer_id(computer_id) => {
+                    Ok(())
+                }
                 _ => Err(smcp::build_bad_request_error()),
             },
             Some("agent") => {
@@ -1802,58 +1804,11 @@ impl SmcpHandler {
     }
 }
 
-/// 规范小写 UUID（protocol#64 / protocol#74）：**整串**匹配，恰好 36 字符，连字符位于
-/// 8/13/18/23，其余为小写十六进制；拒绝 nil / max。首尾空白或结尾换行因长度/字符集不符而非法。
-///
-/// Canonical lowercase UUID: whole-string match, exactly 36 chars, lowercase hex with hyphens at
-/// the fixed positions; nil/max rejected. Leading/trailing whitespace or a trailing newline fails
-/// the length/charset checks.
-fn is_canonical_computer_id(value: &str) -> bool {
-    const NIL: &str = "00000000-0000-0000-0000-000000000000";
-    const MAX: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
-    if value == NIL || value == MAX {
-        return false;
-    }
-    let bytes = value.as_bytes();
-    if bytes.len() != 36 {
-        return false;
-    }
-    bytes.iter().enumerate().all(|(index, byte)| match index {
-        8 | 13 | 18 | 23 => *byte == b'-',
-        _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::DefaultAuthenticationProvider;
     use serde_json;
-
-    /// protocol#64 / protocol#74：`computer_id` 形态必须**整串**匹配（长度/连字符/小写十六进制），
-    /// 且拒绝 nil / max。
-    #[test]
-    fn computer_id_shape_validation_matches_protocol_74() {
-        assert!(is_canonical_computer_id(
-            "0f8fad5b-d9cb-469f-a165-70867728950e"
-        ));
-        for invalid in [
-            "",
-            "0F8FAD5B-D9CB-469F-A165-70867728950E",  // 大写
-            "0f8fad5bd9cb469fa16570867728950e",      // 无连字符
-            "0f8fad5b-d9cb-469f-a165-70867728950",   // 短一位
-            "0f8fad5b-d9cb-469f-a165-70867728950e0", // 长一位
-            "not-a-uuid",
-            "zz9e6679-7425-40de-944b-e07fc1f90ae7", // 非十六进制
-            "00000000-0000-0000-0000-000000000000", // nil
-            "ffffffff-ffff-ffff-ffff-ffffffffffff", // max
-            " 0f8fad5b-d9cb-469f-a165-70867728950e", // 前导空白
-            "0f8fad5b-d9cb-469f-a165-70867728950e ", // 结尾空白
-            "0f8fad5b-d9cb-469f-a165-70867728950e\n", // 结尾换行
-        ] {
-            assert!(!is_canonical_computer_id(invalid), "{invalid:?} 不应通过");
-        }
-    }
 
     /// protocol#64：`computer_id` 的**键存在性**在原始 `Value` 上判定——
     /// Computer 必填，Agent 出现即非法（**含 `null`**），缺 role / 非法 role 交给 typed 反序列化。

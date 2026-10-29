@@ -164,6 +164,29 @@ async fn join_computer(client: &Client, name: &str, office_id: &str, computer_id
     assert_empty_ack(&ack, "Computer join_office");
 }
 
+/// 400 的 canonical 形状（协议 error-handling §400）：固定 message，且**无** `details`。
+fn assert_bad_request(ack: &Value, label: &str) {
+    assert_eq!(ack["code"], 400, "{label}: {ack}");
+    assert_eq!(ack["message"], "Invalid request payload", "{label}: {ack}");
+    assert!(
+        ack.get("details").is_none(),
+        "{label}: 400 不得携带 details: {ack}"
+    );
+}
+
+/// 403 的 canonical 形状（身份声明冲突）：固定 message，且**无** `details`。
+fn assert_forbidden(ack: &Value, label: &str) {
+    assert_eq!(ack["code"], 403, "{label}: {ack}");
+    assert_eq!(
+        ack["message"], "Role or name mismatch with existing session",
+        "{label}: {ack}"
+    );
+    assert!(
+        ack.get("details").is_none(),
+        "{label}: 403 不得携带 details: {ack}"
+    );
+}
+
 /// 轮询等待条件成立。
 async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -233,10 +256,7 @@ async fn scenario_10_invalid_computer_id_is_rejected_with_400() {
 
     for (label, payload) in invalid_payloads {
         let ack = emit_join_for_ack(&computer, payload).await;
-        assert_eq!(
-            ack["code"], 400,
-            "非法 computer_id（{label}）必须回 400，实得 {ack}"
-        );
+        assert_bad_request(&ack, &format!("非法 computer_id（{label}）"));
     }
 
     // 未入房、无广播。
@@ -268,10 +288,7 @@ async fn scenario_11_agent_with_computer_id_is_rejected_with_400() {
         let attacker = create_test_client(&url, SMCP_NAMESPACE).await;
         let ack =
             emit_join_for_ack(&attacker, join_payload("agent", "A2", "R1", Some(value))).await;
-        assert_eq!(
-            ack["code"], 400,
-            "Agent 携带 computer_id（{label}，含 null）必须回 400，实得 {ack}"
-        );
+        assert_bad_request(&ack, &format!("Agent 携带 computer_id（{label}，含 null）"));
         let sessions = list_sessions(&observer, "A", "R1").await;
         assert_eq!(
             sessions.len(),
@@ -384,10 +401,7 @@ async fn scenario_13_same_session_changing_computer_id_is_rejected_with_403() {
         join_payload("computer", "C1", "R1", Some(json!(Y))),
     )
     .await;
-    assert_eq!(
-        ack["code"], 403,
-        "同会话改 computer_id 必须回 403，实得 {ack}"
-    );
+    assert_forbidden(&ack, "同会话改 computer_id");
 
     sleep(QUIET_WINDOW).await;
     assert_eq!(log.enter_count(), enters_before, "403 不得产生广播");
@@ -539,10 +553,7 @@ async fn scenario_18_identity_record_survives_leave() {
         join_payload("computer", "C1", "R1", Some(json!(Y))),
     )
     .await;
-    assert_eq!(
-        ack["code"], 403,
-        "leave 不清除身份记录：同会话改值必须 403，实得 {ack}"
-    );
+    assert_forbidden(&ack, "leave 不清除身份记录：同会话改值");
 
     let sessions = list_sessions(&agent, "A", "R1").await;
     assert_eq!(sessions.len(), 1, "被拒的 C1 不得入房，实得 {sessions:?}");
@@ -567,10 +578,7 @@ async fn scenario_19_identity_mismatch_precedes_seat_check() {
     join_computer(&c2, "C2", "R2", Y).await;
 
     let ack = emit_join_for_ack(&c1, join_payload("computer", "C1", "R2", Some(json!(Y)))).await;
-    assert_eq!(
-        ack["code"], 403,
-        "改值必须先于席位检查（403 而非 4101），实得 {ack}"
-    );
+    assert_forbidden(&ack, "改值必须先于席位检查（403 而非 4101）");
 
     sleep(QUIET_WINDOW).await;
     assert_eq!(log.leave_count(), 0, "403 不得产生 leave 广播");
@@ -593,9 +601,9 @@ async fn scenario_20_agent_with_computer_id_is_400_not_4106() {
     join_agent(&agent, "A", "R1").await;
 
     let ack = emit_join_for_ack(&agent, join_payload("agent", "A", "R2", Some(json!(X)))).await;
-    assert_eq!(
-        ack["code"], 400,
-        "Agent 携带 computer_id 必须先于房间语义（400 而非 4106），实得 {ack}"
+    assert_bad_request(
+        &ack,
+        "Agent 携带 computer_id 必须先于房间语义（400 而非 4106）",
     );
 
     let sessions = list_sessions(&agent, "A", "R1").await;
@@ -634,10 +642,7 @@ async fn identity_record_survives_seat_rejection() {
         ),
     )
     .await;
-    assert_eq!(
-        ack["code"], 403,
-        "4101 拒绝前已记录 Y：同会话改值必须 403，实得 {ack}"
-    );
+    assert_forbidden(&ack, "4101 拒绝前已记录 Y：同会话改值");
 
     server.shutdown();
 }
@@ -665,6 +670,52 @@ async fn disconnect_notification_echoes_computer_id() {
     let leave = log.leave();
     assert_eq!(leave[0]["computer"], "C1");
     assert_eq!(leave[0]["computer_id"], X, "断连 leave 必须回显身份");
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 校验顺序补充：400（形态）先于 403（身份一致性），且拒绝不残留会话
+// ---------------------------------------------------------------------------
+
+/// 顺序 (a)：既有 **Agent** 会话的 sid 上，以 `role="computer"` + **非法形态** join ⇒ `400`
+/// （**非** `403`）——形态校验发生在身份一致性之前。
+#[tokio::test]
+async fn invalid_shape_precedes_identity_forbidden() {
+    let server = SmcpTestServer::start().await;
+    let url = server.url();
+
+    let client = create_test_client(&url, SMCP_NAMESPACE).await;
+    join_agent(&client, "A", "R1").await;
+
+    // 同一 sid 改报 computer 且形态非法：若 403 先判，会回身份冲突；协议要求先回 400。
+    let ack = emit_join_for_ack(
+        &client,
+        join_payload("computer", "A", "R2", Some(json!("BAD-UUID"))),
+    )
+    .await;
+    assert_bad_request(&ack, "非法形态必须先于身份一致性（400 而非 403）");
+
+    server.shutdown();
+}
+
+/// 顺序 (b)：非法形态 join 被拒后，**同一 sid** 的 Agent join 仍成功——证明校验发生在
+/// **建会话之前**（若挪到建会话之后，会残留一条 Computer 会话，随后 Agent join 必 403）。
+#[tokio::test]
+async fn rejected_invalid_shape_leaves_no_session_behind() {
+    let server = SmcpTestServer::start().await;
+    let url = server.url();
+
+    let client = create_test_client(&url, SMCP_NAMESPACE).await;
+    let ack = emit_join_for_ack(
+        &client,
+        join_payload("computer", "A", "R1", Some(json!("BAD-UUID"))),
+    )
+    .await;
+    assert_bad_request(&ack, "非法形态 join");
+
+    // 同一 sid 以 Agent 身份入房必须成功（无残留会话）。
+    join_agent(&client, "A", "R1").await;
 
     server.shutdown();
 }

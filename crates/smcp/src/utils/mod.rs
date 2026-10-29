@@ -14,6 +14,7 @@
 pub mod atomic_io;
 pub mod blob;
 pub mod bundle_id;
+pub mod computer_id;
 pub mod env;
 pub mod env_segment;
 pub mod handshake;
