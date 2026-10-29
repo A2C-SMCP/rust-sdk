@@ -115,6 +115,9 @@ jobs:
         run: python3 .cargo/test_macos_runner.py
       - name: Verify default Cargo entrypoint
         run: cargo test -p smcp-computer --test window_enumeration_diagnostics --test test_mcp_integration
+      - name: Test path resolver lib (case sensitivity / landing / final-path)
+        # macOS-only 语义（大小写不敏感卷的拒绝集/根围栏探测、landing .part）须在 macOS CI 执行
+        run: cargo test -p smcp-computer --lib blob::path_resolver
       - uses: taiki-e/install-action@nextest
       - name: Verify default nextest entrypoint
         run: cargo nextest run -p smcp-computer --test window_enumeration_diagnostics

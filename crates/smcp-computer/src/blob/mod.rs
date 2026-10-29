@@ -14,7 +14,8 @@
 //! 对标 Python 治理层资产 `a2c_smcp/computer/blob/`（0.2.1）。含 [`handle`]（无状态句柄编解码，BLB-01
 //! #62）、[`resolver`]（解析器接口 + SKILL 解析器 + 惰性切片，BLB-02 #64）、[`thresholds`]（SKILL/blob
 //! 通道阈值，BLB-02 #64）、[`toolspool`]（tool_call 二进制内容寻址暂存 + 惰性切片解析器，BLB-03 #66）、
-//! [`upload`]（`client:put_blob` 上行写入的有界上传会话，v0.4.0 #195）。
+//! [`upload`]（`client:put_blob` 上行写入的有界上传会话，v0.4.0 #195）、[`path_resolver`]（按路径读取：
+//! `readRoots` 三形态围栏（配置 / realpath / 磁盘 canonical）+ 九步 resolve 管线 + path 句柄拉取期复核，v0.5.0 protocol#65）。
 
 pub mod handle;
 pub mod path_resolver;
@@ -25,11 +26,14 @@ pub mod upload;
 
 pub use handle::{
     decode_blob_handle, encode_skill_handle, encode_toolspool_handle, BlobHandleError,
-    BlobTooLargeError, DecodedHandle, SkillHandlePayload, ToolspoolHandlePayload,
-    HANDLE_KIND_SKILL, HANDLE_KIND_TOOLSPOOL, HANDLE_VERSION,
+    BlobTooLargeError, DecodedHandle, PathHandlePayload, SkillHandlePayload,
+    ToolspoolHandlePayload, HANDLE_KIND_SKILL, HANDLE_KIND_TOOLSPOOL, HANDLE_VERSION,
 };
 pub use path_resolver::{
-    build_read_roots, lexical_fence, path_within_root, realpath_fence, resolve_read_roots, ReadRoot,
+    build_protected_paths, build_read_roots, lexical_fence, path_within_root, realpath_fence,
+    resolve_for_pull, resolve_path, resolve_read_roots, resolve_read_roots_and_landing_root,
+    PathAccessPolicy, PathPullResult, PathResolveError, ProtectedPaths, ReadRoot, ResolveReason,
+    ResolvedPath,
 };
 pub use resolver::{BlobResolver, BlobSlicer, ResolvedBlob, SkillBlobResolver, SkillRootLookup};
 pub use thresholds::{

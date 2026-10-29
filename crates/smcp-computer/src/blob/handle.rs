@@ -39,6 +39,8 @@ pub const HANDLE_VERSION: u8 = 1;
 pub const HANDLE_KIND_SKILL: &str = "skill";
 /// `kind="toolspool"` / toolspool kind tag。
 pub const HANDLE_KIND_TOOLSPOOL: &str = "toolspool";
+/// `kind="path"`（v0.5.0 protocol#65；SDK 内部 kind，wire 仍是既有不透明 handle）/ path kind（internal）。
+pub const HANDLE_KIND_PATH: &str = "path";
 
 /// base64url（URL-safe，无填充）引擎 / the URL-safe, no-padding base64 engine。
 const B64: base64::engine::general_purpose::GeneralPurpose =
@@ -64,6 +66,29 @@ pub struct ToolspoolHandlePayload {
     pub mime: String,
 }
 
+/// `kind="path"` 句柄 payload（v0.5.0 protocol#65，SDK 内部 kind）/ path handle payload。
+///
+/// **句柄内容不被信任**：`client:get_blob` 解析时按**当前** `readRoots` 重跑围栏 / 固定拒绝集 /
+/// 权限校验，并比对打开句柄的 stat 键（`blob-transfer.md` §生产者三「拉取期」）。`dev` / `ino`
+/// 为文件身份（平台不提供时省略，协议可选项）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathHandlePayload {
+    /// 规范路径（`normalize_path(realpath)` 产物，可直接回用作 `path`）/ canonical path。
+    pub canonical_path: String,
+    /// 文件字节数 / file size in bytes。
+    pub total_size: u64,
+    /// 最后修改时间（Unix epoch 毫秒，向下取整）/ mtime in Unix epoch milliseconds。
+    pub mtime: i64,
+    /// 全量 `sha256` 十六进制（小写）/ full sha256 hex（lowercase）。
+    pub sha256: String,
+    /// 内容 MIME / the minted MIME。
+    pub mime: String,
+    /// 文件身份：设备号（可选）/ file identity: device id（optional）。
+    pub dev: Option<u64>,
+    /// 文件身份：inode / file id（可选）/ file identity: inode / file id（optional）。
+    pub ino: Option<u64>,
+}
+
 /// 解码结果（已识别的句柄种类 + payload）/ a decoded handle (recognized kind + payload)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedHandle {
@@ -71,6 +96,8 @@ pub enum DecodedHandle {
     Skill(SkillHandlePayload),
     /// `kind="toolspool"`。
     Toolspool(ToolspoolHandlePayload),
+    /// `kind="path"`（v0.5.0 protocol#65）。
+    Path(PathHandlePayload),
 }
 
 impl DecodedHandle {
@@ -79,6 +106,7 @@ impl DecodedHandle {
         match self {
             DecodedHandle::Skill(_) => HANDLE_KIND_SKILL,
             DecodedHandle::Toolspool(_) => HANDLE_KIND_TOOLSPOOL,
+            DecodedHandle::Path(_) => HANDLE_KIND_PATH,
         }
     }
 }
@@ -166,6 +194,50 @@ pub fn encode_toolspool_handle(cid: &str, mime: &str) -> String {
     })
 }
 
+/// 铸造 `kind=path` 不透明句柄 / Mint an opaque `kind="path"` handle。
+///
+/// 编码 `canonical_path` + **计算前** stat 键（`total_size` / `mtime`）+ `sha256` + `mime`，
+/// `dev` / `ino` 仅在平台提供时编码（协议：文件身份可选）。句柄仍不透明、无状态——解析方
+/// **MUST** 重跑授权校验（`blob-transfer.md` §生产者三）。
+pub fn encode_path_handle(
+    canonical_path: &str,
+    total_size: u64,
+    mtime: i64,
+    sha256: &str,
+    mime: &str,
+    file_identity: Option<(u64, u64)>,
+) -> String {
+    #[derive(Serialize)]
+    struct PathWire<'a> {
+        v: u8,
+        kind: &'a str,
+        canonical_path: &'a str,
+        total_size: u64,
+        mtime: i64,
+        sha256: &'a str,
+        mime: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dev: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ino: Option<u64>,
+    }
+    let (dev, ino) = match file_identity {
+        Some((dev, ino)) => (Some(dev), Some(ino)),
+        None => (None, None),
+    };
+    encode_named(&PathWire {
+        v: HANDLE_VERSION,
+        kind: HANDLE_KIND_PATH,
+        canonical_path,
+        total_size,
+        mtime,
+        sha256,
+        mime,
+        dev,
+        ino,
+    })
+}
+
 /// 解码 `blob_handle` → [`DecodedHandle`]。
 ///
 /// 解码失败的所有路径（非 base64url / 非 msgpack / 非 map / 缺字段 / `v` 未知 / kind 未知）一律
@@ -215,6 +287,56 @@ pub fn decode_blob_handle(handle: &str) -> Result<DecodedHandle, BlobHandleError
                 })),
                 _ => Err(BlobHandleError::Invalid(
                     "toolspool handle missing cid / mime".to_string(),
+                )),
+            }
+        }
+        Some(HANDLE_KIND_PATH) => {
+            let canonical_path = obj.get("canonical_path").and_then(Value::as_str);
+            let total_size = obj.get("total_size").and_then(Value::as_u64);
+            let mtime = obj.get("mtime").and_then(Value::as_i64);
+            let sha256 = obj.get("sha256").and_then(Value::as_str);
+            let mime = obj.get("mime").and_then(Value::as_str);
+            // 显式 null 视同缺席（与 Python `payload.get()` 同）；**存在但非 u64** → invalid_handle
+            // （不能被静默当作「无身份」而跳过拉取期身份比对）。
+            let dev = match obj.get("dev") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64().ok_or_else(|| {
+                    BlobHandleError::Invalid("path handle invalid dev".to_string())
+                })?),
+            };
+            let ino = match obj.get("ino") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64().ok_or_else(|| {
+                    BlobHandleError::Invalid("path handle invalid ino".to_string())
+                })?),
+            };
+            // `dev` / `ino` 必须同时出现或同时缺席（协议：文件身份可选成对）。
+            if dev.is_some() != ino.is_some() {
+                return Err(BlobHandleError::Invalid(
+                    "path handle must carry both dev and ino, or neither".to_string(),
+                ));
+            }
+            match (
+                canonical_path.filter(|s| !s.is_empty()),
+                total_size,
+                mtime,
+                sha256.filter(|s| !s.is_empty()),
+                mime.filter(|s| !s.is_empty()),
+            ) {
+                (Some(canonical_path), Some(total_size), Some(mtime), Some(sha256), Some(mime)) => {
+                    Ok(DecodedHandle::Path(PathHandlePayload {
+                        canonical_path: canonical_path.to_string(),
+                        total_size,
+                        mtime,
+                        sha256: sha256.to_string(),
+                        mime: mime.to_string(),
+                        dev,
+                        ino,
+                    }))
+                }
+                _ => Err(BlobHandleError::Invalid(
+                    "path handle missing canonical_path / total_size / mtime / sha256 / mime"
+                        .to_string(),
                 )),
             }
         }
@@ -451,5 +573,112 @@ mod tests {
         // Rust 写 == Python 字节（rmp-serde to_vec_named 与 msgpack(use_bin_type) 同构）
         assert_eq!(encode_skill_handle("a", "b"), PY_SKILL_GOLDEN);
         assert_eq!(encode_toolspool_handle("c", "d"), PY_TOOLSPOOL_GOLDEN);
+    }
+
+    // ── v0.5.0 protocol#65：path 句柄 golden / path handle golden ─────────
+    //
+    // 常量 = Python `a2c_smcp.computer.blob.handle.encode_path_handle` 对同输入的实际产出
+    // （`msgpack({...}, use_bin_type=True)`，字段序 v,kind,canonical_path,total_size,mtime,sha256,mime,dev?,ino?）。
+    const PY_PATH_GOLDEN: &str = "iaF2AaRraW5kpHBhdGiuY2Fub25pY2FsX3BhdGitL2hvbWUvdS9hLnR4dKp0b3RhbF9zaXplBaVtdGltZc8AAAGLz-Voe6ZzaGEyNTbZQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWGkbWltZap0ZXh0L3BsYWluo2RldnujaW5vzQHI";
+    const PY_PATH_NO_IDENTITY_GOLDEN: &str = "h6F2AaRraW5kpHBhdGiuY2Fub25pY2FsX3BhdGitL2hvbWUvdS9hLnR4dKp0b3RhbF9zaXplAKVtdGltZQCmc2hhMjU22UBiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJipG1pbWWqdGV4dC9wbGFpbg";
+
+    #[test]
+    fn path_handle_roundtrip() {
+        let handle = encode_path_handle(
+            "/home/u/a.txt",
+            5,
+            1_700_000_000_123,
+            &"a".repeat(64),
+            "text/plain",
+            Some((123, 456)),
+        );
+        assert_eq!(
+            decode_blob_handle(&handle).unwrap(),
+            DecodedHandle::Path(PathHandlePayload {
+                canonical_path: "/home/u/a.txt".to_string(),
+                total_size: 5,
+                mtime: 1_700_000_000_123,
+                sha256: "a".repeat(64),
+                mime: "text/plain".to_string(),
+                dev: Some(123),
+                ino: Some(456),
+            })
+        );
+    }
+
+    #[test]
+    fn path_handle_cross_sdk_golden() {
+        // Rust 读 Python 字节（关键互解方向）。
+        assert_eq!(
+            decode_blob_handle(PY_PATH_GOLDEN).unwrap(),
+            DecodedHandle::Path(PathHandlePayload {
+                canonical_path: "/home/u/a.txt".to_string(),
+                total_size: 5,
+                mtime: 1_700_000_000_123,
+                sha256: "a".repeat(64),
+                mime: "text/plain".to_string(),
+                dev: Some(123),
+                ino: Some(456),
+            })
+        );
+        // Rust 写 == Python 字节（字段序 / int 编码一致）。
+        assert_eq!(
+            encode_path_handle(
+                "/home/u/a.txt",
+                5,
+                1_700_000_000_123,
+                &"a".repeat(64),
+                "text/plain",
+                Some((123, 456)),
+            ),
+            PY_PATH_GOLDEN
+        );
+        // 无文件身份时省略 dev/ino（与 Python 省略键同形）。
+        assert_eq!(
+            encode_path_handle("/home/u/a.txt", 0, 0, &"b".repeat(64), "text/plain", None),
+            PY_PATH_NO_IDENTITY_GOLDEN
+        );
+        assert_eq!(
+            decode_blob_handle(PY_PATH_NO_IDENTITY_GOLDEN).unwrap(),
+            DecodedHandle::Path(PathHandlePayload {
+                canonical_path: "/home/u/a.txt".to_string(),
+                total_size: 0,
+                mtime: 0,
+                sha256: "b".repeat(64),
+                mime: "text/plain".to_string(),
+                dev: None,
+                ino: None,
+            })
+        );
+    }
+
+    #[test]
+    fn path_handle_old_or_malformed_payload_fails_closed() {
+        // 旧 SDK / 未知内部 kind → invalid_handle（fail-closed）。
+        let unknown_kind = encode_value(&json!({
+            "v": 1, "kind": "path-v2",
+            "canonical_path": "/a", "total_size": 1, "mtime": 0,
+            "sha256": "a".repeat(64), "mime": "text/plain"
+        }));
+        assert_eq!(
+            decode_blob_handle(&unknown_kind).unwrap_err().reason(),
+            "invalid_handle"
+        );
+        // kind=path 但缺 stat 键 / sha / mime / 身份不成对 / 身份类型畸形 → invalid_handle。
+        for payload in [
+            json!({"v": 1, "kind": "path", "canonical_path": "/a"}),
+            json!({"v": 1, "kind": "path", "canonical_path": "/a", "total_size": 1, "mtime": 0, "sha256": "a".repeat(64)}),
+            json!({"v": 1, "kind": "path", "canonical_path": "/a", "total_size": 1, "mtime": 0, "sha256": "a".repeat(64), "mime": "text/plain", "dev": 1}),
+            // 双畸形（非 u64）不得被当作「无身份」：显式存在即须为整数。
+            json!({"v": 1, "kind": "path", "canonical_path": "/a", "total_size": 1, "mtime": 0, "sha256": "a".repeat(64), "mime": "text/plain", "dev": "x", "ino": "y"}),
+            json!({"v": 1, "kind": "path", "canonical_path": "/a", "total_size": 1, "mtime": 0, "sha256": "a".repeat(64), "mime": "text/plain", "dev": 1.5, "ino": 2}),
+        ] {
+            let handle = encode_value(&payload);
+            assert_eq!(
+                decode_blob_handle(&handle).unwrap_err().reason(),
+                "invalid_handle",
+                "payload must fail closed: {payload}"
+            );
+        }
     }
 }
