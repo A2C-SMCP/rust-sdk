@@ -728,7 +728,9 @@ async fn rejected_invalid_shape_leaves_no_session_behind() {
 
 /// 顺序 (c)：身份记录发生在 **`403` 之后**——既有 Agent 会话以 `role="computer"` + **合法** `X`
 /// join ⇒ `403`，且该 Agent 的 `SessionInfo` 仍**无** `computer_id` 键。
-/// （若把记录前移到 403 之前，本用例必红。）
+///
+/// **变异自证**：把 handler 的 record 调用前移到 403 检查之前后，Agent 写入护栏返回
+/// `InvalidState` 并经统一出口映射为 `500 Internal error` ⇒ 本用例收到的不是 403、必红。
 #[tokio::test]
 async fn identity_is_recorded_only_after_identity_check() {
     let server = SmcpTestServer::start().await;

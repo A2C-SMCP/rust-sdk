@@ -156,6 +156,32 @@ impl SessionData {
         self.extra = extra;
         self
     }
+
+    /// protocol#64 身份不变量（`register_session` / `reserve_join` 共用）：
+    ///
+    /// - Agent 会话 **MUST NOT** 携带 `computer_id`（`400` 由 dispatcher 前置拒绝，此处是纵深防御）；
+    /// - 任何已记录的值 **MUST** 通过 [`smcp::is_canonical_computer_id`]（单一权威形态）；
+    /// - Computer 会话**在房**、或**即将入房**（`about_to_join`）时 **MUST** 已有 `computer_id`。
+    ///   首次 join 前（无房、未入房）可暂缺——`record_or_verify_computer_id` 会在席位校验前记录。
+    fn validate_identity_invariants(&self, about_to_join: bool) -> Result<(), SessionError> {
+        if let Some(computer_id) = self.computer_id.as_deref() {
+            if self.role == ClientRole::Agent {
+                return Err(SessionError::InvalidState(
+                    "agent session must not carry computer_id".to_string(),
+                ));
+            }
+            if !smcp::is_canonical_computer_id(computer_id) {
+                return Err(SessionError::InvalidState(
+                    "computer_id is not a canonical UUID".to_string(),
+                ));
+            }
+        } else if self.role == ClientRole::Computer && (about_to_join || self.office_id.is_some()) {
+            return Err(SessionError::InvalidState(
+                "computer session joining or in a room must carry computer_id".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// 入房事务对 Socket.IO 成员关系的裁决 / What the join transaction decided for room membership.
@@ -258,17 +284,8 @@ impl SessionManager {
     /// ⚠️ 本方法是底层「置入」原语，**不是**入房闸门——席位（每 role 一席）与房间归属**只能**经
     /// [`Self::reserve_join`] 获得；既有测试用它直接布置房间态。
     pub fn register_session(&self, session: SessionData) -> Result<(), SessionError> {
-        // protocol#64 结构保证：Computer 会话**在房**时必须已有稳定身份——否则 `server:list_room`
-        // 会回显缺 MUST 字段的 `SessionInfo`。无房 Computer 会话可先登记、随后由首次 join 记录身份。
-        if session.role == ClientRole::Computer
-            && session.office_id.is_some()
-            && session.computer_id.is_none()
-        {
-            return Err(SessionError::InvalidState(
-                "computer session in a room must carry computer_id".to_string(),
-            ));
-        }
         let _guard = self.transition();
+        // 幂等优先：同一 sid 重复注册一律 `Ok` 且保留原记录（不校验**新入参**的身份不变量）。
         if let Some(existing) = self.sessions.get(&session.sid) {
             tracing::debug!(
                 "Session {} already registered as {}/{}; keeping the existing identity",
@@ -278,6 +295,9 @@ impl SessionManager {
             );
             return Ok(());
         }
+
+        // protocol#64 结构保证（新记录）：Computer 在房必带规范身份、Agent 不得带身份。
+        session.validate_identity_invariants(false)?;
 
         self.sessions.insert(session.sid.clone(), session.clone());
 
@@ -430,14 +450,10 @@ impl SessionManager {
             .ok_or_else(|| SessionError::NotFound(sid.clone()))?;
         let previous_office = session.office_id.clone();
 
-        // protocol#64 结构保证：Computer 会话必须有已记录的稳定身份。校验从 handler 下沉到本
-        // API——公开入口（`register_session` + `reserve_join`）不能再构造「在房但无
-        // `computer_id`」的 Computer 会话，否则 `server:list_room` 会漏掉协议 MUST 字段。
-        if session.role == ClientRole::Computer && session.computer_id.is_none() {
-            return Err(SessionError::InvalidState(
-                "computer session has no recorded computer_id".to_string(),
-            ));
-        }
+        // protocol#64 结构保证（与 `register_session` 共用同一不变量校验）：Computer 在房必带
+        // 规范身份、Agent 不得带身份、已记录值必须是规范形态。校验从 handler 下沉到本 API——
+        // 公开入口（`register_session` + `reserve_join`）不能再构造违约会话。
+        session.validate_identity_invariants(true)?;
 
         // 席位闸门：目标房该 role 的席位已被**其它会话**占据 ⇒ 4101（自会话由 Noop 分支先行短路）。
         // 判据是「每 role 一席」本身，与 name 无关（protocol#66；`(office_id, role, name)` 唯一性由
@@ -710,6 +726,43 @@ mod tests {
             .unwrap()
             .computer_id
             .is_none());
+    }
+
+    /// protocol#64：`InvalidState`（内部不变量破坏）错误码统一为 500，与 handler 口径一致。
+    #[test]
+    fn invalid_state_maps_to_internal_error() {
+        assert_eq!(
+            SessionError::InvalidState("x".to_string()).error_code(),
+            smcp::error_codes::INTERNAL_ERROR
+        );
+    }
+
+    /// `register_session` 幂等：重复注册同一 sid 一律 `Ok` 且保留原记录（即便新入参本身违约）。
+    #[test]
+    fn register_session_is_idempotent_for_existing_sid() {
+        let manager = SessionManager::new();
+        manager
+            .register_session(
+                SessionData::new("sid-dup".to_string(), "c".to_string(), ClientRole::Computer)
+                    .with_computer_id(TEST_CID),
+            )
+            .unwrap();
+
+        // 重复注册：入参是「在房但无身份」的违约 Computer，仍必须幂等 Ok（保留原记录）。
+        manager
+            .register_session(
+                SessionData::new(
+                    "sid-dup".to_string(),
+                    "other".to_string(),
+                    ClientRole::Computer,
+                )
+                .with_office_id("R1".to_string()),
+            )
+            .expect("重复注册必须幂等 Ok");
+
+        let stored = manager.get_session(&"sid-dup".to_string()).unwrap();
+        assert_eq!(stored.name, "c");
+        assert_eq!(stored.computer_id.as_deref(), Some(TEST_CID));
     }
 
     /// protocol#64 结构保证（守卫回归）：`reserve_join` 对「Computer 且无身份」回 `InvalidState`

@@ -805,13 +805,18 @@ impl SmcpHandler {
                 sid = %sid,
                 session_computer_id = ?recorded,
                 request_computer_id = ?data.computer_id,
-                "server:join_office computer_id claim mismatch with existing session: {}",
+                "server:join_office computer_id claim rejected: {}",
                 error
             );
-            return Err(Box::new(smcp::build_room_rejection_error(
-                smcp::RoomRejectionCode::Forbidden,
-                smcp::RoomRejectionContext::default(),
-            )));
+            // 错误分类：只有「同一 sid 改值」是协议语义的 `403`；其余（`InvalidState` 等内部
+            // 不变量破坏）走统一出口 ⇒ `500 Internal error`，不得伪装成身份冲突 403。
+            return Err(Box::new(match &error {
+                SessionError::ComputerIdMismatch { .. } => smcp::build_room_rejection_error(
+                    smcp::RoomRejectionCode::Forbidden,
+                    smcp::RoomRejectionContext::default(),
+                ),
+                other => Self::room_rejection(other, &data.office_id),
+            }));
         }
 
         // 刷新权威会话快照：上面的 `session` 取自**记录之前**（首次 join 时 `computer_id` 尚未写入），

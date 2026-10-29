@@ -88,7 +88,7 @@ async fn test_session_manager_utils() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     let computer2_session = SessionData::new(
@@ -96,7 +96,7 @@ async fn test_session_manager_utils() {
         "computer2".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office2".to_string());
 
     // 注册会话
@@ -146,7 +146,7 @@ async fn test_get_computer_sid_in_office() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     let computer1_office2 = SessionData::new(
@@ -154,7 +154,7 @@ async fn test_get_computer_sid_in_office() {
         "computer1".to_string(), // 相同名称，不同办公室
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office2".to_string());
 
     let computer2_office3 = SessionData::new(
@@ -162,7 +162,7 @@ async fn test_get_computer_sid_in_office() {
         "computer2".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office3".to_string());
 
     // 注册会话（每 role 一席：office1 / office2 / office3 各至多一台 Computer）
@@ -216,7 +216,7 @@ async fn test_validate_agent_in_office() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话
@@ -264,7 +264,7 @@ async fn test_get_agent_session_in_office() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话
@@ -302,7 +302,7 @@ async fn test_remove_session_from_office() {
         "test_name".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话
@@ -340,7 +340,7 @@ async fn test_update_session_office() {
         "test_name".to_string(),
         ClientRole::Computer,
     )
-    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话
