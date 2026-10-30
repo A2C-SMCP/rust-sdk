@@ -238,6 +238,94 @@ async fn test_resolve_path_relay_forwards_event_and_payload() {
     assert_eq!(forwarded["path"], "/tmp/authorized.txt");
     assert_eq!(forwarded["computer"], "computer1");
     assert_eq!(forwarded["req_id"], "rp1");
+    // PR3：转发请求必须保留 `agent`（PR1 复审遗留）。
+    assert_eq!(forwarded["agent"], "agent1");
+
+    agent.disconnect().await.unwrap();
+    computer.disconnect().await.unwrap();
+    server.shutdown();
+}
+
+/// PR3：Computer 回传的 flat `4020` 必须**逐字**透传给 Agent（code / message / details.reason；
+/// 不二次包裹、不丢字段）。
+#[tokio::test]
+async fn test_resolve_path_relay_passes_flat_4020_verbatim() {
+    let server = SmcpTestServer::start().await;
+    let server_url = server.url();
+
+    let computer = create_client_with_handler(
+        &server_url,
+        "smcp",
+        "client:resolve_path",
+        move |payload, client| {
+            Box::pin(async move {
+                let ack_id = match &payload {
+                    Payload::Text(_, ack_id) => *ack_id,
+                    #[allow(deprecated)]
+                    Payload::String(_, ack_id) => *ack_id,
+                    Payload::Binary(_, _) => None,
+                };
+                if let Some(id) = ack_id {
+                    let _ = client
+                        .ack_with_id(
+                            id,
+                            json!({
+                                "code": 4020,
+                                "message": "Path not accessible",
+                                "details": {"reason": "forbidden"}
+                            }),
+                        )
+                        .await;
+                }
+            })
+        },
+    )
+    .await;
+    join_office(&computer, Role::Computer, "office1", "computer1").await;
+
+    let agent = create_test_client(&server_url, "smcp").await;
+    sleep(Duration::from_millis(100)).await;
+    join_office(&agent, Role::Agent, "office1", "agent1").await;
+    sleep(Duration::from_millis(100)).await;
+
+    let req = ResolvePathReq {
+        base: AgentCallData {
+            agent: "agent1".to_string(),
+            req_id: ReqId("rp-4020".to_string()),
+        },
+        computer: "computer1".to_string(),
+        path: "/tmp/outside.txt".to_string(),
+    };
+    let (tx, rx) = oneshot::channel::<Value>();
+    agent
+        .emit_with_ack(
+            "client:resolve_path",
+            json!(req),
+            Duration::from_secs(5),
+            ack_to_sender(tx, |p| match p {
+                Payload::Text(mut values, _) => values.pop().unwrap_or(Value::Null),
+                _ => Value::Null,
+            }),
+        )
+        .await
+        .expect("emit resolve_path");
+    let ack = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("ack timeout")
+        .unwrap();
+    let body = ack
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(ack);
+    assert_eq!(body["code"], 4020);
+    assert_eq!(body["message"], "Path not accessible");
+    assert_eq!(body["details"]["reason"], "forbidden");
+    // 嵌套包装会被 Agent 解析成成功（#226 P0-1 同类）——此处钉死顶层 code。
+    assert!(
+        body.get("data").is_none(),
+        "flat payload must not be wrapped"
+    );
 
     agent.disconnect().await.unwrap();
     computer.disconnect().await.unwrap();
