@@ -2846,6 +2846,13 @@ mod tests {
             &landing,
             PathPlatform::Posix
         ));
+        // macOS 宿主（大小写不敏感）上 Posix 分支也折叠 `.PART`（protocol#76）。
+        #[cfg(target_os = "macos")]
+        assert!(is_protected(
+            "/landing/a.PART",
+            &landing,
+            PathPlatform::Posix
+        ));
         #[cfg(not(target_os = "macos"))]
         assert!(!is_protected(
             "/landing/a.PART",

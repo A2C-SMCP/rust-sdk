@@ -118,6 +118,9 @@ jobs:
       - name: Test path resolver lib (case sensitivity / landing / final-path)
         # macOS-only 语义（大小写不敏感卷的拒绝集/根围栏探测、landing .part）须在 macOS CI 执行
         run: cargo test -p smcp-computer --lib blob::path_resolver
+      - name: Test resolve_path conformance on case-insensitive FS
+        # #245 PR3 / protocol#76：root/.SKILLENV 等真实 FS 大小写用例须在 macOS 执行
+        run: cargo test -p smcp-computer --test resolve_path_conformance
       - uses: taiki-e/install-action@nextest
       - name: Verify default nextest entrypoint
         run: cargo nextest run -p smcp-computer --test window_enumeration_diagnostics
