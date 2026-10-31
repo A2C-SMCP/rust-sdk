@@ -2578,7 +2578,8 @@ mod tests {
             return; // 大小写敏感文件系统：本测不适用。
         }
         let roots = roots_for(tmp.path());
-        let protected = build_protected_paths(&[], Some(&landing), None, native_platform());
+        let env = isolated_env(tmp.path());
+        let protected = build_protected_paths(&[], Some(&landing), Some(&env), native_platform());
         let error = resolve_path(
             variant.to_str().unwrap(),
             &roots,
@@ -2620,8 +2621,7 @@ mod tests {
     }
 
     /// macOS 默认大小写不敏感：名称谓词在 macOS 折叠（Windows 同），`.SKILLENV` 在
-    /// step 6 即拦截。比 Python posix 分支更严（Python 在 macOS 不折叠属已知缺口，
-    /// 架构师同步 python-sdk-04）。
+    /// step 6 即拦截（与 python#245 已合入实现一致：macOS 宿主折叠）。
     #[cfg(target_os = "macos")]
     #[test]
     fn skillenv_uppercase_is_forbidden_on_macos() {
