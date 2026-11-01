@@ -34,6 +34,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-features -- -D warnings
 
+      - name: Test publish scripts (fake cargo/curl)
+        run: bash scripts/ci/publish_crate_test.sh
+
       - name: Dry-run publish (smcp)
         run: cargo publish --dry-run -p smcp
 
@@ -67,27 +70,19 @@ jobs:
       #          → smcp-server-hyper（被 smcp-agent / smcp-computer 的 dev-deps 引用，
       #            v0.3.2 曾因排在其后导致二者发布失败，CI 报绿但 crate 未上线）
       #          → smcp-agent → smcp-computer → a2c-smcp
-      # 每个 publish 步骤经 scripts/ci/publish_crate.sh 发布：只容忍 crates.io 的
-      # 「该版本已上传」类错误（重跑幂等），token/依赖/网络等其他失败一律让 job 红。
-      # wait-for-index: 每 5 秒轮询 crates.io API（须带 User-Agent，否则 crates.io 返回 403），
-      # 至多等 60 秒；超时即失败（后续 crate 依赖索引可见，静默继续会留下发布缺口）。
+      # 每个 publish 步骤经 scripts/ci/publish_crate.sh 发布：只有「crates.io 已上传消息 +
+      # API 确认该版本存在」双重成立才幂等跳过；token/依赖/网络失败一律让 job 红。
+      # 每个 publish 后经 scripts/ci/wait_for_crate.sh 等 **sparse index**（cargo 解析依赖
+      # 读取的源，而非可能领先/抖动的 crates.io API）；超时即失败。最后一个 a2c-smcp 无下游
+      # 依赖，无需等待。
       # 1. 基础协议层（无内部依赖）
       - name: Publish smcp
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/ci/publish_crate.sh smcp
 
-      - name: Wait for crates.io index (smcp)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="smcp") | .version')
-          for i in $(seq 1 12); do
-            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/smcp/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
-              echo "smcp@$VERSION is indexed"; exit 0
-            fi
-            echo "Waiting for smcp@$VERSION... (${i}/12)"; sleep 5
-          done
-          echo "::error::Timed out waiting for smcp@$VERSION in the crates.io index" >&2
-          exit 1
+      - name: Wait for smcp in crates.io index
+        run: bash scripts/ci/wait_for_crate.sh smcp
 
       # 1b. 客户端传输层（仅依赖 smcp；被 smcp-agent / smcp-computer 依赖——v0.2.2 新增 crate #22，
       #      此前漏配导致 smcp-agent/computer/a2c-smcp 发布失败）
@@ -96,17 +91,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/ci/publish_crate.sh smcp-client-transport
 
-      - name: Wait for crates.io index (smcp-client-transport)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="smcp-client-transport") | .version')
-          for i in $(seq 1 12); do
-            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/smcp-client-transport/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
-              echo "smcp-client-transport@$VERSION is indexed"; exit 0
-            fi
-            echo "Waiting for smcp-client-transport@$VERSION... (${i}/12)"; sleep 5
-          done
-          echo "::error::Timed out waiting for smcp-client-transport@$VERSION in the crates.io index" >&2
-          exit 1
+      - name: Wait for smcp-client-transport in crates.io index
+        run: bash scripts/ci/wait_for_crate.sh smcp-client-transport
 
       # 2. 依赖 smcp 的 crate，且被其他 crate dev-deps 引用
       - name: Publish smcp-server-core
@@ -114,17 +100,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/ci/publish_crate.sh smcp-server-core
 
-      - name: Wait for crates.io index (smcp-server-core)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="smcp-server-core") | .version')
-          for i in $(seq 1 12); do
-            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/smcp-server-core/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
-              echo "smcp-server-core@$VERSION is indexed"; exit 0
-            fi
-            echo "Waiting for smcp-server-core@$VERSION... (${i}/12)"; sleep 5
-          done
-          echo "::error::Timed out waiting for smcp-server-core@$VERSION in the crates.io index" >&2
-          exit 1
+      - name: Wait for smcp-server-core in crates.io index
+        run: bash scripts/ci/wait_for_crate.sh smcp-server-core
 
       # 2b. HTTP 承载层（依赖 smcp；被 smcp-agent / smcp-computer dev-deps 引用——
       #      v0.3.2 曾因排在它们之后导致发布失败）
@@ -133,17 +110,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/ci/publish_crate.sh smcp-server-hyper
 
-      - name: Wait for crates.io index (smcp-server-hyper)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="smcp-server-hyper") | .version')
-          for i in $(seq 1 12); do
-            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/smcp-server-hyper/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
-              echo "smcp-server-hyper@$VERSION is indexed"; exit 0
-            fi
-            echo "Waiting for smcp-server-hyper@$VERSION... (${i}/12)"; sleep 5
-          done
-          echo "::error::Timed out waiting for smcp-server-hyper@$VERSION in the crates.io index" >&2
-          exit 1
+      - name: Wait for smcp-server-hyper in crates.io index
+        run: bash scripts/ci/wait_for_crate.sh smcp-server-hyper
 
       # 3. 依赖 smcp + smcp-server-hyper，dev-deps 依赖 smcp-server-core
       - name: Publish smcp-agent
@@ -151,17 +119,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/ci/publish_crate.sh smcp-agent
 
-      - name: Wait for crates.io index (smcp-agent)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="smcp-agent") | .version')
-          for i in $(seq 1 12); do
-            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/smcp-agent/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
-              echo "smcp-agent@$VERSION is indexed"; exit 0
-            fi
-            echo "Waiting for smcp-agent@$VERSION... (${i}/12)"; sleep 5
-          done
-          echo "::error::Timed out waiting for smcp-agent@$VERSION in the crates.io index" >&2
-          exit 1
+      - name: Wait for smcp-agent in crates.io index
+        run: bash scripts/ci/wait_for_crate.sh smcp-agent
 
       # 4. 依赖 smcp + rmcp，dev-deps 依赖 smcp-server-core / smcp-server-hyper
       - name: Publish smcp-computer
@@ -169,35 +128,14 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/ci/publish_crate.sh smcp-computer
 
-      - name: Wait for crates.io index (smcp-computer)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="smcp-computer") | .version')
-          for i in $(seq 1 12); do
-            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/smcp-computer/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
-              echo "smcp-computer@$VERSION is indexed"; exit 0
-            fi
-            echo "Waiting for smcp-computer@$VERSION... (${i}/12)"; sleep 5
-          done
-          echo "::error::Timed out waiting for smcp-computer@$VERSION in the crates.io index" >&2
-          exit 1
+      - name: Wait for smcp-computer in crates.io index
+        run: bash scripts/ci/wait_for_crate.sh smcp-computer
 
-      # 5. 主包 (re-export 所有组件)
+      # 5. 主包 (re-export 所有组件；无下游依赖，不等待索引)
       - name: Publish a2c-smcp
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/ci/publish_crate.sh a2c-smcp
-
-      - name: Wait for crates.io index (a2c-smcp)
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="a2c-smcp") | .version')
-          for i in $(seq 1 12); do
-            if curl -s -H "User-Agent: a2c-smcp-publish" "https://crates.io/api/v1/crates/a2c-smcp/$VERSION" | jq -e '.version' > /dev/null 2>&1; then
-              echo "a2c-smcp@$VERSION is indexed"; exit 0
-            fi
-            echo "Waiting for a2c-smcp@$VERSION... (${i}/12)"; sleep 5
-          done
-          echo "::error::Timed out waiting for a2c-smcp@$VERSION in the crates.io index" >&2
-          exit 1
 
       # rust-cache 的 post-save 会遍历 target/package/**（cargo package 暂存区，
       # 含已剔除的 tests/target、tests/trybuild 目录）→ 每版 12 条 ENOENT 红 annotation。
