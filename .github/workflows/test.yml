@@ -46,8 +46,15 @@ jobs:
           fi
           awk '/^\[[[:space:]]*resolver([[:space:]]*\.|[[:space:]]*\])/ {on=1} /^\[/ && $0 !~ /^\[[[:space:]]*resolver([[:space:]]*\.|[[:space:]]*\])/ {on=0} on && /^[[:space:]]*incompatible-rust-versions[[:space:]]*=[[:space:]]*"fallback"/ {f=1} END {exit f?0:1}' .cargo/config.toml
 
-      - name: Clippy (workspace)
-        run: cargo clippy --workspace --features agent,computer,server -- -D warnings
+      # 与 publish.yml validate 同口径（--all-features 才启用 smcp-computer/cli 等特性）：
+      # 发布门禁才能发现的 clippy 错误（如 #258 的 question_mark）在 PR 阶段即拦截。
+      - name: Clippy (workspace, all features)
+        run: cargo clippy --workspace --all-features -- -D warnings
+
+      # 发布脚本的假 cargo/curl 回归（秒级）：幂等判定/checksum/yanked/sparse 路径，
+      # 不要只在 release 的 publish validate 才暴露。
+      - name: Test publish scripts (fake cargo/curl)
+        run: bash scripts/ci/publish_crate_test.sh
 
       - name: Build
         run: cargo build --workspace --features agent,computer,server
