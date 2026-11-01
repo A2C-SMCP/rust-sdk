@@ -51,6 +51,11 @@ jobs:
       - name: Clippy (workspace, all features)
         run: cargo clippy --workspace --all-features -- -D warnings
 
+      # 发布脚本的假 cargo/curl 回归（秒级）：幂等判定/checksum/yanked/sparse 路径，
+      # 不要只在 release 的 publish validate 才暴露。
+      - name: Test publish scripts (fake cargo/curl)
+        run: bash scripts/ci/publish_crate_test.sh
+
       - name: Build
         run: cargo build --workspace --features agent,computer,server
 

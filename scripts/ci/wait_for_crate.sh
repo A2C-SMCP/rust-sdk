@@ -26,15 +26,18 @@ fi
 # sparse index 路径规则（https://index.crates.io/）：
 #   1 字符 → 1/<name>；2 字符 → 2/<name>；3 字符 → 3/<first>/<name>；
 #   ≥4 字符 → <first2>/<next2>/<name>。
-name_len=${#crate}
+# 路径必须**小写**（实测混合大小写路径返回 404；cargo 解析依赖同样走小写）；
+# 版本查询仍用 cargo metadata 里的原名。
+crate_path=$(printf '%s' "$crate" | tr '[:upper:]' '[:lower:]')
+name_len=${#crate_path}
 if (( name_len == 1 )); then
-  path="1/${crate}"
+  path="1/${crate_path}"
 elif (( name_len == 2 )); then
-  path="2/${crate}"
+  path="2/${crate_path}"
 elif (( name_len == 3 )); then
-  path="3/${crate:0:1}/${crate}"
+  path="3/${crate_path:0:1}/${crate_path}"
 else
-  path="${crate:0:2}/${crate:2:2}/${crate}"
+  path="${crate_path:0:2}/${crate_path:2:2}/${crate_path}"
 fi
 url="https://index.crates.io/${path}"
 
