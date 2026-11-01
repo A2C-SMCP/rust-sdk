@@ -1059,9 +1059,8 @@ impl CommandHandler {
     async fn current_office_intent(&self) -> Option<String> {
         let socketio = self.computer.get_socketio_client();
         let guard = socketio.read().await;
-        let Some(client) = guard.as_ref() else {
-            return None;
-        };
+        // 未连接 ⇒ 无意图（`?` 从 `Option` 函数返回 `None`，与 let-else 语义一致）。
+        let client = guard.as_ref()?;
         match client.get_office_id().await {
             Some(office) => Some(office),
             None => client.get_desired_office_id().await,
