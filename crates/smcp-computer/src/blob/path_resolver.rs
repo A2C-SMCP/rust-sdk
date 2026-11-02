@@ -763,24 +763,36 @@ fn map_pull_error(error: PathResolveError) -> BlobHandleError {
     }
 }
 
+/// 仅服务**固定拒绝集**的目录前缀判定（protocol#76）。
+///
+/// Windows + macOS：大小写不敏感（`to_lowercase`，与既有名称谓词 / `skills::sandbox` 一致）；
+/// 其余平台保持码点。**不**用于 readRoots 围栏——后者 MUST 保持码点（[`path_within_root`]）。
+fn protected_path_within(path: &str, root: &str, fold: bool) -> bool {
+    if !fold {
+        return path_within_root(path, root);
+    }
+    path_within_root(&path.to_lowercase(), &root.to_lowercase())
+}
+
 /// 固定拒绝集判定（含 `.skillenv` / landing `.part`）。
 ///
-/// 前缀比较按**码点**（协议基准）：拒绝集预置配置/realpath/磁盘 canonical 三种形态，
-/// step-8 最终路径为磁盘形态，可码点匹配。名称谓词在 **Windows + macOS** 折叠
-/// （`to_lowercase`，与 `skills::sandbox` / Python Windows casefold 一致）；Linux（大小写
-/// 敏感）保持码点，避免把普通 `.SKILLENV` 误判为受保护。macOS 比 Python posix 分支更严：
-/// Python 在 macOS 不折叠属已知缺口（架构师同步 python-sdk-04）。
+/// protocol#76：拒绝集的**名称判定与目录判定**在 **Windows + macOS** 均大小写不敏感
+/// （`to_lowercase`；与 Python `casefold` 的常见路径一致）；Linux（大小写敏感）保持码点，
+/// 避免把普通 `.SKILLENV` / `.TFROBOT` 误判为受保护。step 6 目录变体因此直接命中
+/// `protected_set`，不再依赖 step-8 磁盘形态兜底。
+///
+/// readRoots 围栏**不**折叠（协议要求码点比较，见 [`path_within_root`]）。
 fn is_protected(canonical_path: &str, protected: &ProtectedPaths, platform: PathPlatform) -> bool {
+    let fold = platform == PathPlatform::Windows || cfg!(target_os = "macos");
     if protected
         .paths
         .iter()
-        .any(|entry| path_within_root(canonical_path, entry))
+        .any(|entry| protected_path_within(canonical_path, entry, fold))
     {
         return true;
     }
     let raw_name = canonical_path.rsplit('/').next().unwrap_or(canonical_path);
-    let fold_names = platform == PathPlatform::Windows || cfg!(target_os = "macos");
-    let name = if fold_names {
+    let name = if fold {
         raw_name.to_lowercase()
     } else {
         raw_name.to_string()
@@ -789,7 +801,7 @@ fn is_protected(canonical_path: &str, protected: &ProtectedPaths, platform: Path
         return true;
     }
     if let Some(landing) = protected.landing_root.as_deref() {
-        if path_within_root(canonical_path, landing) && name.ends_with(".part") {
+        if protected_path_within(canonical_path, landing, fold) && name.ends_with(".part") {
             return true;
         }
     }
@@ -2489,11 +2501,11 @@ mod tests {
         assert_eq!(pulled.sha256, third.sha256);
     }
 
-    /// macOS 默认大小写不敏感：`.CONFIG` 变体在 step 6（请求拼写）不命中，由 step-8
-    /// 最终路径（磁盘形态）与拒绝集磁盘 canonical 形态匹配拦截。
+    /// macOS 默认大小写不敏感：`.CONFIG` 目录变体在 step 6 即按**折叠前缀**命中
+    /// `protected_set`（protocol#76），不再依赖 step-8 磁盘形态兜底。
     #[cfg(target_os = "macos")]
     #[test]
-    fn protected_prefix_case_variant_forbidden_via_disk_snapshot() {
+    fn protected_prefix_case_variant_forbidden_at_protected_set() {
         let tmp = TempDir::new().unwrap();
         let secret_dir = tmp.path().join("config");
         fs::create_dir(&secret_dir).unwrap();
@@ -2519,7 +2531,64 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.reason, ResolveReason::Forbidden);
-        assert_eq!(error.stage, "final_path_recheck");
+        assert_eq!(error.stage, "protected_set", "{error:?}");
+    }
+
+    /// macOS 真实 FS：`.TFROBOT` 目录变体命中拒绝集（protocol#76；与 python#245 对拍形态）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tfrobot_directory_case_variant_is_forbidden_at_protected_set() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join(".tfrobot");
+        fs::create_dir(&config_dir).unwrap();
+        write_file(&config_dir, "settings.json", b"{}");
+        let variant = tmp.path().join(".TFROBOT/settings.json");
+        if fs::metadata(&variant).is_err() {
+            return; // 大小写敏感文件系统：本测不适用。
+        }
+        let roots = roots_for(tmp.path());
+        let env = isolated_env(tmp.path());
+        let protected = build_protected_paths(
+            std::slice::from_ref(&config_dir),
+            None,
+            Some(&env),
+            native_platform(),
+        );
+        let error = resolve_path(
+            variant.to_str().unwrap(),
+            &roots,
+            &protected,
+            native_platform(),
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set", "{error:?}");
+    }
+
+    /// macOS 真实 FS：landing 目录大小写变体 + `.PART` → `protected_set`。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn landing_case_variant_part_is_forbidden_at_protected_set() {
+        let tmp = TempDir::new().unwrap();
+        let landing = tmp.path().join("landing");
+        fs::create_dir(&landing).unwrap();
+        write_file(&landing, "upload.part", b"partial");
+        let variant = tmp.path().join("LANDING/upload.part");
+        if fs::metadata(&variant).is_err() {
+            return; // 大小写敏感文件系统：本测不适用。
+        }
+        let roots = roots_for(tmp.path());
+        let env = isolated_env(tmp.path());
+        let protected = build_protected_paths(&[], Some(&landing), Some(&env), native_platform());
+        let error = resolve_path(
+            variant.to_str().unwrap(),
+            &roots,
+            &protected,
+            native_platform(),
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set", "{error:?}");
     }
 
     #[test]
@@ -2552,8 +2621,7 @@ mod tests {
     }
 
     /// macOS 默认大小写不敏感：名称谓词在 macOS 折叠（Windows 同），`.SKILLENV` 在
-    /// step 6 即拦截。比 Python posix 分支更严（Python 在 macOS 不折叠属已知缺口，
-    /// 架构师同步 python-sdk-04）。
+    /// step 6 即拦截（与 python#245 已合入实现一致：macOS 宿主折叠）。
     #[cfg(target_os = "macos")]
     #[test]
     fn skillenv_uppercase_is_forbidden_on_macos() {
@@ -2864,6 +2932,88 @@ mod tests {
             &landing,
             PathPlatform::Windows
         ));
+    }
+
+    /// protocol#76：拒绝集的**目录前缀**在 Windows + macOS 折叠、Linux 码点；
+    /// 组件前缀语义不变（`/repo/conf` 不包含 `/repo/config`）。
+    #[test]
+    fn protected_prefix_folding_is_platform_gated() {
+        let protected = ProtectedPaths {
+            paths: vec!["/repo/config".to_string()],
+            ..Default::default()
+        };
+        assert!(is_protected(
+            "/REPO/CONFIG/x",
+            &protected,
+            PathPlatform::Windows
+        ));
+        assert!(is_protected(
+            "/repo/config/x",
+            &protected,
+            PathPlatform::Windows
+        ));
+        assert!(!is_protected(
+            "/repo/conf/x",
+            &protected,
+            PathPlatform::Windows
+        ));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!is_protected(
+            "/REPO/CONFIG/x",
+            &protected,
+            PathPlatform::Posix
+        ));
+        #[cfg(target_os = "macos")]
+        assert!(is_protected(
+            "/REPO/CONFIG/x",
+            &protected,
+            PathPlatform::Posix
+        ));
+
+        let landing = ProtectedPaths {
+            landing_root: Some("/landing".to_string()),
+            ..Default::default()
+        };
+        assert!(is_protected(
+            "/LANDING/a.PART",
+            &landing,
+            PathPlatform::Windows
+        ));
+        assert!(is_protected(
+            "/landing/a.part",
+            &landing,
+            PathPlatform::Windows
+        ));
+        assert!(!is_protected(
+            "/other/a.PART",
+            &landing,
+            PathPlatform::Windows
+        ));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!is_protected(
+            "/LANDING/a.PART",
+            &landing,
+            PathPlatform::Posix
+        ));
+        #[cfg(target_os = "macos")]
+        assert!(is_protected(
+            "/LANDING/a.PART",
+            &landing,
+            PathPlatform::Posix
+        ));
+    }
+
+    /// 反向：readRoots 围栏 MUST 保持码点（不得因拒绝集折叠而全局折叠）。
+    #[test]
+    fn read_roots_fence_remains_code_point() {
+        assert!(!path_within_root("/Repo/x", "/repo"));
+        let roots = vec![ReadRoot {
+            configured: "/repo".to_string(),
+            real: Some("/repo".to_string()),
+            disk: None,
+        }];
+        assert!(!lexical_fence("/Repo/x", &roots));
+        assert!(!realpath_fence("/Repo/x", &roots));
     }
 
     /// macOS 大小写不敏感卷：protected/landing 的**磁盘 canonical 形态**必须入集，
