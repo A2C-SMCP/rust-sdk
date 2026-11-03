@@ -1,9 +1,9 @@
 //! #245 / #248：`readRoots` 写入期清理的共享 raw 助手。
 //!
-//! 本模块服务于**已迁移**的 writer：installer（锁内 no-op / 真写）、CLI `settings set/edit`
-//! （持锁或复用 [`drop_read_roots_from_file`]）以及 flag 诊断的原始文件读取。写入只删除
-//! `readRoots` 这一个键，不回写校验视图（避免静默删除 landingRoot / enabledMcpjsonServers /
-//! 非法 permissions 等被过滤字段）。
+//! 本模块服务于**已迁移**的 writer 与 raw 读取方：installer（锁内 no-op / 真写）、CLI
+//! `settings set/edit`（持锁或复用 [`drop_read_roots_from_file`]），以及 installer / CLI 对原始
+//! 文件的读取（[`read_raw_map`]）。写入只删除 `readRoots` 这一个键，不回写校验视图（避免静默删除
+//! landingRoot / enabledMcpjsonServers / 非法 permissions 等被过滤字段）。
 //!
 //! 其它 writer（config executor / marketplace / mcp_config）仍各自处理校验视图；统一收口见架构师
 //! follow-up Issue，本模块**不**声称覆盖全部写路径。

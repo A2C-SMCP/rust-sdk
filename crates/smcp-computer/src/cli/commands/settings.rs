@@ -177,8 +177,6 @@ pub fn settings_show(
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
     }
-    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
-    super::warn_flag_scope_diagnostics_for(scope, flag_path);
     print_json(&Value::Object(data));
     EXIT_OK
 }
@@ -213,8 +211,6 @@ pub fn settings_get(
     for line in super::format_settings_errors(&errors) {
         eprintln!("{line}");
     }
-    // #248：flag 层 readRoots / landingRoot 运行期不生效——响亮诊断（stderr，含 merged 视图）。
-    super::warn_flag_scope_diagnostics_for(scope, flag_path);
     let Some(value) = data.get(key) else {
         return err(
             &format!("key {key:?} not set in scope {scope:?}"),

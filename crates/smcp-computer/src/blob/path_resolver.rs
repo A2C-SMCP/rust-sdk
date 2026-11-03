@@ -179,30 +179,36 @@ pub fn realpath_fence(canonical: &str, roots: &[ReadRoot]) -> bool {
 /// 从五层合并 settings 取 `readRoots` 并编译（每次现读，不缓存）。
 /// Read the merged `readRoots` from settings and compile it (no caching).
 ///
-/// # flag scope（**有意分叉**，跟进 rust-sdk#248）
-///
-/// `flag_settings_path` 恒 `None`：rust `Computer` 是库组件，运行态不持有 CLI `--settings <file>` 路径
-/// （与 `Computer::landing_root` 同款）。因此 flag 层声明的 `readRoots` 在 CLI `settings show` 可见、
-/// 运行期不生效——这是 SDK 级差异而非静默忽略（见 rust-sdk#248）。
+/// `flag_settings_path` 为 CLI `--settings <file>` / 宿主注入的 flag 层 settings 路径（`None` = 无
+/// flag 层）。flag 是 `readRoots` 的受信 scope（protocol#65，`landingRoot` 同款），与
+/// user / local / policy 按既有合并语义共同生效：数组（`readRoots`）按低→高**拼接去重**、标量
+/// （`landingRoot`）高 scope 覆盖；scope 序 flag 次高（仅低于 policy）。`project` 供给仍被
+/// `TRUSTED_SCOPE_ONLY_FIELDS` 整字段拒绝（rust-sdk#248）。
 ///
 /// settings 可能被原子重写，故调用方每次请求应重新调用。
-pub fn resolve_read_roots(config_dir: &Path, env: Option<&EnvMap>) -> Vec<ReadRoot> {
-    resolve_read_roots_and_landing_root(config_dir, env).0
+pub fn resolve_read_roots(
+    config_dir: &Path,
+    env: Option<&EnvMap>,
+    flag_settings_path: Option<&Path>,
+) -> Vec<ReadRoot> {
+    resolve_read_roots_and_landing_root(config_dir, env, flag_settings_path).0
 }
 
 /// 一次 settings 解析同时得到 `readRoots` 与 `landingRoot`（供 Computer 每请求策略装配）。
 ///
 /// `landingRoot` 的 `~` 展开与 `Computer::landing_root` 同源（`expand_home`）；空值 / 非字符串 →
-/// `None`。合并解析避免每个 resolve / 每个 get_blob 分块重复跑两遍声明层与 policy 探测。
+/// `None`。`flag_settings_path` 语义同 [`resolve_read_roots`]——flag 层的 `landingRoot` 一并生效
+/// （rust-sdk#248）。合并解析避免每个 resolve / 每个 get_blob 分块重复跑两遍声明层与 policy 探测。
 pub fn resolve_read_roots_and_landing_root(
     config_dir: &Path,
     env: Option<&EnvMap>,
+    flag_settings_path: Option<&Path>,
 ) -> (Vec<ReadRoot>, Option<PathBuf>) {
     let policy = resolve_policy_settings(None, None, None);
     let resolved = resolve_settings(ResolveSettingsArgs {
         cwd: Some(config_dir),
         env,
-        flag_settings_path: None,
+        flag_settings_path,
         policy_settings: Some(&policy),
     });
     let raw: Vec<String> = resolved
@@ -1269,7 +1275,7 @@ mod tests {
             "XDG_CONFIG_HOME".to_string(),
             temp.path().to_str().unwrap().to_string(),
         );
-        let roots = resolve_read_roots(temp.path(), Some(&env));
+        let roots = resolve_read_roots(temp.path(), Some(&env), None);
         // `configured` 是 canonical 形态（Windows 宿主为 `/C:/...`），不能与原生串直接比。
         let expected = normalize_path(share.to_str().unwrap(), native_platform()).unwrap();
         assert!(
@@ -1435,7 +1441,7 @@ mod tests {
             "XDG_CONFIG_HOME".to_string(),
             temp.path().to_str().unwrap().to_string(),
         );
-        let roots = resolve_read_roots(&wd, Some(&env));
+        let roots = resolve_read_roots(&wd, Some(&env), None);
         let configured: Vec<String> = roots.iter().map(|root| root.configured.clone()).collect();
         let a_norm = normalize_path(a_s, native_platform()).unwrap();
         let b_norm = normalize_path(b_s, native_platform()).unwrap();
@@ -1456,6 +1462,123 @@ mod tests {
             configured.iter().filter(|root| **root == a_norm).count(),
             1,
             "跨 scope 去重：{configured:?}"
+        );
+    }
+
+    /// #248：flag 层（`--settings`）是 `readRoots` 的受信 scope——可见（数组按低→高拼接去重，
+    /// user 根保留）、project 仍拒、非法项照常丢弃。
+    #[test]
+    fn resolve_read_roots_reads_flag_scope_and_drops_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_dir = temp.path().join("a2c");
+        fs::create_dir_all(&user_dir).unwrap();
+        let wd = temp.path().join("wd");
+        fs::create_dir_all(wd.join(".tfrobot")).unwrap();
+        let user_root = temp.path().join("user-root");
+        let flag_root = temp.path().join("flag-root");
+        let evil = temp.path().join("evil");
+        for dir in [&user_root, &flag_root, &evil] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            user_dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "readRoots": [user_root.to_str().unwrap()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // project scope：协议 MUST 不生效（即使 flag 层同时存在）。
+        fs::write(
+            wd.join(".tfrobot").join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "readRoots": [evil.to_str().unwrap()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let flag = temp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::to_vec(&serde_json::json!({
+                "readRoots": [flag_root.to_str().unwrap(), "relative/ignored"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut env: EnvMap = std::collections::HashMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            temp.path().to_str().unwrap().to_string(),
+        );
+        let roots = resolve_read_roots(&wd, Some(&env), Some(&flag));
+        let configured: Vec<String> = roots.iter().map(|root| root.configured.clone()).collect();
+        let flag_norm = normalize_path(flag_root.to_str().unwrap(), native_platform()).unwrap();
+        let user_norm = normalize_path(user_root.to_str().unwrap(), native_platform()).unwrap();
+        let evil_norm = normalize_path(evil.to_str().unwrap(), native_platform()).unwrap();
+        assert!(
+            configured.contains(&flag_norm),
+            "flag scope root 须生效：{configured:?}"
+        );
+        assert!(
+            configured.contains(&user_norm),
+            "数组读合并为拼接去重（user 根保留，flag 追加）：{configured:?}"
+        );
+        assert!(
+            !configured.contains(&evil_norm),
+            "flag 存在时 project scope root 仍 MUST 不生效：{configured:?}"
+        );
+        assert!(
+            !configured.iter().any(|root| root == "relative/ignored"),
+            "非法项照常丢弃：{configured:?}"
+        );
+    }
+
+    /// #248：flag 层 `landingRoot` 与 `readRoots` 同一解析路径生效；标量按高 scope 覆盖
+    /// （flag 次高 > user）。
+    #[test]
+    fn resolve_landing_root_reads_flag_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let wd = temp.path().join("wd");
+        fs::create_dir_all(&wd).unwrap();
+        let user_dir = temp.path().join("a2c");
+        fs::create_dir_all(&user_dir).unwrap();
+        let landing = temp.path().join("landing");
+        let user_landing = temp.path().join("user-landing");
+        for dir in [&landing, &user_landing] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            user_dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "landingRoot": user_landing.to_str().unwrap()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let flag = temp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::to_vec(&serde_json::json!({
+                "landingRoot": landing.to_str().unwrap()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut env: EnvMap = std::collections::HashMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            temp.path().to_str().unwrap().to_string(),
+        );
+        let (roots, landing_root) =
+            resolve_read_roots_and_landing_root(&wd, Some(&env), Some(&flag));
+        assert!(roots.is_empty(), "未配置 readRoots：{roots:?}");
+        assert_eq!(
+            landing_root.as_deref(),
+            Some(landing.as_path()),
+            "flag 层 landingRoot 须生效，且标量高 scope 覆盖 user"
         );
     }
 
