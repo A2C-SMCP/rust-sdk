@@ -1179,6 +1179,21 @@ mod tests {
     }
 
     #[test]
+    fn revoke_trust_refuses_corrupt_and_non_array_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = trust_path(&env);
+        write_trust_file(&path, "{not json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(revoke_trust("a", Some(&env)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        write_trust_file(&path, r#"{"trustedMarketplaces":"skills"}"#);
+        let before = std::fs::read(&path).unwrap();
+        assert!(revoke_trust("a", Some(&env)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn revoke_trust_repeat_is_noop_253() {
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());

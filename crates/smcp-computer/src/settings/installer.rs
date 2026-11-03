@@ -287,9 +287,9 @@ fn apply_enabled_plugin_write(
     env: Option<&EnvMap>,
 ) -> Result<bool, PluginInstallError> {
     let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
-    // #253：strict raw RMW（共享 helper）——corrupt fail-closed、只改 enabledPlugins[pid]、
-    // project scope 顺带清 readRoots；返回的 `changed` 仍是「enabledPlugins 内容真变」，
-    // 供 Computer 层只在真变时 bump config revision（#115 R1，方案 A）。
+    // #253：strict raw RMW（共享 helper）——corrupt fail-closed、只改 enabledPlugins[pid]；
+    // project scope 的 readRoots 保留 + WARN（A+，不主动删除）。返回的 `changed` 仍是
+    // 「enabledPlugins 内容真变」，供 Computer 层只在真变时 bump config revision（#115 R1，方案 A）。
     let outcome =
         raw_write::update_raw_settings(&path, scope_enum == SettingsScope::Project, |map| {
             let plugins = raw_write::object_field_mut(map, FIELD_ENABLED_PLUGINS, &path)?;
@@ -321,8 +321,7 @@ fn write_enabled_plugin(
 ///
 /// 清除后避免「uninstall → reinstall」残留 `true` 令新装绕过 `installed_disabled` 直接激活。**仅当该键实际存在
 /// 才写盘**——从未 enable 的 plugin 卸载时不触碰 settings.json（保 Computer 层 `env=None` 卸载对 `~/.config`
-/// 无副作用，见 computer.rs enabledPlugins 测试约定）。唯一例外：project scope 残留旧 `readRoots` 时顺带
-/// 做 raw 保真清理（#245）。
+/// 无副作用，见 computer.rs enabledPlugins 测试约定）。project scope 的 `readRoots` 保留 + WARN（A+）。
 fn clear_enabled_plugin(
     plugin_id: &str,
     scope: &str,
@@ -331,7 +330,7 @@ fn clear_enabled_plugin(
 ) -> Result<(), PluginInstallError> {
     let (path, scope_enum) = settings_path_for_scope(scope, project_path, env)?;
     // #253：strict raw RMW；enabledPlugins 容器畸形 → fail-closed（不再静默覆盖）。
-    // 键不存在 / 从未 enable → 不触碰 settings.json（除 project readRoots 清理）。
+    // 键不存在 / 从未 enable → 不触碰 settings.json；project readRoots 保留 + WARN（A+）。
     raw_write::update_raw_settings(&path, scope_enum == SettingsScope::Project, |map| {
         let Some(plugins) = raw_write::object_field_opt_mut(map, FIELD_ENABLED_PLUGINS, &path)?
         else {
@@ -2132,9 +2131,8 @@ mod tests {
     }
 
     #[test]
-    fn project_enable_noop_cleans_existing_read_roots() {
-        // #245：no-op 分支的清理必须 **raw 保真**——只删 readRoots，不得把校验视图整文件回写
-        // （否则会静默删除 project landingRoot / enabledMcpjsonServers / 非法 permissions 等被过滤字段）。
+    fn project_enable_noop_preserves_read_roots_253() {
+        // A+：project scope 写入保留 readRoots（不主动删除）；同值写 → 完全 no-op（不扰盘）。
         let tmp = TempDir::new().unwrap();
         let wd = tmp.path().join("wd");
         let path = workdir_project_settings_path(&wd);
@@ -2151,10 +2149,21 @@ mod tests {
             }"#,
         )
         .unwrap();
+        let before = fs::read(&path).unwrap();
+        let before_mtime = fs::metadata(&path).unwrap().modified().unwrap();
         let changed = write_enabled_plugin("a@mp", true, "project", wd.to_str(), None).unwrap();
         assert!(!changed, "同值写 → enabledPlugins 无变化");
+        assert_eq!(fs::read(&path).unwrap(), before, "no-op 不得重写");
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            before_mtime
+        );
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(
+            saved["readRoots"],
+            serde_json::json!(["/data"]),
+            "A+：readRoots 必须保留"
+        );
         // 其他字段（含被校验过滤的 project 字段）原值保留。
         assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
         assert_eq!(saved["enabledMcpjsonServers"], serde_json::json!(["srv"]));
@@ -2164,7 +2173,7 @@ mod tests {
         );
         assert_eq!(saved["keepUnknown"], serde_json::json!({"k": 1}));
         assert_eq!(saved["enabledPlugins"]["a@mp"], serde_json::json!(true));
-        // 幂等：再次 enable 无 readRoots、无改动。
+        // 幂等：再次 enable 无改动。
         assert!(!write_enabled_plugin("a@mp", true, "project", wd.to_str(), None).unwrap());
     }
 
@@ -2189,7 +2198,11 @@ mod tests {
         let changed = write_enabled_plugin("new@mp", true, "project", wd.to_str(), None).unwrap();
         assert!(changed, "enabledPlugins 缺目标键 → 真写盘");
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(
+            saved["readRoots"],
+            serde_json::json!(["/data"]),
+            "A+：readRoots 必须保留"
+        );
         assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
         assert_eq!(saved["enabledMcpjsonServers"], serde_json::json!(["srv"]));
         assert_eq!(
@@ -2213,7 +2226,11 @@ mod tests {
         .unwrap();
         clear_enabled_plugin("a@mp", "project", wd.to_str(), None).unwrap();
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(
+            saved["readRoots"],
+            serde_json::json!(["/data"]),
+            "A+：readRoots 必须保留"
+        );
         assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
         assert!(saved["enabledPlugins"].get("a@mp").is_none(), "{saved}");
     }
@@ -2231,7 +2248,11 @@ mod tests {
         .unwrap();
         set_enabled_true_if_absent("a@mp", "project", wd.to_str(), None).unwrap();
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(
+            saved["readRoots"],
+            serde_json::json!(["/data"]),
+            "A+：readRoots 必须保留"
+        );
         assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
         assert_eq!(saved["enabledPlugins"]["a@mp"], serde_json::json!(true));
     }

@@ -96,7 +96,8 @@ fn set_same_value_is_noop_and_does_not_touch_file() {
 }
 
 #[test]
-fn set_preserves_project_filtered_fields_and_strips_read_roots() {
+fn set_preserves_project_filtered_fields_and_read_roots_with_warning_253() {
+    // A+：project scope readRoots 保留 + WARN（stderr），其余被过滤字段原样保留。
     let dir = tempdir().unwrap();
     let path = project_settings(dir.path());
     fs::write(
@@ -113,11 +114,20 @@ fn set_preserves_project_filtered_fields_and_strips_read_roots() {
 
     let output = run_set(dir.path(), "maxConcurrency", "7", "project");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stdout={stdout}");
+    assert!(
+        stderr.contains("readRoots") && stderr.contains("preserved"),
+        "stderr must warn that readRoots is preserved/ignored; stderr={stderr}"
+    );
 
     let saved: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    assert!(saved.get("readRoots").is_none(), "{saved}");
+    assert_eq!(
+        saved["readRoots"],
+        serde_json::json!(["/data"]),
+        "A+：readRoots 必须保留"
+    );
     assert_eq!(saved["landingRoot"], serde_json::json!("/landing"));
     assert_eq!(saved["enabledMcpjsonServers"], serde_json::json!(["srv"]));
     assert_eq!(

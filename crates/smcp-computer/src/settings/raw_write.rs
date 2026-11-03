@@ -1,14 +1,15 @@
 //! #253：settings 文件 strict raw RMW（读原始 JSON、只改目标键、corrupt fail-closed）共享助手。
 //!
-//! 与 [`read_roots::read_raw_map`](super::read_roots::read_raw_map)（宽容读，供 #248 flag 诊断与
-//! `settings edit` 收尾清理）分离：本模块的读**区分缺失与损坏**——缺失/空文件按空对象起步；畸形 JSON
-//! 或根非对象返回 [`RawWriteError::Corrupt`]，调用方必须**拒绝写盘、保留原文件逐字节不变**。
+//! 与 [`read_roots::read_raw_map`](super::read_roots::read_raw_map)（宽容读，仅供 `settings edit`
+//! 写后 WARN 判断）分离：
+//! 本模块的读**区分缺失与损坏**——缺失/空文件按空对象起步；畸形 JSON 或根非对象返回
+//! [`RawWriteError::Corrupt`]，调用方必须**拒绝写盘、保留原文件逐字节不变**。
 //!
 //! 写入语义：
 //! - 锁内 read → mutate → compare → write；`mutate` 返回 Err ⇒ 零写盘。
-//! - `changed` = mutate 后与原始语义内容不同（不含 project `readRoots` 清理）。
-//! - `wrote` = 最终 map 与原始不同（含清理）；无变化时不写盘（不扰 mtime）。
-//! - project scope 的 `readRoots` 清理复用 [`remove_read_roots_raw`](super::read_roots::remove_read_roots_raw)。
+//! - `changed` / `wrote` = mutate 后与原始语义内容不同（无变化不写盘、不扰 mtime）。
+//! - **A+（2026-11-03 用户拍板）**：project scope 的 `readRoots` **保留原键 + WARN**，不做任何
+//!   写入期剔除；读面 `trusted-scope-only` 拒绝保持不动。主动删除用户数据与 raw 保真目标相反。
 //!
 //! 注意：即使 no-op / corrupt，[`with_settings_lock`](super::store::with_settings_lock) 仍会创建父目录与
 //! `.lock` 旁车文件——「原文件不变」指 settings 数据文件本身；corrupt 文件**不备份、不删除**。
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use super::read_roots::remove_read_roots_raw;
+use super::schema::FIELD_READ_ROOTS;
 use super::store::{atomic_write_settings_json, with_settings_lock, SettingsStoreError};
 
 /// strict raw 写入错误 / strict raw-write errors。
@@ -65,9 +66,9 @@ pub(crate) enum RawWriteError {
 /// 一次 raw 更新的结果 / Outcome of one raw update。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawUpdateOutcome {
-    /// mutate 是否改变语义内容（不含 project `readRoots` 清理）。
+    /// mutate 是否改变语义内容。
     pub(crate) changed: bool,
-    /// 是否实际写盘（含 `readRoots` 清理）。
+    /// 是否实际写盘。
     pub(crate) wrote: bool,
 }
 
@@ -91,7 +92,9 @@ impl RawWriteError {
     #[cfg(feature = "cli")]
     pub(crate) fn into_io_error(self) -> io::Error {
         match self {
-            RawWriteError::Io { source, .. } => source,
+            RawWriteError::Io { path, source } => {
+                io::Error::new(source.kind(), format!("{}: {source}", path.display()))
+            }
             RawWriteError::Store(e) => io::Error::other(e.to_string()),
             other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
         }
@@ -129,13 +132,38 @@ pub(crate) fn read_strict_map(path: &Path) -> Result<Map<String, Value>, RawWrit
     }
 }
 
+/// project scope 写入时若盘上仍有 `readRoots`，返回用户可见告警文案（A+：保留 + WARN）。
+pub(crate) fn project_read_roots_warning(path: &Path, map: &Map<String, Value>) -> Option<String> {
+    map.contains_key(FIELD_READ_ROOTS).then(|| {
+        format!(
+            "project scope readRoots is ignored at read time (trusted-scope-only); \
+             key preserved on disk at {}",
+            path.display()
+        )
+    })
+}
+
+fn warn_project_read_roots(path: &Path, map: &Map<String, Value>) {
+    if let Some(message) = project_read_roots_warning(path, map) {
+        tracing::warn!(
+            field = FIELD_READ_ROOTS,
+            path = %path.display(),
+            "{}",
+            message
+        );
+        // CLI 未安装 tracing subscriber；写入期 WARN 必须对用户可见（A+）。
+        #[cfg(feature = "cli")]
+        eprintln!("warning: {message}");
+    }
+}
+
 /// 持锁执行 strict raw read-modify-write。
 ///
-/// `strip_project_read_roots` 仅由 project scope 写入方置 true；`mutate` 只应改目标键，返回 Err
-/// 表示拒绝写盘（fail-closed）。无语义变化且无需清理时不写盘。
+/// `project_scope` 仅由 project scope 写入方置 true：若盘上仍有 `readRoots`，**保留并 WARN**
+/// （A+），不做任何剔除。`mutate` 只应改目标键，返回 Err 表示拒绝写盘（fail-closed）。
 pub(crate) fn update_raw_settings(
     path: &Path,
-    strip_project_read_roots: bool,
+    project_scope: bool,
     mutate: impl FnOnce(&mut Map<String, Value>) -> Result<(), RawWriteError>,
 ) -> Result<RawUpdateOutcome, RawWriteError> {
     with_settings_lock(path, || -> Result<RawUpdateOutcome, RawWriteError> {
@@ -143,8 +171,8 @@ pub(crate) fn update_raw_settings(
         let mut next = original.clone();
         mutate(&mut next)?;
         let changed = next != original;
-        if strip_project_read_roots {
-            remove_read_roots_raw(&mut next);
+        if project_scope {
+            warn_project_read_roots(path, &next);
         }
         let wrote = next != original;
         if wrote {
@@ -189,6 +217,7 @@ pub(crate) fn object_field_mut<'a>(
 }
 
 /// 取 object 型目标键；缺失返回 `None`（不物化），类型不符 → fail-closed。
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn object_field_opt_mut<'a>(
     map: &'a mut Map<String, Value>,
     key: &str,
@@ -216,6 +245,7 @@ pub(crate) fn array_field_mut<'a>(
 }
 
 /// 取 array 型目标键；缺失返回 `None`（不物化），类型不符 → fail-closed。
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn array_field_opt_mut<'a>(
     map: &'a mut Map<String, Value>,
     key: &str,
@@ -251,6 +281,7 @@ pub(crate) fn set_bool_field(
 }
 
 /// 校验目标键可安全做 object 深合并：缺失或已是 object → Ok；其它类型 → fail-closed。
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn ensure_object_container(
     map: &Map<String, Value>,
     key: &str,
@@ -363,43 +394,35 @@ mod tests {
     }
 
     #[test]
-    fn strip_read_roots_writes_cleanup_without_semantic_change() {
+    fn project_scope_preserves_read_roots_and_reports_warning() {
+        // A+：project scope 写入保留 readRoots（不主动删除），并产生 WARN 文案。
         let tmp = TempDir::new().unwrap();
         let path = path_of(&tmp);
         write(&path, r#"{"readRoots":["/x"],"keep":1}"#);
-        let outcome = update_raw_settings(&path, true, |_map| Ok(())).unwrap();
-        assert!(!outcome.changed, "changed 不含 readRoots 清理");
-        assert!(outcome.wrote);
-        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none());
-        assert_eq!(saved["keep"], json!(1));
-    }
-
-    #[test]
-    fn strip_absent_read_roots_is_noop() {
-        let tmp = TempDir::new().unwrap();
-        let path = path_of(&tmp);
-        write(&path, r#"{"keep":1}"#);
-        let before_mtime = mtime(&path);
-        let outcome = update_raw_settings(&path, true, |_map| Ok(())).unwrap();
-        assert!(!outcome.changed && !outcome.wrote);
-        assert_eq!(mtime(&path), before_mtime);
-    }
-
-    #[test]
-    fn added_then_stripped_read_roots_is_not_written() {
-        let tmp = TempDir::new().unwrap();
-        let path = path_of(&tmp);
-        write(&path, "{}");
         let before = std::fs::read(&path).unwrap();
+        let before_mtime = mtime(&path);
         let outcome = update_raw_settings(&path, true, |map| {
-            map.insert("readRoots".to_string(), json!(["/x"]));
+            map.insert("newKey".to_string(), json!(2));
             Ok(())
         })
         .unwrap();
-        assert!(outcome.changed);
-        assert!(!outcome.wrote, "新增后又被清理 → 与原始一致，不写盘");
+        assert!(outcome.changed && outcome.wrote);
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["readRoots"], json!(["/x"]), "readRoots 必须保留");
+        assert_eq!(saved["keep"], json!(1));
+        assert_eq!(saved["newKey"], json!(2));
+        assert_ne!(mtime(&path), before_mtime);
+
+        // 无变化时连 WARN 都不应触发写盘；键仍在盘上。
+        write(&path, r#"{"readRoots":["/x"],"keep":1}"#);
+        let before = std::fs::read(&path).unwrap();
+        let outcome = update_raw_settings(&path, true, |_map| Ok(())).unwrap();
+        assert!(!outcome.changed && !outcome.wrote);
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        let warning = project_read_roots_warning(&path, &read_strict_map(&path).unwrap())
+            .expect("readRoots 存在时必须产生 WARN");
+        assert!(warning.contains("readRoots"));
+        assert!(warning.contains("preserved"));
     }
 
     #[test]
@@ -420,7 +443,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // 类型不符 → fail-closed。
+        // 类型不符 → fail-closed（含 opt array 版本）。
         map.insert("bad_obj".to_string(), json!("x"));
         map.insert("bad_arr".to_string(), json!({}));
         map.insert("bad_bool".to_string(), json!("true"));
@@ -430,7 +453,15 @@ mod tests {
             Err(RawWriteError::MalformedTarget { .. })
         ));
         assert!(matches!(
+            object_field_opt_mut(&mut map, "bad_obj", &path),
+            Err(RawWriteError::MalformedTarget { .. })
+        ));
+        assert!(matches!(
             array_field_mut(&mut map, "bad_arr", &path),
+            Err(RawWriteError::MalformedTarget { .. })
+        ));
+        assert!(matches!(
+            array_field_opt_mut(&mut map, "bad_arr", &path),
             Err(RawWriteError::MalformedTarget { .. })
         ));
         assert!(matches!(
@@ -491,7 +522,7 @@ mod tests {
 
     #[cfg(feature = "cli")]
     #[test]
-    fn into_io_error_kinds() {
+    fn into_io_error_kinds_and_path() {
         let path = PathBuf::from("/tmp/settings.json");
         let corrupt = RawWriteError::Corrupt {
             path,
@@ -505,5 +536,9 @@ mod tests {
         }
         .into_io_error();
         assert_eq!(io_err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            io_err.to_string().contains("/tmp/x"),
+            "io 错误必须保留 path: {io_err}"
+        );
     }
 }
