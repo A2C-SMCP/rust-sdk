@@ -521,9 +521,15 @@ impl MCPServerManager {
 
         // 配置更新应保留控制面的启动意图，即使数据面正等待 OAuth。
         let was_started = self.activation_intents.read().await.contains(&bundle_id);
-        let was_connected = self.active_clients.read().await.contains_key(&bundle_id);
+        let had_active_entry = self.active_clients.read().await.contains_key(&bundle_id);
+        // #254 复审：门控看 **live state**，不看成员关系——健康重连失败遗留的 stale entry
+        // （live Disconnected）不得再以「is started」阻止配置更新。`state()` 在锁外调用。
+        let live_connected = {
+            let client = { self.active_clients.read().await.get(&bundle_id).cloned() };
+            client.is_some_and(|client| client.state() == ClientState::Connected)
+        };
 
-        if was_connected {
+        if live_connected {
             let auto_reconnect = *self.auto_reconnect.read().await;
             if !auto_reconnect {
                 return Err(ComputerError::InvalidConfiguration(format!(
@@ -545,12 +551,9 @@ impl MCPServerManager {
                     ComputerError::ConnectionError(format!("failed to drain OAuth flow: {error}"))
                 })?;
         }
-        if was_connected {
+        if had_active_entry {
+            // 含 stale entry：先清退数据面（inner 会在 fallible refresh 之前收敛 remembered）。
             self.disconnect_client_by_id_inner(&bundle_id).await?;
-            self.connection_states
-                .write()
-                .await
-                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
 
         // 更新配置（原地更新：同 bundle_id 覆盖）/ Update configuration (update-in-place by bundle_id)
@@ -568,7 +571,7 @@ impl MCPServerManager {
 
         // 检查是否需要自动连接 / Check if need auto connect
         let auto_connect = *self.auto_connect.read().await;
-        if was_connected || auto_connect {
+        if live_connected || auto_connect {
             self.start_client_by_id_inner(&bundle_id).await?;
         } else if was_started {
             // Replacing an authorization-blocked server must retire the old OAuth capability
@@ -1042,15 +1045,18 @@ impl MCPServerManager {
     async fn stop_client_by_id_inner(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         let was_started = self.activation_intents.write().await.remove(bundle_id);
         self.fire_projected_if_changed(bundle_id).await;
-        let was_connected = self.disconnect_client_by_id_inner(bundle_id).await?;
 
-        // #254 复审：stop 成功后把 remembered 收敛为 Disconnected——否则下一次 start/restart 的首个
-        // 投影会沿用上一次的 Connected/Error，在真实连接前先发一条假状态再发 Connecting（#186 序列失真）。
-        // 此刻激活已撤销、Stopped 掩蔽 remembered，不会额外产生事件。
-        self.connection_states
-            .write()
-            .await
-            .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
+        // #254 复审：只有确有启动意图或活动客户端时才收敛 remembered（未知 bundle_id 不得凭空造
+        // `connection_states` 条目）。无活动客户端时在此写；有客户端时由
+        // `disconnect_client_by_id_inner` 在 fallible refresh 之前写。
+        if was_started && !self.active_clients.read().await.contains_key(bundle_id) {
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
+        }
+
+        let was_connected = self.disconnect_client_by_id_inner(bundle_id).await?;
 
         if was_started || was_connected {
             info!("Client (bundle_id={}) stopped successfully", bundle_id);
@@ -1095,25 +1101,38 @@ impl MCPServerManager {
         // Disconnected 视为已停并返回 Ok；真实 disconnect 失败仍上抛）。
         // 注：`ClientState::Error` 目前仅由死代码 keep-alive 写入，生产传输不可达；若 S5 使其可达，
         // 传输侧 `can_disconnect`（仅 Connected）的状态守卫会拒绝并由本分支如实上抛，届时随 S5 统一。
-        if let Some(ref mut c) = client {
+        let disconnect_result = if let Some(ref mut c) = client {
             match c.state() {
-                ClientState::Connected | ClientState::Error => {
-                    c.disconnect().await.map_err(|e| {
-                        ComputerError::ConnectionError(format!(
-                            "Failed to disconnect from {}: {}",
-                            bundle_id, e
-                        ))
-                    })?;
-                }
+                ClientState::Connected | ClientState::Error => c.disconnect().await.map_err(|e| {
+                    ComputerError::ConnectionError(format!(
+                        "Failed to disconnect from {}: {}",
+                        bundle_id, e
+                    ))
+                }),
                 ClientState::Initialized | ClientState::Disconnected => {
                     debug!(
                         "Server bundle_id={} is already stopped (live state {}); skip disconnect",
                         bundle_id,
                         c.state()
                     );
+                    Ok(())
                 }
             }
+        } else {
+            Ok(())
+        };
+
+        // #254 复审：remembered 收敛放在 fallible `refresh_structural_tool_routes` **之前**（也覆盖
+        // disconnect Err）——否则下一次 start 的首个投影仍会沿用旧 remembered，先发假 `(Started, Connected)`
+        // 再发 Connecting。仅确有活动 entry 时写，未知 bundle_id 不造条目。
+        if was_active {
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
+
+        disconnect_result?;
 
         // 刷新工具路由（幂等，无论是否停到都保持路由一致）/ Refresh tool routes
         self.refresh_structural_tool_routes().await?;
@@ -9092,6 +9111,77 @@ mod tests {
             error.to_string().contains("Failed to disconnect"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_after_stop_does_not_publish_false_connected() {
+        // #254 复审：stop 后 remembered 必须已收敛 Disconnected——下一次 start 的首个投影不得是
+        // 未经真实连接的 (Started, Connected)。
+        let status = Arc::new(RuntimeStatus::new());
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        inject_mock_factory(&manager).await;
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("restart-seq", Some("restart-seq")))
+            .await
+            .unwrap();
+        let bundle_id = bid("restart-seq");
+
+        manager.start_client_by_id(&bundle_id).await.unwrap();
+        manager.stop_client_by_id(&bundle_id).await.unwrap();
+
+        let mut rx = status.subscribe();
+        manager.start_client_by_id(&bundle_id).await.unwrap();
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, first) = changes.first().expect("start must publish status events");
+        assert_eq!(first.activation, MCPServerActivationState::Started);
+        assert_ne!(
+            first.connection,
+            MCPServerConnectionState::Connected,
+            "stop→start 的首个事件不得是未经真实连接的 Connected"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_unknown_bundle_does_not_create_connection_state() {
+        // #254 复审：未知 bundle_id 的幂等 stop 不得凭空造 `connection_states` 条目。
+        let manager = MCPServerManager::new();
+        let unknown = bid("unknown-stop");
+        let stopped = manager.stop_client_by_id(&unknown).await.unwrap();
+        assert!(!stopped);
+        assert!(!manager
+            .connection_states
+            .read()
+            .await
+            .contains_key(&unknown));
+    }
+
+    #[tokio::test]
+    async fn add_or_update_stale_entry_does_not_block_when_auto_reconnect_disabled() {
+        // #254 复审：门控看 live state——stale（Disconnected）entry 不得以「is started」阻止配置更新。
+        let manager = MCPServerManager::new();
+        manager.disable_auto_reconnect().await;
+        let bundle_id = bid("stale-update");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("stale-update", Some("stale-update")),
+        );
+        let stale = Arc::new(live_state_client(
+            false,
+            &Arc::new(tokio::sync::Notify::new()),
+            &Arc::new(tokio::sync::Notify::new()),
+        ));
+        *stale.state.write().unwrap() = ClientState::Disconnected;
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), stale);
+
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("stale-update", Some("stale-update")))
+            .await
+            .expect("a stale entry must not block config updates when auto-reconnect is disabled");
+        assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
     }
 
     /// #186 弱锚点路径端到端：真实 `BaseMCPClient` 传输客户端经 `update_state` 触发回调 →
