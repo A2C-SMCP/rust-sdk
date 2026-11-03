@@ -227,6 +227,11 @@ pub fn settings_get(
 ///
 /// 值解析：JSON 优先（`true` / `["a","b"]` / `{...}`），失败回退字面字符串。写经 `apply_write`——对象递归
 /// 深合并、**数组整体替换**；`null` 写 JSON null（删键仅经 DELETE 哨兵，§5.4）。
+///
+/// **对象值的 fail-closed 规则（#253）**：写入值为 JSON object 时，若盘上同名键已存在且**不是**
+/// object（标量 / null / 数组），命令拒绝写入（退出码 1、原文件不变）——避免静默把用户数据物化
+/// 覆盖。若确认要替换该键为对象，请先 `settings edit` 手工修正/删除；显式写入标量/数组仍整体替换。
+/// 这是与 Python「对象物化」行为的有意分叉。
 pub fn settings_set(
     env: Option<&EnvMap>,
     key: &str,
@@ -311,6 +316,8 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
         "{}",
         REASON
     );
+    // --json 模式也必须让 WARN 对用户可见（stderr）；JSON 契约额外携带 reason。
+    eprintln!("warning: {}", REASON);
     if json_output {
         print_json(&json!({
             "scope": "project",
@@ -320,7 +327,6 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
         }));
         return EXIT_OK;
     }
-    eprintln!("warning: {}", REASON);
     ok_msg(&format!(
         "ignored {} in project scope (trusted-scope-only; existing key preserved)",
         FIELD_READ_ROOTS

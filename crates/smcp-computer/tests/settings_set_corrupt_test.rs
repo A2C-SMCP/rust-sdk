@@ -4,7 +4,8 @@
 /*!
 * 文件名: settings_set_corrupt_test.rs
 * 描述: 真实二进制验证 #253——`settings set` 遇 corrupt settings 文件必须非零退出、给出可操作错误、
-*       且原文件逐字节不变；正常写入必须 raw 保真（只删 project `readRoots`，其余字段原值保留）。
+*       且原文件逐字节不变；正常写入必须 raw 保真（A+：project `readRoots` 保留 + WARN，
+*       其余字段原值保留）。
 *
 * CLI 错误经 `msg_err` / `err_flat` 输出到 **stdout**（不是 stderr），断言按 stdout。
 */
@@ -78,6 +79,34 @@ fn set_refuses_non_object_root_and_keeps_bytes() {
         "stdout should explain the non-object root; got: {stdout}"
     );
     assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn set_read_roots_project_json_warns_on_stderr_and_keeps_file_253() {
+    // A+：project scope readRoots 不写入、不删旧键；--json 契约含 ignored，且 WARN 经 stderr 可见。
+    let dir = tempdir().unwrap();
+    let path = project_settings(dir.path());
+    fs::write(&path, r#"{"readRoots":["/old"],"keep":1}"#).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let output = run_set(dir.path(), "readRoots", "[\"/x\"]", "project");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("\"ignored\""), "stdout={stdout}");
+    assert!(
+        stderr.contains("readRoots") && stderr.contains("preserved"),
+        "stderr must warn that readRoots is preserved/ignored; stderr={stderr}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "A+：project readRoots 不得写盘、不得删旧键"
+    );
 }
 
 #[test]

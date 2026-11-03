@@ -198,16 +198,20 @@ pub async fn run_mcp_approval<S: Session>(
                         }
                         mount(comp, srv).await;
                     }
-                    _ => {
-                        match deny_mcp_server(name, cwd.as_deref()) {
-                            Ok(()) => msg_dim(&format!(
-                                "· denied MCP server {name:?} (written to local scope)"
-                            )),
-                            Err(e) => msg_err(&format!(
-                                "failed to persist denial for MCP server {name:?} (local scope): {e}; skipped for this session only"
-                            )),
+                    _ => match deny_mcp_server(name, cwd.as_deref()) {
+                        Ok(()) => msg_dim(&format!(
+                            "· denied MCP server {name:?} (written to local scope)"
+                        )),
+                        Err(e) => {
+                            let warning = approval_persist_warning(
+                                Err(e),
+                                &format!("denial for MCP server {name:?}"),
+                                "skipped for this session only",
+                            )
+                            .expect("Err must produce a warning");
+                            msg_err(&warning);
                         }
-                    }
+                    },
                 }
             }
         }
@@ -332,5 +336,19 @@ mod tests {
         assert!(msg.contains("failed to persist approval for MCP server \"x\""));
         assert!(msg.contains("corrupt settings"));
         assert!(msg.contains("this session only"));
+
+        // deny 分支复用同一 helper：失败文案必须含 denial + 仅本次会话。
+        let deny_err = McpConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt settings",
+        ));
+        let deny_msg = approval_persist_warning(
+            Err(deny_err),
+            "denial for MCP server \"y\"",
+            "skipped for this session only",
+        )
+        .expect("Err must produce a warning");
+        assert!(deny_msg.contains("failed to persist denial for MCP server \"y\""));
+        assert!(deny_msg.contains("skipped for this session only"));
     }
 }

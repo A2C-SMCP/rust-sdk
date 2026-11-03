@@ -66,9 +66,10 @@ pub(crate) enum RawWriteError {
 /// 一次 raw 更新的结果 / Outcome of one raw update。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawUpdateOutcome {
-    /// mutate 是否改变语义内容。
+    /// `mutate` 是否改变语义内容（installer 据此决定是否 bump config revision）。
     pub(crate) changed: bool,
-    /// 是否实际写盘。
+    /// 是否实际写盘。A+ 后无写入期清理/跳过策略，当前恒等于 `changed`；保留独立字段表达
+    /// 「语义变化」与「实际落盘」两个概念，未来若引入清理/条件跳过可分化。
     pub(crate) wrote: bool,
 }
 
@@ -399,7 +400,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = path_of(&tmp);
         write(&path, r#"{"readRoots":["/x"],"keep":1}"#);
-        let before = std::fs::read(&path).unwrap();
         let before_mtime = mtime(&path);
         let outcome = update_raw_settings(&path, true, |map| {
             map.insert("newKey".to_string(), json!(2));
