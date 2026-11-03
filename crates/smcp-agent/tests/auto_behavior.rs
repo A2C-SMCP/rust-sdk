@@ -104,12 +104,14 @@ async fn test_notification_message_creation() {
         office_id: "office123".to_string(),
         computer: Some("computer1".to_string()),
         agent: Some("agent1".to_string()),
+        computer_id: None,
     });
 
     let leave_office = NotificationMessage::LeaveOffice(smcp::LeaveOfficeNotification {
         office_id: "office123".to_string(),
         computer: Some("computer1".to_string()),
         agent: Some("agent1".to_string()),
+        computer_id: None,
     });
 
     let update_config = NotificationMessage::UpdateConfig(smcp::UpdateMCPConfigNotification {
@@ -150,6 +152,7 @@ async fn test_auto_behavior_sequence() {
         office_id: "office1".to_string(),
         computer: Some("computer1".to_string()),
         agent: None,
+        computer_id: None,
     });
 
     // 2. Computer 更新配置
@@ -218,6 +221,7 @@ async fn test_notification_payload_validation() {
                 office_id: "office1".to_string(),
                 computer: Some("comp1".to_string()),
                 agent: None,
+                computer_id: None,
             }),
             "EnterOffice with computer only",
         ),
@@ -226,6 +230,7 @@ async fn test_notification_payload_validation() {
                 office_id: "office1".to_string(),
                 computer: None,
                 agent: Some("agent1".to_string()),
+                computer_id: None,
             }),
             "EnterOffice with agent only",
         ),
@@ -234,6 +239,7 @@ async fn test_notification_payload_validation() {
                 office_id: "office1".to_string(),
                 computer: Some("comp1".to_string()),
                 agent: Some("agent1".to_string()),
+                computer_id: None,
             }),
             "LeaveOffice with both",
         ),
@@ -303,6 +309,7 @@ async fn test_python_compatibility_behavior() {
             office_id: "office1".to_string(),
             computer: Some("computer1".to_string()),
             agent: None,
+            computer_id: None,
         }),
         NotificationMessage::UpdateConfig(smcp::UpdateMCPConfigNotification {
             computer: "computer1".to_string(),
@@ -353,6 +360,7 @@ async fn test_error_handling_in_notifications() {
             office_id: "".to_string(),
             computer: None,
             agent: None,
+            computer_id: None,
         }),
         // 空的 computer name
         NotificationMessage::UpdateConfig(smcp::UpdateMCPConfigNotification {

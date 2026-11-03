@@ -78,6 +78,7 @@ mod e2e_tests {
             role: Role::Agent,
             name: "Test".to_string(),
             office_id: "Office1".to_string(),
+            computer_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

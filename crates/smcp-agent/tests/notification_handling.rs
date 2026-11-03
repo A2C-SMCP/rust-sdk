@@ -95,6 +95,7 @@ async fn test_notification_message_serialization() {
         office_id: "office123".to_string(),
         computer: Some("computer1".to_string()),
         agent: None,
+        computer_id: None,
     });
 
     // 这个测试主要验证 NotificationMessage 枚举可以正常创建和使用
@@ -118,6 +119,7 @@ async fn test_notification_channel_flow() {
             office_id: "office1".to_string(),
             computer: Some("comp1".to_string()),
             agent: None,
+            computer_id: None,
         },
     ))
     .unwrap();
@@ -127,6 +129,7 @@ async fn test_notification_channel_flow() {
             office_id: "office1".to_string(),
             computer: Some("comp1".to_string()),
             agent: None,
+            computer_id: None,
         },
     ))
     .unwrap();
@@ -175,6 +178,7 @@ async fn test_agent_auto_behavior_on_enter_office() {
         office_id: "office1".to_string(),
         computer: Some("computer1".to_string()),
         agent: None,
+        computer_id: None,
     });
 
     // 验证通知被正确处理
@@ -196,11 +200,13 @@ async fn test_all_notification_types() {
             office_id: "office1".to_string(),
             computer: Some("comp1".to_string()),
             agent: Some("agent1".to_string()),
+            computer_id: None,
         }),
         NotificationMessage::LeaveOffice(smcp::LeaveOfficeNotification {
             office_id: "office1".to_string(),
             computer: Some("comp1".to_string()),
             agent: Some("agent1".to_string()),
+            computer_id: None,
         }),
         NotificationMessage::UpdateConfig(smcp::UpdateMCPConfigNotification {
             computer: "comp1".to_string(),

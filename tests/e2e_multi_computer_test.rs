@@ -2,17 +2,48 @@
 //
 // Tests scenarios with multiple computers in the same office
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// 后续统一抽共享 helper（本批未含）；`#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 mod e2e;
 
 use e2e::*;
 use smcp_agent::{AsyncSmcpAgent, DefaultAuthProvider, SmcpAgentConfig};
 use smcp_computer::computer::{Computer, ConnectOptions, SilentSession};
+use smcp_computer::errors::ComputerError;
 use std::time::Duration;
 
-/// Test agent interacting with multiple computers
+/// protocol#66：一房至多一台 Computer——第二台入房被拒（`4101 {role:"computer"}`），
+/// 旧 Computer 离房释放席位后方可**换绑**入房。
+///
+/// 旧版 `test_multiple_computers` 断言两台 Computer 同房共存；「每 role 一席」下该场景已不可构造，
+/// 本用例改写为跨组件（Agent + Computer + Server）验证单 Computer 语义与换绑流程：
+/// ① C2 入房 ⇒ `ProtocolRejection 4101`，且 Agent 不收到其 enter 广播；
+/// ② C1 离房 ⇒ Agent 收到 `leave(C1)`；
+/// ③ C2 再入房 ⇒ 成功，Agent 收到 `enter(C2)`。
 #[tokio::test]
 #[cfg(all(feature = "agent", feature = "computer", feature = "server"))]
-async fn test_multiple_computers() {
+async fn test_second_computer_rejected_then_rebind_succeeds() {
     tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(tracing::Level::INFO)
@@ -43,14 +74,13 @@ async fn test_multiple_computers() {
         .await
         .expect("Failed to join");
 
-    // NOW create and connect both computers
+    // Create and connect computer 1
     let session1 = SilentSession::new("session1");
-    let computer1 = Computer::new(computer1_name.clone(), session1, None, None, true, true);
+    let computer1 = Computer::new(computer1_name.clone(), session1, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
 
-    let session2 = SilentSession::new("session2");
-    let computer2 = Computer::new(computer2_name.clone(), session2, None, None, true, true);
-
-    // Boot and connect computer 1
     computer1.boot_up().await.expect("Failed to boot computer1");
 
     let auth_secret1 = Some("test_secret".to_string());
@@ -69,7 +99,16 @@ async fn test_multiple_computers() {
         .await
         .expect("Failed to join office");
 
-    // Boot and connect computer 2
+    let received1 = event_handler.wait_for_computer(&computer1_name, 5).await;
+    assert!(received1, "Computer 1 not detected");
+
+    // Create and connect computer 2 — its join to the same office MUST be rejected.
+    let session2 = SilentSession::new("session2");
+    let computer2 = Computer::new(computer2_name.clone(), session2, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
+
     computer2.boot_up().await.expect("Failed to boot computer2");
 
     let auth_secret2 = Some("test_secret".to_string());
@@ -83,21 +122,49 @@ async fn test_multiple_computers() {
         )
         .await
         .expect("Failed to connect computer2");
+
+    let rejection = computer2
+        .join_office(&office_id, &computer2_name)
+        .await
+        .expect_err("second Computer must be rejected under protocol#66 (per-role seat)");
+    match rejection {
+        ComputerError::ProtocolRejection { code, details, .. } => {
+            assert_eq!(code, 4101, "席位已占必须回 4101");
+            assert_eq!(
+                details,
+                Some(serde_json::json!({"office_id": office_id, "role": "computer"})),
+                "4101 必须携带被占席位信息"
+            );
+        }
+        other => panic!("expected ProtocolRejection 4101, got {other:?}"),
+    }
+    // C2 未入房：Agent 不应收到它的 enter 广播。
+    assert!(
+        !event_handler.wait_for_computer(&computer2_name, 1).await,
+        "被拒的第二台 Computer 不得产生 enter 广播"
+    );
+
+    // Rebind: C1 leaves → Agent 收到 leave(C1) 广播 → seat released → C2 joins successfully.
+    computer1
+        .leave_office()
+        .await
+        .expect("computer1 leave office");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    {
+        let leave_events = event_handler.leave_office_events.read().await;
+        assert!(
+            leave_events
+                .iter()
+                .any(|event| event.computer.as_deref() == Some(computer1_name.as_str())),
+            "Agent 应收到 C1 的 leave 广播（换绑序：先 leave 旧、再 enter 新），实得 {leave_events:?}"
+        );
+    }
     computer2
         .join_office(&office_id, &computer2_name)
         .await
-        .expect("Failed to join office");
-
-    // Wait for both computers to be detected
-    let received1 = event_handler.wait_for_computer(&computer1_name, 5).await;
+        .expect("after the seat is released, C2 must be able to join (rebind)");
     let received2 = event_handler.wait_for_computer(&computer2_name, 5).await;
-
-    assert!(received1, "Computer 1 not detected");
-    assert!(received2, "Computer 2 not detected");
-
-    // Get tools from both computers
-    // TODO: Fix get_tools calls - currently fails with "Missing req_id in response"
-    println!("⚠ Skipping get_tools calls due to known issue");
+    assert!(received2, "Computer 2 not detected after rebind");
 
     // Cleanup
     let _ = agent.leave_office().await;
@@ -126,7 +193,10 @@ async fn test_computer_leave_notification() {
     let office_id = generate_office_id();
 
     let session = SilentSession::new("test_session");
-    let computer = Computer::new(computer_name.clone(), session, None, None, true, true);
+    let computer = Computer::new(computer_name.clone(), session, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
 
     computer.boot_up().await.expect("Failed to boot");
 
@@ -201,7 +271,10 @@ async fn test_list_room_sessions() {
     let office_id = generate_office_id();
 
     let session = SilentSession::new("test_session");
-    let computer = Computer::new("test_computer".to_string(), session, None, None, true, true);
+    let computer = Computer::new("test_computer".to_string(), session, None, None, true, true)
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        ));
 
     computer.boot_up().await.expect("Failed to boot");
 

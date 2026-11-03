@@ -2,6 +2,37 @@
 #![cfg(feature = "cli")]
 #![allow(dead_code)]
 
+/// 真实二进制测试的子进程隔离 env（HOME + XDG_CONFIG_HOME 指向 tempdir）。
+pub fn isolated_binary_env(home: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    vec![
+        ("HOME", home.to_path_buf()),
+        ("XDG_CONFIG_HOME", home.join("xdg-config")),
+    ]
+}
+
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// 后续统一抽共享 helper（本批未含）；`#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use serde_json::json;
 /**
 * 文件名: mod.rs
@@ -80,7 +111,8 @@ pub async fn create_test_computer_with_servers() -> Computer<SilentSession> {
         false,
         false,
     )
-    .with_config_dir(config_dir)
+    .with_config_dir(&config_dir)
+    .with_config_env(isolated_config_env(&config_dir))
 }
 
 /// 创建测试服务器配置文件 / Create test server config file
@@ -170,6 +202,7 @@ pub async fn create_command_handler() -> CommandHandler {
         namespace: "test_namespace".to_string(),
         auth: None,
         headers: None,
+        office_rejoin_budget_secs: None,
     };
     CommandHandler::new(computer, cli_config)
 }
@@ -188,12 +221,14 @@ pub async fn create_uninitialized_command_handler() -> CommandHandler {
         false,
         false,
     )
-    .with_config_dir(config_dir);
+    .with_config_dir(&config_dir)
+    .with_config_env(isolated_config_env(&config_dir));
     let cli_config = CliConfig {
         url: None,
         namespace: "test_namespace".to_string(),
         auth: None,
         headers: None,
+        office_rejoin_budget_secs: None,
     };
     CommandHandler::new(computer, cli_config)
 }

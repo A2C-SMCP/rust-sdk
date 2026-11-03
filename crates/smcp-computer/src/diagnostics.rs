@@ -247,6 +247,7 @@ pub(crate) fn classify_recovery(err: &ComputerError) -> (bool, bool) {
     matches!(
         err,
         ComputerError::ConnectionError(_)
+            | ComputerError::StdioInitialization(_)
             | ComputerError::TransportError(_)
             | ComputerError::TimeoutError(_)
     )

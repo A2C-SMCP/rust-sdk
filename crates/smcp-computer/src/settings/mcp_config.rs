@@ -52,7 +52,6 @@
 //! 对此类未知键在 Rust **不触发**（该 server 被容受、不入 `errors`），故 CLI 启动 WARN 接线**不应**假定与 Python
 //! 逐条对等；真正畸形（缺必填 / `type` 非法 / name-key 冲突）仍 drop+error，与 Python 一致。
 
-use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -63,15 +62,16 @@ use serde_json::{Map, Value};
 use crate::mcp_clients::model::{MCPServerConfig, MCPServerInput};
 use crate::settings::config::snapshot::ProvenanceScope;
 use crate::settings::policy::{LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR};
+use crate::settings::raw_write;
 use crate::settings::schema::{
     SettingsScope, SettingsValidationError, FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS,
-    FIELD_DISABLED_MCPJSON_SERVERS, FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP,
+    FIELD_DISABLED_MCPJSON_SERVERS, FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLED_PLUGINS,
+    FIELD_ENABLE_ALL_PROJECT_MCP,
 };
 use crate::settings::scope::{
-    apply_write, load_settings_file, resolve_cwd, resolve_user_config_dir,
-    workdir_local_settings_path, workdir_settings_dir, EnvMap, WriteValue,
+    resolve_cwd, resolve_user_config_dir, workdir_local_settings_path, workdir_settings_dir, EnvMap,
 };
-use crate::settings::store::{self, SettingsStoreError};
+use crate::settings::store::SettingsStoreError;
 
 // ---------------------------------------------------------------------------
 // 常量 / Constants
@@ -786,41 +786,24 @@ fn local_settings_write_path(cwd: Option<&Path>) -> Result<PathBuf, McpConfigErr
     Ok(workdir_local_settings_path(&base))
 }
 
-/// 把 `name` 追加进 local `settings.local.json` 的某 MCP 数组字段（持锁原子 RMW + dedup）/ Append to a local array。
+/// 把 `name` 追加进 local `settings.local.json` 的某 MCP 数组字段（持锁 strict raw RMW + dedup）。
 ///
-/// 复用 store 旁车锁 + 原子写 + scope 的 [`load_settings_file`] / [`apply_write`]（数组整体替换，§5.4）；
-/// settings.local.json 人编意图层 → 无写保护头。锁内读-改-写杜绝并发丢更新。
+/// #253：只改目标数组、保留其余字段（含非法兄弟条目，如非字符串元素）；容器非数组 / corrupt
+/// → fail-closed。settings.local.json 人编意图层 → 无写保护头。
 fn append_local_mcp_array(
     cwd: Option<&Path>,
     field_name: &str,
     name: &str,
 ) -> Result<(), McpConfigError> {
     let path = local_settings_write_path(cwd)?;
-    store::with_settings_lock(&path, || -> io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, SettingsScope::Local);
-        let mut current: Vec<String> = existing
-            .get(field_name)
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !current.iter().any(|v| v == name) {
-            current.push(name.to_string());
+    raw_write::update_raw_settings(&path, false, |map| {
+        let arr = raw_write::array_field_mut(map, field_name, &path)?;
+        if !arr.iter().any(|v| v.as_str() == Some(name)) {
+            arr.push(Value::String(name.to_string()));
         }
-        let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
-        updates.insert(
-            field_name.to_string(),
-            WriteValue::Set(Value::Array(
-                current.into_iter().map(Value::String).collect(),
-            )),
-        );
-        let updated = apply_write(&existing, &updates);
-        store::atomic_write_settings_json(&path, &Value::Object(updated))
-    })??;
+        Ok(())
+    })
+    .map_err(|e| McpConfigError::Store(e.into_store()))?;
     Ok(())
 }
 
@@ -852,16 +835,11 @@ pub fn deny_mcp_server(name: &str, cwd: Option<&Path>) -> Result<(), McpConfigEr
 /// 进程 cwd 不可读 / 写失败 → [`McpConfigError`]。
 pub fn approve_all_project_mcp(cwd: Option<&Path>) -> Result<(), McpConfigError> {
     let path = local_settings_write_path(cwd)?;
-    store::with_settings_lock(&path, || -> io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, SettingsScope::Local);
-        let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
-        updates.insert(
-            FIELD_ENABLE_ALL_PROJECT_MCP.to_string(),
-            WriteValue::Set(Value::Bool(true)),
-        );
-        let updated = apply_write(&existing, &updates);
-        store::atomic_write_settings_json(&path, &Value::Object(updated))
-    })??;
+    // #253：strict raw RMW；已 true → 不写盘；非 bool / corrupt → fail-closed。
+    raw_write::update_raw_settings(&path, false, |map| {
+        raw_write::set_bool_field(map, FIELD_ENABLE_ALL_PROJECT_MCP, true, &path)
+    })
+    .map_err(|e| McpConfigError::Store(e.into_store()))?;
     Ok(())
 }
 
@@ -869,22 +847,19 @@ pub fn approve_all_project_mcp(cwd: Option<&Path>) -> Result<(), McpConfigError>
 ///
 /// project-origin bundled server 的 TOFU：`approve` 写 `true`（local 覆盖 project → origin 变受信 → 下次
 /// reconcile 免批准直挂）；`reject` 写 `false`（**整 plugin 禁用**，协议半态禁令——不可只禁单个 bundled server）。
-/// 复用 store 旁车锁 + 原子写 + [`apply_write`]（嵌套对象写：仅改该 pid，不毁兄弟 `enabledPlugins` 条目）。
+/// #253：strict raw RMW——只改该 pid，保留兄弟条目（含非法值）与其余字段；容器非对象 / corrupt → fail-closed。
 fn write_local_enabled_plugin(
     pid: &str,
     value: bool,
     cwd: Option<&Path>,
 ) -> Result<(), McpConfigError> {
     let path = local_settings_write_path(cwd)?;
-    store::with_settings_lock(&path, || -> io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, SettingsScope::Local);
-        let mut inner: BTreeMap<String, WriteValue> = BTreeMap::new();
-        inner.insert(pid.to_string(), WriteValue::Set(Value::Bool(value)));
-        let mut updates: BTreeMap<String, WriteValue> = BTreeMap::new();
-        updates.insert("enabledPlugins".to_string(), WriteValue::Object(inner));
-        let updated = apply_write(&existing, &updates);
-        store::atomic_write_settings_json(&path, &Value::Object(updated))
-    })??;
+    raw_write::update_raw_settings(&path, false, |map| {
+        let plugins = raw_write::object_field_mut(map, FIELD_ENABLED_PLUGINS, &path)?;
+        plugins.insert(pid.to_string(), Value::Bool(value));
+        Ok(())
+    })
+    .map_err(|e| McpConfigError::Store(e.into_store()))?;
     Ok(())
 }
 
@@ -917,6 +892,7 @@ pub fn reject_bundled_plugin(pid: &str, cwd: Option<&Path>) -> Result<(), McpCon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::scope::load_settings_file;
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
@@ -954,6 +930,129 @@ mod tests {
         let v: Value = serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
         assert_eq!(v["enabledPlugins"]["audit@acme"], Value::Bool(false));
         assert_eq!(v["enabledPlugins"]["other@mp"], Value::Bool(true));
+    }
+
+    // ---- #253：raw 保真 / corrupt fail-closed --------------------------------
+    fn local_settings(cwd: &Path) -> std::path::PathBuf {
+        cwd.join(".tfrobot").join("settings.local.json")
+    }
+
+    fn settings_mtime(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn approve_mcp_server_preserves_unknown_and_invalid_entries_253() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("wd");
+        let path = local_settings(&cwd);
+        write(
+            &path,
+            r#"{"keepUnknown":{"k":1},"landingRoot":"/l","enabledMcpjsonServers":["ok",42],"disabledMcpjsonServers":["d"],"permissions":"bad","allowedMcpServers":["policy-only"]}"#,
+        );
+        approve_mcp_server("new", Some(&cwd)).unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["enabledMcpjsonServers"], json!(["ok", 42, "new"]));
+        assert_eq!(saved["keepUnknown"], json!({"k": 1}));
+        assert_eq!(saved["landingRoot"], json!("/l"));
+        assert_eq!(saved["disabledMcpjsonServers"], json!(["d"]));
+        assert_eq!(saved["permissions"], json!("bad"));
+        assert_eq!(saved["allowedMcpServers"], json!(["policy-only"]));
+    }
+
+    #[test]
+    fn approve_mcp_server_refuses_corrupt_and_non_array_target_253() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("wd");
+        let path = local_settings(&cwd);
+        // 畸形 JSON → 拒绝且字节不变。
+        write(&path, "{not json");
+        let before = fs::read(&path).unwrap();
+        assert!(approve_mcp_server("new", Some(&cwd)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // 根非对象 → 拒绝且字节不变。
+        write(&path, "[1,2]");
+        let before = fs::read(&path).unwrap();
+        assert!(approve_mcp_server("new", Some(&cwd)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // 目标容器非数组 → 拒绝且字节不变。
+        write(&path, r#"{"enabledMcpjsonServers":{}}"#);
+        let before = fs::read(&path).unwrap();
+        assert!(approve_mcp_server("new", Some(&cwd)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn approve_and_deny_are_noop_on_duplicate_253() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("wd");
+        let path = local_settings(&cwd);
+        // 紧凑 fixture：若发生无条件重写，会被 pretty 格式化 → 字节变化（不只依赖 mtime）。
+        write(&path, r#"{"enabledMcpjsonServers":["s"],"keep":1}"#);
+        let before_mtime = settings_mtime(&path);
+        let before_bytes = fs::read(&path).unwrap();
+        approve_mcp_server("s", Some(&cwd)).unwrap();
+        assert_eq!(settings_mtime(&path), before_mtime, "重复 approve 不得写盘");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before_bytes,
+            "重复 approve 不得重写"
+        );
+        write(&path, r#"{"disabledMcpjsonServers":["s"],"keep":1}"#);
+        let before_mtime = settings_mtime(&path);
+        let before_bytes = fs::read(&path).unwrap();
+        deny_mcp_server("s", Some(&cwd)).unwrap();
+        assert_eq!(settings_mtime(&path), before_mtime, "重复 deny 不得写盘");
+        assert_eq!(fs::read(&path).unwrap(), before_bytes, "重复 deny 不得重写");
+    }
+
+    #[test]
+    fn approve_all_project_mcp_refuses_non_bool_and_noops_253() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("wd");
+        let path = local_settings(&cwd);
+        write(&path, r#"{"enableAllProjectMcpServers":"true"}"#);
+        let before = fs::read(&path).unwrap();
+        assert!(approve_all_project_mcp(Some(&cwd)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // 修复畸形值后首次写 true。
+        write(&path, "{}");
+        approve_all_project_mcp(Some(&cwd)).unwrap();
+        // 紧凑 fixture：已 true 时 no-op；若重写会被 pretty 格式化 → 字节变化。
+        write(&path, r#"{"enableAllProjectMcpServers":true,"keep":1}"#);
+        let before_mtime = settings_mtime(&path);
+        let before_bytes = fs::read(&path).unwrap();
+        approve_all_project_mcp(Some(&cwd)).unwrap();
+        assert_eq!(settings_mtime(&path), before_mtime, "已 true → 不得写盘");
+        assert_eq!(fs::read(&path).unwrap(), before_bytes, "已 true → 不得重写");
+    }
+
+    #[test]
+    fn approve_bundled_plugin_preserves_siblings_and_refuses_non_object_253() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("wd");
+        let path = local_settings(&cwd);
+        write(&path, r#"{"enabledPlugins":{"x@mp":"weird"},"keep":1}"#);
+        approve_bundled_plugin("a@mp", Some(&cwd)).unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["enabledPlugins"]["x@mp"], json!("weird"));
+        assert_eq!(saved["enabledPlugins"]["a@mp"], json!(true));
+        assert_eq!(saved["keep"], json!(1));
+        // 紧凑 fixture + 同值重复 approve → 不写盘（若重写会被 pretty 格式化）。
+        write(
+            &path,
+            r#"{"enabledPlugins":{"a@mp":true,"x@mp":"weird"},"keep":1}"#,
+        );
+        let before_mtime = settings_mtime(&path);
+        let before_bytes = fs::read(&path).unwrap();
+        approve_bundled_plugin("a@mp", Some(&cwd)).unwrap();
+        assert_eq!(settings_mtime(&path), before_mtime);
+        assert_eq!(fs::read(&path).unwrap(), before_bytes);
+        // 目标容器非对象 → 拒绝且字节不变。
+        write(&path, r#"{"enabledPlugins":[]}"#);
+        let before = fs::read(&path).unwrap();
+        assert!(approve_bundled_plugin("a@mp", Some(&cwd)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     // ---- load_mcp_config_file ----------------------------------------------
@@ -1016,6 +1115,34 @@ mod tests {
         let invalid = json!({"type": "stdio", "server_parameters": {}});
         let (none, errs) = validate_server("x", &invalid, SettingsScope::User, None);
         assert!(none.is_none() && errs.len() == 1);
+    }
+
+    #[test]
+    fn validate_server_preserves_stdio_connect_timeout_and_rejects_zero() {
+        let valid = json!({
+            "type": "stdio",
+            "server_parameters": {"command": "slow-mcp"},
+            "connect_timeout_secs": 90
+        });
+        let (resolved, errors) = validate_server("slow", &valid, SettingsScope::User, None);
+        assert!(errors.is_empty());
+        let resolved = resolved.expect("valid stdio config should be retained");
+        match resolved.config {
+            MCPServerConfig::Stdio(config) => {
+                assert_eq!(config.connect_timeout_secs, Some(90));
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+
+        let invalid = json!({
+            "type": "stdio",
+            "server_parameters": {"command": "slow-mcp"},
+            "connect_timeout_secs": 0
+        });
+        let (resolved, errors) = validate_server("slow", &invalid, SettingsScope::User, None);
+        assert!(resolved.is_none());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].reason.contains("connect_timeout_secs"));
     }
 
     // ---- resolve_mcp_config 多 scope 合并 ------------------------------------
@@ -1527,7 +1654,7 @@ mod tests {
         // 账本确实含该名——否则红灯来自夹具失效而非档④ 本身（此断言即「借名」前提，勿删）。
         // #138：`bundled_mcp_server_names` 已删，改直读派生账本验证同一前提。
         assert!(
-            store::load_installed_plugins(Some(&home), Some(&env))
+            crate::settings::store::load_installed_plugins(Some(&home), Some(&env))
                 .account
                 .plugins
                 .values()

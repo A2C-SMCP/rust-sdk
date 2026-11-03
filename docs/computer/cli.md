@@ -56,6 +56,10 @@ cargo build -p smcp-computer --features cli
   - 是否自动连接（默认 `true`）
 - `--auto-reconnect <bool>`
   - 是否自动重连（默认 `true`）
+- `--office-rejoin-budget <SECS>`
+  - 传输层自动重连后，自动回房撞 `4101`（本 role 席位被占）时的有界退避总预算（秒）
+  - 缺省用 SDK 默认 `60`（覆盖 socket.io 默认最长回收窗口 45s 并留余量）；`0` = 单次尝试
+  - 仅作用于自动回放；显式 `socket join` 失败仍立即返回错误
 - `--url <string>`
   - Socket.IO 服务器 URL（可选），例如 `http://localhost:3000`
 - `--namespace <string>`
@@ -181,6 +185,18 @@ a2c> socket connect http://localhost:3000
 a2c> socket join <office_id> <computer_name>
 ```
 
+`computer_name` 是实际入房身份。例如 `socket join office-a alice` 成功后，房内名字就是
+`alice`。同名重复加入幂等，同名换房由服务端处理；与当前连接名字不同则自动退旧房、断开、
+以新名重连并加入目标房。重连复用最近一次成功连接的 URL、namespace、auth 和 headers，
+包括交互式 `socket connect <url>` 覆盖的地址。
+
+只有收到成功 ACK 才显示“已加入房间”。退房失败会告警并尝试断开；断开失败即停止改名。
+重连失败会恢复原名字，此时需重新 `socket connect`；重连成功但入房被拒则保留新连接和新名字，
+可换房重试（再次换名仍会重新连接）。ACK 超时表示入房结果未确认，不能据此断言服务端没有入房。
+
+库集成若自行构造 `CommandHandler`，改名时必须独占 Computer 的命名句柄：仍持有
+`Computer::clone()` 的调用方会在退房前收到错误，释放克隆后可重试。普通 REPL 不受此限制。
+
 离开房间：
 
 ```text
@@ -210,6 +226,7 @@ A2C-SMCP 配置示例（`type=stdio` + `server_parameters` + 可选 `default_too
     "tags": ["browser"],
     "auto_apply": true
   },
+  "connect_timeout_secs": 60,
   "server_parameters": {
     "command": "npx",
     "args": ["@playwright/mcp@latest"],
@@ -221,6 +238,9 @@ A2C-SMCP 配置示例（`type=stdio` + `server_parameters` + 可选 `default_too
   "vrl": "# 中文: 只对 browser_navigate 和 browser_navigate_back 工具进行转换\n# English: Only transform for browser_navigate and browser_navigate_back tools\nif .tool_name == \\\"browser_navigate\\\" || .tool_name == \\\"browser_navigate_back\\\" {\n    # 中文: 提取URL，browser_navigate_back 可能没有url参数\n    # English: Extract URL, browser_navigate_back may not have url parameter\n    url = if exists(.parameters.url) {\n        .parameters.url\n    } else {\n        \\\"[BROWSER_BACK_OPERATION]\\\"\n    }\n\n    # 中文: 提取内容 / English: Extract content\n    content = if length!(.content) > 0 {\n        .content[0].text\n    } else {\n        \\\"\\\"\n    }\n\n    # 中文: 使用重新赋值方式，只保留需要的字段\n    # English: Use reassignment to keep only needed fields\n    . = {\n        \\\"url\\\": url,\n        \\\"content\\\": content\n    }\n}"
 }
 ```
+
+`connect_timeout_secs` 是 STDIO MCP Server 初始化握手超时，单位为秒，必须为正整数；省略时使用 SDK 默认值 30 秒。
+该配置只影响进程启动阶段的 `initialize` 握手，不影响后续工具调用超时。
 
 方式 A：以命令行文本形式添加（注意 `vrl` 中引号与换行需要转义）
 

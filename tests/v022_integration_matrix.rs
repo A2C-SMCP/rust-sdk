@@ -793,15 +793,15 @@ async fn tool_call_cancel_fireforget_and_broadcast() {
     use tf_rust_socketio::asynchronous::ClientBuilder;
     use tf_rust_socketio::{Payload, TransportType};
 
-    let td = TempDir::new().unwrap();
     let server = RelayServer::start().await;
-    let computer = spawn_computer(&server.url(), OFFICE, COMPUTER, &td, None).await;
 
-    // 观察者 Computer：捕获 notify:tool_call_cancel 广播载体。房间每 office 仅允许 1 个 Agent（可多
-    // Computer），且 `socket.to(office)` 广播**排除发起方**，故以 Computer 角色作独立观察者接广播。
+    // protocol#66「每 role 一席」：房内至多 1 Agent + 1 Computer，「独立第三方观察者」不可再构造
+    // ——观察者即本房**唯一**的 Computer（裸桩：记录 notify:tool_call_cancel 广播载体）。
+    // `socket.to(office)` 广播**排除发起方**（Agent），故 Room 内其余成员恰好只有这台 Computer。
+    // 取消的**实际副作用**（工具真被中断 / 结果级 meta）由 crate 级套件覆盖；本测试只钉传输契约。
     let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let seen_cb = seen.clone();
-    let observer = ClientBuilder::new(server.url())
+    let computer = ClientBuilder::new(server.url())
         .transport_type(TransportType::Websocket)
         .namespace(NS)
         .auth(serde_json::json!({"token": SECRET}))
@@ -816,14 +816,15 @@ async fn tool_call_cancel_fireforget_and_broadcast() {
         })
         .connect()
         .await
-        .expect("observer connect");
+        .expect("computer connect");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    join(&observer, Role::Computer, OFFICE, "computer-observer").await;
+    join(&computer, Role::Computer, OFFICE, COMPUTER).await;
 
     let agent = agent_client(&server.url()).await;
     join(&agent, Role::Agent, OFFICE, AGENT).await;
 
-    // 起一个在途 sleep 工具（fire-and-forget；只需让其在 Computer 侧在途）。
+    // 让 Computer 侧有一笔在途 tool_call（fire-and-forget；裸桩不应答）。
+    // 叙事完整性：取消针对在途调用；广播本身与工具是否在途无关。
     let tool_req = ToolCallReq {
         base: AgentCallData {
             agent: AGENT.into(),
@@ -870,13 +871,13 @@ async fn tool_call_cancel_fireforget_and_broadcast() {
         "server:tool_call_cancel 应 fire-and-forget（无 ack）"
     );
 
-    // 2) 观察者 Computer 应收到 notify:tool_call_cancel 广播，载体回显 {agent, req_id}。
+    // 2) 本房 Computer 应收到 notify:tool_call_cancel 广播，载体回显 {agent, req_id}。
     tokio::time::sleep(Duration::from_millis(400)).await;
     let payload = seen
         .lock()
         .unwrap()
         .clone()
-        .expect("观察者应收到 notify:tool_call_cancel 广播");
+        .expect("本房 Computer 应收到 notify:tool_call_cancel 广播");
     assert_eq!(
         deep_find(&payload, "req_id").and_then(Value::as_str),
         Some("cancel-req"),
@@ -887,9 +888,8 @@ async fn tool_call_cancel_fireforget_and_broadcast() {
         Some(AGENT)
     );
 
-    computer.shutdown().await.unwrap();
     agent.disconnect().await.unwrap();
-    observer.disconnect().await.unwrap();
+    computer.disconnect().await.unwrap();
     server.shutdown();
 }
 

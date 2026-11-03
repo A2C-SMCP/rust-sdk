@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,10 +27,14 @@ use tracing::{debug, error, info, warn};
 
 // INT-01 #68：SKILL / blob 子系统编排 / SKILL & blob subsystem orchestration。
 use crate::blob::{
-    decode_blob_handle, default_thresholds, encode_toolspool_handle, BlobHandleError, BlobResolver,
-    BlobThresholds, BlobTooLargeError, BlobUploadStore, DecodedHandle, ResolvedBlob,
+    build_protected_paths, decode_blob_handle, default_thresholds, encode_toolspool_handle,
+    resolve_for_pull, resolve_path as resolve_read_path_core, resolve_read_roots,
+    resolve_read_roots_and_landing_root, BlobHandleError, BlobResolver, BlobThresholds,
+    BlobTooLargeError, BlobUploadStore, DecodedHandle, PathAccessPolicy, PathHandlePayload,
+    PathResolveError, ProtectedPaths, ReadRoot, ResolveReason, ResolvedBlob, ResolvedPath,
     SkillBlobResolver, SkillRootLookup, ToolspoolBlobResolver, ToolspoolBlobStore,
 };
+use smcp::utils::path_norm::{native_platform, PathPlatform};
 // 治理生命周期：只导入类型；自由函数全限定调用以免与同名 Computer 方法混淆 / types only; call free fns FQ.
 use crate::governance::{
     resolve_governance_snapshot, GovernanceArgs, GovernanceQueryError, GovernanceRuntimeOverlay,
@@ -98,6 +102,7 @@ use crate::mcp_clients::{
 use crate::oauth::{InMemoryOAuthCredentialStore, OAuthCredentialStore};
 use crate::socketio_client::{
     SmcpComputerClient, SmcpComputerClientBuilder, DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+    DEFAULT_OFFICE_REJOIN_BUDGET,
 };
 use crate::status::{ComputerEvent, ComputerStatusSnapshot, LifecycleState, RuntimeStatus};
 
@@ -107,7 +112,7 @@ type ConfirmCallbackType = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) -> b
 /// Process-unique tokens fence stale Socket.IO clients from publishing Computer lifecycle changes.
 static NEXT_SOCKETIO_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Private dependency boundary for the Socket.IO slot installation transaction.
+/// Private dependency boundary for Socket.IO slot lifecycle operations.
 ///
 /// Keeping transport teardown and lifecycle ownership behind one interface makes the failure
 /// invariants deterministic to test without weakening the public client API or adding production
@@ -133,7 +138,9 @@ trait SocketIoInstallClient: Send + Sync {
 
     fn deactivate_runtime_lifecycle(&self);
 
-    async fn disconnect_for_install(&self) -> ComputerResult<()>;
+    /// Completion is terminal even on a wire-send error; cancellation may leave
+    /// the caller's slot populated until another teardown attempt completes.
+    async fn disconnect_transport(&self) -> ComputerResult<()>;
 }
 
 #[async_trait]
@@ -167,9 +174,25 @@ impl SocketIoInstallClient for SmcpComputerClient {
         self.deactivate_runtime_lifecycle();
     }
 
-    async fn disconnect_for_install(&self) -> ComputerResult<()> {
+    async fn disconnect_transport(&self) -> ComputerResult<()> {
         self.disconnect().await
     }
+}
+
+/// Retire a slot while its write lock and the Computer lifecycle gate are held.
+/// A completed disconnect has stopped the transport even if its CLOSE frame failed.
+async fn retire_socketio_slot<C: SocketIoInstallClient>(
+    slot: &mut Option<Arc<C>>,
+) -> ComputerResult<()> {
+    let result = if let Some(client) = slot.as_ref() {
+        let result = client.disconnect_transport().await;
+        client.deactivate_runtime_lifecycle();
+        result
+    } else {
+        Ok(())
+    };
+    *slot = None;
+    result
 }
 
 /// Install one already-connected client while the Computer Socket.IO lifecycle gate is held.
@@ -216,7 +239,7 @@ where
     // Claim before cleanup so a shut-down Computer cannot disconnect a candidate currently owned
     // by another Computer. An unowned candidate is still retired before the rejection returns.
     if status.state() == LifecycleState::Shutdown {
-        let cleanup = client.disconnect_for_install().await;
+        let cleanup = client.disconnect_transport().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         cleanup?;
         return Err(ComputerError::InvalidState(
@@ -225,28 +248,21 @@ where
     }
 
     // A tf-rust-socketio reader owns an internal Client clone, so dropping the old public Arc does
-    // not close it. Retire it before publishing the replacement; if 0.8.1 is already in reconnect
-    // backoff, the retiring event gate closes its next namespace before any app handler can run.
-    if let Some(previous) = socketio_ref.as_ref() {
-        if let Err(error) = previous.disconnect_for_install().await {
-            if let Err(cleanup_error) = client.disconnect_for_install().await {
-                warn!(
-                    error = %cleanup_error,
-                    "replacement Socket.IO client cleanup failed after old teardown error"
-                );
-            }
-            client.release_runtime_lifecycle_claim(lifecycle_token);
-            return Err(error);
+    // not close it. Teardown stops its reconnect owner before publishing a replacement.
+    // Even a failed CLOSE send is terminal: never retain a retired Arc as the current slot.
+    if let Err(error) = retire_socketio_slot(&mut socketio_ref).await {
+        if let Err(cleanup_error) = client.disconnect_transport().await {
+            warn!(
+                error = %cleanup_error,
+                "replacement Socket.IO client cleanup failed after old teardown error"
+            );
         }
-        previous.deactivate_runtime_lifecycle();
-        // The old transport is now permanently retired. Remove it before candidate activation so
-        // a concurrent direct disconnect that invalidates the candidate cannot leave a dead old
-        // Arc masquerading as the current slot value.
-        socketio_ref.take();
+        client.release_runtime_lifecycle_claim(lifecycle_token);
+        return Err(error);
     }
 
     if !client.activate_runtime_lifecycle(lifecycle_token) {
-        let _ = client.disconnect_for_install().await;
+        let _ = client.disconnect_transport().await;
         client.release_runtime_lifecycle_claim(lifecycle_token);
         return Err(ComputerError::RuntimeError(
             "Socket.IO lifecycle ownership was lost during installation".to_string(),
@@ -311,6 +327,13 @@ pub struct ConnectOptions {
     /// Maximum total wait for initial Engine.IO establishment and Socket.IO namespace readiness.
     /// Defaults to 30 seconds.
     pub namespace_connect_timeout: std::time::Duration,
+    /// #234：自动回房遇到 `4101`（本 role 席位被占）时的有界退避总预算。
+    ///
+    /// 缺省 [`DEFAULT_OFFICE_REJOIN_BUDGET`]（60s）；`Duration::ZERO` = 单次尝试。只作用于传输层
+    /// 重连后的自动回放，显式 `join_office` 从不重试。若通过
+    /// [`Computer::with_office_rejoin_budget`] 注入了覆盖，则以覆盖为准。
+    /// Total budget for bounded backoff retries when an automatic rejoin hits `4101`.
+    pub office_rejoin_budget: std::time::Duration,
 }
 
 impl Default for ConnectOptions {
@@ -321,6 +344,7 @@ impl Default for ConnectOptions {
             headers: None,
             namespace: smcp::SMCP_NAMESPACE.to_string(),
             namespace_connect_timeout: DEFAULT_NAMESPACE_CONNECT_TIMEOUT,
+            office_rejoin_budget: DEFAULT_OFFICE_REJOIN_BUDGET,
         }
     }
 }
@@ -339,6 +363,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("headers", &self.headers)
             .field("namespace", &self.namespace)
             .field("namespace_connect_timeout", &self.namespace_connect_timeout)
+            .field("office_rejoin_budget", &self.office_rejoin_budget)
             .finish()
     }
 }
@@ -484,7 +509,7 @@ struct RawMcpServerEntry {
 
 pub struct Computer<S: Session> {
     /// 计算机名称 / Computer name
-    name: String,
+    name: Arc<String>,
     /// MCP服务器管理器 / MCP server manager
     mcp_manager: Arc<RwLock<Option<MCPServerManager>>>,
     /// 输入定义映射 / Input definitions map (id -> input)
@@ -518,6 +543,8 @@ pub struct Computer<S: Session> {
     /// #214：Computer 级 MCP 启动并发门控——单启/批量启动/Plugin 治理恢复共享同一把，
     /// 任意时刻总在途启动事务数 ≤ 配置上限。未配置记录 in-flight 但不限流。
     mcp_start_gate: Arc<crate::mcp_start_gate::McpStartGate>,
+    /// #214：shutdown 取消尚未进入生命周期读锁的启动事务，避免关闭写锁与排队读锁互相等待。
+    mcp_start_shutdown: CancellationToken,
     /// #214：Input 解析全局串行锁——并发启动期间 **只允许一个交互请求在飞**
     /// （协议 §5.13 每实际启动重解析 Input；交互式 resolver 不得并行触发多个提示）。
     mcp_input_resolve_lock: Arc<Mutex<()>>,
@@ -535,8 +562,28 @@ pub struct Computer<S: Session> {
     /// 协议 §2.5-5 要求 origin 集「可从当次 boot 的声明式输入重建」——Computer 即该 boot 对象，故 flag 与 embed
     /// 同住于此，经 [`non_plugin_declared_bundle_ids`](Self::non_plugin_declared_bundle_ids) 一并投影。
     /// **回收判据 MUST 含本层**：漏传会让经 `--mcp-config` 声明的用户 server 退回「非用户声明」而被连坐停摘
-    /// （#153 遗留缺口形状）。镜像 python `Computer(mcp_flag_config=)`。
+    /// （#153 遗留缺口形状）。镜像 python `Computer(mcp_flag_config=)`。构造期归一失败时置 `None`
+    /// （fail-closed），原因见 [`Self::mcp_flag_config_error`]。
     mcp_flag_config: Option<PathBuf>,
+    /// #248 复审：`with_mcp_flag_config` 归一失败的原因（`Some` = flag 层 mcp.json 已 fail-closed 置空）。
+    ///
+    /// `--mcp-config` 的 flag origin 受信（可免批准直挂 stdio server）；归一失败若回退原始 `~...` 串，
+    /// 被 clone 的仓库可植入 `<cwd>/~alice/mcp.json` 冒充受信 flag。CLI 启动边界经
+    /// [`Self::mcp_flag_config_error`] `eprintln!`。
+    mcp_flag_config_error: Option<String>,
+    /// #248：`--settings <file>` 的 **flag 层** settings.json 路径（`Computer` 运行期解析 `readRoots` /
+    /// `landingRoot` 的 flag 作用域来源；与 `mcp_flag_config` 组成 flag scope 文件对，协议 §2.5-3）。
+    ///
+    /// 缺省 `None` = 无 flag 层（既有行为不变）。构造期经 [`with_flag_settings_path`](Self::with_flag_settings_path)
+    /// 归一为绝对路径——flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集条目（flag 文件本身
+    /// 必须被 [`Self::path_access_policy`] 挡住）与合并视图三处必须始终指向**同一文件**；否则宿主
+    /// `chdir` 后相对路径会漂移到另一份文件，读授权与拒绝集随 cwd 变化而不一致。归一失败时本字段
+    /// 保持 `None`（fail-closed），原因见 [`Self::flag_settings_path_error`]。
+    /// clone 语义同 `mcp_flag_config`：不可变构造入参，随 `Clone` / `clone_for_handlers` 保留。
+    flag_settings_path: Option<PathBuf>,
+    /// #248：`with_flag_settings_path` 归一失败的原因（`Some` = flag 层已 fail-closed 置空，不静默
+    /// 退回相对串 / `<cwd>/~/...`）。CLI 启动边界经 [`Self::flag_settings_path_error`] 取值 `eprintln!`。
+    flag_settings_path_error: Option<String>,
     /// 输入处理器 / Input handler
     input_handler: Arc<RwLock<InputHandler>>,
     /// 自动连接标志 / Auto connect flag
@@ -563,6 +610,8 @@ pub struct Computer<S: Session> {
     socketio_lifecycle_gate: Arc<Mutex<()>>,
     /// Active Socket.IO client's lifecycle publication token.
     socketio_lifecycle_owner: Arc<StdMutex<u64>>,
+    /// #234：自动回房预算覆盖（`Some` 时优先于 `ConnectOptions::office_rejoin_budget`）。
+    office_rejoin_budget_override: Option<std::time::Duration>,
     /// 确认回调函数 / Confirmation callback function
     confirm_callback: Option<ConfirmCallbackType>,
 
@@ -917,7 +966,7 @@ impl<S: Session> Computer<S> {
         auto_connect: bool,
         auto_reconnect: bool,
     ) -> Self {
-        let name = name.into();
+        let name = Arc::new(name.into());
         let inputs = inputs.unwrap_or_default();
         let raw_mcp_servers = mcp_servers.unwrap_or_default();
         // #147/S14：frozen embed 声明快照 = 构造入参**原样**（存储层不折叠，保留同 display 名异显式 bundle_id
@@ -963,9 +1012,13 @@ impl<S: Session> Computer<S> {
             mcp_operations_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_lifecycle_locks: Arc::new(crate::weak_registry::WeakRegistry::default()),
             mcp_start_gate: crate::mcp_start_gate::McpStartGate::new(None),
+            mcp_start_shutdown: CancellationToken::new(),
             mcp_input_resolve_lock: Arc::new(Mutex::new(())),
             embed_servers,
             mcp_flag_config: None,
+            mcp_flag_config_error: None,
+            flag_settings_path: None,
+            flag_settings_path_error: None,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
             auto_reconnect,
@@ -976,6 +1029,7 @@ impl<S: Session> Computer<S> {
             socketio_client,
             socketio_lifecycle_gate: Arc::new(Mutex::new(())),
             socketio_lifecycle_owner: Arc::new(StdMutex::new(0)),
+            office_rejoin_budget_override: None,
             confirm_callback: None,
             skill_registry,
             skill_home,
@@ -1025,6 +1079,26 @@ impl<S: Session> Computer<S> {
         self
     }
 
+    /// #234：注入自动回房 `4101` 有界退避的预算覆盖。
+    ///
+    /// 优先于 [`ConnectOptions::office_rejoin_budget`]（与其它 `with_*` 注入覆盖语义一致）；
+    /// `Duration::ZERO` = 单次尝试。仅作用于传输层重连后的自动回放，显式 `join_office` 从不重试。
+    /// Override the bounded backoff budget for automatic rejoin after `4101`; takes precedence
+    /// over `ConnectOptions::office_rejoin_budget`. `Duration::ZERO` disables retries.
+    #[must_use]
+    pub fn with_office_rejoin_budget(mut self, budget: std::time::Duration) -> Self {
+        self.office_rejoin_budget_override = Some(budget);
+        self
+    }
+
+    /// 本实例的回房预算覆盖值（供 CLI 的 `identity reset` 回房复用同一预算口径）。
+    ///
+    /// `None` 表示未覆盖——调用方应回退到 CLI 参数/默认值。crate 内部读取。
+    #[cfg(feature = "cli")]
+    pub(crate) fn office_rejoin_budget_override_value(&self) -> Option<std::time::Duration> {
+        self.office_rejoin_budget_override
+    }
+
     /// 注入 MCP client factory override（#152 测试接缝）/ Inject a client factory override（test seam）。
     ///
     /// 缺省不注入 → manager 用真实 `client_factory`（stdio/sse/http 真实连接）。注入后由内部 `new_manager`
@@ -1068,6 +1142,9 @@ impl<S: Session> Computer<S> {
     ///
     /// #113 S6：`add_or_update_server` / `remove_server` 落盘经此目录的 project/local scope（#98 project 锚点）。
     /// 测试/部署据此定向落盘目录，避免污染真实进程 cwd。**只碰 project 含 local、不碰 home**。
+    ///
+    /// **不隔离 `computer_id`**：user-scope（含 `a2c/computer-id`）只由 [`Self::with_config_env`]
+    /// 或进程环境决定；仅设置本方法不会改变身份落盘位置。
     #[must_use]
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config_dir = Some(dir.into());
@@ -1080,6 +1157,17 @@ impl<S: Session> Computer<S> {
     /// `add_or_update_server` / `remove_server` 的来源解析与写目标、`list_mcp_servers_with_metadata` 的归属门控、
     /// 以及 boot 的 `reconcile_governance` 恢复，全部锚定**本实例** User config，**不**回退宿主进程 `$HOME`/`$XDG`。
     /// 缺省（未注入）→ `None` → 走进程环境（CLI / ambient，行为与今日一致，守 #121 DoD「未注入保持 ambient」）。
+    ///
+    /// **protocol#64**：该 env 同时决定持久化 `computer_id` 的位置（`<config>/a2c/computer-id`）。若宿主
+    /// 为每次会话注入不同的临时 env，每次启动都会得到**新身份**，基于 `computer://<computer_id>/…` 的
+    /// 持久引用会静默失效——需要稳定身份时请对同一宿主复用同一 env。
+    ///
+    /// 注入映射必须包含**绝对** `HOME` 或**绝对** `XDG_CONFIG_HOME`：否则 `connect_socketio` 以
+    /// [`ComputerError::IdentityStore`] 拒绝（绝不回退宿主进程 `$HOME`）。
+    /// The injected map MUST contain an absolute `HOME` or `XDG_CONFIG_HOME`; otherwise
+    /// `connect_socketio` fails with `IdentityStore` instead of falling back to the host `$HOME`.
+    /// This env also anchors the persisted `computer_id`; per-session env maps silently change the
+    /// identity every start. Reuse one env per host when identity stability matters.
     #[must_use]
     pub fn with_config_env(mut self, env: impl Into<EnvMap>) -> Self {
         self.config_env = Some(env.into());
@@ -1114,10 +1202,90 @@ impl<S: Session> Computer<S> {
     /// 与 `Computer::new(mcp_servers=…)`（embed 层）同属**当次 boot 的声明式输入**（§2.5-5）：二者共同构成
     /// 回收判据的「非用户声明」数据源。CLI `--mcp-config` 与嵌入宿主均应注入，否则该层声明的用户 server 会在
     /// plugin uninstall/disable/gc 时被**连坐**停摘。镜像 python `Computer(mcp_flag_config=)`。
+    ///
+    /// **构造期归一 + fail-closed**（#248 复审）：与 `--settings` 同款（`~` 展开 / 绝对化；失败置 `None`
+    /// 并记录 [`mcp_flag_config_error`](Self::mcp_flag_config_error)）——`--mcp-config` 的 flag origin 受信、
+    /// 可免批准直挂 server，回读原始相对串会允许仓库植入 `<cwd>/~alice/mcp.json` 提权。信任层消费者
+    /// MUST 用 [`normalized_mcp_flag_config`](Self::normalized_mcp_flag_config)。路径含 `~` 且需注入 env 时，
+    /// 请先 [`with_config_env`](Self::with_config_env) 再调用本方法。
     #[must_use]
     pub fn with_mcp_flag_config(mut self, path: impl Into<PathBuf>) -> Self {
-        self.mcp_flag_config = Some(path.into());
+        let raw = path.into();
+        match normalize_flag_path(&raw, self.config_env()) {
+            Ok(normalized) => {
+                self.mcp_flag_config = Some(normalized);
+                self.mcp_flag_config_error = None;
+            }
+            Err(reason) => {
+                let message = format!(
+                    "⚠ mcp config path {} is unusable ({reason}); flag MCP layer disabled (fail-closed)",
+                    raw.display()
+                );
+                error!("{message}");
+                self.mcp_flag_config = None;
+                self.mcp_flag_config_error = Some(message);
+            }
+        }
         self
+    }
+
+    /// #248 复审：`with_mcp_flag_config` 的归一失败诊断（`Some` = flag 层 mcp.json 已 fail-closed 置空）。
+    pub fn mcp_flag_config_error(&self) -> Option<&str> {
+        self.mcp_flag_config_error.as_deref()
+    }
+
+    /// #248 复审：归一后的 `--mcp-config` 绝对路径（`None` = 无 flag 层或归一失败）。
+    ///
+    /// 信任层消费者（启动批准框的 `resolve_mcp_config`）必须用它，不得回读原始串。
+    pub fn normalized_mcp_flag_config(&self) -> Option<&Path> {
+        self.mcp_flag_config.as_deref()
+    }
+
+    /// #248：注入 `--settings <file>` 的 flag 层 settings.json 路径（运行期 `readRoots` / `landingRoot`
+    /// 的 flag 作用域来源）/ inject the `--settings` flag-layer settings path。
+    ///
+    /// 与 [`with_mcp_flag_config`](Self::with_mcp_flag_config) 同属 flag scope 文件对（协议 §2.5-3）。
+    /// **构造期归一为绝对路径**（对齐 python `Computer._absolute_path`）：拒绝集 / 文件读取 / settings
+    /// 合并三处必须看到同一路径。`~` 优先用注入 env 的 `HOME`（空白视同未设置），其次退回进程 `HOME`；
+    /// 两者皆无、`~user` 形态（rust 无 NSS expanduser）或无法绝对化时 **fail-closed**：flag 层置空，
+    /// 失败原因经 [`flag_settings_path_error`](Self::flag_settings_path_error) 呈现（CLI 启动时
+    /// `eprintln!`），**不**退回相对串或 `<cwd>/~/...` 的错误文件。需要 `~` 锚定**注入** HOME 时，
+    /// 请先 [`with_config_env`](Self::with_config_env) 再调用本方法。缺省 `None` = 无 flag 层。
+    #[must_use]
+    pub fn with_flag_settings_path(mut self, path: impl Into<PathBuf>) -> Self {
+        let raw = path.into();
+        match normalize_flag_path(&raw, self.config_env()) {
+            Ok(normalized) => {
+                self.flag_settings_path = Some(normalized);
+                self.flag_settings_path_error = None;
+            }
+            Err(reason) => {
+                let message = format!(
+                    "⚠ flag settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
+                    raw.display()
+                );
+                error!("{message}");
+                self.flag_settings_path = None;
+                self.flag_settings_path_error = Some(message);
+            }
+        }
+        self
+    }
+
+    /// #248：`with_flag_settings_path` 的归一失败诊断（`Some` = flag 层已 fail-closed 置空）。
+    ///
+    /// CLI 在启动边界把它打到 stderr；库宿主可自行呈现。成功后恒 `None`。
+    pub fn flag_settings_path_error(&self) -> Option<&str> {
+        self.flag_settings_path_error.as_deref()
+    }
+
+    /// #248 复审：归一后的 flag settings 绝对路径（`None` = 无 flag 层或归一失败）。
+    ///
+    /// **信任层消费者必须用它，不得回读原始 `--settings` 串**：原始相对串（如 `~alice/x.json`）
+    /// 会按进程 cwd 解析，仓库可植入 `<cwd>/~alice/...` 冒充受信 flag 层；归一失败时这里恒
+    /// `None`，调用方须按「无 flag 层」处理。CLI 的治理重挂与启动批准框即经此取值。
+    pub fn normalized_flag_settings_path(&self) -> Option<&Path> {
+        self.flag_settings_path.as_deref()
     }
 
     /// #214：安装 Computer 级 MCP **最大并发启动数**（构造期策略，`0` 按 `1` 处理）。
@@ -1886,7 +2054,8 @@ impl<S: Session> Computer<S> {
     ///
     /// 优先 `with_landing_root` 注入覆盖；否则从 settings `landingRoot` 取（绝对路径；project scope
     /// 供给已被 [`TRUSTED_SCOPE_ONLY_FIELDS`](crate::settings::schema::TRUSTED_SCOPE_ONLY_FIELDS)
-    /// 过滤）。未配置 → `None` → store fail-closed（`4019 forbidden`，零字节落盘）。
+    /// 过滤；flag 层经 [`with_flag_settings_path`](Self::with_flag_settings_path) 同源参与，rust-sdk#248）。
+    /// 未配置 → `None` → store fail-closed（`4019 forbidden`，零字节落盘）。
     pub async fn landing_root(&self) -> Option<PathBuf> {
         if let Some(override_root) = self.landing_root_override.clone() {
             return Some(override_root);
@@ -1895,7 +2064,11 @@ impl<S: Session> Computer<S> {
         if let Some(cached) = slot.as_ref() {
             return Some(cached.clone());
         }
-        if let Some(root) = resolve_landing_root_settings(&self.config_dir(), self.config_env()) {
+        if let Some(root) = resolve_landing_root_settings(
+            &self.config_dir(),
+            self.config_env(),
+            self.flag_settings_path.as_deref(),
+        ) {
             *slot = Some(root.clone());
             return Some(root);
         }
@@ -2003,7 +2176,135 @@ impl<S: Session> Computer<S> {
                     .map(|r| PathBuf::from(r.path));
                 SkillBlobResolver::new(PreresolvedRoot(root)).resolve(&decoded)
             }
+            // v0.5.0 protocol#65：path 句柄按**当前** readRoots / 文件系统状态重跑第 3–8 步。
+            DecodedHandle::Path(payload) => self.pull_path_blob(payload).await,
         }
+    }
+
+    // ── v0.5.0 protocol#65：按路径读取 / read-by-path ─────────────────────────
+
+    /// `client:resolve_path` 的授权读根（settings 键 `readRoots`，**默认空 = 不可读**）。
+    ///
+    /// 每次请求**现算**（settings 可能被另一进程改写、root 符号链接可能换指向）；空根在
+    /// path core 第 2 步即 `forbidden`，不触碰目标路径。`flag_settings_path` 非 `None` 时 flag 层
+    /// 一并参与合并（受信 scope，rust-sdk#248）。
+    pub async fn read_roots(&self) -> Vec<ReadRoot> {
+        let config_dir = self.config_dir();
+        let env = self.config_env().cloned();
+        let flag_settings_path = self.flag_settings_path.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_read_roots(&config_dir, env.as_ref(), flag_settings_path.as_deref())
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// 一次请求的授权快照（读根 + 固定拒绝集），供 resolve / pull 共用。
+    ///
+    /// 空 `readRoots` 时短路拒绝集构造（fail-closed，且不产生 SKILL Home 副作用）。flag 层
+    /// （`flag_settings_path`）参与读根 / landingRoot 合并，且 flag settings 文件本身进入固定
+    /// 拒绝集（rust-sdk#248，与 python `_build_protected_paths` 对齐）。
+    pub async fn path_access_policy(&self) -> PathAccessPolicy {
+        let config_dir = self.config_dir();
+        let env = self.config_env().cloned();
+        let flag_settings_path = self.flag_settings_path.clone();
+        // 一次 settings 解析同时得读根 + landingRoot；空根直接短路，不构造拒绝集。
+        let (roots, settings_landing) = {
+            let config_dir = config_dir.clone();
+            let env = env.clone();
+            let flag_settings_path = flag_settings_path.clone();
+            tokio::task::spawn_blocking(move || {
+                resolve_read_roots_and_landing_root(
+                    &config_dir,
+                    env.as_ref(),
+                    flag_settings_path.as_deref(),
+                )
+            })
+            .await
+            .unwrap_or_default()
+        };
+        if roots.is_empty() {
+            return PathAccessPolicy {
+                roots,
+                protected: ProtectedPaths::default(),
+            };
+        }
+        let skill_home = self.skill_home();
+        let blob_cache_root = self
+            .blob_cache_root_override
+            .clone()
+            .unwrap_or_else(default_blob_cache_root);
+        // 与写入根对齐：override > 进程内已缓存 > 本次 settings 视图（未配置时不缓存 None，
+        // 事后补配置即时生效）。
+        let landing_root = if let Some(root) = self.landing_root_override.clone() {
+            Some(root)
+        } else if let Some(cached) = self.landing_root.read().await.clone() {
+            Some(cached)
+        } else {
+            settings_landing
+        };
+        // `--mcp-config`（flag 层）可含 server 字面量 env / 凭据，必须在拒绝集内。
+        let flag_mcp_config = self.mcp_flag_config.clone();
+        tokio::task::spawn_blocking(move || {
+            build_path_access_policy(
+                roots,
+                &config_dir,
+                env.as_ref(),
+                skill_home,
+                blob_cache_root,
+                landing_root,
+                flag_mcp_config.as_deref(),
+                flag_settings_path.as_deref(),
+                native_platform(),
+            )
+        })
+        .await
+        // JoinError → 空策略（fail-closed：无根即 forbidden）。
+        .unwrap_or_default()
+    }
+
+    /// 执行协议九步 resolve 管线并铸造 path 句柄（`client:resolve_path` 核心）。
+    ///
+    /// `sha256` 全量流式读取经 [`tokio::task::spawn_blocking`] offload，避免霸占 async 线程。
+    ///
+    /// # Errors
+    /// [`PathResolveError`]（`reason` ∈ invalid_path / forbidden / not_found / not_a_file）→ 4020。
+    pub async fn resolve_read_path(&self, path: &str) -> Result<ResolvedPath, PathResolveError> {
+        let policy = self.path_access_policy().await;
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            resolve_read_path_core(&path, &policy.roots, &policy.protected, native_platform())
+        })
+        .await
+        .map_err(|error| {
+            PathResolveError::new(
+                ResolveReason::Forbidden,
+                format!("resolve task failed: {error}"),
+            )
+        })?
+    }
+
+    /// `client:get_blob` 解析 path 句柄：按当前授权复核并从**同一打开句柄**切片。
+    ///
+    /// # Errors
+    /// [`BlobHandleError`]（4018 `invalid_handle` / `forbidden` / `gone`）。
+    pub async fn pull_path_blob(
+        &self,
+        payload: &PathHandlePayload,
+    ) -> Result<ResolvedBlob, BlobHandleError> {
+        let policy = self.path_access_policy().await;
+        let payload = payload.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_for_pull(
+                &payload,
+                &policy.roots,
+                &policy.protected,
+                native_platform(),
+            )
+            .map(|pull| pull.into_resolved_blob())
+        })
+        .await
+        .map_err(|error| BlobHandleError::Forbidden(format!("path pull task failed: {error}")))?
     }
 
     // ── 编排链：去抖结算 + user 源 watcher（#68，设计 §8）─────────────────────
@@ -2177,11 +2478,45 @@ impl<S: Session> Computer<S> {
         &self.name
     }
 
+    /// CLI naming requires exclusive ownership. Check before leaving the old office.
+    #[cfg(feature = "cli")]
+    pub(crate) fn ensure_exclusive_name(&mut self) -> ComputerResult<()> {
+        Arc::get_mut(&mut self.name).ok_or_else(|| {
+            ComputerError::InvalidState(
+                "Cannot rename while another Computer handle exists; release its clones first"
+                    .to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// CLI-only identity replacement, after disconnect and with no public clones.
+    #[cfg(feature = "cli")]
+    pub(crate) async fn set_name(&mut self, name: impl Into<String>) -> ComputerResult<()> {
+        self.ensure_exclusive_name()?;
+        let _gate = self.socketio_lifecycle_gate.lock().await;
+        if self.socketio_client.read().await.is_some() {
+            return Err(ComputerError::InvalidState(
+                "Disconnect Socket.IO before changing the computer name".to_string(),
+            ));
+        }
+        self.name = Arc::new(name.into());
+        Ok(())
+    }
+
     /// 获取 Socket.IO 客户端引用 / Get Socket.IO client reference
     /// 返回 Arc 包装的客户端，确保其生命周期
     /// Returns Arc-wrapped client, ensuring its lifetime
     pub fn get_socketio_client(&self) -> Arc<RwLock<Option<Arc<SmcpComputerClient>>>> {
         self.socketio_client.clone()
+    }
+
+    /// 当前是否装有 Socket.IO 连接 / Whether a Socket.IO client is installed.
+    ///
+    /// 即 `status` 命令与 [`Self::join_office`] 的「未连接」分支所依据的口径（连接槽内置否）；
+    /// CLI `socket join` / `socket join` 改名路径的前置判据复用本方法。
+    pub async fn has_socketio_client(&self) -> bool {
+        self.socketio_client.read().await.is_some()
     }
 
     /// #178：解析当前 MCP 管理器——读锁内仅克隆 `MCPServerManager`（全 Arc 字段，克隆廉价），
@@ -4043,7 +4378,14 @@ impl<S: Session> Computer<S> {
         // Drop 即释放；排队等待者不持任何生命周期锁，不阻塞 shutdown 排他写锁。
         // 单启/批量/治理恢复共用此门（任意时刻总在途 ≤ 上限；未配置不限流仍计数）。
         let _start_permit = self.mcp_start_gate.acquire().await?;
-        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        let _global_lifecycle = tokio::select! {
+            guard = self.mcp_lifecycle_gate.read() => guard,
+            _ = self.mcp_start_shutdown.cancelled() => {
+                return Err(ComputerError::InvalidState(
+                    "MCP startup cancelled because Computer is shutting down".to_string(),
+                ));
+            }
+        };
         self.ensure_mcp_operations_open()?;
         let lifecycle = self.mcp_lifecycle_lock(id);
         let _lifecycle_guard = lifecycle.lock().await;
@@ -4168,7 +4510,14 @@ impl<S: Session> Computer<S> {
     pub async fn restart_mcp_client(&self, id: &BundleId) -> ComputerResult<()> {
         // #214：restart = stop→start 事务，同样占并发许可（在途启动数 ≤ 上限不变量包含 restart。
         let _start_permit = self.mcp_start_gate.acquire().await?;
-        let _global_lifecycle = self.mcp_lifecycle_gate.read().await;
+        let _global_lifecycle = tokio::select! {
+            guard = self.mcp_lifecycle_gate.read() => guard,
+            _ = self.mcp_start_shutdown.cancelled() => {
+                return Err(ComputerError::InvalidState(
+                    "MCP startup cancelled because Computer is shutting down".to_string(),
+                ));
+            }
+        };
         self.ensure_mcp_operations_open()?;
         let lifecycle = self.mcp_lifecycle_lock(id);
         let _lifecycle_guard = lifecycle.lock().await;
@@ -4470,8 +4819,22 @@ impl<S: Session> Computer<S> {
 
     /// 设置Socket.IO客户端 / Set Socket.IO client
     /// 此方法会替换现有的 client（如果有）并保持强引用
-    /// This method replaces existing client (if any) and keeps strong reference
+    ///
+    /// **protocol#64**：本方法不校验、也不注入 `computer_id`——传入的 client 若未携带身份，
+    /// 入房载荷会省略该键，Server 自 v0.5.0 起会以 `400` 拒绝 Computer 入房。正常路径请用
+    /// [`Self::connect_socketio`]，由它物化并注入稳定身份。装入无身份 client 时会打
+    /// `warn!` 日志（不拒绝，保留既有 API 语义）。
+    /// This setter neither validates nor injects `computer_id`; an identity-less client's join is
+    /// rejected with `400` by the v0.5.0 server (a `warn!` is logged on install). Use
+    /// `connect_socketio` instead.
     pub async fn set_socketio_client(&self, client: Arc<SmcpComputerClient>) -> ComputerResult<()> {
+        if !client.has_computer_identity() {
+            warn!(
+                "set_socketio_client: installed client carries no computer_id; its join_office will \
+                 be rejected with 400 by a v0.5.0 server — production connections must use \
+                 connect_socketio"
+            );
+        }
         let gate = Arc::clone(&self.socketio_lifecycle_gate);
         let socketio_client = Arc::clone(&self.socketio_client);
         let status = Arc::clone(&self.status);
@@ -4507,7 +4870,8 @@ impl<S: Session> Computer<S> {
         let detached_socketio: Arc<RwLock<Option<Arc<SmcpComputerClient>>>> =
             Arc::new(RwLock::new(None));
         Self {
-            name: self.name.clone(),
+            // Detached handlers own a fixed identity snapshot, not a public naming handle.
+            name: Arc::new(self.name.as_ref().clone()),
             mcp_manager: Arc::clone(&self.mcp_manager),
             inputs: Arc::clone(&self.inputs),
             mcp_servers: Arc::clone(&self.mcp_servers),
@@ -4516,11 +4880,17 @@ impl<S: Session> Computer<S> {
             mcp_operations_open: Arc::clone(&self.mcp_operations_open),
             mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
             mcp_start_gate: Arc::clone(&self.mcp_start_gate),
+            mcp_start_shutdown: self.mcp_start_shutdown.clone(),
             mcp_input_resolve_lock: Arc::clone(&self.mcp_input_resolve_lock),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
             mcp_flag_config: self.mcp_flag_config.clone(),
+            mcp_flag_config_error: self.mcp_flag_config_error.clone(),
+            // #248：flag settings 路径是运行期 readRoots / landingRoot 的 flag 作用域来源——handler 克隆
+            // 漏保留会让 wire 路径（client:resolve_path / get_blob）退回 flag-blind（直连生效、wire 不生效）。
+            flag_settings_path: self.flag_settings_path.clone(),
+            flag_settings_path_error: self.flag_settings_path_error.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -4531,6 +4901,7 @@ impl<S: Session> Computer<S> {
             socketio_client: detached_socketio.clone(),
             socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
             socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
+            office_rejoin_budget_override: self.office_rejoin_budget_override,
             confirm_callback: self.confirm_callback.clone(),
             skill_registry: Arc::clone(&self.skill_registry),
             skill_home: Arc::clone(&self.skill_home),
@@ -4570,10 +4941,53 @@ impl<S: Session> Computer<S> {
     /// 建立 Socket.IO 连接 / Establish the Socket.IO connection.
     ///
     /// #86：连接面鉴权唯一走 `options.auth_payload`（Socket.IO auth dict）；`options.headers` 仅路由。
+    ///
+    /// **protocol#64 副作用与错误**：首次连接会物化 / 复用持久化身份 `computer_id`
+    /// （写 `$XDG_CONFIG_HOME/a2c/computer-id`，回退 `~/.config/a2c/computer-id`；见
+    /// [`crate::identity`]），并在每次 `server:join_office` 原样携带。身份文件损坏 / 不可读 /
+    /// 无法创建时返回 [`ComputerError::IdentityStore`]——这是**本地**错误（不上 wire），且重试
+    /// 不会自愈；嵌入式宿主应将其视为启动致命错误，而非可重试的传输层瞬态错误。
+    /// Protocol #64 side effect and error: the first connect materializes/reuses the persisted
+    /// `computer_id` and every join carries it. A corrupt/unreadable identity yields a local
+    /// [`ComputerError::IdentityStore`] — treat it as fatal, not as a retryable transport error.
+    ///
+    /// **取消语义 / Cancellation**：取消本 future（如宿主用 `timeout` 包裹后超时）**不会**中止
+    /// 后台建连任务——detached 任务仍会继续完成握手 → `install`，并持续持有生命周期门（默认
+    /// 至 [`DEFAULT_NAMESPACE_CONNECT_TIMEOUT`] 即 30s）。期间 `reset_computer_id` /
+    /// `disconnect_socketio` / `shutdown` 可能被阻塞到该时限；取消后是否真的安装成功，只能以
+    /// [`Self::has_socketio_client`] 或后续调用的返回值判定，不能假定已中止。
+    /// Cancelling this future does not abort the detached connect task, which keeps the lifecycle
+    /// gate until it installs (default up to 30s namespace timeout).
     pub async fn connect_socketio(&self, url: &str, options: ConnectOptions) -> ComputerResult<()>
     where
         S: Clone + 'static,
     {
+        // protocol#64：身份读取与连接安装同在**生命周期临界区**内，与 `reset_computer_id` /
+        // `disconnect_socketio` 串行——否则 reset 的「检查槽位为空 → 原子替换」与 connect 读取
+        // 身份之间存在 check-then-act 窗口。
+        //
+        // **取消安全**：用 `lock_owned` 取得所有权守卫并**移入 spawn 任务**。若守卫留在本函数
+        // 栈上，宿主以 `timeout` 取消外层 future 后门会随之释放，而 detached 的 connect 任务仍会
+        // 读旧身份并 install——期间 reset 可成功并把槽位换成新身份，随后旧 client 被装回。
+        let lifecycle_guard = Arc::clone(&self.socketio_lifecycle_gate).lock_owned().await;
+        if self.status.state() == LifecycleState::Shutdown {
+            return Err(ComputerError::InvalidState(
+                "Computer is shut down".to_string(),
+            ));
+        }
+
+        // protocol#64（v0.5.0）：首次连接物化 / 复用稳定身份 `computer_id`。
+        // 持久化不可读 / 损坏 / 无法创建 ⇒ fail-fast（`IdentityStore`），**不**回落临时值——
+        // CLI 据此以非零退出码终止启动。
+        //
+        // 必须先于 manager 前置检查：`boot_up` 失败时 manager 可能仍为 None，若先检查 manager
+        // 就会以 `InvalidState` 掩盖身份存储的启动致命错误。
+        let computer_id = crate::identity::load_or_create_computer_id(self.config_env()).await?;
+        info!(
+            identity_path = %crate::identity::computer_id_path(self.config_env()).display(),
+            "Using persisted Computer identity"
+        );
+
         // 确保管理器已初始化 / Ensure manager is initialized
         let _manager_check = {
             let manager_guard = self.current_manager().await;
@@ -4601,15 +5015,20 @@ impl<S: Session> Computer<S> {
         // 能调 resolve_blob / get_skill* / mint / execute_tool_cancellable / acancel_tool。
         // Create Socket.IO client via Builder (threading namespace through).
         let ops: Arc<dyn ComputerHandlerOps> = Arc::new(self.clone_for_handlers());
+        let office_rejoin_budget = self
+            .office_rejoin_budget_override
+            .unwrap_or(options.office_rejoin_budget);
         let mut builder = SmcpComputerClientBuilder::new(
             url,
             self.mcp_manager.clone(),
-            self.name.clone(),
+            self.name.as_ref().clone(),
             self.inputs.clone(),
         )
         .namespace(options.namespace)
         .namespace_connect_timeout(options.namespace_connect_timeout)
-        .computer_ops(ops);
+        .office_rejoin_budget(office_rejoin_budget)
+        .computer_ops(ops)
+        .computer_id(computer_id);
         // #201：动态 Provider 优先；未配置时保留 #86 静态 auth dict 行为。
         if let Some(provider) = options.auth_provider {
             builder = builder.auth_provider(provider);
@@ -4619,17 +5038,13 @@ impl<S: Session> Computer<S> {
         if let Some(h) = parsed_headers {
             builder = builder.headers(h);
         }
-        let gate = Arc::clone(&self.socketio_lifecycle_gate);
         let socketio_client = Arc::clone(&self.socketio_client);
         let status = Arc::clone(&self.status);
         let owner = Arc::clone(&self.socketio_lifecycle_owner);
+        // 取消安全：所有权守卫**移入任务**，任务存活期间一直持有生命周期门直到 install 完成。
+        // 外层 future 被 `timeout` 取消时门不会随之释放，reset 只能等落后台任务结束再判定。
         tokio::spawn(async move {
-            let _gate = gate.lock().await;
-            if status.state() == LifecycleState::Shutdown {
-                return Err(ComputerError::InvalidState(
-                    "Computer is shut down".to_string(),
-                ));
-            }
+            let _lifecycle_guard = lifecycle_guard;
             let client = Arc::new(builder.connect().await?);
             install_socketio_client_locked(socketio_client, status, owner, client).await
         })
@@ -4652,19 +5067,13 @@ impl<S: Session> Computer<S> {
     /// 取写锁；若槽内有 client，先调底层 transport disconnect（发 Socket.IO DISCONNECT 包并关 transport；
     /// 持写锁跨 await，与 `join_office`/`leave_office` 持读锁跨 await 同构——`tf-rust-socketio` 的 `Client`
     /// 背后 reader 后台任务持克隆，仅 Drop 用户句柄**不会**关 transport，必须显式 `disconnect()`），
-    /// 成功后再置 `None`。幂等：槽已空 → no-op。
+    /// 完成后置 `None`，包括关闭帧发送失败。幂等：槽已空 → no-op。
     ///
-    /// 失败上抛 Err 且**不**清槽，槽内 client 保留可重试。membership/lifecycle 会在底层 await 前失效，
-    /// 这是 disconnect Future 的取消安全边界。若底层 0.8.1 已进入 reconnect backoff，`Ok` 表示该
-    /// client 已逻辑退役：业务 handler 已同步闸断，晚到 namespace 会在 Connect callback 内立即关闭。
+    /// 发送失败仍上抛 Err，但底层已终止 reader/重连任务，不能把已退役 client 留作当前连接。
+    /// membership/lifecycle 在底层 await 前失效；若调用方在 await 期间取消，槽仍保留供重试清理。
     async fn close_socketio_transport(&self) -> ComputerResult<()> {
         let mut socketio_ref = self.socketio_client.write().await;
-        if let Some(client) = socketio_ref.as_ref() {
-            client.disconnect().await?;
-            client.deactivate_runtime_lifecycle();
-        }
-        *socketio_ref = None;
-        Ok(())
+        retire_socketio_slot(&mut socketio_ref).await
     }
 
     /// 断开Socket.IO连接 / Disconnect Socket.IO
@@ -4678,13 +5087,35 @@ impl<S: Session> Computer<S> {
         Ok(())
     }
 
-    /// 加入办公室 / Join office
-    pub async fn join_office(&self, office_id: &str, _computer_name: &str) -> ComputerResult<()> {
+    /// protocol#64：重置 Computer 稳定身份（生成新 UUID 并**原子替换**持久化文件）。
+    ///
+    /// 身份在一条连接内不可变（协议 MUST）：**连接中调用返回 [`ComputerError::InvalidState`]**，
+    /// 调用方须先 [`Self::disconnect_socketio`]；重置后以**新连接**入房才会生效。CLI
+    /// `identity reset` 已编排「退房 → 断开 → 重置 → 重连 → 回房」。
+    ///
+    /// Resets the persisted identity. Rejected while connected; the new value only takes effect on
+    /// a new connection.
+    pub async fn reset_computer_id(&self) -> ComputerResult<String> {
+        // 与 connect / disconnect 共用生命周期临界区：消除「检查槽位为空 → 替换身份」与并发
+        // `connect_socketio` 之间的 check-then-act 窗口（连接读身份在门内，本方法在同一门内）。
+        let _lifecycle_gate = self.socketio_lifecycle_gate.lock().await;
+        if self.has_socketio_client().await {
+            return Err(ComputerError::InvalidState(
+                "Cannot reset computer identity while connected; disconnect first".to_string(),
+            ));
+        }
+        crate::identity::reset_computer_id(self.config_env()).await
+    }
+
+    /// Join using the specified identity, rejecting a name different from the connection's.
+    /// To use a different identity, create a Computer and connection with that name.
+    /// The CLI manages connection replacement when `socket join` changes the name.
+    pub async fn join_office(&self, office_id: &str, computer_name: &str) -> ComputerResult<()> {
         let socketio_ref = self.socketio_client.read().await;
         if let Some(ref client) = *socketio_ref {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
-            client.join_office(office_id).await?;
+            client.join_office_as(office_id, computer_name).await?;
             return Ok(());
         }
         Err(ComputerError::InvalidState(
@@ -4698,13 +5129,24 @@ impl<S: Session> Computer<S> {
         if let Some(ref client) = *socketio_ref {
             // 直接使用 Arc<SmcpComputerClient>，不需要 upgrade
             // Use Arc<SmcpComputerClient> directly, no need to upgrade
-            let current_office_id = client.get_current_office_id().await?;
-            client.leave_office(&current_office_id).await?;
+            // #234：目标在 client 的 office_operation 临界区内解析（confirmed → desired），
+            // 重连回房退避期间退房可取消重试，且不会被并发换房带偏到错误房号。
+            client.leave_current_office().await?;
             return Ok(());
         }
         Err(ComputerError::InvalidState(
             "Socket.IO client not connected".to_string(),
         ))
+    }
+
+    /// #234：一次性提示——最近一次显式 join 失败是否取消了待回放的自动回房意图。
+    #[cfg(feature = "cli")]
+    pub(crate) async fn take_rejoin_intent_cancelled(&self) -> bool {
+        let socketio = self.socketio_client.read().await;
+        match socketio.as_ref() {
+            Some(client) => client.take_rejoin_intent_cancelled().await,
+            None => false,
+        }
     }
 
     /// 发送配置更新通知 / Emit config update notification
@@ -4729,6 +5171,7 @@ impl<S: Session> Computer<S> {
         // 已在途事务（已持许可 + 已持 `mcp_lifecycle_gate` 读门）由下方写锁天然等待收敛，
         // 之后 manager close 不会与在途启动竞争（无进程遗留）。
         self.mcp_start_gate.close();
+        self.mcp_start_shutdown.cancel();
         // Linearize terminal shutdown before any new candidate can be installed. A connect/set
         // transaction that won the gate first is completed and then closed below; one that starts
         // later observes Shutdown and tears down its candidate instead of publishing it.
@@ -4793,11 +5236,17 @@ impl<S: Session + Clone> Clone for Computer<S> {
             mcp_operations_open: Arc::clone(&self.mcp_operations_open),
             mcp_lifecycle_locks: Arc::clone(&self.mcp_lifecycle_locks),
             mcp_start_gate: Arc::clone(&self.mcp_start_gate),
+            mcp_start_shutdown: self.mcp_start_shutdown.clone(),
             mcp_input_resolve_lock: Arc::clone(&self.mcp_input_resolve_lock),
             // #147：embed 声明快照是**不可变构造入参**（非运行期状态），MUST 随 clone 保留——否则克隆出的
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
             mcp_flag_config: self.mcp_flag_config.clone(),
+            mcp_flag_config_error: self.mcp_flag_config_error.clone(),
+            // #248：公开 Clone 同样是 handler/宿主持有的 Computer 句柄——flag settings 路径 MUST 保留，
+            // 否则 clone 出的实例运行期退回 flag-blind（与 clone_for_handlers 同一条不变量）。
+            flag_settings_path: self.flag_settings_path.clone(),
+            flag_settings_path_error: self.flag_settings_path_error.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -4808,6 +5257,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
             socketio_client: Arc::clone(&self.socketio_client),
             socketio_lifecycle_gate: Arc::clone(&self.socketio_lifecycle_gate),
             socketio_lifecycle_owner: Arc::clone(&self.socketio_lifecycle_owner),
+            office_rejoin_budget_override: self.office_rejoin_budget_override,
             confirm_callback: self.confirm_callback.clone(),
             // Public Clone is another handle to the same Computer lifecycle. All resources that
             // boot creates and shutdown tears down must therefore share the exact cleanup handles.
@@ -4858,8 +5308,10 @@ impl<S: Session + Clone> Clone for Computer<S> {
 pub(crate) trait ComputerHandlerOps: Send + Sync {
     /// Raw desired MCP declarations joined with current runtime status / protocol config view.
     async fn get_computer_config_servers(&self) -> ComputerResult<serde_json::Value>;
-    /// 解析 blob 句柄（toolspool / skill）→ 可切片描述符 / resolve a blob handle。
+    /// 解析 blob 句柄（toolspool / skill / path）→ 可切片描述符 / resolve a blob handle。
     async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError>;
+    /// `client:resolve_path`：九步管线解析并铸造 path 句柄 / resolve a local path（4020 core）。
+    async fn resolve_read_path(&self, path: &str) -> Result<ResolvedPath, PathResolveError>;
     /// 活跃 SKILL 列表（排除孤儿）/ active SKILL refs。
     async fn get_skills(&self) -> Vec<A2CSkillRef>;
     /// 按 name 查活跃 SKILL / lookup an active SKILL by name。
@@ -4899,6 +5351,9 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
     }
     async fn resolve_blob(&self, handle: &str) -> Result<ResolvedBlob, BlobHandleError> {
         Computer::resolve_blob(self, handle).await
+    }
+    async fn resolve_read_path(&self, path: &str) -> Result<ResolvedPath, PathResolveError> {
+        Computer::resolve_read_path(self, path).await
     }
     async fn get_skills(&self) -> Vec<A2CSkillRef> {
         Computer::get_skills(self).await
@@ -4945,21 +5400,19 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
 /// 与 python `landing_root` 属性同构：`~` 前缀经 [`expand_home`](crate::skills::home::expand_home)
 /// 展开（尊重注入 env，保持 hermetic）；非字符串 / 空值 → `None`（fail-closed）。
 ///
-/// **有意分叉（🟡2 确认）/ Deliberate divergence**: `flag_settings_path` 恒 `None`——rust
-/// `Computer` 是库组件，运行态**不持有** flag 文件路径（flag scope 仅在 CLI 命令上下文经
-/// `--settings <file>` 注入，见 `cli/commands`），与 rust 全部其它 runtime settings 解析点
-/// 一致；python `Computer(flag_settings_path=...)` 构造参数由 CLI 注入（`_resolve_declared_settings`
-/// 会并入 flag 层）。即 `landingRoot` 的 flag scope 声明在 rust 下不可见（有意取舍：flag
-/// 层声明走 CLI 直连的 settings 命令视图，非本属性职责）。
+/// `flag_settings_path`（`--settings <file>`）非 `None` 时 flag 层一并参与合并——flag 是
+/// `landingRoot` 的受信 scope（protocol#65，rust-sdk#248）。**缓存语义保持**：`Computer::landing_root`
+/// 仍是「已解析且已配置 → 进程内缓存；未配置 → 每次重查」，运行期改 settings 的生效时机不变。
 fn resolve_landing_root_settings(
     config_dir: &std::path::Path,
     env: Option<&EnvMap>,
+    flag_settings_path: Option<&Path>,
 ) -> Option<PathBuf> {
     let policy = resolve_policy_settings(None, None, None);
     let resolved = resolve_settings(ResolveSettingsArgs {
         cwd: Some(config_dir),
         env,
-        flag_settings_path: None,
+        flag_settings_path,
         policy_settings: Some(&policy),
     });
     let raw = resolved.settings.get(FIELD_LANDING_ROOT)?.as_str()?;
@@ -4967,6 +5420,155 @@ fn resolve_landing_root_settings(
         return None;
     }
     Some(crate::skills::home::expand_home(raw.trim(), env))
+}
+
+/// 构造期归一 **flag 层文件路径**（`--settings` / `--mcp-config`）：成功 → 绝对路径；失败 → 原因
+/// （调用方 fail-closed 置 `None`）。
+///
+/// 规则：
+/// - 空路径 → 失败；非 UTF-8 → 无 `~` 语义，直接绝对化（失败则报错）。
+/// - 前导 `~` / `~/...` / `~\...`（Windows 写法，对齐 python `expanduser`）：用注入 env 的 `HOME`
+///   （空白视同未设置），其次进程 `HOME`；**仅 Windows** 再退 `USERPROFILE`（POSIX 不读，对齐
+///   python）；全部为空 → 失败（**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的
+///   路径会被当成受信 flag 层）。
+/// - `~user`（前导 `~` 但不是 `~` / `~/` / `~\`）：rust 无 NSS expanduser → 显式失败，不静默锚到
+///   `<cwd>/~user`。
+/// - 其它（含中段 `~` 的合法相对路径，如 `conf/~/flag.json`）：中段 `~` 只是普通字符，按构造期 cwd
+///   绝对化。
+///
+/// 对齐 python `Computer._absolute_path`：flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集
+/// 条目与合并视图必须始终指向**同一文件**；相对路径在宿主 `chdir` 后会漂移。`std::path::absolute`
+/// 不访问文件系统、不跟随符号链接；读取期由 canonicalize / dev+ino 身份兜底，安全语义不受影响。
+pub(crate) fn normalize_flag_path(
+    path: &Path,
+    env: Option<&EnvMap>,
+) -> Result<PathBuf, &'static str> {
+    normalize_flag_path_with(
+        path,
+        home_lookup(env).as_deref(),
+        home_lookup(None).as_deref(),
+    )
+}
+
+/// [`normalize_flag_path`] 的纯逻辑体（HOME 显式注入，覆盖无/空 HOME 三分支测试）。
+fn normalize_flag_path_with(
+    path: &Path,
+    injected_home: Option<&str>,
+    process_home: Option<&str>,
+) -> Result<PathBuf, &'static str> {
+    let Some(raw) = path.to_str() else {
+        // 非 UTF-8：无 `~` 语义，直接绝对化。
+        return std::path::absolute(path).map_err(|_| "path cannot be absolutized");
+    };
+    if raw.trim().is_empty() {
+        return Err("empty path");
+    }
+    let expanded = if raw == "~" {
+        PathBuf::from(
+            non_empty(injected_home)
+                .or_else(|| non_empty(process_home))
+                .ok_or("`~` cannot be expanded: HOME/USERPROFILE is unset or empty")?,
+        )
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        // Windows 客户端常见 `~\flag.json`（python `expanduser` 同样识别）；POSIX 下 `~/` 为主，
+        // `~\` 统一按 `~` 展开（跨端一致，不当作字面文件名）。
+        let home = non_empty(injected_home)
+            .or_else(|| non_empty(process_home))
+            .ok_or("`~` cannot be expanded: HOME/USERPROFILE is unset or empty")?;
+        Path::new(home).join(rest.trim_start_matches(['/', '\\']))
+    } else if raw.starts_with('~') {
+        return Err("`~user` form is not supported; use an absolute path or `~/...`");
+    } else {
+        // 中段 `~`（如 `conf/~/flag.json`）是普通字符，不是展开语法。
+        PathBuf::from(raw)
+    };
+    std::path::absolute(&expanded).map_err(|_| "path cannot be absolutized")
+}
+
+/// 取非空 HOME（空白视同未设置）；Windows 下 `USERPROFILE` 优先（对齐 python `ntpath.expanduser`）。
+fn home_lookup(env: Option<&EnvMap>) -> Option<String> {
+    home_lookup_with(env, cfg!(windows))
+}
+
+/// [`home_lookup`] 的平台可注入体。
+///
+/// Windows：**`USERPROFILE` 优先**，`HOME` 次之（对齐 python `ntpath.expanduser`）；POSIX：只读
+/// `HOME`（不读 `USERPROFILE`，对齐 python posixpath）。
+fn home_lookup_with(env: Option<&EnvMap>, windows: bool) -> Option<String> {
+    let lookup = |name: &str| match env {
+        Some(map) => map.get(name).cloned(),
+        None => std::env::var(name).ok(),
+    };
+    if windows {
+        non_blank(lookup("USERPROFILE")).or_else(|| non_blank(lookup("HOME")))
+    } else {
+        non_blank(lookup("HOME"))
+    }
+}
+
+/// 字符串值去空白后非空才算可用 / trim and treat blank as unset.
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_string())
+        .filter(|trimmed| !trimmed.is_empty())
+}
+
+/// `HOME` 值非空白才算可用 / treat blank HOME as unset.
+fn non_empty(home: Option<&str>) -> Option<&str> {
+    home.filter(|value| !value.trim().is_empty())
+}
+
+/// 构造一次请求的授权快照（读根 + 固定拒绝集）。
+///
+/// 空 `readRoots` 直接返回空策略（fail-closed；第 2 步即 forbidden），不构造拒绝集——避免
+/// `skill_home()` 之外的额外副作用与无谓 stat。非空时把接线层已知位置注入拒绝集：
+/// SKILL Home、blob 缓存根、`.tfrobot` 治理目录及其具体文件（硬链接身份兜底）。
+// 私有策略装配函数：参数即调用点已持有的快照各分量，拆结构体只会多一层搬运。
+#[allow(clippy::too_many_arguments)]
+fn build_path_access_policy(
+    roots: Vec<ReadRoot>,
+    config_dir: &Path,
+    env: Option<&EnvMap>,
+    skill_home: PathBuf,
+    blob_cache_root: PathBuf,
+    landing_root: Option<PathBuf>,
+    flag_mcp_config: Option<&Path>,
+    flag_settings_file: Option<&Path>,
+    platform: PathPlatform,
+) -> PathAccessPolicy {
+    if roots.is_empty() {
+        return PathAccessPolicy {
+            roots,
+            protected: ProtectedPaths::default(),
+        };
+    }
+
+    let mut extra = vec![skill_home, blob_cache_root];
+    let governance_dir = config_dir.join(crate::settings::TFROBOT_DIRNAME);
+    extra.push(governance_dir.clone());
+    // 具体文件一并注入：硬链接到 `.tfrobot/mcp.json` 时路径前缀失效，只有文件身份能挡。
+    for name in [
+        crate::settings::PROJECT_SETTINGS_FILENAME,
+        crate::settings::LOCAL_SETTINGS_FILENAME,
+        crate::settings::MCP_CONFIG_FILENAME,
+        crate::settings::MCP_LOCAL_CONFIG_FILENAME,
+    ] {
+        let candidate = governance_dir.join(name);
+        if candidate.exists() {
+            extra.push(candidate);
+        }
+    }
+    if let Some(flag_mcp_config) = flag_mcp_config {
+        extra.push(flag_mcp_config.to_path_buf());
+    }
+    // flag 层 settings.json（`--settings`）与 `--mcp-config` 同属 flag scope 文件对：可含 readRoots /
+    // landingRoot / 治理声明，必须在拒绝集内（与 python `_build_protected_paths` 对齐，rust-sdk#248）。
+    if let Some(flag_settings_file) = flag_settings_file {
+        extra.push(flag_settings_file.to_path_buf());
+    }
+
+    let protected = build_protected_paths(&extra, landing_root.as_deref(), env, platform);
+    PathAccessPolicy { roots, protected }
 }
 
 /// MCP 源 SKILL 重物化的共享自由函数（#106）：`Computer::restage_mcp_skills` 与 [`McpChangeReactor`] 共用，
@@ -5172,6 +5774,17 @@ mod tests {
     };
     use std::sync::atomic::AtomicBool;
 
+    /// #234：默认预算 60s（覆盖 socket.io 45s 回收窗口并留一次尝试余量），且 Debug 暴露字段。
+    #[test]
+    fn connect_options_default_office_rejoin_budget_is_60s() {
+        let options = ConnectOptions::default();
+        assert_eq!(
+            options.office_rejoin_budget,
+            std::time::Duration::from_secs(60)
+        );
+        assert!(format!("{options:?}").contains("office_rejoin_budget"));
+    }
+
     struct FakeSocketIoInstallClient {
         active: AtomicBool,
         claim_succeeds: bool,
@@ -5231,7 +5844,7 @@ mod tests {
             self.deactivated.store(true, Ordering::Release);
         }
 
-        async fn disconnect_for_install(&self) -> ComputerResult<()> {
+        async fn disconnect_transport(&self) -> ComputerResult<()> {
             self.disconnect_calls.fetch_add(1, Ordering::AcqRel);
             if self.disconnect_fails {
                 Err(ComputerError::RuntimeError(
@@ -5268,7 +5881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socketio_install_teardown_failure_retains_previous_and_releases_candidate() {
+    async fn socketio_install_teardown_failure_clears_retired_slot_and_releases_candidate() {
         let previous = Arc::new(FakeSocketIoInstallClient {
             disconnect_fails: true,
             ..FakeSocketIoInstallClient::new(true)
@@ -5285,12 +5898,8 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(slot
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &previous)));
-        assert!(!previous.deactivated.load(Ordering::Acquire));
+        assert!(slot.read().await.is_none());
+        assert!(previous.deactivated.load(Ordering::Acquire));
         assert_eq!(candidate.disconnect_calls.load(Ordering::Acquire), 1);
         assert!(candidate.released.load(Ordering::Acquire));
     }
@@ -5324,7 +5933,7 @@ mod tests {
         let session = SilentSession::new("test");
         let computer = Computer::new("test_computer", session, None, None, true, true);
 
-        assert_eq!(computer.name, "test_computer");
+        assert_eq!(computer.name(), "test_computer");
         assert!(computer.auto_connect);
         assert!(computer.auto_reconnect);
     }
@@ -7009,6 +7618,7 @@ mod tests {
     fn user_stdio_server97(name: &str) -> MCPServerConfig {
         MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: name.to_string(),
             bundle_id: None,
             disabled: true,
@@ -7456,6 +8066,7 @@ mod tests {
             "server1".to_string(),
             MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
+                connect_timeout_secs: None,
                 name: "server1".to_string(),
                 bundle_id: None,
                 disabled: false,
@@ -7616,6 +8227,7 @@ mod tests {
         // 添加服务器配置 / Add server configuration
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: false,
@@ -7640,6 +8252,7 @@ mod tests {
         // Note: Since MCPServerManager is private, we test updates by adding duplicate servers
         let updated_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: true, // 更新为禁用状态 / Update to disabled state
@@ -8072,6 +8685,7 @@ mod tests {
         // 创建带有占位符的服务器配置 / Create server config with placeholders
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: false,
@@ -8115,6 +8729,7 @@ mod tests {
         // 创建带有不存在输入的配置 / Create config with non-existent input
         let server_config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_server".to_string(),
             bundle_id: None,
             disabled: false,
@@ -8245,6 +8860,7 @@ mod tests {
     fn stdio_with_arg(arg: &str) -> MCPServerConfig {
         MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "s".to_string(),
             bundle_id: None,
             disabled: false,
@@ -10592,6 +11208,7 @@ mod tests {
         let computer = Arc::new(computer);
         let cfg = MCPServerConfig::Stdio(crate::mcp_clients::model::StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "gov".to_string(),
             bundle_id: None,
             disabled: false,
@@ -10825,6 +11442,580 @@ mod tests {
         computer
     }
 
+    // ── v0.5.0 protocol#65：path_access_policy / resolve_read_path / pull_path_blob ──────
+
+    #[tokio::test]
+    async fn test_computer_resolve_read_path_and_pull() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let file = share.join("hello.txt");
+        std::fs::write(&file, b"hello path").unwrap();
+        std::fs::write(
+            xdg.join("a2c").join("settings.json"),
+            serde_json::json!({"readRoots": [share.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        assert_eq!(computer.read_roots().await.len(), 1);
+        let resolved = computer
+            .resolve_read_path(file.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resolved.total_size, 10);
+        assert_eq!(resolved.mime_type, "text/plain");
+
+        let payload = match crate::blob::decode_blob_handle(&resolved.blob_handle).unwrap() {
+            crate::blob::DecodedHandle::Path(payload) => payload,
+            other => panic!("unexpected kind {}", other.kind()),
+        };
+        let pulled = computer.pull_path_blob(&payload).await.unwrap();
+        assert_eq!(pulled.sha256, resolved.sha256);
+        assert_eq!(pulled.slice(0, 5).unwrap(), b"hello".to_vec());
+
+        // `resolve_blob` 路由 Path 句柄 → 拉取期复核 + 同一套切片接口（get_blob handler 的入口）。
+        let routed = computer.resolve_blob(&resolved.blob_handle).await.unwrap();
+        assert_eq!(routed.sha256, resolved.sha256);
+        assert_eq!(routed.slice(0, 5).unwrap(), b"hello".to_vec());
+
+        // 经 ComputerHandlerOps（client:resolve_path handler 的接线面）再走一次。
+        let via_ops = ComputerHandlerOps::resolve_read_path(&computer, file.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(via_ops.canonical_path, resolved.canonical_path);
+
+        // 授权根之外 → 4020 forbidden（不泄露存在性）。
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"nope").unwrap();
+        let error = computer
+            .resolve_read_path(outside.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+
+        // 删除后经 get_blob 入口 → 4018 gone（拉取期复核）。
+        std::fs::remove_file(&file).unwrap();
+        let error = computer
+            .resolve_blob(&resolved.blob_handle)
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason(), "gone");
+    }
+
+    #[tokio::test]
+    async fn test_computer_resolve_read_path_without_read_roots_is_forbidden() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(xdg.join("a2c")).unwrap();
+        // 未配置 readRoots（默认空 = 不可读）。
+        let file = tmp.path().join("visible.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        assert!(computer.read_roots().await.is_empty());
+        let error = computer
+            .resolve_read_path(file.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+    }
+
+    /// settings `landingRoot` / `with_landing_root` 都必须把 `.part` 接入固定拒绝集。
+    #[tokio::test]
+    async fn test_computer_landing_part_forbidden_from_settings_and_override() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let landing = tmp.path().join("landing");
+        let override_landing = tmp.path().join("override-landing");
+        let proj = tmp.path().join("proj");
+        for dir in [&home, &share, &landing, &override_landing] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let part = landing.join("upload.part");
+        fs::write(&part, b"partial").unwrap();
+        let override_part = override_landing.join("upload.part");
+        fs::write(&override_part, b"partial").unwrap();
+        fs::write(
+            xdg.join("a2c").join("settings.json"),
+            serde_json::json!({
+                "readRoots": [tmp.path().to_string_lossy()],
+                "landingRoot": landing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env.clone())
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        let error = computer
+            .resolve_read_path(part.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
+
+        // `with_landing_root` 覆盖优先于 settings：`.part` 规则对准实际写入根。
+        let computer_override =
+            Computer::new("c", SilentSession::new("s"), None, None, false, false)
+                .with_config_dir(&proj)
+                .with_config_env(env)
+                .with_skill_home(&home)
+                .with_blob_cache_root(tmp.path().join("blob"))
+                .with_landing_root(&override_landing);
+        let error = computer_override
+            .resolve_read_path(override_part.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
+    }
+
+    /// #248：`--settings`（flag 层）必须驱动**运行期** `readRoots` / `landingRoot`——flag root 可读、
+    /// project scope 仍拒、`landing_root` 取 flag 值；缺省 `None` 保持 flag-blind（既有行为）。
+    #[tokio::test]
+    async fn test_computer_flag_settings_drives_runtime_roots_and_landing() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let landing = tmp.path().join("landing");
+        let proj = tmp.path().join("proj");
+        for dir in [&home, &share, &landing] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        fs::create_dir_all(proj.join(".tfrobot")).unwrap();
+        // project scope：协议 MUST 不生效（即使 flag 层同时存在）。
+        let evil = tmp.path().join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(
+            proj.join(".tfrobot").join("settings.json"),
+            serde_json::json!({"readRoots": [evil.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+        let visible = share.join("hello.txt");
+        fs::write(&visible, b"flag root").unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({
+                "readRoots": [share.to_string_lossy()],
+                "landingRoot": landing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env.clone())
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        assert!(
+            !computer.read_roots().await.is_empty(),
+            "flag readRoots 须生效"
+        );
+        let resolved = computer
+            .resolve_read_path(visible.to_str().unwrap())
+            .await
+            .expect("flag 层 readRoots 内的文件应可读");
+        assert_eq!(resolved.total_size, 9);
+        assert_eq!(
+            computer.landing_root().await.as_deref(),
+            Some(landing.as_path()),
+            "flag 层 landingRoot 须生效"
+        );
+        // project scope 仍 MUST 被拒绝（flag 呈现场合不改变该门控）。
+        let error = computer
+            .resolve_read_path(evil.join("x.txt").to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+
+        // 缺省（None）保持既有 flag-blind 行为：不传路径时 flag 声明不可见。
+        let blind = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        assert!(blind.read_roots().await.is_empty());
+        assert!(blind.landing_root().await.is_none());
+    }
+
+    /// #248：flag settings 文件本身必须进入固定拒绝集（与 python `_build_protected_paths` 对齐）——
+    /// 即使它位于某条 readRoot 内，也不得经 `resolve_path` / `get_blob` 读出（内容含 readRoots /
+    /// landingRoot / 治理声明）。
+    #[tokio::test]
+    async fn test_computer_flag_settings_file_is_protected() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        for dir in [&home, &share] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        // flag 文件放在 readRoot 目录内：路径前缀围栏会放行，只有拒绝集能挡。
+        let flag = share.join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({"readRoots": [share.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        let error = computer
+            .resolve_read_path(flag.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
+    }
+
+    /// #248：flag 层 `landingRoot` 必须驱动 `.part` 保护（`.part` 规则对准实际写入根）。
+    #[tokio::test]
+    async fn test_computer_flag_landing_root_drives_part_protection() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let landing = share.join("landing");
+        for dir in [&home, &share, &landing] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let part = landing.join("upload.part");
+        fs::write(&part, b"partial").unwrap();
+        let ok = landing.join("done.txt");
+        fs::write(&ok, b"done").unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({
+                "readRoots": [share.to_string_lossy()],
+                "landingRoot": landing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        // `.part` 在 landing 内 → 拒绝；同目录普通文件 → 放行（证明围栏不是整目录拒绝）。
+        let error = computer
+            .resolve_read_path(part.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
+        computer
+            .resolve_read_path(ok.to_str().unwrap())
+            .await
+            .expect("landing 内非 .part 文件应可读");
+    }
+
+    /// #248：公开 `Clone` 与 handler 克隆（`clone_for_handlers`）都必须保留 flag settings 路径——
+    /// 否则 wire 路径（`ComputerHandlerOps`）退回 flag-blind：直连生效、handler 不生效。
+    #[tokio::test]
+    async fn test_computer_clone_and_handler_clone_preserve_flag_settings_path() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        for dir in [&home, &share] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let visible = share.join("hello.txt");
+        fs::write(&visible, b"hello").unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({"readRoots": [share.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        let cloned = computer.clone();
+        assert_eq!(cloned.flag_settings_path, computer.flag_settings_path);
+        cloned
+            .resolve_read_path(visible.to_str().unwrap())
+            .await
+            .expect("公开 clone 须保留 flag settings 路径");
+
+        // handler 克隆 = socketio-detached 的 `Arc<dyn ComputerHandlerOps>`，wire 路径实际持有者。
+        let handler_clone = computer.clone_for_handlers();
+        assert_eq!(
+            handler_clone.flag_settings_path,
+            computer.flag_settings_path
+        );
+        let via_ops =
+            ComputerHandlerOps::resolve_read_path(&handler_clone, visible.to_str().unwrap())
+                .await
+                .expect("handler 克隆须保留 flag settings 路径（wire 不得 flag-blind）");
+        assert_eq!(
+            via_ops.canonical_path,
+            computer
+                .resolve_read_path(visible.to_str().unwrap())
+                .await
+                .unwrap()
+                .canonical_path
+        );
+    }
+
+    /// #248：构造期归一——相对路径锚定构造期 cwd，`~` 用注入 env 展开；存储值恒为绝对路径。
+    #[test]
+    fn test_with_flag_settings_path_absolutizes_at_construction() {
+        let relative = PathBuf::from("flag-settings.json");
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_flag_settings_path(&relative);
+        let stored = computer.flag_settings_path.expect("path stored");
+        assert!(stored.is_absolute(), "相对路径须绝对化：{stored:?}");
+        assert_eq!(stored, std::path::absolute(&relative).unwrap());
+
+        let home = tempfile::TempDir::new().unwrap();
+        let mut env = EnvMap::new();
+        env.insert(
+            "HOME".to_string(),
+            home.path().to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_flag_settings_path("~/flag-settings.json");
+        assert_eq!(
+            computer.flag_settings_path,
+            Some(home.path().join("flag-settings.json")),
+            "`~` 前缀须用注入 env 的 HOME 展开"
+        );
+    }
+
+    /// #248 复审 🔴：`~` 兜底三分支——无/空 HOME 与 `~user` 均 fail-closed（不退回相对串 /
+    /// `<cwd>/~/...`），中段 `~` 的合法相对路径照常绝对化。
+    #[test]
+    fn normalize_flag_path_tilde_branches_fail_closed() {
+        // 空路径 / 无 HOME / 空 HOME：不得退回相对串或 <cwd>/~/...
+        assert!(normalize_flag_path_with(Path::new(""), None, None).is_err());
+        assert!(normalize_flag_path_with(Path::new("~/flag.json"), None, None).is_err());
+        assert!(normalize_flag_path_with(Path::new("~/flag.json"), Some(""), Some("  ")).is_err());
+        // 注入 HOME 优先；注入 HOME 空白时退回进程 HOME。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let injected = tmp.path().join("injected");
+        let process = tmp.path().join("process");
+        assert_eq!(
+            normalize_flag_path_with(
+                Path::new("~/flag.json"),
+                injected.to_str(),
+                process.to_str()
+            )
+            .unwrap(),
+            injected.join("flag.json")
+        );
+        assert_eq!(
+            normalize_flag_path_with(Path::new("~/flag.json"), Some("   "), process.to_str())
+                .unwrap(),
+            process.join("flag.json")
+        );
+        // Windows 写法 `~\flag.json`：同样按 `~` 展开（对齐 python expanduser）。
+        assert_eq!(
+            normalize_flag_path_with(
+                Path::new("~\\flag.json"),
+                injected.to_str(),
+                process.to_str()
+            )
+            .unwrap(),
+            injected.join("flag.json")
+        );
+        // `~user`：显式失败，不得静默锚到 <cwd>/~user。
+        assert!(normalize_flag_path_with(
+            Path::new("~alice/flag.json"),
+            Some("/home/a"),
+            Some("/home/a")
+        )
+        .is_err());
+        // 中段 `~` 是普通字符：合法相对路径照常绝对化。
+        let middle = normalize_flag_path_with(Path::new("conf/~/flag.json"), None, None)
+            .expect("middle ~ must not be treated as tilde expansion");
+        assert!(middle.is_absolute(), "{middle:?}");
+        assert!(
+            middle.ends_with(Path::new("conf/~/flag.json")),
+            "{middle:?}"
+        );
+    }
+
+    /// #248 复审：`HOME` 缺失/空白时退 `USERPROFILE`（Windows，对齐 python expanduser）。
+    #[test]
+    fn home_lookup_falls_back_to_userprofile_on_windows_only() {
+        let mut env = EnvMap::new();
+        env.insert("USERPROFILE".to_string(), r"C:\Users\alice".to_string());
+        // POSIX 不读 USERPROFILE（对齐 python expanduser）；Windows 才兜底。
+        assert_eq!(home_lookup_with(Some(&env), false), None);
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some(r"C:\Users\alice"),
+            "Windows 下 HOME 缺失时须用 USERPROFILE"
+        );
+        env.insert("HOME".to_string(), "   ".to_string());
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some(r"C:\Users\alice"),
+            "HOME 空白视同未设置"
+        );
+        env.insert("HOME".to_string(), "/home/alice".to_string());
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some(r"C:\Users\alice"),
+            "Windows 下 USERPROFILE 优先（对齐 python ntpath）"
+        );
+        assert_eq!(
+            home_lookup_with(Some(&env), false).as_deref(),
+            Some("/home/alice"),
+            "POSIX 只读 HOME"
+        );
+        env.remove("USERPROFILE");
+        assert_eq!(
+            home_lookup_with(Some(&env), false).as_deref(),
+            Some("/home/alice")
+        );
+    }
+
+    /// #248 复审 🔴/🟡：builder 对不可用输入 fail-closed（存储 `None`）并经公开访问器给出诊断；
+    /// 中段 `~` 正常存储绝对路径且无诊断。
+    #[test]
+    fn with_flag_settings_path_fails_closed_and_reports_unusable_input() {
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_flag_settings_path("~alice/flag.json");
+        assert!(
+            computer.flag_settings_path.is_none(),
+            "`~user` 须 fail-closed"
+        );
+        assert!(
+            computer
+                .flag_settings_path_error()
+                .is_some_and(|message| message.contains("~user")),
+            "失败原因须经公开访问器可见：{:?}",
+            computer.flag_settings_path_error()
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_flag_settings_path("conf/~/flag.json");
+        assert!(computer.flag_settings_path_error().is_none());
+        let stored = computer
+            .flag_settings_path
+            .expect("middle ~ is a legal relative path");
+        assert!(stored.is_absolute(), "{stored:?}");
+    }
+
     #[tokio::test]
     async fn test_execute_tool_cancellable_timeout_marks_meta_and_history() {
         use crate::mcp_clients::manager::test_support::CancelBehavior;
@@ -10918,6 +12109,7 @@ mod tests {
             let bid = BundleId::try_from(name.clone()).expect("test fixture bundle_id");
             let cfg = MCPServerConfig::Stdio(StdioServerConfig {
                 env_file: None,
+                connect_timeout_secs: None,
                 name: name.clone(),
                 bundle_id: Some(bid.clone()),
                 disabled: false,

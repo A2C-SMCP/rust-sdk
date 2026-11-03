@@ -20,15 +20,13 @@ async fn test_list_room_success() {
     let server = SmcpTestServer::start().await;
     let server_url = server.url();
 
-    // 创建多个客户端
+    // 创建客户端（protocol#66：一房一 Agent + 至多一台 Computer）
     let agent_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
     let computer1_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
-    let computer2_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
 
-    // 所有客户端加入同一办公室
+    // 客户端加入同一办公室
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
     join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
-    join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
 
     // 等待所有客户端加入完成
     sleep(Duration::from_millis(300)).await;
@@ -100,12 +98,12 @@ async fn test_list_room_success() {
         });
         assert!(has_computer1, "Should contain computer1 with computer role");
 
-        // 验证包含computer2
-        let has_computer2 = sessions.iter().any(|session| {
-            session.get("name").and_then(|n| n.as_str()) == Some("computer2")
-                && session.get("role").and_then(|r| r.as_str()) == Some("computer")
-        });
-        assert!(has_computer2, "Should contain computer2 with computer role");
+        // protocol#66：一房至多一台 Computer——会话数恰为 2（1 Agent + 1 Computer）。
+        assert_eq!(
+            sessions.len(),
+            2,
+            "每 role 一席下 office1 恰有 agent1 + computer1 两个会话：{sessions:?}"
+        );
 
         // 验证所有会话都在正确的办公室
         for session in sessions {
@@ -122,7 +120,6 @@ async fn test_list_room_success() {
     // 清理
     agent_client.disconnect().await.unwrap();
     computer1_client.disconnect().await.unwrap();
-    computer2_client.disconnect().await.unwrap();
     server.shutdown();
 }
 
@@ -350,31 +347,20 @@ async fn test_list_room_cross_office_access_denied() {
         .expect("list_room ack timeout")
         .unwrap();
 
-    // 验证错误响应
-    // 当前实现返回空会话列表而不是错误消息
-    let sessions_count = match error_payload {
-        serde_json::Value::Array(arr) => {
-            if let Some(obj) = arr.first() {
-                obj.get("sessions")
-                    .and_then(|s| s.as_array())
-                    .map(|s| s.len())
-                    .unwrap_or(0)
-            } else {
-                0
-            }
+    // 越权访问必须返回 flat ErrorPayload，而不是伪装成空房间。
+    let error_payload = match error_payload {
+        serde_json::Value::Array(mut args)
+            if args.len() == 1 && args.first().is_some_and(serde_json::Value::is_object) =>
+        {
+            args.remove(0)
         }
-        serde_json::Value::Object(obj) => obj
-            .get("sessions")
-            .and_then(|s| s.as_array())
-            .map(|s| s.len())
-            .unwrap_or(0),
-        _ => 0,
+        payload => payload,
     };
-
-    // 验证返回空会话列表（权限被拒绝）
+    assert_eq!(error_payload["code"], smcp::error_codes::CROSS_ROOM_ACCESS);
+    assert!(error_payload.get("sessions").is_none());
     assert_eq!(
-        sessions_count, 0,
-        "Cross-office access should return empty sessions"
+        error_payload["details"]["office_id"],
+        serde_json::Value::String("office2".to_string())
     );
 
     // 清理
@@ -495,8 +481,13 @@ async fn test_list_room_multiple_offices() {
     server.shutdown();
 }
 
+/// 一致性场景 #2：**同名第二台 Computer 入房 ⇒ `4101`（不得回 `4105`）**。
+///
+/// 席位判定与 `name` 无关——同名与否都先撞「每 role 一席」；`4105` 已转预留码（MUST NOT 产出）。
+/// 载荷逐字对齐协议 error-handling.md §Room Full：
+/// `{"code":4101,"message":"Room already has a computer","details":{"office_id":…,"role":"computer"}}`。
 #[tokio::test]
-async fn test_computer_duplicate_name_rejected() {
+async fn test_computer_duplicate_name_rejected_seat_taken() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let server = SmcpTestServer::start().await;
@@ -518,7 +509,6 @@ async fn test_computer_duplicate_name_rejected() {
     .await;
 
     // 创建第二个Computer客户端
-    println!("Creating second computer client...");
     let computer2_client = create_test_client(&server_url, SMCP_NAMESPACE).await;
 
     // 等待连接完全建立
@@ -529,59 +519,26 @@ async fn test_computer_duplicate_name_rejected() {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "duplicate_comp".to_string(),
+        computer_id: Some("6c41dfb7-8d90-41a2-ce1f-3a4b5c6d7e80".to_string()),
     };
 
-    println!("Sending join_office request from second computer...");
+    let result = emit_join_for_ack(&computer2_client, json!(join_req)).await;
 
-    // 创建channel接收响应
-    let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
-
-    // 发送加入请求
-    println!("About to emit_with_ack from second computer...");
-    computer2_client
-        .emit_with_ack(
-            "server:join_office",
-            json!(join_req),
-            Duration::from_secs(5),
-            ack_to_sender(result_tx, |p| {
-                println!("Ack callback invoked for second computer! Payload: {:?}", p);
-                match p {
-                    Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
-                    _ => serde_json::Value::Null,
-                }
-            }),
-        )
-        .await
-        .expect("join_office emit_with_ack failed");
-
-    // 等待响应
-    let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
-        .await
-        .expect("join_office ack timeout")
-        .unwrap();
-
-    // 验证加入失败
-    // 服务端返回 (bool, Option<String>) 元组，序列化为 [false, "error"] 格式
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-    assert!(
-        !success,
-        "Second computer with same name should fail to join"
+    // 失败回 flat ErrorPayload：席位码 4101 + computer 席文案 + details（office_id / role 双键）。
+    assert_eq!(
+        result["code"],
+        smcp::error_codes::ROOM_FULL,
+        "同名第二台必须回 4101（席位规则先拦），实得 {result}"
     );
-
-    // 验证错误信息
-    let error_msg = if let Some(arr) = result.as_array() {
-        arr.get(1).and_then(|v| v.as_str()).unwrap_or("")
-    } else {
-        ""
-    };
-    assert!(
-        error_msg.contains("already exists"),
-        "Error should contain 'already exists', got: {}",
-        error_msg
+    assert_eq!(result["message"], "Room already has a computer");
+    assert_eq!(
+        result["details"],
+        json!({"office_id": "office1", "role": "computer"})
+    );
+    assert_ne!(
+        result["code"],
+        smcp::error_codes::NAME_CONFLICT,
+        "4105 为预留码，任何路径 MUST NOT 产出"
     );
 
     // 清理
@@ -590,8 +547,12 @@ async fn test_computer_duplicate_name_rejected() {
     server.shutdown();
 }
 
+/// 一致性场景 #1：**不同名第二台 Computer 入房同样回 `4101`**（一房至多一台 Computer）。
+///
+/// 与场景 #2 成对：证明拒绝与 `name` 无关，席位判据就是「目标房已有 Computer 且非本会话」。
+/// 同时校验拒绝**先于副作用**：被拒方不产生任何成员变更（仍无房）。
 #[tokio::test]
-async fn test_computer_different_name_allowed() {
+async fn test_computer_different_name_also_rejected() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let server = SmcpTestServer::start().await;
@@ -612,55 +573,27 @@ async fn test_computer_different_name_allowed() {
     // 等待连接完全建立
     sleep(Duration::from_millis(200)).await;
 
-    // 第二个Computer使用不同名称加入同一办公室
+    // 第二个Computer使用**不同名称**加入同一办公室
     let join_req = EnterOfficeReq {
         office_id: "office1".to_string(),
         role: Role::Computer,
         name: "comp2".to_string(),
+        computer_id: Some("7d52e0c8-9ea1-42b3-df2a-4b5c6d7e8f90".to_string()),
     };
 
-    // 创建channel接收响应
-    let (result_tx, result_rx) = oneshot::channel::<serde_json::Value>();
+    let result = emit_join_for_ack(&computer2_client, json!(join_req)).await;
 
-    // 发送加入请求
-    computer2_client
-        .emit_with_ack(
-            "server:join_office",
-            json!(join_req),
-            Duration::from_secs(5),
-            ack_to_sender(result_tx, |p| match p {
-                Payload::Text(mut values, _) => values.pop().unwrap_or(serde_json::Value::Null),
-                _ => serde_json::Value::Null,
-            }),
-        )
-        .await
-        .expect("join_office emit_with_ack failed");
-
-    // 等待响应
-    let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
-        .await
-        .expect("join_office ack timeout")
-        .unwrap();
-
-    // 验证加入成功
-    // 服务端返回 (bool, Option<String>) 元组，序列化为 [true, null] 格式
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-    assert!(
-        success,
-        "Computer with different name should succeed to join"
+    // 不同名同样拒绝：席位已占（协议 v0.5.0 起一房至多一台 Computer，不替换）。
+    assert_eq!(
+        result["code"],
+        smcp::error_codes::ROOM_FULL,
+        "不同名第二台也必须回 4101，实得 {result}"
     );
-
-    // 验证没有错误
-    let has_error = if let Some(arr) = result.as_array() {
-        arr.get(1).and_then(|v| v.as_str()).is_some()
-    } else {
-        true
-    };
-    assert!(!has_error, "Should not have error");
+    assert_eq!(result["message"], "Room already has a computer");
+    assert_eq!(
+        result["details"],
+        json!({"office_id": "office1", "role": "computer"})
+    );
 
     // 清理
     computer1_client.disconnect().await.unwrap();
@@ -695,6 +628,7 @@ async fn test_computer_switch_room_with_same_name_allowed() {
         office_id: "office2".to_string(),
         role: Role::Computer,
         name: "switching_comp".to_string(),
+        computer_id: Some(TEST_COMPUTER_ID.to_string()),
     };
 
     // 创建channel接收响应
@@ -720,25 +654,8 @@ async fn test_computer_switch_room_with_same_name_allowed() {
         .expect("join_office ack timeout")
         .unwrap();
 
-    // 验证切换成功
-    // 服务端返回 (bool, Option<String>) 元组，序列化为 [true, null] 格式
-    let success = if let Some(arr) = result.as_array() {
-        arr.first().and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
-    assert!(
-        success,
-        "Computer should be able to switch rooms with same name"
-    );
-
-    // 验证没有错误
-    let has_error = if let Some(arr) = result.as_array() {
-        arr.get(1).and_then(|v| v.as_str()).is_some()
-    } else {
-        true
-    };
-    assert!(!has_error, "Should not have error");
+    // 成功回空 ack（零参 ACK `[]`）。
+    assert_empty_ack(&result, "join_office");
 
     // 清理
     computer_client.disconnect().await.unwrap();

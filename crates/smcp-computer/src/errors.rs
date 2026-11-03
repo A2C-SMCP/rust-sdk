@@ -74,6 +74,15 @@ pub enum ComputerError {
     /// 连接错误 / Connection error
     ConnectionError(String),
 
+    /// Structured stdio child-process initialization diagnostics.
+    ///
+    /// **透传内层文案**（#226 复审 🟡8）：内层 `StdioInitializationError` 已按失败相位写好类别前缀
+    /// （`InitializeTimeout` ⇒ `Timeout error: …`，其余 ⇒ `Connection error: …`）。此处若再套一层
+    /// `"Connection error: "`，非超时相位会产出 `Connection error: Connection error: …` 的重复前缀，
+    /// 而超时相位会被**错误分类**为连接错误——与变体语义不符，故不再包裹。
+    #[error("{0}")]
+    StdioInitialization(#[from] crate::mcp_clients::StdioInitializationError),
+
     #[error("HTTP authentication error: {0}")]
     /// Structured HTTP authentication negotiation result.
     HttpAuthentication(#[from] crate::mcp_clients::HttpAuthenticationError),
@@ -103,6 +112,39 @@ pub enum ComputerError {
     /// 协议错误 / Protocol error
     ProtocolError(String),
 
+    /// 对端在 ack 上回传的**结构化协议拒绝**（房间/身份类）：协议码与 `details` **原样保留**。
+    ///
+    /// 与 [`Self::ProtocolError`] 的分工（#226 复审 🟡4）：`ProtocolError(String)` 是**本端**发现的
+    /// 协议违约（字符串描述即可，没有对端码）；本变体承载**对端裁决**，故必须让消费方**按码分流**——
+    /// 协议 §建议的重试策略把 `4101`（本 role 席位被占，protocol#66 泛化后含 Computer 席）定为
+    /// 传输层重连后的瞬态冲突（可有界退避重试），`4106` / `400` 为永久失败；`4105` 已转预留码
+    /// （收到即协议违规，绝不重试）。历史实现把整包 `format!` 成 `"room join rejected (4101): …"`，
+    /// 消费方只能靠字符串解析（#219 的按码退避因此无从实现）。
+    ///
+    /// Carries the peer's structured rejection verbatim so consumers can dispatch on `code` instead of
+    /// parsing a formatted string.
+    #[error("Protocol rejection ({code}): {message}")]
+    ProtocolRejection {
+        /// 对端 flat `ErrorPayload.code`（如 `4101` / `4106`；`4105` 为预留码，仅可能来自违规对端）。
+        code: i64,
+        /// 对端 `message`（协议 canonical 文案）。
+        message: String,
+        /// 对端 `details` 原样保留（诊断容器；`Agent` 侧同款字段语义见 `SmcpProtocolError::details`）。
+        details: Option<serde_json::Value>,
+    },
+
+    /// The requested name differs from the immutable connection identity.
+    #[error(
+        "Connection identity is immutable: this connection declares `{current}`, not `{requested}` \
+         — create a new connection to change the name"
+    )]
+    IdentityMismatch {
+        /// 本连接身份（建立该 Socket.IO 连接时声明的名字）。
+        current: String,
+        /// 本次请求要声明的名字。
+        requested: String,
+    },
+
     #[error("Socket.IO error: {0}")]
     /// Socket.IO错误 / Socket.IO error
     SocketIoError(String),
@@ -131,6 +173,25 @@ pub enum ComputerError {
     /// 值**（落盘的是原始 `${input:*}` 引用，D1/§4.6.6）。runtime mutate（add_or_update/remove_server）经此报错。
     /// Config-layer persistence failure surfaced from `update_config`; carries no secret values。
     ConfigPersist(String),
+
+    /// protocol#64：Computer 稳定身份持久化失败（不可读 / 损坏 / 空 / 无法创建）。
+    ///
+    /// **本地**错误（`error_code` 500），不上 wire：身份文件损坏时必须 fail-fast，不得静默重生成
+    /// 或覆写（重置身份是显式入口）。`reason` 只含路径与原因，不含任何 secret。
+    /// Local-only identity-store failure (HTTP-500 analogue); never sent on the wire. Corrupt or
+    /// unreadable identity MUST fail fast — never silently regenerate or overwrite.
+    ///
+    /// 处置指引由**具体原因**决定（写在 `reason` 里）：只有「文件内容无效 / 非 UTF-8」才提示
+    /// 运行 `smcp-computer identity reset`（或删除文件）重建；非绝对路径 / 权限 / 路径是目录等
+    /// 重试或删文件都无效，不能给同一句 hint（否则用户会照抄未展开的哨兵路径去删真实身份文件）。
+    /// Remediation belongs to the specific `reason`, not to every identity-store error.
+    #[error("Computer identity store error at {path}: {reason}")]
+    IdentityStore {
+        /// 身份文件路径 / identity file path.
+        path: String,
+        /// 失败原因 / failure reason.
+        reason: String,
+    },
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ComputerError {
@@ -174,6 +235,7 @@ impl ComputerError {
 
             // 连接错误 / Connection errors
             ComputerError::ConnectionError(_) => 500, // INTERNAL_ERROR
+            ComputerError::StdioInitialization(_) => 500, // INTERNAL_ERROR
             ComputerError::HttpAuthentication(error) => match error {
                 crate::mcp_clients::HttpAuthenticationError::Forbidden => 403,
                 crate::mcp_clients::HttpAuthenticationError::OAuthRequired
@@ -198,6 +260,10 @@ impl ComputerError {
 
             // 协议错误 / Protocol errors
             ComputerError::ProtocolError(_) => 500, // INTERNAL_ERROR
+            // 对端结构化拒绝：码空间就是协议码本身（4101/4102/4105/4106…），原样透出以便按码分流。
+            ComputerError::ProtocolRejection { code, .. } => *code as i32,
+            // 本地身份不变量（#224）：与对端对同一违约的裁决同码，消费方分流口径不变。
+            ComputerError::IdentityMismatch { .. } => 403, // FORBIDDEN
 
             // 状态错误 / State errors
             ComputerError::InvalidState(_) => 400, // BAD_REQUEST
@@ -214,6 +280,9 @@ impl ComputerError {
 
             // #113 S6：config 落盘错误（只读 origin / synthesized / I/O）/ config persistence errors
             ComputerError::ConfigPersist(_) => 400, // BAD_REQUEST（写目标不可写 / 非法实体）
+
+            // protocol#64：本地身份存储错误（不上 wire）/ local identity-store error (never on the wire)
+            ComputerError::IdentityStore { .. } => 500, // INTERNAL_ERROR
         }
     }
 }
@@ -288,6 +357,47 @@ pub enum McpClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #226 复审 🟡4：对端结构化拒绝 MUST 保留 `code` / `details`，使消费方**按码分流**
+    /// （瞬态 `4101` vs 永久 `4106` / `400`；`4105` 为预留码，收到即协议违规、绝不重试），
+    /// 而不是解析 `"room join rejected (4101): …"` 这类格式化字符串。
+    #[test]
+    fn protocol_rejection_preserves_code_message_and_details() {
+        let err = ComputerError::ProtocolRejection {
+            code: 4101,
+            message: "Room already has an agent".to_string(),
+            details: Some(serde_json::json!({"office_id": "office-a"})),
+        };
+
+        // ① 码原样透出（`error_code()` 不再是笼统 500）。
+        assert_eq!(err.error_code(), 4101);
+        // ② 结构化字段可直接 match，无需字符串解析。
+        match &err {
+            ComputerError::ProtocolRejection {
+                code,
+                message,
+                details,
+            } => {
+                assert_eq!(*code, 4101);
+                assert_eq!(message, "Room already has an agent");
+                assert_eq!(
+                    details
+                        .as_ref()
+                        .and_then(|d| d.get("office_id"))
+                        .and_then(|v| v.as_str()),
+                    Some("office-a")
+                );
+            }
+            other => panic!("expected ProtocolRejection, got {other:?}"),
+        }
+        // ③ Display 仍携带码与文案（日志可读）。
+        let displayed = err.to_string();
+        assert!(displayed.contains("4101"), "{displayed}");
+        assert!(
+            displayed.contains("Room already has an agent"),
+            "{displayed}"
+        );
+    }
 
     #[test]
     fn test_protocol_version_mismatch_from_payload() {

@@ -458,6 +458,46 @@ mod tests {
         assert!(on_disk["servers"]["beta"].is_object());
     }
 
+    #[test]
+    fn import_round_trips_stdio_connect_timeout_216() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = xdg_env(&tmp);
+        let managed = tmp.path().join("no-managed.json");
+        let project_mcp = crate::settings::mcp_config::workdir_mcp_config_path(&wd);
+        let c = ctx(&wd, &env, &managed);
+
+        let mut server = stdio("slow", "slow-mcp");
+        if let MCPServerConfig::Stdio(config) = &mut server {
+            config.connect_timeout_secs = Some(90);
+        } else {
+            panic!("expected stdio config");
+        }
+        import_mcp_servers(&c, &[server]).expect("custom timeout import should succeed");
+
+        let on_disk: Value = serde_json::from_str(&fs::read_to_string(&project_mcp).unwrap())
+            .expect("persisted config should be valid JSON");
+        assert_eq!(
+            on_disk["servers"]["slow"]["connect_timeout_secs"],
+            serde_json::json!(90)
+        );
+
+        let resolved = crate::settings::mcp_config::resolve_mcp_config(
+            crate::settings::mcp_config::ResolveMcpConfigArgs {
+                cwd: Some(&wd),
+                env: Some(&env),
+                managed_mcp_path: Some(&managed),
+                ..Default::default()
+            },
+        );
+        match &resolved.servers["slow"].config {
+            MCPServerConfig::Stdio(config) => {
+                assert_eq!(config.connect_timeout_secs, Some(90));
+            }
+            other => panic!("expected stdio config after reload, got {other:?}"),
+        }
+    }
+
     /// #151 Part 2：不同 origin——既有 Local server 的 update 落其 origin；新 server 落 upsert_new_scope。
     #[test]
     fn import_different_origins_update_and_add_151() {

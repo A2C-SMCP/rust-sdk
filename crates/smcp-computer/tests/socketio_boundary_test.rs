@@ -13,6 +13,29 @@
 //! Problem 2 需 Node.js（`tests/echo-mcp-server`），故 `#[ignore]`：
 //!   cargo test --package smcp-computer --test socketio_boundary_test -- --ignored --nocapture
 
+/// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
+/// 后续统一抽共享 helper（本批未含）；`#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
+#[allow(dead_code)]
+fn isolated_config_env(
+    base: impl AsRef<std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 每次调用分配独立子目录：同一测试二进制内的多个 Computer、以及共享 temp_dir 的 e2e
+    // 用例都不会复用同一身份（PR3 记录/回显身份后“两台电脑”前提仍然成立）。
+    let base = base.as_ref().join(format!(
+        "smcp-identity-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), base.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        base.join("xdg-config").display().to_string(),
+    );
+    env
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +57,7 @@ use smcp_computer::mcp_clients::bundle_id::resolve_bundle_id;
 use smcp_computer::mcp_clients::model::{
     MCPServerConfig, StdioServerConfig, StdioServerParameters,
 };
+
 use smcp_computer::mcp_clients::{HttpServerConfig, HttpServerParameters};
 use smcp_computer::LifecycleState;
 
@@ -68,8 +92,8 @@ impl RelayObs {
 /// 启动裸 socketioxide+hyper recording relay，返回 `(url, shutdown_tx)`。
 ///
 /// - `/smcp` namespace（与 SMCP server 一致，Computer 默认可连）；
-/// - ACK `server:join_office` 为 `(true, None)`——与真实 server `on_server_join_office` 返回同构，
-///   使 Computer 的 `call`（emit-with-ack）解析为成功、达 joined 状态（`leave_office` 走 `emit` 无 ack）；
+/// - ACK `server:join_office` 为成功空 ack——与真实 server 契约同构，使 Computer 的 `call`（
+///   emit-with-ack）解析为成功、达 joined 状态（`leave_office` 走 `emit` 无 ack）；
 /// - 记录 connect / disconnect / `server:update_tool_list`。
 async fn start_relay(obs: Arc<RelayObs>) -> (String, oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -91,11 +115,15 @@ async fn start_relay(obs: Arc<RelayObs>) -> (String, oneshot::Sender<()>) {
                 }
             });
 
-            // ACK join 成功（mirror 真实 server 的 `(bool, Option<String>)` = `[true, null]`）。
+            // ACK join 成功。注意本 mock 发的是 `ack.send(&())` ⇒ socketioxide 的 `to_value`
+            // 把非 tuple-like 包成 1-tuple ⇒ 线上是 `[null]`，**不是**真实 server 现在的空 ack 形态
+            // （v0.5.0 起真实 server 由 `EmptyAck::serialize_tuple(0)` 产出零参 `[]`）。因此本 mock
+            // 覆盖的是客户端「向后兼容 `[null]`」这条容忍分支；`[]` 成功路径由
+            // `auth_dict_injection_test.rs` 的 `ZeroArgAck` mock 覆盖（#226 复审 🟡5 据实订正）。
             socket.on(
                 "server:join_office",
                 move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {
-                    let _ = ack.send(&(true, None::<String>));
+                    let _ = ack.send(&());
                 },
             );
 
@@ -179,11 +207,15 @@ async fn start_relay_pinged(
                 }
             });
 
-            // ACK join 成功（mirror 真实 server 的 `(bool, Option<String>)` = `[true, null]`）。
+            // ACK join 成功。注意本 mock 发的是 `ack.send(&())` ⇒ socketioxide 的 `to_value`
+            // 把非 tuple-like 包成 1-tuple ⇒ 线上是 `[null]`，**不是**真实 server 现在的空 ack 形态
+            // （v0.5.0 起真实 server 由 `EmptyAck::serialize_tuple(0)` 产出零参 `[]`）。因此本 mock
+            // 覆盖的是客户端「向后兼容 `[null]`」这条容忍分支；`[]` 成功路径由
+            // `auth_dict_injection_test.rs` 的 `ZeroArgAck` mock 覆盖（#226 复审 🟡5 据实订正）。
             socket.on(
                 "server:join_office",
                 move |_s: SocketRef, _d: Data<Value>, ack: AckSender| async move {
-                    let _ = ack.send(&(true, None::<String>));
+                    let _ = ack.send(&());
                 },
             );
 
@@ -290,7 +322,11 @@ async fn disconnect_socketio_closes_transport_relay_observes() {
 
     let td = TempDir::new().unwrap();
     let computer = isolate(
-        Computer::new("c1", SilentSession::new("s"), None, None, false, false),
+        Computer::new("c1", SilentSession::new("s"), None, None, false, false).with_config_env(
+            isolated_config_env(
+                std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+            ),
+        ),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -353,7 +389,11 @@ async fn shutdown_closes_transport_relay_observes() {
 
     let td = TempDir::new().unwrap();
     let computer = isolate(
-        Computer::new("c2", SilentSession::new("s"), None, None, false, false),
+        Computer::new("c2", SilentSession::new("s"), None, None, false, false).with_config_env(
+            isolated_config_env(
+                std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+            ),
+        ),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -415,7 +455,10 @@ async fn start_stop_mcp_syncs_tool_list_when_joined() {
             Some(servers),
             false,
             false,
-        ),
+        )
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        )),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -473,7 +516,10 @@ async fn start_stop_mcp_no_sync_when_not_joined() {
             Some(servers),
             false,
             false,
-        ),
+        )
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        )),
         &td,
     );
     computer.boot_up().await.expect("boot");
@@ -556,7 +602,10 @@ async fn setup_pending_computer() -> (
             Some(servers),
             false,
             false,
-        ),
+        )
+        .with_config_env(isolated_config_env(
+            std::env::temp_dir().join(format!("smcp-test-{}", std::process::id())),
+        )),
         &td,
     );
     computer.boot_up().await.expect("boot");

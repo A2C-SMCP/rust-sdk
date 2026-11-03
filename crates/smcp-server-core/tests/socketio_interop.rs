@@ -20,6 +20,8 @@ use hyper::body::Bytes;
 use smcp_server_core::{DefaultAuthenticationProvider, SessionManager, SmcpServerBuilder};
 use tower::{Layer, Service};
 
+const TEST_COMPUTER_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
 async fn find_available_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().port()
@@ -344,6 +346,7 @@ async fn test_update_notifications_and_role_checks() {
             smcp::events::SERVER_JOIN_OFFICE,
             serde_json::json!({
                 "role": "computer",
+                "computer_id": TEST_COMPUTER_ID,
                 "name": "comp_a",
                 "office_id": "shared_office"
             }),
@@ -629,6 +632,7 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
             smcp::events::SERVER_JOIN_OFFICE,
             serde_json::json!({
                 "role": "computer",
+                "computer_id": TEST_COMPUTER_ID,
                 "name": "c1",
                 "office_id": "office1"
             }),
@@ -644,10 +648,8 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        join_payload.to_string().contains("true")
-            || join_payload.to_string().contains("[true, null]")
-    );
+    // 成功 = 空 ack（**零参** ACK，逐字节 `[]`；对齐 python-socketio 参考实现与 #226 P1-6）。
+    assert_eq!(join_payload, serde_json::json!([]));
 
     let (list_tx, list_rx) = oneshot::channel::<serde_json::Value>();
     client
@@ -721,17 +723,19 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         )
         .await
         .expect("get_tools emit_with_ack failed");
-    // 新语义（SRV-01 #47）：非 Agent 调用方（此处 Computer "c1"）发起 client:get_tools → 角色隔离
-    // 拒绝，Server **不投递协议 ack**（镜像 Python raise；不泄露、不造非协议错误码）。发起方侧自行
-    // 超时。断言：未收到「工具列表」或旧的 "Only agents" 错误 ack（容忍客户端库的超时占位回调）。
-    let got = timeout(Duration::from_secs(3), get_tools_rx).await;
-    let arrived_protocol_ack = matches!(
-        &got,
-        Ok(Ok(v)) if v.get("tools").is_some() || v.to_string().contains("Only agents")
-    );
-    assert!(
-        !arrived_protocol_ack,
-        "expected NO protocol ack for non-Agent caller (isolation), got: {got:?}"
+    // #223: a Computer issuing client:* receives the canonical flat 403 ACK.
+    // The Socket.IO callback preserves its argument array; assert the entire payload,
+    // including the absence of details, rather than accepting any error-shaped reply.
+    let got = timeout(Duration::from_secs(3), get_tools_rx)
+        .await
+        .expect("non-Agent rejection must acknowledge")
+        .expect("ACK callback dropped");
+    assert_eq!(
+        got,
+        serde_json::json!([{
+            "code": 403,
+            "message": "Only agents may issue client:* calls"
+        }])
     );
 
     let (leave_tx, leave_rx) = oneshot::channel::<serde_json::Value>();
@@ -751,10 +755,8 @@ async fn test_smcp_handler_join_list_leave_and_invalid_get_tools() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        leave_payload.to_string().contains("true")
-            || leave_payload.to_string().contains("[true, null]")
-    );
+    // 成功 = 空 ack（零参 ACK `[]`）。
+    assert_eq!(leave_payload, serde_json::json!([]));
 
     client.disconnect().await.expect("Failed to disconnect");
     server.shutdown();
