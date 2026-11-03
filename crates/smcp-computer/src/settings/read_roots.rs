@@ -55,7 +55,11 @@ pub(crate) fn remove_read_roots_raw(map: &mut Map<String, Value>) -> bool {
 
 /// 持锁 raw 保真删除（读取 / 删除 / 回写在同一把 settings 锁内）。
 ///
-/// 返回是否删除；缺失 / 畸形 → `Ok(false)`；锁 / IO 错误 → `Err(String)`。
+/// 返回是否删除；缺失 / 畸形 → `Ok(false)`（**不覆盖、不报错**）；锁 / IO 错误 → `Err(String)`。
+///
+/// **仅**用于 `settings edit` 的收尾清理（外部编辑器可直接写出任意内容，含 corrupt——这是 #253 的
+/// 显式 carve-out）。`settings set` / installer / marketplace / mcp_config 等写路径必须走
+/// `raw_write::update_raw_settings`（strict fail-closed），不得调用本函数。
 #[cfg(feature = "cli")]
 pub(crate) fn drop_read_roots_from_file(path: &Path) -> Result<bool, String> {
     let written = with_settings_lock(path, || -> std::io::Result<bool> {

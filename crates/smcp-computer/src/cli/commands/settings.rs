@@ -941,4 +941,18 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
+
+    #[test]
+    fn edit_cleanup_carve_out_is_tolerant_for_corrupt_file_253() {
+        // `settings edit` 的收尾清理是显式 carve-out：外部编辑器可写出任意内容，corrupt 时
+        // 宽容返回 false、不覆盖原文件；strict fail-closed 只适用于 settings set 等写路径。
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(drop_read_roots_from_file(&path), Ok(false));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 }
