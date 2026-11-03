@@ -8,6 +8,7 @@
 * 描述: 交互式REPL循环 / Interactive REPL loop
 */
 
+use crate::cli::commands::handler::print_rejoin_intent_cancelled_notice;
 use crate::cli::commands::{msg_warn, CommandError, CommandHandler};
 use crate::cli::completer::{A2CCompleter, SkillNameSnapshot};
 use crate::cli::help::render_help;
@@ -294,10 +295,21 @@ async fn handle_command(
                 "join" => {
                     if parts.len() < 4 {
                         return Err(CommandError::InvalidCommand(
-                            "用法: socket join <office_id> <computer_name> / Usage: socket join <office_id> <computer_name>".to_string(),
+                            "用法: socket join <office_id> <computer_name>（改名会自动重建连接）/ Usage: socket join <office_id> <computer_name> (rename reconnects)".to_string(),
                         ));
                     }
-                    handler.join_socket_room(parts[2], parts[3]).await?;
+                    match handler
+                        .join_socket_room_with_outcome(parts[2], parts[3])
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(failure) => {
+                            if let Some(notice) = failure.cancelled_notice() {
+                                print_rejoin_intent_cancelled_notice(notice);
+                            }
+                            return Err(failure.error);
+                        }
+                    }
                 }
                 "leave" => {
                     handler.leave_socket_room().await?;
@@ -305,6 +317,26 @@ async fn handle_command(
                 _ => {
                     return Err(CommandError::InvalidCommand(format!(
                         "未知的 socket 子命令: {}",
+                        parts[1]
+                    )));
+                }
+            }
+        }
+        "identity" => {
+            if parts.len() < 2 {
+                return Err(CommandError::InvalidCommand(
+                    "identity 子命令缺失（可用: reset）/ missing identity subcommand (available: reset)"
+                        .to_string(),
+                ));
+            }
+            match parts[1] {
+                "reset" => {
+                    // protocol#64：连接中由 handler 编排 退房 → 断开 → 重置 → 重连 → 回房。
+                    handler.reset_computer_identity().await?;
+                }
+                _ => {
+                    return Err(CommandError::InvalidCommand(format!(
+                        "未知的 identity 子命令: {}（可用: reset）",
                         parts[1]
                     )));
                 }

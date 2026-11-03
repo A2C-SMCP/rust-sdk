@@ -12,11 +12,12 @@ use crate::{
     auth::AuthProvider,
     config::SmcpAgentConfig,
     error::{Result, SmcpAgentError},
+    office::OfficeMembershipState,
     AsyncSmcpAgent,
 };
 use smcp::{
     utils::blob::PutBlobResult, A2CSkillRef, GetBlobRet, GetComputerConfigRet, GetResourcesRet,
-    GetSkillRet, SMCPTool, SessionInfo,
+    GetSkillRet, ResolvePathRet, SMCPTool, SessionInfo,
 };
 use tokio::runtime::Runtime;
 
@@ -57,6 +58,20 @@ impl SyncSmcpAgent {
     /// 离开办公室
     pub fn leave_office(&self) -> Result<()> {
         self.runtime.block_on(self.async_agent.leave_office())
+    }
+
+    /// 当前 Office 成员关系（只读快照）。
+    ///
+    /// 语义同 [`AsyncSmcpAgent::office_membership`]：区分「已连接但不在房」与「服务端已确认在房」——
+    /// 自动回房失败后状态回退到前者，SDK 绝不静默假装仍在房（#219）。
+    pub fn office_membership(&self) -> OfficeMembershipState {
+        self.async_agent.office_membership()
+    }
+
+    /// 服务端**已确认**的房间号；不在房时为 `None`（语义同
+    /// [`AsyncSmcpAgent::confirmed_office_id`]）。
+    pub fn confirmed_office_id(&self) -> Option<String> {
+        self.async_agent.confirmed_office_id()
     }
 
     /// 获取指定Computer的工具列表
@@ -139,6 +154,14 @@ impl SyncSmcpAgent {
         ))
     }
 
+    /// 按路径读取（v0.5.0，protocol#65，同步）/ Resolve a local path (sync).
+    ///
+    /// 阻塞包装 [`AsyncSmcpAgent::resolve_path`]；错误面与 async 版一致（4020 → 协议错误）。
+    pub fn resolve_path(&self, computer: &str, path: &str) -> Result<ResolvePathRet> {
+        self.runtime
+            .block_on(self.async_agent.resolve_path(computer, path))
+    }
+
     /// 上行落盘到 Computer landing root（v0.4.0 #195，同步）/ Upload bytes to the landing root (sync)。
     ///
     /// 阻塞包装 [`AsyncSmcpAgent::put_blob`]；错误面与 async 版一致（4019 → [`SmcpAgentError::Upload`]，
@@ -162,20 +185,25 @@ impl SyncSmcpAgent {
         computer: &str,
         tool_name: &str,
         params: serde_json::Value,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<serde_json::Value> {
-        self.runtime
-            .block_on(self.async_agent.tool_call(computer, tool_name, params))
-    }
-
-    /// 取消一次在途工具调用（fire-and-forget，无 ack，AGT-05 #44）。
-    /// `req_id` MUST==被取消的原 tool_call req_id。详见 [`AsyncSmcpAgent::tool_call_cancel`]。
-    pub fn tool_call_cancel(&self, req_id: &str) -> Result<()> {
-        self.runtime
-            .block_on(self.async_agent.tool_call_cancel(req_id))
+        self.runtime.block_on(
+            self.async_agent
+                .tool_call(computer, tool_name, params, cancel),
+        )
     }
 
     /// 列出房间内的所有会话
     pub fn list_room(&self, office_id: &str) -> Result<Vec<SessionInfo>> {
         self.runtime.block_on(self.async_agent.list_room(office_id))
+    }
+
+    /// 获取房内**唯一**的 Computer（protocol#66 单数便捷方法；同步版）。
+    ///
+    /// 语义与 [`AsyncSmcpAgent::get_computer_in_office`](crate::AsyncSmcpAgent::get_computer_in_office)
+    /// 完全一致：`Ok(None)` = 房内暂无 Computer；服务端报告多于一台 ⇒ 协议违规错误。
+    pub fn get_computer_in_office(&self, office_id: &str) -> Result<Option<SessionInfo>> {
+        self.runtime
+            .block_on(self.async_agent.get_computer_in_office(office_id))
     }
 }

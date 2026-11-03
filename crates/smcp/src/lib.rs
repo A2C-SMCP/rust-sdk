@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 /// 基础设施工具模块 / Infrastructure utilities（原子 IO / 环境变量 / 路径；治理层 SET/SKL 共用）。
 pub mod utils;
+/// protocol#64：`computer_id` 规范形态谓词（Server 校验与 Computer 解析的**单一权威**）。
+pub use utils::computer_id::{is_canonical_computer_id, MAX_UUID, NIL_UUID};
 
 /// SKILL name 解析与合成（段数消歧 lexer）/ SKILL name parse & synthesis (segment-count lexer)。
 pub mod skill_name;
@@ -22,26 +24,39 @@ pub const SMCP_NAMESPACE: &str = "/smcp";
 
 /// A2C-SMCP 协议版本号 / A2C-SMCP protocol version
 ///
-/// `MAJOR.MINOR` = `0.3.0`。v0.3.0 为 plugin install/enable 生命周期分离（`computer-management.md` §2.4，
-/// 非加性、破坏性），故从 `0.2.x` bump 到 `0.3.0`，用于 HTTP 握手阶段的版本协商。**v0.x 阶段 MINOR 严格相等**
-/// （见 [`version::is_compatible`]）——三方（Agent/Computer/Server）必须同为 `0.3.x` 才能握手，`0.2.x` 与
-/// `0.3.x` 互不兼容（4008）。PATCH 不影响兼容性。
+/// `MAJOR.MINOR` = `0.5.0`。v0.5.0 引入房间事件 ack 的破坏性线格式变更，故从 `0.4.x` bump 到 `0.5.0`，
+/// 用于 HTTP 握手阶段的版本协商。**v0.x 阶段 MINOR 严格相等**（见 [`version::is_compatible`]）——三方
+///（Agent/Computer/Server）必须同为 `0.5.x` 才能握手，`0.4.x` 与 `0.5.x` 互不兼容（4008）。PATCH 不影响兼容性。
 ///
-/// `MAJOR.MINOR` = `0.3.0`. v0.3.0 splits the plugin install/enable lifecycle (breaking, not additive),
-/// bumping from `0.2.x`. In v0.x MINOR must match exactly, so all three roles must be `0.3.x` to handshake.
+/// `MAJOR.MINOR` = `0.5.0`. v0.5.0 changes room-event ack wire shapes (breaking), bumping from `0.4.x`.
+/// In v0.x MINOR must match exactly, so all three roles must be `0.5.x` to handshake.
 ///
 /// 协议依据 / Protocol: `a2c-smcp-protocol` versioning.md。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py`。
-pub const PROTOCOL_VERSION: &str = "0.4.0";
+pub const PROTOCOL_VERSION: &str = "0.5.0";
 
 /// 标准错误码模块 / Standard error codes module
 ///
-/// ⚠️ 与 [`ErrorCode`] 枚举是**两套有意不合并的命名空间**（对齐 Python `a2c_smcp/smcp.py`，
-/// 其 `ErrorCode` 同样不含 4001–4005 / 4101–4104，合并会偏离参考实现）：
-/// - 本模块 = **传输/管理层码** + 工具/房间码（400–500、4001–4005、4101–4104）。
-/// - [`ErrorCode`] = **协议级闭集**（404、4006–4018），是 [`is_protocol_error_payload`] 识别的集合，
-///   也是 `client:*` ack 协议级错误必用的码。
-/// - 两者仅 `404` 重合。
+/// ⚠️ 本模块 = **数值定义表**（传输/管理层码 + 工具码 + 房间码），[`ErrorCode`] = **裸整数出线的
+/// 协议级闭集**（[`is_protocol_error_payload`] 识别的集合）。二者的关系是「同一批数字，两个用途」：
+///
+/// - 本模块持有**全部**码的数值，含**未进** [`ErrorCode`] 的工具码 `4001`–`4005`——它们只走
+///   MCP `CallToolResult.isError` 通道，**不**出现在协议 ack 上，故**不得**进入闭集。
+/// - [`ErrorCode`] 是 ack / HTTP 握手层可承载的码：`404`、`4006`–`4020`，以及 v0.5.0 起随房间
+///   事件 ack 一并纳入的 `400` / `403` / `500` / `4101`–`4106`（对齐 Python `a2c_smcp/smcp.py`
+///   的 v0.5.0 `ErrorCode`，其同样含这九个值）。
+///
+/// ## v0.5.0 扩充理由 / Why v0.5.0 added them
+///
+/// `server:join_office` / `server:leave_office` / `server:list_room` 的失败通道自 v0.5.0 起为
+/// flat `ErrorPayload`，拒绝码即房间码。若它们**不**在闭集内，[`is_protocol_error_payload`] 会
+/// 对「房间已被占用」这类结构化拒绝返回 `false`，Agent 端 `raise_for_error_payload` 随之静默放行
+/// ——把**被拒**读成**成功**（#226 P0-1）。故空缺必须补齐，而非在消费者侧另开旁路。
+///
+/// Both the transport/management codes and the tool codes live here as numeric definitions, but only
+/// the ones an ack can legally carry belong to [`ErrorCode`] — the closed set recognized by
+/// [`is_protocol_error_payload`]. Tool codes `4001`–`4005` deliberately stay out: they travel in MCP
+/// `CallToolResult.isError`, never on a protocol ack.
 pub mod error_codes {
     // 通用错误码 / General error codes
     pub const BAD_REQUEST: i32 = 400;
@@ -72,10 +87,35 @@ pub mod error_codes {
     pub const TOOL_REQUIRES_CONFIRMATION: i32 = 4005;
 
     // 房间管理错误码 / Room management error codes
+    /// 加入时目标房**该 role 的席位**已被其它会话占据（每 role 一席：一房 ≤1 Agent、≤1 Computer）。
+    /// Room-scoped **per-role seat** already taken (at most one Agent and one Computer per room)。
     pub const ROOM_FULL: i32 = 4101;
+    /// **预留码**：协议当前任何路径都不产生（房间由首次 `server:join_office` 隐式创建）。
+    /// SDK **MUST NOT** 主动返回；[`super::RoomRejectionCode`] 在类型层面排除了它。
+    /// Reserved: no protocol path produces this code, and SDKs MUST NOT return it.
     pub const ROOM_NOT_FOUND: i32 = 4102;
     pub const NOT_IN_ROOM: i32 = 4103;
     pub const CROSS_ROOM_ACCESS: i32 = 4104;
+    /// **预留码（v0.5.0 起）**：仅存在于 0.5.0-dev 草案（Discussion#61）；「每 role 一席」使同 role 的
+    /// 第二个会话无论是否同名都先撞 [`ROOM_FULL`]（4101），本码再无可达路径。房内名字唯一不变量
+    /// **`(office_id, role, name)`** 仍成立，由席位规则蕴含。SDK **MUST NOT** 主动返回；
+    /// [`super::RoomRejectionCode`] 在类型层面排除了它。收到时按协议违规记录并放弃。
+    ///
+    /// Reserved since v0.5.0: implied by the per-role seat rule; SDKs MUST NOT return it.
+    pub const NAME_CONFLICT: i32 = 4105;
+    pub const ALREADY_IN_ROOM: i32 = 4106;
+
+    /// 预留码判定（当前协议版本**无任何路径产出**）：`4102 Room Not Found` / `4105 Name Conflict`。
+    ///
+    /// 消费方（Agent / Computer 客户端的房间 ack 解析）收到任一预留码即判对端**协议违规**：
+    /// 记录告警并放弃（照常按拒绝处理，绝不重试）。本谓词是跨 SDK 的**单一权威**——新增预留码时
+    /// 只改此处，两侧客户端自动同步（避免各写一份 `==` 比较而漏改一端）。取 `i64` 以直接承接
+    /// ack / `ErrorPayload.code` 的线格式宽度。
+    ///
+    /// Is this code reserved (never producible by a conforming peer)? Single source for clients.
+    pub const fn is_reserved(code: i64) -> bool {
+        code == ROOM_NOT_FOUND as i64 || code == NAME_CONFLICT as i64
+    }
 }
 
 /// WebSocket 握手版本拒绝的 close code（RFC 6455 私有段 4000–4999）。
@@ -97,7 +137,7 @@ pub mod error_codes {
 /// with no structured body. Different namespaces, intentionally different values.
 pub const WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: i32 = 4900;
 
-/// A2C-SMCP 协议错误码（v0.2.0 起；v0.2.1 加性追加 `4016` / `4017` / `4018`）。
+/// A2C-SMCP 协议错误码（v0.2.0 起；v0.2.1 加性追加 `4016` / `4017` / `4018`；v0.4.0 追加 `4019`；v0.5.0 追加 `4020`）。
 ///
 /// 镜像 Python 参考实现 `a2c_smcp/smcp.py::ErrorCode`，**序列化 / 反序列化均为整数**
 /// （与协议 `ErrorPayload.code` 的线格式一致）。协议依据 / Protocol: error-handling.md。
@@ -108,11 +148,21 @@ pub const WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: i32 = 4900;
 /// 语义要点 / Semantics:
 /// - [`ErrorCode::NotFound`]（`404`）：通用「资源不存在」。本 SDK 用于 `client:*` 路由层
 ///   目标 Computer 名未命中（error-handling.md 明确「Computer 不存在」归 404）；镜像协议已有定义，非新增。
+/// - [`ErrorCode::BadRequest`]（`400` / v0.5.0）：具备 ack 通道的事件载荷 schema 校验失败**必须**回本码
+///   （**MUST NOT** 静默不 ack——「挂到客户端自身超时」与「立即收到结构化错误」是两种客户端可感行为）；
+///   覆盖「校验在进入业务 handler 之前失败」的时机。
+/// - [`ErrorCode::Forbidden`]（`403` / v0.5.0）：同一 sid 声明的 `role` / `name` 与既有会话不符
+///   （身份声明冲突，**非**房间语义——房间冲突一律走 `4101`–`4106`）。
+/// - [`ErrorCode::InternalError`]（`500` / v0.5.0）：未预期内部异常。协议 ack 层码表未列举本码（协议空档），
+///   但「有 ack 通道 ⇒ 失败必须产出 ack」是硬约束，故以通用码承载；文案笼统，原文只进日志。
+/// - [`ErrorCode::RoomFull`] 等 `4101`–`4106`（v0.5.0）：三个房间事件 ack 的业务拒绝码。构造入口为
+///   [`build_room_rejection_error`]（canonical 文案 + `details` 白名单的单一 choke point）；
+///   `4102` / `4105` 为**预留码**，[`RoomRejectionCode`] 均在类型层面排除，SDK **MUST NOT** 主动返回。
 /// - [`ErrorCode::McpServerNotFound`]（`4014`）：v0.2.1 复用——SKILL `name` **格式合法但不存在**
 ///   （未注册 / 已卸载 / 孤儿）复用此码；`name` 格式非法 → [`ErrorCode::SkillNameInvalid`]（`4016`）；
 ///   `name` 有效但 `rel_path` 不可达 → [`ErrorCode::SkillResourceNotAccessible`]（`4017`）。
 /// - SKILL 通道**不使用** `4015`：未声明 `resources` capability 的 server 在物化阶段即被排除，不上送 Agent。
-/// - `4017` / `4018` 的 `details.reason` 为**开放枚举**：解析方 MUST 容忍未知值并兜底
+/// - `4017` / `4018` / `4019` / `4020` 的 `details.reason` 为**开放枚举**：解析方 MUST 容忍未知值并兜底
 ///   （默认「不重试 + 诊断」），未来可非破坏地新增 reason。
 ///
 /// Mirrors the Python reference `ErrorCode`; serializes to / from an **integer** matching the
@@ -144,6 +194,45 @@ pub enum ErrorCode {
     /// `client:put_blob` 写入期唯一错误码；`details.reason` ∈ invalid_upload / invalid_declaration /
     /// range / too_large / busy / forbidden / integrity / io_error，开放枚举）。
     BlobWriteFailed = 4019,
+    /// 按路径读取的铸造期失败 / Path-based read mint-time failure（v0.5.0，protocol#65，
+    /// `client:resolve_path` 唯一错误码；`details.reason` ∈ invalid_path / forbidden /
+    /// not_found / not_a_file，开放枚举）。拉取期撤权/删除仍走 [`ErrorCode::BlobNotAccessible`]（4018）。
+    PathNotAccessible = 4020,
+    /// 通用请求错误：具备 ack 通道的事件载荷 schema 校验失败 / Generic bad request (ack payload invalid)。
+    ///
+    /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.BAD_REQUEST`）：房间事件与全部 `client:*` 路由在载荷
+    /// 畸形时**必须**回本码，而非静默不 ack。
+    BadRequest = 400,
+    /// 身份声明冲突：同一 sid 声明的 `role` / `name` / `computer_id` 与既有会话不符 /
+    /// Identity claim mismatch。
+    ///
+    /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.FORBIDDEN`）。**不**用于房间冲突——那是
+    /// `4101`–`4106`。`computer_id` 自 v0.5.0（protocol#64）起纳入本码的触发条件。
+    Forbidden = 403,
+    /// 未预期内部异常（文案笼统，原文只进日志）/ Unexpected internal error。
+    ///
+    /// v0.5.0 纳入闭集（对齐 Python `ErrorCode.INTERNAL_ERROR`）。
+    InternalError = 500,
+    /// `server:join_office` 拒绝：目标房**该 role 的席位**已被其它会话占据（每 role 一席，v0.5.0 起
+    /// 覆盖 Computer，见 [`ErrorCode`] 头注）。`details.role` 标明被占席位（= 发起者自己声明的 role）。
+    /// Target room's **per-role seat** already taken (`details.role` carries the seat's role)。
+    RoomFull = 4101,
+    /// **预留码**：协议当前无任何路径产生；保留号码以维持 `4101`–`4106` 语义连续。
+    /// 本枚举**识别**它（用于解析对端违规报文），但 [`RoomRejectionCode`] 在类型层面阻止本 SDK 产出它。
+    /// Reserved code: recognized on the wire, never produced by this SDK.
+    RoomNotFound = 4102,
+    /// 会话无 `office_id` 时发起需要房间上下文的操作 / Operation needs a room context but the session has none。
+    NotInRoom = 4103,
+    /// 调用方**显式指定**了非自己所在房的操作（如 `server:list_room` 查询他房）/ Explicit cross-room access。
+    CrossRoomAccess = 4104,
+    /// **预留码（v0.5.0 起）**：仅存在于 0.5.0-dev 草案（Discussion#61），表示过「房内同 role 同名」。
+    /// 「每 role 一席」使其再无可达路径（同 role 第二个会话先撞 `4101`）——房内名字唯一不变量
+    /// `(office_id, role, name)` 仍成立，由席位规则蕴含。本枚举**识别**它（用于把对端违规报文解析成
+    /// 可记录的结构化错误），但 [`RoomRejectionCode`] 在类型层面阻止本 SDK 产出它。
+    /// Reserved since v0.5.0; recognized on the wire, never produced by this SDK。
+    NameConflict = 4105,
+    /// **Agent** 已在其它房又请求加入新房间（Computer 自动换房，不产生本码）/ Agent is already in another room。
+    AlreadyInRoom = 4106,
 }
 
 impl ErrorCode {
@@ -165,6 +254,16 @@ impl ErrorCode {
             4017 => Some(Self::SkillResourceNotAccessible),
             4018 => Some(Self::BlobNotAccessible),
             4019 => Some(Self::BlobWriteFailed),
+            4020 => Some(Self::PathNotAccessible),
+            400 => Some(Self::BadRequest),
+            403 => Some(Self::Forbidden),
+            500 => Some(Self::InternalError),
+            4101 => Some(Self::RoomFull),
+            4102 => Some(Self::RoomNotFound),
+            4103 => Some(Self::NotInRoom),
+            4104 => Some(Self::CrossRoomAccess),
+            4105 => Some(Self::NameConflict),
+            4106 => Some(Self::AlreadyInRoom),
             _ => None,
         }
     }
@@ -209,7 +308,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// - 4014（MCP Server 未命中）→ `mcp_server`（值 = **bundle_id**，协议 0.3.0 §身份正交性 #18）；
 ///   4015（能力不支持）→ `mcp_server`（bundle_id）/ `capability`（SRV-01 #47 / AUTH-01 #23；构造见
 ///   [`ErrorPayload::with_mcp_server`] / [`ErrorPayload::with_capability`]）。
-/// - 4016 / 4017 / 4018 的 code-specific 字段下沉到 `details` 子对象（无顶层平铺新字段）。
+/// - 4016 / 4017 / 4018 / 4019 / 4020 的 code-specific 字段下沉到 `details` 子对象（无顶层平铺新字段）。
 ///
 /// 未知顶层字段由 [`ErrorPayload::extra`]（`#[serde(flatten)]`）**捕获并保留**，跨-SDK 往返
 /// 不静默丢字段——镜像 Python `total=False` TypedDict（运行时即 `dict`）的开放语义，避免旧
@@ -269,8 +368,11 @@ impl ErrorPayload {
     /// 由协议 [`ErrorCode`] 构造 flat 错误负载，消除调用点手工 `i64::from(ErrorCode::X.code())` 样板。
     ///
     /// 产出的 `code` 必属 [`is_protocol_error_payload`] 识别的协议级闭集（编译期由 [`ErrorCode`] 保证），
-    /// 杜绝误用传输/管理层整数字面量（400 / 401 / 500 / 4101…）落入 `client:*` ack 致 Agent 端
-    /// [`is_protocol_error_payload`] 误判为「非协议错误」。
+    /// 杜绝误用**非闭集**的整数字面量（如工具码 `4001`–`4005`、`401`/`408` 等传输层专用值）落入 ack，
+    /// 致 Agent 端 [`is_protocol_error_payload`] 误判为「非协议错误」而把拒绝读成成功。
+    ///
+    /// v0.5.0 起 `400` / `403` / `500` / `4101`–`4106` 亦属闭集（房间事件 ack 的失败通道），
+    /// 故经本函数构造它们同样安全。
     ///
     /// Build a flat payload from a protocol [`ErrorCode`], removing manual
     /// `i64::from(ErrorCode::X.code())` boilerplate and guaranteeing the wire `code` is always a
@@ -369,6 +471,167 @@ pub fn build_computer_not_found_error(computer_name: &str) -> ErrorPayload {
     .with_detail("computer_name", computer_name)
 }
 
+/// 房间管理「业务拒绝」的协议码 / Protocol code of a room-management business rejection.
+///
+/// 由三个具备 ack 通道的房间事件（`server:join_office` / `server:leave_office` /
+/// `server:list_room`）产出，一律以 flat [`ErrorPayload`] 承载（protocol#61）。
+///
+/// **类型层面排除预留码 `4102` / `4105`**：协议定义二者为预留码（「房间不存在」在隐式建房模型下
+/// 不可达；「房内同 role 同名」被「每 role 一席」蕴含而不可达），任何 SDK 路径都 **MUST NOT** 主动
+/// 返回。Python 参考实现把这条约束放在 `build_room_rejection_error` 的运行时 `ValueError`；本 SDK 把它
+/// 前移到**类型**——调用方连表达「回 4105」的能力都没有，故无需依赖调用方自觉。
+/// Type-level exclusion of the reserved codes `4102` / `4105`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RoomRejectionCode {
+    /// `403`：同一 sid 的 `role` / `name` / `computer_id` 声明与既有会话不符
+    /// （身份声明冲突，非房间语义）。
+    Forbidden,
+    /// `4101`：目标房**该 role 的席位**已被其它会话占据（每 role 一席；`details.role` 标明席位）。
+    RoomFull,
+    /// `4103`：会话无 `office_id` 却发起需要房间上下文的操作。
+    NotInRoom,
+    /// `4104`：调用方显式指定了非自己所在房的目标。
+    CrossRoomAccess,
+    /// `4106`：Agent 已在其它房。
+    AlreadyInRoom,
+}
+
+impl RoomRejectionCode {
+    /// 协议码数值 / The protocol code value.
+    pub const fn code(self) -> i32 {
+        match self {
+            Self::Forbidden => ErrorCode::Forbidden as i32,
+            Self::RoomFull => ErrorCode::RoomFull as i32,
+            Self::NotInRoom => ErrorCode::NotInRoom as i32,
+            Self::CrossRoomAccess => ErrorCode::CrossRoomAccess as i32,
+            Self::AlreadyInRoom => ErrorCode::AlreadyInRoom as i32,
+        }
+    }
+
+    /// 协议标准文案（与 `error-handling.md` / `room-model.md` 的响应示例、Python
+    /// `_ROOM_REJECTION_MESSAGES` **逐字一致**）。
+    ///
+    /// `4101` 的文案随**被占席位**二选一（`"Room already has an agent"` / `"Room already has a
+    /// computer"`，逐字取自 protocol#66 后的 error-handling.md 示例），`role` 须与同一 context 的
+    /// `declared_role` 同源传入——[`build_room_rejection_error`] 从单一局部变量取用，二者结构上不可漂移。
+    /// `role` 缺省时按 `agent` 席文案（防御性兜底；正常路径恒有 role）。
+    ///
+    /// `403` 例外：协议未给该码示例文案，本仓与 Python 参考实现自拟
+    /// `"Role or name mismatch with existing session"`。该文案**同时承载** `computer_id`
+    /// 不一致（protocol#64 起纳入同一码）——措辞保持不变以维持与 Python 的逐字一致。
+    /// 文案**恒为常量**——调用方无法拼接自身上下文，也就无法把内部错误类名或对端标识泄到线上。
+    /// Canonical message; constant by construction.
+    ///
+    /// `role` 为**类型化**的 [`Role`]（而非裸字符串）：只有 `Some(Computer)` 走 computer 席文案，
+    /// `None`/`Some(Agent)` 走 agent 席——不存在「大小写/拼写不匹配却仍回退 agent 文案」而与
+    /// `details.role` 自相矛盾的路径。
+    pub const fn message(self, role: Option<Role>) -> &'static str {
+        match self {
+            Self::Forbidden => "Role or name mismatch with existing session",
+            Self::RoomFull => match role {
+                Some(Role::Computer) => "Room already has a computer",
+                _ => "Room already has an agent",
+            },
+            Self::NotInRoom => "Not in any room",
+            Self::CrossRoomAccess => "Cross-room access denied",
+            Self::AlreadyInRoom => "Agent already in another room",
+        }
+    }
+}
+
+/// 房间管理事件**业务拒绝**的上下文（只含与**发起者自身**相关的字段）。
+///
+/// 为什么不是三个相邻的 `Option<&str>` 位置参数：三者语义互不相同（发起者声明的**目标房** /
+/// 发起者**自己声明**的 role / 会话**当前**所在房），而位置参数下 `(Some(x), None, None)` 与
+/// `(None, None, Some(x))` **都能编译**——写反即静默的线上语义错误（例如 `4106` 把「被拒的目标房」
+/// 当成「当前所在房」报出去，客户端据此误判自己身在何处）。具名结构体让每个值的来源在调用点自解释；
+/// Python 参考实现用 keyword-only（`*`）表达同一约束。
+///
+/// Why a named struct instead of three adjacent `Option<&str>`s: the three sources have distinct
+/// meanings and positional arguments cannot tell them apart at compile time. Python enforces the same
+/// with keyword-only arguments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoomRejectionContext<'a> {
+    /// 发起者自己声明的**目标房**：`4101` / `4104` 的 `details.office_id`。
+    pub target_office_id: Option<&'a str>,
+    /// 发起者**自己声明**的 role：仅 `4101` 的 `details.role`（= 被占席位的 role；即发起方自己声明的
+    /// role，**非**冲突方对端的 role——报对端会泄露对端信息）。
+    ///
+    /// **类型化**（非裸字符串）：文案选择（[`RoomRejectionCode::message`]）与 `details.role` 写入
+    /// 由同一枚 [`Role`] 派生，结构上无「文案与实际 role 不一致」的形态。
+    pub declared_role: Option<Role>,
+    /// 会话**当前**所在房：仅 `4106` 的 `details.office_id`（**非**被拒的目标房）。
+    pub current_office_id: Option<&'a str>,
+}
+
+/// 房间管理事件的**业务拒绝** → flat [`ErrorPayload`]。
+///
+/// 「协议码 → 文案」与「协议码 → `details` 键集」的**唯一 choke point**，与 Python
+/// `a2c_smcp/smcp.py::build_room_rejection_error` **逐字节对齐**（双实现镜像约束）。
+///
+/// `details` 只承载**与发起者自身相关**的上下文（协议 security.md §敏感信息过滤 +
+/// error-handling.md「`details` MUST NOT 携带其它会话的内部标识」）：
+///
+/// | `code` | `details` 键 | 取值来源（[`RoomRejectionContext`] 字段）|
+/// |---|---|---|
+/// | `403` | — | 无 code-specific 字段 |
+/// | `4101` | `office_id` / `role` | `target_office_id` + `declared_role`：被占席位的 role（= 发起者**自己声明**的 role，非冲突方）|
+/// | `4103` | — | 会话自身无房可报 |
+/// | `4104` | `office_id` | `target_office_id`：被拒的**目标**房 |
+/// | `4106` | `office_id` | `current_office_id`：会话**当前**所在房（**非**被拒的目标房） |
+///
+/// 无可写字段时**不产出** `details` 键，故 403 / 4103 的线上报文不含 `details`（对齐 Python）。
+///
+/// ⚠️ **本函数不是信息流保证**：上下文里都是调用方给的裸字符串，本函数无从校验其来源。真正的来源
+/// 约束在调用点——`current_office_id` 取自会话自身、`target_office_id` 取自请求载荷、`declared_role`
+/// 取自请求声明。Not an information-flow guarantee: provenance is enforced at the call sites.
+pub fn build_room_rejection_error(
+    code: RoomRejectionCode,
+    context: RoomRejectionContext<'_>,
+) -> ErrorPayload {
+    let protocol_code = ErrorCode::from_code(code.code())
+        .expect("every RoomRejectionCode maps to a protocol ErrorCode");
+    // `4101` 的文案与被占席位（`declared_role`）同源，从**同一局部变量**取用，二者结构上不可漂移。
+    let declared_role = context.declared_role;
+    let mut payload = ErrorPayload::from_error_code(protocol_code, code.message(declared_role));
+    match code {
+        // 403 / 4103 无 code-specific 字段（协议 §各错误码标准字段总表：details 列为「—」）。
+        RoomRejectionCode::Forbidden | RoomRejectionCode::NotInRoom => {}
+        RoomRejectionCode::RoomFull => {
+            if let Some(office_id) = context.target_office_id {
+                payload = payload.with_detail("office_id", office_id);
+            }
+            if let Some(role) = declared_role {
+                payload = payload.with_detail("role", role.to_string());
+            }
+        }
+        RoomRejectionCode::CrossRoomAccess => {
+            if let Some(office_id) = context.target_office_id {
+                payload = payload.with_detail("office_id", office_id);
+            }
+        }
+        RoomRejectionCode::AlreadyInRoom => {
+            if let Some(office_id) = context.current_office_id {
+                payload = payload.with_detail("office_id", office_id);
+            }
+        }
+    }
+    payload
+}
+
+/// 载荷 schema 校验失败 → flat [`ErrorPayload`]（`code = 400`）。
+///
+/// 协议 error-handling.md：对**具备 ack 通道**的事件，载荷校验失败时 Server **MUST** 回 flat
+/// `ErrorPayload`，**MUST NOT** 静默不 ack——「客户端挂起到自身超时」与「立即收到结构化错误」是两种
+/// 客户端可感行为。本要求**覆盖校验的触发时机**：校验放在业务 handler 之前（框架层提取器 / 中间件 /
+/// 序列化层）同样 MUST 回写 ack。
+///
+/// **刻意不带 `details`**：校验器文案可能内嵌客户端原始输入，回显进诊断面即等于把输入原样送还。
+/// 对齐 Python `build_bad_request_error`。
+pub fn build_bad_request_error() -> ErrorPayload {
+    ErrorPayload::from_error_code(ErrorCode::BadRequest, "Invalid request payload")
+}
+
 /// SMCP事件常量定义
 pub mod events {
     /// 客户端请求获取工具列表
@@ -389,6 +652,8 @@ pub mod events {
     pub const CLIENT_GET_BLOB: &str = "client:get_blob";
     /// 客户端通用二进制上行写入请求（v0.4.0）/ Generic binary push (v0.4.0)。
     pub const CLIENT_PUT_BLOB: &str = "client:put_blob";
+    /// 客户端按路径读取请求（v0.5.0，protocol#65）/ Path-based read (v0.5.0)。
+    pub const CLIENT_RESOLVE_PATH: &str = "client:resolve_path";
 
     /// 服务器加入办公室请求
     pub const SERVER_JOIN_OFFICE: &str = "server:join_office";
@@ -454,7 +719,7 @@ impl Default for ReqId {
 }
 
 /// 角色类型
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Agent,
@@ -745,6 +1010,23 @@ pub struct EnterOfficeReq {
     pub role: Role,
     pub name: String,
     pub office_id: String,
+    /// Computer 稳定身份（v0.5.0 起，protocol#64）：`role="computer"` 时 MUST 携带，
+    /// `role="agent"` 时 MUST NOT 出现该键（包含 `null`）。Agent 侧生产构造恒为 `None`，
+    /// 序列化即省略键；Server 自 v0.5.0 起强制校验（缺失/形态非法/Agent 携带 ⇒ `400`）。
+    ///
+    /// **实现约束（Server 侧）**：`Option<String>` 反序列化会把「键缺失」与「键存在且为
+    /// `null`」都塌缩成 `None`，本字段无法区分两者。服务端对 `role="agent"` 携带该键（含
+    /// `null`）回 `400` 的校验在原始 `Value` 上判键存在性（`contains_key`），不依赖 `is_some()`。
+    ///
+    /// Stable Computer identity (v0.5.0, protocol#64): MUST be carried when `role="computer"`;
+    /// MUST NOT appear for `role="agent"` (including `null`). Agent producers always set `None`,
+    /// which omits the key. Enforcement is server-side since v0.5.0 (rejects with `400`).
+    ///
+    /// Implementation constraint: `Option<String>` collapses key-absent and key-present-null into
+    /// `None`, so the server-side `400` check MUST test key presence on the raw `Value`
+    /// (`contains_key`), not `is_some()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
 }
 
 /// 离开办公室请求
@@ -906,6 +1188,17 @@ pub struct SessionInfo {
     /// serialization when absent (legacy connections that did not negotiate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2c_version: Option<String>,
+    /// Computer 稳定身份（v0.5.0 起，protocol#64）：`role="computer"` 时由 Server 保证存在，
+    /// `role="agent"` 时省略该键。与展示名 `name` 解耦。
+    ///
+    /// Rust Server 自 v0.5.0 起对 Computer 会话按连接记录填充该字段；Agent 会话省略键。
+    ///
+    /// Stable Computer identity (v0.5.0, protocol#64): guaranteed present for `role="computer"`,
+    /// omitted for `role="agent"`. Decoupled from the display name `name`.
+    ///
+    /// The in-repo Server fills this from the per-connection record for Computer sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
 }
 
 /// 列出房间返回
@@ -921,6 +1214,10 @@ pub struct EnterOfficeNotification {
     pub office_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub computer: Option<String>,
+    /// 加入的 Computer 稳定身份（仅成员为 Computer 时出现，v0.5.0 起）/ stable identity of the
+    /// joining Computer (present only when the member is a Computer, since v0.5.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }
@@ -931,6 +1228,10 @@ pub struct LeaveOfficeNotification {
     pub office_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub computer: Option<String>,
+    /// 离开的 Computer 稳定身份（仅成员为 Computer 时出现，v0.5.0 起）/ stable identity of the
+    /// leaving Computer (present only when the member is a Computer, since v0.5.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }
@@ -1206,6 +1507,11 @@ pub struct GetBlobRet {
 /// 对齐 Python `a2c_smcp.smcp.PUT_BLOB_EVENT`。
 pub const PUT_BLOB_EVENT: &str = events::CLIENT_PUT_BLOB;
 
+/// `client:resolve_path` 事件名 / event name（顶层别名，等于 [`events::CLIENT_RESOLVE_PATH`]）。
+///
+/// 对齐 Python `a2c_smcp.smcp.RESOLVE_PATH_EVENT`。
+pub const RESOLVE_PATH_EVENT: &str = events::CLIENT_RESOLVE_PATH;
+
 /// 通用二进制上行写入请求（`client:put_blob`，v0.4.0）。
 ///
 /// [`GetBlobReq`] 的方向镜像：`chunk_offset` / `eof` 由 **Agent 驱动推进**，`sha256` / `total_size`
@@ -1332,6 +1638,46 @@ pub struct PutBlobRet {
     pub req_id: Option<ReqId>,
 }
 
+/// 按路径读取请求 / Path-based read request（`client:resolve_path`，v0.5.0）。
+///
+/// Agent 给出 Computer 本地绝对路径；Computer 规范化 → `readRoots` 校验 → stat，返回
+/// `canonical_path` 与元数据并现铸 `blob_handle`；字节仍经 `client:get_blob` 拉取。
+/// 协议依据 / Protocol: events.md §client:resolve_path；data-structures.md §ResolvePathReq；
+/// blob-transfer.md §生产者三（protocol#65）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvePathReq {
+    #[serde(flatten)]
+    pub base: AgentCallData,
+    /// 目标 Computer 名 / target Computer name。
+    pub computer: String,
+    /// Computer 本地绝对路径：原生形态或 `canonical_path` 形态 / local absolute path。
+    pub path: String,
+}
+
+/// 按路径读取响应 / Path-based read response（`ResolvePathRet`，v0.5.0）。
+///
+/// 全部字段必填（协议 `total=True`）：`canonical_path` 为 realpath 后经 `normalize_path` 的规范路径；
+/// `blob_handle` 为现铸的不透明句柄；`mtime` 为 Unix epoch 毫秒（1970 前为负，仅作提示）。
+/// 持久引用 = `computer_id` + `canonical_path`，**不是** `blob_handle`。
+/// 协议依据 / Protocol: data-structures.md §ResolvePathRet；blob-transfer.md §生产者三。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvePathRet {
+    /// 规范路径（realpath 后经 `normalize_path`；可直接回用作 `path`）/ canonical path。
+    pub canonical_path: String,
+    /// 现铸的不透明句柄（转 `client:get_blob` 拉字节）/ freshly minted opaque handle。
+    pub blob_handle: BlobHandle,
+    /// 确定性推断的 MIME / deterministic MIME。
+    pub mime_type: String,
+    /// 文件字节数 / file size in bytes。
+    pub total_size: u64,
+    /// 全量 sha256 十六进制（小写）/ full-content sha256 (hex)。
+    pub sha256: String,
+    /// 最后修改时间：Unix epoch 毫秒（1970 前为负；仅作提示）/ mtime in epoch ms。
+    pub mtime: i64,
+    /// 请求 id / request id。
+    pub req_id: ReqId,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,6 +1712,7 @@ mod tests {
             role: Role::Agent,
             office_id: "office-1".to_string(),
             a2c_version: Some("0.2.0".to_string()),
+            computer_id: None,
         };
         let json = serde_json::to_value(&with_ver).unwrap();
         assert_eq!(json["a2c_version"], "0.2.0");
@@ -1377,6 +1724,7 @@ mod tests {
             role: Role::Computer,
             office_id: "office-1".to_string(),
             a2c_version: None,
+            computer_id: None,
         };
         let json_none = serde_json::to_value(&without_ver).unwrap();
         assert!(
@@ -1400,6 +1748,7 @@ mod tests {
             office_id: "office1".to_string(),
             computer: Some("c1".to_string()),
             agent: None,
+            computer_id: None,
         });
 
         let json = serde_json::to_string(&n).unwrap();
@@ -1540,7 +1889,9 @@ mod tests {
     #[test]
     fn test_is_protocol_error_payload_flat_true() {
         // 顶层 code 为协议 ErrorCode 取值 → true
-        for code in [404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019] {
+        for code in [
+            404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019, 4020,
+        ] {
             let v = serde_json::json!({ "code": code, "message": "x" });
             assert!(
                 is_protocol_error_payload(&v),
@@ -1553,19 +1904,32 @@ mod tests {
     }
 
     #[test]
+    fn test_is_protocol_error_payload_recognizes_4020_with_reason() {
+        // protocol#65：4020 是 resolve_path 铸造期的结构化拒绝；必须进闭集，
+        // 否则会被误分类为非协议错误（internal / 反序列化失败），丢失结构化 reason。
+        let v = serde_json::json!({
+            "code": 4020,
+            "message": "Path not accessible",
+            "details": { "reason": "forbidden" }
+        });
+        assert!(is_protocol_error_payload(&v));
+    }
+
+    #[test]
     fn test_is_protocol_error_payload_false() {
         // 嵌套 envelope → false（禁止二次 unwrap 的关键防线）
         let nested = serde_json::json!({ "error": { "code": 404, "message": "x" } });
         assert!(!is_protocol_error_payload(&nested));
 
-        // 非协议码（legacy 服务内部码 400 / 未知码 9999）→ false
-        assert!(!is_protocol_error_payload(
-            &serde_json::json!({ "code": 400 })
-        ));
-        assert!(!is_protocol_error_payload(
-            &serde_json::json!({ "code": 9999 })
-        ));
-
+        // 非闭集码 → false：`400` **已**在 v0.5.0 闭集内（房间事件 ack 的载荷校验失败码），
+        // 故此处以**真正不在闭集**的码为反例——工具码 4001–4005（只走 MCP `CallToolResult.isError`，
+        // 永不出现于 ack）、传输层专用 401 / 408、以及未知码 9999。
+        for code in [4001, 4005, 401, 408, 9999] {
+            assert!(
+                !is_protocol_error_payload(&serde_json::json!({ "code": code })),
+                "code {code} 不属于协议 ack 闭集，MUST NOT 判为协议错误负载"
+            );
+        }
         // 缺 code / code 非整数 / 非对象 → false
         assert!(!is_protocol_error_payload(
             &serde_json::json!({ "message": "x" })
@@ -1725,6 +2089,7 @@ mod tests {
         assert_eq!(ErrorCode::SkillResourceNotAccessible.code(), 4017);
         assert_eq!(ErrorCode::BlobNotAccessible.code(), 4018);
         assert_eq!(ErrorCode::BlobWriteFailed.code(), 4019);
+        assert_eq!(ErrorCode::PathNotAccessible.code(), 4020);
     }
 
     #[test]
@@ -1739,6 +2104,10 @@ mod tests {
         // 作为结构体字段时同样是裸整数（对齐 ErrorPayload.code 线格式）
         let v = serde_json::json!({ "code": ErrorCode::BlobNotAccessible });
         assert_eq!(v["code"], serde_json::json!(4018));
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::PathNotAccessible).unwrap(),
+            "4020"
+        );
     }
 
     #[test]
@@ -1747,6 +2116,8 @@ mod tests {
         assert_eq!(c, ErrorCode::McpServerNotFound);
         let c: ErrorCode = serde_json::from_str("4019").unwrap();
         assert_eq!(c, ErrorCode::BlobWriteFailed);
+        let c: ErrorCode = serde_json::from_str("4020").unwrap();
+        assert_eq!(c, ErrorCode::PathNotAccessible);
         // 未知码值必须报错（解析方对已知集合是封闭的）
         assert!(serde_json::from_str::<ErrorCode>("9999").is_err());
         assert_eq!(ErrorCode::from_code(9999), None);
@@ -1765,6 +2136,7 @@ mod tests {
             ErrorCode::SkillResourceNotAccessible,
             ErrorCode::BlobNotAccessible,
             ErrorCode::BlobWriteFailed,
+            ErrorCode::PathNotAccessible,
         ] {
             let json = serde_json::to_string(&code).unwrap();
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
@@ -1886,6 +2258,79 @@ mod tests {
         assert_eq!(v["eof"], true);
         let back: GetBlobRet = serde_json::from_value(v).unwrap();
         assert_eq!(back, last);
+    }
+
+    // ── protocol#65：client:resolve_path ─────────────────────────────────
+
+    #[test]
+    fn test_resolve_path_event_constant() {
+        assert_eq!(RESOLVE_PATH_EVENT, "client:resolve_path");
+        assert_eq!(RESOLVE_PATH_EVENT, events::CLIENT_RESOLVE_PATH);
+    }
+
+    #[test]
+    fn test_resolve_path_req_serde() {
+        let req = ResolvePathReq {
+            base: AgentCallData {
+                agent: "agent-1".to_string(),
+                req_id: ReqId::from_string("r1".to_string()),
+            },
+            computer: "comp-1".to_string(),
+            path: "/home/u/a.txt".to_string(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["agent"], "agent-1");
+        assert_eq!(v["req_id"], "r1");
+        assert_eq!(v["computer"], "comp-1");
+        assert_eq!(v["path"], "/home/u/a.txt");
+        let back: ResolvePathReq = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn test_resolve_path_ret_serde_all_fields_required() {
+        let ret = ResolvePathRet {
+            canonical_path: "/home/u/a.txt".to_string(),
+            blob_handle: "opaque-handle".to_string(),
+            mime_type: "text/plain".to_string(),
+            total_size: 5,
+            sha256: "abc123".to_string(),
+            mtime: -1, // 1970 前可为负
+            req_id: ReqId::from_string("r1".to_string()),
+        };
+        let v = serde_json::to_value(&ret).unwrap();
+        for key in [
+            "canonical_path",
+            "blob_handle",
+            "mime_type",
+            "total_size",
+            "sha256",
+            "mtime",
+            "req_id",
+        ] {
+            assert!(v.get(key).is_some(), "missing required key {key}");
+        }
+        assert_eq!(v["mtime"], -1);
+        let back: ResolvePathRet = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ret);
+
+        // 协议 `total=True`：逐一移除每个必填字段都必须反序列化失败。
+        for key in [
+            "canonical_path",
+            "blob_handle",
+            "mime_type",
+            "total_size",
+            "sha256",
+            "mtime",
+            "req_id",
+        ] {
+            let mut missing = serde_json::to_value(&ret).unwrap();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<ResolvePathRet>(missing).is_err(),
+                "missing required key {key} must fail"
+            );
+        }
     }
 
     // ── #195 client:put_blob 上行写入 / Upstream binary push ──────────────
@@ -2418,5 +2863,91 @@ mod tests {
             neither.resource().unwrap_err(),
             SkillRetError::NeitherPresent
         );
+    }
+
+    // ── protocol#66 房间拒绝载荷（4101 泛化）────────────────────────────
+
+    /// 4101 载荷**字节级**稳定：`{"code":4101,"message":…,"details":{"office_id":…,"role":…}}`。
+    ///
+    /// 顶层顺序 = [`ErrorPayload`] 结构体字段序（code → message → details），`details` 内
+    /// `office_id` < `role`（serde_json 默认 BTreeMap 字典序）。该串即与对称 SDK 对拍的
+    /// canonical 形态——接线（文案 / 键集 / 顺序 / 空格）任一处漂移都会在这里变红。
+    #[test]
+    fn room_rejection_payload_is_byte_stable() {
+        let computer_seat = build_room_rejection_error(
+            RoomRejectionCode::RoomFull,
+            RoomRejectionContext {
+                target_office_id: Some("office-a"),
+                declared_role: Some(Role::Computer),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&computer_seat).unwrap(),
+            r#"{"code":4101,"message":"Room already has a computer","details":{"office_id":"office-a","role":"computer"}}"#
+        );
+
+        let agent_seat = build_room_rejection_error(
+            RoomRejectionCode::RoomFull,
+            RoomRejectionContext {
+                target_office_id: Some("office-a"),
+                declared_role: Some(Role::Agent),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&agent_seat).unwrap(),
+            r#"{"code":4101,"message":"Room already has an agent","details":{"office_id":"office-a","role":"agent"}}"#
+        );
+    }
+
+    /// 4101 的文案必须随**被占席位**选择，且与 `details.role` 同源——`role` 缺失时按 agent 席
+    /// 兜底（正常路径恒有 role；该分支仅防御）。`role` 为类型化 [`Role`]，不存在大小写/拼写漂移。
+    #[test]
+    fn room_full_message_follows_seat_role() {
+        assert_eq!(
+            RoomRejectionCode::RoomFull.message(Some(Role::Computer)),
+            "Room already has a computer"
+        );
+        assert_eq!(
+            RoomRejectionCode::RoomFull.message(Some(Role::Agent)),
+            "Room already has an agent"
+        );
+        assert_eq!(
+            RoomRejectionCode::RoomFull.message(None),
+            "Room already has an agent"
+        );
+    }
+
+    /// `4105` 预留码：`RoomRejectionCode` **类型层面**不可表达（与 `4102` 同款排除）；
+    /// `ErrorCode` 仍可识别它（解析对端违规报文），但本 SDK 无产出路径。
+    #[test]
+    fn name_conflict_is_reserved_not_constructible() {
+        // ErrorCode 侧：解析仍识别 4105；预留码谓词为两侧客户端的单一权威。
+        assert_eq!(ErrorCode::from_code(4105), Some(ErrorCode::NameConflict));
+        assert!(error_codes::is_reserved(i64::from(
+            error_codes::NAME_CONFLICT
+        )));
+        assert!(error_codes::is_reserved(i64::from(
+            error_codes::ROOM_NOT_FOUND
+        )));
+        assert!(!error_codes::is_reserved(i64::from(error_codes::ROOM_FULL)));
+
+        // 构造侧：**编译期护栏**在 `RoomRejectionCode::code()` 与 `build_room_rejection_error` 的
+        // 两处**无 wildcard 穷举 match**（新增变体即编译失败，强制在评审中核对 4102/4105 预留约束）。
+        // 本测试钉住**现有**变体的码值映射：防「把既有变体改映射到预留码」这类不触发编译错误的回归。
+        for (code, expected) in [
+            (RoomRejectionCode::Forbidden, 403),
+            (RoomRejectionCode::RoomFull, 4101),
+            (RoomRejectionCode::NotInRoom, 4103),
+            (RoomRejectionCode::CrossRoomAccess, 4104),
+            (RoomRejectionCode::AlreadyInRoom, 4106),
+        ] {
+            assert_eq!(code.code(), expected, "{code:?} 码值映射漂移");
+            assert!(
+                !error_codes::is_reserved(i64::from(code.code())),
+                "{code:?} 不得映射到预留码 4102 / 4105"
+            );
+        }
     }
 }

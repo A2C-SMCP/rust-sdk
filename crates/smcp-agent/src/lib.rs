@@ -15,6 +15,7 @@ pub(crate) mod blob_sideband;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod office;
 pub mod protocol_error;
 pub mod request_builders;
 pub mod response;
@@ -28,13 +29,15 @@ pub use auth::{AuthProvider, DefaultAuthProvider};
 pub use config::SmcpAgentConfig;
 pub use error::{Result, SmcpAgentError};
 pub use events::{AgentEventHandler, AsyncAgentEventHandler};
+pub use office::{OfficeIntent, OfficeMembershipState};
 pub use protocol_error::{raise_for_error_payload, SmcpProtocolError};
 pub use request_builders::{
     build_get_blob_request, build_get_desktop_request, build_get_resources_request,
     build_get_skill_request, build_get_skills_request, build_get_tools_request,
-    build_put_blob_request, build_tool_call_cancel, build_tool_call_request, validate_emit_event,
+    build_put_blob_request, build_resolve_path_request, build_tool_call_cancel,
+    build_tool_call_request, validate_emit_event,
 };
 pub use response::{classify_tool_call_outcome, ToolCallOutcome};
 pub use skill_consume::{parse_get_skill_response, parse_get_skills_response};
 pub use sync_agent::SyncSmcpAgent;
-pub use transport::{NotificationMessage, SocketIoTransport};
+pub use transport::{NotificationMessage, SocketIoTransport, TransportLifecycle};

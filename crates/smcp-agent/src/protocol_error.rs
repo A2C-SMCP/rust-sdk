@@ -18,6 +18,18 @@
 //! 传输/调用层错误，[`SmcpProtocolError`] 是从对端 ack 解析出的**协议级**错误。
 
 use serde_json::Value;
+use tracing::warn;
+
+/// 「无法判定」时的兜底文案（既非空 ack、也非可识别 flat ErrorPayload）。
+///
+/// 注意它**不再**表示「空响应失败」——自协议 v0.5.0 起空 ack 是**成功**；真正落进本文案的是形状
+/// 不认识的响应（如已废除的 `(bool, str | None)` 元组形态）。
+///
+/// ⚠️ 该串是**用户可见**的兜底文案，且与 Python 参考实现**逐字对齐**——Python
+/// `a2c_smcp/utils/office.py::NO_RESPONSE_MESSAGE` 是**双语**串
+/// （`"服务器未返回结果 / No response from server"`）。历史实现只取了英文半句却仍声称「逐字对齐」，
+/// 任何跨 SDK 的报文 / fixture 对照都会红（#226 复审 🔴1）。改文案必须两边同时改。
+pub const NO_RESPONSE_MESSAGE: &str = "服务器未返回结果 / No response from server";
 
 /// A2C-SMCP 协议级错误（flat ErrorPayload）/ A2C-SMCP protocol-level error (flat ErrorPayload)。
 ///
@@ -27,6 +39,7 @@ use serde_json::Value;
 /// - `client:get_skill[s]`：`4014` 复用 / `4016` Invalid Name / `4017` Resource Not Accessible
 ///   （v0.2.1 `details.reason`）。
 /// - `client:get_blob`：`4018 Blob Not Accessible`（v0.2.1 `details.reason`）。
+/// - `client:resolve_path`：`4020 Path Not Accessible`（v0.5.0 `details.reason`）。
 ///
 /// `details` 是诊断容器，Agent **MUST NOT** 透传给最终用户（防泄露）。
 // 不派生 `Eq`：`details` 持 [`serde_json::Value`]（含 `f64`，非 `Eq`）。
@@ -48,8 +61,8 @@ pub struct SmcpProtocolError {
     pub capability: Option<String>,
     /// 诊断容器（4016 / 4017 / 4018 的 code-specific 字段下沉于此）/ diagnostic container。
     pub details: serde_json::Map<String, Value>,
-    /// 4017 / 4018 共用的 `details.reason`（**开放枚举**：未知值原样保留、不 panic）。
-    /// `details.reason` shared by 4017 / 4018; an open enum — unknown values are preserved verbatim.
+    /// 4017 / 4018 / 4019 / 4020 共用的 `details.reason`（**开放枚举**：未知值原样保留、不 panic）。
+    /// `details.reason` shared by 4017 / 4018 / 4019 / 4020; an open enum — unknown values are preserved verbatim.
     pub reason: Option<String>,
 }
 
@@ -84,6 +97,85 @@ impl SmcpProtocolError {
             reason,
         }
     }
+
+    /// 无法判定 ack 形状时的兜底构造（无码：`code = -1`）。
+    ///
+    /// 用于 [`parse_room_ack`] 的第三分歧——形状不认识（既非空 ack、也非顶层含 `code` 的 flat
+    /// ErrorPayload）。**宁严勿宽**：把它判成失败，而不是静默当成功（后者会把未迁移的调用方缺陷藏起来）。
+    pub fn indeterminate() -> Self {
+        Self {
+            payload: serde_json::Map::new(),
+            code: -1,
+            message: NO_RESPONSE_MESSAGE.to_string(),
+            mcp_server: None,
+            capability: None,
+            details: serde_json::Map::new(),
+            reason: None,
+        }
+    }
+
+    /// 由**本端主动构造**的 flat [`smcp::ErrorPayload`] 产出协议错误。
+    ///
+    /// 用途：SDK 在**本地前置校验**阶段产生的拒绝（如 Agent 换房时的 `4106 Already In Room`）必须与
+    /// 「服务端经 ack 回传的拒绝」对调用方**同形**——同一个 [`SmcpProtocolError`]、同一套字段提取、
+    /// 同一份 canonical 文案（文案由 [`smcp::build_room_rejection_error`] 提供）。故此处复用内部的
+    /// `from_value` 而非另写字段映射，避免两条构造路径漂移。
+    ///
+    /// Build a protocol error from a locally constructed flat payload, reusing the same field
+    /// extraction as the ack-parsing path so the two cannot drift apart.
+    pub fn from_error_payload(payload: &smcp::ErrorPayload) -> Self {
+        match serde_json::to_value(payload) {
+            Ok(value) => Self::from_value(&value),
+            // `ErrorPayload` 恒可序列化；万一失败则退化为「无法判定」（`code = -1`），绝不 panic。
+            Err(_) => Self::indeterminate(),
+        }
+    }
+}
+
+/// 解析**房间事件 ack**（`server:join_office` / `server:leave_office`）→ 裁决。
+///
+/// 房间事件的成功响应是**空 ack**、失败是 flat [`smcp::ErrorPayload`]（协议 v0.5.0 废除
+/// `(bool, str | None)` 元组形态），判定规则与 Python 参考实现
+/// `a2c_smcp/utils/office.py::parse_join_ack` **逐条一致**：
+///
+/// | ack 形状 | 结果 |
+/// |---|---|
+/// | 空 ack（零参 ACK 拆封后的 `[]`，或 1-tuple 形态拆封后的 `null`）| `Ok(())` |
+/// | 顶层含 `code` 的对象（flat ErrorPayload）| `Err`，带 `code` / `message` / `details` |
+/// | 其余任何形状 | `Err`（`code = -1`，文案 [`NO_RESPONSE_MESSAGE`]）|
+///
+/// **未知码同样算拒绝**（宁严勿宽）：协议未来新增码时，旧 SDK MUST fail-safe 到「被拒」，绝不静默
+/// 假装成功。故此处**不**复用闭集谓词 [`smcp::is_protocol_error_payload`]（它只认已建模的码），
+/// 而以「顶层含 `code`」为判据。
+///
+/// **参数顺序亦是契约**：`code` 存在即拒绝，故调用方 MUST 在 `req_id` 校验**之前**调用本函数——
+/// ErrorPayload 不带 `req_id`，先查 `req_id` 会把结构化拒绝误报成「响应 req_id 不匹配」。对标 Python
+/// `client.py::get_computers_in_office` 的同款约束。
+///
+/// Resolve a room-event ack: empty ack means success; a top-level `code` means a structured
+/// rejection (unknown codes included, fail-safe); any other shape is an indeterminate failure.
+// 与同模块 [`raise_for_error_payload`] 同一约定：`SmcpProtocolError` 携带 code/message/details 等诊断
+// 字段，体积超 clippy `result_large_err` 阈值；按项目既有做法局部 `#[allow]` 而非装箱——装箱会给每个
+// 调用点（含服务端 ack 判定的热路径）增加一次解包成本，收益不成比例。
+#[allow(clippy::result_large_err)]
+pub fn parse_room_ack(response: &Value) -> Result<(), SmcpProtocolError> {
+    if response.is_null() || response.as_array().is_some_and(Vec::is_empty) {
+        return Ok(());
+    }
+    if response.get("code").is_some() {
+        let error = SmcpProtocolError::from_value(response);
+        // 预留码（4102 / 4105）：协议当前无任何路径产出，收到即对端协议违规——按协议
+        // 「记录并放弃」：告警留痕，然后照常按拒绝返回（分类为不可重试）。
+        // 谓词取 `smcp::error_codes::is_reserved` 单一权威（与 Computer 侧同源，预留码演进不漏改一端）。
+        if smcp::error_codes::is_reserved(error.code) {
+            warn!(
+                code = error.code,
+                "room ack carried a reserved protocol code (protocol violation); rejecting without retry"
+            );
+        }
+        return Err(error);
+    }
+    Err(SmcpProtocolError::indeterminate())
 }
 
 /// 若 `response` 是 flat ErrorPayload（顶层 `code` 属协议错误码闭集）→ `Err(SmcpProtocolError)`；
@@ -119,12 +211,79 @@ mod tests {
 
     #[test]
     fn test_all_protocol_codes_raise() {
-        for code in [404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018] {
+        for code in [
+            404, 4006, 4007, 4008, 4014, 4015, 4016, 4017, 4018, 4019, 4020,
+        ] {
             let err = raise_for_error_payload(&json!({"code": code, "message": "boom"}))
                 .expect_err(&format!("code {code} 应判定为协议错误"));
             assert_eq!(err.code, code);
             assert_eq!(err.message, "boom");
         }
+    }
+
+    /// #226 P0-1：房间事件的拒绝码 MUST 被判定为协议错误。
+    ///
+    /// 历史实现里 `ErrorCode::from_code` 不含 400 / 403 / 500 / 4101–4106 ⇒ `is_protocol_error_payload`
+    /// 对这批码恒 `false` ⇒ 本函数返回 `Ok(())`，于是**结构化拒绝被当作成功**：Agent 收到「房间已有
+    /// Agent」却报成功，此后所有 `client:*` 调用从一个从未进入的房发起。本测试钉死该闭集不得再缺这九个码。
+    #[test]
+    fn test_room_management_codes_are_protocol_errors() {
+        for code in [400, 403, 500, 4101, 4102, 4103, 4104, 4105, 4106] {
+            let err = raise_for_error_payload(&json!({"code": code, "message": "room rejected"}))
+                .expect_err(&format!(
+                    "房间/通用码 {code} 必须被判为协议错误，否则拒绝会被读成成功"
+                ));
+            assert_eq!(
+                err.code, code,
+                "房间/通用码 {code} 必须被判为协议错误，否则拒绝会被读成成功"
+            );
+            assert_eq!(err.message, "room rejected");
+        }
+    }
+
+    /// 房间事件 ack 的三分歧（空 ack / flat ErrorPayload / 无法判定），逐条对齐 Python
+    /// `utils/office.py::parse_join_ack`。
+    #[test]
+    fn test_parse_room_ack_three_way_verdict() {
+        // 空 ack 的两种线格式：零参 ACK 拆封后的 `[]`，与 1-tuple 形态拆封后的 `null` ⇒ 成功。
+        assert!(parse_room_ack(&json!([])).is_ok());
+        assert!(parse_room_ack(&Value::Null).is_ok());
+
+        // flat ErrorPayload ⇒ 结构化拒绝，code / message / details 齐备（调用方可按码分流）。
+        let rejected = parse_room_ack(&json!({
+            "code": 4105,
+            "message": "Name already taken in room",
+            "details": {"office_id": "office-a", "role": "computer"}
+        }))
+        .unwrap_err();
+        assert_eq!(rejected.code, 4105);
+        assert_eq!(rejected.message, "Name already taken in room");
+        assert_eq!(
+            rejected.details.get("role").and_then(Value::as_str),
+            Some("computer")
+        );
+
+        // **未建模的码也算拒绝**（宁严勿宽）：未来协议新增码时旧 SDK 必须 fail-safe 到「被拒」。
+        let unknown = parse_room_ack(&json!({"code": 4299, "message": "future code"})).unwrap_err();
+        assert_eq!(unknown.code, 4299);
+
+        // 形状不认识（已废除的 `(bool, str | None)` 元组）⇒ 无法判定，**不**当成功。
+        let indeterminate = parse_room_ack(&json!([true, null])).unwrap_err();
+        assert_eq!(indeterminate.code, -1);
+        assert_eq!(indeterminate.message, NO_RESPONSE_MESSAGE);
+    }
+
+    /// #226 复审 🔴1：「无法判定」兜底文案必须与 Python 参考实现**逐字**一致。
+    ///
+    /// Python `a2c_smcp/utils/office.py::NO_RESPONSE_MESSAGE` 是**双语**串；历史实现只保留了英文
+    /// 半句，却在注释里声称已对齐——跨 SDK 报文对照（以及任何以文案为判据的 fixture）都会红。
+    /// 本断言把字面值钉死，改文案必须两边同时改。
+    #[test]
+    fn test_no_response_message_matches_python_reference_verbatim() {
+        assert_eq!(
+            NO_RESPONSE_MESSAGE,
+            "服务器未返回结果 / No response from server"
+        );
     }
 
     #[test]

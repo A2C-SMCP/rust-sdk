@@ -17,7 +17,7 @@
 
 use smcp::{
     AgentCallData, GetBlobReq, GetComputerConfigReq, GetDesktopReq, GetResourcesReq, GetSkillReq,
-    GetSkillsReq, GetToolsReq, PutBlobReq, ReqId, ToolCallReq,
+    GetSkillsReq, GetToolsReq, PutBlobReq, ReqId, ResolvePathReq, ToolCallReq,
 };
 
 use crate::error::{Result, SmcpAgentError};
@@ -197,6 +197,18 @@ pub fn build_put_blob_request(
     }
 }
 
+/// 创建按路径读取请求 / Create a `client:resolve_path` request（v0.5.0，protocol#65）。
+///
+/// `path` 为 Computer 本地绝对路径（原生形态或 `canonical_path` 形态）；Computer 负责规范化、
+/// `readRoots` 授权围栏、stat 与铸造句柄。`req_id` 每请求一次 uuid。
+pub fn build_resolve_path_request(agent: &str, computer: &str, path: &str) -> ResolvePathReq {
+    ResolvePathReq {
+        base: base(agent),
+        computer: computer.to_string(),
+        path: path.to_string(),
+    }
+}
+
 /// 校验发送事件的合法性 / Validate an emitted event name。
 ///
 /// Agent 客户端**不得**发起 `notify:*`（Server 广播）与 `agent:*`（保留）事件。
@@ -337,6 +349,22 @@ mod tests {
         ));
         assert_eq!(v["chunk_offset"], 2);
         assert_eq!(v["max_chunk_bytes"], 1024);
+    }
+
+    #[test]
+    fn test_resolve_path_request_shape() {
+        let v = to_val(&build_resolve_path_request("a", "c1", "/home/u/a.txt"));
+        assert_eq!(v["agent"], "a");
+        assert_eq!(v["computer"], "c1");
+        assert_eq!(v["path"], "/home/u/a.txt");
+        assert!(
+            v.get("req_id").and_then(|v| v.as_str()).is_some(),
+            "req_id must be present"
+        );
+        // req_id 每请求唯一
+        let a = to_val(&build_resolve_path_request("a", "c1", "/x"));
+        let b = to_val(&build_resolve_path_request("a", "c1", "/x"));
+        assert_ne!(a["req_id"], b["req_id"]);
     }
 
     #[test]

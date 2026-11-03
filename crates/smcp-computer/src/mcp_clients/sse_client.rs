@@ -16,10 +16,23 @@ use eventsource_client as es;
 use futures::stream::{Stream, StreamExt};
 use serde_json;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// SSE 常驻流任务的关闭等待上限（超时后 abort 兜底，仍会 await 到任务真正结束）。
+/// Bounded join for the SSE stream task; on timeout it is aborted and awaited to completion.
+const SSE_STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 单次 SSE 连接的任务所有权 / Ownership of one SSE stream-task generation.
+struct SseStreamOwner {
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
 
 /// SSE MCP客户端 / SSE MCP client
 pub struct SseMCPClient {
@@ -47,6 +60,15 @@ pub struct SseMCPClient {
     update_tx: Arc<Mutex<Option<mpsc::UnboundedSender<ResourceUpdate>>>>,
     /// 运行期变化通知上报接缝（#106，None=不转发）/ runtime change-notification seam。
     notify: Option<ClientNotifyCtx>,
+    /// SSE 常驻流任务所有权（std Mutex：`Drop` 需同步 take；take 后立即释放，不跨 await）/
+    /// ownership of the SSE stream task（std Mutex so Drop can take it synchronously）.
+    stream_owner: StdMutex<Option<SseStreamOwner>>,
+    /// 每连接代际：shutdown 递增使旧任务的写入失效 / per-connection generation for stale-write fencing.
+    stream_generation: Arc<AtomicU64>,
+    /// start 与 shutdown 互斥（防 shutdown 落在 spawn 与 store 之间）/ serializes start vs shutdown.
+    stream_lifecycle: Mutex<()>,
+    /// endpoint 就绪等待上限（生产 10s；单测可缩短）/ endpoint readiness timeout (tests may shorten).
+    endpoint_ready_timeout: Duration,
 }
 
 /// 资源更新通知
@@ -117,6 +139,10 @@ impl SseMCPClient {
             resource_cache: ResourceCache::new(Duration::from_secs(60)), // 默认 60 秒 TTL
             update_tx: Arc::new(Mutex::new(None)),
             notify: None,
+            stream_owner: StdMutex::new(None),
+            stream_generation: Arc::new(AtomicU64::new(0)),
+            stream_lifecycle: Mutex::new(()),
+            endpoint_ready_timeout: Duration::from_secs(10),
         }
     }
 
@@ -197,8 +223,85 @@ impl SseMCPClient {
         }
     }
 
+    /// 尽力投递一条 SSE lifecycle 消息（shutdown/exit）——直接 POST，不经流任务队列。
+    ///
+    /// #254 复审：原先入队后立刻 cancel，公平轮询下任务也未必先消费队列（响应通道还可能被上一条
+    /// 响应“插队”）；改为直接 POST 保证投递，并加 1s 上限避免 teardown 被慢服务器拖住。
+    async fn post_lifecycle_message(&self, method: &str) {
+        let Some(endpoint) = self.endpoint_url.lock().await.clone() else {
+            debug!("Skip SSE {method}: endpoint not established");
+            return;
+        };
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "id": request_id,
+        });
+        let mut request = self
+            .http_client
+            .post(&endpoint)
+            .header("Content-Type", "application/json");
+        for (key, value) in &self.base.params.headers {
+            request = request.header(key, value);
+        }
+        match tokio::time::timeout(SSE_STREAM_SHUTDOWN_TIMEOUT, request.json(&body).send()).await {
+            Ok(Ok(_)) => debug!("SSE {method} posted"),
+            Ok(Err(error)) => warn!("Failed to send {method} request: {}", error),
+            Err(_) => warn!("Timed out posting {method} request"),
+        }
+    }
+
+    /// 结束当前 SSE 流任务并清空全部连接态（#254 S2）。
+    ///
+    /// 前置条件：调用方持有 `stream_lifecycle`。先递增代际使旧任务写入失效，再取消并有界等待；
+    /// 超时 abort 后**仍 await 到任务真正结束**，最后才清共享字段——`abort()` 非同步，若提前清，
+    /// 正在 poll 的旧任务可能在 clear 之后把陈旧 `endpoint_url` 写回来。
+    async fn shutdown_stream_locked(&self) {
+        self.stream_generation.fetch_add(1, Ordering::SeqCst);
+        let owner = self
+            .stream_owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(owner) = owner {
+            owner.cancel.cancel();
+            let mut task = owner.task;
+            if tokio::time::timeout(SSE_STREAM_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                // 确认任务真正结束（abort 只是取消 future 的下一次 poll）。
+                let _ = task.await;
+            }
+        }
+
+        *self.request_tx.lock().await = None;
+        *self.response_rx.lock().await = None;
+        *self.endpoint_url.lock().await = None;
+        *self.session_id.lock().await = None;
+        *self.capabilities_resources.lock().await = None;
+        // teardown 清资源缓存：断连后旧 server 的 resources 不得继续被当作可用数据（#254 复审）。
+        self.resource_cache.clear().await;
+    }
+
+    /// 取 `stream_lifecycle` 后执行 [`Self::shutdown_stream_locked`]。
+    async fn shutdown_stream(&self) {
+        let _lifecycle = self.stream_lifecycle.lock().await;
+        self.shutdown_stream_locked().await;
+    }
+
     /// 启动SSE连接 / Start SSE connection
     async fn start_sse_connection(&self) -> Result<(), MCPClientError> {
+        // #254 S2：同一 client 重连只保留一条流——先清退上一代（幂等），再开新代。
+        let _lifecycle = self.stream_lifecycle.lock().await;
+        self.shutdown_stream_locked().await;
+        let generation = self.stream_generation.load(Ordering::SeqCst);
+
         let url = &self.base.params.url;
 
         // 直接使用原始 URL，不拼接 ?events=true
@@ -241,14 +344,28 @@ impl SseMCPClient {
                 builder.build().stream()
             };
 
-        tokio::spawn(async move {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let stream_generation = Arc::clone(&self.stream_generation);
+        let task = tokio::spawn(async move {
             let mut stream = Box::pin(stream);
             let mut request_rx = Box::pin(request_rx);
 
             loop {
+                // 取消检查放在 loop 顶部：teardown 命中后即使 select 先被高频流事件唤醒，也会在
+                // 下一轮立即退出。**不要**用 `biased` 固定 cancel→stream→request 顺序——流持续就绪时
+                // request_rx 永不轮询，call_tool/list_tools 会全部饿死到 30s 超时（#254 复审 🔴）。
+                // 公平轮询 + 顶部复查同时消除「所有分支 disabled」panic。
+                if task_cancel.is_cancelled() {
+                    break;
+                }
                 tokio::select! {
+                    _ = task_cancel.cancelled() => break,
                     // 处理SSE事件 / Handle SSE events
                     Some(event_result) = stream.next() => {
+                        if stream_generation.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
                         match event_result {
                             Ok(event) => {
                                 debug!("Received SSE event: {:?}", event);
@@ -260,8 +377,14 @@ impl SseMCPClient {
                                             let endpoint = event_data.data.trim();
                                             // 支持相对路径 / Support relative paths
                                             let resolved = resolve_endpoint_url(&base_url, endpoint);
+                                            // 代际校验必须在持锁后、写入前（锁外检查仍可与 shutdown 竞争）。
+                                            let mut guard = endpoint_url.lock().await;
+                                            if stream_generation.load(Ordering::SeqCst) != generation {
+                                                break;
+                                            }
                                             info!("SSE endpoint resolved: {}", resolved);
-                                            *endpoint_url.lock().await = Some(resolved);
+                                            *guard = Some(resolved);
+                                            drop(guard);
                                             continue;
                                         }
 
@@ -275,7 +398,15 @@ impl SseMCPClient {
                                                     if let McpChangeKind::ResourceUpdated { uri } = &kind {
                                                         if !uri.is_empty() {
                                                             if let Some(data) = value.get("params").and_then(|p| p.get("data")) {
+                                                                // 前置代际校验：陈旧代不得再写资源缓存（#254 复审）。
+                                                                if stream_generation.load(Ordering::SeqCst) != generation {
+                                                                    break;
+                                                                }
                                                                 let _ = resource_cache.refresh(uri, data.clone()).await;
+                                                                // 代际复查：refresh 期间可能已 teardown / 换代。
+                                                                if stream_generation.load(Ordering::SeqCst) != generation {
+                                                                    break;
+                                                                }
                                                                 if let Some(tx) = update_tx.lock().await.as_ref() {
                                                                     let _ = tx.send(ResourceUpdate {
                                                                         uri: uri.clone(),
@@ -285,6 +416,10 @@ impl SseMCPClient {
                                                                 }
                                                             }
                                                         }
+                                                    }
+                                                    // 代际复查：上面的 await（update_tx 锁）期间可能已被新一代接管。
+                                                    if stream_generation.load(Ordering::SeqCst) != generation {
+                                                        break;
                                                     }
                                                     debug!("SSE MCP notification forwarded: {:?}", kind);
                                                     if let Some(n) = &notify {
@@ -324,6 +459,9 @@ impl SseMCPClient {
 
                     // 处理请求发送 / Handle request sending via HTTP POST
                     Some(request) = request_rx.recv() => {
+                        if stream_generation.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
                         debug!("Sending request via HTTP POST: {}", request);
 
                         let post_url = match endpoint_url.lock().await.clone() {
@@ -410,6 +548,9 @@ impl SseMCPClient {
                 }
             }
         });
+
+        *self.stream_owner.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(SseStreamOwner { cancel, task });
 
         Ok(())
     }
@@ -538,6 +679,22 @@ fn resolve_endpoint_url(base_url: &str, endpoint: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), endpoint)
 }
 
+impl Drop for SseMCPClient {
+    fn drop(&mut self) {
+        // #254 S2：Drop 不能 await——同步取消并 abort，避免 client 被直接 drop（clear_all / stale
+        // retire）时流任务与 SSE 连接泄漏。正常 teardown 走 `shutdown_stream` 的有界等待。
+        let owner = self
+            .stream_owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(owner) = owner {
+            owner.cancel.cancel();
+            owner.task.abort();
+        }
+    }
+}
+
 #[async_trait]
 impl MCPClientProtocol for SseMCPClient {
     fn state(&self) -> ClientState {
@@ -561,15 +718,20 @@ impl MCPClientProtocol for SseMCPClient {
         }
 
         // 启动SSE连接 / Start SSE connection
-        self.start_sse_connection().await?;
+        // #254 S2：connect 的每条失败路径都必须回收已 spawn 的流任务与连接态。
+        if let Err(error) = self.start_sse_connection().await {
+            self.shutdown_stream().await;
+            return Err(error);
+        }
 
         // 等待 endpoint URL 就绪 / Wait for endpoint URL to be ready
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + self.endpoint_ready_timeout;
         loop {
             if self.endpoint_url.lock().await.is_some() {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
+                self.shutdown_stream().await;
                 return Err(MCPClientError::TimeoutError(
                     "Timed out waiting for SSE endpoint event".to_string(),
                 ));
@@ -578,7 +740,10 @@ impl MCPClientProtocol for SseMCPClient {
         }
 
         // 初始化会话 / Initialize session
-        self.initialize_session().await?;
+        if let Err(error) = self.initialize_session().await {
+            self.shutdown_stream().await;
+            return Err(error);
+        }
 
         // 更新状态 / Update state
         self.base.update_state(ClientState::Connected).await;
@@ -596,24 +761,14 @@ impl MCPClientProtocol for SseMCPClient {
             )));
         }
 
-        // 尝试优雅关闭 / Try graceful shutdown
-        if let Err(e) = self.send_request("shutdown", None).await {
-            warn!("Failed to send shutdown request: {}", e);
-        }
+        // 尽力通知 server 侧关闭 / Best-effort lifecycle messages.
+        // #254 复审：直接 POST 而非入队——入队后立刻 cancel 会丢消息（且不依赖队列消费时序）；
+        // POST 本身带 1s 上限，保证 teardown 不被慢服务器拖住。更完整的 bounded/fire-and-forget 归 S4。
+        self.post_lifecycle_message("shutdown").await;
+        self.post_lifecycle_message("exit").await;
 
-        // 发送exit通知 / Send exit notification
-        if let Err(e) = self.send_request("exit", None).await {
-            warn!("Failed to send exit notification: {}", e);
-        }
-
-        // 关闭SSE连接 / Close SSE connection
-        *self.request_tx.lock().await = None;
-
-        // 清理会话ID / Clear session ID
-        *self.session_id.lock().await = None;
-
-        // 清理 endpoint URL
-        *self.endpoint_url.lock().await = None;
+        // 关闭SSE连接：取消并等待流任务、清 response_rx / 连接态（#254 S2）。
+        self.shutdown_stream().await;
 
         // 更新状态 / Update state
         self.base.update_state(ClientState::Disconnected).await;
@@ -1361,5 +1516,663 @@ mod tests {
 
         let debug_str = format!("{:?}", client);
         assert!(debug_str.contains("SseMCPClient"));
+    }
+
+    // =========================================================================
+    // #254 S2：SSE 流任务所有权（CI-safe in-process hyper mock）
+    // =========================================================================
+
+    use futures_util::stream::unfold;
+    use http_body_util::{BodyExt, Full, StreamBody};
+    use hyper::body::{Bytes, Frame};
+    use hyper::service::service_fn;
+    use hyper::{Method, Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use tokio::net::TcpListener;
+
+    type TestSseSender = mpsc::UnboundedSender<Result<Frame<Bytes>, Infallible>>;
+    type TestSseBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+    struct TestSseMock {
+        port: u16,
+        active: Arc<AtomicUsize>,
+        connections: Arc<StdMutex<Vec<TestSseSender>>>,
+        /// 所有 POST /messages 的 JSON-RPC method 序列（#254 复审：断言 disconnect 的实际投递）。
+        post_methods: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl TestSseMock {
+        async fn spawn(initialize_status: StatusCode) -> Self {
+            Self::spawn_with(initialize_status, true, false).await
+        }
+
+        /// GET /sse 建立连接但**不发 endpoint 事件**——用于 endpoint 超时清理测试。
+        async fn spawn_silent() -> Self {
+            Self::spawn_with(StatusCode::OK, false, false).await
+        }
+
+        /// shutdown/exit 的 POST 永不响应——用于 disconnect 的 1s 上限测试。
+        async fn spawn_with_hanging_lifecycle() -> Self {
+            Self::spawn_with(StatusCode::OK, true, true).await
+        }
+
+        async fn spawn_with(
+            initialize_status: StatusCode,
+            send_endpoint: bool,
+            hang_lifecycle: bool,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let active = Arc::new(AtomicUsize::new(0));
+            let connections: Arc<StdMutex<Vec<TestSseSender>>> =
+                Arc::new(StdMutex::new(Vec::new()));
+            let post_methods: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+
+            let active_for_server = active.clone();
+            let connections_for_server = connections.clone();
+            let post_methods_for_server = post_methods.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let io = TokioIo::new(stream);
+                    let active = active_for_server.clone();
+                    let connections = connections_for_server.clone();
+                    let post_methods = post_methods_for_server.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req| {
+                            let active = active.clone();
+                            let connections = connections.clone();
+                            let post_methods = post_methods.clone();
+                            async move {
+                                sse_test_handler(
+                                    req,
+                                    active,
+                                    connections,
+                                    post_methods,
+                                    initialize_status,
+                                    send_endpoint,
+                                    hang_lifecycle,
+                                )
+                                .await
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await;
+                    });
+                }
+            });
+
+            Self {
+                port,
+                active,
+                connections,
+                post_methods,
+            }
+        }
+
+        fn post_methods(&self) -> Vec<String> {
+            self.post_methods
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
+        fn sse_url(&self) -> String {
+            format!("http://127.0.0.1:{}/sse", self.port)
+        }
+
+        fn active_connections(&self) -> usize {
+            self.active.load(Ordering::SeqCst)
+        }
+
+        fn push_notification(&self, index: usize, value: &serde_json::Value) {
+            let tx = self.connections.lock().unwrap().get(index).cloned();
+            if let Some(tx) = tx {
+                let frame = format!(
+                    "event: message\ndata: {}\n\n",
+                    serde_json::to_string(value).unwrap()
+                );
+                let _ = tx.send(Ok(Frame::data(Bytes::from(frame))));
+            }
+        }
+    }
+
+    /// 活跃连接计数守卫：响应体被 drop（客户端断开 / 任务取消）时递减。
+    struct ActiveConnectionGuard(Arc<AtomicUsize>);
+
+    impl Drop for ActiveConnectionGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn sse_test_handler(
+        req: Request<hyper::body::Incoming>,
+        active: Arc<AtomicUsize>,
+        connections: Arc<StdMutex<Vec<TestSseSender>>>,
+        post_methods: Arc<StdMutex<Vec<String>>>,
+        initialize_status: StatusCode,
+        send_endpoint: bool,
+        hang_lifecycle: bool,
+    ) -> Result<Response<TestSseBody>, Infallible> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+
+        if method == Method::GET && path == "/sse" {
+            active.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::unbounded_channel::<Result<Frame<Bytes>, Infallible>>();
+            connections.lock().unwrap().push(tx.clone());
+            if send_endpoint {
+                let _ = tx.send(Ok(Frame::data(Bytes::from(
+                    "event: endpoint\ndata: /messages\n\n",
+                ))));
+            }
+            let guard = ActiveConnectionGuard(active);
+            let stream = unfold((rx, guard), |(mut rx, guard)| async move {
+                rx.recv().await.map(|item| (item, (rx, guard)))
+            });
+            let boxed: TestSseBody = BodyExt::boxed(StreamBody::new(stream));
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .body(boxed)
+                .unwrap());
+        }
+
+        if method == Method::POST && path == "/messages" {
+            let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({}));
+            let rpc_method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+            post_methods
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(rpc_method.to_string());
+
+            if hang_lifecycle && matches!(rpc_method, "shutdown" | "exit") {
+                // 永不响应：覆盖 disconnect 直接 POST 的 1s 上限（旧 30s send_request 会超 5s 外层断言）。
+                std::future::pending::<()>().await;
+            }
+
+            if rpc_method.starts_with("notifications/") {
+                return Ok(Response::builder()
+                    .status(StatusCode::ACCEPTED)
+                    .body(empty_test_body())
+                    .unwrap());
+            }
+            if rpc_method == "initialize" && initialize_status != StatusCode::OK {
+                return Ok(Response::builder()
+                    .status(initialize_status)
+                    .body(empty_test_body())
+                    .unwrap());
+            }
+
+            let result = match rpc_method {
+                "initialize" => serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {}, "resources": {} },
+                    "serverInfo": { "name": "test-sse-mock", "version": "0.1.0" }
+                }),
+                _ => serde_json::json!({}),
+            };
+            let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            let bytes = serde_json::to_vec(&resp).unwrap();
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(full_test_body(bytes))
+                .unwrap());
+        }
+
+        Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(empty_test_body())
+            .unwrap())
+    }
+
+    fn full_test_body(bytes: Vec<u8>) -> TestSseBody {
+        BodyExt::boxed(Full::new(Bytes::from(bytes)))
+    }
+
+    fn empty_test_body() -> TestSseBody {
+        full_test_body(Vec::new())
+    }
+
+    fn sse_test_params(mock: &TestSseMock) -> SseServerParameters {
+        SseServerParameters {
+            url: mock.sse_url(),
+            headers: HashMap::new(),
+        }
+    }
+
+    async fn wait_for_no_active_connections(mock: &TestSseMock) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while mock.active_connections() != 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_one_active_connection(mock: &TestSseMock) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while mock.active_connections() != 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #254 复审：connect 失败 / disconnect 后五处连接态必须全部清空。
+    async fn assert_stream_state_cleared(client: &SseMCPClient) {
+        assert!(
+            client.request_tx.lock().await.is_none(),
+            "request_tx must be cleared"
+        );
+        assert!(
+            client.response_rx.lock().await.is_none(),
+            "response_rx must be cleared"
+        );
+        assert!(
+            client.endpoint_url.lock().await.is_none(),
+            "endpoint_url must be cleared"
+        );
+        assert!(
+            client.session_id.lock().await.is_none(),
+            "session_id must be cleared"
+        );
+        assert!(
+            client.capabilities_resources.lock().await.is_none(),
+            "capabilities_resources must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_stream_task_and_clears_response_rx() {
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+        assert_eq!(mock.active_connections(), 1);
+        assert!(client.response_rx.lock().await.is_some());
+
+        client.disconnect().await.expect("disconnect failed");
+
+        wait_for_no_active_connections(&mock).await;
+        assert_eq!(
+            mock.active_connections(),
+            0,
+            "the SSE stream task must be cancelled on disconnect"
+        );
+        assert_stream_state_cleared(&client).await;
+        assert_eq!(client.base.get_state().await, ClientState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn connect_failure_cleans_up_stream_task() {
+        let mock = TestSseMock::spawn(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.connect()).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "connect must fail fast when initialize is rejected"
+        );
+
+        wait_for_no_active_connections(&mock).await;
+        assert_eq!(
+            mock.active_connections(),
+            0,
+            "a failed connect must retire the stream task"
+        );
+        assert_stream_state_cleared(&client).await;
+    }
+
+    #[tokio::test]
+    async fn connect_invalid_url_cleans_stream_state() {
+        // 失败路径 1/3：URL 非法（http::Uri 无法解析）——连接器构造即失败，五处连接态必须为空。
+        let client = SseMCPClient::new(SseServerParameters {
+            url: "http://[::1".to_string(),
+            headers: HashMap::new(),
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), client.connect()).await;
+        assert!(matches!(result, Ok(Err(_))), "invalid URL must fail fast");
+        assert_stream_state_cleared(&client).await;
+    }
+
+    #[tokio::test]
+    async fn connect_invalid_header_cleans_stream_state() {
+        // 失败路径 2/3：header 非法——builder.header 失败，五处连接态必须为空。
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let mut headers = HashMap::new();
+        headers.insert("bad header name".to_string(), "x".to_string());
+        let client = SseMCPClient::new(SseServerParameters {
+            url: mock.sse_url(),
+            headers,
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), client.connect()).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "invalid header must fail fast"
+        );
+        assert_stream_state_cleared(&client).await;
+    }
+
+    #[tokio::test]
+    async fn connect_endpoint_timeout_cleans_stream_task() {
+        // 失败路径 3/3：endpoint 事件迟迟不到——超时后必须取消任务并清五处连接态。
+        let mock = TestSseMock::spawn_silent().await;
+        let mut client = SseMCPClient::new(sse_test_params(&mock));
+        client.endpoint_ready_timeout = Duration::from_millis(300);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.connect()).await;
+        assert!(
+            matches!(result, Ok(Err(MCPClientError::TimeoutError(_)))),
+            "endpoint wait must time out"
+        );
+        wait_for_no_active_connections(&mock).await;
+        assert_eq!(
+            mock.active_connections(),
+            0,
+            "endpoint timeout must retire the stream task"
+        );
+        assert_stream_state_cleared(&client).await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_resource_cache() {
+        // #254 复审：teardown 清资源缓存——断连后旧 server 的 resources 不得继续被判为可用。
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+        client
+            .resource_cache
+            .set(
+                "res://cached".to_string(),
+                serde_json::json!({ "ok": true }),
+                None,
+            )
+            .await;
+        assert!(client.get_cached_resource("res://cached").await.is_some());
+
+        client.disconnect().await.expect("disconnect failed");
+
+        assert!(
+            client.get_cached_resource("res://cached").await.is_none(),
+            "teardown must clear the resource cache"
+        );
+        assert_eq!(client.resource_cache.size().await, 0);
+    }
+
+    #[test]
+    fn sse_stream_select_must_not_use_biased_polling() {
+        // #254 复审回归：`select!` 若恢复 `biased`（cancel→stream→request），高频流下 request_rx
+        // 会被饿死（工具调用排到 30s 超时）。真实 HTTP 栈的 chunk 间隙使行为级复现不稳定，
+        // 这里以源码为锚做确定性守卫；行为级用例见 continuous_stream_traffic_does_not_starve_tool_requests。
+        let source = include_str!("sse_client.rs");
+        // 排除 `#[cfg(test)]` 之后的测试自身（本文件测试代码含 "biased" 字面量）。
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+        let select_offsets: Vec<usize> = production
+            .match_indices("tokio::select! {")
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(
+            select_offsets.len(),
+            1,
+            "expected exactly one production `tokio::select!` in sse_client.rs"
+        );
+        let select_at = select_offsets[0];
+        // 按 chars 截取，避免多字节 UTF-8 边界 panic（注释含中文）。
+        let head: String = production
+            .get(select_at..)
+            .expect("select offset must be a char boundary")
+            .chars()
+            .take(160)
+            .collect();
+        assert!(
+            !head.contains("biased"),
+            "SSE stream select! must not use `biased`: it can starve request_rx"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_stream_traffic_does_not_starve_tool_requests() {
+        // #254 复审测试缺口：SSE 流持续就绪时 request_rx 不得被饿死。
+        // 多线程运行时 + 独立泵任务持续灌 `notifications/resources/updated`（处理含 await），
+        // 复现生产下「stream 分支始终就绪」；若 `select!` 加回 `biased`（cancel→stream→request），
+        // list_tools 会排到 30s 响应超时。预灌一段突发确保 request 入队瞬间流非空。
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        let pump_tx = mock.connections.lock().unwrap()[0].clone();
+        let event = format!(
+            "event: message\ndata: {}\n\n",
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": { "uri": "window://mock/1", "data": { "v": 1 } }
+            }))
+            .unwrap()
+        );
+        // 每个 body 帧打包多个 SSE 事件：解析器一次读入后会连续 Ready，逼近生产的「流持续就绪」。
+        let big_frame = event.repeat(500);
+        // 预置缓存初值：`refresh` 只更新既有条目，用它观测「首个 resources/updated 已被消费」。
+        client
+            .resource_cache
+            .set(
+                "window://mock/1".to_string(),
+                serde_json::json!({ "v": 0 }),
+                None,
+            )
+            .await;
+        for _ in 0..64 {
+            let _ = pump_tx.send(Ok(Frame::data(Bytes::from(big_frame.clone()))));
+        }
+        let pump = tokio::spawn(async move {
+            loop {
+                if pump_tx
+                    .send(Ok(Frame::data(Bytes::from(big_frame.clone()))))
+                    .is_err()
+                {
+                    break;
+                }
+                // 节流：`yield_now` 紧循环会让生产端比消费端快两个数量级，biased 回归时 3s 窗口
+                // 可积压数百 MB 触发 OOM/SIGKILL；1ms/帧约 75MB/s，足以让 stream 分支持续就绪。
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        // 等到流**真正热起来**（首个 resources/updated 已刷新缓存）再发请求，确保 request 入队时
+        // stream 分支已持续就绪——否则请求可能赶在首帧到达前被服务，测不出饥饿。
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_cached_resource("window://mock/1").await
+                    == Some(serde_json::json!({ "v": 1 }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the stream pump did not feed the client");
+
+        let tools = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+            .await
+            .expect("tool request must not be starved by continuous stream traffic")
+            .expect("list_tools failed");
+        assert!(tools.is_empty());
+
+        pump.abort();
+        client.disconnect().await.expect("disconnect failed");
+    }
+
+    #[tokio::test]
+    async fn disconnect_posts_shutdown_then_exit() {
+        // #254 复审测试缺口：disconnect 必须**实际发出** shutdown、exit 两个 POST（直接投递）。
+        // 若回退为「入队后立即 cancel」，队列消息可能未消费即被取消，该序列断言会失败。
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        client.disconnect().await.expect("disconnect failed");
+        // `notifications/initialized` 是 connect 期间发出的通知 POST，可能晚于 disconnect 落达；
+        // 这里只核对**请求**序列（initialize 之后的 lifecycle 消息必须实际投递）。
+        let lifecycle: Vec<String> = mock
+            .post_methods()
+            .into_iter()
+            .filter(|method| !method.starts_with("notifications/"))
+            .collect();
+        assert_eq!(
+            lifecycle,
+            vec![
+                "initialize".to_string(),
+                "shutdown".to_string(),
+                "exit".to_string()
+            ],
+            "disconnect must POST shutdown then exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_is_bounded_when_lifecycle_posts_hang() {
+        // #254 复审：shutdown/exit 直接 POST 各带 1s 上限——挂起的 server 不得把 disconnect 拖成
+        // 30s×2（旧 `send_request(...).await` 会超过下面的 5s 外层断言）。
+        let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+            .await
+            .expect("disconnect must be bounded when lifecycle POSTs hang")
+            .expect("disconnect failed");
+    }
+
+    #[tokio::test]
+    async fn reconnect_ignores_stale_connection_notifications() {
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
+        let notify = ClientNotifyCtx {
+            bundle_id: BundleId::try_from("sse-test").unwrap(),
+            tx: notify_tx,
+        };
+        let client = SseMCPClient::new(sse_test_params(&mock)).with_notify(Some(notify));
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+        mock.push_notification(0, &notification);
+        let first = tokio::time::timeout(Duration::from_secs(2), notify_rx.recv())
+            .await
+            .expect("the first connection's notification must be forwarded");
+        assert!(first.is_some());
+
+        client.disconnect().await.expect("disconnect failed");
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("reconnect timed out")
+            .expect("reconnect failed");
+        wait_for_one_active_connection(&mock).await;
+        assert_eq!(
+            mock.active_connections(),
+            1,
+            "reconnect must keep exactly one live SSE stream"
+        );
+
+        // 旧连接（index 0）的帧不得进入新连接。
+        mock.push_notification(0, &notification);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), notify_rx.recv())
+                .await
+                .is_err(),
+            "stale connection notifications must not be forwarded"
+        );
+
+        mock.push_notification(1, &notification);
+        let second = tokio::time::timeout(Duration::from_secs(2), notify_rx.recv())
+            .await
+            .expect("the new connection's notification must be forwarded");
+        assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_frames_are_not_forwarded() {
+        // #254 复审：直测代际围栏——模拟「新一代已接管」后，旧任务的帧不得再转发。
+        // （上面的重连用例证明旧连接不可达；本用例证明代际检查本身可证伪。）
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
+        let notify = ClientNotifyCtx {
+            bundle_id: BundleId::try_from("sse-test").unwrap(),
+            tx: notify_tx,
+        };
+        let client = SseMCPClient::new(sse_test_params(&mock)).with_notify(Some(notify));
+
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+        client.stream_generation.fetch_add(1, Ordering::SeqCst);
+
+        mock.push_notification(
+            0,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed"
+            }),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), notify_rx.recv())
+                .await
+                .is_err(),
+            "frames from a stale generation must not be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_cancels_stream_task() {
+        // #254 复审：client 被直接 drop（clear_all / stale retire）时，流任务与连接必须关闭。
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+        assert_eq!(mock.active_connections(), 1);
+
+        drop(client);
+
+        wait_for_no_active_connections(&mock).await;
+        assert_eq!(
+            mock.active_connections(),
+            0,
+            "dropping the client must abort the SSE stream task"
+        );
     }
 }

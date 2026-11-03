@@ -15,10 +15,36 @@
 //! `get_resources` 响应解析（`parse_get_resources_response`，与 `skill_consume` 同款纯函数约定）。
 
 use serde_json::Value;
-use smcp::{GetBlobRet, GetComputerConfigRet, GetResourcesRet};
+use smcp::{GetBlobRet, GetComputerConfigRet, GetResourcesRet, ResolvePathRet};
 
 use crate::error::{Result, SmcpAgentError};
 use crate::protocol_error::raise_for_error_payload;
+
+/// 从 `server:list_room` 会话表投影出「房内唯一 Computer」（纯函数；protocol#66）。
+///
+/// 「每 role 一席」下任一时刻房内至多一台 Computer；`>1` 属服务端违反协议不变量 ⇒ 判协议违规
+/// 如实失败（**不**挑第一台——把不变量违背冻结进调用方本地状态是最坏的静默降级）。
+///
+/// Project the room's single Computer out of a `list_room` session table; more than one is a
+/// protocol violation, reported loudly rather than silently picking the first.
+pub(crate) fn parse_single_computer(
+    sessions: Vec<smcp::SessionInfo>,
+    office_id: &str,
+) -> Result<Option<smcp::SessionInfo>> {
+    let mut computers: Vec<smcp::SessionInfo> = sessions
+        .into_iter()
+        .filter(|session| session.role == smcp::Role::Computer)
+        .collect();
+
+    match computers.len() {
+        0 => Ok(None),
+        1 => Ok(computers.pop()),
+        count => Err(SmcpAgentError::TooManyComputersInOffice {
+            office_id: office_id.to_string(),
+            count,
+        }),
+    }
+}
 
 /// 校验响应回显的 `req_id` 与请求一致 / validate the echoed `req_id` matches the request。
 ///
@@ -82,6 +108,22 @@ pub(crate) fn parse_get_blob_response(
     raise_for_error_payload(response)?;
     ensure_req_id(response, expected_req_id)?;
     let ret: GetBlobRet = serde_json::from_value(response.clone())?;
+    Ok(ret)
+}
+
+/// 解析 `client:resolve_path` 响应为 [`ResolvePathRet`] / parse a `client:resolve_path` ack。
+///
+/// 顺序与 [`parse_get_blob_response`] 一致：flat ErrorPayload（`4020` `details.reason` ∈
+/// invalid_path / forbidden / not_found / not_a_file）→ 协议错误；`req_id` 回显校验；整包反序列化。
+/// 4020 的 flat 负载**无 `req_id`**，故错误判定 MUST 先于回显校验。无 I/O，供 async/sync Agent
+/// 共享并独立单测。对标 Python `a2c_smcp/agent/client.py::resolve_path` 响应段。
+pub(crate) fn parse_resolve_path_response(
+    response: &Value,
+    expected_req_id: &str,
+) -> Result<ResolvePathRet> {
+    raise_for_error_payload(response)?;
+    ensure_req_id(response, expected_req_id)?;
+    let ret: ResolvePathRet = serde_json::from_value(response.clone())?;
     Ok(ret)
 }
 
@@ -420,6 +462,121 @@ mod tests {
         assert!(
             matches!(err, SmcpAgentError::ReqIdMismatch { .. }),
             "got {err:?}"
+        );
+    }
+
+    // ── protocol#65：parse_resolve_path_response ─────────────────────────
+
+    #[test]
+    fn test_resolve_path_happy_all_fields() {
+        let resp = json!({
+            "canonical_path": "/home/u/a.txt",
+            "blob_handle": "opaque-handle",
+            "mime_type": "text/plain",
+            "total_size": 5,
+            "sha256": "abc123",
+            "mtime": 1_700_000_000_000i64,
+            "req_id": "R1"
+        });
+        let ret = parse_resolve_path_response(&resp, "R1").unwrap();
+        assert_eq!(ret.canonical_path, "/home/u/a.txt");
+        assert_eq!(ret.blob_handle, "opaque-handle");
+        assert_eq!(ret.mime_type, "text/plain");
+        assert_eq!(ret.total_size, 5);
+        assert_eq!(ret.sha256, "abc123");
+        assert_eq!(ret.mtime, 1_700_000_000_000);
+        assert_eq!(ret.req_id.as_str(), "R1");
+    }
+
+    #[test]
+    fn test_resolve_path_flat_error_4020_raises_with_reason() {
+        // 4020 铸造期拒绝，details.reason 开放枚举；错误解析必须先于 req_id 校验
+        // （ErrorPayload 无 req_id）。
+        let resp = json!({
+            "code": 4020,
+            "message": "Path not accessible",
+            "details": { "reason": "forbidden" }
+        });
+        let err = parse_resolve_path_response(&resp, "R1").unwrap_err();
+        match err {
+            SmcpAgentError::Protocol(p) => {
+                assert_eq!(p.code, 4020);
+                assert_eq!(p.reason.as_deref(), Some("forbidden"));
+            }
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_path_req_id_mismatch() {
+        let resp = json!({
+            "canonical_path": "/x",
+            "blob_handle": "h",
+            "mime_type": "text/plain",
+            "total_size": 0,
+            "sha256": "x",
+            "mtime": 0,
+            "req_id": "OTHER"
+        });
+        let err = parse_resolve_path_response(&resp, "R1").unwrap_err();
+        assert!(
+            matches!(err, SmcpAgentError::ReqIdMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// protocol#66：`get_computer_in_office` 的投影纯函数 —— 0 台 ⇒ `None`、恰 1 台 ⇒ `Some`、
+    /// **多于 1 台 ⇒ 协议违规错误**（不挑第一台）。
+    #[test]
+    fn parse_single_computer_projects_zero_one_or_violation() {
+        use smcp::{Role, SessionInfo};
+
+        fn session(name: &str, role: Role) -> SessionInfo {
+            SessionInfo {
+                sid: format!("sid-{name}"),
+                name: name.to_string(),
+                role,
+                office_id: "office-a".to_string(),
+                a2c_version: None,
+                computer_id: None,
+            }
+        }
+
+        // 空房 / 只有 Agent ⇒ None（SessionInfo 无 PartialEq，按 is_none 断言）。
+        assert!(
+            parse_single_computer(vec![], "office-a").unwrap().is_none(),
+            "空房应返回 None"
+        );
+        assert!(
+            parse_single_computer(vec![session("a", Role::Agent)], "office-a")
+                .unwrap()
+                .is_none(),
+            "只有 Agent 的房间也应返回 None"
+        );
+
+        // 恰一台 Computer（混有 Agent）⇒ Some(该 Computer)。
+        let one = parse_single_computer(
+            vec![session("a", Role::Agent), session("c", Role::Computer)],
+            "office-a",
+        )
+        .unwrap()
+        .expect("应投影出唯一 Computer");
+        assert_eq!(one.name, "c");
+        assert_eq!(one.role, Role::Computer);
+
+        // 多于一台 ⇒ 协议违规（响亮失败，绝不挑第一台）。
+        let err = parse_single_computer(
+            vec![session("c1", Role::Computer), session("c2", Role::Computer)],
+            "office-a",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SmcpAgentError::TooManyComputersInOffice { ref office_id, count: 2 }
+                    if office_id == "office-a"
+            ),
+            "多于一台 Computer 必须判协议违规，got {err:?}"
         );
     }
 }

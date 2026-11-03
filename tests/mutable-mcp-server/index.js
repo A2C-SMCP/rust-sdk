@@ -118,6 +118,9 @@ function handleRequest(req) {
       return null;
 
     case "tools/list":
+      if (process.env.SMCP_TEST_TOOL_LIST_LOG) {
+        require("fs").appendFileSync(process.env.SMCP_TEST_TOOL_LIST_LOG, "tools/list\n");
+      }
       return ok(id, { tools: currentTools() });
 
     case "resources/list":

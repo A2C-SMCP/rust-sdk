@@ -56,9 +56,13 @@ pub fn client_factory(
     notify: Option<ClientNotifyCtx>,
 ) -> StdArc<dyn MCPClientProtocol> {
     match config {
-        MCPServerConfig::Stdio(config) => {
-            StdArc::new(StdioMCPClient::new(config.server_parameters).with_notify(notify))
-        }
+        MCPServerConfig::Stdio(config) => StdArc::new(
+            StdioMCPClient::new_with_connect_timeout_secs(
+                config.server_parameters,
+                config.connect_timeout_secs,
+            )
+            .with_notify(notify),
+        ),
         MCPServerConfig::Sse(config) => {
             StdArc::new(SseMCPClient::new(config.server_parameters).with_notify(notify))
         }
@@ -137,6 +141,7 @@ mod tests {
     async fn test_client_factory_stdio() {
         let config = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "test_stdio".to_string(),
             bundle_id: None,
             disabled: false,

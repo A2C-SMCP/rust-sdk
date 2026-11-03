@@ -99,6 +99,11 @@ keyring = { version = "3", features = ["windows-native"] }
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
 
+# POSIX 路径读取（v0.5.0 protocol#65）：O_NONBLOCK / O_NOFOLLOW / errno 映射 / F_GETPATH。
+# POSIX read-by-path: open flags / errno mapping / F_GETPATH.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["vrl"]
 vrl = ["dep:vrl"]

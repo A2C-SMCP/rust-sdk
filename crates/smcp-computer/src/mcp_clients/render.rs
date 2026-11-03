@@ -83,6 +83,10 @@ impl ConfigRender {
         self.render_with_depth(data, resolver, 0).await
     }
 
+    // Rust 1.99 起 clippy `double_must_use` 会对 `#[async_recursion]` 生成的
+    // `#[must_use]` + boxed Future（本身即 must_use）报警；async-recursion 1.1.1（最新）
+    // 尚无修复。此处局部 allow（同 `result_large_err` 的既有做法），待上游修复后移除。
+    #[allow(clippy::double_must_use)]
     #[async_recursion]
     async fn render_with_depth<F, Fut>(
         &self,

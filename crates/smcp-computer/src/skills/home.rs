@@ -155,8 +155,11 @@ pub fn ensure_skill_home(env: Option<&EnvMap>) -> std::io::Result<PathBuf> {
 }
 
 /// 递归创建每用户私有目录（POSIX `0o700`）/ Recursively create a per-user-private dir。
+///
+/// protocol#64：`identity` 模块复用本原语（身份目录与 SKILL Home 同策略：仅新建目录套用 mode，
+/// 既存目录不改权限）。
 #[cfg(unix)]
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     // recursive(true)：既存目录视为成功且**不**改其权限（仅新建目录套用 mode）。
     std::fs::DirBuilder::new()
@@ -167,7 +170,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 /// 递归创建目录（非 POSIX：隔离由平台 ACL 承担，忽略 mode）/ Recursive create (non-POSIX).
 #[cfg(not(unix))]
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 

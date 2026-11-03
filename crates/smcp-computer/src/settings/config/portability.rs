@@ -33,7 +33,10 @@ use serde_json::{Map, Value};
 
 use crate::settings::redaction::url_with_redacted_userinfo;
 
-use super::crud::{load_project_config_doc, save_config, ConfigCrudError, ProjectConfigDoc};
+use super::crud::{
+    drop_project_read_roots, load_project_config_doc, save_config, ConfigCrudError,
+    ProjectConfigDoc,
+};
 use super::validate::{validate_config, ValidationReport};
 
 /// 脱敏哨兵：抹去 secret 字面值后的占位记号（显式、非明文、提示导入方补值）/ redaction sentinel。
@@ -53,10 +56,13 @@ static PLACEHOLDER_RE: LazyLock<Regex> =
 
 /// 导出**可分享**的 project 配置（脱敏 + 丢 local 层）/ export a shareable, sanitized project config。
 ///
-/// 返回 [`ProjectConfigDoc`]（`settings_local`/`mcp_local` 恒 `None`；project 层已脱敏）。调用方负责序列化落盘/传输。
+/// 返回 [`ProjectConfigDoc`]（`settings_local`/`mcp_local` 恒 `None`；project 层已脱敏；project scope 的
+/// `readRoots` 被剔除——协议禁止项且含用户本地绝对路径，#245）。调用方负责序列化落盘/传输。
 pub fn export_config(config_dir: &Path) -> Result<ProjectConfigDoc, ConfigCrudError> {
-    let doc = load_project_config_doc(config_dir)?;
-    Ok(sanitize_for_boundary(&doc))
+    let mut doc = sanitize_for_boundary(&load_project_config_doc(config_dir)?);
+    // #245：project scope 的 readRoots 是协议禁止项（且含用户本地绝对路径），不随分享物旅行。
+    drop_project_read_roots(&mut doc);
+    Ok(doc)
 }
 
 /// 导入外来 project 配置到 `config_dir`（先脱敏、后 schema 校验、再落盘）/ import an external project config。
@@ -68,6 +74,7 @@ pub fn import_config(
     incoming: &ProjectConfigDoc,
 ) -> Result<ValidationReport, ConfigCrudError> {
     let sanitized = sanitize_for_boundary(incoming);
+    // 先校验（保留 project scope 非法字段的诊断）；`save_config` 负责落盘前剔除（#245）。
     let report = validate_config(&sanitized);
     save_config(config_dir, &sanitized)?;
     Ok(report)
@@ -537,6 +544,48 @@ mod tests {
         assert!(!report.is_valid(), "非法 server type → 报告非空");
         // 非阻断：仍落盘。
         assert!(workdir_mcp_config_path(&fx.wd).exists());
+    }
+
+    #[test]
+    fn import_drops_project_read_roots_but_reports_diagnostic() {
+        let fx = Fx::new();
+        let incoming = ProjectConfigDoc {
+            settings: Some(obj(json!({
+                "readRoots": ["/data/share"],
+                "strictKnownMarketplaces": true
+            }))),
+            ..Default::default()
+        };
+        let report = import_config(&fx.wd, &incoming).unwrap();
+        assert!(!report.is_valid(), "project readRoots 须记诊断");
+        assert!(
+            report.errors.iter().any(|e| e.field == "readRoots"),
+            "errors={:?}",
+            report.errors
+        );
+        let saved = read_json(&workdir_project_settings_path(&fx.wd));
+        assert!(
+            saved.get("readRoots").is_none(),
+            "project readRoots 不得落盘：{saved}"
+        );
+        assert_eq!(saved["strictKnownMarketplaces"], json!(true));
+    }
+
+    #[test]
+    fn export_drops_project_read_roots() {
+        // #245：分享物不得携带 project scope 的 readRoots（含用户本地绝对路径）。
+        let fx = Fx::new();
+        write(
+            &workdir_project_settings_path(&fx.wd),
+            r#"{"readRoots":["/data/share"],"strictKnownMarketplaces":true}"#,
+        );
+        let exported = export_config(&fx.wd).unwrap();
+        let settings = exported.settings.expect("project settings");
+        assert!(
+            settings.get("readRoots").is_none(),
+            "export 不得携带 readRoots：{settings:?}"
+        );
+        assert_eq!(settings["strictKnownMarketplaces"], json!(true));
     }
 
     #[test]

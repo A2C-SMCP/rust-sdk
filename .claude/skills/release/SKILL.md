@@ -101,10 +101,11 @@ gh run list --workflow=publish.yml --limit=1
 gh run watch <run-id>
 ```
 
-**⚠️ job success ≠ 发布成功**。publish.yml 每个发布步骤带 `|| true`（容忍
-already-exists 以便重跑），真实失败也会被吞掉、workflow 仍绿（v0.2.2/v0.2.3/v0.3.2
-三次实测）。**必须逐 crate 验收 crates.io**（API 不传 User-Agent 会被 403 拒绝 → 误判
-"未发布"）：
+**⚠️ job success ≠ crates.io 全量可见**。publish.yml 的发布步骤经
+`scripts/ci/publish_crate.sh`：只有「crates.io 已上传消息 + API 确认该版本存在」双重成立
+才幂等跳过（重跑自动补发缺的），token/依赖/网络等真实失败会让 job 红；index 等待同样超时
+即失败（v0.2.2/v0.2.3/v0.3.2 曾被无条件 `|| true` 吞掉失败而假绿）。即便如此，仍**必须
+逐 crate 验收 crates.io**（API 不传 User-Agent 会被 403 拒绝 → 误判 "未发布"）：
 
 ```bash
 for c in a2c-smcp smcp smcp-agent smcp-client-transport smcp-computer \
@@ -121,12 +122,12 @@ done
   （crates.io 版本不可删且失败不留在 CI 痕迹里，只作当次兜底）：
 
 ```bash
-# 1. 用全量日志定位真因（--log-failed 抓不到——每步 exit 0，必须全量 grep）
-gh run view <run-id> --log > /tmp/publish.log && grep -n 'error' /tmp/publish.log
+# 1. 直接看失败步骤的日志（发布 / index 等待失败均为非零退出，--log-failed 可定位）
+gh run view <run-id> --log-failed
 
-# 2. 修 publish.yml（依赖序 / wait-for-index curl 补 User-Agent）→ push main（develop 同步）
+# 2. 修 publish.yml（依赖序 / sparse index 等待）→ push main（develop 同步）
 
-# 3. 重跑（已在 registry 的 crate 会 "already exists" 被 || true 跳过，自动补发缺的）
+# 3. 重跑（已发布的 crate 由 publish_crate.sh 幂等跳过，自动补发缺的）
 gh workflow run publish.yml --ref main
 ```
 

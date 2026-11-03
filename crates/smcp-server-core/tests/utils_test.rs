@@ -18,15 +18,14 @@ async fn test_get_computers_in_office() {
     let server = SmcpTestServer::start().await;
     let server_url = server.url();
 
-    // 创建多个客户端
+    // 每 role 一席（protocol#66）：两台 Computer 分居两房。
     let agent_client = create_test_client(&server_url, "smcp").await;
     let computer1_client = create_test_client(&server_url, "smcp").await;
     let computer2_client = create_test_client(&server_url, "smcp").await;
 
-    // 所有客户端加入同一办公室
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
     join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
-    join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
+    join_office(&computer2_client, Role::Computer, "office2", "computer2").await;
 
     // 等待所有客户端加入完成
     sleep(Duration::from_millis(300)).await;
@@ -48,15 +47,14 @@ async fn test_get_all_sessions_in_office() {
     let server = SmcpTestServer::start().await;
     let server_url = server.url();
 
-    // 创建多个客户端
+    // 每 role 一席（protocol#66）：两台 Computer 分居两房。
     let agent_client = create_test_client(&server_url, "smcp").await;
     let computer1_client = create_test_client(&server_url, "smcp").await;
     let computer2_client = create_test_client(&server_url, "smcp").await;
 
-    // 所有客户端加入同一办公室
     join_office(&agent_client, Role::Agent, "office1", "agent1").await;
     join_office(&computer1_client, Role::Computer, "office1", "computer1").await;
-    join_office(&computer2_client, Role::Computer, "office1", "computer2").await;
+    join_office(&computer2_client, Role::Computer, "office2", "computer2").await;
 
     // 等待所有客户端加入完成
     sleep(Duration::from_millis(300)).await;
@@ -73,7 +71,8 @@ async fn test_get_all_sessions_in_office() {
 
 #[tokio::test]
 async fn test_session_manager_utils() {
-    // 直接测试SessionManager的工具方法
+    // 直接测试SessionManager的工具方法（`register_session` 是**置入原语**，非入房闸门；
+    // 布置的房间态遵循「每 role 一席」不变量，与生产路径经 `reserve_join` 得到的状态同构）。
     let session_manager = SessionManager::new();
 
     // 创建测试会话
@@ -89,6 +88,7 @@ async fn test_session_manager_utils() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     let computer2_session = SessionData::new(
@@ -96,22 +96,13 @@ async fn test_session_manager_utils() {
         "computer2".to_string(),
         ClientRole::Computer,
     )
-    .with_office_id("office1".to_string());
-
-    let other_computer_session = SessionData::new(
-        "other_computer_sid".to_string(),
-        "other_computer".to_string(),
-        ClientRole::Computer,
-    )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office2".to_string());
 
     // 注册会话
     session_manager.register_session(agent_session).unwrap();
     session_manager.register_session(computer1_session).unwrap();
     session_manager.register_session(computer2_session).unwrap();
-    session_manager
-        .register_session(other_computer_session)
-        .unwrap();
 
     // 测试获取office1中的计算机 - 使用get_sessions_in_office并过滤
     let computers: Vec<_> = session_manager
@@ -119,13 +110,13 @@ async fn test_session_manager_utils() {
         .into_iter()
         .filter(|s| s.role == ClientRole::Computer)
         .collect();
-    assert_eq!(computers.len(), 2);
+    assert_eq!(computers.len(), 1);
 
     // 测试获取office1中的所有会话
     let all_sessions = session_manager.get_sessions_in_office(&"office1".to_string());
-    assert_eq!(all_sessions.len(), 3); // 1 agent + 2 computers
+    assert_eq!(all_sessions.len(), 2); // 1 agent + 1 computer（每 role 一席）
 
-    // 测试获取office2中的计算机
+    // 测试获取office2中的计算机（跨房隔离：另一房的 Computer 不计入本房）
     let computers_office2: Vec<_> = session_manager
         .get_sessions_in_office(&"office2".to_string())
         .into_iter()
@@ -155,6 +146,7 @@ async fn test_get_computer_sid_in_office() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     let computer1_office2 = SessionData::new(
@@ -162,19 +154,21 @@ async fn test_get_computer_sid_in_office() {
         "computer1".to_string(), // 相同名称，不同办公室
         ClientRole::Computer,
     )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office2".to_string());
 
-    let computer2_office1 = SessionData::new(
+    let computer2_office3 = SessionData::new(
         "comp3_sid".to_string(),
         "computer2".to_string(),
         ClientRole::Computer,
     )
-    .with_office_id("office1".to_string());
+    .with_computer_id(TEST_COMPUTER_ID)
+    .with_office_id("office3".to_string());
 
-    // 注册会话
+    // 注册会话（每 role 一席：office1 / office2 / office3 各至多一台 Computer）
     session_manager.register_session(computer1_office1).unwrap();
     session_manager.register_session(computer1_office2).unwrap();
-    session_manager.register_session(computer2_office1).unwrap();
+    session_manager.register_session(computer2_office3).unwrap();
 
     // 测试查找
     assert_eq!(
@@ -188,7 +182,7 @@ async fn test_get_computer_sid_in_office() {
     );
 
     assert_eq!(
-        session_manager.get_computer_sid_in_office(&"office1".to_string(), "computer2"),
+        session_manager.get_computer_sid_in_office(&"office3".to_string(), "computer2"),
         Some("comp3_sid".to_string())
     );
 
@@ -200,7 +194,7 @@ async fn test_get_computer_sid_in_office() {
 
     // 测试不存在的办公室
     assert_eq!(
-        session_manager.get_computer_sid_in_office(&"office3".to_string(), "computer1"),
+        session_manager.get_computer_sid_in_office(&"office4".to_string(), "computer1"),
         None
     );
 }
@@ -222,6 +216,7 @@ async fn test_validate_agent_in_office() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话
@@ -233,8 +228,16 @@ async fn test_validate_agent_in_office() {
     assert!(!session_manager.has_agent_in_office(&"office2".to_string()));
     assert!(!session_manager.has_agent_in_office(&"office3".to_string()));
 
-    // 测试Computer不能通过Agent验证
-    assert!(session_manager.has_computer_in_office(&"office1".to_string(), "computer1"));
+    // 测试Computer不能通过Agent验证（房内按名解析走 `get_computer_sid_in_office`；
+    // 全局按名查找 `has_computer_in_office` / `get_sid_by_name` 已按 #226 复审 🟡1 删除）
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "computer1"),
+        Some("computer_sid".to_string())
+    );
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "agent1"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -261,6 +264,7 @@ async fn test_get_agent_session_in_office() {
         "computer1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话
@@ -277,8 +281,15 @@ async fn test_get_agent_session_in_office() {
     let office2_sessions = session_manager.get_sessions_in_office(&"office2".to_string());
     assert!(!office2_sessions.iter().any(|s| s.name == "agent1"));
 
-    // Test Computer not found as agent
-    assert!(session_manager.has_computer_in_office(&"office1".to_string(), "computer1"));
+    // Test Computer not found as agent（按 Computer 角色解析，故 Agent 名查不到）
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "computer1"),
+        Some("computer_sid".to_string())
+    );
+    assert_eq!(
+        session_manager.get_computer_sid_in_office(&"office1".to_string(), "agent1"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -291,6 +302,7 @@ async fn test_remove_session_from_office() {
         "test_name".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话
@@ -328,6 +340,7 @@ async fn test_update_session_office() {
         "test_name".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id(TEST_COMPUTER_ID)
     .with_office_id("office1".to_string());
 
     // 注册会话

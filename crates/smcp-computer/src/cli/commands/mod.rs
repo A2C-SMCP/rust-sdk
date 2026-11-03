@@ -44,7 +44,10 @@ pub mod settings;
 pub mod skill;
 
 // REPL 适配器复用既有 handler 的运行时类型 / re-export for the REPL entry & interactive loop。
-pub use handler::{CliConfig, CommandError, CommandHandler};
+pub use handler::{
+    rejoin_intent_cancelled_notice, CliConfig, CommandError, CommandHandler, JoinSocketRoomFailure,
+    JoinSocketRoomOutcome,
+};
 
 // ── 退出码语义（§4.6）/ Exit code semantics ──────────────────────────────────
 /// 成功 / success。
@@ -350,10 +353,27 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
 ///   `run_governance_remount(flag_config=...)`）：`--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效；
 ///   同一份 `declared` 既建归属索引又驱动重挂 → `roots` 键与迭代集对齐；
 /// - 单 server 失败不阻断；marketplace 降级仅 WARN；整体**非阻塞**（与 `a2c-computer run` 启动隔离策略一致）。
+/// - #248 复审：`flag_path` **MUST** 是 `Computer::normalized_flag_settings_path()` 的返回值（归一失败传
+///   `None`）；不得传原始 `--settings` 串——相对串会按调用方 cwd 解析，仓库可植入 `<cwd>/~alice/...`
+///   冒充受信 flag 层（该路径参与治理重挂的信任判定）。
 ///
 /// [`Computer::reconcile_governance`]: crate::computer::Computer::reconcile_governance
 pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: Option<&Path>) {
-    let declared = resolved_settings(None, None, flag_path);
+    let resolved = resolved_settings_with_errors(None, None, flag_path);
+    // #143/#248：flag 层普通校验错误（scope 越权 / 字段判废）照常呈现，不静默；readRoots /
+    // landingRoot 已由 Computer 运行期消费 flag 层（rust-sdk#248），不再有「运行期不生效」诊断。
+    if flag_path.is_some() {
+        let flag_errors: Vec<_> = resolved
+            .errors
+            .iter()
+            .filter(|e| e.scope == crate::settings::SettingsScope::Flag)
+            .cloned()
+            .collect();
+        for line in format_settings_errors(&flag_errors) {
+            eprintln!("{line}");
+        }
+    }
+    let declared = resolved.settings;
     let hooks = CliMcpHooks::new_remount(comp, &declared).await;
     let report = comp
         .reconcile_governance(Some(&hooks), Some(&declared))
@@ -502,6 +522,7 @@ mod tests {
         let hooks = CliMcpHooks::new(&comp, Some("figma".into()), Some("acme".into())).await;
         let cfg = MCPServerConfig::Stdio(StdioServerConfig {
             env_file: None,
+            connect_timeout_secs: None,
             name: "s".to_string(),
             bundle_id: None,
             disabled: false,

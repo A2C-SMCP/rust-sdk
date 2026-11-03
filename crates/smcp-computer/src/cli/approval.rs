@@ -36,9 +36,39 @@ use crate::computer::{Computer, Session};
 use crate::mcp_clients::model::MCPServerConfig;
 use crate::settings::mcp_config::{
     approve_all_project_mcp, approve_bundled_plugin, approve_mcp_server, deny_mcp_server,
-    gate_mcp_servers, reject_bundled_plugin, resolve_mcp_config, McpApprovalStatus,
+    gate_mcp_servers, reject_bundled_plugin, resolve_mcp_config, McpApprovalStatus, McpConfigError,
     ResolveMcpConfigArgs, ResolvedMcpServer,
 };
+
+/// #253：把审批写入结果转成用户可见告警（Ok → `None`；Err → 可操作文案）。
+///
+/// 独立纯函数便于单测——`run_mcp_approval` 本身无 cwd/env 注入接缝（见 `mcp_config` 测试注释），
+/// 但「写失败必须提示而非 `let _ =`」的判定逻辑在此锁定。
+fn persist_warning_text(action: &str, consequence: &str, error: &McpConfigError) -> String {
+    format!("failed to persist {action} (local scope): {error}; {consequence}")
+}
+
+fn approval_persist_warning(
+    result: Result<(), McpConfigError>,
+    action: &str,
+    consequence: &str,
+) -> Option<String> {
+    result
+        .err()
+        .map(|e| persist_warning_text(action, consequence, &e))
+}
+
+/// deny 分支的失败后果文案（实现与测试共用，避免自造字符串漂移）。
+const DENY_CONSEQUENCE: &str = "skipped for this session only";
+
+/// deny 持久化失败的告警（锚定 deny 分支实际使用的 action/consequence）。
+fn deny_persist_warning(name: &str, error: McpConfigError) -> String {
+    persist_warning_text(
+        &format!("denial for MCP server {name:?}"),
+        DENY_CONSEQUENCE,
+        &error,
+    )
+}
 
 /// 合并 resolved server 的 `config`（含占位符）+ `ext`（剥离的 envFile 等）为挂载用 config。
 ///
@@ -91,6 +121,9 @@ async fn mount<S: Session>(comp: &Computer<S>, srv: &ResolvedMcpServer) {
 /// flag 层，喂 [`resolved_settings_with_errors`]）；`flag_mcp_config` = `--mcp-config`（mcp.json flag 层，**次高**，
 /// 喂 [`resolve_mcp_config`]）。#137：后者接线到位——flag 层受信（`is_trusted_origin`）⇒ 门判 Enabled 直挂、
 /// 覆盖 user/project/local 同 `bundle_id`，本次运行**不落盘**；文件 `inputs` 段亦经该解析入池（替代旧 `--inputs`）。
+/// #248 复审：两个 flag 路径 **MUST** 取 `Computer` 的归一访问器（`normalized_flag_settings_path` /
+/// `normalized_mcp_flag_config`；失败传 `None`），不得传原始 `--settings` / `--mcp-config` 串——相对串按
+/// cwd 解析，仓库可植入 `<cwd>/~alice/...` 冒充受信 flag（受信 ⇒ 免批准直挂）。
 pub async fn run_mcp_approval<S: Session>(
     comp: &Computer<S>,
     approve_all: bool,
@@ -162,20 +195,34 @@ pub async fn run_mcp_approval<S: Session>(
                 ));
                 match ans.as_str() {
                     "a" | "all" => {
-                        let _ = approve_all_project_mcp(cwd.as_deref());
+                        // #253：写失败（corrupt/锁/IO）必须显式告知——fail-closed 不改原文件，
+                        // 本次会话仍挂载，但持久化未生效。
+                        if let Some(warning) = approval_persist_warning(
+                            approve_all_project_mcp(cwd.as_deref()),
+                            "approval of enableAllProjectMcpServers",
+                            "mounting for this session only",
+                        ) {
+                            msg_err(&warning);
+                        }
                         approved_all_session = true;
                         mount(comp, srv).await;
                     }
                     "y" | "yes" => {
-                        let _ = approve_mcp_server(name, cwd.as_deref());
+                        if let Some(warning) = approval_persist_warning(
+                            approve_mcp_server(name, cwd.as_deref()),
+                            &format!("approval for MCP server {name:?}"),
+                            "mounting for this session only",
+                        ) {
+                            msg_err(&warning);
+                        }
                         mount(comp, srv).await;
                     }
-                    _ => {
-                        let _ = deny_mcp_server(name, cwd.as_deref());
-                        msg_dim(&format!(
+                    _ => match deny_mcp_server(name, cwd.as_deref()) {
+                        Ok(()) => msg_dim(&format!(
                             "· denied MCP server {name:?} (written to local scope)"
-                        ));
-                    }
+                        )),
+                        Err(e) => msg_err(&deny_persist_warning(name, e)),
+                    },
                 }
             }
         }
@@ -279,5 +326,36 @@ mod tests {
         };
         // merge 后 config.env_file() 回挂为 ".env"（否则 spawn 静默丢失）。
         assert_eq!(merge_mount_config(&srv).env_file(), Some(".env"));
+    }
+
+    #[test]
+    fn approval_persist_warning_reports_err_and_ignores_ok_253() {
+        assert!(
+            approval_persist_warning(Ok(()), "approval", "mounting for this session only")
+                .is_none()
+        );
+        let err = McpConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt settings",
+        ));
+        let msg = approval_persist_warning(
+            Err(err),
+            "approval for MCP server \"x\"",
+            "mounting for this session only",
+        )
+        .expect("Err must produce a warning");
+        assert!(msg.contains("failed to persist approval for MCP server \"x\""));
+        assert!(msg.contains("corrupt settings"));
+        assert!(msg.contains("this session only"));
+
+        // deny 分支：锚定实际使用的 deny_persist_warning（实现与测试共用 action/consequence）。
+        let deny_err = McpConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt settings",
+        ));
+        let deny_msg = deny_persist_warning("y", deny_err);
+        assert!(deny_msg.contains(&format!("denial for MCP server {:?}", "y")));
+        assert!(deny_msg.contains(DENY_CONSEQUENCE));
+        assert!(deny_msg.contains("corrupt settings"));
     }
 }

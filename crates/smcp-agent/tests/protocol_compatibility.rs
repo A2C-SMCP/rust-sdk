@@ -46,6 +46,7 @@ fn test_protocol_serialization_compatibility() {
         role: Role::Agent,
         name: "Test Agent".to_string(),
         office_id: "test-office".to_string(),
+        computer_id: None,
     };
     let enter_req_json = serde_json::to_string(&enter_req).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&enter_req_json).unwrap();

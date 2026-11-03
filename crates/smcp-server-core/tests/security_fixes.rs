@@ -40,6 +40,7 @@ async fn test_list_room_permission_validation() {
         "computer_1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office_1".to_string());
 
     // 注册会话
@@ -103,7 +104,8 @@ async fn test_session_role_name_validation() {
     let sid = "test_sid".to_string();
 
     // 注册初始会话
-    let session1 = SessionData::new(sid.clone(), "test_name".to_string(), ClientRole::Agent);
+    let session1 = SessionData::new(sid.clone(), "test_name".to_string(), ClientRole::Agent)
+        .with_office_id("test_office".to_string());
     manager.register_session(session1).unwrap();
 
     // 验证初始会话
@@ -111,13 +113,24 @@ async fn test_session_role_name_validation() {
     assert_eq!(session.name, "test_name");
     assert_eq!(session.role, ClientRole::Agent);
 
-    // 测试名称冲突
+    // 同名同房第二个会话：**注册**（置入原语）本身不判冲突——房内唯一性由「每 role 一席」
+    // 在**入房**（reserve_join）时以 4101 判定；同 role 第二个会话同名与否都一样
+    // （protocol#66 场景 #2；旧的注册期同名拒绝 / 4105 已随名字注册表删除）。
     let session2 = SessionData::new(
         "different_sid".to_string(),
         "test_name".to_string(),
         ClientRole::Agent,
     );
-    assert!(manager.register_session(session2).is_err());
+    manager.register_session(session2).unwrap();
+    assert!(
+        matches!(
+            manager.reserve_join(&"different_sid".to_string(), "test_office"),
+            Err(smcp_server_core::session::SessionError::SeatTaken(
+                ClientRole::Agent
+            ))
+        ),
+        "同 role 第二个会话（即使同名）必须被席位规则以 4101 拒绝"
+    );
 
     println!("✅ 会话角色和名称验证测试通过");
 }
@@ -140,6 +153,7 @@ async fn test_office_id_permissions() {
         "test_computer".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id(office_id.clone());
 
     // 注册会话

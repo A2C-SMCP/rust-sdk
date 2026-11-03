@@ -40,6 +40,7 @@ async fn test_message_forwarding() {
         "computer_1".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office_1".to_string());
 
     session_manager.register_session(agent_session).unwrap();
@@ -66,6 +67,7 @@ async fn test_session_manager_computer_lookup() {
         "computer_a".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office1".to_string());
 
     let comp2 = SessionData::new(
@@ -73,6 +75,7 @@ async fn test_session_manager_computer_lookup() {
         "computer_b".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office1".to_string());
 
     let comp3 = SessionData::new(
@@ -80,6 +83,7 @@ async fn test_session_manager_computer_lookup() {
         "computer_a".to_string(),
         ClientRole::Computer,
     )
+    .with_computer_id("0f8fad5b-d9cb-469f-a165-70867728950e")
     .with_office_id("office2".to_string());
 
     manager.register_session(comp1).unwrap();
