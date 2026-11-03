@@ -2,6 +2,14 @@
 #![cfg(feature = "cli")]
 #![allow(dead_code)]
 
+/// 真实二进制测试的子进程隔离 env（HOME + XDG_CONFIG_HOME 指向 tempdir）。
+pub fn isolated_binary_env(home: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    vec![
+        ("HOME", home.to_path_buf()),
+        ("XDG_CONFIG_HOME", home.join("xdg-config")),
+    ]
+}
+
 /// protocol#64：隔离的 user-config 环境（XDG-first），测试绝不读写真实 `$HOME`。
 /// 后续统一抽共享 helper（本批未含）；`#[allow(dead_code)]` 兼容部分 feature 组合下用例被 cfg 掉的情况。
 #[allow(dead_code)]

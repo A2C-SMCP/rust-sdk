@@ -4,10 +4,13 @@
 /*!
 * 文件名: settings_set_corrupt_test.rs
 * 描述: 真实二进制验证 #253——`settings set` 遇 corrupt settings 文件必须非零退出、给出可操作错误、
-*       且原文件逐字节不变；正常写入必须 raw 保真（只删 project `readRoots`，其余字段原值保留）。
+*       且原文件逐字节不变；正常写入必须 raw 保真（A+：project `readRoots` 保留 + WARN，
+*       其余字段原值保留）。
 *
 * CLI 错误经 `msg_err` / `err_flat` 输出到 **stdout**（不是 stderr），断言按 stdout。
 */
+
+mod common;
 
 use std::fs;
 use std::path::Path;
@@ -16,20 +19,23 @@ use std::time::SystemTime;
 
 use tempfile::tempdir;
 
-/// 子进程隔离 env：HOME + XDG_CONFIG_HOME 指向 tempdir。
-fn isolated_env(home: &Path) -> Vec<(&'static str, std::path::PathBuf)> {
-    vec![
-        ("HOME", home.to_path_buf()),
-        ("XDG_CONFIG_HOME", home.join("xdg-config")),
-    ]
-}
-
 fn run_set(dir: &Path, key: &str, value: &str, scope: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
         .args(["settings", "set", key, value, "--scope", scope, "--json"])
         .current_dir(dir)
         .env_clear()
-        .envs(isolated_env(dir))
+        .envs(common::isolated_binary_env(dir))
+        .output()
+        .expect("smcp-computer binary runs")
+}
+
+/// 非 `--json` 形态（人类可读输出）。
+fn run_set_plain(dir: &Path, key: &str, value: &str, scope: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
+        .args(["settings", "set", key, value, "--scope", scope])
+        .current_dir(dir)
+        .env_clear()
+        .envs(common::isolated_binary_env(dir))
         .output()
         .expect("smcp-computer binary runs")
 }
@@ -78,6 +84,73 @@ fn set_refuses_non_object_root_and_keeps_bytes() {
         "stdout should explain the non-object root; got: {stdout}"
     );
     assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn set_read_roots_project_json_warns_on_stderr_and_keeps_file_253() {
+    // A+：project scope readRoots 不写入、不删旧键；--json 契约含 ignored，且 WARN 经 stderr 可见。
+    let dir = tempdir().unwrap();
+    let path = project_settings(dir.path());
+    fs::write(&path, r#"{"readRoots":["/old"],"keep":1}"#).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let output = run_set(dir.path(), "readRoots", "[\"/x\"]", "project");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    // 严格解析 stdout JSON：ignored==true、reason 非空；WARN 不得混入 stdout。
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    assert_eq!(json["ignored"], serde_json::json!(true), "{json}");
+    assert!(
+        json["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "reason must be non-empty: {json}"
+    );
+    assert!(
+        !stdout.contains("warning:"),
+        "WARN 必须走 stderr，不得混入 stdout JSON: {stdout}"
+    );
+    assert!(
+        stderr.contains("readRoots") && stderr.contains("preserved"),
+        "stderr must warn that readRoots is preserved/ignored; stderr={stderr}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "A+：project readRoots 不得写盘、不得删旧键"
+    );
+}
+
+#[test]
+fn set_read_roots_project_without_json_warns_on_stderr_253() {
+    // 非 --json 形态同样必须在 stderr 告警（若 eprintln 被移进 json 分支，本用例必红）。
+    let dir = tempdir().unwrap();
+    let path = project_settings(dir.path());
+    fs::write(&path, r#"{"readRoots":["/old"],"keep":1}"#).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let output = run_set_plain(dir.path(), "readRoots", "[\"/x\"]", "project");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("ignored"), "stdout={stdout}");
+    assert!(
+        stderr.contains("readRoots") && stderr.contains("preserved"),
+        "stderr must warn that readRoots is preserved/ignored; stderr={stderr}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "A+：project readRoots 不得写盘、不得删旧键"
+    );
 }
 
 #[test]

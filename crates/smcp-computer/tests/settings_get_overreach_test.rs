@@ -11,19 +11,12 @@
 * → 真 `SettingsValidationError`（非 hand-stuffed 字面量）。
 */
 
+mod common;
+
 use std::fs;
-use std::path::Path;
 use std::process::Command;
 
 use tempfile::tempdir;
-
-/// 子进程隔离 env：HOME + XDG_CONFIG_HOME 指向 tempdir，避免宿主 `~/.tfrobot` 泄入。
-fn isolated_env(home: &Path) -> Vec<(&'static str, std::path::PathBuf)> {
-    vec![
-        ("HOME", home.to_path_buf()),
-        ("XDG_CONFIG_HOME", home.join("xdg-config")),
-    ]
-}
 
 /// #145：越权字段被过滤后，`settings get` 必在 stderr 解释（修复前 stderr 全空 → 主动误导）。
 #[test]
@@ -49,7 +42,7 @@ fn get_overreach_field_explains_instead_of_bare_not_set() {
         ])
         .current_dir(dir.path())
         .env_clear()
-        .envs(isolated_env(dir.path()))
+        .envs(common::isolated_binary_env(dir.path()))
         .output()
         .expect("smcp-computer binary runs");
 

@@ -44,6 +44,10 @@ use crate::settings::mcp_config::{
 ///
 /// 独立纯函数便于单测——`run_mcp_approval` 本身无 cwd/env 注入接缝（见 `mcp_config` 测试注释），
 /// 但「写失败必须提示而非 `let _ =`」的判定逻辑在此锁定。
+fn persist_warning_text(action: &str, consequence: &str, error: &McpConfigError) -> String {
+    format!("failed to persist {action} (local scope): {error}; {consequence}")
+}
+
 fn approval_persist_warning(
     result: Result<(), McpConfigError>,
     action: &str,
@@ -51,7 +55,19 @@ fn approval_persist_warning(
 ) -> Option<String> {
     result
         .err()
-        .map(|e| format!("failed to persist {action} (local scope): {e}; {consequence}"))
+        .map(|e| persist_warning_text(action, consequence, &e))
+}
+
+/// deny 分支的失败后果文案（实现与测试共用，避免自造字符串漂移）。
+const DENY_CONSEQUENCE: &str = "skipped for this session only";
+
+/// deny 持久化失败的告警（锚定 deny 分支实际使用的 action/consequence）。
+fn deny_persist_warning(name: &str, error: McpConfigError) -> String {
+    persist_warning_text(
+        &format!("denial for MCP server {name:?}"),
+        DENY_CONSEQUENCE,
+        &error,
+    )
 }
 
 /// 合并 resolved server 的 `config`（含占位符）+ `ext`（剥离的 envFile 等）为挂载用 config。
@@ -198,16 +214,12 @@ pub async fn run_mcp_approval<S: Session>(
                         }
                         mount(comp, srv).await;
                     }
-                    _ => {
-                        match deny_mcp_server(name, cwd.as_deref()) {
-                            Ok(()) => msg_dim(&format!(
-                                "· denied MCP server {name:?} (written to local scope)"
-                            )),
-                            Err(e) => msg_err(&format!(
-                                "failed to persist denial for MCP server {name:?} (local scope): {e}; skipped for this session only"
-                            )),
-                        }
-                    }
+                    _ => match deny_mcp_server(name, cwd.as_deref()) {
+                        Ok(()) => msg_dim(&format!(
+                            "· denied MCP server {name:?} (written to local scope)"
+                        )),
+                        Err(e) => msg_err(&deny_persist_warning(name, e)),
+                    },
                 }
             }
         }
@@ -332,5 +344,15 @@ mod tests {
         assert!(msg.contains("failed to persist approval for MCP server \"x\""));
         assert!(msg.contains("corrupt settings"));
         assert!(msg.contains("this session only"));
+
+        // deny 分支：锚定实际使用的 deny_persist_warning（实现与测试共用 action/consequence）。
+        let deny_err = McpConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt settings",
+        ));
+        let deny_msg = deny_persist_warning("y", deny_err);
+        assert!(deny_msg.contains(&format!("denial for MCP server {:?}", "y")));
+        assert!(deny_msg.contains(DENY_CONSEQUENCE));
+        assert!(deny_msg.contains("corrupt settings"));
     }
 }

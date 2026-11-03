@@ -41,6 +41,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+#[cfg(feature = "cli")]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -788,7 +790,8 @@ pub async fn uninstall_plugin(
                     // #253：CLI 未安装 tracing subscriber——best-effort 清理失败必须对用户可见，
                     // 否则 stale flag 会静默残留（下次重装继承 true）。
                     #[cfg(feature = "cli")]
-                    eprintln!(
+                    let _ = writeln!(
+                        std::io::stderr(),
                         "warning: failed to clear enabledPlugins[{plugin_id}] in user scope: {e}; settings file left unchanged"
                     );
                 }
@@ -917,7 +920,8 @@ pub async fn uninstall_plugin(
         if let Err(e) = clear_enabled_plugin(plugin_id, scope, project_path.as_deref(), env) {
             tracing::warn!(plugin = plugin_id, scope = %scope, error = %e, "uninstall: clear enabledPlugins failed (stale flag may 残留)");
             #[cfg(feature = "cli")]
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "warning: failed to clear enabledPlugins[{plugin_id}] in {scope} scope: {e}; settings file left unchanged"
             );
         }

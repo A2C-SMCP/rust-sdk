@@ -15,6 +15,8 @@
 //! `.lock` 旁车文件——「原文件不变」指 settings 数据文件本身；corrupt 文件**不备份、不删除**。
 
 use std::io;
+#[cfg(feature = "cli")]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -66,9 +68,10 @@ pub(crate) enum RawWriteError {
 /// 一次 raw 更新的结果 / Outcome of one raw update。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawUpdateOutcome {
-    /// mutate 是否改变语义内容。
+    /// `mutate` 是否改变语义内容（installer 据此决定是否 bump config revision）。
     pub(crate) changed: bool,
-    /// 是否实际写盘。
+    /// 是否实际写盘。A+ 后无写入期清理/跳过策略，当前恒等于 `changed`；保留独立字段表达
+    /// 「语义变化」与「实际落盘」两个概念，未来若引入清理/条件跳过可分化。
     pub(crate) wrote: bool,
 }
 
@@ -152,8 +155,9 @@ fn warn_project_read_roots(path: &Path, map: &Map<String, Value>) {
             message
         );
         // CLI 未安装 tracing subscriber；写入期 WARN 必须对用户可见（A+）。
+        // stderr 关闭/管道断裂时不得 panic：用 writeln! 并忽略结果。
         #[cfg(feature = "cli")]
-        eprintln!("warning: {message}");
+        let _ = writeln!(std::io::stderr(), "warning: {message}");
     }
 }
 

@@ -20,6 +20,7 @@
 */
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
@@ -176,7 +177,7 @@ pub fn settings_show(
     };
     // #143：scope 越权被过滤的字段在此有解释（打 stderr，不污染 stdout 的 JSON）。
     for line in super::format_settings_errors(&errors) {
-        eprintln!("{line}");
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
     print_json(&Value::Object(data));
     EXIT_OK
@@ -210,7 +211,7 @@ pub fn settings_get(
     // （文件里明明写了，却被安全策略过滤谎报成「你没配」）。故在判 key 命中之前先经 stderr 解释。
     // 对齐 settings_show 与 python-sdk#157（emit 置于 key 判空之前）；stdout JSON 契约不变。
     for line in super::format_settings_errors(&errors) {
-        eprintln!("{line}");
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
     let Some(value) = data.get(key) else {
         return err(
@@ -227,6 +228,11 @@ pub fn settings_get(
 ///
 /// 值解析：JSON 优先（`true` / `["a","b"]` / `{...}`），失败回退字面字符串。写经 `apply_write`——对象递归
 /// 深合并、**数组整体替换**；`null` 写 JSON null（删键仅经 DELETE 哨兵，§5.4）。
+///
+/// **对象值的 fail-closed 规则（#253）**：写入值为 JSON object 时，若盘上同名键已存在且**不是**
+/// object（标量 / null / 数组），命令拒绝写入（退出码 1、原文件不变）——避免静默把用户数据物化
+/// 覆盖。若确认要替换该键为对象，请先 `settings edit` 手工修正/删除；显式写入标量/数组仍整体替换。
+/// 这是与 Python「对象物化」行为的有意分叉。
 pub fn settings_set(
     env: Option<&EnvMap>,
     key: &str,
@@ -311,6 +317,9 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
         "{}",
         REASON
     );
+    // --json 模式也必须让 WARN 对用户可见（stderr）；JSON 契约额外携带 reason。
+    // 用 writeln! 而非 eprintln!：stderr 关闭/管道断裂时不得 panic（--json 会变 exit 101）。
+    let _ = writeln!(std::io::stderr(), "warning: {}", REASON);
     if json_output {
         print_json(&json!({
             "scope": "project",
@@ -320,7 +329,6 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
         }));
         return EXIT_OK;
     }
-    eprintln!("warning: {}", REASON);
     ok_msg(&format!(
         "ignored {} in project scope (trusted-scope-only; existing key preserved)",
         FIELD_READ_ROOTS
@@ -397,7 +405,8 @@ pub fn settings_edit(
                             path = %path.display(),
                             "project scope readRoots preserved after edit (ignored at read time)"
                         );
-                        eprintln!(
+                        let _ = writeln!(
+                            std::io::stderr(),
                             "warning: project scope {} is preserved but ignored at read time \
                              (trusted-scope-only; use settings.local.json or the user scope)",
                             FIELD_READ_ROOTS

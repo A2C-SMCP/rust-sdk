@@ -10,19 +10,13 @@
 *       诊断文案，且普通 flag 层校验错误仍照常呈现（不静默）。
 */
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
 use tempfile::tempdir;
-
-/// 子进程隔离 env：HOME + XDG_CONFIG_HOME 指向 tempdir，避免宿主配置泄入。
-fn isolated_env(home: &Path) -> Vec<(&'static str, std::path::PathBuf)> {
-    vec![
-        ("HOME", home.to_path_buf()),
-        ("XDG_CONFIG_HOME", home.join("xdg-config")),
-    ]
-}
 
 fn run(dir: &Path, flag: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
@@ -31,7 +25,7 @@ fn run(dir: &Path, flag: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env_clear()
-        .envs(isolated_env(dir))
+        .envs(common::isolated_binary_env(dir))
         .output()
         .expect("smcp-computer binary runs")
 }
