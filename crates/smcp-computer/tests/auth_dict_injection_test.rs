@@ -1274,6 +1274,93 @@ async fn failed_explicit_join_during_rejoin_backoff_cancels_pending_intent() {
     server.shutdown();
 }
 
+/// #240：CLI 结构化 outcome —— 退避窗口内显式 join 失败取消挂起的自动回房意图时，
+/// outcome 置位且纯文案与实现一致；不做二进制 stdout e2e（决策 D3）。
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_join_outcome_reports_cancelled_rejoin_intent() {
+    use smcp_computer::cli::commands::{
+        rejoin_intent_cancelled_notice, CliConfig, CommandError, CommandHandler,
+    };
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server_with_policy(
+        join_verdict(|attempt, _| (attempt >= 2).then_some(4101)),
+        None,
+        None,
+    )
+    .await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-cancel-cli", &temp).await;
+    let mut handler = CommandHandler::new(
+        computer,
+        CliConfig {
+            url: None,
+            namespace: "/smcp".to_string(),
+            auth: None,
+            headers: None,
+            office_rejoin_budget_secs: Some(30),
+        },
+    );
+    // 走 CLI 连接路径，让 `CliConfig::office_rejoin_budget_secs` 真正进入 ConnectOptions。
+    handler
+        .connect_socketio(&server.url, "/smcp", &None, &None)
+        .await
+        .expect("connect through CLI handler");
+    let _ = server.next_auth().await;
+    handler
+        .join_socket_room_with_outcome("office-rejoin-cancel", "office-cancel-cli")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    let mut events = handler.computer.subscribe_events();
+    server.force_network_disconnect();
+    wait_for_lifecycle(&mut events, LifecycleState::Connecting).await;
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 第 2 次（auto）被 4101 拒绝，进入 1s 退避
+
+    // 退避窗口内显式换房同样被 4101 拒绝：取消无属主的旧回房意图。
+    let failure = handler
+        .join_socket_room_with_outcome("office-cancel-target", "office-cancel-cli")
+        .await
+        .expect_err("the explicit join must fail");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if server.next_join().await["office_id"] == "office-cancel-target" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the explicit join must reach the server");
+
+    assert!(
+        matches!(
+            failure.error,
+            CommandError::ComputerError(ComputerError::ProtocolRejection { code: 4101, .. })
+        ),
+        "the cancelled intent must come from the 4101 verdict, got {:?}",
+        failure.error
+    );
+    assert!(
+        failure.rejoin_intent_cancelled,
+        "the structured outcome must report the cancelled rejoin intent"
+    );
+    assert_eq!(
+        rejoin_intent_cancelled_notice(),
+        "  ⚠ 此前的自动回房意图已取消 / the previous pending automatic rejoin intent was cancelled",
+        "the CLI notice is a pure format string and must not drift"
+    );
+
+    handler
+        .computer
+        .shutdown()
+        .await
+        .expect("shutdown computer");
+    server.shutdown();
+}
+
 /// #234：预算耗尽后回退 `Connected`，且不再发送重试（负向断言）。
 #[tokio::test]
 async fn exhausted_rejoin_budget_falls_back_to_connected_and_stops_retrying() {

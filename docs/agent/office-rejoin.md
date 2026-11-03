@@ -145,7 +145,7 @@ Socket.IO 的 room 成员关系挂在**namespace 会话**上。传输层断线�
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `office_rejoin_timeout` | `10s` | 单次重放的 ack 等待上限（对齐 python `OFFICE_REJOIN_TIMEOUT` 与本仓 Computer 侧同值） |
+| `office_rejoin_timeout` | `10s` | 单次重放的 ack 等待上限（对齐 python `OFFICE_JOIN_TIMEOUT` 与本仓 Computer 侧同值） |
 | `office_rejoin_budget_secs` | `60s` | 有界退避重试的**总预算**，覆盖 socket.io 默认最长回收窗口 45s |
 
 退避曲线（SDK 自治）：首次**立即**尝试，其后 `1s → 2s → 4s → 8s`，此后封顶 8s。

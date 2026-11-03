@@ -342,6 +342,38 @@ enum AckCallError {
     Failed(ComputerError),
 }
 
+/// ACK **等待**失败的两条路径（#240）：与发送失败分开归类。
+///
+/// kernel 对「已匹配但已超时」的 ACK 会静默丢弃且不调用回调（tf-rust-socketio
+/// `handle_ack`），回调里的 oneshot Sender 随之 drop——此时传输可能完全健康，
+/// 只是 ACK 恰好迟到。ACK 等待期间的真实断线也不会走发送失败（`emit_with_ack`
+/// 此刻已返回 Ok），而是等满外层 timeout 或由 Close/epoch 守卫取消。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckWaitFailure {
+    /// 回调 sender 被丢弃：迟到 ACK 静默丢弃 / 通道关闭。
+    ChannelClosed,
+    /// 外层 `tokio::time::timeout` 到期。
+    TimedOut,
+}
+
+impl AckWaitFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ChannelClosed => "Channel closed while waiting for response",
+            Self::TimedOut => "Timeout while waiting for response",
+        }
+    }
+}
+
+/// #240：ACK 等待失败的**纯映射**（单测锁定分类）。
+///
+/// 两条路径都必须归 `Failed`（超时类）。`Interrupted` 仅保留给发送时传输失效
+/// （`emit_with_ack` 返回 Err）；若把通道关闭改回 `Interrupted`，自动回房会误判
+/// 连接级失效、保留重放意图而不落失败终态，生命周期也不会再接管。
+fn classify_ack_wait_failure(failure: AckWaitFailure) -> AckCallError {
+    AckCallError::Failed(ComputerError::SocketIoError(failure.message().to_string()))
+}
+
 /// 自动回房单次 `server:join_office` 的失败分类（#234）。
 #[derive(Debug)]
 enum JoinOfficeFailure {
@@ -1941,28 +1973,14 @@ impl SmcpComputerClient {
             }
             Ok(Err(_)) => {
                 error!("Channel closed while calling event: {}", event);
-                // #234：`Ok(Err(_))` **不能**判为连接级中断。kernel 对「已匹配但已超时」的
-                // ACK 会静默丢弃且不调用回调（tf-rust-socketio `handle_ack`），回调里的
-                // oneshot Sender 随之 drop——此时传输可能完全健康，只是 ACK 恰好迟到。
-                // ACK 等待期间的真实断线不会走发送失败：`emit_with_ack` 此时已返回 Ok，
-                // 发送那一刻是成功的。断线要么等满本函数的 10s 外层 timeout（→Failed），
-                // 要么由 Close/epoch 守卫在结果落账前取消/丢弃本次尝试；两者都不是
-                // Interrupted——Interrupted 仅保留给发送时传输失效（`emit_with_ack` 返回 Err）。
-                // 此处按「本次尝试失败（超时类）」处理，避免 lifecycle 无事件接管而永久停在
-                // Connecting. A real disconnect during the ACK wait surfaces as this outer
-                // timeout or the Close/epoch guard — never as a send failure; `Interrupted`
-                // is reserved for a send-time transport failure (`emit_with_ack` Err).
-                // The kernel may drop an expired ACK without invoking the callback, so a
-                // closed ACK channel is a timeout-like failure, not a transport interruption.
-                Err(AckCallError::Failed(ComputerError::SocketIoError(
-                    "Channel closed while waiting for response".to_string(),
-                )))
+                // #234/#240：迟到 ACK 被 kernel 静默丢弃（传输可能健康）——按超时类失败
+                // 处理；分类由 `classify_ack_wait_failure` 单测锁定，不得改回 Interrupted。
+                // 真实断线走外层 timeout 或 Close/epoch 守卫，interrupted 仅留给发送失败。
+                Err(classify_ack_wait_failure(AckWaitFailure::ChannelClosed))
             }
             Err(_) => {
                 error!("Timeout while calling event: {}", event);
-                Err(AckCallError::Failed(ComputerError::SocketIoError(
-                    "Timeout while waiting for response".to_string(),
-                )))
+                Err(classify_ack_wait_failure(AckWaitFailure::TimedOut))
             }
         }
     }
@@ -4329,5 +4347,34 @@ mod tests {
         assert!(client.take_rejoin_intent_cancelled().await);
         assert!(!client.take_rejoin_intent_cancelled().await);
         client.disconnect().await.expect("disconnect");
+    }
+
+    /// #240：迟到 ACK / 健康传输路径——kernel 静默丢弃已超时 ACK 的回调导致通道关闭，
+    /// 必须归 `Failed`（超时类）。改回 `Interrupted` 时本用例必须失败。
+    ///
+    /// 本用例锁定纯映射（D2：不做真实 socket 集成用例）；调用点若内联改回 `Interrupted`，
+    /// `ChannelClosed` 变体在非 test 构建不再被构造，`dead_code` 会被 clippy `-D warnings` 拦截。
+    #[test]
+    fn late_ack_channel_close_maps_to_failed() {
+        match classify_ack_wait_failure(AckWaitFailure::ChannelClosed) {
+            AckCallError::Failed(ComputerError::SocketIoError(message)) => {
+                assert_eq!(message, "Channel closed while waiting for response");
+            }
+            other => panic!(
+                "a closed ACK channel is a timeout-like failure on a possibly healthy \
+                 transport; it must map to Failed, got {other:?}"
+            ),
+        }
+    }
+
+    /// #240：外层 ACK 超时同样归 `Failed`（与通道关闭同一分类，均非 `Interrupted`）。
+    #[test]
+    fn ack_wait_timeout_maps_to_failed() {
+        match classify_ack_wait_failure(AckWaitFailure::TimedOut) {
+            AckCallError::Failed(ComputerError::SocketIoError(message)) => {
+                assert_eq!(message, "Timeout while waiting for response");
+            }
+            other => panic!("an ACK wait timeout must map to Failed, got {other:?}"),
+        }
     }
 }
