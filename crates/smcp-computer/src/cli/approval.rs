@@ -54,6 +54,18 @@ fn approval_persist_warning(
         .map(|e| format!("failed to persist {action} (local scope): {e}; {consequence}"))
 }
 
+/// deny 分支的失败后果文案（实现与测试共用，避免自造字符串漂移）。
+const DENY_CONSEQUENCE: &str = "skipped for this session only";
+
+/// deny 持久化失败的告警（锚定 deny 分支实际使用的 action/consequence）。
+fn deny_persist_warning(name: &str, error: McpConfigError) -> Option<String> {
+    approval_persist_warning(
+        Err(error),
+        &format!("denial for MCP server {name:?}"),
+        DENY_CONSEQUENCE,
+    )
+}
+
 /// 合并 resolved server 的 `config`（含占位符）+ `ext`（剥离的 envFile 等）为挂载用 config。
 ///
 /// ★ 必须合回 `ext`，否则 spawn 时看不到 `envFile` → 静默丢失（对标 Python `_mount_dict`，#69 Group B 风险 2）。
@@ -203,12 +215,8 @@ pub async fn run_mcp_approval<S: Session>(
                             "· denied MCP server {name:?} (written to local scope)"
                         )),
                         Err(e) => {
-                            let warning = approval_persist_warning(
-                                Err(e),
-                                &format!("denial for MCP server {name:?}"),
-                                "skipped for this session only",
-                            )
-                            .expect("Err must produce a warning");
+                            let warning =
+                                deny_persist_warning(name, e).expect("Err must produce a warning");
                             msg_err(&warning);
                         }
                     },
@@ -337,18 +345,14 @@ mod tests {
         assert!(msg.contains("corrupt settings"));
         assert!(msg.contains("this session only"));
 
-        // deny 分支复用同一 helper：失败文案必须含 denial + 仅本次会话。
+        // deny 分支：锚定实际使用的 deny_persist_warning（实现与测试共用 action/consequence）。
         let deny_err = McpConfigError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "corrupt settings",
         ));
-        let deny_msg = approval_persist_warning(
-            Err(deny_err),
-            "denial for MCP server \"y\"",
-            "skipped for this session only",
-        )
-        .expect("Err must produce a warning");
-        assert!(deny_msg.contains("failed to persist denial for MCP server \"y\""));
-        assert!(deny_msg.contains("skipped for this session only"));
+        let deny_msg = deny_persist_warning("y", deny_err).expect("Err must produce a warning");
+        assert!(deny_msg.contains(&format!("denial for MCP server {:?}", "y")));
+        assert!(deny_msg.contains(DENY_CONSEQUENCE));
+        assert!(deny_msg.contains("corrupt settings"));
     }
 }

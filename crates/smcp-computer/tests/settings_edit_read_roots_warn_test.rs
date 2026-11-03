@@ -9,19 +9,13 @@
 *       可见地告警（CLI 无 tracing subscriber → eprintln 到 stderr）。
 */
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::process::Command;
 
 use tempfile::tempdir;
-
-fn isolated_env(home: &Path) -> Vec<(&'static str, std::path::PathBuf)> {
-    vec![
-        ("HOME", home.to_path_buf()),
-        ("XDG_CONFIG_HOME", home.join("xdg-config")),
-    ]
-}
 
 #[test]
 fn settings_edit_preserves_project_read_roots_and_warns() {
@@ -43,7 +37,7 @@ fn settings_edit_preserves_project_read_roots_and_warns() {
         .args(["settings", "edit", "--scope", "project", "--json"])
         .current_dir(dir.path())
         .env_clear()
-        .envs(isolated_env(dir.path()))
+        .envs(common::isolated_binary_env(dir.path()))
         .env("EDITOR", &editor)
         .output()
         .expect("smcp-computer binary runs");

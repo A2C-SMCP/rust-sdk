@@ -20,6 +20,7 @@
 */
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
@@ -317,7 +318,8 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
         REASON
     );
     // --json 模式也必须让 WARN 对用户可见（stderr）；JSON 契约额外携带 reason。
-    eprintln!("warning: {}", REASON);
+    // 用 writeln! 而非 eprintln!：stderr 关闭/管道断裂时不得 panic（--json 会变 exit 101）。
+    let _ = writeln!(std::io::stderr(), "warning: {}", REASON);
     if json_output {
         print_json(&json!({
             "scope": "project",
@@ -403,7 +405,8 @@ pub fn settings_edit(
                             path = %path.display(),
                             "project scope readRoots preserved after edit (ignored at read time)"
                         );
-                        eprintln!(
+                        let _ = writeln!(
+                            std::io::stderr(),
                             "warning: project scope {} is preserved but ignored at read time \
                              (trusted-scope-only; use settings.local.json or the user scope)",
                             FIELD_READ_ROOTS

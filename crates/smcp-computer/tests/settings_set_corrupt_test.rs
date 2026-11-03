@@ -35,6 +35,17 @@ fn run_set(dir: &Path, key: &str, value: &str, scope: &str) -> Output {
         .expect("smcp-computer binary runs")
 }
 
+/// 非 `--json` 形态（人类可读输出）。
+fn run_set_plain(dir: &Path, key: &str, value: &str, scope: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
+        .args(["settings", "set", key, value, "--scope", scope])
+        .current_dir(dir)
+        .env_clear()
+        .envs(isolated_env(dir))
+        .output()
+        .expect("smcp-computer binary runs")
+}
+
 fn mtime(path: &Path) -> SystemTime {
     fs::metadata(path).unwrap().modified().unwrap()
 }
@@ -97,7 +108,46 @@ fn set_read_roots_project_json_warns_on_stderr_and_keeps_file_253() {
         Some(0),
         "stdout={stdout} stderr={stderr}"
     );
-    assert!(stdout.contains("\"ignored\""), "stdout={stdout}");
+    // 严格解析 stdout JSON：ignored==true、reason 非空；WARN 不得混入 stdout。
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    assert_eq!(json["ignored"], serde_json::json!(true), "{json}");
+    assert!(
+        json["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "reason must be non-empty: {json}"
+    );
+    assert!(
+        !stdout.contains("warning:"),
+        "WARN 必须走 stderr，不得混入 stdout JSON: {stdout}"
+    );
+    assert!(
+        stderr.contains("readRoots") && stderr.contains("preserved"),
+        "stderr must warn that readRoots is preserved/ignored; stderr={stderr}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "A+：project readRoots 不得写盘、不得删旧键"
+    );
+}
+
+#[test]
+fn set_read_roots_project_without_json_warns_on_stderr_253() {
+    // 非 --json 形态同样必须在 stderr 告警（若 eprintln 被移进 json 分支，本用例必红）。
+    let dir = tempdir().unwrap();
+    let path = project_settings(dir.path());
+    fs::write(&path, r#"{"readRoots":["/old"],"keep":1}"#).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let output = run_set_plain(dir.path(), "readRoots", "[\"/x\"]", "project");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("ignored"), "stdout={stdout}");
     assert!(
         stderr.contains("readRoots") && stderr.contains("preserved"),
         "stderr must warn that readRoots is preserved/ignored; stderr={stderr}"
@@ -111,6 +161,8 @@ fn set_read_roots_project_json_warns_on_stderr_and_keeps_file_253() {
 
 #[test]
 fn set_same_value_is_noop_and_does_not_touch_file() {
+    let dir = tempdir().unwrap();
+    let path = project_settings(dir.path());
     let dir = tempdir().unwrap();
     let path = project_settings(dir.path());
     fs::write(&path, r#"{"maxConcurrency":7,"keepUnknown":{"k":1}}"#).unwrap();
