@@ -121,6 +121,9 @@ async fn mount<S: Session>(comp: &Computer<S>, srv: &ResolvedMcpServer) {
 /// flag 层，喂 [`resolved_settings_with_errors`]）；`flag_mcp_config` = `--mcp-config`（mcp.json flag 层，**次高**，
 /// 喂 [`resolve_mcp_config`]）。#137：后者接线到位——flag 层受信（`is_trusted_origin`）⇒ 门判 Enabled 直挂、
 /// 覆盖 user/project/local 同 `bundle_id`，本次运行**不落盘**；文件 `inputs` 段亦经该解析入池（替代旧 `--inputs`）。
+/// #248 复审：两个 flag 路径 **MUST** 取 `Computer` 的归一访问器（`normalized_flag_settings_path` /
+/// `normalized_mcp_flag_config`；失败传 `None`），不得传原始 `--settings` / `--mcp-config` 串——相对串按
+/// cwd 解析，仓库可植入 `<cwd>/~alice/...` 冒充受信 flag（受信 ⇒ 免批准直挂）。
 pub async fn run_mcp_approval<S: Session>(
     comp: &Computer<S>,
     approve_all: bool,
