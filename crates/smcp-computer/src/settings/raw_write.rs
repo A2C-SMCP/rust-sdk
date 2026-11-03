@@ -399,7 +399,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = path_of(&tmp);
         write(&path, r#"{"readRoots":["/x"],"keep":1}"#);
-        let before = std::fs::read(&path).unwrap();
         let before_mtime = mtime(&path);
         let outcome = update_raw_settings(&path, true, |map| {
             map.insert("newKey".to_string(), json!(2));

@@ -652,6 +652,9 @@ async fn delay_oauth_discovery(state: &OAuthMockState) {
     }
 }
 
+// `Atomic::fetch_update` 在 rustc 1.99 起被 renamed 为 `try_update` 并标记 deprecated，但后者要求
+// 更新的工具链；本项目 MSRV 1.86，故本测试局部 `allow` 保持兼容（升 MSRV 时再改 `try_update`）。
+#[allow(deprecated)]
 async fn oauth_http_mock_handler(
     req: Request<hyper::body::Incoming>,
     state: Arc<OAuthMockState>,

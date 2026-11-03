@@ -395,7 +395,7 @@ async fn fixed_rejection_set_skillenv_and_landing_part() {
     let part = landing.join("upload.part");
     fs::write(&part, b"partial").unwrap();
 
-    ctx.set_read_roots_and_landing(&[&ctx.tmp.path().to_path_buf()], &landing);
+    ctx.set_read_roots_and_landing(&[ctx.tmp.path()], &landing);
     let computer = ctx.computer();
 
     let error = computer
