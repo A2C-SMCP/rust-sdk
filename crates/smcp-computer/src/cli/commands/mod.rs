@@ -353,6 +353,9 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
 ///   `run_governance_remount(flag_config=...)`）：`--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效；
 ///   同一份 `declared` 既建归属索引又驱动重挂 → `roots` 键与迭代集对齐；
 /// - 单 server 失败不阻断；marketplace 降级仅 WARN；整体**非阻塞**（与 `a2c-computer run` 启动隔离策略一致）。
+/// - #248 复审：`flag_path` **MUST** 是 `Computer::normalized_flag_settings_path()` 的返回值（归一失败传
+///   `None`）；不得传原始 `--settings` 串——相对串会按调用方 cwd 解析，仓库可植入 `<cwd>/~alice/...`
+///   冒充受信 flag 层（该路径参与治理重挂的信任判定）。
 ///
 /// [`Computer::reconcile_governance`]: crate::computer::Computer::reconcile_governance
 pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: Option<&Path>) {

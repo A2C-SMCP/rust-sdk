@@ -562,8 +562,15 @@ pub struct Computer<S: Session> {
     /// 协议 §2.5-5 要求 origin 集「可从当次 boot 的声明式输入重建」——Computer 即该 boot 对象，故 flag 与 embed
     /// 同住于此，经 [`non_plugin_declared_bundle_ids`](Self::non_plugin_declared_bundle_ids) 一并投影。
     /// **回收判据 MUST 含本层**：漏传会让经 `--mcp-config` 声明的用户 server 退回「非用户声明」而被连坐停摘
-    /// （#153 遗留缺口形状）。镜像 python `Computer(mcp_flag_config=)`。
+    /// （#153 遗留缺口形状）。镜像 python `Computer(mcp_flag_config=)`。构造期归一失败时置 `None`
+    /// （fail-closed），原因见 [`Self::mcp_flag_config_error`]。
     mcp_flag_config: Option<PathBuf>,
+    /// #248 复审：`with_mcp_flag_config` 归一失败的原因（`Some` = flag 层 mcp.json 已 fail-closed 置空）。
+    ///
+    /// `--mcp-config` 的 flag origin 受信（可免批准直挂 stdio server）；归一失败若回退原始 `~...` 串，
+    /// 被 clone 的仓库可植入 `<cwd>/~alice/mcp.json` 冒充受信 flag。CLI 启动边界经
+    /// [`Self::mcp_flag_config_error`] `eprintln!`。
+    mcp_flag_config_error: Option<String>,
     /// #248：`--settings <file>` 的 **flag 层** settings.json 路径（`Computer` 运行期解析 `readRoots` /
     /// `landingRoot` 的 flag 作用域来源；与 `mcp_flag_config` 组成 flag scope 文件对，协议 §2.5-3）。
     ///
@@ -1009,6 +1016,7 @@ impl<S: Session> Computer<S> {
             mcp_input_resolve_lock: Arc::new(Mutex::new(())),
             embed_servers,
             mcp_flag_config: None,
+            mcp_flag_config_error: None,
             flag_settings_path: None,
             flag_settings_path_error: None,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
@@ -1194,10 +1202,43 @@ impl<S: Session> Computer<S> {
     /// 与 `Computer::new(mcp_servers=…)`（embed 层）同属**当次 boot 的声明式输入**（§2.5-5）：二者共同构成
     /// 回收判据的「非用户声明」数据源。CLI `--mcp-config` 与嵌入宿主均应注入，否则该层声明的用户 server 会在
     /// plugin uninstall/disable/gc 时被**连坐**停摘。镜像 python `Computer(mcp_flag_config=)`。
+    ///
+    /// **构造期归一 + fail-closed**（#248 复审）：与 `--settings` 同款（`~` 展开 / 绝对化；失败置 `None`
+    /// 并记录 [`mcp_flag_config_error`](Self::mcp_flag_config_error)）——`--mcp-config` 的 flag origin 受信、
+    /// 可免批准直挂 server，回读原始相对串会允许仓库植入 `<cwd>/~alice/mcp.json` 提权。信任层消费者
+    /// MUST 用 [`normalized_mcp_flag_config`](Self::normalized_mcp_flag_config)。路径含 `~` 且需注入 env 时，
+    /// 请先 [`with_config_env`](Self::with_config_env) 再调用本方法。
     #[must_use]
     pub fn with_mcp_flag_config(mut self, path: impl Into<PathBuf>) -> Self {
-        self.mcp_flag_config = Some(path.into());
+        let raw = path.into();
+        match normalize_flag_path(&raw, self.config_env()) {
+            Ok(normalized) => {
+                self.mcp_flag_config = Some(normalized);
+                self.mcp_flag_config_error = None;
+            }
+            Err(reason) => {
+                let message = format!(
+                    "⚠ mcp config path {} is unusable ({reason}); flag MCP layer disabled (fail-closed)",
+                    raw.display()
+                );
+                error!("{message}");
+                self.mcp_flag_config = None;
+                self.mcp_flag_config_error = Some(message);
+            }
+        }
         self
+    }
+
+    /// #248 复审：`with_mcp_flag_config` 的归一失败诊断（`Some` = flag 层 mcp.json 已 fail-closed 置空）。
+    pub fn mcp_flag_config_error(&self) -> Option<&str> {
+        self.mcp_flag_config_error.as_deref()
+    }
+
+    /// #248 复审：归一后的 `--mcp-config` 绝对路径（`None` = 无 flag 层或归一失败）。
+    ///
+    /// 信任层消费者（启动批准框的 `resolve_mcp_config`）必须用它，不得回读原始串。
+    pub fn normalized_mcp_flag_config(&self) -> Option<&Path> {
+        self.mcp_flag_config.as_deref()
     }
 
     /// #248：注入 `--settings <file>` 的 flag 层 settings.json 路径（运行期 `readRoots` / `landingRoot`
@@ -1213,7 +1254,7 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_flag_settings_path(mut self, path: impl Into<PathBuf>) -> Self {
         let raw = path.into();
-        match normalize_flag_settings_path(&raw, self.config_env()) {
+        match normalize_flag_path(&raw, self.config_env()) {
             Ok(normalized) => {
                 self.flag_settings_path = Some(normalized);
                 self.flag_settings_path_error = None;
@@ -1236,6 +1277,15 @@ impl<S: Session> Computer<S> {
     /// CLI 在启动边界把它打到 stderr；库宿主可自行呈现。成功后恒 `None`。
     pub fn flag_settings_path_error(&self) -> Option<&str> {
         self.flag_settings_path_error.as_deref()
+    }
+
+    /// #248 复审：归一后的 flag settings 绝对路径（`None` = 无 flag 层或归一失败）。
+    ///
+    /// **信任层消费者必须用它，不得回读原始 `--settings` 串**：原始相对串（如 `~alice/x.json`）
+    /// 会按进程 cwd 解析，仓库可植入 `<cwd>/~alice/...` 冒充受信 flag 层；归一失败时这里恒
+    /// `None`，调用方须按「无 flag 层」处理。CLI 的治理重挂与启动批准框即经此取值。
+    pub fn normalized_flag_settings_path(&self) -> Option<&Path> {
+        self.flag_settings_path.as_deref()
     }
 
     /// #214：安装 Computer 级 MCP **最大并发启动数**（构造期策略，`0` 按 `1` 处理）。
@@ -4836,6 +4886,7 @@ impl<S: Session> Computer<S> {
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
             mcp_flag_config: self.mcp_flag_config.clone(),
+            mcp_flag_config_error: self.mcp_flag_config_error.clone(),
             // #248：flag settings 路径是运行期 readRoots / landingRoot 的 flag 作用域来源——handler 克隆
             // 漏保留会让 wire 路径（client:resolve_path / get_blob）退回 flag-blind（直连生效、wire 不生效）。
             flag_settings_path: self.flag_settings_path.clone(),
@@ -5191,6 +5242,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
             mcp_flag_config: self.mcp_flag_config.clone(),
+            mcp_flag_config_error: self.mcp_flag_config_error.clone(),
             // #248：公开 Clone 同样是 handler/宿主持有的 Computer 句柄——flag settings 路径 MUST 保留，
             // 否则 clone 出的实例运行期退回 flag-blind（与 clone_for_handlers 同一条不变量）。
             flag_settings_path: self.flag_settings_path.clone(),
@@ -5370,32 +5422,36 @@ fn resolve_landing_root_settings(
     Some(crate::skills::home::expand_home(raw.trim(), env))
 }
 
-/// 构造期归一 flag settings 路径：成功 → 绝对路径；失败 → 原因（调用方 fail-closed 置 `None`）。
+/// 构造期归一 **flag 层文件路径**（`--settings` / `--mcp-config`）：成功 → 绝对路径；失败 → 原因
+/// （调用方 fail-closed 置 `None`）。
 ///
 /// 规则：
 /// - 空路径 → 失败；非 UTF-8 → 无 `~` 语义，直接绝对化（失败则报错）。
-/// - 前导 `~` / `~/...`：用注入 env 的 `HOME`（空白视同未设置），其次进程 `HOME`；两者皆无 → 失败
-///   （**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的路径会被当成受信 flag 层）。
-/// - `~user`（前导 `~` 但不是 `~` / `~/`）：rust 无 NSS expanduser → 显式失败，不静默锚到 `<cwd>/~user`。
+/// - 前导 `~` / `~/...` / `~\...`（Windows 写法，对齐 python `expanduser`）：用注入 env 的 `HOME`
+///   （空白视同未设置），其次进程 `HOME`；**仅 Windows** 再退 `USERPROFILE`（POSIX 不读，对齐
+///   python）；全部为空 → 失败（**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的
+///   路径会被当成受信 flag 层）。
+/// - `~user`（前导 `~` 但不是 `~` / `~/` / `~\`）：rust 无 NSS expanduser → 显式失败，不静默锚到
+///   `<cwd>/~user`。
 /// - 其它（含中段 `~` 的合法相对路径，如 `conf/~/flag.json`）：中段 `~` 只是普通字符，按构造期 cwd
 ///   绝对化。
 ///
 /// 对齐 python `Computer._absolute_path`：flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集
 /// 条目与合并视图必须始终指向**同一文件**；相对路径在宿主 `chdir` 后会漂移。`std::path::absolute`
 /// 不访问文件系统、不跟随符号链接；读取期由 canonicalize / dev+ino 身份兜底，安全语义不受影响。
-fn normalize_flag_settings_path(
+pub(crate) fn normalize_flag_path(
     path: &Path,
     env: Option<&EnvMap>,
 ) -> Result<PathBuf, &'static str> {
-    normalize_flag_settings_path_with(
+    normalize_flag_path_with(
         path,
         home_lookup(env).as_deref(),
         home_lookup(None).as_deref(),
     )
 }
 
-/// [`normalize_flag_settings_path`] 的纯逻辑体（HOME 显式注入，覆盖无/空 HOME 三分支测试）。
-fn normalize_flag_settings_path_with(
+/// [`normalize_flag_path`] 的纯逻辑体（HOME 显式注入，覆盖无/空 HOME 三分支测试）。
+fn normalize_flag_path_with(
     path: &Path,
     injected_home: Option<&str>,
     process_home: Option<&str>,
@@ -5407,15 +5463,19 @@ fn normalize_flag_settings_path_with(
     if raw.trim().is_empty() {
         return Err("empty path");
     }
-    let expanded = if raw == "~" || raw.starts_with("~/") {
+    let expanded = if raw == "~" {
+        PathBuf::from(
+            non_empty(injected_home)
+                .or_else(|| non_empty(process_home))
+                .ok_or("`~` cannot be expanded: HOME/USERPROFILE is unset or empty")?,
+        )
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        // Windows 客户端常见 `~\flag.json`（python `expanduser` 同样识别）；POSIX 下 `~/` 为主，
+        // `~\` 统一按 `~` 展开（跨端一致，不当作字面文件名）。
         let home = non_empty(injected_home)
             .or_else(|| non_empty(process_home))
-            .ok_or("`~` cannot be expanded: HOME is unset or empty")?;
-        if raw == "~" {
-            PathBuf::from(home)
-        } else {
-            Path::new(home).join(raw.strip_prefix("~/").unwrap_or_default())
-        }
+            .ok_or("`~` cannot be expanded: HOME/USERPROFILE is unset or empty")?;
+        Path::new(home).join(rest.trim_start_matches(['/', '\\']))
     } else if raw.starts_with('~') {
         return Err("`~user` form is not supported; use an absolute path or `~/...`");
     } else {
@@ -5425,14 +5485,32 @@ fn normalize_flag_settings_path_with(
     std::path::absolute(&expanded).map_err(|_| "path cannot be absolutized")
 }
 
-/// 取非空 HOME（空白视同未设置）/ a non-blank HOME lookup.
+/// 取非空 HOME（空白视同未设置）；Windows 下 `USERPROFILE` 优先（对齐 python `ntpath.expanduser`）。
 fn home_lookup(env: Option<&EnvMap>) -> Option<String> {
-    let raw = match env {
-        Some(map) => map.get("HOME").cloned(),
-        None => std::env::var("HOME").ok(),
-    }?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    home_lookup_with(env, cfg!(windows))
+}
+
+/// [`home_lookup`] 的平台可注入体。
+///
+/// Windows：**`USERPROFILE` 优先**，`HOME` 次之（对齐 python `ntpath.expanduser`）；POSIX：只读
+/// `HOME`（不读 `USERPROFILE`，对齐 python posixpath）。
+fn home_lookup_with(env: Option<&EnvMap>, windows: bool) -> Option<String> {
+    let lookup = |name: &str| match env {
+        Some(map) => map.get(name).cloned(),
+        None => std::env::var(name).ok(),
+    };
+    if windows {
+        non_blank(lookup("USERPROFILE")).or_else(|| non_blank(lookup("HOME")))
+    } else {
+        non_blank(lookup("HOME"))
+    }
+}
+
+/// 字符串值去空白后非空才算可用 / trim and treat blank as unset.
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_string())
+        .filter(|trimmed| !trimmed.is_empty())
 }
 
 /// `HOME` 值非空白才算可用 / treat blank HOME as unset.
@@ -11825,20 +11903,17 @@ mod tests {
     /// #248 复审 🔴：`~` 兜底三分支——无/空 HOME 与 `~user` 均 fail-closed（不退回相对串 /
     /// `<cwd>/~/...`），中段 `~` 的合法相对路径照常绝对化。
     #[test]
-    fn normalize_flag_settings_path_tilde_branches_fail_closed() {
+    fn normalize_flag_path_tilde_branches_fail_closed() {
         // 空路径 / 无 HOME / 空 HOME：不得退回相对串或 <cwd>/~/...
-        assert!(normalize_flag_settings_path_with(Path::new(""), None, None).is_err());
-        assert!(normalize_flag_settings_path_with(Path::new("~/flag.json"), None, None).is_err());
-        assert!(
-            normalize_flag_settings_path_with(Path::new("~/flag.json"), Some(""), Some("  "))
-                .is_err()
-        );
+        assert!(normalize_flag_path_with(Path::new(""), None, None).is_err());
+        assert!(normalize_flag_path_with(Path::new("~/flag.json"), None, None).is_err());
+        assert!(normalize_flag_path_with(Path::new("~/flag.json"), Some(""), Some("  ")).is_err());
         // 注入 HOME 优先；注入 HOME 空白时退回进程 HOME。
         let tmp = tempfile::TempDir::new().unwrap();
         let injected = tmp.path().join("injected");
         let process = tmp.path().join("process");
         assert_eq!(
-            normalize_flag_settings_path_with(
+            normalize_flag_path_with(
                 Path::new("~/flag.json"),
                 injected.to_str(),
                 process.to_str()
@@ -11847,28 +11922,70 @@ mod tests {
             injected.join("flag.json")
         );
         assert_eq!(
-            normalize_flag_settings_path_with(
-                Path::new("~/flag.json"),
-                Some("   "),
+            normalize_flag_path_with(Path::new("~/flag.json"), Some("   "), process.to_str())
+                .unwrap(),
+            process.join("flag.json")
+        );
+        // Windows 写法 `~\flag.json`：同样按 `~` 展开（对齐 python expanduser）。
+        assert_eq!(
+            normalize_flag_path_with(
+                Path::new("~\\flag.json"),
+                injected.to_str(),
                 process.to_str()
             )
             .unwrap(),
-            process.join("flag.json")
+            injected.join("flag.json")
         );
         // `~user`：显式失败，不得静默锚到 <cwd>/~user。
-        assert!(normalize_flag_settings_path_with(
+        assert!(normalize_flag_path_with(
             Path::new("~alice/flag.json"),
             Some("/home/a"),
             Some("/home/a")
         )
         .is_err());
         // 中段 `~` 是普通字符：合法相对路径照常绝对化。
-        let middle = normalize_flag_settings_path_with(Path::new("conf/~/flag.json"), None, None)
+        let middle = normalize_flag_path_with(Path::new("conf/~/flag.json"), None, None)
             .expect("middle ~ must not be treated as tilde expansion");
         assert!(middle.is_absolute(), "{middle:?}");
         assert!(
             middle.ends_with(Path::new("conf/~/flag.json")),
             "{middle:?}"
+        );
+    }
+
+    /// #248 复审：`HOME` 缺失/空白时退 `USERPROFILE`（Windows，对齐 python expanduser）。
+    #[test]
+    fn home_lookup_falls_back_to_userprofile_on_windows_only() {
+        let mut env = EnvMap::new();
+        env.insert("USERPROFILE".to_string(), r"C:\Users\alice".to_string());
+        // POSIX 不读 USERPROFILE（对齐 python expanduser）；Windows 才兜底。
+        assert_eq!(home_lookup_with(Some(&env), false), None);
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some(r"C:\Users\alice"),
+            "Windows 下 HOME 缺失时须用 USERPROFILE"
+        );
+        env.insert("HOME".to_string(), "   ".to_string());
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some(r"C:\Users\alice"),
+            "HOME 空白视同未设置"
+        );
+        env.insert("HOME".to_string(), "/home/alice".to_string());
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some(r"C:\Users\alice"),
+            "Windows 下 USERPROFILE 优先（对齐 python ntpath）"
+        );
+        assert_eq!(
+            home_lookup_with(Some(&env), false).as_deref(),
+            Some("/home/alice"),
+            "POSIX 只读 HOME"
+        );
+        env.remove("USERPROFILE");
+        assert_eq!(
+            home_lookup_with(Some(&env), false).as_deref(),
+            Some("/home/alice")
         );
     }
 
