@@ -1540,27 +1540,40 @@ mod tests {
         port: u16,
         active: Arc<AtomicUsize>,
         connections: Arc<StdMutex<Vec<TestSseSender>>>,
+        /// 所有 POST /messages 的 JSON-RPC method 序列（#254 复审：断言 disconnect 的实际投递）。
+        post_methods: Arc<StdMutex<Vec<String>>>,
     }
 
     impl TestSseMock {
         async fn spawn(initialize_status: StatusCode) -> Self {
-            Self::spawn_with(initialize_status, true).await
+            Self::spawn_with(initialize_status, true, false).await
         }
 
         /// GET /sse 建立连接但**不发 endpoint 事件**——用于 endpoint 超时清理测试。
         async fn spawn_silent() -> Self {
-            Self::spawn_with(StatusCode::OK, false).await
+            Self::spawn_with(StatusCode::OK, false, false).await
         }
 
-        async fn spawn_with(initialize_status: StatusCode, send_endpoint: bool) -> Self {
+        /// shutdown/exit 的 POST 永不响应——用于 disconnect 的 1s 上限测试。
+        async fn spawn_with_hanging_lifecycle() -> Self {
+            Self::spawn_with(StatusCode::OK, true, true).await
+        }
+
+        async fn spawn_with(
+            initialize_status: StatusCode,
+            send_endpoint: bool,
+            hang_lifecycle: bool,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let active = Arc::new(AtomicUsize::new(0));
             let connections: Arc<StdMutex<Vec<TestSseSender>>> =
                 Arc::new(StdMutex::new(Vec::new()));
+            let post_methods: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
 
             let active_for_server = active.clone();
             let connections_for_server = connections.clone();
+            let post_methods_for_server = post_methods.clone();
             tokio::spawn(async move {
                 loop {
                     let (stream, _) = match listener.accept().await {
@@ -1570,17 +1583,21 @@ mod tests {
                     let io = TokioIo::new(stream);
                     let active = active_for_server.clone();
                     let connections = connections_for_server.clone();
+                    let post_methods = post_methods_for_server.clone();
                     tokio::spawn(async move {
                         let service = service_fn(move |req| {
                             let active = active.clone();
                             let connections = connections.clone();
+                            let post_methods = post_methods.clone();
                             async move {
                                 sse_test_handler(
                                     req,
                                     active,
                                     connections,
+                                    post_methods,
                                     initialize_status,
                                     send_endpoint,
+                                    hang_lifecycle,
                                 )
                                 .await
                             }
@@ -1596,7 +1613,15 @@ mod tests {
                 port,
                 active,
                 connections,
+                post_methods,
             }
+        }
+
+        fn post_methods(&self) -> Vec<String> {
+            self.post_methods
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         fn sse_url(&self) -> String {
@@ -1632,8 +1657,10 @@ mod tests {
         req: Request<hyper::body::Incoming>,
         active: Arc<AtomicUsize>,
         connections: Arc<StdMutex<Vec<TestSseSender>>>,
+        post_methods: Arc<StdMutex<Vec<String>>>,
         initialize_status: StatusCode,
         send_endpoint: bool,
+        hang_lifecycle: bool,
     ) -> Result<Response<TestSseBody>, Infallible> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -1666,6 +1693,15 @@ mod tests {
                 serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({}));
             let rpc_method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
             let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+            post_methods
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(rpc_method.to_string());
+
+            if hang_lifecycle && matches!(rpc_method, "shutdown" | "exit") {
+                // 永不响应：覆盖 disconnect 直接 POST 的 1s 上限（旧 30s send_request 会超 5s 外层断言）。
+                std::future::pending::<()>().await;
+            }
 
             if rpc_method.starts_with("notifications/") {
                 return Ok(Response::builder()
@@ -1876,6 +1912,162 @@ mod tests {
             "teardown must clear the resource cache"
         );
         assert_eq!(client.resource_cache.size().await, 0);
+    }
+
+    #[test]
+    fn sse_stream_select_must_not_use_biased_polling() {
+        // #254 复审回归：`select!` 若恢复 `biased`（cancel→stream→request），高频流下 request_rx
+        // 会被饿死（工具调用排到 30s 超时）。真实 HTTP 栈的 chunk 间隙使行为级复现不稳定，
+        // 这里以源码为锚做确定性守卫；行为级用例见 continuous_stream_traffic_does_not_starve_tool_requests。
+        let source = include_str!("sse_client.rs");
+        // 排除 `#[cfg(test)]` 之后的测试自身（本文件测试代码含 "biased" 字面量）。
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+        let select_offsets: Vec<usize> = production
+            .match_indices("tokio::select! {")
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(
+            select_offsets.len(),
+            1,
+            "expected exactly one production `tokio::select!` in sse_client.rs"
+        );
+        let select_at = select_offsets[0];
+        // 按 chars 截取，避免多字节 UTF-8 边界 panic（注释含中文）。
+        let head: String = production
+            .get(select_at..)
+            .expect("select offset must be a char boundary")
+            .chars()
+            .take(160)
+            .collect();
+        assert!(
+            !head.contains("biased"),
+            "SSE stream select! must not use `biased`: it can starve request_rx"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_stream_traffic_does_not_starve_tool_requests() {
+        // #254 复审测试缺口：SSE 流持续就绪时 request_rx 不得被饿死。
+        // 多线程运行时 + 独立泵任务持续灌 `notifications/resources/updated`（处理含 await），
+        // 复现生产下「stream 分支始终就绪」；若 `select!` 加回 `biased`（cancel→stream→request），
+        // list_tools 会排到 30s 响应超时。预灌一段突发确保 request 入队瞬间流非空。
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        let pump_tx = mock.connections.lock().unwrap()[0].clone();
+        let event = format!(
+            "event: message\ndata: {}\n\n",
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": { "uri": "window://mock/1", "data": { "v": 1 } }
+            }))
+            .unwrap()
+        );
+        // 每个 body 帧打包多个 SSE 事件：解析器一次读入后会连续 Ready，逼近生产的「流持续就绪」。
+        let big_frame = event.repeat(500);
+        // 预置缓存初值：`refresh` 只更新既有条目，用它观测「首个 resources/updated 已被消费」。
+        client
+            .resource_cache
+            .set(
+                "window://mock/1".to_string(),
+                serde_json::json!({ "v": 0 }),
+                None,
+            )
+            .await;
+        for _ in 0..64 {
+            let _ = pump_tx.send(Ok(Frame::data(Bytes::from(big_frame.clone()))));
+        }
+        let pump = tokio::spawn(async move {
+            loop {
+                if pump_tx
+                    .send(Ok(Frame::data(Bytes::from(big_frame.clone()))))
+                    .is_err()
+                {
+                    break;
+                }
+                // 节流：`yield_now` 紧循环会让生产端比消费端快两个数量级，biased 回归时 3s 窗口
+                // 可积压数百 MB 触发 OOM/SIGKILL；1ms/帧约 75MB/s，足以让 stream 分支持续就绪。
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        // 等到流**真正热起来**（首个 resources/updated 已刷新缓存）再发请求，确保 request 入队时
+        // stream 分支已持续就绪——否则请求可能赶在首帧到达前被服务，测不出饥饿。
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_cached_resource("window://mock/1").await
+                    == Some(serde_json::json!({ "v": 1 }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the stream pump did not feed the client");
+
+        let tools = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
+            .await
+            .expect("tool request must not be starved by continuous stream traffic")
+            .expect("list_tools failed");
+        assert!(tools.is_empty());
+
+        pump.abort();
+        client.disconnect().await.expect("disconnect failed");
+    }
+
+    #[tokio::test]
+    async fn disconnect_posts_shutdown_then_exit() {
+        // #254 复审测试缺口：disconnect 必须**实际发出** shutdown、exit 两个 POST（直接投递）。
+        // 若回退为「入队后立即 cancel」，队列消息可能未消费即被取消，该序列断言会失败。
+        let mock = TestSseMock::spawn(StatusCode::OK).await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        client.disconnect().await.expect("disconnect failed");
+        // `notifications/initialized` 是 connect 期间发出的通知 POST，可能晚于 disconnect 落达；
+        // 这里只核对**请求**序列（initialize 之后的 lifecycle 消息必须实际投递）。
+        let lifecycle: Vec<String> = mock
+            .post_methods()
+            .into_iter()
+            .filter(|method| !method.starts_with("notifications/"))
+            .collect();
+        assert_eq!(
+            lifecycle,
+            vec![
+                "initialize".to_string(),
+                "shutdown".to_string(),
+                "exit".to_string()
+            ],
+            "disconnect must POST shutdown then exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_is_bounded_when_lifecycle_posts_hang() {
+        // #254 复审：shutdown/exit 直接 POST 各带 1s 上限——挂起的 server 不得把 disconnect 拖成
+        // 30s×2（旧 `send_request(...).await` 会超过下面的 5s 外层断言）。
+        let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+            .await
+            .expect("disconnect must be bounded when lifecycle POSTs hang")
+            .expect("disconnect failed");
     }
 
     #[tokio::test]
