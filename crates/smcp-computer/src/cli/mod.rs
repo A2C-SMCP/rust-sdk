@@ -553,7 +553,21 @@ fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
     // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
     let cwd = std::env::current_dir().ok();
     let cwd = cwd.as_deref();
-    let flag = root.flag_path.as_deref();
+    // #248 复审：一次性 settings 子命令与运行期同口径——flag 路径先归一；失败 = 无 flag 层
+    // （fail-closed + stderr 诊断），不得回读原始 `~...` 串（仓库可植入 `<cwd>/~alice/...`）。
+    let flag_normalized = root.flag_path.as_deref().and_then(|raw| {
+        match crate::computer::normalize_flag_path(raw, None) {
+            Ok(path) => Some(path),
+            Err(reason) => {
+                eprintln!(
+                    "⚠ settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
+                    raw.display()
+                );
+                None
+            }
+        }
+    });
+    let flag = flag_normalized.as_deref();
     match action {
         SettingsCmd::Show { scope, json } => {
             settings_show(None, scope.as_deref().unwrap_or("merged"), cwd, flag, json)
@@ -706,8 +720,9 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) ->
     )
     .await;
 
-    // 进入交互模式。
-    if let Err(e) = interactive::run_interactive_loop(handler, root.flag_path.clone()).await {
+    // 进入交互模式。#248 复审：REPL 内 `settings show/get --scope flag` 同样只认归一后的路径——
+    // 归一路径在 move handler 前取（与批准框同一份），否则会回读 `<cwd>/~/...` 的仓库植入文件。
+    if let Err(e) = interactive::run_interactive_loop(handler, flag_settings_path.clone()).await {
         eprintln!("交互模式错误: {e}");
     }
     commands::EXIT_OK
@@ -1083,11 +1098,13 @@ mod tests {
             "控制组：植入 settings 必须是有效信任载荷"
         );
         use crate::settings::mcp_config::{resolve_mcp_config, ResolveMcpConfigArgs};
+        // policy / managed-mcp 无 env 接缝：managed 指向 tempdir 内路径（不读宿主），断言只看 Flag 层。
+        let managed = tmp.path().join("managed-mcp.json");
         let control_mcp = resolve_mcp_config(ResolveMcpConfigArgs {
             cwd: Some(tmp.path()),
             env: Some(&resolve_env),
             flag_config_path: Some(planted_mcp.as_path()),
-            managed_mcp_path: None,
+            managed_mcp_path: Some(managed.as_path()),
             platform: None,
             embed_servers: &[],
         });
@@ -1123,23 +1140,27 @@ mod tests {
             "`--mcp-config` 信任层不得拿到原始串/相对路径"
         );
         let effective = commands::resolved_settings_with_errors(
-            None,
+            Some(tmp.path()),
             Some(&resolve_env),
             trust_path.as_deref(),
         );
+        // policy 无 env 接缝：只看 Flag 层（merged 可能含宿主 policy），不看 merged。
+        let flag_layer = effective
+            .scope_layers
+            .iter()
+            .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
+            .map(|(_, layer)| layer)
+            .expect("five-layer view always contains Flag");
         assert!(
-            effective
-                .settings
-                .get("enableAllProjectMcpServers")
-                .is_none(),
-            "植入的权重键不得进入信任视图：{:?}",
-            effective.settings.get("enableAllProjectMcpServers")
+            flag_layer.get("enableAllProjectMcpServers").is_none(),
+            "植入的权重键不得进入 Flag 层信任视图：{:?}",
+            flag_layer.get("enableAllProjectMcpServers")
         );
         let effective_mcp = resolve_mcp_config(ResolveMcpConfigArgs {
             cwd: Some(tmp.path()),
             env: Some(&resolve_env),
             flag_config_path: computer.normalized_mcp_flag_config(),
-            managed_mcp_path: None,
+            managed_mcp_path: Some(managed.as_path()),
             platform: None,
             embed_servers: &[],
         });
@@ -1148,5 +1169,23 @@ mod tests {
             "植入的 mcp.json 不得进入信任解析：{:?}",
             effective_mcp.servers.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// #248 复审 🟡B：`--mcp-config` 成功路径也必须在构造期归一——信任层拿到的是绝对路径；
+    /// 若回退为原样存储（相对串），本用例即红。
+    #[test]
+    fn build_run_computer_normalizes_mcp_flag_config_success_path() {
+        let args = Args::parse_from(["smcp-computer", "run"]);
+        let root = RootState::default();
+        let computer = build_run_computer(&args, &root, Some(Path::new("flag-mcp.json")), None);
+        let stored = computer
+            .normalized_mcp_flag_config()
+            .expect("成功路径须归一存储");
+        assert!(
+            stored.is_absolute(),
+            "`--mcp-config` 必须绝对化：{stored:?}"
+        );
+        assert_eq!(stored, std::path::absolute("flag-mcp.json").unwrap());
+        assert!(computer.mcp_flag_config_error().is_none());
     }
 }

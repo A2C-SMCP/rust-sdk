@@ -1202,6 +1202,12 @@ impl<S: Session> Computer<S> {
     /// 与 `Computer::new(mcp_servers=…)`（embed 层）同属**当次 boot 的声明式输入**（§2.5-5）：二者共同构成
     /// 回收判据的「非用户声明」数据源。CLI `--mcp-config` 与嵌入宿主均应注入，否则该层声明的用户 server 会在
     /// plugin uninstall/disable/gc 时被**连坐**停摘。镜像 python `Computer(mcp_flag_config=)`。
+    ///
+    /// **构造期归一 + fail-closed**（#248 复审）：与 `--settings` 同款（`~` 展开 / 绝对化；失败置 `None`
+    /// 并记录 [`mcp_flag_config_error`](Self::mcp_flag_config_error)）——`--mcp-config` 的 flag origin 受信、
+    /// 可免批准直挂 server，回读原始相对串会允许仓库植入 `<cwd>/~alice/mcp.json` 提权。信任层消费者
+    /// MUST 用 [`normalized_mcp_flag_config`](Self::normalized_mcp_flag_config)。路径含 `~` 且需注入 env 时，
+    /// 请先 [`with_config_env`](Self::with_config_env) 再调用本方法。
     #[must_use]
     pub fn with_mcp_flag_config(mut self, path: impl Into<PathBuf>) -> Self {
         let raw = path.into();
@@ -5433,7 +5439,10 @@ fn resolve_landing_root_settings(
 /// 对齐 python `Computer._absolute_path`：flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集
 /// 条目与合并视图必须始终指向**同一文件**；相对路径在宿主 `chdir` 后会漂移。`std::path::absolute`
 /// 不访问文件系统、不跟随符号链接；读取期由 canonicalize / dev+ino 身份兜底，安全语义不受影响。
-fn normalize_flag_path(path: &Path, env: Option<&EnvMap>) -> Result<PathBuf, &'static str> {
+pub(crate) fn normalize_flag_path(
+    path: &Path,
+    env: Option<&EnvMap>,
+) -> Result<PathBuf, &'static str> {
     normalize_flag_path_with(
         path,
         home_lookup(env).as_deref(),
@@ -5476,24 +5485,25 @@ fn normalize_flag_path_with(
     std::path::absolute(&expanded).map_err(|_| "path cannot be absolutized")
 }
 
-/// 取非空 HOME（空白视同未设置）；**仅 Windows** 退 `USERPROFILE`（对齐 python `expanduser`）。
+/// 取非空 HOME（空白视同未设置）；Windows 下 `USERPROFILE` 优先（对齐 python `ntpath.expanduser`）。
 fn home_lookup(env: Option<&EnvMap>) -> Option<String> {
     home_lookup_with(env, cfg!(windows))
 }
 
-/// [`home_lookup`] 的平台可注入体（`windows=false` 时不读 `USERPROFILE`，POSIX 语义）。
+/// [`home_lookup`] 的平台可注入体。
+///
+/// Windows：**`USERPROFILE` 优先**，`HOME` 次之（对齐 python `ntpath.expanduser`）；POSIX：只读
+/// `HOME`（不读 `USERPROFILE`，对齐 python posixpath）。
 fn home_lookup_with(env: Option<&EnvMap>, windows: bool) -> Option<String> {
     let lookup = |name: &str| match env {
         Some(map) => map.get(name).cloned(),
         None => std::env::var(name).ok(),
     };
-    non_blank(lookup("HOME")).or_else(|| {
-        if windows {
-            non_blank(lookup("USERPROFILE"))
-        } else {
-            None
-        }
-    })
+    if windows {
+        non_blank(lookup("USERPROFILE")).or_else(|| non_blank(lookup("HOME")))
+    } else {
+        non_blank(lookup("HOME"))
+    }
 }
 
 /// 字符串值去空白后非空才算可用 / trim and treat blank as unset.
@@ -11964,8 +11974,18 @@ mod tests {
         env.insert("HOME".to_string(), "/home/alice".to_string());
         assert_eq!(
             home_lookup_with(Some(&env), true).as_deref(),
+            Some(r"C:\Users\alice"),
+            "Windows 下 USERPROFILE 优先（对齐 python ntpath）"
+        );
+        assert_eq!(
+            home_lookup_with(Some(&env), false).as_deref(),
             Some("/home/alice"),
-            "HOME 优先于 USERPROFILE"
+            "POSIX 只读 HOME"
+        );
+        env.remove("USERPROFILE");
+        assert_eq!(
+            home_lookup_with(Some(&env), false).as_deref(),
+            Some("/home/alice")
         );
     }
 
