@@ -7,6 +7,19 @@
 * 依赖: serde, serde_json, regex
 * 描述: Computer 治理层 settings 模块（意图层 settings.json 结构与字段级容错校验）
 *       Computer governance-layer settings module (intent-layer settings.json schema & validation)
+*
+* ## 写路径约定（#253）
+*
+* 除显式例外——`config::validate::migrate_config`（有意有损规范化）、`config::crud::save_config`
+* （整文档 import/duplicate）与 `settings edit`（外部编辑器直接写文件）——所有 settings 文件写入均经
+* `raw_write::update_raw_settings` 做 strict raw RMW：只改目标键、保留其余字段、corrupt 或目标容器
+* 畸形 fail-closed（拒绝写盘、原文件逐字节不变）。
+*
+* **A+（2026-11-03 用户拍板）**：project scope 的 `readRoots` 写入期**保留 + WARN**，读面
+* trusted-scope-only 拒绝保持不动；不做任何主动删除。
+*
+* `config::executor` 的 corrupt root 已 fail-closed（`CorruptTarget`）；其目标容器畸形校验、统一
+* helper 复用**以及 project `readRoots` 剔除的 A+ 对齐**留 PR-B（v0.5.1）。
 */
 
 pub mod config;
@@ -14,6 +27,7 @@ pub mod installer;
 pub mod lifecycle;
 pub mod mcp_config;
 pub mod policy;
+pub(crate) mod raw_write;
 pub(crate) mod read_roots;
 pub mod reconciler;
 pub mod recovery;

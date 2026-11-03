@@ -36,9 +36,23 @@ use crate::computer::{Computer, Session};
 use crate::mcp_clients::model::MCPServerConfig;
 use crate::settings::mcp_config::{
     approve_all_project_mcp, approve_bundled_plugin, approve_mcp_server, deny_mcp_server,
-    gate_mcp_servers, reject_bundled_plugin, resolve_mcp_config, McpApprovalStatus,
+    gate_mcp_servers, reject_bundled_plugin, resolve_mcp_config, McpApprovalStatus, McpConfigError,
     ResolveMcpConfigArgs, ResolvedMcpServer,
 };
+
+/// #253：把审批写入结果转成用户可见告警（Ok → `None`；Err → 可操作文案）。
+///
+/// 独立纯函数便于单测——`run_mcp_approval` 本身无 cwd/env 注入接缝（见 `mcp_config` 测试注释），
+/// 但「写失败必须提示而非 `let _ =`」的判定逻辑在此锁定。
+fn approval_persist_warning(
+    result: Result<(), McpConfigError>,
+    action: &str,
+    consequence: &str,
+) -> Option<String> {
+    result
+        .err()
+        .map(|e| format!("failed to persist {action} (local scope): {e}; {consequence}"))
+}
 
 /// 合并 resolved server 的 `config`（含占位符）+ `ext`（剥离的 envFile 等）为挂载用 config。
 ///
@@ -162,19 +176,37 @@ pub async fn run_mcp_approval<S: Session>(
                 ));
                 match ans.as_str() {
                     "a" | "all" => {
-                        let _ = approve_all_project_mcp(cwd.as_deref());
+                        // #253：写失败（corrupt/锁/IO）必须显式告知——fail-closed 不改原文件，
+                        // 本次会话仍挂载，但持久化未生效。
+                        if let Some(warning) = approval_persist_warning(
+                            approve_all_project_mcp(cwd.as_deref()),
+                            "approval of enableAllProjectMcpServers",
+                            "mounting for this session only",
+                        ) {
+                            msg_err(&warning);
+                        }
                         approved_all_session = true;
                         mount(comp, srv).await;
                     }
                     "y" | "yes" => {
-                        let _ = approve_mcp_server(name, cwd.as_deref());
+                        if let Some(warning) = approval_persist_warning(
+                            approve_mcp_server(name, cwd.as_deref()),
+                            &format!("approval for MCP server {name:?}"),
+                            "mounting for this session only",
+                        ) {
+                            msg_err(&warning);
+                        }
                         mount(comp, srv).await;
                     }
                     _ => {
-                        let _ = deny_mcp_server(name, cwd.as_deref());
-                        msg_dim(&format!(
-                            "· denied MCP server {name:?} (written to local scope)"
-                        ));
+                        match deny_mcp_server(name, cwd.as_deref()) {
+                            Ok(()) => msg_dim(&format!(
+                                "· denied MCP server {name:?} (written to local scope)"
+                            )),
+                            Err(e) => msg_err(&format!(
+                                "failed to persist denial for MCP server {name:?} (local scope): {e}; skipped for this session only"
+                            )),
+                        }
                     }
                 }
             }
@@ -279,5 +311,26 @@ mod tests {
         };
         // merge 后 config.env_file() 回挂为 ".env"（否则 spawn 静默丢失）。
         assert_eq!(merge_mount_config(&srv).env_file(), Some(".env"));
+    }
+
+    #[test]
+    fn approval_persist_warning_reports_err_and_ignores_ok_253() {
+        assert!(
+            approval_persist_warning(Ok(()), "approval", "mounting for this session only")
+                .is_none()
+        );
+        let err = McpConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt settings",
+        ));
+        let msg = approval_persist_warning(
+            Err(err),
+            "approval for MCP server \"x\"",
+            "mounting for this session only",
+        )
+        .expect("Err must produce a warning");
+        assert!(msg.contains("failed to persist approval for MCP server \"x\""));
+        assert!(msg.contains("corrupt settings"));
+        assert!(msg.contains("this session only"));
     }
 }

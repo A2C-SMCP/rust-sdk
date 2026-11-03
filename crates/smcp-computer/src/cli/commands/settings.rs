@@ -9,8 +9,9 @@
 *       Settings command handlers.
 *
 * 对标 Python `a2c_smcp/computer/cli/commands/settings.py`：读经 [`super::resolved_settings`]（merged，含 policy
-* first-source-wins）或单层 [`load_settings_file`]；写经 [`apply_write`]（**数组整体替换**；删键仅经 DELETE
-* 哨兵，`null` 写 JSON null，§5.4）+ store 持锁原子写。
+* first-source-wins）或单层 [`load_settings_file`]；写经 `raw_write::update_raw_settings` 做 strict raw RMW
+* （只改目标键、保留其余字段；corrupt / 目标容器畸形 fail-closed、原文件不变）+ store 持锁原子写。
+* 写语义仍是 [`apply_write`] 的数组整体替换；`null` 写 JSON null（§5.4）。
 *
 * - **scope**：`user` / `project` / `local` 可写；`flag` / `policy` **只读**（set/edit 拒绝，退出码 1）；
 *   `merged`（默认 show）= 五层合并视图。#98：project/local 锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
@@ -26,12 +27,12 @@ use serde_json::{json, Map, Value};
 use super::{
     err_flat as err, ok_msg, print_json, resolved_settings_with_errors, EXIT_OK, EXIT_USER_ERROR,
 };
-use crate::settings::read_roots::{drop_read_roots_from_file, read_raw_map, remove_read_roots_raw};
+use crate::settings::raw_write;
 use crate::settings::scope::{
     apply_write, load_settings_file, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
 };
-use crate::settings::store::{atomic_write_settings_json, with_settings_lock};
+use crate::settings::store::SettingsStoreError;
 use crate::settings::{
     resolve_policy_settings, validate_settings, SettingsScope, SettingsValidationError,
     FIELD_READ_ROOTS,
@@ -248,17 +249,10 @@ pub fn settings_set(
         Ok(pair) => pair,
         Err(e) => return err(&e, json_output, EXIT_USER_ERROR),
     };
-    // #245 / protocol#65：`readRoots` 仅受信 scope 可设；project scope 写入期丢弃 + 诊断（不落盘、不硬报错）。
+    // #245 / protocol#65 / A+（#253）：`readRoots` 仅受信 scope 可设；project scope **不写入**
+    // 本次值，也**不主动删除**盘上旧键（保留 + WARN，读面 trusted-scope 拒绝）。
     // 放在 `writable_path` 之后：anchor 不可解析时与其他键同样返回用户错误（不静默成功）。
     if scope == "project" && key == FIELD_READ_ROOTS {
-        // 盘上若已有旧版本写入的该键，一并清掉（不只跳过本次写入）。
-        if let Err(e) = drop_read_roots_from_file(&path) {
-            return err(
-                &format!("readRoots cleanup failed: {e}"),
-                json_output,
-                EXIT_USER_ERROR,
-            );
-        }
         return drop_project_read_roots(json_output);
     }
 
@@ -272,30 +266,26 @@ pub fn settings_set(
     let updates: BTreeMap<String, WriteValue> =
         BTreeMap::from([(key.to_string(), WriteValue::from(parsed.clone()))]);
 
-    let locked = with_settings_lock(&path, || -> std::io::Result<()> {
-        // #245：**raw 保真 RMW**——不回写校验视图（否则会静默删除 landingRoot /
-        // enabledMcpjsonServers / 非法 permissions 等被过滤字段）；project scope 顺带剔除旧
-        // `readRoots`（只删该键）。无变化 → 不重写（不扰 mtime）。
-        let mut existing = read_raw_map(&path)?.unwrap_or_default();
-        let had_read_roots =
-            enum_ == SettingsScope::Project && remove_read_roots_raw(&mut existing);
-        let updated = apply_write(&existing, &updates);
-        // 无变化且无需清理 readRoots → 不重写（不扰 mtime）。
-        if updated == existing && !had_read_roots {
-            return Ok(());
+    // #245 / #253：**strict raw 保真 RMW**——不回写校验视图；corrupt 文件拒绝写盘、原文件不变。
+    // 目标键是 object 值时先校验既有父键类型（非对象 → fail-closed，不静默物化覆盖）。
+    // 仅校验顶层目标键；嵌套子键仍按 apply_write 深合并（与 Python 物化语义一致）。
+    let updated = raw_write::update_raw_settings(&path, enum_ == SettingsScope::Project, |map| {
+        if parsed.is_object() {
+            raw_write::ensure_object_container(map, key, &path)?;
         }
-        atomic_write_settings_json(&path, &Value::Object(updated))
+        *map = apply_write(map, &updates);
+        Ok(())
     });
-    match locked {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return err(&format!("write failed: {e}"), json_output, EXIT_USER_ERROR),
-        Err(e) => {
+    match updated {
+        Ok(_) => {}
+        Err(raw_write::RawWriteError::Store(e @ SettingsStoreError::Lock { .. })) => {
             return err(
                 &format!("settings lock failed: {e}"),
                 json_output,
                 EXIT_USER_ERROR,
             )
         }
+        Err(e) => return err(&format!("write failed: {e}"), json_output, EXIT_USER_ERROR),
     }
 
     if json_output {
@@ -305,13 +295,16 @@ pub fn settings_set(
     ok_msg(&format!("set {key} in {scope} scope"))
 }
 
-/// #245 / protocol#65：project scope 的 `readRoots` 写入期丢弃（不落盘、不硬报错）。
+/// #245 / protocol#65 / A+（#253）：project scope 的 `readRoots` **不写入本次值、不删除旧键**，
+/// 仅告警（读面 trusted-scope-only 拒绝保持不动）。
 ///
 /// 协议 `security.md` §读取通道安全：`readRoots` 仅受信 scope 可设；project settings 入 git、随仓库
 /// 分发，clone 的仓库不得把读授权扩到任意路径。读侧过滤（[`validate_settings`]）保留为纵深防御。
 fn drop_project_read_roots(json_output: bool) -> i32 {
-    const REASON: &str = "readRoots is a trusted-scope-only field and is never written to the project \
-                          scope (git-tracked); use settings.local.json (not git-tracked) or the user scope";
+    const REASON: &str =
+        "readRoots is a trusted-scope-only field and is not written to the project \
+                          scope (git-tracked); any existing project readRoots is preserved on disk \
+                          but ignored at read time — use settings.local.json or the user scope";
     tracing::warn!(
         field = FIELD_READ_ROOTS,
         target_scope = "project",
@@ -322,14 +315,14 @@ fn drop_project_read_roots(json_output: bool) -> i32 {
         print_json(&json!({
             "scope": "project",
             "key": FIELD_READ_ROOTS,
-            "dropped": true,
+            "ignored": true,
             "reason": REASON,
         }));
         return EXIT_OK;
     }
     eprintln!("warning: {}", REASON);
     ok_msg(&format!(
-        "ignored {} in project scope (trusted-scope-only)",
+        "ignored {} in project scope (trusted-scope-only; existing key preserved)",
         FIELD_READ_ROOTS
     ))
 }
@@ -394,28 +387,21 @@ pub fn settings_edit(
         .status();
     match status {
         Ok(s) if s.success() => {
-            // #245：project scope 的 readRoots 写入期丢弃 + 诊断（编辑内容不落盘）。
+            // A+（#253）：edit 不再主动删除 readRoots；若项目文件仍含该键，仅 WARN（读面拒绝）。
+            // 外部编辑器夹具仍是 #253 的显式 carve-out（可写出任意内容）。
             if scope == "project" {
-                match drop_read_roots_from_file(&path) {
-                    Ok(true) => {
+                if let Ok(Some(map)) = crate::settings::read_roots::read_raw_map(&path) {
+                    if map.contains_key(FIELD_READ_ROOTS) {
                         tracing::warn!(
                             field = FIELD_READ_ROOTS,
                             path = %path.display(),
-                            "project scope readRoots dropped after edit"
+                            "project scope readRoots preserved after edit (ignored at read time)"
                         );
                         eprintln!(
-                            "warning: dropped {} from project scope \
+                            "warning: project scope {} is preserved but ignored at read time \
                              (trusted-scope-only; use settings.local.json or the user scope)",
                             FIELD_READ_ROOTS
                         );
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        return err(
-                            &format!("post-edit readRoots cleanup failed: {e}"),
-                            json_output,
-                            EXIT_USER_ERROR,
-                        )
                     }
                 }
             }
@@ -597,10 +583,10 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains('{'));
     }
 
-    // ── #245 / protocol#65：project scope readRoots 写入期丢弃 ────────────────
+    // ── #245 / protocol#65 / A+：project scope readRoots 不写入、保留旧键 ─────
 
     #[test]
-    fn set_read_roots_in_project_scope_is_dropped_not_persisted() {
+    fn set_read_roots_in_project_scope_is_not_persisted_253() {
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
         let wd = dir.path().join("wd");
@@ -641,13 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn set_read_roots_in_project_scope_cleans_existing_old_key() {
+    fn set_read_roots_in_project_scope_preserves_existing_old_key_253() {
+        // A+：project scope 的 readRoots 不写入本次值，也不主动删除盘上旧键（保留 + WARN）。
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
         let wd = dir.path().join("wd");
         let path = workdir_project_settings_path(&wd);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"readRoots":["/old"],"keep":1}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
         let share = dir.path().join("share");
         let value = serde_json::to_string(&vec![share.to_str().unwrap()]).unwrap();
         assert_eq!(
@@ -661,8 +649,13 @@ mod tests {
             ),
             EXIT_OK
         );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "project readRoots 不写盘、不删旧键 → 文件不变"
+        );
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["readRoots"], json!(["/old"]), "旧键必须保留");
         assert_eq!(saved["keep"], json!(1), "其他键须保留");
     }
 
@@ -697,7 +690,8 @@ mod tests {
             EXIT_OK
         );
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none(), "{saved}");
+        // A+：readRoots 与其他被过滤字段一样原样保留（读面拒绝，不主动删除）。
+        assert_eq!(saved["readRoots"], json!(["/data"]), "{saved}");
         assert_eq!(saved["maxConcurrency"], json!(7));
         assert_eq!(saved["landingRoot"], json!("/landing"));
         assert_eq!(saved["enabledMcpjsonServers"], json!(["srv"]));
@@ -706,14 +700,16 @@ mod tests {
     }
 
     #[test]
-    fn set_same_value_in_project_scope_still_cleans_read_roots() {
-        // 写同值（内容无变化）但盘上有旧 readRoots → 仍须落盘清理（changed || had_read_roots）。
+    fn set_same_value_in_project_scope_is_noop_and_preserves_read_roots_253() {
+        // A+：写同值（无变化）且盘上有 readRoots → 不写盘、不删键（纯 raw no-op）。
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
         let wd = dir.path().join("wd");
         let path = workdir_project_settings_path(&wd);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"readRoots":["/data"],"maxConcurrency":7}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(
             settings_set(
                 Some(&env),
@@ -725,28 +721,20 @@ mod tests {
             ),
             EXIT_OK
         );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "无变化不得重写");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before_mtime
+        );
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none(), "{saved}");
+        assert_eq!(saved["readRoots"], json!(["/data"]), "readRoots 必须保留");
         assert_eq!(saved["maxConcurrency"], json!(7));
     }
 
-    #[test]
-    fn drop_project_read_roots_from_file_removes_only_that_field() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-        std::fs::write(&path, r#"{"readRoots":["/data"],"keep":1}"#).unwrap();
-        assert!(drop_read_roots_from_file(&path).unwrap());
-        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("readRoots").is_none());
-        assert_eq!(saved["keep"], json!(1));
-        // 幂等：已无该键 → no-op。
-        assert!(!drop_read_roots_from_file(&path).unwrap());
-    }
-
-    /// `settings edit` 的真实写入路径：编辑器写入 `readRoots` 后由 post-edit 清理剔除。
+    /// `settings edit` 的真实写入路径：A+ 下编辑器写入 `readRoots` 后**保留**（不主动删除）。
     #[cfg(unix)]
     #[test]
-    fn edit_project_scope_drops_read_roots_after_editor() {
+    fn edit_project_scope_preserves_read_roots_after_editor_253() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let env = test_env(dir.path());
@@ -773,9 +761,10 @@ mod tests {
             &std::fs::read_to_string(workdir_project_settings_path(&wd)).unwrap(),
         )
         .unwrap();
-        assert!(
-            saved.get("readRoots").is_none(),
-            "readRoots 不得落盘：{saved}"
+        assert_eq!(
+            saved["readRoots"],
+            json!(["/data"]),
+            "A+：edit 不得主动删除 readRoots：{saved}"
         );
         assert_eq!(saved["keep"], json!(1));
     }
@@ -829,5 +818,119 @@ mod tests {
         assert_eq!(cleaned.get("allowedMcpServers"), Some(&json!(["a"])));
         assert_eq!(cleaned.get("trustedMarketplaces"), Some(&json!(["mp"])));
         assert!(errors.is_empty());
+    }
+
+    // ---- #253：strict raw RMW / corrupt fail-closed -------------------------
+    fn settings_file_mtime(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn set_refuses_corrupt_user_settings_and_keeps_bytes_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(Some(&env), "k", "1", "user", None, true),
+            EXIT_USER_ERROR
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // 根非对象同样拒绝。
+        std::fs::write(&path, "[1,2]").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(Some(&env), "k", "1", "user", None, true),
+            EXIT_USER_ERROR
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn set_noop_does_not_touch_mtime_or_bytes_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"maxConcurrency":7,"keepUnknown":{"k":1}}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let before_mtime = settings_file_mtime(&path);
+        assert_eq!(
+            settings_set(Some(&env), "maxConcurrency", "7", "user", None, true),
+            EXIT_OK
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(settings_file_mtime(&path), before_mtime);
+    }
+
+    #[test]
+    fn set_preserves_filtered_and_unknown_fields_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"allowedMcpServers":["a"],"permissions":"bad","keepUnknown":{"k":1},"landingRoot":"/l"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings_set(Some(&env), "maxConcurrency", "7", "user", None, true),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["allowedMcpServers"], json!(["a"]));
+        assert_eq!(saved["permissions"], json!("bad"));
+        assert_eq!(saved["keepUnknown"], json!({"k": 1}));
+        assert_eq!(saved["landingRoot"], json!("/l"));
+        assert_eq!(saved["maxConcurrency"], json!(7));
+    }
+
+    #[test]
+    fn set_read_roots_project_does_not_touch_corrupt_file_253() {
+        // A+：project readRoots 不写盘、不删旧键；corrupt 文件也无需读取 → 成功且原文件不变。
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "readRoots",
+                "[\"/x\"]",
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_OK
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn set_object_over_non_object_target_fails_closed_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"enabledPlugins":"oops"}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "enabledPlugins",
+                r#"{"a@mp":true}"#,
+                "user",
+                None,
+                true
+            ),
+            EXIT_USER_ERROR
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }
