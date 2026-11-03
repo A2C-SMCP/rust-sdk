@@ -87,10 +87,10 @@ impl Stack {
 
     fn computer(&self, name: &str) -> Computer<SilentSession> {
         Computer::new(name, SilentSession::new("pr3"), None, None, false, false)
-            .with_config_dir(&self.tmp.path().join("proj"))
+            .with_config_dir(self.tmp.path().join("proj"))
             .with_config_env(self.env.clone())
-            .with_skill_home(&self.tmp.path().join("skills"))
-            .with_blob_cache_root(&self.tmp.path().join("blob"))
+            .with_skill_home(self.tmp.path().join("skills"))
+            .with_blob_cache_root(self.tmp.path().join("blob"))
     }
 }
 
@@ -180,7 +180,7 @@ async fn async_agent_resolve_path_to_get_blob_end_to_end() {
     let computer_name = generate_computer_name();
     let agent_name = generate_agent_name();
     let (_computer, agent) =
-        connect_stack(&stack, &server.url(), &office, &computer_name, &agent_name).await;
+        connect_stack(&stack, server.url(), &office, &computer_name, &agent_name).await;
 
     let file = stack.file("hello.txt", b"hello path");
     let ret = agent
