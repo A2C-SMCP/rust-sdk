@@ -26,10 +26,17 @@ fn isolated_env(home: &Path) -> Vec<(&'static str, std::path::PathBuf)> {
 
 /// 以 tempdir 为 cwd 跑 `run`（stdin 关闭 → REPL 立即 EOF 退出）。
 fn run_repl(dir: &Path, settings: &str) -> Output {
+    run_args(dir, &["--settings", settings, "run"])
+}
+
+/// 以 tempdir 为 cwd 跑 `run --mcp-config <path>`。
+fn run_repl_with_mcp_config(dir: &Path, mcp_config: &str) -> Output {
+    run_args(dir, &["run", "--mcp-config", mcp_config])
+}
+
+fn run_args(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
-        .arg("--settings")
-        .arg(settings)
-        .arg("run")
+        .args(args)
         .current_dir(dir)
         .env_clear()
         .envs(isolated_env(dir))
@@ -56,6 +63,19 @@ fn cli_run_reports_unusable_settings_path_on_stderr() {
     assert_eq!(output.status.code(), Some(0), "stderr={stderr}");
     assert!(
         stderr.contains("flag settings path") && stderr.contains("fail-closed"),
+        "删掉 eprintln 必须红：stderr={stderr}"
+    );
+}
+
+/// `--mcp-config` 同类信任洞：归一失败必须在 stderr 明确告知（删 eprintln 即红）。
+#[test]
+fn cli_run_reports_unusable_mcp_config_on_stderr() {
+    let dir = tempdir().unwrap();
+    let output = run_repl_with_mcp_config(dir.path(), "~alice/mcp.json");
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(0), "stderr={stderr}");
+    assert!(
+        stderr.contains("mcp config path") && stderr.contains("fail-closed"),
         "删掉 eprintln 必须红：stderr={stderr}"
     );
 }

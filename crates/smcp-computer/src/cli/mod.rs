@@ -609,6 +609,7 @@ fn build_run_computer(
     args: &Args,
     root: &RootState,
     mcp_config: Option<&Path>,
+    config_env: Option<crate::settings::EnvMap>,
 ) -> Computer<SilentSession> {
     let mut computer = Computer::new(
         "friday_hands",
@@ -618,15 +619,22 @@ fn build_run_computer(
         args.auto_connect,
         args.auto_reconnect,
     );
+    // env 接缝：必须先注入再归一（`~` 展开用注入 HOME/USERPROFILE），CLI 传 `None` 保持 ambient。
+    if let Some(env) = config_env {
+        computer = computer.with_config_env(env);
+    }
     if let Some(p) = mcp_config {
         computer = computer.with_mcp_flag_config(p.to_path_buf());
     }
     if let Some(p) = root.flag_path.as_deref() {
         computer = computer.with_flag_settings_path(p);
     }
-    // #248：归一失败（无/空 HOME、`~user`、无法绝对化）→ flag 层已 fail-closed 置空；在 CLI 启动
-    // 边界明确告知（tracing 在 CLI 无 subscriber，不能只靠日志）。库宿主可经同名访问器自取。
+    // #248：归一失败（无/空 HOME、`~user`、无法绝对化）→ 对应 flag 层已 fail-closed 置空；在 CLI
+    // 启动边界明确告知（tracing 在 CLI 无 subscriber，不能只靠日志）。库宿主可经同名访问器自取。
     if let Some(message) = computer.flag_settings_path_error() {
+        eprintln!("{message}");
+    }
+    if let Some(message) = computer.mcp_flag_config_error() {
         eprintln!("{message}");
     }
     if let Some(max) = args.concurrency {
@@ -648,9 +656,8 @@ fn trust_flag_settings_path(computer: &Computer<SilentSession>) -> Option<PathBu
 
 /// 返回进程退出码：身份存储等**启动致命**错误非零（protocol#64），其余保持既有非阻塞行为。
 async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) -> i32 {
-    let computer = build_run_computer(args, root, mcp_config.as_deref());
-    // #248 复审：两处信任层消费者只认归一后的路径（失败 = 无 flag 层），见 helper 说明。
-    let flag_settings_path = trust_flag_settings_path(&computer);
+    // CLI 用 ambient env（`None` 接缝）；归一在 builder 内完成（失败 fail-closed + stderr 诊断）。
+    let computer = build_run_computer(args, root, mcp_config.as_deref(), None);
 
     let cli_config = commands::CliConfig {
         url: args.url.clone(),
@@ -663,7 +670,7 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) ->
     // 启动前缀（boot_up 子系统装配 → 治理重挂 → socket.io 连接）抽出为可测 helper。
     // #137：`--mcp-config` 不再走此处（旧 `--config` 的持久化加载已退役）——改为 flag 层喂启动期批准框
     // （见下方 `run_mcp_approval`），flag scope 次高、受信直挂、不落盘。
-    let handler = match prepare_handler(computer, cli_config, flag_settings_path.clone()).await {
+    let handler = match prepare_handler(computer, cli_config).await {
         Ok(handler) => handler,
         Err(error) => {
             eprintln!("启动失败 / Startup failed: {error}");
@@ -684,11 +691,18 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) ->
 
     // 启动期 MCP 批准框（--approve-all-mcp / 逐项 y-a-n）。#137：`--mcp-config` 作 flag 层 mcp.json 喂入
     // ——flag scope 次高、受信（`is_trusted_origin`）⇒ 门判 Enabled 直挂（非持久）；文件 `inputs` 段一并消费。
+    // #248 复审：两个 flag 层路径**都从 Computer 归一后的访问器取**（失败 = 无 flag 层）——绝不回读
+    // 原始 `--settings` / `--mcp-config` 串，防仓库植入 `<cwd>/~alice/...` 冒充受信 flag。
+    let flag_settings_path = trust_flag_settings_path(&handler.computer);
+    let mcp_flag_config = handler
+        .computer
+        .normalized_mcp_flag_config()
+        .map(Path::to_path_buf);
     approval::run_mcp_approval(
         &handler.computer,
         root.approve_all_mcp,
         flag_settings_path.as_deref(),
-        mcp_config.as_deref(),
+        mcp_flag_config.as_deref(),
     )
     .await;
 
@@ -710,8 +724,10 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) ->
 async fn prepare_handler(
     computer: Computer<SilentSession>,
     cli_config: commands::CliConfig,
-    flag_path: Option<PathBuf>,
 ) -> Result<CommandHandler, commands::CommandError> {
+    // #248 复审：治理重挂的 flag 作用域路径**内部自取**归一路径（失败 = 无 flag 层），
+    // 调用方无法再传入原始 `--settings` 串（杜绝仓库植入 `<cwd>/~alice/...` 冒充受信 flag）。
+    let flag_path = trust_flag_settings_path(&computer);
     let url = cli_config.url.clone();
     let namespace = cli_config.namespace.clone();
     let auth = cli_config.auth.clone();
@@ -785,7 +801,7 @@ mod tests {
             headers: None,
             office_rejoin_budget_secs: None,
         };
-        let handler = prepare_handler(computer, cli_config, None)
+        let handler = prepare_handler(computer, cli_config)
             .await
             .expect("prepare_handler 不应因 boot 告警失败");
 
@@ -822,7 +838,7 @@ mod tests {
             headers: None,
             office_rejoin_budget_secs: None,
         };
-        let error = match prepare_handler(computer, cli_config, None).await {
+        let error = match prepare_handler(computer, cli_config).await {
             Ok(_) => panic!("损坏的身份文件必须使启动失败"),
             Err(error) => error,
         };
@@ -865,7 +881,7 @@ mod tests {
         };
         let handler = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            prepare_handler(computer, cli_config, None),
+            prepare_handler(computer, cli_config),
         )
         .await
         .expect("连接失败必须快速返回（非阻塞）")
@@ -996,7 +1012,7 @@ mod tests {
             flag_path: args.settings.clone(),
             approve_all_mcp: false,
         };
-        let computer = build_run_computer(&args, &root, None).with_config_env(env);
+        let computer = build_run_computer(&args, &root, None, Some(env));
 
         // 路径字段私有：以运行期 resolve 结果证明 `--settings` 已接线（否则 flag-blind 时为空）。
         let roots = computer.read_roots().await;
@@ -1025,6 +1041,13 @@ mod tests {
         std::fs::create_dir_all(&planted_dir).unwrap();
         let planted = planted_dir.join("settings.json");
         std::fs::write(&planted, r#"{"enableAllProjectMcpServers":true}"#).unwrap();
+        // `--mcp-config` 同类植入：flag origin 受信，若按原始串读取可免批准直挂 stdio server。
+        let planted_mcp = planted_dir.join("mcp.json");
+        std::fs::write(
+            &planted_mcp,
+            r#"{"servers":{"mcp":{"type":"stdio","server_parameters":{"command":"/bin/true"}}}}"#,
+        )
+        .unwrap();
 
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
@@ -1036,25 +1059,41 @@ mod tests {
             "XDG_STATE_HOME".to_string(),
             tmp.path().join("state").to_string_lossy().into_owned(),
         );
+        // 控制组/生效组同用这份 env，避免读到宿主 user/policy（否则宿主配了信任键会 false-red）。
+        let resolve_env = env.clone();
 
         let args = Args::parse_from(["smcp-computer", "--settings", "~alice/settings.json", "run"]);
         let root = RootState {
             flag_path: args.settings.clone(),
             approve_all_mcp: false,
         };
-        // hermetic：注入 env，不读宿主 HOME/XDG。
-        let computer = build_run_computer(&args, &root, None).with_config_env(env);
+        // hermetic：先注入 env 再归一（不读宿主 HOME/XDG）；两个 flag 路径都用同一不可用形态。
+        let computer =
+            build_run_computer(&args, &root, Some(Path::new("~alice/mcp.json")), Some(env));
 
-        // 控制组：该植入文件若被作为 flag 路径读取，确实会产出信任判据（否则本用例无判别力）。
+        // 控制组：两个植入文件若被作为 flag 路径读取，确实会产出信任判据（否则本用例无判别力）。
         let control = commands::resolved_settings_with_errors(
             Some(tmp.path()),
-            None,
+            Some(&resolve_env),
             Some(planted.as_path()),
         );
         assert_eq!(
             control.settings.get("enableAllProjectMcpServers"),
             Some(&serde_json::json!(true)),
-            "控制组：植入文件必须是有效信任载荷"
+            "控制组：植入 settings 必须是有效信任载荷"
+        );
+        use crate::settings::mcp_config::{resolve_mcp_config, ResolveMcpConfigArgs};
+        let control_mcp = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(tmp.path()),
+            env: Some(&resolve_env),
+            flag_config_path: Some(planted_mcp.as_path()),
+            managed_mcp_path: None,
+            platform: None,
+            embed_servers: &[],
+        });
+        assert!(
+            control_mcp.servers.contains_key("mcp"),
+            "控制组：植入 mcp.json 必须能被 flag 层解析出 server"
         );
 
         assert!(
@@ -1068,11 +1107,26 @@ mod tests {
             "失败原因须对 CLI 边界可见：{:?}",
             computer.flag_settings_path_error()
         );
+        assert!(
+            computer
+                .mcp_flag_config_error()
+                .is_some_and(|message| message.contains("~user")),
+            "`--mcp-config` 失败原因须可见：{:?}",
+            computer.mcp_flag_config_error()
+        );
 
-        // 信任层派生路径恒 None；据此得到的视图不含植入的信任键。
+        // 信任层派生路径恒 None；据此得到的视图不含植入的信任键 / server。
         let trust_path = trust_flag_settings_path(&computer);
         assert!(trust_path.is_none(), "信任层不得拿到原始串/相对路径");
-        let effective = commands::resolved_settings_with_errors(None, None, trust_path.as_deref());
+        assert!(
+            computer.normalized_mcp_flag_config().is_none(),
+            "`--mcp-config` 信任层不得拿到原始串/相对路径"
+        );
+        let effective = commands::resolved_settings_with_errors(
+            None,
+            Some(&resolve_env),
+            trust_path.as_deref(),
+        );
         assert!(
             effective
                 .settings
@@ -1080,6 +1134,19 @@ mod tests {
                 .is_none(),
             "植入的权重键不得进入信任视图：{:?}",
             effective.settings.get("enableAllProjectMcpServers")
+        );
+        let effective_mcp = resolve_mcp_config(ResolveMcpConfigArgs {
+            cwd: Some(tmp.path()),
+            env: Some(&resolve_env),
+            flag_config_path: computer.normalized_mcp_flag_config(),
+            managed_mcp_path: None,
+            platform: None,
+            embed_servers: &[],
+        });
+        assert!(
+            effective_mcp.servers.is_empty(),
+            "植入的 mcp.json 不得进入信任解析：{:?}",
+            effective_mcp.servers.keys().collect::<Vec<_>>()
         );
     }
 }
