@@ -30,7 +30,7 @@ pub struct SmcpAgentConfig {
     pub reconnect_interval: u64,
     /// 「重连后回房」单次 `server:join_office` 重放的 **ack 等待上限（秒）**。
     ///
-    /// 默认 `10`——与 python 参考实现 `OFFICE_REJOIN_TIMEOUT` 及本仓 Computer 侧重放所用的 `10`
+    /// 默认 `10`——与 python 参考实现 `OFFICE_JOIN_TIMEOUT` 及本仓 Computer 侧重放所用的 `10`
     /// 同值（跨端时序可比）。回房用**等 ack**（`call`）而非 emit，故本值即单次尝试的耗时上界。
     ///
     /// Per-attempt ack timeout (seconds) for the automatic office rejoin.
@@ -159,7 +159,7 @@ mod tests {
         assert!(config.auto_fetch_tools); // 默认开启 / Default enabled
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.reconnect_interval, 1000);
-        // 回房默认：单次 ack 等待 10s（对齐 python `OFFICE_REJOIN_TIMEOUT` 与本仓 Computer 侧），
+        // 回房默认：单次 ack 等待 10s（对齐 python `OFFICE_JOIN_TIMEOUT` 与本仓 Computer 侧），
         // 总预算 60s ⇒ 覆盖 socket.io 默认最长回收窗口 45s（#219 裁决）。
         assert_eq!(config.office_rejoin_timeout, 10);
         assert_eq!(

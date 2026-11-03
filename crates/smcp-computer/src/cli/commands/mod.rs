@@ -44,7 +44,10 @@ pub mod settings;
 pub mod skill;
 
 // REPL 适配器复用既有 handler 的运行时类型 / re-export for the REPL entry & interactive loop。
-pub use handler::{CliConfig, CommandError, CommandHandler};
+pub use handler::{
+    rejoin_intent_cancelled_notice, CliConfig, CommandError, CommandHandler, JoinSocketRoomFailure,
+    JoinSocketRoomOutcome,
+};
 
 // ── 退出码语义（§4.6）/ Exit code semantics ──────────────────────────────────
 /// 成功 / success。

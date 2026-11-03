@@ -8,6 +8,7 @@
 * 描述: 交互式REPL循环 / Interactive REPL loop
 */
 
+use crate::cli::commands::handler::print_rejoin_intent_cancelled_notice;
 use crate::cli::commands::{msg_warn, CommandError, CommandHandler};
 use crate::cli::completer::{A2CCompleter, SkillNameSnapshot};
 use crate::cli::help::render_help;
@@ -297,7 +298,18 @@ async fn handle_command(
                             "用法: socket join <office_id> <computer_name>（改名会自动重建连接）/ Usage: socket join <office_id> <computer_name> (rename reconnects)".to_string(),
                         ));
                     }
-                    handler.join_socket_room(parts[2], parts[3]).await?;
+                    match handler
+                        .join_socket_room_with_outcome(parts[2], parts[3])
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(failure) => {
+                            if let Some(notice) = failure.cancelled_notice() {
+                                print_rejoin_intent_cancelled_notice(notice);
+                            }
+                            return Err(failure.error);
+                        }
+                    }
                 }
                 "leave" => {
                     handler.leave_socket_room().await?;

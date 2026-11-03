@@ -111,6 +111,46 @@ pub enum CommandError {
     ComputerError(#[from] ComputerError),
 }
 
+/// #240：`join_socket_room_with_outcome` 的结构化结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinSocketRoomOutcome {
+    /// 是否取消了此前挂起的自动回房意图（一次性提示，已在该路径消费）。
+    pub rejoin_intent_cancelled: bool,
+}
+
+/// #240：结构化 join 失败——保留底层错误，同时携带一次性取消提示标志。
+///
+/// 保留 `error` 的原始类型与文案：结构化信息是增量，不改变既有错误处理。
+/// 注意：不要用 `map_err(|failure| failure.error)` 直接转回 `CommandError`——那会静默
+/// 丢弃一次性取消提示；需要提示的调用方先取 [`Self::cancelled_notice`]。
+#[derive(Debug)]
+pub struct JoinSocketRoomFailure {
+    /// 底层的入房错误（与 `join_socket_room` 原样返回的错误一致）。
+    pub error: CommandError,
+    /// 是否取消了此前挂起的自动回房意图（一次性，已在该路径消费）。
+    pub rejoin_intent_cancelled: bool,
+}
+
+impl JoinSocketRoomFailure {
+    /// #240：需要提示时返回纯文案（调用方负责样式与打印）；`None` = 无提示。
+    ///
+    /// 把「失败 → 是否提示」的判断收敛到可单测的访问器，wrapper 与 REPL 共用同一实现。
+    pub fn cancelled_notice(&self) -> Option<&'static str> {
+        self.rejoin_intent_cancelled
+            .then(rejoin_intent_cancelled_notice)
+    }
+}
+
+/// #240：取消自动回房意图的**纯文案**（不含 ANSI 样式；样式由打印方施加，便于测试断言）。
+pub fn rejoin_intent_cancelled_notice() -> &'static str {
+    "  ⚠ 此前的自动回房意图已取消 / the previous pending automatic rejoin intent was cancelled"
+}
+
+/// #240：打印一次性取消提示（样式集中在此，wrapper 与 REPL 共用）。
+pub(crate) fn print_rejoin_intent_cancelled_notice(notice: &str) {
+    println!("{}", style(notice).yellow());
+}
+
 pub struct CommandHandler {
     pub computer: Computer<SilentSession>,
     pub cli_config: CliConfig,
@@ -931,39 +971,84 @@ impl CommandHandler {
     }
 
     /// Join as the requested name; changing identity requires a new connection.
+    ///
+    /// 兼容 wrapper（约 19 处既有调用点）：签名与行为保持不变——失败时打印一次性的
+    /// 自动回房取消提示，再返回原错误。需要结构化结果的调用方用
+    /// [`Self::join_socket_room_with_outcome`]。
     pub async fn join_socket_room(
         &mut self,
         office_id: &str,
         computer_name: &str,
     ) -> Result<(), CommandError> {
+        match self
+            .join_socket_room_with_outcome(office_id, computer_name)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(failure) => {
+                if let Some(notice) = failure.cancelled_notice() {
+                    print_rejoin_intent_cancelled_notice(notice);
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Join as the requested name, returning the structured outcome (#240).
+    ///
+    /// 与 [`Self::join_socket_room`] 的差异仅在返回值：一次性「自动回房意图已取消」提示
+    /// 不在这里打印，而是随 `JoinSocketRoomFailure` / `JoinSocketRoomOutcome` 返回，
+    /// 由调用方（REPL 或 wrapper）决定如何呈现。
+    // `CommandError` 已接近尺寸阈值，结构化包装只多一个 bool；按项目既有做法局部
+    // `#[allow]` 而非装箱（同 `smcp-agent/src/protocol_error.rs` 的 `result_large_err` 处理）。
+    #[allow(clippy::result_large_err)]
+    pub async fn join_socket_room_with_outcome(
+        &mut self,
+        office_id: &str,
+        computer_name: &str,
+    ) -> Result<JoinSocketRoomOutcome, JoinSocketRoomFailure> {
         if !self.computer.has_socketio_client().await {
-            return Err(CommandError::InvalidCommand(
-                "未连接 Socket.IO，请先 `socket connect <url>` / Not connected to Socket.IO; run \
-                 `socket connect <url>` first"
-                    .to_string(),
-            ));
+            return Err(JoinSocketRoomFailure {
+                error: CommandError::InvalidCommand(
+                    "未连接 Socket.IO，请先 `socket connect <url>` / Not connected to Socket.IO; run \
+                     `socket connect <url>` first"
+                        .to_string(),
+                ),
+                rejoin_intent_cancelled: false,
+            });
         }
 
         if self.computer.name() == computer_name {
-            if let Err(error) = self.computer.join_office(office_id, computer_name).await {
-                if self.computer.take_rejoin_intent_cancelled().await {
-                    println!(
-                        "{}",
-                        style(
-                            "  ⚠ 此前的自动回房意图已取消 / the previous pending automatic rejoin \
-                             intent was cancelled"
-                        )
-                        .yellow()
-                    );
+            return match self.computer.join_office(office_id, computer_name).await {
+                Ok(()) => {
+                    println!("✅ 已加入房间 / Joined office: {office_id}");
+                    Ok(JoinSocketRoomOutcome {
+                        rejoin_intent_cancelled: false,
+                    })
                 }
-                return Err(error.into());
-            }
-            println!("✅ 已加入房间 / Joined office: {office_id}");
-            return Ok(());
+                Err(error) => {
+                    // 一次性标志在此消费：调用方据 outcome 决定是否打印提示。
+                    let rejoin_intent_cancelled =
+                        self.computer.take_rejoin_intent_cancelled().await;
+                    Err(JoinSocketRoomFailure {
+                        error: error.into(),
+                        rejoin_intent_cancelled,
+                    })
+                }
+            };
         }
 
         println!("改名将重新连接 / Reconnecting to change name");
-        self.rename_and_join(office_id, computer_name).await
+        match self.rename_and_join(office_id, computer_name).await {
+            Ok(()) => Ok(JoinSocketRoomOutcome {
+                rejoin_intent_cancelled: false,
+            }),
+            // 新连接没有 previous_desired，取消语义不会在这里触发（flag 恒 false）。
+            Err(error) => Err(JoinSocketRoomFailure {
+                error,
+                rejoin_intent_cancelled: false,
+            }),
+        }
     }
 
     /// Leave and retire the old connection before installing the new identity.
@@ -1954,6 +2039,29 @@ mod tests {
         assert_eq!(
             default.office_rejoin_budget,
             crate::socketio_client::DEFAULT_OFFICE_REJOIN_BUDGET
+        );
+    }
+
+    /// #240：失败 → 提示文案的判断是可单测的纯访问器；flag=false 必须无提示。
+    #[test]
+    fn cancelled_notice_is_derived_from_rejoin_intent_flag() {
+        let cancelled = JoinSocketRoomFailure {
+            error: CommandError::InvalidCommand("join rejected".to_string()),
+            rejoin_intent_cancelled: true,
+        };
+        assert_eq!(
+            cancelled.cancelled_notice(),
+            Some(rejoin_intent_cancelled_notice())
+        );
+
+        let quiet = JoinSocketRoomFailure {
+            error: CommandError::InvalidCommand("join rejected".to_string()),
+            rejoin_intent_cancelled: false,
+        };
+        assert_eq!(
+            quiet.cancelled_notice(),
+            None,
+            "a failure without a cancelled intent must not print the notice"
         );
     }
 
