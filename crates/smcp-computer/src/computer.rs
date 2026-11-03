@@ -1238,6 +1238,15 @@ impl<S: Session> Computer<S> {
         self.flag_settings_path_error.as_deref()
     }
 
+    /// #248 复审：归一后的 flag settings 绝对路径（`None` = 无 flag 层或归一失败）。
+    ///
+    /// **信任层消费者必须用它，不得回读原始 `--settings` 串**：原始相对串（如 `~alice/x.json`）
+    /// 会按进程 cwd 解析，仓库可植入 `<cwd>/~alice/...` 冒充受信 flag 层；归一失败时这里恒
+    /// `None`，调用方须按「无 flag 层」处理。CLI 的治理重挂与启动批准框即经此取值。
+    pub fn normalized_flag_settings_path(&self) -> Option<&Path> {
+        self.flag_settings_path.as_deref()
+    }
+
     /// #214：安装 Computer 级 MCP **最大并发启动数**（构造期策略，`0` 按 `1` 处理）。
     ///
     /// 该上限约束**单个启动、批量启动（含 `start all`）与 Plugin 治理恢复**全路径——三者共享同一
@@ -5374,9 +5383,11 @@ fn resolve_landing_root_settings(
 ///
 /// 规则：
 /// - 空路径 → 失败；非 UTF-8 → 无 `~` 语义，直接绝对化（失败则报错）。
-/// - 前导 `~` / `~/...`：用注入 env 的 `HOME`（空白视同未设置），其次进程 `HOME`；两者皆无 → 失败
+/// - 前导 `~` / `~/...` / `~\...`（Windows 写法，对齐 python `expanduser`）：用注入 env 的 `HOME`
+///   （空白视同未设置），其次进程 `HOME`；Windows 环境退 `USERPROFILE`；全部为空 → 失败
 ///   （**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的路径会被当成受信 flag 层）。
-/// - `~user`（前导 `~` 但不是 `~` / `~/`）：rust 无 NSS expanduser → 显式失败，不静默锚到 `<cwd>/~user`。
+/// - `~user`（前导 `~` 但不是 `~` / `~/` / `~\`）：rust 无 NSS expanduser → 显式失败，不静默锚到
+///   `<cwd>/~user`。
 /// - 其它（含中段 `~` 的合法相对路径，如 `conf/~/flag.json`）：中段 `~` 只是普通字符，按构造期 cwd
 ///   绝对化。
 ///
@@ -5407,15 +5418,19 @@ fn normalize_flag_settings_path_with(
     if raw.trim().is_empty() {
         return Err("empty path");
     }
-    let expanded = if raw == "~" || raw.starts_with("~/") {
+    let expanded = if raw == "~" {
+        PathBuf::from(
+            non_empty(injected_home)
+                .or_else(|| non_empty(process_home))
+                .ok_or("`~` cannot be expanded: HOME/USERPROFILE is unset or empty")?,
+        )
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        // Windows 客户端常见 `~\flag.json`（python `expanduser` 同样识别）；POSIX 下 `~/` 为主，
+        // `~\` 统一按 `~` 展开（跨端一致，不当作字面文件名）。
         let home = non_empty(injected_home)
             .or_else(|| non_empty(process_home))
-            .ok_or("`~` cannot be expanded: HOME is unset or empty")?;
-        if raw == "~" {
-            PathBuf::from(home)
-        } else {
-            Path::new(home).join(raw.strip_prefix("~/").unwrap_or_default())
-        }
+            .ok_or("`~` cannot be expanded: HOME/USERPROFILE is unset or empty")?;
+        Path::new(home).join(rest.trim_start_matches(['/', '\\']))
     } else if raw.starts_with('~') {
         return Err("`~user` form is not supported; use an absolute path or `~/...`");
     } else {
@@ -5425,14 +5440,21 @@ fn normalize_flag_settings_path_with(
     std::path::absolute(&expanded).map_err(|_| "path cannot be absolutized")
 }
 
-/// 取非空 HOME（空白视同未设置）/ a non-blank HOME lookup.
+/// 取非空 HOME（空白视同未设置）；Windows 退 `USERPROFILE`（对齐 python `expanduser`）。
 fn home_lookup(env: Option<&EnvMap>) -> Option<String> {
-    let raw = match env {
-        Some(map) => map.get("HOME").cloned(),
-        None => std::env::var("HOME").ok(),
-    }?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    match env {
+        Some(map) => non_blank(map.get("HOME").cloned())
+            .or_else(|| non_blank(map.get("USERPROFILE").cloned())),
+        None => non_blank(std::env::var("HOME").ok())
+            .or_else(|| non_blank(std::env::var("USERPROFILE").ok())),
+    }
+}
+
+/// 字符串值去空白后非空才算可用 / trim and treat blank as unset.
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_string())
+        .filter(|trimmed| !trimmed.is_empty())
 }
 
 /// `HOME` 值非空白才算可用 / treat blank HOME as unset.
@@ -11855,6 +11877,16 @@ mod tests {
             .unwrap(),
             process.join("flag.json")
         );
+        // Windows 写法 `~\flag.json`：同样按 `~` 展开（对齐 python expanduser）。
+        assert_eq!(
+            normalize_flag_settings_path_with(
+                Path::new("~\\flag.json"),
+                injected.to_str(),
+                process.to_str()
+            )
+            .unwrap(),
+            injected.join("flag.json")
+        );
         // `~user`：显式失败，不得静默锚到 <cwd>/~user。
         assert!(normalize_flag_settings_path_with(
             Path::new("~alice/flag.json"),
@@ -11869,6 +11901,30 @@ mod tests {
         assert!(
             middle.ends_with(Path::new("conf/~/flag.json")),
             "{middle:?}"
+        );
+    }
+
+    /// #248 复审：`HOME` 缺失/空白时退 `USERPROFILE`（Windows，对齐 python expanduser）。
+    #[test]
+    fn home_lookup_falls_back_to_userprofile() {
+        let mut env = EnvMap::new();
+        env.insert("USERPROFILE".to_string(), r"C:\Users\alice".to_string());
+        assert_eq!(
+            home_lookup(Some(&env)).as_deref(),
+            Some(r"C:\Users\alice"),
+            "HOME 缺失时须用 USERPROFILE"
+        );
+        env.insert("HOME".to_string(), "   ".to_string());
+        assert_eq!(
+            home_lookup(Some(&env)).as_deref(),
+            Some(r"C:\Users\alice"),
+            "HOME 空白视同未设置"
+        );
+        env.insert("HOME".to_string(), "/home/alice".to_string());
+        assert_eq!(
+            home_lookup(Some(&env)).as_deref(),
+            Some("/home/alice"),
+            "HOME 优先于 USERPROFILE"
         );
     }
 
