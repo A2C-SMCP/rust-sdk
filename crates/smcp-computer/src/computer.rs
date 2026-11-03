@@ -568,11 +568,15 @@ pub struct Computer<S: Session> {
     /// `landingRoot` 的 flag 作用域来源；与 `mcp_flag_config` 组成 flag scope 文件对，协议 §2.5-3）。
     ///
     /// 缺省 `None` = 无 flag 层（既有行为不变）。构造期经 [`with_flag_settings_path`](Self::with_flag_settings_path)
-    /// 归一到绝对路径——flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集条目（flag 文件本身
+    /// 归一为绝对路径——flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集条目（flag 文件本身
     /// 必须被 [`Self::path_access_policy`] 挡住）与合并视图三处必须始终指向**同一文件**；否则宿主
-    /// `chdir` 后相对路径会漂移到另一份文件，读授权与拒绝集随 cwd 变化而不一致。
+    /// `chdir` 后相对路径会漂移到另一份文件，读授权与拒绝集随 cwd 变化而不一致。归一失败时本字段
+    /// 保持 `None`（fail-closed），原因见 [`Self::flag_settings_path_error`]。
     /// clone 语义同 `mcp_flag_config`：不可变构造入参，随 `Clone` / `clone_for_handlers` 保留。
     flag_settings_path: Option<PathBuf>,
+    /// #248：`with_flag_settings_path` 归一失败的原因（`Some` = flag 层已 fail-closed 置空，不静默
+    /// 退回相对串 / `<cwd>/~/...`）。CLI 启动边界经 [`Self::flag_settings_path_error`] 取值 `eprintln!`。
+    flag_settings_path_error: Option<String>,
     /// 输入处理器 / Input handler
     input_handler: Arc<RwLock<InputHandler>>,
     /// 自动连接标志 / Auto connect flag
@@ -1006,6 +1010,7 @@ impl<S: Session> Computer<S> {
             embed_servers,
             mcp_flag_config: None,
             flag_settings_path: None,
+            flag_settings_path_error: None,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
             auto_reconnect,
@@ -1199,15 +1204,38 @@ impl<S: Session> Computer<S> {
     /// 的 flag 作用域来源）/ inject the `--settings` flag-layer settings path。
     ///
     /// 与 [`with_mcp_flag_config`](Self::with_mcp_flag_config) 同属 flag scope 文件对（协议 §2.5-3）。
-    /// **构造期绝对化**（前导 `~` 展开 + 相对路径锚定构造期 cwd，对齐 python `Computer._absolute_path`）：
-    /// 拒绝集 / 文件读取 / settings 合并三处必须看到同一路径。`~` 优先用注入 env 的 `HOME`；注入 env
-    /// 未提供 `HOME` 时退回进程 `HOME`（对齐 python `expanduser`），仍不可展开则保留原样并告警
-    /// （fail-closed）。需要 `~` 锚定**注入** HOME 时，请先 [`with_config_env`](Self::with_config_env)
-    /// 再调用本方法。缺省 `None` = 无 flag 层。
+    /// **构造期归一为绝对路径**（对齐 python `Computer._absolute_path`）：拒绝集 / 文件读取 / settings
+    /// 合并三处必须看到同一路径。`~` 优先用注入 env 的 `HOME`（空白视同未设置），其次退回进程 `HOME`；
+    /// 两者皆无、`~user` 形态（rust 无 NSS expanduser）或无法绝对化时 **fail-closed**：flag 层置空，
+    /// 失败原因经 [`flag_settings_path_error`](Self::flag_settings_path_error) 呈现（CLI 启动时
+    /// `eprintln!`），**不**退回相对串或 `<cwd>/~/...` 的错误文件。需要 `~` 锚定**注入** HOME 时，
+    /// 请先 [`with_config_env`](Self::with_config_env) 再调用本方法。缺省 `None` = 无 flag 层。
     #[must_use]
     pub fn with_flag_settings_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.flag_settings_path = Some(absolutize_settings_path(path.into(), self.config_env()));
+        let raw = path.into();
+        match normalize_flag_settings_path(&raw, self.config_env()) {
+            Ok(normalized) => {
+                self.flag_settings_path = Some(normalized);
+                self.flag_settings_path_error = None;
+            }
+            Err(reason) => {
+                let message = format!(
+                    "⚠ flag settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
+                    raw.display()
+                );
+                error!("{message}");
+                self.flag_settings_path = None;
+                self.flag_settings_path_error = Some(message);
+            }
+        }
         self
+    }
+
+    /// #248：`with_flag_settings_path` 的归一失败诊断（`Some` = flag 层已 fail-closed 置空）。
+    ///
+    /// CLI 在启动边界把它打到 stderr；库宿主可自行呈现。成功后恒 `None`。
+    pub fn flag_settings_path_error(&self) -> Option<&str> {
+        self.flag_settings_path_error.as_deref()
     }
 
     /// #214：安装 Computer 级 MCP **最大并发启动数**（构造期策略，`0` 按 `1` 处理）。
@@ -4811,6 +4839,7 @@ impl<S: Session> Computer<S> {
             // #248：flag settings 路径是运行期 readRoots / landingRoot 的 flag 作用域来源——handler 克隆
             // 漏保留会让 wire 路径（client:resolve_path / get_blob）退回 flag-blind（直连生效、wire 不生效）。
             flag_settings_path: self.flag_settings_path.clone(),
+            flag_settings_path_error: self.flag_settings_path_error.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -5165,6 +5194,7 @@ impl<S: Session + Clone> Clone for Computer<S> {
             // #248：公开 Clone 同样是 handler/宿主持有的 Computer 句柄——flag settings 路径 MUST 保留，
             // 否则 clone 出的实例运行期退回 flag-blind（与 clone_for_handlers 同一条不变量）。
             flag_settings_path: self.flag_settings_path.clone(),
+            flag_settings_path_error: self.flag_settings_path_error.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -5340,40 +5370,74 @@ fn resolve_landing_root_settings(
     Some(crate::skills::home::expand_home(raw.trim(), env))
 }
 
-/// 构造期路径 → 绝对路径（前导 `~` 展开 + 相对路径锚定构造期 cwd）。
+/// 构造期归一 flag settings 路径：成功 → 绝对路径；失败 → 原因（调用方 fail-closed 置 `None`）。
+///
+/// 规则：
+/// - 空路径 → 失败；非 UTF-8 → 无 `~` 语义，直接绝对化（失败则报错）。
+/// - 前导 `~` / `~/...`：用注入 env 的 `HOME`（空白视同未设置），其次进程 `HOME`；两者皆无 → 失败
+///   （**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的路径会被当成受信 flag 层）。
+/// - `~user`（前导 `~` 但不是 `~` / `~/`）：rust 无 NSS expanduser → 显式失败，不静默锚到 `<cwd>/~user`。
+/// - 其它（含中段 `~` 的合法相对路径，如 `conf/~/flag.json`）：中段 `~` 只是普通字符，按构造期 cwd
+///   绝对化。
 ///
 /// 对齐 python `Computer._absolute_path`：flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集
-/// 条目与合并视图必须始终指向**同一文件**；相对路径在宿主 `chdir` 后会漂移，三处各看各的文件。
-/// `~` 优先用 `env` 的 `HOME`；`env` 存在但缺 `HOME` 时退回进程 `HOME`（对齐 python `expanduser`），
-/// 两者都没有则保留 `~/...` 原样并 `warn!`（fail-closed：文件读不到 → flag 层为空，不静默指向
-/// `<cwd>/~/...` 的错误路径）。`std::path::absolute` 不访问文件系统、不跟随符号链接；读取期由
-/// canonicalize / dev+ino 身份兜底，安全语义不受影响。
-fn absolutize_settings_path(path: PathBuf, env: Option<&EnvMap>) -> PathBuf {
-    let Some(raw) = path.to_str() else {
-        // 非 UTF-8 路径：无法做 `~` 展开，直接绝对化。
-        let absolute = std::path::absolute(&path);
-        return absolute.unwrap_or(path);
-    };
-    let mut expanded = crate::skills::home::expand_home(raw, env);
-    if env.is_some() && has_literal_tilde(&expanded) {
-        // 注入 env 缺 HOME（如仅 XDG_CONFIG_HOME）：退回进程 HOME，避免 `<cwd>/~/...` 的错误文件。
-        expanded = crate::skills::home::expand_home(raw, None);
-    }
-    if has_literal_tilde(&expanded) {
-        warn!(
-            path = %expanded.display(),
-            "flag settings path has an unexpandable `~` (no HOME); keeping as-is (fail-closed)"
-        );
-        return expanded;
-    }
-    let absolute = std::path::absolute(&expanded);
-    absolute.unwrap_or(expanded)
+/// 条目与合并视图必须始终指向**同一文件**；相对路径在宿主 `chdir` 后会漂移。`std::path::absolute`
+/// 不访问文件系统、不跟随符号链接；读取期由 canonicalize / dev+ino 身份兜底，安全语义不受影响。
+fn normalize_flag_settings_path(
+    path: &Path,
+    env: Option<&EnvMap>,
+) -> Result<PathBuf, &'static str> {
+    normalize_flag_settings_path_with(
+        path,
+        home_lookup(env).as_deref(),
+        home_lookup(None).as_deref(),
+    )
 }
 
-/// 路径中是否仍含字面 `~` 分量（`expand_home` 未能展开）/ whether a literal `~` component remains.
-fn has_literal_tilde(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str() == "~")
+/// [`normalize_flag_settings_path`] 的纯逻辑体（HOME 显式注入，覆盖无/空 HOME 三分支测试）。
+fn normalize_flag_settings_path_with(
+    path: &Path,
+    injected_home: Option<&str>,
+    process_home: Option<&str>,
+) -> Result<PathBuf, &'static str> {
+    let Some(raw) = path.to_str() else {
+        // 非 UTF-8：无 `~` 语义，直接绝对化。
+        return std::path::absolute(path).map_err(|_| "path cannot be absolutized");
+    };
+    if raw.trim().is_empty() {
+        return Err("empty path");
+    }
+    let expanded = if raw == "~" || raw.starts_with("~/") {
+        let home = non_empty(injected_home)
+            .or_else(|| non_empty(process_home))
+            .ok_or("`~` cannot be expanded: HOME is unset or empty")?;
+        if raw == "~" {
+            PathBuf::from(home)
+        } else {
+            Path::new(home).join(raw.strip_prefix("~/").unwrap_or_default())
+        }
+    } else if raw.starts_with('~') {
+        return Err("`~user` form is not supported; use an absolute path or `~/...`");
+    } else {
+        // 中段 `~`（如 `conf/~/flag.json`）是普通字符，不是展开语法。
+        PathBuf::from(raw)
+    };
+    std::path::absolute(&expanded).map_err(|_| "path cannot be absolutized")
+}
+
+/// 取非空 HOME（空白视同未设置）/ a non-blank HOME lookup.
+fn home_lookup(env: Option<&EnvMap>) -> Option<String> {
+    let raw = match env {
+        Some(map) => map.get("HOME").cloned(),
+        None => std::env::var("HOME").ok(),
+    }?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// `HOME` 值非空白才算可用 / treat blank HOME as unset.
+fn non_empty(home: Option<&str>) -> Option<&str> {
+    home.filter(|value| !value.trim().is_empty())
 }
 
 /// 构造一次请求的授权快照（读根 + 固定拒绝集）。
@@ -11732,8 +11796,7 @@ mod tests {
         );
     }
 
-    /// #248：构造期绝对化——相对路径锚定构造期 cwd，`~` 用注入 env 展开；两种形态都必须是绝对路径
-    /// （否则拒绝集条目会被 `normalize_path` 判 invalid 静默丢弃）。
+    /// #248：构造期归一——相对路径锚定构造期 cwd，`~` 用注入 env 展开；存储值恒为绝对路径。
     #[test]
     fn test_with_flag_settings_path_absolutizes_at_construction() {
         let relative = PathBuf::from("flag-settings.json");
@@ -11757,6 +11820,83 @@ mod tests {
             Some(home.path().join("flag-settings.json")),
             "`~` 前缀须用注入 env 的 HOME 展开"
         );
+    }
+
+    /// #248 复审 🔴：`~` 兜底三分支——无/空 HOME 与 `~user` 均 fail-closed（不退回相对串 /
+    /// `<cwd>/~/...`），中段 `~` 的合法相对路径照常绝对化。
+    #[test]
+    fn normalize_flag_settings_path_tilde_branches_fail_closed() {
+        // 空路径 / 无 HOME / 空 HOME：不得退回相对串或 <cwd>/~/...
+        assert!(normalize_flag_settings_path_with(Path::new(""), None, None).is_err());
+        assert!(normalize_flag_settings_path_with(Path::new("~/flag.json"), None, None).is_err());
+        assert!(
+            normalize_flag_settings_path_with(Path::new("~/flag.json"), Some(""), Some("  "))
+                .is_err()
+        );
+        // 注入 HOME 优先；注入 HOME 空白时退回进程 HOME。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let injected = tmp.path().join("injected");
+        let process = tmp.path().join("process");
+        assert_eq!(
+            normalize_flag_settings_path_with(
+                Path::new("~/flag.json"),
+                injected.to_str(),
+                process.to_str()
+            )
+            .unwrap(),
+            injected.join("flag.json")
+        );
+        assert_eq!(
+            normalize_flag_settings_path_with(
+                Path::new("~/flag.json"),
+                Some("   "),
+                process.to_str()
+            )
+            .unwrap(),
+            process.join("flag.json")
+        );
+        // `~user`：显式失败，不得静默锚到 <cwd>/~user。
+        assert!(normalize_flag_settings_path_with(
+            Path::new("~alice/flag.json"),
+            Some("/home/a"),
+            Some("/home/a")
+        )
+        .is_err());
+        // 中段 `~` 是普通字符：合法相对路径照常绝对化。
+        let middle = normalize_flag_settings_path_with(Path::new("conf/~/flag.json"), None, None)
+            .expect("middle ~ must not be treated as tilde expansion");
+        assert!(middle.is_absolute(), "{middle:?}");
+        assert!(
+            middle.ends_with(Path::new("conf/~/flag.json")),
+            "{middle:?}"
+        );
+    }
+
+    /// #248 复审 🔴/🟡：builder 对不可用输入 fail-closed（存储 `None`）并经公开访问器给出诊断；
+    /// 中段 `~` 正常存储绝对路径且无诊断。
+    #[test]
+    fn with_flag_settings_path_fails_closed_and_reports_unusable_input() {
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_flag_settings_path("~alice/flag.json");
+        assert!(
+            computer.flag_settings_path.is_none(),
+            "`~user` 须 fail-closed"
+        );
+        assert!(
+            computer
+                .flag_settings_path_error()
+                .is_some_and(|message| message.contains("~user")),
+            "失败原因须经公开访问器可见：{:?}",
+            computer.flag_settings_path_error()
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_flag_settings_path("conf/~/flag.json");
+        assert!(computer.flag_settings_path_error().is_none());
+        let stored = computer
+            .flag_settings_path
+            .expect("middle ~ is a legal relative path");
+        assert!(stored.is_absolute(), "{stored:?}");
     }
 
     #[tokio::test]

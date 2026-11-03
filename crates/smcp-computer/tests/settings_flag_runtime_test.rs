@@ -115,6 +115,57 @@ fn settings_show_still_reports_flag_validation_errors() {
     );
 }
 
+/// 撤诊断反转覆盖**畸形值**：`readRoots` / `landingRoot` 类型错误照常呈现（stderr 含字段名），
+/// 且不得出现「not applied at runtime」（show / get 同类）。
+#[test]
+fn malformed_flag_values_are_reported_without_ineffective_diagnostic() {
+    let dir = tempdir().unwrap();
+    let flag = dir.path().join("flag-settings.json");
+    fs::write(&flag, r#"{"readRoots":123,"landingRoot":123}"#).unwrap();
+
+    for scope in ["flag", "merged"] {
+        let output = run(
+            dir.path(),
+            &flag,
+            &["settings", "show", "--scope", scope, "--json"],
+        );
+        let stderr = stderr_lines(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "scope={scope}; stderr={stderr}"
+        );
+        assert_stdout_json(&output);
+        for field in ["readRoots", "landingRoot"] {
+            assert!(
+                stderr.lines().any(|line| line.contains(field)),
+                "scope={scope}：畸形值校验错误须含字段名 {field}；stderr={stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("not applied at runtime"),
+            "scope={scope}：撤除的诊断不得复活；stderr={stderr}"
+        );
+    }
+
+    for key in ["readRoots", "landingRoot"] {
+        let output = run(
+            dir.path(),
+            &flag,
+            &["settings", "get", key, "--scope", "merged", "--json"],
+        );
+        let stderr = stderr_lines(&output);
+        assert!(
+            stderr.lines().any(|line| line.contains(key)),
+            "get {key}：畸形值校验错误须含字段名；stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("not applied at runtime"),
+            "get {key}：撤除的诊断不得复活；stderr={stderr}"
+        );
+    }
+}
+
 /// `settings get <flag key> --scope merged` 同样不告警，且 stdout 是命中值的干净 JSON。
 #[test]
 fn settings_get_merged_has_no_ineffective_diagnostic() {

@@ -624,6 +624,11 @@ fn build_run_computer(
     if let Some(p) = root.flag_path.as_deref() {
         computer = computer.with_flag_settings_path(p);
     }
+    // #248：归一失败（无/空 HOME、`~user`、无法绝对化）→ flag 层已 fail-closed 置空；在 CLI 启动
+    // 边界明确告知（tracing 在 CLI 无 subscriber，不能只靠日志）。库宿主可经同名访问器自取。
+    if let Some(message) = computer.flag_settings_path_error() {
+        eprintln!("{message}");
+    }
     if let Some(max) = args.concurrency {
         computer = computer.with_mcp_start_concurrency(max);
     }
@@ -989,6 +994,30 @@ mod tests {
         assert!(
             roots.iter().any(|root| root.configured == expected),
             "flag 层 readRoots 须经 run_repl 装配生效：{roots:?}"
+        );
+    }
+
+    /// #248 复审 🔴：不可用的 `--settings`（`~user`）须 fail-closed（不加载 flag 层）并给出诊断，
+    /// CLI 启动边界 `eprintln!` 呈现（`build_run_computer` 内）。
+    #[tokio::test]
+    async fn build_run_computer_fails_closed_and_reports_unusable_settings_path() {
+        let args = Args::parse_from(["smcp-computer", "--settings", "~alice/flag.json", "run"]);
+        let root = RootState {
+            flag_path: args.settings.clone(),
+            approve_all_mcp: false,
+        };
+        let computer = build_run_computer(&args, &root, None);
+
+        assert!(
+            computer.read_roots().await.is_empty(),
+            "不可用路径不得以任何形式加载 flag 层"
+        );
+        assert!(
+            computer
+                .flag_settings_path_error()
+                .is_some_and(|message| message.contains("~user")),
+            "失败原因须对 CLI 边界可见：{:?}",
+            computer.flag_settings_path_error()
         );
     }
 }
