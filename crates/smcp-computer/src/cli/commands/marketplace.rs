@@ -1185,11 +1185,17 @@ mod tests {
         let path = trust_path(&env);
         write_trust_file(&path, r#"{"trustedMarketplaces":["a","b"],"keep":1}"#);
         revoke_trust("a", Some(&env)).unwrap();
+        // 紧凑 fixture：若重复 revoke 无条件重写，会被 pretty 格式化 → 字节变化。
+        write_trust_file(&path, r#"{"trustedMarketplaces":["b"],"keep":1}"#);
         let before_mtime = trust_mtime(&path);
         let before_bytes = std::fs::read(&path).unwrap();
         revoke_trust("a", Some(&env)).unwrap();
         assert_eq!(trust_mtime(&path), before_mtime, "重复 revoke 不得写盘");
-        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before_bytes,
+            "重复 revoke 不得重写"
+        );
     }
 
     #[test]

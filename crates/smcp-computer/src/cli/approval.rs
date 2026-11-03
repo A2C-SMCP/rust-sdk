@@ -180,7 +180,7 @@ pub async fn run_mcp_approval<S: Session>(
                         // 本次会话仍挂载，但持久化未生效。
                         if let Some(warning) = approval_persist_warning(
                             approve_all_project_mcp(cwd.as_deref()),
-                            "approval (enableAllProjectMcpServers)",
+                            "approval of enableAllProjectMcpServers",
                             "mounting for this session only",
                         ) {
                             msg_err(&warning);
