@@ -30,7 +30,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use smcp::utils::path_norm::{native_platform, normalize_path, PathPlatform};
 
@@ -387,22 +387,6 @@ fn validate_read_roots_for(
         cleaned.push(Value::String(raw.to_string()));
     }
     (Some(Value::Array(cleaned)), errors)
-}
-
-/// #248：flag scope 中**运行期不生效**的键（rust `Computer` 是库组件，不持有 flag settings 路径）。
-///
-/// `readRoots` / `landingRoot` 仅受信 scope 可设，但 flag 层在 rust 运行期不被读取（与
-/// `Computer::landing_root` 同款）；CLI `settings show --scope flag` 可见，故必须响亮诊断而非静默。
-pub const FLAG_SCOPE_INEFFECTIVE_FIELDS: &[&str] = &[FIELD_READ_ROOTS, FIELD_LANDING_ROOT];
-
-/// 返回 `layer` 中命中 [`FLAG_SCOPE_INEFFECTIVE_FIELDS`] 的键（保持常量顺序）。
-#[must_use]
-pub fn flag_scope_ineffective_fields(layer: &Map<String, Value>) -> Vec<&'static str> {
-    FLAG_SCOPE_INEFFECTIVE_FIELDS
-        .iter()
-        .copied()
-        .filter(|field| layer.contains_key(*field))
-        .collect()
 }
 
 fn validate_enabled_plugins(key: &str, value: &Value, scope: SettingsScope) -> ValidateResult {
@@ -1072,18 +1056,6 @@ mod tests {
         );
         assert_eq!(cleaned.expect("cleaned"), json!([]));
         assert_eq!(errors.len(), 1, "errors={errors:?}");
-    }
-
-    /// #248：flag 层诊断键集——有键→命中（固定顺序），无键→空（不告警）。
-    #[test]
-    fn flag_scope_ineffective_fields_reports_only_present_keys() {
-        let layer = json!({"readRoots": [], "landingRoot": "/x", "other": 1});
-        assert_eq!(
-            flag_scope_ineffective_fields(layer.as_object().unwrap()),
-            vec![FIELD_READ_ROOTS, FIELD_LANDING_ROOT]
-        );
-        let clean = json!({"other": 1});
-        assert!(flag_scope_ineffective_fields(clean.as_object().unwrap()).is_empty());
     }
 
     /// typed round-trip：`readRoots` 以 camelCase 键进出 [`ComputerSettings`]。

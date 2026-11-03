@@ -564,6 +564,15 @@ pub struct Computer<S: Session> {
     /// **回收判据 MUST 含本层**：漏传会让经 `--mcp-config` 声明的用户 server 退回「非用户声明」而被连坐停摘
     /// （#153 遗留缺口形状）。镜像 python `Computer(mcp_flag_config=)`。
     mcp_flag_config: Option<PathBuf>,
+    /// #248：`--settings <file>` 的 **flag 层** settings.json 路径（`Computer` 运行期解析 `readRoots` /
+    /// `landingRoot` 的 flag 作用域来源；与 `mcp_flag_config` 组成 flag scope 文件对，协议 §2.5-3）。
+    ///
+    /// 缺省 `None` = 无 flag 层（既有行为不变）。构造期经 [`with_flag_settings_path`](Self::with_flag_settings_path)
+    /// 归一到绝对路径——flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集条目（flag 文件本身
+    /// 必须被 [`Self::path_access_policy`] 挡住）与合并视图三处必须始终指向**同一文件**；否则宿主
+    /// `chdir` 后相对路径会漂移到另一份文件，读授权与拒绝集随 cwd 变化而不一致。
+    /// clone 语义同 `mcp_flag_config`：不可变构造入参，随 `Clone` / `clone_for_handlers` 保留。
+    flag_settings_path: Option<PathBuf>,
     /// 输入处理器 / Input handler
     input_handler: Arc<RwLock<InputHandler>>,
     /// 自动连接标志 / Auto connect flag
@@ -996,6 +1005,7 @@ impl<S: Session> Computer<S> {
             mcp_input_resolve_lock: Arc::new(Mutex::new(())),
             embed_servers,
             mcp_flag_config: None,
+            flag_settings_path: None,
             input_handler: Arc::new(RwLock::new(InputHandler::new())),
             auto_connect,
             auto_reconnect,
@@ -1182,6 +1192,21 @@ impl<S: Session> Computer<S> {
     #[must_use]
     pub fn with_mcp_flag_config(mut self, path: impl Into<PathBuf>) -> Self {
         self.mcp_flag_config = Some(path.into());
+        self
+    }
+
+    /// #248：注入 `--settings <file>` 的 flag 层 settings.json 路径（运行期 `readRoots` / `landingRoot`
+    /// 的 flag 作用域来源）/ inject the `--settings` flag-layer settings path。
+    ///
+    /// 与 [`with_mcp_flag_config`](Self::with_mcp_flag_config) 同属 flag scope 文件对（协议 §2.5-3）。
+    /// **构造期绝对化**（前导 `~` 展开 + 相对路径锚定构造期 cwd，对齐 python `Computer._absolute_path`）：
+    /// 拒绝集 / 文件读取 / settings 合并三处必须看到同一路径。`~` 优先用注入 env 的 `HOME`；注入 env
+    /// 未提供 `HOME` 时退回进程 `HOME`（对齐 python `expanduser`），仍不可展开则保留原样并告警
+    /// （fail-closed）。需要 `~` 锚定**注入** HOME 时，请先 [`with_config_env`](Self::with_config_env)
+    /// 再调用本方法。缺省 `None` = 无 flag 层。
+    #[must_use]
+    pub fn with_flag_settings_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.flag_settings_path = Some(absolutize_settings_path(path.into(), self.config_env()));
         self
     }
 
@@ -1951,7 +1976,8 @@ impl<S: Session> Computer<S> {
     ///
     /// 优先 `with_landing_root` 注入覆盖；否则从 settings `landingRoot` 取（绝对路径；project scope
     /// 供给已被 [`TRUSTED_SCOPE_ONLY_FIELDS`](crate::settings::schema::TRUSTED_SCOPE_ONLY_FIELDS)
-    /// 过滤）。未配置 → `None` → store fail-closed（`4019 forbidden`，零字节落盘）。
+    /// 过滤；flag 层经 [`with_flag_settings_path`](Self::with_flag_settings_path) 同源参与，rust-sdk#248）。
+    /// 未配置 → `None` → store fail-closed（`4019 forbidden`，零字节落盘）。
     pub async fn landing_root(&self) -> Option<PathBuf> {
         if let Some(override_root) = self.landing_root_override.clone() {
             return Some(override_root);
@@ -1960,7 +1986,11 @@ impl<S: Session> Computer<S> {
         if let Some(cached) = slot.as_ref() {
             return Some(cached.clone());
         }
-        if let Some(root) = resolve_landing_root_settings(&self.config_dir(), self.config_env()) {
+        if let Some(root) = resolve_landing_root_settings(
+            &self.config_dir(),
+            self.config_env(),
+            self.flag_settings_path.as_deref(),
+        ) {
             *slot = Some(root.clone());
             return Some(root);
         }
@@ -2078,27 +2108,39 @@ impl<S: Session> Computer<S> {
     /// `client:resolve_path` 的授权读根（settings 键 `readRoots`，**默认空 = 不可读**）。
     ///
     /// 每次请求**现算**（settings 可能被另一进程改写、root 符号链接可能换指向）；空根在
-    /// path core 第 2 步即 `forbidden`，不触碰目标路径。
+    /// path core 第 2 步即 `forbidden`，不触碰目标路径。`flag_settings_path` 非 `None` 时 flag 层
+    /// 一并参与合并（受信 scope，rust-sdk#248）。
     pub async fn read_roots(&self) -> Vec<ReadRoot> {
         let config_dir = self.config_dir();
         let env = self.config_env().cloned();
-        tokio::task::spawn_blocking(move || resolve_read_roots(&config_dir, env.as_ref()))
-            .await
-            .unwrap_or_default()
+        let flag_settings_path = self.flag_settings_path.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_read_roots(&config_dir, env.as_ref(), flag_settings_path.as_deref())
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// 一次请求的授权快照（读根 + 固定拒绝集），供 resolve / pull 共用。
     ///
-    /// 空 `readRoots` 时短路拒绝集构造（fail-closed，且不产生 SKILL Home 副作用）。
+    /// 空 `readRoots` 时短路拒绝集构造（fail-closed，且不产生 SKILL Home 副作用）。flag 层
+    /// （`flag_settings_path`）参与读根 / landingRoot 合并，且 flag settings 文件本身进入固定
+    /// 拒绝集（rust-sdk#248，与 python `_build_protected_paths` 对齐）。
     pub async fn path_access_policy(&self) -> PathAccessPolicy {
         let config_dir = self.config_dir();
         let env = self.config_env().cloned();
+        let flag_settings_path = self.flag_settings_path.clone();
         // 一次 settings 解析同时得读根 + landingRoot；空根直接短路，不构造拒绝集。
         let (roots, settings_landing) = {
             let config_dir = config_dir.clone();
             let env = env.clone();
+            let flag_settings_path = flag_settings_path.clone();
             tokio::task::spawn_blocking(move || {
-                resolve_read_roots_and_landing_root(&config_dir, env.as_ref())
+                resolve_read_roots_and_landing_root(
+                    &config_dir,
+                    env.as_ref(),
+                    flag_settings_path.as_deref(),
+                )
             })
             .await
             .unwrap_or_default()
@@ -2134,6 +2176,7 @@ impl<S: Session> Computer<S> {
                 blob_cache_root,
                 landing_root,
                 flag_mcp_config.as_deref(),
+                flag_settings_path.as_deref(),
                 native_platform(),
             )
         })
@@ -4765,6 +4808,9 @@ impl<S: Session> Computer<S> {
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
             mcp_flag_config: self.mcp_flag_config.clone(),
+            // #248：flag settings 路径是运行期 readRoots / landingRoot 的 flag 作用域来源——handler 克隆
+            // 漏保留会让 wire 路径（client:resolve_path / get_blob）退回 flag-blind（直连生效、wire 不生效）。
+            flag_settings_path: self.flag_settings_path.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -5116,6 +5162,9 @@ impl<S: Session + Clone> Clone for Computer<S> {
             // Computer 上跑 #139 回收判据时 embed 面静默消失 → 重开「误回收 embed」缺口。同理 flag 层路径。
             embed_servers: self.embed_servers.clone(),
             mcp_flag_config: self.mcp_flag_config.clone(),
+            // #248：公开 Clone 同样是 handler/宿主持有的 Computer 句柄——flag settings 路径 MUST 保留，
+            // 否则 clone 出的实例运行期退回 flag-blind（与 clone_for_handlers 同一条不变量）。
+            flag_settings_path: self.flag_settings_path.clone(),
             input_handler: Arc::clone(&self.input_handler),
             auto_connect: self.auto_connect,
             auto_reconnect: self.auto_reconnect,
@@ -5269,21 +5318,19 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
 /// 与 python `landing_root` 属性同构：`~` 前缀经 [`expand_home`](crate::skills::home::expand_home)
 /// 展开（尊重注入 env，保持 hermetic）；非字符串 / 空值 → `None`（fail-closed）。
 ///
-/// **有意分叉（🟡2 确认）/ Deliberate divergence**: `flag_settings_path` 恒 `None`——rust
-/// `Computer` 是库组件，运行态**不持有** flag 文件路径（flag scope 仅在 CLI 命令上下文经
-/// `--settings <file>` 注入，见 `cli/commands`），与 rust 全部其它 runtime settings 解析点
-/// 一致；python `Computer(flag_settings_path=...)` 构造参数由 CLI 注入（`_resolve_declared_settings`
-/// 会并入 flag 层）。即 `landingRoot` 的 flag scope 声明在 rust 下不可见（有意取舍：flag
-/// 层声明走 CLI 直连的 settings 命令视图，非本属性职责）。
+/// `flag_settings_path`（`--settings <file>`）非 `None` 时 flag 层一并参与合并——flag 是
+/// `landingRoot` 的受信 scope（protocol#65，rust-sdk#248）。**缓存语义保持**：`Computer::landing_root`
+/// 仍是「已解析且已配置 → 进程内缓存；未配置 → 每次重查」，运行期改 settings 的生效时机不变。
 fn resolve_landing_root_settings(
     config_dir: &std::path::Path,
     env: Option<&EnvMap>,
+    flag_settings_path: Option<&Path>,
 ) -> Option<PathBuf> {
     let policy = resolve_policy_settings(None, None, None);
     let resolved = resolve_settings(ResolveSettingsArgs {
         cwd: Some(config_dir),
         env,
-        flag_settings_path: None,
+        flag_settings_path,
         policy_settings: Some(&policy),
     });
     let raw = resolved.settings.get(FIELD_LANDING_ROOT)?.as_str()?;
@@ -5291,6 +5338,42 @@ fn resolve_landing_root_settings(
         return None;
     }
     Some(crate::skills::home::expand_home(raw.trim(), env))
+}
+
+/// 构造期路径 → 绝对路径（前导 `~` 展开 + 相对路径锚定构造期 cwd）。
+///
+/// 对齐 python `Computer._absolute_path`：flag 文件的读取（每次请求按 settings cwd 解析）、拒绝集
+/// 条目与合并视图必须始终指向**同一文件**；相对路径在宿主 `chdir` 后会漂移，三处各看各的文件。
+/// `~` 优先用 `env` 的 `HOME`；`env` 存在但缺 `HOME` 时退回进程 `HOME`（对齐 python `expanduser`），
+/// 两者都没有则保留 `~/...` 原样并 `warn!`（fail-closed：文件读不到 → flag 层为空，不静默指向
+/// `<cwd>/~/...` 的错误路径）。`std::path::absolute` 不访问文件系统、不跟随符号链接；读取期由
+/// canonicalize / dev+ino 身份兜底，安全语义不受影响。
+fn absolutize_settings_path(path: PathBuf, env: Option<&EnvMap>) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        // 非 UTF-8 路径：无法做 `~` 展开，直接绝对化。
+        let absolute = std::path::absolute(&path);
+        return absolute.unwrap_or(path);
+    };
+    let mut expanded = crate::skills::home::expand_home(raw, env);
+    if env.is_some() && has_literal_tilde(&expanded) {
+        // 注入 env 缺 HOME（如仅 XDG_CONFIG_HOME）：退回进程 HOME，避免 `<cwd>/~/...` 的错误文件。
+        expanded = crate::skills::home::expand_home(raw, None);
+    }
+    if has_literal_tilde(&expanded) {
+        warn!(
+            path = %expanded.display(),
+            "flag settings path has an unexpandable `~` (no HOME); keeping as-is (fail-closed)"
+        );
+        return expanded;
+    }
+    let absolute = std::path::absolute(&expanded);
+    absolute.unwrap_or(expanded)
+}
+
+/// 路径中是否仍含字面 `~` 分量（`expand_home` 未能展开）/ whether a literal `~` component remains.
+fn has_literal_tilde(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "~")
 }
 
 /// 构造一次请求的授权快照（读根 + 固定拒绝集）。
@@ -5308,6 +5391,7 @@ fn build_path_access_policy(
     blob_cache_root: PathBuf,
     landing_root: Option<PathBuf>,
     flag_mcp_config: Option<&Path>,
+    flag_settings_file: Option<&Path>,
     platform: PathPlatform,
 ) -> PathAccessPolicy {
     if roots.is_empty() {
@@ -5334,6 +5418,11 @@ fn build_path_access_policy(
     }
     if let Some(flag_mcp_config) = flag_mcp_config {
         extra.push(flag_mcp_config.to_path_buf());
+    }
+    // flag 层 settings.json（`--settings`）与 `--mcp-config` 同属 flag scope 文件对：可含 readRoots /
+    // landingRoot / 治理声明，必须在拒绝集内（与 python `_build_protected_paths` 对齐，rust-sdk#248）。
+    if let Some(flag_settings_file) = flag_settings_file {
+        extra.push(flag_settings_file.to_path_buf());
     }
 
     let protected = build_protected_paths(&extra, landing_root.as_deref(), env, platform);
@@ -11387,6 +11476,287 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.reason, ResolveReason::Forbidden);
         assert_eq!(error.stage, "protected_set");
+    }
+
+    /// #248：`--settings`（flag 层）必须驱动**运行期** `readRoots` / `landingRoot`——flag root 可读、
+    /// project scope 仍拒、`landing_root` 取 flag 值；缺省 `None` 保持 flag-blind（既有行为）。
+    #[tokio::test]
+    async fn test_computer_flag_settings_drives_runtime_roots_and_landing() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let landing = tmp.path().join("landing");
+        let proj = tmp.path().join("proj");
+        for dir in [&home, &share, &landing] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        fs::create_dir_all(proj.join(".tfrobot")).unwrap();
+        // project scope：协议 MUST 不生效（即使 flag 层同时存在）。
+        let evil = tmp.path().join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(
+            proj.join(".tfrobot").join("settings.json"),
+            serde_json::json!({"readRoots": [evil.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+        let visible = share.join("hello.txt");
+        fs::write(&visible, b"flag root").unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({
+                "readRoots": [share.to_string_lossy()],
+                "landingRoot": landing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env.clone())
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        assert!(
+            !computer.read_roots().await.is_empty(),
+            "flag readRoots 须生效"
+        );
+        let resolved = computer
+            .resolve_read_path(visible.to_str().unwrap())
+            .await
+            .expect("flag 层 readRoots 内的文件应可读");
+        assert_eq!(resolved.total_size, 9);
+        assert_eq!(
+            computer.landing_root().await.as_deref(),
+            Some(landing.as_path()),
+            "flag 层 landingRoot 须生效"
+        );
+        // project scope 仍 MUST 被拒绝（flag 呈现场合不改变该门控）。
+        let error = computer
+            .resolve_read_path(evil.join("x.txt").to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+
+        // 缺省（None）保持既有 flag-blind 行为：不传路径时 flag 声明不可见。
+        let blind = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_dir(&proj)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        assert!(blind.read_roots().await.is_empty());
+        assert!(blind.landing_root().await.is_none());
+    }
+
+    /// #248：flag settings 文件本身必须进入固定拒绝集（与 python `_build_protected_paths` 对齐）——
+    /// 即使它位于某条 readRoot 内，也不得经 `resolve_path` / `get_blob` 读出（内容含 readRoots /
+    /// landingRoot / 治理声明）。
+    #[tokio::test]
+    async fn test_computer_flag_settings_file_is_protected() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        for dir in [&home, &share] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        // flag 文件放在 readRoot 目录内：路径前缀围栏会放行，只有拒绝集能挡。
+        let flag = share.join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({"readRoots": [share.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        let error = computer
+            .resolve_read_path(flag.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
+    }
+
+    /// #248：flag 层 `landingRoot` 必须驱动 `.part` 保护（`.part` 规则对准实际写入根）。
+    #[tokio::test]
+    async fn test_computer_flag_landing_root_drives_part_protection() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        let landing = share.join("landing");
+        for dir in [&home, &share, &landing] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let part = landing.join("upload.part");
+        fs::write(&part, b"partial").unwrap();
+        let ok = landing.join("done.txt");
+        fs::write(&ok, b"done").unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({
+                "readRoots": [share.to_string_lossy()],
+                "landingRoot": landing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        // `.part` 在 landing 内 → 拒绝；同目录普通文件 → 放行（证明围栏不是整目录拒绝）。
+        let error = computer
+            .resolve_read_path(part.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, ResolveReason::Forbidden);
+        assert_eq!(error.stage, "protected_set");
+        computer
+            .resolve_read_path(ok.to_str().unwrap())
+            .await
+            .expect("landing 内非 .part 文件应可读");
+    }
+
+    /// #248：公开 `Clone` 与 handler 克隆（`clone_for_handlers`）都必须保留 flag settings 路径——
+    /// 否则 wire 路径（`ComputerHandlerOps`）退回 flag-blind：直连生效、handler 不生效。
+    #[tokio::test]
+    async fn test_computer_clone_and_handler_clone_preserve_flag_settings_path() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        for dir in [&home, &share] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let visible = share.join("hello.txt");
+        fs::write(&visible, b"hello").unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        fs::write(
+            &flag,
+            serde_json::json!({"readRoots": [share.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_skill_home(&home)
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_flag_settings_path(&flag);
+
+        let cloned = computer.clone();
+        assert_eq!(cloned.flag_settings_path, computer.flag_settings_path);
+        cloned
+            .resolve_read_path(visible.to_str().unwrap())
+            .await
+            .expect("公开 clone 须保留 flag settings 路径");
+
+        // handler 克隆 = socketio-detached 的 `Arc<dyn ComputerHandlerOps>`，wire 路径实际持有者。
+        let handler_clone = computer.clone_for_handlers();
+        assert_eq!(
+            handler_clone.flag_settings_path,
+            computer.flag_settings_path
+        );
+        let via_ops =
+            ComputerHandlerOps::resolve_read_path(&handler_clone, visible.to_str().unwrap())
+                .await
+                .expect("handler 克隆须保留 flag settings 路径（wire 不得 flag-blind）");
+        assert_eq!(
+            via_ops.canonical_path,
+            computer
+                .resolve_read_path(visible.to_str().unwrap())
+                .await
+                .unwrap()
+                .canonical_path
+        );
+    }
+
+    /// #248：构造期绝对化——相对路径锚定构造期 cwd，`~` 用注入 env 展开；两种形态都必须是绝对路径
+    /// （否则拒绝集条目会被 `normalize_path` 判 invalid 静默丢弃）。
+    #[test]
+    fn test_with_flag_settings_path_absolutizes_at_construction() {
+        let relative = PathBuf::from("flag-settings.json");
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_flag_settings_path(&relative);
+        let stored = computer.flag_settings_path.expect("path stored");
+        assert!(stored.is_absolute(), "相对路径须绝对化：{stored:?}");
+        assert_eq!(stored, std::path::absolute(&relative).unwrap());
+
+        let home = tempfile::TempDir::new().unwrap();
+        let mut env = EnvMap::new();
+        env.insert(
+            "HOME".to_string(),
+            home.path().to_string_lossy().into_owned(),
+        );
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env)
+            .with_flag_settings_path("~/flag-settings.json");
+        assert_eq!(
+            computer.flag_settings_path,
+            Some(home.path().join("flag-settings.json")),
+            "`~` 前缀须用注入 env 的 HOME 展开"
+        );
     }
 
     #[tokio::test]

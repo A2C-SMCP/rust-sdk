@@ -1,15 +1,13 @@
-// #248：flag scope `readRoots` / `landingRoot` 运行期不生效诊断（真实二进制）。
+// #248：flag 层 readRoots / landingRoot 已由运行期消费——`settings show/get` 不得再报
+// 「not applied at runtime」（#251 诊断随 seam 落地撤除）。
 #![cfg(feature = "cli")]
 
 /*!
-* 文件名: settings_flag_diag_test.rs
-* 描述: rust `Computer` 运行期不读取 flag settings，故 flag 层的 `readRoots` / `landingRoot`
-*       不会生效（fail-closed）。GA 前不得静默：`settings show --scope flag|merged` 与
-*       `settings get --scope merged` 必须在 stderr 明确提示「not applied at runtime」，
-*       且 stdout 仍是干净 JSON。
-*
-* 锚定真实二进制与真实 flag 文件（`--settings`），路径取宿主平台原生绝对路径
-* （Windows 用盘符形态，避免被校验器按 POSIX 丢弃造成假绿）。
+* 文件名: settings_flag_runtime_test.rs
+* 描述: rust `Computer` 运行期已读取 flag settings（`--settings`）的 `readRoots` / `landingRoot`
+*       （rust-sdk#248）。此前 #251 的诊断在 `settings show/get --scope flag|merged` 上打
+*       「not applied at runtime」；本测试锚定**反转**：stdout 仍是干净 JSON、stderr 不再出现该
+*       诊断文案，且普通 flag 层校验错误仍照常呈现（不静默）。
 */
 
 use std::fs;
@@ -48,9 +46,9 @@ fn stderr_lines(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// flag 层出现 `readRoots` / `landingRoot` → `--scope flag` 与默认 `merged` 均须**按字段**告警。
+/// `settings show --scope flag|merged`：值可见、exit 0、stderr **无**「not applied at runtime」。
 #[test]
-fn flag_keys_are_diagnosed_on_flag_and_merged_views() {
+fn settings_show_no_longer_reports_flag_scope_as_ineffective() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("data");
     fs::create_dir_all(&root).unwrap();
@@ -74,25 +72,52 @@ fn flag_keys_are_diagnosed_on_flag_and_merged_views() {
             Some(0),
             "scope={scope}; stderr={stderr}"
         );
-        assert_stdout_json(&output);
+        let value = assert_stdout_json(&output);
         assert!(
-            stderr
-                .lines()
-                .any(|l| l.contains("readRoots") && l.contains("not applied at runtime")),
-            "scope={scope}：stderr 缺 readRoots 诊断；stderr={stderr}"
+            value.get("readRoots").is_some(),
+            "scope={scope}：flag 值应仍可见：{value}"
         );
         assert!(
-            stderr
-                .lines()
-                .any(|l| l.contains("landingRoot") && l.contains("not applied at runtime")),
-            "scope={scope}：stderr 缺 landingRoot 诊断；stderr={stderr}"
+            !stderr.contains("not applied at runtime"),
+            "scope={scope}：诊断已撤除，不得再报运行期不生效；stderr={stderr}"
         );
     }
 }
 
-/// `settings get <flag key> --scope merged` 同样告警，且 stdout 是命中值的干净 JSON。
+/// 撤除的仅是「运行期不生效」诊断；普通 flag 层校验错误（scope 越权 / 字段判废）仍须照常呈现
+/// （决策保留项，stderr 呈现且不污染 stdout JSON）。
 #[test]
-fn settings_get_merged_reports_flag_diagnostic() {
+fn settings_show_still_reports_flag_validation_errors() {
+    let dir = tempdir().unwrap();
+    let flag = dir.path().join("flag-settings.json");
+    // `allowedMcpServers` 是 policy-only：出现于 flag scope → 过滤 + 记错（#143 既有契约）。
+    fs::write(&flag, r#"{"allowedMcpServers":["x"]}"#).unwrap();
+
+    let output = run(
+        dir.path(),
+        &flag,
+        &["settings", "show", "--scope", "flag", "--json"],
+    );
+    let stderr = stderr_lines(&output);
+    assert_eq!(output.status.code(), Some(0), "stderr={stderr}");
+    let value = assert_stdout_json(&output);
+    assert!(
+        value.get("allowedMcpServers").is_none(),
+        "policy-only 字段须被过滤：{value}"
+    );
+    assert!(
+        stderr.lines().any(|l| l.contains("allowedMcpServers")),
+        "普通 flag 层校验错误须照常呈现：stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("not applied at runtime"),
+        "撤除的诊断不得复活：{stderr}"
+    );
+}
+
+/// `settings get <flag key> --scope merged` 同样不告警，且 stdout 是命中值的干净 JSON。
+#[test]
+fn settings_get_merged_has_no_ineffective_diagnostic() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("data");
     fs::create_dir_all(&root).unwrap();
@@ -120,32 +145,7 @@ fn settings_get_merged_reports_flag_diagnostic() {
         "merged get 应命中 flag 层值：{value}"
     );
     assert!(
-        stderr
-            .lines()
-            .any(|l| l.contains("readRoots") && l.contains("not applied at runtime")),
-        "stderr 缺诊断：{stderr}"
+        !stderr.contains("not applied at runtime"),
+        "stderr 不得再报运行期不生效：{stderr}"
     );
-}
-
-/// flag 层无这两个键 → 不产生该诊断文案；exit 0 且 stdout 干净。
-#[test]
-fn flag_without_ineffective_keys_has_no_diagnostic() {
-    let dir = tempdir().unwrap();
-    let flag = dir.path().join("flag-settings.json");
-    fs::write(&flag, r#"{"strictKnownMarketplaces":true}"#).unwrap();
-
-    for scope in ["flag", "merged"] {
-        let output = run(
-            dir.path(),
-            &flag,
-            &["settings", "show", "--scope", scope, "--json"],
-        );
-        let stderr = stderr_lines(&output);
-        assert_eq!(output.status.code(), Some(0), "scope={scope}");
-        assert_stdout_json(&output);
-        assert!(
-            !stderr.contains("not applied at runtime"),
-            "scope={scope} 不应告警；stderr={stderr}"
-        );
-    }
 }

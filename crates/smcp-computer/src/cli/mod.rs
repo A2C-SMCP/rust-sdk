@@ -595,29 +595,44 @@ async fn dispatch_skill(action: SkillCmd) -> i32 {
 }
 
 // ── REPL 运行模式 / REPL run mode ─────────────────────────────────────────────
-/// 返回进程退出码：身份存储等**启动致命**错误非零（protocol#64），其余保持既有非阻塞行为。
-async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) -> i32 {
-    let session = SilentSession::new("cli-session");
+/// 从 CLI 参数装配 REPL 用的 `Computer`（`run_repl` 与回归测试共用）。
+///
+/// 接线三类宿主显式输入：
+/// - `--mcp-config`（flag 层 mcp.json，§2.5-5）：回收判据的「非用户声明」集须含 flag 层声明，
+///   否则该层声明的用户 server 会在 plugin uninstall/disable/gc 时被连坐停摘（#153 缺口形状）。
+/// - `--settings`（flag 层 settings.json）：运行期 `readRoots` / `landingRoot` 的 flag 作用域来源
+///   （rust-sdk#248）；此前只在 CLI 命令视图里生效、运行期 flag-blind。
+/// - `--concurrency`（#214）：宿主显式注入的运行时策略（不落盘；缺省 = 串行，行为不变）。
+///
+/// 抽独立函数使「`--settings` 真进入 Computer」可被单测覆盖（`run_repl` 末尾进交互循环、不可直接测）。
+fn build_run_computer(
+    args: &Args,
+    root: &RootState,
+    mcp_config: Option<&Path>,
+) -> Computer<SilentSession> {
     let mut computer = Computer::new(
         "friday_hands",
-        session,
+        SilentSession::new("cli-session"),
         None,
         None,
         args.auto_connect,
         args.auto_reconnect,
     );
-    // #139：把 `--mcp-config`（flag 层）作为**当次 boot 的声明式输入**绑到 Computer 上——回收判据的
-    // 「非用户声明」集据此包含 flag 层声明，否则经 `--mcp-config` 声明的用户 server 会在 plugin
-    // uninstall/disable/gc 时被连坐停摘（§2.5-5 / #153 缺口形状）。
-    if let Some(ref p) = mcp_config {
-        computer = computer.with_mcp_flag_config(p.clone());
+    if let Some(p) = mcp_config {
+        computer = computer.with_mcp_flag_config(p.to_path_buf());
     }
-    // #214：`--concurrency` 为宿主显式注入的运行时策略（不落盘；缺省 = 串行，行为不变）。
-    // 单启 / `start all` / 治理恢复共享该 Computer 级上限。
+    if let Some(p) = root.flag_path.as_deref() {
+        computer = computer.with_flag_settings_path(p);
+    }
     if let Some(max) = args.concurrency {
         computer = computer.with_mcp_start_concurrency(max);
     }
-    let computer = computer;
+    computer
+}
+
+/// 返回进程退出码：身份存储等**启动致命**错误非零（protocol#64），其余保持既有非阻塞行为。
+async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) -> i32 {
+    let computer = build_run_computer(args, root, mcp_config.as_deref());
 
     let cli_config = commands::CliConfig {
         url: args.url.clone(),
@@ -926,5 +941,54 @@ mod tests {
             &RootState::default(),
         );
         assert_eq!(code, EXIT_USER_ERROR);
+    }
+
+    /// #248：`run_repl` 的 Computer 装配必须把 `--settings` 接线到 `with_flag_settings_path`——
+    /// 否则 CLI 传了 flag 文件、运行期仍 flag-blind（settings show 可见但 readRoots / landingRoot 不生效）。
+    #[tokio::test]
+    async fn build_run_computer_wires_settings_flag_into_runtime_resolver() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        let share = tmp.path().join("share");
+        for dir in [&home, &share] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::create_dir_all(xdg.join("a2c")).unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(
+            &flag,
+            serde_json::json!({"readRoots": [share.to_string_lossy()]}).to_string(),
+        )
+        .unwrap();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            tmp.path().join("state").to_string_lossy().into_owned(),
+        );
+
+        let args = Args::parse_from(["smcp-computer", "--settings", flag.to_str().unwrap(), "run"]);
+        let root = RootState {
+            flag_path: args.settings.clone(),
+            approve_all_mcp: false,
+        };
+        let computer = build_run_computer(&args, &root, None).with_config_env(env);
+
+        // 路径字段私有：以运行期 resolve 结果证明 `--settings` 已接线（否则 flag-blind 时为空）。
+        let roots = computer.read_roots().await;
+        // `configured` 是 canonical 形态（Windows 宿主为 `/C:/...`），不能与原生串直接比，统一过
+        // `normalize_path` 再比较（与 blob/path_resolver 既有测试同口径）。
+        use smcp::utils::path_norm::{native_platform, normalize_path};
+        let expected = normalize_path(share.to_str().unwrap(), native_platform()).unwrap();
+        assert!(
+            roots.iter().any(|root| root.configured == expected),
+            "flag 层 readRoots 须经 run_repl 装配生效：{roots:?}"
+        );
     }
 }
