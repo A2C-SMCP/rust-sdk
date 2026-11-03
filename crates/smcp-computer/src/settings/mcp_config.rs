@@ -987,16 +987,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cwd = tmp.path().join("wd");
         let path = local_settings(&cwd);
-        approve_mcp_server("s", Some(&cwd)).unwrap();
+        // 紧凑 fixture：若发生无条件重写，会被 pretty 格式化 → 字节变化（不只依赖 mtime）。
+        write(&path, r#"{"enabledMcpjsonServers":["s"],"keep":1}"#);
         let before_mtime = settings_mtime(&path);
         let before_bytes = fs::read(&path).unwrap();
         approve_mcp_server("s", Some(&cwd)).unwrap();
         assert_eq!(settings_mtime(&path), before_mtime, "重复 approve 不得写盘");
-        assert_eq!(fs::read(&path).unwrap(), before_bytes);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before_bytes,
+            "重复 approve 不得重写"
+        );
+        write(&path, r#"{"disabledMcpjsonServers":["s"],"keep":1}"#);
+        let before_mtime = settings_mtime(&path);
+        let before_bytes = fs::read(&path).unwrap();
         deny_mcp_server("s", Some(&cwd)).unwrap();
-        deny_mcp_server("s", Some(&cwd)).unwrap();
-        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["disabledMcpjsonServers"], json!(["s"]));
+        assert_eq!(settings_mtime(&path), before_mtime, "重复 deny 不得写盘");
+        assert_eq!(fs::read(&path).unwrap(), before_bytes, "重复 deny 不得重写");
     }
 
     #[test]
@@ -1008,12 +1015,16 @@ mod tests {
         let before = fs::read(&path).unwrap();
         assert!(approve_all_project_mcp(Some(&cwd)).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
-        // 修复畸形值后：首次写 true，再写同值 → no-op。
+        // 修复畸形值后首次写 true。
         write(&path, "{}");
         approve_all_project_mcp(Some(&cwd)).unwrap();
+        // 紧凑 fixture：已 true 时 no-op；若重写会被 pretty 格式化 → 字节变化。
+        write(&path, r#"{"enableAllProjectMcpServers":true,"keep":1}"#);
         let before_mtime = settings_mtime(&path);
+        let before_bytes = fs::read(&path).unwrap();
         approve_all_project_mcp(Some(&cwd)).unwrap();
         assert_eq!(settings_mtime(&path), before_mtime, "已 true → 不得写盘");
+        assert_eq!(fs::read(&path).unwrap(), before_bytes, "已 true → 不得重写");
     }
 
     #[test]
@@ -1027,10 +1038,16 @@ mod tests {
         assert_eq!(saved["enabledPlugins"]["x@mp"], json!("weird"));
         assert_eq!(saved["enabledPlugins"]["a@mp"], json!(true));
         assert_eq!(saved["keep"], json!(1));
-        // 同值重复 approve → 不写盘。
+        // 紧凑 fixture + 同值重复 approve → 不写盘（若重写会被 pretty 格式化）。
+        write(
+            &path,
+            r#"{"enabledPlugins":{"a@mp":true,"x@mp":"weird"},"keep":1}"#,
+        );
         let before_mtime = settings_mtime(&path);
+        let before_bytes = fs::read(&path).unwrap();
         approve_bundled_plugin("a@mp", Some(&cwd)).unwrap();
         assert_eq!(settings_mtime(&path), before_mtime);
+        assert_eq!(fs::read(&path).unwrap(), before_bytes);
         // 目标容器非对象 → 拒绝且字节不变。
         write(&path, r#"{"enabledPlugins":[]}"#);
         let before = fs::read(&path).unwrap();

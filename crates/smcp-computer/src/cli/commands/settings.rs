@@ -277,6 +277,7 @@ pub fn settings_set(
 
     // #245 / #253：**strict raw 保真 RMW**——不回写校验视图；corrupt 文件拒绝写盘、原文件不变。
     // 目标键是 object 值时先校验既有父键类型（非对象 → fail-closed，不静默物化覆盖）。
+    // 仅校验顶层目标键；嵌套子键仍按 apply_write 深合并（与 Python 物化语义一致）。
     let updated = raw_write::update_raw_settings(&path, enum_ == SettingsScope::Project, |map| {
         if parsed.is_object() {
             raw_write::ensure_object_container(map, key, &path)?;

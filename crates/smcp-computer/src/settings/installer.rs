@@ -786,6 +786,12 @@ pub async fn uninstall_plugin(
                 // best-effort 清 user scope 残留旗（存在性守卫：无旗则不触碰文件）。
                 if let Err(e) = clear_enabled_plugin(plugin_id, "user", None, env) {
                     tracing::warn!(plugin = plugin_id, error = %e, "uninstall: clear dangling enabledPlugins failed");
+                    // #253：CLI 未安装 tracing subscriber——best-effort 清理失败必须对用户可见，
+                    // 否则 stale flag 会静默残留（下次重装继承 true）。
+                    #[cfg(feature = "cli")]
+                    eprintln!(
+                        "warning: failed to clear enabledPlugins[{plugin_id}] in user scope: {e}; settings file left unchanged"
+                    );
                 }
                 tracing::info!(
                     plugin = plugin_id,
@@ -911,6 +917,10 @@ pub async fn uninstall_plugin(
     for (scope, project_path) in &scopes_to_clear {
         if let Err(e) = clear_enabled_plugin(plugin_id, scope, project_path.as_deref(), env) {
             tracing::warn!(plugin = plugin_id, scope = %scope, error = %e, "uninstall: clear enabledPlugins failed (stale flag may 残留)");
+            #[cfg(feature = "cli")]
+            eprintln!(
+                "warning: failed to clear enabledPlugins[{plugin_id}] in {scope} scope: {e}; settings file left unchanged"
+            );
         }
     }
 
