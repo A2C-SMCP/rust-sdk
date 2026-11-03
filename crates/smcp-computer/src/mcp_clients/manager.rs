@@ -9114,6 +9114,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forced_disconnect_failure_converges_remembered_before_early_return() {
+        // #254 复审测试缺口：remembered 收敛位于 `disconnect_result?` 之前——强制 disconnect 失败时
+        // 也必须已收敛为 Disconnected，下一次 start 的首个投影不得是假 `(Started, Connected)`。
+        // （`restart_after_stop...` 只覆盖成功 stop，抓不住 disconnect Err 的提前返回回退。）
+        let status = Arc::new(RuntimeStatus::new());
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        inject_mock_factory(&manager).await;
+        let bundle_id = bid("forced-stop-seq");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("forced-stop-seq", Some("forced-stop-seq")),
+        );
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        // 模拟「曾连接成功」的 remembered——它是 disconnect Err 提前返回后产生假 Connected 的来源。
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+        manager.active_clients.write().await.insert(
+            bundle_id.clone(),
+            Arc::new(AuthErrClient {
+                msg: "n/a".into(),
+                disconnect_error: true,
+            }),
+        );
+
+        let error = manager
+            .stop_client_by_id(&bundle_id)
+            .await
+            .expect_err("a real disconnect failure must still surface as Err");
+        assert!(error.to_string().contains("Failed to disconnect"));
+        assert_eq!(
+            manager
+                .connection_states
+                .read()
+                .await
+                .get(&bundle_id)
+                .copied(),
+            Some(MCPServerConnectionState::Disconnected),
+            "remembered must converge before the early return on disconnect Err"
+        );
+
+        let mut rx = status.subscribe();
+        manager
+            .start_client_by_id(&bundle_id)
+            .await
+            .expect("start after a failed disconnect must succeed");
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, first) = changes.first().expect("start must publish status events");
+        assert_eq!(first.activation, MCPServerActivationState::Started);
+        assert_ne!(
+            first.connection,
+            MCPServerConnectionState::Connected,
+            "first event after a failed stop must not be a false (Started, Connected)"
+        );
+    }
+
+    #[tokio::test]
     async fn restart_after_stop_does_not_publish_false_connected() {
         // #254 复审：stop 后 remembered 必须已收敛 Disconnected——下一次 start 的首个投影不得是
         // 未经真实连接的 (Started, Connected)。
