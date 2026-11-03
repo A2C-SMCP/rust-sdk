@@ -10,6 +10,8 @@
 * CLI 错误经 `msg_err` / `err_flat` 输出到 **stdout**（不是 stderr），断言按 stdout。
 */
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -17,20 +19,12 @@ use std::time::SystemTime;
 
 use tempfile::tempdir;
 
-/// 子进程隔离 env：HOME + XDG_CONFIG_HOME 指向 tempdir。
-fn isolated_env(home: &Path) -> Vec<(&'static str, std::path::PathBuf)> {
-    vec![
-        ("HOME", home.to_path_buf()),
-        ("XDG_CONFIG_HOME", home.join("xdg-config")),
-    ]
-}
-
 fn run_set(dir: &Path, key: &str, value: &str, scope: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
         .args(["settings", "set", key, value, "--scope", scope, "--json"])
         .current_dir(dir)
         .env_clear()
-        .envs(isolated_env(dir))
+        .envs(common::isolated_binary_env(dir))
         .output()
         .expect("smcp-computer binary runs")
 }
@@ -41,7 +35,7 @@ fn run_set_plain(dir: &Path, key: &str, value: &str, scope: &str) -> Output {
         .args(["settings", "set", key, value, "--scope", scope])
         .current_dir(dir)
         .env_clear()
-        .envs(isolated_env(dir))
+        .envs(common::isolated_binary_env(dir))
         .output()
         .expect("smcp-computer binary runs")
 }
@@ -161,8 +155,6 @@ fn set_read_roots_project_without_json_warns_on_stderr_253() {
 
 #[test]
 fn set_same_value_is_noop_and_does_not_touch_file() {
-    let dir = tempdir().unwrap();
-    let path = project_settings(dir.path());
     let dir = tempdir().unwrap();
     let path = project_settings(dir.path());
     fs::write(&path, r#"{"maxConcurrency":7,"keepUnknown":{"k":1}}"#).unwrap();

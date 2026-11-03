@@ -177,7 +177,7 @@ pub fn settings_show(
     };
     // #143：scope 越权被过滤的字段在此有解释（打 stderr，不污染 stdout 的 JSON）。
     for line in super::format_settings_errors(&errors) {
-        eprintln!("{line}");
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
     print_json(&Value::Object(data));
     EXIT_OK
@@ -211,7 +211,7 @@ pub fn settings_get(
     // （文件里明明写了，却被安全策略过滤谎报成「你没配」）。故在判 key 命中之前先经 stderr 解释。
     // 对齐 settings_show 与 python-sdk#157（emit 置于 key 判空之前）；stdout JSON 契约不变。
     for line in super::format_settings_errors(&errors) {
-        eprintln!("{line}");
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
     let Some(value) = data.get(key) else {
         return err(
