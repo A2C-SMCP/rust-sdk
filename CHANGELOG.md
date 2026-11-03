@@ -2,6 +2,79 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-11-03
+
+### Bug Fixes
+
+- *(computer)* Cancel startup wait during shutdown
+- Scope session names by office
+- *(server)* Trust session room for leave_office
+- Box room ack errors for clippy
+- Harden stdio initialization cleanup
+- *(computer)* 有界等待 stderr drain，去掉 stdio 测试的线程串行化
+- *(ci)* 补齐 CI 门禁——rustdoc 私有链接 + hyper 集成测试的空 ack 断言
+- *(agent,server,computer)* 落实 PR#225 架构复审（4 项 blocking + 10 项建议）
+- *(server)* 无房 client:* 按协议回 flat 4103（Not In Room）
+- *(agent)* 自动重连后恢复 Office 成员关系（#219）
+- *(agent)* Close replaced connections and serialize office state publication
+- *(agent)* Make connection cancellation and office recovery safe
+- *(computer)* Honor CLI socket join identity with reconnect (#224)
+- *(computer)* Clear retired socket slots after teardown errors
+- Preserve Office updates and invalidate calls across reconnects (#231)
+- *(computer)* [**breaking**] #234 自动回房 4101 有界退避重试（镜像 python#212） (#239)
+- *(smcp)* #245 PR2a 遗留收口（installer raw 保真 + #248 flag 诊断） (#251)
+- *(computer)* #256 拒绝集目录/landing 前缀大小写折叠（protocol#76） (#257)
+- *(computer)* #254 MCP client teardown 韧性（S1 manager 诚实性 + S2 SSE 任务所有权） (#261)
+- *(computer)* #248 复审收尾——flag/mcp-config 信任路径归一与 fail-closed 补齐 (#264)
+
+### Documentation
+
+- *(test)* Diagnose macOS artifact-directory timeout failures (#229)
+
+### Features
+
+- *(smcp-agent)* Add cancellable tool calls
+- *(computer)* Configure stdio initialization timeout
+- *(computer)* Add stdio initialization diagnostics (#194)
+- *(smcp-server-core)* Isolate office rooms and validate acks
+- Unify room ack and error contracts
+- *(server,agent)* 房间 ack 契约闭环 — 落实 PR#225 复审 blocking（#226）
+- Complete session contracts and incremental update recovery
+- *(room)* [**breaking**] 一房至多一台 Computer——每 role 一席 / 4101 泛化 / 4105 收回为预留码（#232）(#233)
+- *(smcp)* #241 PR1 computer_id 类型与 Agent 编译面 (#243)
+- *(computer)* #241 PR2 Computer 身份持久化与入房携带 (#244)
+- *(smcp)* #245 PR1 client:resolve_path 事件管道与 4020 (#249)
+- *(server)* #241 PR3 computer_id Server 强制校验、回显与场景 #10–#21 (#246)
+- *(smcp)* #245 PR2a canonical_path 规范化 + readRoots 配置/围栏基础 (#247)
+- *(computer)* #245 PR2b path 句柄、九步 resolve 管线与 client:resolve_path（protocol#65） (#250)
+- *(computer)* #241 PR4 身份重置 SDK/CLI 与崩溃窗口恢复 (#252)
+- *(computer)* #248 flag scope 最小 seam（运行期 readRoots/landingRoot + 撤 #251 诊断） (#260)
+- *(computer)* #253 settings 写入 strict raw RMW 与 corrupt fail-closed（PR-A） (#262)
+
+### Miscellaneous Tasks
+
+- *(computer)* #240 PR-A 注释订正与回房测试判别修正 (#242)
+- *(ci)* 发版前置——clippy all-features 门禁修复 + publish 失败不再被吞 (#258)
+- *(ci)* 清零 clippy 基线红，cargo clippy-workspace 全绿 (#265)
+
+### Testing
+
+- *(agent)* Assert synchronous office recovery before leaving
+- *(computer)* #235 auth_error 4006 三景补传输级 isError 断言（全字段口径）
+- *(computer)* #237 env_segment 向量溯源改为协议 vendored 副本
+- *(computer)* #245 PR3 resolve_path 集成、真实链路与 python 对拍 (#255)
+- *(computer)* #240 PR-B 迟到 ACK 分类单测与 CLI 取消提示 outcome (#259)
+- *(computer)* #254 补复审测试缺口（强制断开回退 / 请求饥饿 / lifecycle POST 序列） (#263)
+- *(computer)* #253 A+ 跟进——文档/告警可见性与测试补强 (#266)
+
+### Build
+
+- Integrate released transport 0.9.3
+
+### Ci
+
+- Serialize stdio integration tests
+
 ## [0.4.1] - 2026-08-28
 
 ### Breaking Changes
