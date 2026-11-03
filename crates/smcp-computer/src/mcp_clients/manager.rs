@@ -123,6 +123,17 @@ async fn withdraw_bundle_tool_routes(
     before != (routes.len(), disabled.len(), projection.len())
 }
 
+/// 启动早退探查结果（#254 S1）/ Result of probing an existing active-client entry before a start。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveEntryState {
+    /// 无活跃 entry / No active entry.
+    Absent,
+    /// 活跃 entry 的 live 状态为 `Connected`（幂等命中）/ Entry is live-connected (idempotent hit).
+    Connected,
+    /// 活跃 entry 已 stale，已移除并撤销路由 / Stale entry was retired and its routes were withdrawn.
+    Retired,
+}
+
 /// client factory 类型（#152 测试接缝）/ client factory type（test seam）。
 ///
 /// [`MCPServerManager::start_client_by_id`] 默认用自由函数 [`client_factory`]
@@ -510,9 +521,15 @@ impl MCPServerManager {
 
         // 配置更新应保留控制面的启动意图，即使数据面正等待 OAuth。
         let was_started = self.activation_intents.read().await.contains(&bundle_id);
-        let was_connected = self.active_clients.read().await.contains_key(&bundle_id);
+        let had_active_entry = self.active_clients.read().await.contains_key(&bundle_id);
+        // #254 复审：门控看 **live state**，不看成员关系——健康重连失败遗留的 stale entry
+        // （live Disconnected）不得再以「is started」阻止配置更新。`state()` 在锁外调用。
+        let live_connected = {
+            let client = { self.active_clients.read().await.get(&bundle_id).cloned() };
+            client.is_some_and(|client| client.state() == ClientState::Connected)
+        };
 
-        if was_connected {
+        if live_connected {
             let auto_reconnect = *self.auto_reconnect.read().await;
             if !auto_reconnect {
                 return Err(ComputerError::InvalidConfiguration(format!(
@@ -534,12 +551,9 @@ impl MCPServerManager {
                     ComputerError::ConnectionError(format!("failed to drain OAuth flow: {error}"))
                 })?;
         }
-        if was_connected {
+        if had_active_entry {
+            // 含 stale entry：先清退数据面（inner 会在 fallible refresh 之前收敛 remembered）。
             self.disconnect_client_by_id_inner(&bundle_id).await?;
-            self.connection_states
-                .write()
-                .await
-                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
 
         // 更新配置（原地更新：同 bundle_id 覆盖）/ Update configuration (update-in-place by bundle_id)
@@ -557,7 +571,7 @@ impl MCPServerManager {
 
         // 检查是否需要自动连接 / Check if need auto connect
         let auto_connect = *self.auto_connect.read().await;
-        if was_connected || auto_connect {
+        if live_connected || auto_connect {
             self.start_client_by_id_inner(&bundle_id).await?;
         } else if was_started {
             // Replacing an authorization-blocked server must retire the old OAuth capability
@@ -678,6 +692,65 @@ impl MCPServerManager {
         Ok(())
     }
 
+    /// 探查并清退 stale 活跃 entry（#254 S1）。
+    ///
+    /// 启动幂等判定一律看 **live state**（[`MCPClientProtocol::state`]），不看 `active_clients` 成员关系：
+    /// 健康重连失败会留下 live=`Disconnected`、remembered=`Error` 的死 entry，成员早退会谎报成功。
+    ///
+    /// 清退顺序：remove + generation bump 在 `active_clients` 写锁内完成；**释放写锁后**才 withdraw 路由——
+    /// 路由刷新的提交锁序是 tool 四表 → `active_clients.read()`（[`Self::refresh_tool_routes_observations`]），
+    /// 持 `active_clients.write()` 等 tool 锁会 ABBA（既有 OAuth health 分支同样先 drop 再 withdraw）。
+    ///
+    /// 本 helper **不 fire、不改 remembered**：调用点随后写 `Connecting` 并 fire（或 stop 已在更早处
+    /// 发布 `Stopped`），保证事件流与快照同源。
+    async fn inspect_and_retire_stale_active_client(
+        &self,
+        bundle_id: &BundleId,
+    ) -> ActiveEntryState {
+        loop {
+            let client = {
+                let clients = self.active_clients.read().await;
+                clients.get(bundle_id).cloned()
+            };
+            let Some(client) = client else {
+                return ActiveEntryState::Absent;
+            };
+            // `state()` 的 try_read 失败会走 block_in_place —— 必须在任何 manager 锁之外调用。
+            if client.state() == ClientState::Connected {
+                return ActiveEntryState::Connected;
+            }
+
+            let retired = {
+                let mut clients = self.active_clients.write().await;
+                if !clients
+                    .get(bundle_id)
+                    .is_some_and(|current| StdArc::ptr_eq(current, &client))
+                {
+                    // 并发替换（如 `clear_all` 不经 per-bundle lifecycle 锁）：重新探查，避免双启动。
+                    false
+                } else {
+                    clients.remove(bundle_id);
+                    let mut generations = self.active_client_generations.write().await;
+                    bump_active_client_generation(&mut generations, bundle_id);
+                    true
+                }
+            };
+            if !retired {
+                continue;
+            }
+
+            withdraw_bundle_tool_routes(
+                &self.tool_routes,
+                &self.disabled_tools,
+                &self.tool_projection,
+                &self.tool_owners,
+                bundle_id,
+            )
+            .await;
+            return ActiveEntryState::Retired;
+        }
+    }
+
     /// Start from a freshly materialized configuration while preserving idempotent-start semantics.
     ///
     /// The per-server lifecycle lock is held before deciding whether materialization is needed, so
@@ -706,7 +779,15 @@ impl MCPServerManager {
                 "Unknown server bundle_id: {bundle_id}"
             )));
         }
-        if self.active_clients.read().await.contains_key(bundle_id) {
+        // #254 S1：幂等命中只看 **live state**（Connected）。stale entry 不在此清退——retire 会改变
+        // `project_one` 的 live→remembered 回退（Disconnected → Error），而下面 materialize / OAuth
+        // retire / 配置替换均可失败；若提前清退且随后失败，事件流会停留在旧投影、破坏 #186 resync。
+        // 清退推后到 `start_client_by_id_inner`（materialize 之后），其后紧接着写 Connecting + fire。
+        let live_entry = {
+            let clients = self.active_clients.read().await;
+            clients.get(bundle_id).cloned()
+        };
+        if live_entry.is_some_and(|client| client.state() == ClientState::Connected) {
             return Ok(false);
         }
         if disabled {
@@ -805,14 +886,18 @@ impl MCPServerManager {
         // 检查是否已连接 / Check if already connected
         // 读 guard 须先放再 fire：#186 投影发布会重读 `active_clients`，持读锁跨 fire 与他任务
         // 排队的写锁构成 ABBA 死锁（同「fire 不得在 manager 锁内调用」不变量）。
-        let already_connected = self.active_clients.read().await.contains_key(bundle_id);
-        if already_connected {
-            self.connection_states
-                .write()
-                .await
-                .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
-            self.fire_projected_if_changed(bundle_id).await;
-            return Ok(()); // 已经启动 / Already started
+        // #254 S1：以 live state 为准——Connected 才是幂等命中；stale（如健康重连失败遗留的
+        // Disconnected entry）先移除 + generation bump + 撤路由，再走下面的真实启动。
+        match self.inspect_and_retire_stale_active_client(bundle_id).await {
+            ActiveEntryState::Connected => {
+                self.connection_states
+                    .write()
+                    .await
+                    .insert(bundle_id.clone(), MCPServerConnectionState::Connected);
+                self.fire_projected_if_changed(bundle_id).await;
+                return Ok(()); // 已经启动 / Already started
+            }
+            ActiveEntryState::Absent | ActiveEntryState::Retired => {}
         }
 
         self.connection_states
@@ -893,6 +978,16 @@ impl MCPServerManager {
                 .await
                 .insert(bundle_id.clone(), connection);
             self.fire_projected_if_changed(bundle_id).await;
+            // #254 S1：失败路径不得残留路由——stale 清退已撤一次，这里幂等兜底（失败后诊断/投影
+            // 由上面的 Error fire 如实保留，不被任何假成功清除）。
+            withdraw_bundle_tool_routes(
+                &self.tool_routes,
+                &self.disabled_tools,
+                &self.tool_projection,
+                &self.tool_owners,
+                bundle_id,
+            )
+            .await;
             return Err(match error {
                 MCPClientError::HttpAuthentication(error) => {
                     ComputerError::HttpAuthentication(error)
@@ -950,6 +1045,17 @@ impl MCPServerManager {
     async fn stop_client_by_id_inner(&self, bundle_id: &BundleId) -> Result<bool, ComputerError> {
         let was_started = self.activation_intents.write().await.remove(bundle_id);
         self.fire_projected_if_changed(bundle_id).await;
+
+        // #254 复审：只有确有启动意图或活动客户端时才收敛 remembered（未知 bundle_id 不得凭空造
+        // `connection_states` 条目）。无活动客户端时在此写；有客户端时由
+        // `disconnect_client_by_id_inner` 在 fallible refresh 之前写。
+        if was_started && !self.active_clients.read().await.contains_key(bundle_id) {
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
+        }
+
         let was_connected = self.disconnect_client_by_id_inner(bundle_id).await?;
 
         if was_started || was_connected {
@@ -980,15 +1086,53 @@ impl MCPServerManager {
         };
         let was_active = client.is_some();
 
-        // 断开连接 / Disconnect
-        if let Some(ref mut c) = client {
-            c.disconnect().await.map_err(|e| {
-                ComputerError::ConnectionError(format!(
-                    "Failed to disconnect from {}: {}",
-                    bundle_id, e
-                ))
-            })?;
+        // #254 S1：先撤路由再 fallible disconnect——旧序在 disconnect 失败时 `?` 早退，路由会停留在
+        // 旧表。锁序：此刻不持 `active_clients` 锁（上面移除块的 guard 已释放）。
+        withdraw_bundle_tool_routes(
+            &self.tool_routes,
+            &self.disabled_tools,
+            &self.tool_projection,
+            &self.tool_owners,
+            bundle_id,
+        )
+        .await;
+
+        // 断开连接 / Disconnect。按 live state 决策（#254 决策：Connected/Error 才尝试 disconnect；
+        // Disconnected 视为已停并返回 Ok；真实 disconnect 失败仍上抛）。
+        // 注：`ClientState::Error` 目前仅由死代码 keep-alive 写入，生产传输不可达；若 S5 使其可达，
+        // 传输侧 `can_disconnect`（仅 Connected）的状态守卫会拒绝并由本分支如实上抛，届时随 S5 统一。
+        let disconnect_result = if let Some(ref mut c) = client {
+            match c.state() {
+                ClientState::Connected | ClientState::Error => c.disconnect().await.map_err(|e| {
+                    ComputerError::ConnectionError(format!(
+                        "Failed to disconnect from {}: {}",
+                        bundle_id, e
+                    ))
+                }),
+                ClientState::Initialized | ClientState::Disconnected => {
+                    debug!(
+                        "Server bundle_id={} is already stopped (live state {}); skip disconnect",
+                        bundle_id,
+                        c.state()
+                    );
+                    Ok(())
+                }
+            }
+        } else {
+            Ok(())
+        };
+
+        // #254 复审：remembered 收敛放在 fallible `refresh_structural_tool_routes` **之前**（也覆盖
+        // disconnect Err）——否则下一次 start 的首个投影仍会沿用旧 remembered，先发假 `(Started, Connected)`
+        // 再发 Connecting。仅确有活动 entry 时写，未知 bundle_id 不造条目。
+        if was_active {
+            self.connection_states
+                .write()
+                .await
+                .insert(bundle_id.clone(), MCPServerConnectionState::Disconnected);
         }
+
+        disconnect_result?;
 
         // 刷新工具路由（幂等，无论是否停到都保持路由一致）/ Refresh tool routes
         self.refresh_structural_tool_routes().await?;
@@ -8386,7 +8530,16 @@ mod tests {
             Ok(())
         }
         async fn disconnect(&self) -> Result<(), MCPClientError> {
-            *self.state.write().unwrap() = ClientState::Disconnected;
+            // 镜像真实传输的状态守卫（base_client.rs:187-190 / 243-257）：仅 Connected 可断开。
+            // 否则 pre-fix 的 stop 谎报测试会因「无条件 Ok」假绿（#254 S1 红测试前提）。
+            let mut state = self.state.write().unwrap();
+            if *state != ClientState::Connected {
+                return Err(MCPClientError::ConnectionError(format!(
+                    "Cannot disconnect in state: {}",
+                    *state
+                )));
+            }
+            *state = ClientState::Disconnected;
             Ok(())
         }
         async fn list_tools(&self) -> Result<Vec<Tool>, MCPClientError> {
@@ -8571,6 +8724,464 @@ mod tests {
         assert_eq!(last.bundle_id, bundle_id);
         assert_eq!(last.activation, MCPServerActivationState::Started);
         assert_eq!(last.connection, MCPServerConnectionState::Connected);
+    }
+
+    // =========================================================================
+    // #254 S1：teardown / start 诚实性（健康重连失败后的 stale entry）
+    // =========================================================================
+
+    /// 触发一次健康重连失败并停止监控：(manager, bundle_id, 旧 client)。
+    /// 等待 live=Disconnected 且 remembered=Error 落定，避免与监控任务竞态。
+    async fn drive_health_reconnect_failure(
+        status: &Arc<RuntimeStatus>,
+        id: &str,
+        client: LiveStateClient,
+    ) -> (MCPServerManager, BundleId, Arc<LiveStateClient>) {
+        let ready = client.health_ready.clone();
+        let release = client.health_release.clone();
+        let (manager, bundle_id, client) = health_ready_manager(status, id, client).await;
+
+        let inspected = ready.notified();
+        manager.start_health_monitor().await;
+        tokio::time::timeout(Duration::from_secs(2), inspected)
+            .await
+            .expect("health monitor did not inspect the client");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let live_disconnected = client.state() == ClientState::Disconnected;
+                let remembered_error = manager
+                    .connection_states
+                    .read()
+                    .await
+                    .get(&bundle_id)
+                    .copied()
+                    == Some(MCPServerConnectionState::Error);
+                if live_disconnected && remembered_error {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("health reconnect failure did not settle");
+        manager.stop_health_monitor().await;
+        (manager, bundle_id, client)
+    }
+
+    /// 为该 bundle 播一条路由 / 所有者 / 禁用名 / 投影。
+    /// `withdraw_bundle_tool_routes` 的 names 集由 routes ∪ owners 推导，故两者都要 seed。
+    async fn seed_bundle_routes(manager: &MCPServerManager, bundle_id: &BundleId, exposed: &str) {
+        manager.tool_routes.write().await.insert(
+            exposed.to_string(),
+            ExposedToolRoute {
+                bundle_id: bundle_id.clone(),
+                server_name: bundle_id.as_str().to_string(),
+                original_tool_name: "echo".to_string(),
+                alias: None,
+            },
+        );
+        manager
+            .tool_owners
+            .write()
+            .await
+            .insert(exposed.to_string(), bundle_id.clone());
+        let disabled = format!("{exposed}__disabled");
+        manager
+            .disabled_tools
+            .write()
+            .await
+            .insert(disabled.clone());
+        manager
+            .tool_owners
+            .write()
+            .await
+            .insert(disabled, bundle_id.clone());
+        manager
+            .tool_projection
+            .write()
+            .await
+            .insert(exposed.to_string(), serde_json::json!({ "name": "echo" }));
+    }
+
+    async fn assert_bundle_routes_withdrawn(
+        manager: &MCPServerManager,
+        bundle_id: &BundleId,
+        exposed: &str,
+    ) {
+        assert!(!manager.tool_routes.read().await.contains_key(exposed));
+        assert!(!manager.tool_projection.read().await.contains_key(exposed));
+        assert!(!manager.tool_owners.read().await.contains_key(exposed));
+        assert!(!manager
+            .disabled_tools
+            .read()
+            .await
+            .contains(&format!("{exposed}__disabled")));
+        assert!(manager
+            .tool_routes
+            .read()
+            .await
+            .values()
+            .all(|route| route.bundle_id != *bundle_id));
+    }
+
+    fn fresh_live_state_client() -> Arc<LiveStateClient> {
+        Arc::new(live_state_client(
+            false,
+            &Arc::new(tokio::sync::Notify::new()),
+            &Arc::new(tokio::sync::Notify::new()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn health_reconnect_failure_then_stop_is_ok_and_withdraws_routes() {
+        // #254 S1：重连失败（live Disconnected / remembered Error）后 stop 必须如实 Ok，且路由已撤。
+        let status = Arc::new(RuntimeStatus::new());
+        let (manager, bundle_id, _stale) = drive_health_reconnect_failure(
+            &status,
+            "health-stop",
+            live_state_client(
+                true,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+        seed_bundle_routes(&manager, &bundle_id, "health-stop__echo").await;
+        // 锚定 `was_active`：去掉预置 activation intent，stop 的回执只能来自 stale active entry。
+        manager.activation_intents.write().await.remove(&bundle_id);
+
+        let stopped = manager
+            .stop_client_by_id(&bundle_id)
+            .await
+            .expect("stop after a failed reconnect must be an honest Ok");
+        assert!(stopped, "stopping a stale active entry must report true");
+        assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
+        assert_bundle_routes_withdrawn(&manager, &bundle_id, "health-stop__echo").await;
+    }
+
+    #[tokio::test]
+    async fn health_reconnect_failure_then_close_is_ok() {
+        // #254 S1：同一 stale 终态下 shutdown/close 不得因 stop_all 的假失败而 Err。
+        let status = Arc::new(RuntimeStatus::new());
+        let (manager, bundle_id, _stale) = drive_health_reconnect_failure(
+            &status,
+            "health-close",
+            live_state_client(
+                true,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+
+        manager
+            .close()
+            .await
+            .expect("close after a failed reconnect must be Ok");
+        assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
+    }
+
+    #[tokio::test]
+    async fn start_after_health_reconnect_failure_really_reconnects() {
+        // #254 S1：stale 早退必须改为「移除 + generation bump + 真实启动」。
+        let status = Arc::new(RuntimeStatus::new());
+        let (manager, bundle_id, stale) = drive_health_reconnect_failure(
+            &status,
+            "health-restart",
+            live_state_client(
+                true,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+        let fresh = fresh_live_state_client();
+        let fresh_for_factory: StdArc<dyn MCPClientProtocol> = fresh.clone();
+        manager
+            .set_client_factory(Some(Arc::new(move |_, _| fresh_for_factory.clone())))
+            .await;
+        let generation_before = manager
+            .active_client_generations
+            .read()
+            .await
+            .get(&bundle_id)
+            .copied()
+            .unwrap_or_default();
+
+        manager
+            .start_client_by_id(&bundle_id)
+            .await
+            .expect("start after a failed reconnect must really reconnect");
+        let active = manager
+            .active_clients
+            .read()
+            .await
+            .get(&bundle_id)
+            .cloned()
+            .expect("a fresh client must be inserted");
+        let stale_dyn: StdArc<dyn MCPClientProtocol> = stale.clone();
+        assert!(
+            !StdArc::ptr_eq(&active, &stale_dyn),
+            "the stale entry must be replaced, not silently reused"
+        );
+        assert_eq!(active.state(), ClientState::Connected);
+        assert_eq!(
+            fresh.connect_calls.load(Ordering::SeqCst),
+            1,
+            "start must issue a real connect (no false early exit)"
+        );
+        let generation_after = manager
+            .active_client_generations
+            .read()
+            .await
+            .get(&bundle_id)
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            generation_after > generation_before,
+            "retire + reinsert must bump the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_after_health_reconnect_failure_errors_and_keeps_error() {
+        // #254 S1：stale 上的真实启动失败必须如实 Err；诊断保留为 Error，路由不得残留。
+        let status = Arc::new(RuntimeStatus::new());
+        let (manager, bundle_id, _stale) = drive_health_reconnect_failure(
+            &status,
+            "health-err",
+            live_state_client(
+                true,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+        seed_bundle_routes(&manager, &bundle_id, "health-err__echo").await;
+        let factory: ClientFactory =
+            Arc::new(|_, _| Arc::new(super::test_support::ConnectFailClient));
+        manager.set_client_factory(Some(factory)).await;
+
+        let result = manager.start_client_by_id(&bundle_id).await;
+        assert!(result.is_err(), "start must not report a false success");
+        assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
+        let runtime = manager.get_server_runtime_statuses().await;
+        let row = runtime.iter().find(|r| r.bundle_id == bundle_id).unwrap();
+        assert_eq!(row.activation, MCPServerActivationState::Started);
+        assert_eq!(
+            row.connection,
+            MCPServerConnectionState::Error,
+            "a failed real start must keep an honest Error diagnostic"
+        );
+        assert_bundle_routes_withdrawn(&manager, &bundle_id, "health-err__echo").await;
+    }
+
+    #[tokio::test]
+    async fn materialized_start_returns_ok_false_only_for_live_connected() {
+        // #254 S1：materialized 早退只看 live state——Connected 才是幂等 Ok(false)。
+        let status = Arc::new(RuntimeStatus::new());
+        let (manager, bundle_id, client) = health_ready_manager(
+            &status,
+            "mat-connected",
+            live_state_client(
+                false,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+        assert_eq!(client.state(), ClientState::Connected);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let cfg = stdio_cfg_with_bundle("mat-connected", Some("mat-connected"));
+        let started = manager
+            .start_client_by_id_materialized(&bundle_id, false, move || async move {
+                calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ComputerError>(cfg)
+            })
+            .await
+            .expect("idempotent materialized start must succeed");
+        assert!(
+            !started,
+            "a live Connected entry is an idempotent Ok(false)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "idempotent start must not materialize"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_start_replaces_stale_client() {
+        // #254 S1：stale entry 不是幂等命中——必须 materialize 并真实启动。
+        let status = Arc::new(RuntimeStatus::new());
+        let (manager, bundle_id, stale) = health_ready_manager(
+            &status,
+            "mat-stale",
+            live_state_client(
+                false,
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(tokio::sync::Notify::new()),
+            ),
+        )
+        .await;
+        *stale.state.write().unwrap() = ClientState::Disconnected;
+        manager
+            .connection_states
+            .write()
+            .await
+            .insert(bundle_id.clone(), MCPServerConnectionState::Error);
+        seed_bundle_routes(&manager, &bundle_id, "mat-stale__echo").await;
+
+        let fresh = fresh_live_state_client();
+        let fresh_for_factory: StdArc<dyn MCPClientProtocol> = fresh.clone();
+        manager
+            .set_client_factory(Some(Arc::new(move |_, _| fresh_for_factory.clone())))
+            .await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let cfg = stdio_cfg_with_bundle("mat-stale", Some("mat-stale"));
+        let started = manager
+            .start_client_by_id_materialized(&bundle_id, false, move || async move {
+                calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ComputerError>(cfg)
+            })
+            .await
+            .expect("materialized start on a stale entry must really start");
+        assert!(
+            started,
+            "a stale entry must not be a false idempotent Ok(false)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "materialize must run for a real start"
+        );
+        let active = manager
+            .active_clients
+            .read()
+            .await
+            .get(&bundle_id)
+            .cloned()
+            .expect("a fresh client must be active");
+        let stale_dyn: StdArc<dyn MCPClientProtocol> = stale.clone();
+        assert!(
+            !StdArc::ptr_eq(&active, &stale_dyn),
+            "the stale entry must be replaced"
+        );
+        assert_eq!(active.state(), ClientState::Connected);
+        assert_eq!(
+            fresh.connect_calls.load(Ordering::SeqCst),
+            1,
+            "materialized start must connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_disconnect_failure_still_errors() {
+        // #254 S1：真实 disconnect 失败仍须上抛（不得被幂等/诚实化吞掉）。
+        let manager = MCPServerManager::new();
+        let bundle_id = bid("forced-stop");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("forced-stop", Some("forced-stop")),
+        );
+        manager
+            .activation_intents
+            .write()
+            .await
+            .insert(bundle_id.clone());
+        manager.active_clients.write().await.insert(
+            bundle_id.clone(),
+            Arc::new(AuthErrClient {
+                msg: "n/a".into(),
+                disconnect_error: true,
+            }),
+        );
+
+        let error = manager
+            .stop_client_by_id(&bundle_id)
+            .await
+            .expect_err("a real disconnect failure must still surface as Err");
+        assert!(
+            error.to_string().contains("Failed to disconnect"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_after_stop_does_not_publish_false_connected() {
+        // #254 复审：stop 后 remembered 必须已收敛 Disconnected——下一次 start 的首个投影不得是
+        // 未经真实连接的 (Started, Connected)。
+        let status = Arc::new(RuntimeStatus::new());
+        let manager = MCPServerManager::new().with_runtime_status(Arc::clone(&status));
+        inject_mock_factory(&manager).await;
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("restart-seq", Some("restart-seq")))
+            .await
+            .unwrap();
+        let bundle_id = bid("restart-seq");
+
+        manager.start_client_by_id(&bundle_id).await.unwrap();
+        manager.stop_client_by_id(&bundle_id).await.unwrap();
+
+        let mut rx = status.subscribe();
+        manager.start_client_by_id(&bundle_id).await.unwrap();
+        let changes = collect_status_changes(&mut rx, 300).await;
+        let (_, first) = changes.first().expect("start must publish status events");
+        assert_eq!(first.activation, MCPServerActivationState::Started);
+        assert_ne!(
+            first.connection,
+            MCPServerConnectionState::Connected,
+            "stop→start 的首个事件不得是未经真实连接的 Connected"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_unknown_bundle_does_not_create_connection_state() {
+        // #254 复审：未知 bundle_id 的幂等 stop 不得凭空造 `connection_states` 条目。
+        let manager = MCPServerManager::new();
+        let unknown = bid("unknown-stop");
+        let stopped = manager.stop_client_by_id(&unknown).await.unwrap();
+        assert!(!stopped);
+        assert!(!manager
+            .connection_states
+            .read()
+            .await
+            .contains_key(&unknown));
+    }
+
+    #[tokio::test]
+    async fn add_or_update_stale_entry_does_not_block_when_auto_reconnect_disabled() {
+        // #254 复审：门控看 live state——stale（Disconnected）entry 不得以「is started」阻止配置更新。
+        let manager = MCPServerManager::new();
+        manager.disable_auto_reconnect().await;
+        let bundle_id = bid("stale-update");
+        manager.servers_config.write().await.insert(
+            bundle_id.clone(),
+            stdio_cfg_with_bundle("stale-update", Some("stale-update")),
+        );
+        let stale = Arc::new(live_state_client(
+            false,
+            &Arc::new(tokio::sync::Notify::new()),
+            &Arc::new(tokio::sync::Notify::new()),
+        ));
+        *stale.state.write().unwrap() = ClientState::Disconnected;
+        manager
+            .active_clients
+            .write()
+            .await
+            .insert(bundle_id.clone(), stale);
+
+        manager
+            .add_or_update_server(stdio_cfg_with_bundle("stale-update", Some("stale-update")))
+            .await
+            .expect("a stale entry must not block config updates when auto-reconnect is disabled");
+        assert!(!manager.active_clients.read().await.contains_key(&bundle_id));
     }
 
     /// #186 弱锚点路径端到端：真实 `BaseMCPClient` 传输客户端经 `update_state` 触发回调 →
