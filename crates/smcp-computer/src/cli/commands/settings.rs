@@ -9,8 +9,9 @@
 *       Settings command handlers.
 *
 * 对标 Python `a2c_smcp/computer/cli/commands/settings.py`：读经 [`super::resolved_settings`]（merged，含 policy
-* first-source-wins）或单层 [`load_settings_file`]；写经 [`apply_write`]（**数组整体替换**；删键仅经 DELETE
-* 哨兵，`null` 写 JSON null，§5.4）+ store 持锁原子写。
+* first-source-wins）或单层 [`load_settings_file`]；写经 `raw_write::update_raw_settings` 做 strict raw RMW
+* （只改目标键、保留其余字段；corrupt / 目标容器畸形 fail-closed、原文件不变）+ store 持锁原子写。
+* 写语义仍是 [`apply_write`] 的数组整体替换；`null` 写 JSON null（§5.4）。
 *
 * - **scope**：`user` / `project` / `local` 可写；`flag` / `policy` **只读**（set/edit 拒绝，退出码 1）；
 *   `merged`（默认 show）= 五层合并视图。#98：project/local 锚定进程 cwd（`cwd` 注入接缝，`None` → 进程 cwd）。
@@ -26,12 +27,13 @@ use serde_json::{json, Map, Value};
 use super::{
     err_flat as err, ok_msg, print_json, resolved_settings_with_errors, EXIT_OK, EXIT_USER_ERROR,
 };
-use crate::settings::read_roots::{drop_read_roots_from_file, read_raw_map, remove_read_roots_raw};
+use crate::settings::raw_write;
+use crate::settings::read_roots::drop_read_roots_from_file;
 use crate::settings::scope::{
     apply_write, load_settings_file, resolve_cwd, user_settings_path, workdir_local_settings_path,
     workdir_project_settings_path, EnvMap, WriteValue,
 };
-use crate::settings::store::{atomic_write_settings_json, with_settings_lock};
+use crate::settings::store::SettingsStoreError;
 use crate::settings::{
     resolve_policy_settings, validate_settings, SettingsScope, SettingsValidationError,
     FIELD_READ_ROOTS,
@@ -250,9 +252,10 @@ pub fn settings_set(
     };
     // #245 / protocol#65：`readRoots` 仅受信 scope 可设；project scope 写入期丢弃 + 诊断（不落盘、不硬报错）。
     // 放在 `writable_path` 之后：anchor 不可解析时与其他键同样返回用户错误（不静默成功）。
+    // #253：清理走 strict raw helper——corrupt 文件必须 fail-closed（不再当缺失静默跳过）。
     if scope == "project" && key == FIELD_READ_ROOTS {
         // 盘上若已有旧版本写入的该键，一并清掉（不只跳过本次写入）。
-        if let Err(e) = drop_read_roots_from_file(&path) {
+        if let Err(e) = raw_write::update_raw_settings(&path, true, |_| Ok(())) {
             return err(
                 &format!("readRoots cleanup failed: {e}"),
                 json_output,
@@ -272,30 +275,25 @@ pub fn settings_set(
     let updates: BTreeMap<String, WriteValue> =
         BTreeMap::from([(key.to_string(), WriteValue::from(parsed.clone()))]);
 
-    let locked = with_settings_lock(&path, || -> std::io::Result<()> {
-        // #245：**raw 保真 RMW**——不回写校验视图（否则会静默删除 landingRoot /
-        // enabledMcpjsonServers / 非法 permissions 等被过滤字段）；project scope 顺带剔除旧
-        // `readRoots`（只删该键）。无变化 → 不重写（不扰 mtime）。
-        let mut existing = read_raw_map(&path)?.unwrap_or_default();
-        let had_read_roots =
-            enum_ == SettingsScope::Project && remove_read_roots_raw(&mut existing);
-        let updated = apply_write(&existing, &updates);
-        // 无变化且无需清理 readRoots → 不重写（不扰 mtime）。
-        if updated == existing && !had_read_roots {
-            return Ok(());
+    // #245 / #253：**strict raw 保真 RMW**——不回写校验视图；corrupt 文件拒绝写盘、原文件不变。
+    // 目标键是 object 值时先校验既有父键类型（非对象 → fail-closed，不静默物化覆盖）。
+    let updated = raw_write::update_raw_settings(&path, enum_ == SettingsScope::Project, |map| {
+        if parsed.is_object() {
+            raw_write::ensure_object_container(map, key, &path)?;
         }
-        atomic_write_settings_json(&path, &Value::Object(updated))
+        *map = apply_write(map, &updates);
+        Ok(())
     });
-    match locked {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return err(&format!("write failed: {e}"), json_output, EXIT_USER_ERROR),
-        Err(e) => {
+    match updated {
+        Ok(_) => {}
+        Err(raw_write::RawWriteError::Store(e @ SettingsStoreError::Lock { .. })) => {
             return err(
                 &format!("settings lock failed: {e}"),
                 json_output,
                 EXIT_USER_ERROR,
             )
         }
+        Err(e) => return err(&format!("write failed: {e}"), json_output, EXIT_USER_ERROR),
     }
 
     if json_output {
@@ -829,5 +827,118 @@ mod tests {
         assert_eq!(cleaned.get("allowedMcpServers"), Some(&json!(["a"])));
         assert_eq!(cleaned.get("trustedMarketplaces"), Some(&json!(["mp"])));
         assert!(errors.is_empty());
+    }
+
+    // ---- #253：strict raw RMW / corrupt fail-closed -------------------------
+    fn settings_file_mtime(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn set_refuses_corrupt_user_settings_and_keeps_bytes_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(Some(&env), "k", "1", "user", None, true),
+            EXIT_USER_ERROR
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // 根非对象同样拒绝。
+        std::fs::write(&path, "[1,2]").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(Some(&env), "k", "1", "user", None, true),
+            EXIT_USER_ERROR
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn set_noop_does_not_touch_mtime_or_bytes_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"maxConcurrency":7,"keepUnknown":{"k":1}}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let before_mtime = settings_file_mtime(&path);
+        assert_eq!(
+            settings_set(Some(&env), "maxConcurrency", "7", "user", None, true),
+            EXIT_OK
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(settings_file_mtime(&path), before_mtime);
+    }
+
+    #[test]
+    fn set_preserves_filtered_and_unknown_fields_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"allowedMcpServers":["a"],"permissions":"bad","keepUnknown":{"k":1},"landingRoot":"/l"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings_set(Some(&env), "maxConcurrency", "7", "user", None, true),
+            EXIT_OK
+        );
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["allowedMcpServers"], json!(["a"]));
+        assert_eq!(saved["permissions"], json!("bad"));
+        assert_eq!(saved["keepUnknown"], json!({"k": 1}));
+        assert_eq!(saved["landingRoot"], json!("/l"));
+        assert_eq!(saved["maxConcurrency"], json!(7));
+    }
+
+    #[test]
+    fn set_read_roots_project_refuses_corrupt_file_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let wd = dir.path().join("wd");
+        let path = workdir_project_settings_path(&wd);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "readRoots",
+                "[\"/x\"]",
+                "project",
+                Some(&wd),
+                true
+            ),
+            EXIT_USER_ERROR
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn set_object_over_non_object_target_fails_closed_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = user_settings_path(Some(&env));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"enabledPlugins":"oops"}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            settings_set(
+                Some(&env),
+                "enabledPlugins",
+                r#"{"a@mp":true}"#,
+                "user",
+                None,
+                true
+            ),
+            EXIT_USER_ERROR
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

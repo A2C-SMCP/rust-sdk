@@ -1,12 +1,14 @@
-//! #245 / #248：`readRoots` 写入期清理的共享 raw 助手。
+//! #245 / #253：`readRoots` 写入期清理与 settings 原始读取的共享 raw 助手。
 //!
-//! 本模块服务于**已迁移**的 writer 与 raw 读取方：installer（锁内 no-op / 真写）、CLI
-//! `settings set/edit`（持锁或复用 [`drop_read_roots_from_file`]），以及 installer / CLI 对原始
-//! 文件的读取（[`read_raw_map`]）。写入只删除 `readRoots` 这一个键，不回写校验视图（避免静默删除
-//! landingRoot / enabledMcpjsonServers / 非法 permissions 等被过滤字段）。
+//! **写路径全局约定（#253）**：除显式例外——`config::validate::migrate_config`（有意有损规范化）、
+//! `config::crud::save_config`（整文档 import/duplicate）与 `settings_edit`（外部编辑器直接写文件）——
+//! 所有 settings 文件 writer 均经 `settings::raw_write::update_raw_settings` 做 **strict raw RMW**：
+//! 只改目标键、保留其余字段（含未知键 / 被校验过滤字段 / 非法兄弟条目）、corrupt 或目标容器畸形
+//! **fail-closed**（拒绝写盘、原文件逐字节不变）。`config/executor.rs` 已是 strict raw（`CorruptTarget`），
+//! 其复用本 helper 留 PR-B（v0.5.1）。
 //!
-//! 其它 writer（config executor / marketplace / mcp_config）仍各自处理校验视图；统一收口见架构师
-//! follow-up Issue，本模块**不**声称覆盖全部写路径。
+//! 本模块的 [`read_raw_map`] 是**宽容读**（畸形 / 非对象按缺失处理），供 `drop_read_roots_from_file`
+//! 使用；**不得**用于新的写路径——写路径请用 `raw_write::read_strict_map`。
 
 use std::path::Path;
 

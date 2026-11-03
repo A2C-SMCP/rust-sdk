@@ -18,7 +18,6 @@
 * （CC 模型，§16：`known_marketplaces.json` **不**带 trusted 字段，故 trust **不**属 `skill_home` 治理边界）。
 */
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -33,16 +32,14 @@ use crate::settings::lifecycle::{
     remove_marketplace, resolve_marketplace_identity, AddMarketplaceParams, GovernanceError,
     MarketplaceRefreshRow, MarketplaceRemoveOutcome, RefreshStatus, RemoveMarketplaceParams,
 };
+use crate::settings::raw_write;
 use crate::settings::redaction::{
     git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
 };
 use crate::settings::schema::FIELD_TRUSTED_MARKETPLACES;
-use crate::settings::scope::{
-    apply_write, load_settings_file, user_settings_path, EnvMap, WriteValue,
-};
+use crate::settings::scope::{load_settings_file, user_settings_path, EnvMap};
 use crate::settings::store::{
-    atomic_write_settings_json, load_installed_plugins, load_known_marketplaces,
-    update_known_marketplaces, with_settings_lock, SettingsStoreError,
+    load_installed_plugins, load_known_marketplaces, update_known_marketplaces,
 };
 use crate::settings::{KnownMarketplaceEntry, KnownMarketplaces, SettingsScope};
 use crate::skills::SkillRegistry;
@@ -52,10 +49,6 @@ use crate::skills::SkillRegistry;
 pub use crate::settings::lifecycle::{default_marketplace_name, normalize_marketplace_url};
 
 // ── 输出辅助 / output helpers ────────────────────────────────────────────────
-fn map_store_err(e: SettingsStoreError) -> std::io::Error {
-    std::io::Error::other(e.to_string())
-}
-
 /// 身份解析错误的 CLI 文案。保持纯函数，使终端文本与 JSON `error` 字段共用同一安全边界。
 fn identity_error_message(error: &GovernanceError) -> String {
     match error {
@@ -183,36 +176,32 @@ fn load_trusted(env: Option<&EnvMap>) -> Vec<String> {
 
 fn record_trust(name: &str, env: Option<&EnvMap>) -> std::io::Result<()> {
     let path = user_settings_path(env);
-    with_settings_lock(&path, || -> std::io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, SettingsScope::User);
-        let mut current = read_string_array(&existing, FIELD_TRUSTED_MARKETPLACES);
-        if !current.iter().any(|n| n == name) {
-            current.push(name.to_string());
+    // #253：strict raw RMW——只改 trustedMarketplaces，保留其余字段（含非法兄弟条目）；
+    // 非数组 / 畸形 JSON / 根非对象 → fail-closed（marketplace_add 据此返回用户错误）。
+    raw_write::update_raw_settings(&path, false, |map| {
+        let arr = raw_write::array_field_mut(map, FIELD_TRUSTED_MARKETPLACES, &path)?;
+        if !arr.iter().any(|v| v.as_str() == Some(name)) {
+            arr.push(Value::String(name.to_string()));
         }
-        let updates = BTreeMap::from([(
-            FIELD_TRUSTED_MARKETPLACES.to_string(),
-            WriteValue::Set(json!(current)),
-        )]);
-        atomic_write_settings_json(&path, &apply_write(&existing, &updates))
+        Ok(())
     })
-    .map_err(map_store_err)?
+    .map_err(raw_write::RawWriteError::into_io_error)?;
+    Ok(())
 }
 
 fn revoke_trust(name: &str, env: Option<&EnvMap>) -> std::io::Result<()> {
     let path = user_settings_path(env);
-    with_settings_lock(&path, || -> std::io::Result<()> {
-        let (existing, _errors) = load_settings_file(&path, SettingsScope::User);
-        let current: Vec<String> = read_string_array(&existing, FIELD_TRUSTED_MARKETPLACES)
-            .into_iter()
-            .filter(|n| n != name)
-            .collect();
-        let updates = BTreeMap::from([(
-            FIELD_TRUSTED_MARKETPLACES.to_string(),
-            WriteValue::Set(json!(current)),
-        )]);
-        atomic_write_settings_json(&path, &apply_write(&existing, &updates))
+    // #253：strict raw RMW；字段/成员缺失 → 无操作（不创建 key）；末次移除保留 `[]`（沿用现状）。
+    raw_write::update_raw_settings(&path, false, |map| {
+        let Some(arr) = raw_write::array_field_opt_mut(map, FIELD_TRUSTED_MARKETPLACES, &path)?
+        else {
+            return Ok(());
+        };
+        arr.retain(|v| v.as_str() != Some(name));
+        Ok(())
     })
-    .map_err(map_store_err)?
+    .map_err(raw_write::RawWriteError::into_io_error)?;
+    Ok(())
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -1113,6 +1102,94 @@ mod tests {
         assert_eq!(v["uninstalledPlugins"], json!(["audit@skills"]));
         assert_eq!(v["keptPlugins"], json!(false));
         assert_eq!(v.as_object().unwrap().len(), 4, "仅这 4 个键");
+    }
+
+    // ---- #253：trust 写入 raw 保真 / corrupt fail-closed ----------------------
+    fn trust_path(env: &EnvMap) -> std::path::PathBuf {
+        user_settings_path(Some(env))
+    }
+
+    fn write_trust_file(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn trust_mtime(path: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn record_trust_preserves_unknown_and_invalid_entries_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = trust_path(&env);
+        write_trust_file(
+            &path,
+            r#"{"keepUnknown":{"k":1},"trustedMarketplaces":["ok",42],"permissions":"bad","allowedMcpServers":["policy-only"]}"#,
+        );
+        record_trust("new", Some(&env)).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["trustedMarketplaces"], json!(["ok", 42, "new"]));
+        assert_eq!(saved["keepUnknown"], json!({"k": 1}));
+        assert_eq!(saved["permissions"], json!("bad"));
+        assert_eq!(saved["allowedMcpServers"], json!(["policy-only"]));
+    }
+
+    #[test]
+    fn record_trust_refuses_corrupt_and_non_array_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = trust_path(&env);
+        write_trust_file(&path, "{not json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(record_trust("new", Some(&env)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        write_trust_file(&path, r#"{"trustedMarketplaces":"skills"}"#);
+        let before = std::fs::read(&path).unwrap();
+        assert!(record_trust("new", Some(&env)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn record_trust_duplicate_is_noop_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = trust_path(&env);
+        write_trust_file(&path, r#"{"trustedMarketplaces":["skills"]}"#);
+        let before_mtime = trust_mtime(&path);
+        let before_bytes = std::fs::read(&path).unwrap();
+        record_trust("skills", Some(&env)).unwrap();
+        assert_eq!(trust_mtime(&path), before_mtime);
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+    }
+
+    #[test]
+    fn revoke_trust_removes_only_matching_strings_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = trust_path(&env);
+        write_trust_file(
+            &path,
+            r#"{"trustedMarketplaces":["a",42,"b","a"],"keep":1}"#,
+        );
+        revoke_trust("a", Some(&env)).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["trustedMarketplaces"], json!([42, "b"]));
+        assert_eq!(saved["keep"], json!(1));
+    }
+
+    #[test]
+    fn revoke_trust_absent_is_noop_and_last_removal_keeps_empty_array_253() {
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let path = trust_path(&env);
+        // 文件缺失 → 不创建 key、不报错。
+        revoke_trust("a", Some(&env)).unwrap();
+        assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().trim().is_empty());
+        write_trust_file(&path, r#"{"trustedMarketplaces":["a"]}"#);
+        revoke_trust("a", Some(&env)).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["trustedMarketplaces"], json!([]));
     }
 
     #[test]

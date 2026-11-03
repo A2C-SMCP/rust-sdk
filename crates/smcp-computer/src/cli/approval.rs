@@ -162,16 +162,30 @@ pub async fn run_mcp_approval<S: Session>(
                 ));
                 match ans.as_str() {
                     "a" | "all" => {
-                        let _ = approve_all_project_mcp(cwd.as_deref());
+                        // #253：写失败（corrupt/锁/IO）必须显式告知——fail-closed 不改原文件，
+                        // 本次会话仍挂载，但持久化未生效。
+                        if let Err(e) = approve_all_project_mcp(cwd.as_deref()) {
+                            msg_err(&format!(
+                                "failed to persist approval (enableAllProjectMcpServers, local scope): {e}; mounting for this session only"
+                            ));
+                        }
                         approved_all_session = true;
                         mount(comp, srv).await;
                     }
                     "y" | "yes" => {
-                        let _ = approve_mcp_server(name, cwd.as_deref());
+                        if let Err(e) = approve_mcp_server(name, cwd.as_deref()) {
+                            msg_err(&format!(
+                                "failed to persist approval for MCP server {name:?} (local scope): {e}; mounting for this session only"
+                            ));
+                        }
                         mount(comp, srv).await;
                     }
                     _ => {
-                        let _ = deny_mcp_server(name, cwd.as_deref());
+                        if let Err(e) = deny_mcp_server(name, cwd.as_deref()) {
+                            msg_err(&format!(
+                                "failed to persist denial for MCP server {name:?} (local scope): {e}; skipped for this session only"
+                            ));
+                        }
                         msg_dim(&format!(
                             "· denied MCP server {name:?} (written to local scope)"
                         ));

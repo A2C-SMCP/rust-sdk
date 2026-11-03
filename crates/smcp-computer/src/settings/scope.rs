@@ -208,6 +208,9 @@ impl From<Value> for WriteValue {
 ///
 /// 与 [`merge_read`] **语义相反**：数组**不拼接、直接替换**；[`WriteValue::Delete`] 的 key 被删除；
 /// 嵌套对象继续递归（`settings set a.b.c` 只动该叶子，不毁同级兄弟键）。返回**新 Map**（不就地改）。
+///
+/// **容器型写入注意**：`WriteValue::Object` 在父键缺失 / 非对象时会物化为新对象。需要 fail-closed
+/// 的持久化调用方必须先经 `settings::raw_write` 的容器访问器校验既有类型（#253）。
 pub fn apply_write(
     existing: &Map<String, Value>,
     updates: &BTreeMap<String, WriteValue>,
