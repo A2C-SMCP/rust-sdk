@@ -78,12 +78,21 @@ pub(crate) fn git_source_for_error(raw: &str) -> String {
 ///
 /// - ASCII scp-like `user@host:path` → `host:path`（丢弃 userinfo，剥除 query/fragment；
 ///   path 含 `@`/`:`/`%` 等嵌套 URL 或编码凭据形态时回退占位符）
+/// - 含 `@` 但缺 `://` 的 opaque 形态 → 占位符（严格函数会把 userinfo 当 path 原样保留）
 /// - 其余输入委托 [`git_url_for_display`]（scheme URL 行为不变）
 ///
 /// 账本（`known_marketplaces.json`）仍须视为不可信输入：本函数只保证不放大凭据与结构，
 /// 不保证展示值可克隆或与存储值逐字一致。
 pub(crate) fn known_git_source_for_display(raw: &str) -> String {
-    scp_like_source_for_display(raw).unwrap_or_else(|| git_url_for_display(raw))
+    if let Some(display) = scp_like_source_for_display(raw) {
+        return display;
+    }
+    // opaque（缺 `//`）的 supported-scheme URL 可能把 userinfo 当 path 原样序列化；
+    // 严格函数不剥离该形态，展示面必须自行 fail-closed（共享严格函数不在本单放宽）。
+    if raw.contains('@') && !raw.contains("://") {
+        return REDACTED_GIT_SOURCE.to_string();
+    }
+    git_url_for_display(raw)
 }
 
 /// scp-like `user@host:path` 的展示值：丢弃 userinfo，剥除 query/fragment。
@@ -318,6 +327,13 @@ mod tests {
             "git@example.com:alice%3APW@example.com/repo.git",
             "git@example.com:org%2Frepo.git",
             "git@example.com://evil.example/repo.git",
+            "ssh:alice:PW_LEAK@example.com",
+            "git:alice:PW_LEAK@host/repo.git",
+            "@example.com:org/repo.git",
+            "git@:org/repo.git",
+            "git@example.com:",
+            "git@example.com:?token=X",
+            "git@example.com:#frag",
             "用户@example.com:org/repo.git",
             "用户@例子.公司:org/repo.git",
             "alice@my_host: Permission denied (publickey).",
