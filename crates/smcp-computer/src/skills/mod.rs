@@ -52,7 +52,7 @@ pub use sources::{
 
 pub use frontmatter::{parse_skill_frontmatter, strip_skill_frontmatter};
 
-pub use registry::SkillRegistry;
+pub use registry::{SkillRegistry, SkillSourceConflict};
 
 pub use sandbox::{
     ensure_within_size_cap, resolve_skill_resource, resolve_skill_resource_with, SkillSandboxError,

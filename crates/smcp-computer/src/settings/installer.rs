@@ -69,7 +69,7 @@ use crate::skills::manifest::{
     check_strict_conflict, find_plugin_entry, load_bundled_servers, plugin_root_base,
     read_marketplace_manifest, read_plugin_metadata, resolve_plugin_version, PluginManifestError,
 };
-use crate::skills::registry::SkillRegistry;
+use crate::skills::registry::{SkillRegistry, SkillSourceConflict};
 use crate::skills::staging::{
     locate_plugin_root, stage_marketplace_skills, MarketplaceStageOptions, SkillStagingError,
     DEFAULT_GIT_TIMEOUT,
@@ -91,15 +91,90 @@ pub struct McpHookError(pub String);
 #[error("MCP server name conflict: {0}")]
 pub struct McpServerNameConflictError(pub String);
 
+/// 同名 plugin 跨 marketplace 冲突 / Cross-marketplace plugin-name conflict。
+///
+/// 协议依据 skill.md §1.5 / conformance-tests.md:365：安装层按 `<plugin>` 裸名跨 marketplace 全局唯一，
+/// 拒绝第二个；已装集合与先到 SKILL 的 `source` 保持不变。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginNameConflictError {
+    /// 本次被拒绝的 `<plugin>@<marketplace>` / requested pid。
+    pub requested_pid: String,
+    /// 裸 plugin 名（身份）/ bare plugin name。
+    pub plugin: String,
+    /// 冲突类别 / conflict kind。
+    pub kind: PluginNameConflictKind,
+}
+
+/// 同名 plugin 冲突类别 / Kind of plugin-name conflict。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginNameConflictKind {
+    /// 已装集合（`installedPlugins` 意图）内已存在同名 plugin。
+    Installed {
+        /// 已安装的冲突 pid（`<plugin>@<marketplace>`）。
+        installed_pid: String,
+    },
+    /// Skill Registry 中同名 SKILL 已被其它 source 占用（保留先到者）。
+    SkillSource {
+        /// 冲突明细 / conflict details。
+        conflicts: Vec<SkillSourceConflict>,
+    },
+}
+
+impl std::error::Error for PluginNameConflictError {}
+
+impl std::fmt::Display for PluginNameConflictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            PluginNameConflictKind::Installed { installed_pid } => write!(
+                f,
+                "plugin name conflict: cannot use plugin {:?}: plugin name {:?} is already \
+                 installed as {:?} (plugin names are unique across marketplaces). Run \
+                 'plugin uninstall {}' first if you want to switch marketplaces.",
+                self.requested_pid, self.plugin, installed_pid, installed_pid
+            ),
+            PluginNameConflictKind::SkillSource { conflicts } => {
+                let mut names: Vec<&str> = conflicts.iter().map(|c| c.name.as_str()).collect();
+                names.sort_unstable();
+                names.dedup();
+                let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+                let more = names.len().saturating_sub(3);
+                let kept = conflicts
+                    .first()
+                    .map(|c| c.kept_source.as_str())
+                    .unwrap_or("another source");
+                write!(
+                    f,
+                    "plugin name conflict: cannot register skills of plugin {:?}: skill(s) {} \
+                     already owned by source {:?} (first registrant wins). Remove the conflicting \
+                     marketplace or plugin (e.g. 'marketplace remove <marketplace>' or \
+                     'plugin uninstall <plugin>@<marketplace>') and retry.",
+                    self.requested_pid,
+                    if more > 0 {
+                        format!("{shown} (+{more} more)")
+                    } else {
+                        shown
+                    },
+                    kept
+                )
+            }
+        }
+    }
+}
+
 /// plugin install/enable/uninstall/disable 失败 / Plugin lifecycle failure。
 ///
 /// [`PluginInstallError::Conflict`] 单独建模 §10.6「外来 MCP 同名硬抛」——调用方可 `matches!` 精确识别
 /// （对标 Python 的独立 `MCPServerNameConflictError` 异常类型，无逃生口）。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PluginInstallError {
     /// 前置失败（marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 id / 非法 scope）。
     #[error("{0}")]
     Precondition(String),
+    /// 同名 plugin 跨 marketplace 冲突（安装层拒绝、零配置变更）。
+    #[error(transparent)]
+    NameConflict(#[from] PluginNameConflictError),
     /// 外来 MCP server 同名冲突（硬抛、无逃生口，§10.6）。
     #[error(transparent)]
     Conflict(#[from] McpServerNameConflictError),
@@ -373,12 +448,122 @@ fn set_enabled_true_if_absent(
 fn plugin_skill_names(registry: &SkillRegistry, marketplace: &str, plugin: &str) -> Vec<String> {
     let want_source = format!("{SOURCE_MARKETPLACE}:{marketplace}");
     let prefix = format!("{plugin}:");
-    registry
-        .active_refs()
+    registry.names_for_source(&want_source, &prefix, false)
+}
+
+/// 某 plugin 的 marketplace SKILL name（**含孤儿**，uninstall 清名用）/ All SKILL names incl. orphans。
+fn plugin_skill_names_all(
+    registry: &SkillRegistry,
+    marketplace: &str,
+    plugin: &str,
+) -> Vec<String> {
+    let want_source = format!("{SOURCE_MARKETPLACE}:{marketplace}");
+    let prefix = format!("{plugin}:");
+    registry.names_for_source(&want_source, &prefix, true)
+}
+
+/// 安装层唯一性前置（协议 skill.md §1.5 / conformance-tests.md:365）：已装集合
+/// （`installedPlugins` 意图）中不得存在同裸名、不同 marketplace 的 pid。
+///
+/// 仅读意图文件——失败零变更（不 clone / 不 staging / 不写 intent/ledger/settings、不改 registry）。
+fn ensure_bare_plugin_not_installed(
+    plugin: &str,
+    requested_pid: &str,
+    home: &Path,
+    env: Option<&EnvMap>,
+) -> Result<(), PluginInstallError> {
+    let intent = load_installed_plugins_intent(Some(home), env);
+    for pid in &intent.account.installed_plugins {
+        if pid == requested_pid {
+            continue;
+        }
+        if let Some((installed_plugin, _)) = pid.split_once('@') {
+            if installed_plugin == plugin {
+                return Err(PluginNameConflictError {
+                    requested_pid: requested_pid.to_string(),
+                    plugin: plugin.to_string(),
+                    kind: PluginNameConflictKind::Installed {
+                        installed_pid: pid.clone(),
+                    },
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #275：清除「未安装 marketplace 源」对目标 plugin 的 SKILL 占名（installed intent 优先）。
+///
+/// 仅在已装集合内无同裸名冲突（前置门已过）时调用：此时其他 marketplace 源的同名 SKILL 必来自
+/// 未安装/仅添加的 plugin，可安全让位给本次安装/启用的源（修复 CLI 离线重建把 add-only 源当 owner）。
+fn clear_uninstalled_marketplace_skill_names(
+    registry: &mut SkillRegistry,
+    home: &Path,
+    env: Option<&EnvMap>,
+    requested_source: &str,
+    skill_prefix: &str,
+) {
+    let intent = load_installed_plugins_intent(Some(home), env);
+    // pid 粒度保护：只有「该 skill 所属 plugin 的 pid 确在 installedPlugins」才保留占名。
+    // marketplace 粒度会把同源其它已装 plugin（如 mp-a 的 beta）误当保护伞，挡住 alpha@mp-b。
+    let installed_pids: HashSet<String> =
+        intent.account.installed_plugins.iter().cloned().collect();
+    let marketplace_prefix = format!("{SOURCE_MARKETPLACE}:");
+    let stale: Vec<String> = registry
+        .all_refs()
         .into_iter()
-        .filter(|r| r.source == want_source && r.name.starts_with(&prefix))
-        .map(|r| r.name)
-        .collect()
+        .filter(|(r, _)| {
+            if !r.name.starts_with(skill_prefix) || r.source == requested_source {
+                return false;
+            }
+            let Some(mp) = r.source.strip_prefix(&marketplace_prefix) else {
+                return false;
+            };
+            let Some((plugin, _)) = r.name.split_once(':') else {
+                return false;
+            };
+            !installed_pids.contains(&format!("{plugin}@{mp}"))
+        })
+        .map(|(r, _)| r.name)
+        .collect();
+    for name in stale {
+        registry.unregister(&name);
+    }
+}
+
+/// #275：清除某 plugin × marketplace 的跨 source 冲突记录（uninstall 后 stale 不应再发诊断）。
+fn clear_source_conflicts_for_plugin(
+    registry: &mut SkillRegistry,
+    plugin: &str,
+    marketplace_source: &str,
+) {
+    let prefix = format!("{plugin}:");
+    registry.clear_source_conflicts_where(|c| {
+        c.name.starts_with(&prefix)
+            && (c.kept_source == marketplace_source || c.rejected_source == marketplace_source)
+    });
+}
+
+/// 是否属于「本 plugin × 本 source」的跨 source 冲突 / Whether a conflict belongs to this plugin+source。
+fn is_own_source_conflict(conflict: &SkillSourceConflict, want_source: &str, prefix: &str) -> bool {
+    conflict.rejected_source == want_source && conflict.name.starts_with(prefix)
+}
+
+/// 取走「本 plugin × 本 source」的跨 source 冲突（清旧 + 供 stage 后归因）/ Take this plugin's conflicts。
+fn take_own_source_conflicts(
+    registry: &mut SkillRegistry,
+    want_source: &str,
+    prefix: &str,
+) -> Vec<SkillSourceConflict> {
+    let conflicts: Vec<SkillSourceConflict> = registry
+        .source_conflicts()
+        .iter()
+        .filter(|c| is_own_source_conflict(c, want_source, prefix))
+        .cloned()
+        .collect();
+    registry.clear_source_conflicts_where(|c| is_own_source_conflict(c, want_source, prefix));
+    conflicts
 }
 
 /// 该 plugin 物化记录里全部声明依赖 **bundle_id**（跨 scope 记录并集）/ All declared dependency bundle_ids。
@@ -664,11 +849,13 @@ pub async fn materialize_plugin_record(
 /// `orphan`（不进 `get_skills`），bundled MCP server **不**挂、inputs **不**注入、**不**写 `enabledPlugins`
 /// （absent = 未启用 → `installed_disabled`）。激活全部交给 [`enable_plugin`]。
 ///
-/// 顺序：① 解析 id + mp source；② 要求 catalog 已 clone、读 marketplace.json 定位 entry；③ `locate_plugin_root`
-/// 定位 plugin 根（必要时 clone）；④ strict 冲突检测 + [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**
-/// （外来 MCP 同名硬抛、零变更——满足「install 拒绝 foreign name conflict」，虽本步不挂载）；⑥ stage skills →
-/// 立即 `mark_orphan`（不投影）；⑦ **config-first 写 `installedPlugins` 全局安装意图**（权威）→ ⑧ 写账本
-/// （派生缓存）。
+/// 顺序：⓪ **★安装层唯一性闸门**（#275：`installedPlugins` 意图内同裸名 `<plugin>` 跨 marketplace 唯一；
+/// 命中即拒绝、零变更，且先于 materialize）→ ① 解析 id + mp source；② 要求 catalog 已 clone、读
+/// marketplace.json 定位 entry；③ `locate_plugin_root` 定位 plugin 根（必要时 clone）；④ strict 冲突检测 +
+/// [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**（外来 MCP 同名硬抛、零变更——满足
+/// 「install 拒绝 foreign name conflict」，虽本步不挂载）；⑥ stage skills → 立即 `mark_orphan`（不投影；
+/// 若本 plugin 的 SKILL 已被其它 source 占名则恢复 registry 快照并拒绝，add-first 边界 fail-closed）；
+/// ⑦ **config-first 写 `installedPlugins` 全局安装意图**（权威，锁内二次同名复核）→ ⑧ 写账本（派生缓存）。
 ///
 /// # Errors
 /// 见 [`PluginInstallError`]（冲突 / 前置 / manifest / 定位 / 意图 / 账本）。
@@ -682,6 +869,11 @@ pub async fn install_plugin(
     let scope = options.scope.unwrap_or("user");
     let timeout = options.timeout.unwrap_or(DEFAULT_GIT_TIMEOUT);
     let env = options.env;
+
+    // ⓪ #275 安装层唯一性前置（协议 skill.md §1.5 / conformance-tests.md:365）：已装集合内同一裸名
+    //    `<plugin>` 只能来自一个 marketplace。必须在 [`materialize_plugin`] 之前，保证拒绝时零变更。
+    let (plugin, _marketplace) = split_plugin_id(plugin_id)?;
+    ensure_bare_plugin_not_installed(&plugin, plugin_id, home, env)?;
 
     // ①-④：解析 mp source + 定位 plugin 根（必要时 clone）+ strict 冲突检测 + 载入 bundled servers（注册前
     // 畸形即抛 → 原子前置）。install 与账本重建 [`materialize_plugin_record`] 共享此原语，杜绝物化路径漂移。
@@ -705,6 +897,14 @@ pub async fn install_plugin(
     // —— 过闸：物化但**不激活**（v0.3.0，协议 §2.4：install 落 `installed_disabled`）——
     // 不挂 server、不注入 inputs（延到 [`enable_plugin`]）；skills 注册后立即 orphan（不进 `get_skills`）。
     let filter: HashSet<String> = std::iter::once(m.plugin.clone()).collect();
+    // #275：stage 前快照 + 让未安装 marketplace 源让位（installed intent 优先）+ 清本 plugin/source
+    // 旧冲突记录；stage 后仍出现的跨源冲突（如 user/mcp 占名或并发抢跑）fail-closed，恢复快照。
+    let want_source = format!("{SOURCE_MARKETPLACE}:{}", m.marketplace);
+    let skill_prefix = format!("{}:", m.plugin);
+    // 快照成本 O(n)（registry 条目数）；管理面低频操作，可接受。
+    let snapshot = registry.clone();
+    clear_uninstalled_marketplace_skill_names(registry, home, env, &want_source, &skill_prefix);
+    let _ = take_own_source_conflicts(registry, &want_source, &skill_prefix);
     // skills 注册：复用既有 clone（refresh 透传）；失败降级（返回 Vec、不抛，见 #49）。计数供成功日志。
     let staged_skills = stage_marketplace_skills(
         &m.marketplace,
@@ -720,20 +920,56 @@ pub async fn install_plugin(
         },
     )
     .await;
+    let source_conflicts = take_own_source_conflicts(registry, &want_source, &skill_prefix);
+    if !source_conflicts.is_empty() {
+        *registry = snapshot;
+        return Err(PluginNameConflictError {
+            requested_pid: plugin_id.to_string(),
+            plugin: m.plugin.clone(),
+            kind: PluginNameConflictKind::SkillSource {
+                conflicts: source_conflicts,
+            },
+        }
+        .into());
+    }
     // installed_disabled 末态：本 plugin 全部 skill 置 orphan（镜像 [`disable_plugin`]；enable 再翻活）。
     for name in plugin_skill_names(registry, &m.marketplace, &m.plugin) {
         registry.mark_orphan(&name);
     }
 
-    // ⑦：★config-first 先写 `installedPlugins` 全局安装意图（权威）
+    // ⑦：★config-first 先写 `installedPlugins` 全局安装意图（权威）。
+    //    #275 TOCTOU 硬化：锁内再查一次同裸名（前置门在 materialize 之前，防另一进程在窗口内抢先安装）；
+    //    命中则**放弃落盘**（intent 逐字节不变），返回后恢复 registry 快照并报冲突（账本尚未写）。
     let pid_intent = plugin_id.to_string();
-    update_installed_plugins_intent(
-        move |file| {
-            file.account.installed_plugins.insert(pid_intent);
+    let bare_for_intent = plugin.clone();
+    let mut raced_with: Option<String> = None;
+    crate::settings::store::try_update_installed_plugins_intent(
+        |file| {
+            for other in &file.account.installed_plugins {
+                if other != &pid_intent {
+                    if let Some((installed_plugin, _)) = other.split_once('@') {
+                        if installed_plugin == bare_for_intent.as_str() {
+                            raced_with = Some(other.clone());
+                            return false;
+                        }
+                    }
+                }
+            }
+            file.account.installed_plugins.insert(pid_intent.clone());
+            true
         },
         Some(home),
         env,
     )?;
+    if let Some(installed_pid) = raced_with {
+        *registry = snapshot;
+        return Err(PluginNameConflictError {
+            requested_pid: plugin_id.to_string(),
+            plugin,
+            kind: PluginNameConflictKind::Installed { installed_pid },
+        }
+        .into());
+    }
 
     // ⑧：★再写账本（派生缓存，仅全成功；与账本重建复用 [`write_ledger_record`]）
     let record = write_ledger_record(home, plugin_id, scope, options.project_path, &m, env)?;
@@ -769,6 +1005,7 @@ pub async fn uninstall_plugin(
     hooks: Option<&dyn McpInstallHooks>,
 ) -> Result<bool, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
+    let marketplace_source = format!("{SOURCE_MARKETPLACE}:{marketplace}");
     let env = options.env;
     let installed = load_installed_plugins(Some(home), env);
     let records = match installed.account.plugins.get(plugin_id) {
@@ -801,6 +1038,12 @@ pub async fn uninstall_plugin(
                         "warning: failed to clear enabledPlugins[{plugin_id}] in user scope: {e}; settings file left unchanged"
                     );
                 }
+                // #275 复审 🔴：dangling-intent 路径同样须注销 registry 条目（含 install stage 后留下
+                // 的 orphan），否则「按 uninstall 指引换源」在本进程内仍是死路（跨源守卫会拒绝新源）。
+                for name in plugin_skill_names_all(registry, &marketplace, &plugin) {
+                    registry.unregister(&name);
+                }
+                clear_source_conflicts_for_plugin(registry, &plugin, &marketplace_source);
                 tracing::info!(
                     plugin = plugin_id,
                     "uninstall: converged dangling install-intent (no ledger record)"
@@ -850,9 +1093,12 @@ pub async fn uninstall_plugin(
         }
     }
 
-    for name in plugin_skill_names(registry, &marketplace, &plugin) {
+    // #275：注销 active **与 orphan**（installed_disabled）条目——按 uninstall 指引换源后，名字须在本进程
+    // 内立即释放，否则后续 install/enable 仍被 registry 守卫拒绝。
+    for name in plugin_skill_names_all(registry, &marketplace, &plugin) {
         registry.unregister(&name);
     }
+    clear_source_conflicts_for_plugin(registry, &plugin, &marketplace_source);
 
     if !options.keep_servers {
         if let Some(h) = hooks {
@@ -1040,6 +1286,10 @@ pub async fn enable_plugin(
         }
     };
 
+    // ⓪ #275 enable 防御：存量双装下同裸名已存在其它已装 pid → 写 enabledPlugins 之前拒绝（fail-closed，
+    //    不自动挑选赢家；指引用户 uninstall 其中一个）。
+    ensure_bare_plugin_not_installed(&plugin, plugin_id, home, env)?;
+
     // ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 冲突预检（零持久化变更前）。
     let mut servers: Vec<MCPServerConfig> = Vec::new();
     for rec in &records {
@@ -1060,6 +1310,13 @@ pub async fn enable_plugin(
     // ③ 复活 skills（re-stage：register_or_update 翻活孤儿；复用既有 clone）。
     let (source, _commit_sha) = resolve_marketplace_source(&marketplace, home, env)?;
     let filter: HashSet<String> = std::iter::once(plugin.clone()).collect();
+    // #275：让未安装 marketplace 源让位（installed intent 优先）；stage 后仍出现的跨源冲突
+    // （如 user/mcp 占名或并发抢跑）→ fail-closed，恢复快照并回滚 enabledPlugins。
+    let want_source = format!("{SOURCE_MARKETPLACE}:{marketplace}");
+    let skill_prefix = format!("{plugin}:");
+    let snapshot = registry.clone();
+    clear_uninstalled_marketplace_skill_names(registry, home, env, &want_source, &skill_prefix);
+    let _ = take_own_source_conflicts(registry, &want_source, &skill_prefix);
     stage_marketplace_skills(
         &marketplace,
         &source,
@@ -1074,6 +1331,27 @@ pub async fn enable_plugin(
         },
     )
     .await;
+    let source_conflicts = take_own_source_conflicts(registry, &want_source, &skill_prefix);
+    if !source_conflicts.is_empty() {
+        *registry = snapshot;
+        // 回滚落定为**确定性禁用**（显式 false；原 absent 也写 false），与 #94 server-remount 回滚先例
+        // 一致；`changed == false`（原已 true）不改写，避免把幂等 re-enable 的失败升级成迁移。
+        if changed {
+            if let Err(we) =
+                write_enabled_plugin(plugin_id, false, scope, options.project_path, env)
+            {
+                tracing::warn!(plugin = plugin_id, error = %we, "enable rollback: re-disable write failed after skill-source conflict (ledger may残留 enabled=true)");
+            }
+        }
+        return Err(PluginNameConflictError {
+            requested_pid: plugin_id.to_string(),
+            plugin: plugin.clone(),
+            kind: PluginNameConflictKind::SkillSource {
+                conflicts: source_conflicts,
+            },
+        }
+        .into());
+    }
 
     // ④ 重挂 servers——**原子回滚**（#94 点 4 / §10.6 回滚契约）：与 install 把账本写在最后不同，enable 先写
     //    `enabledPlugins=true`（步骤 ②）再挂 server，故 `register_server` 失败会留"标记已启用但 server 未挂"的
@@ -3164,5 +3442,689 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    // ---- #275：跨 marketplace 同名 plugin 唯一性 --------------------------
+
+    /// 构造含指定 plugin 的 marketplace 源仓库（plugin 名可变，供跨 marketplace 同名用）。
+    fn build_plugin_repo(repo: &Path, plugin: &str, description: &str) -> Value {
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            format!(r#"{{"plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#),
+        )
+        .unwrap();
+        let skill = repo.join(format!("plugins/{plugin}/skills/code-review"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())})
+    }
+
+    /// 一个 marketplace 含多个 plugin（R1：同源其它已装 plugin 不得当保护伞）。
+    fn build_multi_plugin_repo(repo: &Path, plugins: &[(&str, &str)]) -> Value {
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        let entries: Vec<String> = plugins
+            .iter()
+            .map(|(plugin, _)| format!(r#"{{"name": "{plugin}", "source": "./plugins/{plugin}"}}"#))
+            .collect();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            format!(r#"{{"plugins": [{}]}}"#, entries.join(",")),
+        )
+        .unwrap();
+        for (plugin, description) in plugins {
+            let skill = repo.join(format!("plugins/{plugin}/skills/code-review"));
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
+            )
+            .unwrap();
+        }
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())})
+    }
+
+    /// 预 clone marketplace catalog + 写 known_marketplaces.json（install/enable 前置）。
+    async fn seed_marketplace(home: &Path, env: &EnvMap, name: &str, source: &Value) {
+        let mut throwaway = SkillRegistry::new();
+        stage_marketplace_skills(
+            name,
+            source,
+            &mut throwaway,
+            home,
+            MarketplaceStageOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let src = source.clone();
+        let mp = name.to_string();
+        update_known_marketplaces(
+            move |file| {
+                file.account.marketplaces.insert(
+                    mp,
+                    crate::settings::reconciler::KnownMarketplaceEntry {
+                        source: src,
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
+    }
+
+    /// 两个 marketplace（mp-a / mp-b，各含同名 plugin `alpha`）→ (home, env, src_a, src_b)。
+    async fn setup_cross_marketplace(tmp: &TempDir) -> (PathBuf, EnvMap, Value, Value) {
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let mut env = EnvMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        );
+        let src_a = build_plugin_repo(&tmp.path().join("mp-a"), "alpha", "from mp-a");
+        let src_b = build_plugin_repo(&tmp.path().join("mp-b"), "alpha", "from mp-b");
+        seed_marketplace(&home, &env, "mp-a", &src_a).await;
+        seed_marketplace(&home, &env, "mp-b", &src_b).await;
+        (home, env, src_a, src_b)
+    }
+
+    fn seed_intent(home: &Path, env: &EnvMap, pids: &[&str]) {
+        let pids: Vec<String> = pids.iter().map(|s| s.to_string()).collect();
+        crate::settings::store::update_installed_plugins_intent(
+            move |file| {
+                for pid in pids {
+                    file.account.installed_plugins.insert(pid);
+                }
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
+    }
+
+    fn seed_ledger_record_with_path(home: &Path, env: &EnvMap, pid: &str, install_path: &Path) {
+        let pid = pid.to_string();
+        let install_path = install_path.to_string_lossy().into_owned();
+        crate::settings::store::update_installed_plugins(
+            move |file| {
+                file.account.plugins.insert(
+                    pid,
+                    vec![InstalledPluginRecord {
+                        install_path: Some(install_path),
+                        mcp_servers: Vec::new(),
+                        extra: Map::new(),
+                    }],
+                );
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
+    }
+
+    fn plugin_root(home: &Path, marketplace: &str, plugin: &str) -> PathBuf {
+        marketplace_skill_dir(home, marketplace, &[])
+            .join("plugins")
+            .join(plugin)
+    }
+
+    fn plugin_name_conflict(err: &PluginInstallError) -> &PluginNameConflictError {
+        match err {
+            PluginInstallError::NameConflict(e) => e,
+            other => panic!("expected NameConflict, got {other:?}"),
+        }
+    }
+
+    /// 序 1（conformance-tests.md:365 原复现序）：已装 `alpha@mp-a` 后 install `alpha@mp-b` →
+    /// 安装层拒绝，零变更（不 clone mp-b、不写 intent/ledger/settings、registry 不动）。
+    #[tokio::test]
+    async fn install_rejects_duplicate_bare_plugin_before_materialize_zero_change() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        enable_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 删掉 mp-b 预 clone：若前置门在 materialize 之后，install 会尝试重新 clone 并留下目录。
+        let mp_b_dir = marketplace_skill_dir(&home, "mp-b", &[]);
+        fs::remove_dir_all(&mp_b_dir).unwrap();
+
+        let intent_path =
+            crate::settings::store::installed_plugins_intent_path(Some(&home), Some(&env));
+        let ledger_path = installed_plugins_path(Some(&home), Some(&env));
+        let settings_path = user_settings_path(Some(&env));
+        let intent_before = fs::read(&intent_path).unwrap();
+        let ledger_before = fs::read(&ledger_path).unwrap();
+        let settings_before = fs::read(&settings_path).unwrap();
+        let refs_before = reg.all_refs();
+
+        let err = install_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        let conflict = plugin_name_conflict(&err);
+        assert_eq!(conflict.plugin, "alpha");
+        assert!(matches!(
+            &conflict.kind,
+            PluginNameConflictKind::Installed { installed_pid } if installed_pid == "alpha@mp-a"
+        ));
+
+        // 零变更：不 clone、不写三处持久化、registry 不动。
+        assert!(!mp_b_dir.exists(), "前置门必须在 materialize/clone 之前");
+        assert_eq!(fs::read(&intent_path).unwrap(), intent_before);
+        assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+        assert_eq!(fs::read(&settings_path).unwrap(), settings_before);
+        assert_eq!(reg.all_refs(), refs_before);
+        assert_eq!(
+            reg.resolve("alpha:code-review").unwrap().source,
+            "marketplace:mp-a"
+        );
+    }
+
+    /// 同 pid 重装不属于跨 marketplace 冲突，仍幂等允许。
+    #[tokio::test]
+    async fn reinstall_same_pid_is_not_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        install_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("同 pid 重装不得按跨 marketplace 冲突拒绝");
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(&home), Some(&env))
+            .account
+            .installed_plugins;
+        assert_eq!(intent.iter().filter(|p| *p == "alpha@mp-a").count(), 1);
+        assert_eq!(ledger_records(&home, &env, "alpha@mp-a").len(), 1);
+    }
+
+    /// 序 4（存量双装）：intent 中两个同名 pid 并存 → enable 任一都 fail-closed，指引先 uninstall。
+    #[tokio::test]
+    async fn enable_rejects_legacy_duplicate_bare_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        seed_intent(&home, &env, &["alpha@mp-a", "alpha@mp-b"]);
+        seed_ledger_record_with_path(
+            &home,
+            &env,
+            "alpha@mp-a",
+            &plugin_root(&home, "mp-a", "alpha"),
+        );
+        seed_ledger_record_with_path(
+            &home,
+            &env,
+            "alpha@mp-b",
+            &plugin_root(&home, "mp-b", "alpha"),
+        );
+
+        let mut reg = SkillRegistry::new();
+        let err = enable_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        let conflict = plugin_name_conflict(&err);
+        assert!(matches!(
+            &conflict.kind,
+            PluginNameConflictKind::Installed { installed_pid } if installed_pid == "alpha@mp-a"
+        ));
+        // 写 enabledPlugins 之前失败：零变更。
+        assert_eq!(enabled_flag(&env, "alpha@mp-b"), None);
+        assert_eq!(enabled_flag(&env, "alpha@mp-a"), None);
+    }
+
+    fn user_skill(name: &str) -> smcp::A2CSkillRef {
+        smcp::A2CSkillRef {
+            name: name.to_string(),
+            source: "user".to_string(),
+            uri: None,
+            path: format!("/abs/skills/{name}"),
+            description: "d".to_string(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            tags: None,
+            version: None,
+            skill_metadata: None,
+        }
+    }
+
+    /// add-only 的 marketplace 源不应挡住已安装来源（installed intent 优先）：install mp-b 时清掉
+    /// 未安装 mp-a 的占名，mp-b 成为 owner。
+    #[tokio::test]
+    async fn install_overrides_add_only_marketplace_owner() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        let mut reg = SkillRegistry::new();
+        stage_marketplace_skills(
+            "mp-a",
+            &src_a,
+            &mut reg,
+            &home,
+            MarketplaceStageOptions::default(),
+        )
+        .await;
+        assert_eq!(
+            reg.resolve("alpha:code-review").unwrap().source,
+            "marketplace:mp-a"
+        );
+
+        install_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("已安装来源应胜过仅 add 的 marketplace 占名");
+        let (kept, orphaned) = reg
+            .all_refs()
+            .into_iter()
+            .find(|(r, _)| r.name == "alpha:code-review")
+            .unwrap();
+        assert_eq!(kept.source, "marketplace:mp-b");
+        assert!(orphaned);
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(&home), Some(&env))
+            .account
+            .installed_plugins;
+        assert!(intent.contains("alpha@mp-b"));
+    }
+
+    /// 非 marketplace 源（user）占名仍 fail-closed：清掉 add-only 源不等于放弃全局唯一性。
+    #[tokio::test]
+    async fn install_fails_closed_on_non_marketplace_skill_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        let mut reg = SkillRegistry::new();
+        assert!(reg.register(user_skill("alpha:code-review")));
+
+        let err = install_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        let conflict = plugin_name_conflict(&err);
+        assert!(matches!(
+            &conflict.kind,
+            PluginNameConflictKind::SkillSource { .. }
+        ));
+        assert!(
+            !crate::settings::store::installed_plugins_intent_path(Some(&home), Some(&env))
+                .exists(),
+            "fail-closed 不写安装意图"
+        );
+        assert_eq!(reg.resolve("alpha:code-review").unwrap().source, "user");
+    }
+
+    /// add-only 的 marketplace 源不应挡住已安装来源：enable mp-b 时清掉未安装 mp-a 的占名。
+    #[tokio::test]
+    async fn enable_overrides_add_only_marketplace_owner() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        seed_intent(&home, &env, &["alpha@mp-b"]);
+        seed_ledger_record_with_path(
+            &home,
+            &env,
+            "alpha@mp-b",
+            &plugin_root(&home, "mp-b", "alpha"),
+        );
+        let mut reg = SkillRegistry::new();
+        stage_marketplace_skills(
+            "mp-a",
+            &src_a,
+            &mut reg,
+            &home,
+            MarketplaceStageOptions::default(),
+        )
+        .await;
+
+        enable_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("已安装来源应胜过仅 add 的 marketplace 占名");
+        assert_eq!(enabled_flag(&env, "alpha@mp-b"), Some(true));
+        assert_eq!(
+            reg.resolve("alpha:code-review").unwrap().source,
+            "marketplace:mp-b"
+        );
+    }
+
+    async fn setup_mixed_marketplaces(tmp: &TempDir) -> (PathBuf, EnvMap, Value) {
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg).unwrap();
+        let mut env = EnvMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg.to_string_lossy().into_owned(),
+        );
+        let src_a = build_multi_plugin_repo(
+            &tmp.path().join("mp-a"),
+            &[("alpha", "from mp-a"), ("beta", "beta mp-a")],
+        );
+        let src_b = build_plugin_repo(&tmp.path().join("mp-b"), "alpha", "from mp-b");
+        seed_marketplace(&home, &env, "mp-a", &src_a).await;
+        seed_marketplace(&home, &env, "mp-b", &src_b).await;
+        (home, env, src_a)
+    }
+
+    /// R1（install）：mp-a 装了 **beta** 但 alpha 未装 → mp-a 的 alpha 不得挡住 mp-b 的 alpha。
+    #[tokio::test]
+    async fn install_alpha_ignores_same_marketplace_installed_beta() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, src_a) = setup_mixed_marketplaces(&tmp).await;
+        let mut reg = SkillRegistry::new();
+        stage_marketplace_skills(
+            "mp-a",
+            &src_a,
+            &mut reg,
+            &home,
+            MarketplaceStageOptions::default(),
+        )
+        .await;
+        install_plugin(
+            "beta@mp-a",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        install_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("R1：同源其它已装 plugin 不得挡住 alpha@mp-b");
+        let (kept, _) = reg
+            .all_refs()
+            .into_iter()
+            .find(|(r, _)| r.name == "alpha:code-review")
+            .unwrap();
+        assert_eq!(kept.source, "marketplace:mp-b");
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(&home), Some(&env))
+            .account
+            .installed_plugins;
+        assert!(intent.contains("beta@mp-a") && intent.contains("alpha@mp-b"));
+    }
+
+    /// R1（enable）：mp-a 装了 **beta** 但 alpha 未装 → enable mp-b 的 alpha 不得被 mp-a 占名挡住。
+    #[tokio::test]
+    async fn enable_alpha_ignores_same_marketplace_installed_beta() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, src_a) = setup_mixed_marketplaces(&tmp).await;
+        seed_intent(&home, &env, &["beta@mp-a", "alpha@mp-b"]);
+        seed_ledger_record_with_path(
+            &home,
+            &env,
+            "alpha@mp-b",
+            &plugin_root(&home, "mp-b", "alpha"),
+        );
+        let mut reg = SkillRegistry::new();
+        stage_marketplace_skills(
+            "mp-a",
+            &src_a,
+            &mut reg,
+            &home,
+            MarketplaceStageOptions::default(),
+        )
+        .await;
+
+        enable_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("R1：同源其它已装 plugin 不得挡住 enable alpha@mp-b");
+        assert_eq!(enabled_flag(&env, "alpha@mp-b"), Some(true));
+        assert_eq!(
+            reg.resolve("alpha:code-review").unwrap().source,
+            "marketplace:mp-b"
+        );
+    }
+
+    /// 非 marketplace 源（user）占名仍 fail-closed：enable 回滚 enabledPlugins=false + registry 快照。
+    #[tokio::test]
+    async fn enable_rolls_back_enabled_flag_on_non_marketplace_skill_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        seed_intent(&home, &env, &["alpha@mp-b"]);
+        seed_ledger_record_with_path(
+            &home,
+            &env,
+            "alpha@mp-b",
+            &plugin_root(&home, "mp-b", "alpha"),
+        );
+        let mut reg = SkillRegistry::new();
+        assert!(reg.register(user_skill("alpha:code-review")));
+
+        let err = enable_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        let conflict = plugin_name_conflict(&err);
+        assert!(matches!(
+            &conflict.kind,
+            PluginNameConflictKind::SkillSource { .. }
+        ));
+        assert_eq!(enabled_flag(&env, "alpha@mp-b"), Some(false));
+        assert_eq!(reg.resolve("alpha:code-review").unwrap().source, "user");
+    }
+
+    /// uninstall 须注销 orphan（installed_disabled）条目，让「按指引卸载后可换源」在本进程闭环。
+    #[tokio::test]
+    async fn uninstall_removes_orphan_skill_entries() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(reg.is_orphan("alpha:code-review"));
+
+        uninstall_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(reg.source_conflicts().is_empty());
+        assert!(
+            !reg.contains("alpha:code-review"),
+            "uninstall 应注销 active + orphan 条目"
+        );
+    }
+
+    /// 复审 🔴 回归：dangling-intent 早退路径也必须清 registry（含 orphan），否则「按 uninstall
+    /// 指引换源」在本进程内仍被跨源守卫挡住。
+    #[tokio::test]
+    async fn uninstall_dangling_intent_clears_orphan_skills_and_allows_source_switch() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, src_a, _src_b) = setup_cross_marketplace(&tmp).await;
+        let mut reg = SkillRegistry::new();
+        // 模拟 install alpha@mp-a 写 intent 成功、写 ledger 失败：skills 已 stage 并 mark_orphan。
+        stage_marketplace_skills(
+            "mp-a",
+            &src_a,
+            &mut reg,
+            &home,
+            MarketplaceStageOptions::default(),
+        )
+        .await;
+        assert!(reg.mark_orphan("alpha:code-review"));
+        seed_intent(&home, &env, &["alpha@mp-a"]);
+
+        assert!(uninstall_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap());
+        assert!(
+            !reg.contains("alpha:code-review"),
+            "dangling uninstall 必须注销 active + orphan 条目"
+        );
+
+        // 同进程换源：install alpha@mp-b 成功（不再被 mp-a orphan 占名）。
+        install_plugin(
+            "alpha@mp-b",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("uninstall 后换源 install 不得再被占名阻塞");
+        let (kept, orphaned) = reg
+            .all_refs()
+            .into_iter()
+            .find(|(r, _)| r.name == "alpha:code-review")
+            .unwrap();
+        assert_eq!(kept.source, "marketplace:mp-b");
+        assert!(orphaned, "install 后仍为 installed_disabled（orphan）");
     }
 }

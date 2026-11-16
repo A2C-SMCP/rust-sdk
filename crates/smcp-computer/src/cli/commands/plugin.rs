@@ -174,6 +174,15 @@ pub async fn plugin_install(
                 Some("mcp_server_name_conflict"),
             )
         }
+        // #275：跨 marketplace 同名 plugin（安装层唯一性）→ 结构化 error_code。
+        Err(PluginInstallError::NameConflict(e)) => {
+            return plugin_err(
+                &e.to_string(),
+                json_output,
+                EXIT_USER_ERROR,
+                Some("plugin_name_conflict"),
+            )
+        }
         Err(e) => return plugin_err(&e.to_string(), json_output, EXIT_USER_ERROR, None),
     };
 
@@ -298,6 +307,15 @@ pub async fn plugin_enable(
                     json_output,
                     EXIT_USER_ERROR,
                     Some("mcp_server_name_conflict"),
+                )
+            }
+            // #275：跨 marketplace 同名 plugin（enable 防御 / stage 后 fail-closed）。
+            Err(PluginInstallError::NameConflict(e)) => {
+                return plugin_err(
+                    &e.to_string(),
+                    json_output,
+                    EXIT_USER_ERROR,
+                    Some("plugin_name_conflict"),
                 )
             }
             Err(e) => return plugin_err(&e.to_string(), json_output, EXIT_USER_ERROR, None),
