@@ -84,6 +84,10 @@ pub enum DiagnosticCode {
     MarketplaceSyncFailed,
     /// 账本派生缓存重物化失败（§63，Degraded）。
     LedgerRematerializeFailed,
+    /// 跨 marketplace 同名 plugin（安装层唯一性；存量双装 → Degraded）。
+    PluginNameConflict,
+    /// 同名 SKILL 已被其它 source 占用（保留先到者；被拒源 Degraded）。
+    SkillSourceConflict,
 }
 
 /// 严重度（TFRC-76 北极星）/ severity.
@@ -135,6 +139,10 @@ pub enum DiagnosticOperation {
     MarketplaceSync,
     /// 账本重物化（阶段一·五）。
     LedgerRematerialize,
+    /// 安装/启用前检查裸 plugin 名跨 marketplace 唯一性。
+    CheckPluginNameUniqueness,
+    /// 装配 Skill Registry 时注册 SKILL（跨 source 冲突）。
+    RegisterSkill,
 }
 
 /// 受影响对象 / affected target（非 `Option`：boot 失败影响的是「整个 runtime」而非「无」）。
@@ -281,6 +289,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DiagnosticTarget::Runtime).unwrap(),
             "\"runtime\""
+        );
+        // #275：跨 marketplace 同名 plugin / skill source 冲突的稳定诊断码。
+        assert_eq!(
+            serde_json::to_string(&DiagnosticCode::PluginNameConflict).unwrap(),
+            "\"plugin_name_conflict\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DiagnosticCode::SkillSourceConflict).unwrap(),
+            "\"skill_source_conflict\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DiagnosticOperation::CheckPluginNameUniqueness).unwrap(),
+            "\"check_plugin_name_uniqueness\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DiagnosticOperation::RegisterSkill).unwrap(),
+            "\"register_skill\""
         );
     }
 

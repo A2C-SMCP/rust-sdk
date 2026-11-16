@@ -74,7 +74,8 @@ pub struct KnownMarketplaceEntry {
 /// `known_marketplaces.json` 全量 / the whole known-marketplaces file。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KnownMarketplaces {
-    /// `name → entry`（保物化顺序）/ ordered marketplace records。
+    /// `name → entry`（内存内 IndexMap 保插入序；**文件 reload 经 serde_json Map 不保证原序**——不得把
+    /// 该顺序当 SKILL 所有权仲裁依据，已装 plugin 的源优先）/ in-memory ordered records.
     #[serde(default)]
     pub marketplaces: IndexMap<String, KnownMarketplaceEntry>,
 }
@@ -358,8 +359,8 @@ pub(crate) fn remove_plugin_install_path(
 /// 从 Registry 注销某 marketplace（可选限定单 plugin）的 SKILL / Unregister a marketplace's SKILLs。
 ///
 /// 按 `A2CSkillRef.source == "marketplace:<mp>"` 反查（marketplace SKILL name 形如 `<plugin>:<skill>`，
-/// `plugin` 给定时再按 `<plugin>:` 前缀过滤）。additive-only 模型下 marketplace clone 树不上 watcher，
-/// 其 SKILL 在 prune/gc 前恒活跃，故经 [`SkillRegistry::active_refs`] 枚举即可。
+/// `plugin` 给定时再按 `<plugin>:` 前缀过滤）。**含孤儿**：installed_disabled plugin 的 SKILL 在 Registry
+/// 中保留为 orphan（不投影但占名），source 变更 / prune / gc 时必须一并注销，否则同名跨源守卫会阻止换源。
 fn unregister_marketplace_skills(
     registry: &mut SkillRegistry,
     marketplace: &str,
@@ -367,20 +368,16 @@ fn unregister_marketplace_skills(
 ) {
     let want_source = format!("{SOURCE_MARKETPLACE}:{marketplace}");
     let prefix = plugin.map(|p| format!("{p}:"));
-    let names: Vec<String> = registry
-        .active_refs()
-        .into_iter()
-        .filter(|r| r.source == want_source)
-        .filter(|r| {
-            prefix
-                .as_ref()
-                .is_none_or(|pre| r.name.starts_with(pre.as_str()))
-        })
-        .map(|r| r.name)
-        .collect();
+    let names = registry.names_for_source(&want_source, prefix.as_deref().unwrap_or(""), true);
     for name in names {
         registry.unregister(&name);
     }
+    // #275：注销该源（或该 plugin×源）后，相关跨源冲突记录随之失效，避免后续 add/refresh 重发 stale 诊断。
+    let conflict_prefix = prefix.unwrap_or_default();
+    registry.clear_source_conflicts_where(|c| {
+        c.name.starts_with(&conflict_prefix)
+            && (c.kept_source == want_source || c.rejected_source == want_source)
+    });
 }
 
 // ===========================================================================

@@ -21,7 +21,7 @@ use serde_json::{json, Map, Value};
 
 use super::{err_flat as err, msg_dim, msg_warn, print_json, EXIT_OK, EXIT_USER_ERROR};
 use crate::settings::scope::EnvMap;
-use crate::settings::store::load_known_marketplaces;
+use crate::settings::store::{installed_marketplace_order, load_known_marketplaces};
 use crate::skills::{
     stage_marketplace_skills, stage_user_skills, MarketplaceStageOptions, SkillRegistry,
     SOURCE_MARKETPLACE, SOURCE_MCP, SOURCE_USER,
@@ -158,7 +158,21 @@ pub fn skill_info(registry: &SkillRegistry, name: &str, json_output: bool) -> i3
 pub async fn rebuild_registry(home: &Path, env: Option<&EnvMap>) -> SkillRegistry {
     let mut registry = SkillRegistry::new();
     let known = load_known_marketplaces(Some(home), env).account;
+    // #275：已装 plugin 的 marketplace 优先 stage（installed intent 顺序），避免「仅添加」的源凭
+    // known_marketplaces 载入序抢占同名 SKILL 所有权（reload 经 serde_json Map 不保证文件原序）。
+    let priority = installed_marketplace_order(Some(home), env);
+    let mut ordered = Vec::new();
+    for mp in &priority {
+        if let Some(rec) = known.marketplaces.get(mp) {
+            ordered.push((mp, rec));
+        }
+    }
     for (name, rec) in &known.marketplaces {
+        if !priority.contains(name) {
+            ordered.push((name, rec));
+        }
+    }
+    for (name, rec) in ordered {
         let auto_update = rec
             .extra
             .get("autoUpdate")
@@ -187,6 +201,7 @@ pub async fn rebuild_registry(home: &Path, env: Option<&EnvMap>) -> SkillRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::store::{update_installed_plugins_intent, update_known_marketplaces};
     use smcp::A2CSkillRef;
 
     fn skill_ref(name: &str, source: &str) -> A2CSkillRef {
@@ -286,5 +301,103 @@ mod tests {
             .all_refs()
             .iter()
             .any(|(r, _)| source_segment(&r.source) == "user"));
+    }
+
+    fn git(args: &[&str], cwd: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn build_marketplace_repo(repo: &std::path::Path, description: &str) -> String {
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins": [{"name": "alpha", "source": "./plugins/alpha"}]}"#,
+        )
+        .unwrap();
+        let skill = repo.join("plugins/alpha/skills/code-review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        format!("file://{}", repo.display())
+    }
+
+    /// #275：CLI 离线重建须让已装 plugin 的 marketplace 先 stage，避免仅 add 的源凭载入序占名。
+    #[tokio::test]
+    async fn rebuild_registry_prioritizes_installed_marketplace_over_add_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let url_a = build_marketplace_repo(&dir.path().join("repo-a"), "from mp-a");
+        let url_b = build_marketplace_repo(&dir.path().join("repo-b"), "from mp-b");
+        let mut throwaway = SkillRegistry::new();
+        for (name, url) in [("mp-a", &url_a), ("mp-b", &url_b)] {
+            stage_marketplace_skills(
+                name,
+                &json!({"type": "git", "url": url}),
+                &mut throwaway,
+                home,
+                MarketplaceStageOptions {
+                    refresh: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        update_known_marketplaces(
+            |f| {
+                for (name, url) in [("mp-a", &url_a), ("mp-b", &url_b)] {
+                    f.account.marketplaces.insert(
+                        name.to_string(),
+                        crate::settings::reconciler::KnownMarketplaceEntry {
+                            source: json!({"type": "git", "url": url}),
+                            extra: Map::new(),
+                        },
+                    );
+                }
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("alpha@mp-b".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+
+        let registry = rebuild_registry(home, None).await;
+        let (kept, _) = registry
+            .all_refs()
+            .into_iter()
+            .find(|(r, _)| r.name == "alpha:code-review")
+            .unwrap();
+        assert_eq!(
+            kept.source, "marketplace:mp-b",
+            "已装来源必须先于仅 add 的源注册"
+        );
     }
 }

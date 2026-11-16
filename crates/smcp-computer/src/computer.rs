@@ -67,7 +67,7 @@ use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
     AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer, SkillFileWatcher, SkillRegistry,
-    SkillResourceView, SkillSandboxError, SOURCE_USER,
+    SkillResourceView, SkillSandboxError, SkillSourceConflict, SOURCE_USER,
 };
 use smcp::utils::env_truthy;
 use smcp::A2CSkillRef;
@@ -710,6 +710,34 @@ fn reconcile_orphans_in(
     for name in to_orphan {
         registry.mark_orphan(&name);
     }
+}
+
+/// #275：SKILL 源冲突 → 被拒 pid（`<plugin>@<marketplace>`）/ Rejected pid from a source conflict。
+fn skill_source_conflict_pid(conflict: &SkillSourceConflict) -> Option<String> {
+    let plugin = conflict.name.split_once(':')?.0;
+    let marketplace = conflict.rejected_source.strip_prefix("marketplace:")?;
+    Some(format!("{plugin}@{marketplace}"))
+}
+
+/// #275：过滤仍成立的 SKILL 源冲突（kept source 仍是 owner ∧ rejected marketplace 仍 known）。
+///
+/// add/refresh 即时诊断与 reconcile 的 prior 复核共用，避免把 uninstall/remove 后的 stale 记录
+/// 重新发成诊断。
+fn live_skill_source_conflicts(
+    registry: &SkillRegistry,
+    known: &crate::settings::reconciler::KnownMarketplaces,
+    conflicts: &[SkillSourceConflict],
+) -> Vec<SkillSourceConflict> {
+    conflicts
+        .iter()
+        .filter(|c| {
+            registry.source_of(&c.name) == Some(c.kept_source.as_str())
+                && c.rejected_source
+                    .strip_prefix("marketplace:")
+                    .is_some_and(|mp| known.marketplaces.contains_key(mp))
+        })
+        .cloned()
+        .collect()
 }
 
 /// 递归扫描配置 JSON，收集所有 `${input:<id>}` 引用的 input id（#112 S5）/ collect referenced input ids。
@@ -1454,12 +1482,19 @@ impl<S: Session> Computer<S> {
         params: AddMarketplaceParams<'_>,
     ) -> Result<MarketplaceAddOutcome, GovernanceError> {
         let home = self.skill_home();
-        let res = {
+        let (res, conflicts) = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::lifecycle::add_marketplace(&mut reg, &home, None, git_url, params)
-                .await
+            let res =
+                crate::settings::lifecycle::add_marketplace(&mut reg, &home, None, git_url, params)
+                    .await;
+            // #275：add 阶段被跨源守卫拒绝的 SKILL 不静默——即时写结构化诊断（仅发仍成立的冲突；
+            // 保留记录供 reconcile 复核，不在此 drain）。
+            let known = crate::settings::store::load_known_marketplaces(Some(&home), None).account;
+            let conflicts = live_skill_source_conflicts(&reg, &known, reg.source_conflicts());
+            (res, conflicts)
         };
         if res.is_ok() {
+            self.record_skill_source_conflicts(&conflicts);
             self.mark_skills_dirty();
             self.emit_governance_config_change().await;
         }
@@ -1471,10 +1506,17 @@ impl<S: Session> Computer<S> {
     /// `target == "all"` → 全部已知 marketplace；否则单个目标。未知目标 → `missing` 行（不整体报错）。
     pub async fn refresh_marketplace(&self, target: &str) -> Vec<MarketplaceRefreshRow> {
         let home = self.skill_home();
-        let rows = {
+        let (rows, conflicts) = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::lifecycle::refresh_marketplaces(&mut reg, &home, None, target).await
+            let rows =
+                crate::settings::lifecycle::refresh_marketplaces(&mut reg, &home, None, target)
+                    .await;
+            let known = crate::settings::store::load_known_marketplaces(Some(&home), None).account;
+            let conflicts = live_skill_source_conflicts(&reg, &known, reg.source_conflicts());
+            (rows, conflicts)
         };
+        // #275：refresh 阶段被跨源守卫拒绝的 SKILL 即时写结构化诊断（记录保留给 reconcile 复核）。
+        self.record_skill_source_conflicts(&conflicts);
         // refresh 即便全 unchanged 也可能翻活孤儿 / 重挂；统一标脏交去抖器判定。
         self.mark_skills_dirty();
         rows
@@ -1766,6 +1808,86 @@ impl<S: Session> Computer<S> {
         res
     }
 
+    /// #275：把「同裸名 plugin 多 marketplace 已装」与「SKILL 源冲突」写入 Governance 诊断。
+    ///
+    /// 只读 intent + 本轮 registry 冲突记录；不迁移、不改写 `installedPlugins` / `enabledPlugins`。
+    /// 同一被拒 pid 的多条 SKILL 冲突按 `(code, target)` 键聚合为一条。诊断只声明「重复对」，
+    /// 不臆测哪一侧可用（被拒侧可能恰是唯一可达源），由宿主/用户自行决定 uninstall 哪一个。
+    fn record_cross_marketplace_conflicts(
+        &self,
+        home: &Path,
+        env: Option<&EnvMap>,
+        conflicts: &[SkillSourceConflict],
+    ) {
+        // 1) installedPlugins 意图：同裸名第二个及之后的 pid → PluginNameConflict。
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(home), env);
+        let mut first_by_plugin: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for pid in &intent.account.installed_plugins {
+            let Some((plugin, _)) = pid.split_once('@') else {
+                continue;
+            };
+            match first_by_plugin.get(plugin) {
+                Some(first) => {
+                    if first == pid {
+                        continue;
+                    }
+                    self.status.record_diagnostic(RuntimeDiagnostic::new(
+                        DiagnosticCode::PluginNameConflict,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Governance,
+                        DiagnosticOperation::CheckPluginNameUniqueness,
+                        DiagnosticTarget::Plugin(pid.clone()),
+                        format!(
+                            "plugin name conflict: {plugin:?} is installed from multiple marketplaces \
+                             ({first} and {pid}); keep exactly one and uninstall the rest before \
+                             switching sources"
+                        ),
+                    ));
+                }
+                None => {
+                    first_by_plugin.insert(plugin.to_string(), pid.clone());
+                }
+            }
+        }
+
+        self.record_skill_source_conflicts(conflicts);
+    }
+
+    /// #275：SKILL 源冲突 → 按被拒 pid 聚合的 Governance 诊断（reconcile / add / refresh 共用）。
+    fn record_skill_source_conflicts(&self, conflicts: &[SkillSourceConflict]) {
+        let mut by_pid: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for conflict in conflicts {
+            if let Some(pid) = skill_source_conflict_pid(conflict) {
+                by_pid.entry(pid).or_default().push(conflict.name.clone());
+            }
+        }
+        for (pid, mut names) in by_pid {
+            names.sort_unstable();
+            names.dedup();
+            let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            let more = names.len().saturating_sub(3);
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::SkillSourceConflict,
+                DiagnosticSeverity::Degraded,
+                DiagnosticSource::Governance,
+                DiagnosticOperation::RegisterSkill,
+                DiagnosticTarget::Plugin(pid.clone()),
+                format!(
+                    "skill source conflict for {pid}: skill(s) {} already owned by another \
+                     marketplace source (first registrant wins); resolve the conflicting source \
+                     (uninstall its plugin or remove its marketplace)",
+                    if more > 0 {
+                        format!("{shown} (+{more} more)")
+                    } else {
+                        shown
+                    }
+                ),
+            ));
+        }
+    }
+
     /// 治理状态启动恢复（从 `skill_home` 持久化 ledger 重建边界内派生态）/ governance boot recovery（#95）。
     ///
     /// 冷启动 / 进程重启后，从 `installed_plugins_intent.json`（安装意图，v0.3.0 权威）+ `known_marketplaces.json`
@@ -1863,10 +1985,26 @@ impl<S: Session> Computer<S> {
         // 恢复即自然清除（运行期恢复路径，boot 与运行期统一语义）。
         self.status
             .clear_diagnostics_where(|d| d.source == DiagnosticSource::Governance);
-        let mut report = {
+        let (mut report, source_conflicts) = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, env, declared)
-                .await
+            // #275：上一轮 add/refresh 的冲突记录先取出，本轮 recovery 后逐条复核——仅当 kept source 仍是
+            // 该 name 的 owner 且被拒 marketplace 仍 known 才保留（只丢弃可证明已不存在的记录）。
+            let prior = reg.drain_source_conflicts();
+            let report = crate::settings::recovery::recover_marketplace_skills(
+                &mut reg, &home, env, declared,
+            )
+            .await;
+            let known = crate::settings::store::load_known_marketplaces(Some(&home), env).account;
+            let retained = live_skill_source_conflicts(&reg, &known, &prior);
+            let mut conflicts = reg.drain_source_conflicts();
+            for conflict in retained {
+                if !conflicts.contains(&conflict) {
+                    conflicts.push(conflict);
+                }
+            }
+            // 回写 registry：下一轮 reconcile 的 prior drain 才能继续复核（否则二次 reconcile 静默清除）。
+            reg.record_source_conflicts(conflicts.iter().cloned());
+            (report, conflicts)
         };
 
         // 阶段一·五：账本派生缓存补全（§63 账本删除无损，#104）。**已释放 skill 写锁**、无锁纯 FS/git，故置于
@@ -1902,6 +2040,8 @@ impl<S: Session> Computer<S> {
                 format!("ledger rematerialize failed for enabled plugin: {pid}"),
             ));
         }
+        // #275：存量双装（同裸名多 marketplace）与 SKILL 源冲突 → 结构化诊断（Degraded / Governance）。
+        self.record_cross_marketplace_conflicts(&home, env, &source_conflicts);
 
         // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
         // 严格镜像 Python `computer.py::reconcile_governance` remount 臂（PR #119 / #100 设计 Y）：

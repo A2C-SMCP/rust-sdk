@@ -674,24 +674,74 @@ pub fn update_installed_plugins_intent(
     home: Option<&Path>,
     env: Option<&EnvMap>,
 ) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    Ok(update_installed_plugins_intent_locked(
+        |current| {
+            mutator(current);
+            true
+        },
+        home,
+        env,
+    )?
+    .expect("update_installed_plugins_intent always commits"))
+}
+
+/// 可中止的 intent RMW：`mutator` 返回 `false` → **不落盘**（文件逐字节不变）/ Abortable intent RMW.
+///
+/// #275 TOCTOU 复核用：锁内发现同裸名抢跑时放弃插入，避免「拒绝仍重写 intent」造成抢跑路径的
+/// 非字节级变更。返回 `None` 表示放弃；`Some(file)` 表示已提交落盘。
+pub(crate) fn try_update_installed_plugins_intent(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile) -> bool,
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<Option<InstalledPluginsIntentFile>, SettingsStoreError> {
+    update_installed_plugins_intent_locked(mutator, home, env)
+}
+
+fn update_installed_plugins_intent_locked(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile) -> bool,
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<Option<InstalledPluginsIntentFile>, SettingsStoreError> {
     let path = installed_plugins_intent_path(home, env);
     with_file_lock(
         &path,
         DEFAULT_LOCK_RETRIES,
         DEFAULT_LOCK_BACKOFF_BASE,
         DEFAULT_LOCK_BACKOFF_MAX,
-        || -> io::Result<InstalledPluginsIntentFile> {
+        || -> io::Result<Option<InstalledPluginsIntentFile>> {
             let mut current = match read_jsonc_with_recovery(&path) {
                 Some(data) => coerce_installed_plugins_intent(&data, &path),
                 None => empty_installed_plugins_intent(),
             };
-            mutator(&mut current);
+            if !mutator(&mut current) {
+                return Ok(None);
+            }
             current.version = MATERIALIZED_VERSION;
             atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
-            Ok(current)
+            Ok(Some(current))
         },
     )?
     .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 已装 plugin 所属 marketplace，按 `installedPlugins` 首次出现顺序（installed intent 优先）/
+/// Marketplaces owning installed plugins, in installed-intent order.
+///
+/// 用于 CLI 离线重建 / refresh-all 的 **staging 排序**：已装 plugin 的源必须先于「仅添加」的源注册，
+/// 否则跨 marketplace 同名 SKILL 的「先到者胜」会被字母序的 catalog 载入顺序错误仲裁。
+pub fn installed_marketplace_order(home: Option<&Path>, env: Option<&EnvMap>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for pid in &load_installed_plugins_intent(home, env)
+        .account
+        .installed_plugins
+    {
+        if let Some((_, marketplace)) = pid.split_once('@') {
+            if !order.iter().any(|m| m == marketplace) {
+                order.push(marketplace.to_string());
+            }
+        }
+    }
+    order
 }
 
 // ===========================================================================
@@ -956,6 +1006,59 @@ mod tests {
         assert_eq!(
             loaded2.into_iter().collect::<Vec<_>>(),
             vec!["ok@mp".to_string()]
+        );
+    }
+
+    #[test]
+    fn try_update_intent_aborts_without_touching_file() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let path = installed_plugins_intent_path(Some(home), None);
+        // 缺失文件 + abort → 文件仍不存在（不得因「落盘即建文件」副作用创建）。
+        let out = try_update_installed_plugins_intent(|_| false, Some(home), None).unwrap();
+        assert!(out.is_none());
+        assert!(!path.exists());
+
+        // 已有文件 + abort → 逐字节不变。
+        update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("a@mp".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let out = try_update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("b@mp".to_string());
+                false
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn installed_marketplace_order_follows_intent_sequence() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("alpha@mp-b".to_string());
+                f.account.installed_plugins.insert("beta@mp-a".to_string());
+                f.account.installed_plugins.insert("gamma@mp-b".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_marketplace_order(Some(home), None),
+            vec!["mp-b".to_string(), "mp-a".to_string()]
         );
     }
 

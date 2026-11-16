@@ -40,8 +40,8 @@ use crate::settings::redaction::{
 };
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
-    load_installed_plugins, load_known_marketplaces, update_known_marketplaces,
-    FileSkillGovernanceStore, SettingsStoreError,
+    installed_marketplace_order, load_installed_plugins, load_known_marketplaces,
+    update_known_marketplaces, FileSkillGovernanceStore, SettingsStoreError,
 };
 use crate::settings::{is_valid_git_url, is_valid_marketplace_name, KnownMarketplaceEntry};
 use crate::skills::{
@@ -387,7 +387,19 @@ pub async fn refresh_marketplaces(
 ) -> Vec<MarketplaceRefreshRow> {
     let mps = load_known_marketplaces(Some(home), env).account;
     let names: Vec<String> = if target == "all" {
-        mps.marketplaces.keys().cloned().collect()
+        // #275：已装 plugin 的 marketplace 先 stage（installed intent 顺序），其余后置；避免仅添加的
+        // 源凭 known_marketplaces 载入序抢占同名 SKILL 所有权。
+        let priority = installed_marketplace_order(Some(home), env);
+        let mut names: Vec<String> = priority
+            .into_iter()
+            .filter(|m| mps.marketplaces.contains_key(m))
+            .collect();
+        for name in mps.marketplaces.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
     } else {
         vec![target.to_string()]
     };
@@ -1141,5 +1153,203 @@ mod tests {
         ));
         // 降级铁律：未落 known_marketplaces。
         assert!(!marketplace_name_taken(home, None, "acme"));
+    }
+
+    // ---- #275：跨 marketplace 同名 plugin（add-after-enable / refresh-all）----------------
+
+    fn build_plugin_repo(repo: &Path, plugin: &str, description: &str) -> Value {
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            format!(r#"{{"plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#),
+        )
+        .unwrap();
+        let skill = repo.join(format!("plugins/{plugin}/skills/code-review"));
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        json!({"type": "git", "url": format!("file://{}", repo.display())})
+    }
+
+    fn test_env(dir: &Path) -> EnvMap {
+        let cfg = dir.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let mut env = EnvMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            cfg.to_string_lossy().into_owned(),
+        );
+        env
+    }
+
+    async fn add_mp(
+        registry: &mut SkillRegistry,
+        home: &Path,
+        env: &EnvMap,
+        name: &str,
+        url: &str,
+    ) {
+        add_marketplace(
+            registry,
+            home,
+            Some(env),
+            url,
+            AddMarketplaceParams {
+                name: Some(name),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// 序 2（add-after-enable）：先 enable `alpha@mp-a`，再 add 含同名 plugin 的 mp-b →
+    /// add 成功但不得改写先到 SKILL 的 source；冲突入 registry 记录，intent 不新增 mp-b。
+    #[tokio::test]
+    async fn add_after_enable_preserves_first_plugin_source() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let env = test_env(home);
+        let repo_a = dir.path().join("mp-a");
+        let repo_b = dir.path().join("mp-b");
+        let src_a = build_plugin_repo(&repo_a, "alpha", "from mp-a");
+        let src_b = build_plugin_repo(&repo_b, "alpha", "from mp-b");
+        let url_a = src_a
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let url_b = src_b
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let mut reg = SkillRegistry::new();
+        add_mp(&mut reg, home, &env, "mp-a", &url_a).await;
+        crate::settings::installer::install_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            home,
+            crate::settings::installer::InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        crate::settings::installer::enable_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            home,
+            crate::settings::installer::EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reg.resolve("alpha:code-review").unwrap().source,
+            "marketplace:mp-a"
+        );
+
+        add_mp(&mut reg, home, &env, "mp-b", &url_b).await;
+        assert_eq!(
+            reg.resolve("alpha:code-review").unwrap().source,
+            "marketplace:mp-a",
+            "add 不得静默改写先到 plugin 的 SKILL source"
+        );
+        assert!(reg.source_conflicts().iter().any(|c| {
+            c.name == "alpha:code-review"
+                && c.kept_source == "marketplace:mp-a"
+                && c.rejected_source == "marketplace:mp-b"
+        }));
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(home), Some(&env))
+            .account
+            .installed_plugins;
+        assert!(intent.contains("alpha@mp-a"));
+        assert!(!intent.contains("alpha@mp-b"));
+    }
+
+    /// 序 3（refresh-all）：两源同名；同源内容 refresh 仍生效（取 mp-a 新 description），
+    /// 跨源仍被拒（source 不变），intent/enabled 不变。
+    #[tokio::test]
+    async fn refresh_all_preserves_first_source_and_updates_same_source() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let env = test_env(home);
+        let repo_a = dir.path().join("mp-a");
+        let repo_b = dir.path().join("mp-b");
+        let src_a = build_plugin_repo(&repo_a, "alpha", "from mp-a");
+        let src_b = build_plugin_repo(&repo_b, "alpha", "from mp-b");
+        let url_a = src_a
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let url_b = src_b
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let mut reg = SkillRegistry::new();
+        add_mp(&mut reg, home, &env, "mp-a", &url_a).await;
+        crate::settings::installer::install_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            home,
+            crate::settings::installer::InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        crate::settings::installer::enable_plugin(
+            "alpha@mp-a",
+            &mut reg,
+            home,
+            crate::settings::installer::EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        add_mp(&mut reg, home, &env, "mp-b", &url_b).await;
+
+        // 同源内容 refresh：mp-a 更新 description 并 commit。
+        std::fs::write(
+            repo_a.join("plugins/alpha/skills/code-review/SKILL.md"),
+            "---\nname: code-review\ndescription: v2\n---\nbody2",
+        )
+        .unwrap();
+        git(&["add", "-A"], &repo_a);
+        git(&["commit", "-qm", "v2"], &repo_a);
+
+        refresh_marketplaces(&mut reg, home, Some(&env), "all").await;
+        let kept = reg.resolve("alpha:code-review").unwrap();
+        assert_eq!(
+            kept.source, "marketplace:mp-a",
+            "跨源 refresh 不得改写 source"
+        );
+        assert_eq!(kept.description, "v2", "同源内容 refresh 仍须生效");
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(home), Some(&env))
+            .account
+            .installed_plugins;
+        assert!(intent.contains("alpha@mp-a"));
+        assert!(!intent.contains("alpha@mp-b"));
     }
 }
