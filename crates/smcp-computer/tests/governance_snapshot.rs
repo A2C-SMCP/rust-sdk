@@ -228,6 +228,74 @@ async fn governance_snapshot_covers_four_plugin_classes() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. #273：账本 scp-like 源展示 host+path（凭据 / 嵌套 URL 仍不出现）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scp_like_marketplace_source_shows_host_and_path_without_credentials() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    // update_known_marketplaces 不校验 URL，等价手编/外部写入的不可信账本输入。
+    update_known_marketplaces(
+        |f| {
+            f.account.marketplaces.insert(
+                "mp".to_string(),
+                KnownMarketplaceEntry {
+                    source: json!({
+                        "type": "git",
+                        "url": "deploy-token@example.com:org/repo.git?token=QUERY#FRAGMENT"
+                    }),
+                    extra: Map::new(),
+                },
+            );
+            // 单斜杠嵌套 URL：path 内嵌 userinfo，必须回落严格占位符。
+            f.account.marketplaces.insert(
+                "evil".to_string(),
+                KnownMarketplaceEntry {
+                    source: json!({
+                        "type": "git",
+                        "url": "git@example.com:https:/alice:PW_LEAK@example.com/repo.git"
+                    }),
+                    extra: Map::new(),
+                },
+            );
+        },
+        Some(&home),
+        None,
+    )
+    .unwrap();
+    let computer = make_computer(&td);
+
+    let snap = computer.governance_snapshot().await.unwrap();
+
+    let mp = snap
+        .marketplaces
+        .iter()
+        .find(|m| m.name == "mp")
+        .expect("seeded marketplace must be projected");
+    assert_eq!(mp.source_url.as_deref(), Some("example.com:org/repo.git"));
+    let rendered = format!("{:?}", mp.source_url);
+    for secret in ["deploy-token", "QUERY", "FRAGMENT"] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+
+    let evil = snap
+        .marketplaces
+        .iter()
+        .find(|m| m.name == "evil")
+        .expect("malformed marketplace must still be projected");
+    assert_eq!(
+        evil.source_url.as_deref(),
+        Some("<redacted-git-source>"),
+        "path 内嵌 userinfo 必须 fail-closed"
+    );
+    let rendered = format!("{:?}", evil.source_url);
+    for secret in ["alice", "PW_LEAK", "https:/"] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 2. intent 权威：陈旧 ledger 记录不得报为 installed
 // ---------------------------------------------------------------------------
 

@@ -71,6 +71,54 @@ pub(crate) fn git_source_for_error(raw: &str) -> String {
     git_url_for_display(raw)
 }
 
+/// 展示面的 Git 来源归一值 / display-normalized Git source for presentation surfaces.
+///
+/// 仅用于展示面（治理快照、marketplace CLI）；**错误与诊断边界必须继续使用**
+/// [`git_url_for_display`]。本函数仅对 scp-like 分支做形状级 fail-closed，不依赖调用方预校验：
+///
+/// - ASCII scp-like `user@host:path` → `host:path`（丢弃 userinfo，剥除 query/fragment；
+///   path 含 `@`/`:`/`%` 等嵌套 URL 或编码凭据形态时回退占位符）
+/// - 其余输入委托 [`git_url_for_display`]（scheme URL 行为不变）
+///
+/// 账本（`known_marketplaces.json`）仍须视为不可信输入：本函数只保证不放大凭据与结构，
+/// 不保证展示值可克隆或与存储值逐字一致。
+pub(crate) fn known_git_source_for_display(raw: &str) -> String {
+    scp_like_source_for_display(raw).unwrap_or_else(|| git_url_for_display(raw))
+}
+
+/// scp-like `user@host:path` 的展示值：丢弃 userinfo，剥除 query/fragment。
+///
+/// 仅当 user/host 为 ASCII 且 path 非空、为 ASCII graphic、不含 `@`/`:`/`%`、不以 `//`
+/// 开头（防止嵌套 URL、编码凭据与伪 host 歧义）时返回 `Some`；其余形态交回
+/// [`git_url_for_display`]。
+fn scp_like_source_for_display(raw: &str) -> Option<String> {
+    let (user, rest) = raw.split_once('@')?;
+    if user.is_empty()
+        || !user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+    {
+        return None;
+    }
+    let (host, path) = rest.split_once(':')?;
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    if path.is_empty()
+        || path.contains(['@', ':', '%'])
+        || path.starts_with("//")
+        || !path.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return None;
+    }
+    Some(format!("{host}:{path}"))
+}
+
 fn source_end_boundary(ch: char) -> bool {
     ch.is_whitespace()
 }
@@ -221,6 +269,87 @@ mod tests {
         for secret in ["cnb", "FAKE_TOKEN", "QUERY", "FRAGMENT"] {
             assert!(!got.contains(secret));
         }
+    }
+
+    #[test]
+    fn known_source_display_restores_scp_like_host_and_path() {
+        assert_eq!(
+            known_git_source_for_display("git@example.com:org/repo.git"),
+            "example.com:org/repo.git"
+        );
+        assert_eq!(
+            known_git_source_for_display("git@example.com:org/repo.git?token=QUERY#FRAGMENT"),
+            "example.com:org/repo.git"
+        );
+        let got = known_git_source_for_display("deploy-token@example.com:org/repo.git");
+        assert_eq!(got, "example.com:org/repo.git");
+        assert!(!got.contains("deploy-token"));
+        assert_eq!(
+            known_git_source_for_display("git@example.com:~/repo.git"),
+            "example.com:~/repo.git"
+        );
+    }
+
+    #[test]
+    fn known_source_display_matches_strict_display_for_scheme_urls() {
+        for source in [
+            "ssh://git@example.com/org/repo.git",
+            "https://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT",
+            "git://host/path",
+            "file:///abs/path/repo",
+            "https://example.com/org/repo.git",
+        ] {
+            assert_eq!(
+                known_git_source_for_display(source),
+                git_url_for_display(source),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_source_display_fails_closed_for_untrusted_shapes() {
+        for source in [
+            "cnb:FAKE_TOKEN@example.com/org/repo.git",
+            "cnb:FAKE_TOKEN@https://example.com/org/repo.git",
+            "git@example.com:org/repo.git://nested",
+            "git@example.com:https:/alice:PW_LEAK@example.com/repo.git",
+            "git@example.com:user:pass@host/repo.git",
+            "git@example.com:alice%3APW@example.com/repo.git",
+            "git@example.com:org%2Frepo.git",
+            "git@example.com://evil.example/repo.git",
+            "用户@example.com:org/repo.git",
+            "用户@例子.公司:org/repo.git",
+            "alice@my_host: Permission denied (publickey).",
+            "ftp://cnb:FAKE_TOKEN",
+            "not a url",
+            "",
+        ] {
+            let got = known_git_source_for_display(source);
+            assert_eq!(got, REDACTED_GIT_SOURCE, "{source}");
+            for secret in [
+                "cnb",
+                "FAKE_TOKEN",
+                "nested",
+                "PW_LEAK",
+                "user",
+                "pass",
+                "alice",
+                "evil.example",
+                "用户",
+                "my_host",
+            ] {
+                assert!(!got.contains(secret), "{got}");
+            }
+        }
+    }
+
+    #[test]
+    fn strict_display_still_hides_scp_like_sources() {
+        assert_eq!(
+            git_url_for_display("git@example.com:org/repo.git"),
+            REDACTED_GIT_SOURCE
+        );
     }
 
     #[test]
