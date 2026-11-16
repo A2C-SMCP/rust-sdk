@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::settings::config::snapshot::{resolve_snapshot, SnapshotArgs};
 use crate::settings::redaction::{
-    git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
+    known_git_source_for_display, redact_git_urls_in_text, untrusted_name_for_display,
 };
 use crate::settings::schema::is_valid_marketplace_name;
 use crate::settings::scope::EnvMap;
@@ -173,7 +173,10 @@ pub enum MarketplaceStatus {
 pub struct MarketplaceSnapshot {
     /// marketplace 名 / name。
     pub name: String,
-    /// 记录的 git 源 URL（`source.url`）/ recorded source URL。
+    /// `source.url` 的展示归一值（非可克隆原始值）/ display-normalized source URL.
+    ///
+    /// 已去除 userinfo/query/fragment；scp-like 展示为 `host:path`；无法安全展示时为
+    /// `<redacted-git-source>`。不可回写存储或用于 git 操作。
     pub source_url: Option<String>,
     /// 是否在 `trustedMarketplaces` / trusted。
     pub trusted: bool,
@@ -509,7 +512,7 @@ pub(crate) fn resolve_governance_snapshot(
 
         marketplaces.push(MarketplaceSnapshot {
             name: untrusted_name_for_display(name),
-            source_url: source_url.map(|url| git_url_for_display(&url)),
+            source_url: source_url.map(|url| known_git_source_for_display(&url)),
             trusted: is_trusted,
             blocked: is_blocked,
             strict,

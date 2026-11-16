@@ -34,7 +34,8 @@ use crate::settings::lifecycle::{
 };
 use crate::settings::raw_write;
 use crate::settings::redaction::{
-    git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
+    git_url_for_display, known_git_source_for_display, redact_git_urls_in_text,
+    untrusted_name_for_display,
 };
 use crate::settings::schema::FIELD_TRUSTED_MARKETPLACES;
 use crate::settings::scope::{load_settings_file, user_settings_path, EnvMap};
@@ -151,9 +152,28 @@ fn source_url(rec: &KnownMarketplaceEntry) -> Option<&str> {
     rec.source.get("url").and_then(Value::as_str)
 }
 
-/// 账本 URL 的 CLI 安全展示值；JSON 与文本输出必须共用，避免某种输出模式绕过脱敏。
+/// 账本 URL 的 CLI 展示值；JSON 与文本输出必须共用，避免某种输出模式绕过脱敏。
+///
+/// 账本读取可能含手编/外部写入（不可信），known 展示函数自身按形状 fail-closed：
+/// 合法 scp-like 恢复 `host:path`，畸形形态回落严格占位符。
 fn display_source_url(rec: &KnownMarketplaceEntry) -> Option<String> {
-    source_url(rec).map(git_url_for_display)
+    source_url(rec).map(known_git_source_for_display)
+}
+
+/// 非交互 untrusted 错误文案；错误载荷必须使用严格展示值（#154 边界）。
+///
+/// 内部套一层 [`git_url_for_display`]，让「错误面走 strict」由本函数自身保证，
+/// 不依赖调用方预先把值脱敏。
+fn untrusted_marketplace_message(mp_name: &str, raw_url: &str) -> String {
+    let strict_url = git_url_for_display(raw_url);
+    format!(
+        "untrusted marketplace {mp_name:?} ({strict_url}); pass --trust to confirm non-interactively"
+    )
+}
+
+/// `marketplace add` 成功 JSON 的 URL 展示值（展示归一，不含凭据）。
+fn added_marketplace_display_url(raw_url: &str) -> String {
+    known_git_source_for_display(raw_url)
 }
 
 fn read_string_array(map: &Map<String, Value>, key: &str) -> Vec<String> {
@@ -243,7 +263,8 @@ pub async fn marketplace_add(
         Err(e) => return err(&e.to_string(), json_output, EXIT_USER_ERROR),
     };
     let mp_name = identity.name.clone();
-    let display_url = git_url_for_display(&identity.url);
+    // 交互确认属展示面（known 归一）；错误载荷由 untrusted 文案助手内部走严格边界。
+    let display_url = known_git_source_for_display(&identity.url);
 
     // 重名校验先于信任提示（保留既有时序：重名直接拒、不弹 confirm、不记 trust）。
     if marketplace_name_taken(home, env, &mp_name) {
@@ -260,12 +281,10 @@ pub async fn marketplace_add(
         match opts.confirm {
             None => {
                 return err(
-                    &format!(
-                        "untrusted marketplace {mp_name:?} ({display_url}); pass --trust to confirm non-interactively"
-                    ),
+                    &untrusted_marketplace_message(&mp_name, &identity.url),
                     json_output,
                     EXIT_USER_ERROR,
-                )
+                );
             }
             Some(confirm) => {
                 if !load_trusted(env).iter().any(|n| n == &mp_name)
@@ -305,7 +324,7 @@ pub async fn marketplace_add(
             if json_output {
                 print_json(&json!({
                     "added": outcome.name,
-                    "url": git_url_for_display(&outcome.url),
+                    "url": added_marketplace_display_url(&outcome.url),
                     "skills": outcome.skills.len()
                 }));
                 return EXIT_OK;
@@ -742,6 +761,46 @@ mod tests {
         for secret in ["cnb", "FAKE_TOKEN", "QUERY", "FRAGMENT"] {
             assert!(!displayed.contains(secret));
         }
+    }
+
+    #[test]
+    fn ledger_scp_like_url_display_restores_host_and_path() {
+        let rec = KnownMarketplaceEntry {
+            source: json!({
+                "type": "git",
+                "url": "deploy-token@example.com:org/repo.git?token=QUERY#FRAGMENT"
+            }),
+            extra: Map::new(),
+        };
+        let displayed = display_source_url(&rec).unwrap();
+        assert_eq!(displayed, "example.com:org/repo.git");
+        let row = marketplace_list_row("mp", &rec, false);
+        assert_eq!(row["url"], "example.com:org/repo.git");
+        for secret in ["deploy-token", "QUERY", "FRAGMENT"] {
+            assert!(!displayed.contains(secret), "{displayed}");
+        }
+    }
+
+    #[test]
+    fn untrusted_marketplace_error_keeps_strict_display_for_scp_like_source() {
+        // 传原始 URL：助手内部必须走 strict，错误载荷不得出现 known 展示的 host:path。
+        let message = untrusted_marketplace_message("repo", "git@example.com:org/repo.git");
+        assert!(message.contains("<redacted-git-source>"), "{message}");
+        assert!(!message.contains("example.com"), "{message}");
+    }
+
+    #[test]
+    fn add_display_targets_restore_scp_like_host_and_path() {
+        let identity = resolve_marketplace_identity("git@example.com:org/repo.git", None).unwrap();
+
+        // 交互 confirm target 与成功 JSON 都必须展示 host:path，且不含 user@。
+        let confirm_target = known_git_source_for_display(&identity.url);
+        assert_eq!(confirm_target, "example.com:org/repo.git");
+        assert!(!confirm_target.contains("git@"));
+
+        let json_url = added_marketplace_display_url(&identity.url);
+        assert_eq!(json_url, "example.com:org/repo.git");
+        assert!(!json_url.contains("git@"));
     }
 
     #[test]
