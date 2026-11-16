@@ -50,8 +50,8 @@ use crate::settings::scope::EnvMap;
 use crate::skills::home::{marketplace_skill_dir, SOURCE_MARKETPLACE};
 use crate::skills::registry::SkillRegistry;
 use crate::skills::staging::{
-    stage_marketplace_skills, KnownMarketplaceRecorder, MarketplaceStageOptions,
-    DEFAULT_GIT_TIMEOUT, EXTERNAL_PLUGINS_NS,
+    external_plugin_dir, stage_marketplace_skills, KnownMarketplaceRecorder,
+    MarketplaceStageOptions, DEFAULT_GIT_TIMEOUT, EXTERNAL_PLUGINS_NS,
 };
 
 // ===========================================================================
@@ -82,7 +82,9 @@ pub struct KnownMarketplaces {
 /// `installed_plugins.json` 单条安装记录 / one plugin install record。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InstalledPluginRecord {
-    /// plugin 物化落点（仅词法位于 SKILL Home 内才删）/ install path。
+    /// plugin 物化落点。删除策略：**仅当**位于该 plugin 独占外部 clone
+    /// `<home>/marketplace/.plugins/<mp>/<plugin>` 内才删（`remove_plugin_install_path`）；相对源位于共享
+    /// catalog clone 的路径保留，归 marketplace remove/prune 清理（#271）/ install path。
     #[serde(
         default,
         rename = "installPath",
@@ -299,6 +301,43 @@ pub(crate) fn safe_rmtree(path: &Path, home: &Path) {
     if let Err(e) = std::fs::remove_dir_all(path) {
         tracing::warn!(path = %path.display(), error = %e, "reconcile: failed to remove");
     }
+}
+
+/// 按 plugin 文件归属删除 `installPath`：**仅**当其位于该 plugin 独占的外部 clone
+/// `<home>/marketplace/.plugins/<mp>/<plugin>`（含 `git-subdir` 的后代子目录）时，删除**整个 clone 根**并返回
+/// `true`；其余路径保留并返回 `false`（#271 方案 A）。
+///
+/// 相对源（`source: "./plugins/x"`）的 `installPath` 落在**共享 catalog clone** `<home>/marketplace/<mp>/...`：
+/// 该树是 marketplace 级缓存——兄弟插件、剩余 scope 与重装都依赖它，归 marketplace remove/prune/gc 清理，
+/// uninstall / plugin-gc MUST NOT 删除。
+///
+/// 谓词为纯词法（[`is_within`] 分量级 + `..` 折叠），与 `installPath` 的生成方式一致，且路径可能已不存在；
+/// 实际删除仍由 [`safe_rmtree`] 的 canonicalize + Home 包含守卫兜底。空/非法 marketplace 或 plugin 名
+/// （含 gc 中无 `@` 的 pid）→ 无法识别独占根，保守保留（漏删优于误删）。
+pub(crate) fn remove_plugin_install_path(
+    install_path: &Path,
+    home: &Path,
+    marketplace: &str,
+    plugin: &str,
+) -> bool {
+    if install_path.as_os_str().is_empty()
+        || !is_valid_marketplace_name(marketplace)
+        || !is_valid_marketplace_name(plugin)
+    {
+        return false;
+    }
+    let ext_root = external_plugin_dir(home, marketplace, plugin);
+    if !is_within(install_path, &ext_root) {
+        tracing::debug!(
+            path = %install_path.display(),
+            marketplace,
+            plugin,
+            "keeping installPath (shared marketplace catalog / non-exclusive path)"
+        );
+        return false;
+    }
+    safe_rmtree(&ext_root, home);
+    true
 }
 
 /// 从 Registry 注销某 marketplace（可选限定单 plugin）的 SKILL / Unregister a marketplace's SKILLs。
@@ -539,11 +578,13 @@ pub fn reclaimable_mcp_deps(
         .collect()
 }
 
-/// 清理孤儿 plugin（installPath 树 + installed_plugins 条目 + Registry SKILL + bundled MCP）/ GC plugins。
+/// 清理孤儿 plugin（独占外部 clone + installed_plugins 条目 + Registry SKILL + bundled MCP）/ GC plugins。
 ///
 /// y/N 确认交 CLI 层（#68）；`plugin_ids` 应为 [`list_orphan_plugins`] 的子集（用户确认后传入）。每条记录的
-/// `installPath` 仅在词法位于 SKILL Home 内才删（`safe_rmtree`）；`bundledMcpServers` 汇总后经 `mcp_teardown`
-/// 回调停/摘（真正接线由 computer.py 集成承担，本模块只触发回调）。返回实际清理的 plugin id 列表。
+/// `installPath` **仅当位于该 plugin 独占外部 clone `<home>/marketplace/.plugins/<mp>/<plugin>` 内**
+/// 才删（`remove_plugin_install_path`）；共享 catalog clone 内的相对源 installPath 保留（归 marketplace
+/// remove/prune，见 #271）。`bundledMcpServers` 汇总后经 `mcp_teardown` 回调停/摘（真正接线由 computer.py
+/// 集成承担，本模块只触发回调）。返回实际清理的 plugin id 列表。
 pub async fn gc_plugins(
     plugin_ids: &[String],
     registry: &mut SkillRegistry,
@@ -558,11 +599,15 @@ pub async fn gc_plugins(
         let Some(records) = installed.plugins.get(pid) else {
             continue;
         };
-        // 停摘自足：依赖名单在账本记录移除**之前**取得，且仅依赖账本自身字段（installPath 树此刻已删）。
+        // pid = "<plugin>@<mp>"；无 '@' → marketplace 空（无法识别独占 clone，installPath 保守保留）。
+        let (plugin, marketplace) = pid.split_once('@').unwrap_or((pid.as_str(), ""));
+        // 停摘自足：依赖名单在账本记录移除**之前**取得，且仅依赖账本自身字段——与 installPath 树是否删除无关
+        // （#271 后共享 catalog 内的树不再被本函数删除）。
         let mut deps: Vec<BundleId> = Vec::new();
         for rec in records {
             if let Some(install_path) = rec.install_path.as_deref().filter(|s| !s.is_empty()) {
-                safe_rmtree(Path::new(install_path), home);
+                // #271：只删 plugin 独占外部 clone；共享 catalog 归 marketplace 级清理。
+                remove_plugin_install_path(Path::new(install_path), home, marketplace, plugin);
             }
             for id in &rec.mcp_servers {
                 if !deps.contains(id) {
@@ -575,8 +620,7 @@ pub async fn gc_plugins(
         let other = other_plugin_mcp_deps(&installed, pid);
         let reclaim = reclaimable_mcp_deps(&deps, &other, non_plugin_bundle_ids);
 
-        // pid = "<plugin>@<mp>"；无 '@' → marketplace 空（不注销）。
-        let (plugin, marketplace) = pid.split_once('@').unwrap_or((pid.as_str(), ""));
+        // 无 '@' → marketplace 空（不注销）。
         if !marketplace.is_empty() {
             unregister_marketplace_skills(registry, marketplace, Some(plugin));
         }
@@ -882,6 +926,63 @@ mod tests {
         assert!(!inside.exists(), "home 内目录应被删");
     }
 
+    /// #271：删除谓词边界——只有独占外部 clone（含 `git-subdir` 后代）才删；共享 catalog / 兄弟目录 /
+    /// 非法段一律保留。
+    #[test]
+    fn remove_plugin_install_path_boundaries_271() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let ext_root = home.join("marketplace/.plugins/acme/audit");
+        let catalog = home.join("marketplace/acme/plugins/audit");
+        let elsewhere = home.join("elsewhere");
+        for d in [&ext_root, &catalog, &elsewhere] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let ext_sub = ext_root.join("pkg/sub");
+        std::fs::create_dir_all(&ext_sub).unwrap();
+        let sibling = home.join("marketplace/.plugins/acme/audit2");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        // 保留：共享 catalog / 无关路径 / 兄弟 plugin / 空与非法段 / 空路径。
+        assert!(!remove_plugin_install_path(
+            &catalog, &home, "acme", "audit"
+        ));
+        assert!(catalog.exists());
+        assert!(!remove_plugin_install_path(
+            &elsewhere, &home, "acme", "audit"
+        ));
+        assert!(!remove_plugin_install_path(
+            &sibling, &home, "acme", "audit"
+        ));
+        assert!(sibling.exists());
+        assert!(!remove_plugin_install_path(
+            Path::new(""),
+            &home,
+            "acme",
+            "audit"
+        ));
+        assert!(!remove_plugin_install_path(&ext_root, &home, "", "audit"));
+        assert!(!remove_plugin_install_path(&ext_root, &home, "acme", ".."));
+        assert!(ext_root.exists());
+
+        // 删除：ext 子目录 → 删整个独占 clone 根；共享 catalog 不受影响。
+        assert!(remove_plugin_install_path(&ext_sub, &home, "acme", "audit"));
+        assert!(!ext_root.exists(), "subdir installPath → 删除独占 clone 根");
+        assert!(catalog.exists());
+
+        // 删除：ext 根本身（重建后）。
+        std::fs::create_dir_all(&ext_root).unwrap();
+        assert!(remove_plugin_install_path(
+            &ext_root, &home, "acme", "audit"
+        ));
+        assert!(!ext_root.exists());
+
+        // 缺失路径：词法命中，safe_rmtree no-op、不 panic。
+        assert!(remove_plugin_install_path(
+            &ext_root, &home, "acme", "audit"
+        ));
+    }
+
     // ---- unregister by source / plugin prefix --------------------------------
     #[test]
     fn unregister_marketplace_skills_filters_by_source_and_plugin() {
@@ -954,7 +1055,12 @@ mod tests {
     async fn list_and_gc_orphan_plugins_with_teardown() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
-        let install_path = home.join("marketplace").join(".plugins").join("audit");
+        // 独占外部 clone 的正确布局：`.plugins/<mp>/<plugin>`（#271 后按此边界判定删除）。
+        let install_path = home
+            .join("marketplace")
+            .join(".plugins")
+            .join("acme")
+            .join("audit");
         std::fs::create_dir_all(&install_path).unwrap();
 
         let store = MemStore::default();
@@ -1230,7 +1336,12 @@ mod tests {
         // mcp_teardown = None：仍删 plugin + store 条目，不 panic。
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
-        let install_path = home.join("marketplace").join(".plugins").join("audit");
+        // 独占外部 clone 的正确布局：`.plugins/<mp>/<plugin>`（#271 后按此边界判定删除）。
+        let install_path = home
+            .join("marketplace")
+            .join(".plugins")
+            .join("acme")
+            .join("audit");
         std::fs::create_dir_all(&install_path).unwrap();
         let store = MemStore::default();
         store.update_installed_plugins(&mut |data| {
@@ -1284,15 +1395,25 @@ mod tests {
 
     #[tokio::test]
     async fn gc_pid_without_marketplace() {
-        // pid 无 '@' → marketplace 空、不尝试注销 → 仍从 store 移除。
+        // pid 无 '@' → marketplace 空、不尝试注销 → 仍从 store 移除；无 marketplace 段 ⇒ 无法识别独占外部
+        // clone，installPath 保守保留（#271：漏删优于误删）。
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
-        std::fs::create_dir_all(&home).unwrap();
+        let install_path = home
+            .join("marketplace")
+            .join(".plugins")
+            .join("acme")
+            .join("audit");
+        std::fs::create_dir_all(&install_path).unwrap();
         let store = MemStore::default();
         store.update_installed_plugins(&mut |data| {
             data.plugins.insert(
                 "local-only".to_string(),
-                vec![InstalledPluginRecord::default()],
+                vec![InstalledPluginRecord {
+                    install_path: Some(install_path.to_string_lossy().into_owned()),
+                    mcp_servers: Vec::new(),
+                    extra: Map::new(),
+                }],
             );
         });
         let mut reg = SkillRegistry::new();
@@ -1310,6 +1431,103 @@ mod tests {
             .load_installed_plugins()
             .plugins
             .contains_key("local-only"));
+        assert!(
+            install_path.exists(),
+            "无 marketplace 段 → 无法识别独占外部 clone，installPath 保守保留"
+        );
+    }
+
+    /// #271：相对源 plugin 的 installPath 在共享 catalog 内 → gc MUST NOT 删除（归 marketplace remove/prune）。
+    #[tokio::test]
+    async fn gc_relative_source_keeps_shared_catalog_271() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let install_path = home
+            .join("marketplace")
+            .join("acme")
+            .join("plugins")
+            .join("audit");
+        std::fs::create_dir_all(install_path.join("skills/code-review")).unwrap();
+        std::fs::write(install_path.join("skills/code-review/SKILL.md"), "x").unwrap();
+        let sibling = install_path.parent().unwrap().join("shared-sentinel.txt");
+        std::fs::write(&sibling, "keep").unwrap();
+
+        let store = MemStore::default();
+        store.update_installed_plugins(&mut |data| {
+            data.plugins.insert(
+                "audit@acme".to_string(),
+                vec![InstalledPluginRecord {
+                    install_path: Some(install_path.to_string_lossy().into_owned()),
+                    mcp_servers: Vec::new(),
+                    extra: Map::new(),
+                }],
+            );
+        });
+        let mut reg = SkillRegistry::new();
+        reg.register(mp_ref("audit:code-review", "acme", &home));
+        let removed = gc_plugins(
+            &["audit@acme".to_string()],
+            &mut reg,
+            &home,
+            &store,
+            &HashSet::new(),
+            None,
+        )
+        .await;
+        assert_eq!(removed, vec!["audit@acme".to_string()]);
+        assert!(
+            install_path.exists(),
+            "共享 catalog 树 MUST NOT 被 plugin gc 删除（#271 方案 A）"
+        );
+        assert!(sibling.exists(), "兄弟 plugin 共用文件必须保留");
+        assert!(!reg.contains("audit:code-review"));
+        assert!(!store
+            .load_installed_plugins()
+            .plugins
+            .contains_key("audit@acme"));
+    }
+
+    /// #271：git-subdir 的 installPath 是独占外部 clone 的后代 → 删除整个 clone 根（而非只删子目录）。
+    #[tokio::test]
+    async fn gc_external_git_subdir_record_removes_clone_root_271() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let ext_root = home
+            .join("marketplace")
+            .join(".plugins")
+            .join("acme")
+            .join("audit");
+        let sub = ext_root.join("pkg").join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(ext_root.join("root-marker.txt"), "x").unwrap();
+        std::fs::write(sub.join("sub-marker.txt"), "x").unwrap();
+
+        let store = MemStore::default();
+        store.update_installed_plugins(&mut |data| {
+            data.plugins.insert(
+                "audit@acme".to_string(),
+                vec![InstalledPluginRecord {
+                    install_path: Some(sub.to_string_lossy().into_owned()),
+                    mcp_servers: Vec::new(),
+                    extra: Map::new(),
+                }],
+            );
+        });
+        let mut reg = SkillRegistry::new();
+        let removed = gc_plugins(
+            &["audit@acme".to_string()],
+            &mut reg,
+            &home,
+            &store,
+            &HashSet::new(),
+            None,
+        )
+        .await;
+        assert_eq!(removed, vec!["audit@acme".to_string()]);
+        assert!(
+            !ext_root.exists(),
+            "git-subdir → 删除整个 plugin 独占外部 clone 根"
+        );
     }
 
     #[test]
