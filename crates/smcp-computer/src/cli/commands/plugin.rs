@@ -194,7 +194,8 @@ pub async fn plugin_install(
     ok_msg(&format!("installed {plugin_id:?}{detail}"))
 }
 
-/// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联停摘 bundled server + 删账本）/ uninstall a plugin。
+/// 卸载单个 plugin（删 plugin 独占外部 clone，共享 catalog 不删 + 注销 skills + 级联停摘 bundled server +
+/// 删账本）/ uninstall a plugin。
 ///
 /// `non_plugin_bundle_ids` = 回收判据「非用户声明」数据源（`origin != plugin` 的 bundle_id 全集，含
 /// durable/flag/embed）。**MUST 由持有 `Computer` 的调用方经

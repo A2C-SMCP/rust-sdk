@@ -1731,7 +1731,8 @@ impl<S: Session> Computer<S> {
         }
     }
 
-    /// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联停摘 bundled server + 删账本）/ uninstall。
+    /// 卸载单个 plugin（删 plugin 独占外部 clone，共享 catalog 不删 + 注销 skills + 级联停摘 bundled server +
+    /// 删账本）/ uninstall。
     ///
     /// 未安装 / 无匹配 scope → `Ok(false)`（no-op）。
     ///

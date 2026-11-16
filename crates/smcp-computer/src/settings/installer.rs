@@ -52,7 +52,9 @@ use serde_json::{Map, Value};
 use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig, ServerName};
 use crate::settings::raw_write;
-use crate::settings::reconciler::{safe_rmtree, InstalledPluginRecord};
+use crate::settings::reconciler::{
+    is_external_plugin_install_path, remove_plugin_install_path, InstalledPluginRecord,
+};
 use crate::settings::schema::{is_valid_enabled_plugin_key, SettingsScope, FIELD_ENABLED_PLUGINS};
 use crate::settings::scope::{
     user_settings_path, workdir_local_settings_path, workdir_project_settings_path, EnvMap,
@@ -743,14 +745,18 @@ pub async fn install_plugin(
     Ok(record)
 }
 
-/// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联 stop+remove bundled server + 删账本记录）/ Uninstall。
+/// 卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills + 级联 stop+remove bundled server + 删账本记录）/ Uninstall。
 ///
 /// `scope=None` 删该 id 全部记录；指定 scope 仅删该 scope 记录。未安装 / 无匹配 → `false`（no-op）。
 ///
-/// ⚠️ **相对源 plugin 的删除范围**：source 为相对路径时，其 `installPath` 位于**共享 catalog clone 内**
-/// （`<home>/marketplace/<mp>/.../<plugin>`），`safe_rmtree` 删的是该 marketplace 共享 git 工作树的子目录
-/// （与兄弟 `gc_plugins` 同一 `safe_rmtree` 语义，非本函数新引入）；后续 `marketplace refresh` 遇脏树会 fallback
-/// 全量重 clone 干净恢复。即「删 plugin 子树」可能动到共享 catalog——勿误判为仅删独立 `.plugins/` 外部树。
+/// ⚠️ **文件归属（#271 方案 A）**：只有 **plugin 独占的外部 clone** `<home>/marketplace/.plugins/<mp>/<plugin>`
+/// 会被删除（`remove_plugin_install_path`），且仅在**无 retained 账本记录**的 installPath 仍引用该 clone 时
+/// （指定 scope 卸载保留其余 scope 仍依赖的 clone）。相对源（`source: "./plugins/x"`）的 `installPath` 位于
+/// **共享 catalog clone**
+/// `<home>/marketplace/<mp>/...`——该树是 marketplace 级缓存，兄弟插件、剩余 scope 与重装都依赖它，MUST NOT 在此删除；
+/// 归 `marketplace remove` / reconcile / prune 清理。
+///
+/// 协议 §4.9.1-3 的「停摘自足」指停摘名单在账本移除**之前**取得且仅依赖账本字段，与 installPath 树是否删除无关。
 ///
 /// # Errors
 /// id 非法 / `remove_server` 失败 / 账本写失败 → [`PluginInstallError`]。
@@ -806,22 +812,36 @@ pub async fn uninstall_plugin(
         }
     };
 
-    let targeted: Vec<&InstalledPluginRecord> = records
-        .iter()
-        .filter(|r| {
-            options.scope.is_none() || r.extra.get("scope").and_then(Value::as_str) == options.scope
-        })
-        .collect();
+    let in_scope = |r: &InstalledPluginRecord| {
+        options.scope.is_none() || r.extra.get("scope").and_then(Value::as_str) == options.scope
+    };
+    let targeted: Vec<&InstalledPluginRecord> = records.iter().filter(|r| in_scope(r)).collect();
     if targeted.is_empty() {
         tracing::info!(plugin = plugin_id, scope = ?options.scope, "uninstall: no record in scope (no-op)");
         return Ok(false);
     }
+    let retained: Vec<&InstalledPluginRecord> = records.iter().filter(|r| !in_scope(r)).collect();
 
-    // 停摘自足：依赖名单在账本记录移除**之前**取得，且仅依赖账本自身字段（`safe_rmtree` 已删 installPath 树）。
+    // #271：按「引用」判定而非记录数——仅当**没有 retained 记录**的 installPath 仍落在该 plugin 独占外部
+    // clone `<home>/marketplace/.plugins/<mp>/<plugin>` 内时才删除。跨 scope 源类型变化（如 user 为 Git 源、
+    // project 为相对源）下，按记录数门控会在先卸 user 时误保留 ext clone，随后卸 project 又不再命中 → 永久泄漏。
+    let ext_clone_still_referenced = retained.iter().any(|r| {
+        r.install_path
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_some_and(|ip| {
+                is_external_plugin_install_path(Path::new(ip), home, &marketplace, &plugin)
+            })
+    });
+
+    // 停摘自足：依赖名单在账本记录移除**之前**取得，且仅依赖账本自身字段（与 installPath 树是否删除无关）。
     let mut deps: Vec<BundleId> = Vec::new();
     for rec in &targeted {
         if let Some(ip) = rec.install_path.as_deref().filter(|s| !s.is_empty()) {
-            safe_rmtree(Path::new(ip), home);
+            if !ext_clone_still_referenced {
+                // #271：只删 plugin 独占外部 clone；共享 catalog 树保留（归 marketplace 级清理）。
+                remove_plugin_install_path(Path::new(ip), home, &marketplace, &plugin);
+            }
         }
         for id in &rec.mcp_servers {
             if !deps.contains(id) {
@@ -1355,9 +1375,24 @@ mod tests {
     ) -> (PathBuf, EnvMap, Value) {
         let repo = tmp.path().join("repo");
         let source = build_source_repo_with_servers(&repo, servers);
+        let (home, env) = setup_home_with_catalog(tmp, source.clone()).await;
+        (home, env, source)
+    }
+
+    /// 用给定 marketplace 源仓库建 home（预 clone catalog + 写 known_marketplaces.json），返回 (home, env)。
+    ///
+    /// `env` 恒注入 `XDG_CONFIG_HOME=<tmp>/cfg`：uninstall 的 `clear_enabled_plugin` 会经
+    /// `raw_write::update_raw_settings` 创建父目录/锁文件——不隔离会落到开发者真实 `$HOME/.config`。
+    async fn setup_home_with_catalog(tmp: &TempDir, source: Value) -> (PathBuf, EnvMap) {
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
-        let env: EnvMap = EnvMap::new();
+        let cfg_home = tmp.path().join("cfg");
+        fs::create_dir_all(&cfg_home).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_home.to_string_lossy().into_owned(),
+        ))
+        .collect();
         // 预 clone catalog（throwaway registry）：install 要求 catalog 已存在。
         let mut throwaway = SkillRegistry::new();
         stage_marketplace_skills(
@@ -1387,7 +1422,53 @@ mod tests {
             Some(&env),
         )
         .unwrap();
-        (home, env, source)
+        (home, env)
+    }
+
+    /// 构造自定义 marketplace 源仓库：`entries` = (plugin 名, source Value)。字符串 source（相对路径）会自动
+    /// 在 `<repo>/<rel>/skills/<plugin>-skill/SKILL.md` 落一份技能；返回 `{"type":"git","url":"file://…"}`。
+    fn build_marketplace_repo_with_entries(repo: &Path, entries: &[(&str, Value)]) -> Value {
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        let plugins: Vec<Value> = entries
+            .iter()
+            .map(|(name, source)| serde_json::json!({"name": name, "source": source}))
+            .collect();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            serde_json::to_string(&serde_json::json!({"plugins": plugins})).unwrap(),
+        )
+        .unwrap();
+        for (name, source) in entries {
+            if let Some(rel) = source.as_str() {
+                let rel = rel.trim_start_matches("./");
+                let skill = repo.join(rel).join("skills").join(format!("{name}-skill"));
+                fs::create_dir_all(&skill).unwrap();
+                fs::write(
+                    skill.join("SKILL.md"),
+                    format!("---\nname: {name}-skill\ndescription: {name}\n---\nbody"),
+                )
+                .unwrap();
+            }
+        }
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())})
+    }
+
+    /// 构造独立 plugin git 仓库（Git 源插件），返回 `file://…` URL。
+    fn build_plugin_git_repo(repo: &Path) -> String {
+        let skill = repo.join("skills/code-review");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: review code\n---\nbody",
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        format!("file://{}", repo.display())
     }
 
     // ---- 注入回调替身 / hook fakes ------------------------------------------
@@ -1696,7 +1777,7 @@ mod tests {
 
         let mut reg = SkillRegistry::new();
         let hooks = RecordingHooks::new();
-        install_plugin(
+        let record = install_plugin(
             "audit@acme",
             &mut reg,
             &home,
@@ -1708,6 +1789,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let install_path = PathBuf::from(record.install_path.clone().unwrap());
         // enable 激活（skill 活跃 + server 挂），再卸载验证全链摘除。
         enable_plugin(
             "audit@acme",
@@ -1739,6 +1821,10 @@ mod tests {
         assert!(removed);
         assert!(reg.resolve("audit:code-review").is_none());
         assert!(ledger_records(&home, &env, "audit@acme").is_empty());
+        assert!(
+            install_path.exists(),
+            "相对源 installPath（共享 catalog）MUST 在卸载后保留（#271 方案 A）"
+        );
         // installedPlugins 意图移除 + enabledPlugins 条目清除（避免 reinstall 残留旗）。
         assert!(
             !crate::settings::store::load_installed_plugins_intent(Some(&home), Some(&env))
@@ -1805,6 +1891,613 @@ mod tests {
         .await
         .unwrap();
         assert!(hooks.removed.lock().unwrap().is_empty());
+    }
+
+    // ---- #271：相对源卸载保留共享 catalog / 多 scope / 可重装 -------------------
+    /// 父子/同源目录：卸载 alpha 不得删除 beta（`./plugin/nested`）与 gamma（同 `./plugin`）依赖的文件。
+    #[tokio::test]
+    async fn uninstall_relative_source_keeps_shared_catalog_siblings_271() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let source = build_marketplace_repo_with_entries(
+            &repo,
+            &[
+                ("alpha", serde_json::json!("./plugin")),
+                ("beta", serde_json::json!("./plugin/nested")),
+                ("gamma", serde_json::json!("./plugin")),
+            ],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let mut reg = SkillRegistry::new();
+        let mut paths = HashMap::new();
+        for pid in ["alpha@acme", "beta@acme", "gamma@acme"] {
+            let rec = install_plugin(
+                pid,
+                &mut reg,
+                &home,
+                InstallOptions {
+                    env: Some(&env),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            paths.insert(pid.to_string(), PathBuf::from(rec.install_path.unwrap()));
+        }
+        assert_eq!(
+            paths["alpha@acme"], paths["gamma@acme"],
+            "alpha/gamma 同源 → 同一 installPath"
+        );
+        assert!(
+            paths["beta@acme"].starts_with(&paths["alpha@acme"]),
+            "beta 位于 alpha 子树"
+        );
+
+        let removed = uninstall_plugin(
+            "alpha@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(removed);
+
+        assert!(
+            paths["alpha@acme"].exists(),
+            "共享 catalog 树 MUST NOT 被卸载删除（#271 方案 A）"
+        );
+        assert!(
+            paths["beta@acme"]
+                .join("skills/beta-skill/SKILL.md")
+                .exists(),
+            "父子目录：beta 文件必须保留"
+        );
+        assert!(!ledger_records(&home, &env, "beta@acme").is_empty());
+        assert!(!ledger_records(&home, &env, "gamma@acme").is_empty());
+        assert!(ledger_records(&home, &env, "alpha@acme").is_empty());
+    }
+
+    /// 不相交目录对照：卸载 alpha 后 beta 文件保留；alpha 的 catalog 树同样保留（归 marketplace 级清理）。
+    #[tokio::test]
+    async fn uninstall_relative_source_disjoint_control_271() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let source = build_marketplace_repo_with_entries(
+            &repo,
+            &[
+                ("alpha", serde_json::json!("./plugins/alpha")),
+                ("beta", serde_json::json!("./plugins/beta")),
+            ],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let mut reg = SkillRegistry::new();
+        let mut paths = HashMap::new();
+        for pid in ["alpha@acme", "beta@acme"] {
+            let rec = install_plugin(
+                pid,
+                &mut reg,
+                &home,
+                InstallOptions {
+                    env: Some(&env),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            paths.insert(pid.to_string(), PathBuf::from(rec.install_path.unwrap()));
+        }
+
+        uninstall_plugin(
+            "alpha@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(paths["alpha@acme"].exists());
+        assert!(paths["beta@acme"]
+            .join("skills/beta-skill/SKILL.md")
+            .exists());
+        assert!(!ledger_records(&home, &env, "beta@acme").is_empty());
+    }
+
+    /// 多 scope：仅卸 user 时，project 记录与其依赖的 catalog 文件必须保留（能力面拆除不在本单）。
+    #[tokio::test]
+    async fn uninstall_user_scope_keeps_project_record_and_catalog_271() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let source =
+            build_marketplace_repo_with_entries(&repo, &[("audit", serde_json::json!("./plugin"))]);
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                scope: Some("project"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ledger_records(&home, &env, "audit@acme").len(), 2);
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                scope: Some("user"),
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let recs = ledger_records(&home, &env, "audit@acme");
+        assert_eq!(recs.len(), 1, "仅 user scope 记录被移除");
+        assert_eq!(
+            recs[0].extra.get("scope").and_then(Value::as_str),
+            Some("project")
+        );
+        let ip = recs[0].install_path.as_deref().unwrap();
+        assert!(
+            Path::new(ip).exists(),
+            "剩余 project scope 依赖的 catalog 文件 MUST 保留"
+        );
+        assert!(
+            load_installed_plugins_intent(Some(&home), Some(&env))
+                .account
+                .installed_plugins
+                .contains("audit@acme"),
+            "仍有账本记录 → 安装意图保留"
+        );
+    }
+
+    /// 卸载相对源插件后可重装（默认 refresh=false 与 refresh=true 两路）。
+    #[tokio::test]
+    async fn reinstall_after_uninstall_relative_source_succeeds_271() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, false).await;
+        let mut reg = SkillRegistry::new();
+
+        let first = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let install_path = PathBuf::from(first.install_path.unwrap());
+        let removed = uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(removed, "首次卸载应实际移除");
+        assert!(
+            ledger_records(&home, &env, "audit@acme").is_empty(),
+            "卸载后账本已清"
+        );
+        assert!(
+            install_path.exists(),
+            "共享 catalog installPath 保留（旧实现此处已被删除）"
+        );
+        // 旧实现：catalog 子树被删 → "plugin root not found after source resolution"。
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("默认重装应成功");
+        let removed_again = uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(removed_again, "二次卸载应实际移除");
+        assert!(ledger_records(&home, &env, "audit@acme").is_empty());
+        assert!(install_path.exists(), "二次卸载后 catalog 仍保留");
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("refresh=true 重装应成功");
+    }
+
+    /// 外部 Git clone：卸载仍删除 plugin 独占的 `.plugins/<mp>/<plugin>`，不碰共享 catalog。
+    #[tokio::test]
+    async fn uninstall_external_git_plugin_removes_clone_root_271() {
+        let tmp = TempDir::new().unwrap();
+        let plugin_repo = tmp.path().join("plugin-repo");
+        let url = build_plugin_git_repo(&plugin_repo);
+        let repo = tmp.path().join("repo");
+        let source = build_marketplace_repo_with_entries(
+            &repo,
+            &[("audit", serde_json::json!({"source": "url", "url": url}))],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let mut reg = SkillRegistry::new();
+        let rec = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let ip = PathBuf::from(rec.install_path.unwrap());
+        let ext_root = home.join("marketplace/.plugins/acme/audit");
+        assert_eq!(ip, ext_root, "Git 源 installPath = 独占外部 clone 根");
+        assert!(ext_root.exists());
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!ext_root.exists(), "独占外部 clone MUST 随卸载删除");
+        assert!(
+            home.join("marketplace/acme").exists(),
+            "共享 catalog MUST NOT 因外部 plugin 卸载删除"
+        );
+        assert!(ledger_records(&home, &env, "audit@acme").is_empty());
+    }
+
+    /// 多 scope × Git 源：仅卸 user 时其余 scope 仍依赖同一外部 clone，不得删除；全卸尽后才删。
+    #[tokio::test]
+    async fn uninstall_git_plugin_user_scope_keeps_project_clone_271() {
+        let tmp = TempDir::new().unwrap();
+        let plugin_repo = tmp.path().join("plugin-repo");
+        let url = build_plugin_git_repo(&plugin_repo);
+        let repo = tmp.path().join("repo");
+        let source = build_marketplace_repo_with_entries(
+            &repo,
+            &[("audit", serde_json::json!({"source": "url", "url": url}))],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let ext_root = home.join("marketplace/.plugins/acme/audit");
+
+        let mut reg = SkillRegistry::new();
+        for opts in [
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            InstallOptions {
+                scope: Some("project"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+        ] {
+            install_plugin("audit@acme", &mut reg, &home, opts, None)
+                .await
+                .unwrap();
+        }
+        assert!(ext_root.exists());
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                scope: Some("user"),
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ledger_records(&home, &env, "audit@acme").len(), 1);
+        assert!(
+            ext_root.exists(),
+            "剩余 project scope 仍依赖同一外部 clone → MUST 保留"
+        );
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!ext_root.exists(), "全部 scope 移除后外部 clone 删除");
+    }
+
+    /// 跨 scope 源类型变化：user 装 Git 源（ext clone）、project 装相对源（catalog）。先卸 user 时 retained
+    /// project 记录**不引用** ext clone → 必须删除，不得因按「记录数」门控而永久泄漏。
+    #[tokio::test]
+    async fn uninstall_user_git_scope_with_project_relative_does_not_leak_ext_clone_271() {
+        let tmp = TempDir::new().unwrap();
+        let plugin_repo = tmp.path().join("plugin-repo");
+        let url = build_plugin_git_repo(&plugin_repo);
+        let repo = tmp.path().join("repo");
+        let source_git = build_marketplace_repo_with_entries(
+            &repo,
+            &[("audit", serde_json::json!({"source": "url", "url": url}))],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source_git.clone()).await;
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let ext_root = home.join("marketplace/.plugins/acme/audit");
+
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(ext_root.exists(), "Git 源 user 记录落在独占 ext clone");
+
+        // 上游 marketplace 改为相对源并 refresh（模拟跨 scope 源类型变化）。
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins":[{"name":"audit","source":"./plugin"}]}"#,
+        )
+        .unwrap();
+        let skill = repo.join("plugin/skills/audit-skill");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: audit-skill\ndescription: audit\n---\nbody",
+        )
+        .unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "relative"], &repo);
+        let mut throwaway = SkillRegistry::new();
+        stage_marketplace_skills(
+            "acme",
+            &source_git,
+            &mut throwaway,
+            &home,
+            MarketplaceStageOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                scope: Some("project"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let recs = ledger_records(&home, &env, "audit@acme");
+        assert_eq!(recs.len(), 2);
+        let project_path = recs
+            .iter()
+            .find(|r| r.extra.get("scope").and_then(Value::as_str) == Some("project"))
+            .and_then(|r| r.install_path.clone())
+            .unwrap();
+        assert!(
+            Path::new(&project_path).starts_with(home.join("marketplace/acme")),
+            "project 记录应落在共享 catalog：{project_path}"
+        );
+
+        // 先卸 user：retained project 不引用 ext clone → ext clone 删除（不永久泄漏）。
+        let removed = uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                scope: Some("user"),
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(removed);
+        assert!(
+            !ext_root.exists(),
+            "retained 记录不引用 ext clone → 先卸 user 时即删除（#276 复审 🟡1）"
+        );
+        let recs = ledger_records(&home, &env, "audit@acme");
+        assert_eq!(recs.len(), 1);
+        assert!(
+            Path::new(&project_path).exists(),
+            "project 的 catalog 路径保留"
+        );
+
+        // 再卸尽：catalog 仍保留。
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(ledger_records(&home, &env, "audit@acme").is_empty());
+        assert!(Path::new(&project_path).exists());
+    }
+
+    /// 真实 git-subdir 源：install → uninstall 删除整个独占 clone 根，共享 catalog 保留。
+    #[tokio::test]
+    async fn uninstall_git_subdir_plugin_removes_clone_root_271() {
+        let tmp = TempDir::new().unwrap();
+        let plugin_repo = tmp.path().join("plugin-repo");
+        let skill = plugin_repo.join("pkg/sub/skills/code-review");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: review code\n---\nbody",
+        )
+        .unwrap();
+        git(&["init", "-q"], &plugin_repo);
+        // file:// 部分克隆（--filter=tree:0 --sparse）依赖服务端 allowFilter。
+        git(&["config", "uploadpack.allowFilter", "true"], &plugin_repo);
+        git(&["add", "-A"], &plugin_repo);
+        git(&["commit", "-qm", "init"], &plugin_repo);
+        let url = format!("file://{}", plugin_repo.display());
+        let repo = tmp.path().join("repo");
+        let source = build_marketplace_repo_with_entries(
+            &repo,
+            &[(
+                "audit",
+                serde_json::json!({"source": "git-subdir", "url": url, "path": "pkg/sub"}),
+            )],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let ext_root = home.join("marketplace/.plugins/acme/audit");
+
+        let mut reg = SkillRegistry::new();
+        let rec = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let ip = PathBuf::from(rec.install_path.unwrap());
+        assert_eq!(
+            ip,
+            ext_root.join("pkg/sub"),
+            "git-subdir installPath 为 clone 根后代"
+        );
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!ext_root.exists(), "git-subdir → 删除整个独占 clone 根");
+        assert!(
+            home.join("marketplace/acme").exists(),
+            "共享 catalog 不因外部 plugin 卸载删除"
+        );
     }
 
     // ---- enable / disable ---------------------------------------------------

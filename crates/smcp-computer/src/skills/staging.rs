@@ -784,7 +784,11 @@ fn entry_plugin_name(entry: &Map<String, Value>) -> Result<String, SkillStagingE
 }
 
 /// 独立 clone plugin 的落点 `<home>/marketplace/.plugins/<mp>/<plugin>/` / External plugin clone dir。
-fn external_plugin_dir(home: &Path, marketplace: &str, plugin: &str) -> PathBuf {
+///
+/// Git 源（`url`/`github`/`cnb`/`git-subdir`）的 `installPath` 等于该根，或（`git-subdir`）为其后代子目录。
+/// 该根是 **plugin 独占**的删除边界：uninstall / gc 只允许删这里（#271）；相对源的 `installPath` 位于
+/// 共享 catalog clone（`<home>/marketplace/<mp>/...`），属 marketplace 级缓存，由 marketplace remove/prune 清理。
+pub(crate) fn external_plugin_dir(home: &Path, marketplace: &str, plugin: &str) -> PathBuf {
     home.join(SOURCE_MARKETPLACE)
         .join(EXTERNAL_PLUGINS_NS)
         .join(marketplace)
