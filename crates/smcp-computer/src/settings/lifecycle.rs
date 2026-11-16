@@ -705,6 +705,9 @@ mod tests {
         for raw in [
             "cnb:FAKE_TOKEN@example.com/org/repo.git",
             "ftp://cnb:FAKE_TOKEN",
+            "ssh:alice:PW_LEAK@example.com",
+            "git:alice:PW_LEAK@host/repo.git",
+            "ssh:alice%3APW_LEAK%40example.com",
         ] {
             let err = resolve_marketplace_identity(raw, Some("valid-name")).unwrap_err();
             assert!(matches!(
@@ -712,8 +715,9 @@ mod tests {
                 GovernanceError::InvalidUrl(source) if source == "<redacted-git-source>"
             ));
             let public_forms = format!("{err}\n{err:?}");
-            assert!(!public_forms.contains("cnb"));
-            assert!(!public_forms.contains("FAKE_TOKEN"));
+            for secret in ["cnb", "FAKE_TOKEN", "alice", "PW_LEAK"] {
+                assert!(!public_forms.contains(secret), "{public_forms}");
+            }
         }
     }
 

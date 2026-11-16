@@ -54,6 +54,11 @@ pub(crate) fn git_url_for_display(raw: &str) -> String {
     if !matches!(parsed.scheme(), "ssh" | "git" | "http" | "https" | "file") {
         return REDACTED_GIT_SOURCE.to_string();
     }
+    // opaque（缺 `//`）URL 的 userinfo 会落在 path 里、`username()` 为空，原样序列化会回显
+    // 凭据（含 `%40` 编码形态）。合法 Git 源（`://` scheme 或 scp-like）不会 cannot-be-a-base。
+    if parsed.cannot_be_a_base() {
+        return REDACTED_GIT_SOURCE.to_string();
+    }
 
     if !parsed.username().is_empty() && parsed.set_username("").is_err() {
         return REDACTED_GIT_SOURCE.to_string();
@@ -78,21 +83,13 @@ pub(crate) fn git_source_for_error(raw: &str) -> String {
 ///
 /// - ASCII scp-like `user@host:path` → `host:path`（丢弃 userinfo，剥除 query/fragment；
 ///   path 含 `@`/`:`/`%` 等嵌套 URL 或编码凭据形态时回退占位符）
-/// - 含 `@` 但缺 `://` 的 opaque 形态 → 占位符（严格函数会把 userinfo 当 path 原样保留）
-/// - 其余输入委托 [`git_url_for_display`]（scheme URL 行为不变）
+/// - 其余输入委托 [`git_url_for_display`]（scheme URL 行为不变；opaque 形态由严格函数
+///   fail-closed）
 ///
 /// 账本（`known_marketplaces.json`）仍须视为不可信输入：本函数只保证不放大凭据与结构，
 /// 不保证展示值可克隆或与存储值逐字一致。
 pub(crate) fn known_git_source_for_display(raw: &str) -> String {
-    if let Some(display) = scp_like_source_for_display(raw) {
-        return display;
-    }
-    // opaque（缺 `//`）的 supported-scheme URL 可能把 userinfo 当 path 原样序列化；
-    // 严格函数不剥离该形态，展示面必须自行 fail-closed（共享严格函数不在本单放宽）。
-    if raw.contains('@') && !raw.contains("://") {
-        return REDACTED_GIT_SOURCE.to_string();
-    }
-    git_url_for_display(raw)
+    scp_like_source_for_display(raw).unwrap_or_else(|| git_url_for_display(raw))
 }
 
 /// scp-like `user@host:path` 的展示值：丢弃 userinfo，剥除 query/fragment。
@@ -374,9 +371,25 @@ mod tests {
             "cnb:FAKE_TOKEN@example.com/org/repo.git",
             "cnb:FAKE_TOKEN@https://example.com/org/repo.git",
             "ftp://cnb:FAKE_TOKEN",
+            "ssh:alice:PW_LEAK@example.com",
+            "git:alice:PW_LEAK@host/repo.git",
+            "ssh:alice%3APW_LEAK%40example.com",
+            "ssh:opaque?token=QUERY_LEAK#FRAGMENT_LEAK",
         ] {
-            assert_eq!(git_url_for_display(source), REDACTED_GIT_SOURCE);
+            assert_eq!(git_url_for_display(source), REDACTED_GIT_SOURCE, "{source}");
         }
+    }
+
+    #[test]
+    fn hierarchical_supported_schemes_still_strip_userinfo() {
+        assert_eq!(
+            git_url_for_display("ssh://alice:PW_LEAK@example.com/repo.git"),
+            "ssh://example.com/repo.git"
+        );
+        assert_eq!(
+            git_url_for_display("git://alice:PW_LEAK@host/repo.git"),
+            "git://host/repo.git"
+        );
     }
 
     #[test]
