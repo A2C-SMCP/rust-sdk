@@ -303,18 +303,13 @@ pub(crate) fn safe_rmtree(path: &Path, home: &Path) {
     }
 }
 
-/// 按 plugin 文件归属删除 `installPath`：**仅**当其位于该 plugin 独占的外部 clone
-/// `<home>/marketplace/.plugins/<mp>/<plugin>`（含 `git-subdir` 的后代子目录）时，删除**整个 clone 根**并返回
-/// `true`；其余路径保留并返回 `false`（#271 方案 A）。
+/// `installPath` 是否位于该 plugin 独占的外部 clone `<home>/marketplace/.plugins/<mp>/<plugin>`
+/// （含 `git-subdir` 的后代子目录）/ whether installPath lives in the plugin-exclusive external clone。
 ///
-/// 相对源（`source: "./plugins/x"`）的 `installPath` 落在**共享 catalog clone** `<home>/marketplace/<mp>/...`：
-/// 该树是 marketplace 级缓存——兄弟插件、剩余 scope 与重装都依赖它，归 marketplace remove/prune/gc 清理，
-/// uninstall / plugin-gc MUST NOT 删除。
-///
-/// 谓词为纯词法（[`is_within`] 分量级 + `..` 折叠），与 `installPath` 的生成方式一致，且路径可能已不存在；
-/// 实际删除仍由 [`safe_rmtree`] 的 canonicalize + Home 包含守卫兜底。空/非法 marketplace 或 plugin 名
-/// （含 gc 中无 `@` 的 pid）→ 无法识别独占根，保守保留（漏删优于误删）。
-pub(crate) fn remove_plugin_install_path(
+/// 供删除谓词与 uninstall 的「剩余 scope 是否仍引用该 clone」判定共用。谓词为纯词法（[`is_within`] 分量级 +
+/// `..` 折叠），与 `installPath` 的生成方式一致，且路径可能已不存在。空/非法 marketplace 或 plugin 名
+/// （含 gc 中无 `@` 的 pid）→ `false`（无法识别独占根，保守保留，漏删优于误删）。
+pub(crate) fn is_external_plugin_install_path(
     install_path: &Path,
     home: &Path,
     marketplace: &str,
@@ -326,8 +321,28 @@ pub(crate) fn remove_plugin_install_path(
     {
         return false;
     }
-    let ext_root = external_plugin_dir(home, marketplace, plugin);
-    if !is_within(install_path, &ext_root) {
+    is_within(
+        install_path,
+        &external_plugin_dir(home, marketplace, plugin),
+    )
+}
+
+/// 按 plugin 文件归属删除 `installPath`：**仅**当其位于该 plugin 独占的外部 clone
+/// `<home>/marketplace/.plugins/<mp>/<plugin>`（含 `git-subdir` 的后代子目录）时，删除**整个 clone 根**并返回
+/// `true`；其余路径保留并返回 `false`（#271 方案 A）。
+///
+/// 相对源（`source: "./plugins/x"`）的 `installPath` 落在**共享 catalog clone** `<home>/marketplace/<mp>/...`：
+/// 该树是 marketplace 级缓存——兄弟插件、剩余 scope 与重装都依赖它，归 marketplace remove/prune/gc 清理，
+/// uninstall / plugin-gc MUST NOT 删除。
+///
+/// 实际删除仍由 [`safe_rmtree`] 的 canonicalize + Home 包含守卫兜底（磁盘上 ext root 为 symlink 时拒删）。
+pub(crate) fn remove_plugin_install_path(
+    install_path: &Path,
+    home: &Path,
+    marketplace: &str,
+    plugin: &str,
+) -> bool {
+    if !is_external_plugin_install_path(install_path, home, marketplace, plugin) {
         tracing::debug!(
             path = %install_path.display(),
             marketplace,
@@ -336,7 +351,7 @@ pub(crate) fn remove_plugin_install_path(
         );
         return false;
     }
-    safe_rmtree(&ext_root, home);
+    safe_rmtree(&external_plugin_dir(home, marketplace, plugin), home);
     true
 }
 
@@ -964,6 +979,11 @@ mod tests {
         assert!(!remove_plugin_install_path(&ext_root, &home, "", "audit"));
         assert!(!remove_plugin_install_path(&ext_root, &home, "acme", ".."));
         assert!(ext_root.exists());
+        // `..` 穿越：归一后落在 ext root 外 → 保留（词法归一不放宽删除边界）。
+        let traversal = ext_root.join("../../acme/plugins/audit");
+        assert!(!remove_plugin_install_path(
+            &traversal, &home, "acme", "audit"
+        ));
 
         // 删除：ext 子目录 → 删整个独占 clone 根；共享 catalog 不受影响。
         assert!(remove_plugin_install_path(&ext_sub, &home, "acme", "audit"));
@@ -981,6 +1001,29 @@ mod tests {
         assert!(remove_plugin_install_path(
             &ext_root, &home, "acme", "audit"
         ));
+    }
+
+    /// #271：ext root 被植入指向 Home 外的 symlink 时，`safe_rmtree` 的 canonicalize 守卫拒删，目标存活。
+    #[cfg(unix)]
+    #[test]
+    fn remove_plugin_install_path_refuses_symlinked_ext_root_escape_271() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+        let ext_root = home.join("marketplace/.plugins/acme/audit");
+        std::fs::create_dir_all(ext_root.parent().unwrap()).unwrap();
+        symlink(&outside, &ext_root).unwrap();
+
+        let _ = remove_plugin_install_path(&ext_root, &home, "acme", "audit");
+        assert!(
+            outside.join("keep.txt").exists(),
+            "symlink 目标（Home 外）MUST NOT 被删除"
+        );
+        assert!(ext_root.exists(), "symlink 本身保留（拒删越界路径）");
     }
 
     // ---- unregister by source / plugin prefix --------------------------------
