@@ -192,6 +192,12 @@ pub fn entry_is_strict(entry: &Map<String, Value>) -> bool {
     }
 }
 
+/// marketplace entry 是否声明某组件字段（marketplace-v1：entry 字段即声明；空/缺/falsy 不算）/
+/// Whether a marketplace entry declares a component field。
+pub fn entry_declares_component(entry: &Map<String, Value>, field: &str) -> bool {
+    entry.get(field).is_some_and(json_truthy)
+}
+
 /// plugin.json 中**真值**组件字段名列表（空/缺/falsy 不算声明）/ Truthy component fields declared。
 pub fn manifest_declared_components(plugin_manifest: &Map<String, Value>) -> Vec<&'static str> {
     COMPONENT_FIELDS
