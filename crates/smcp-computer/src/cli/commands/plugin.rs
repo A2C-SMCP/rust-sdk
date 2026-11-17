@@ -10,7 +10,7 @@
 *
 * 对标 Python `a2c_smcp/computer/cli/commands/plugin.py`：与 marketplace 同范式——handler 取显式资源
 * （`registry` / `home` / `env`）+ flags，返回退出码（0 成功 / 1 用户错 / 2 网络错），包裹
-* [`install_plugin`] / [`uninstall_plugin`] / [`enable_plugin`] / [`disable_plugin`] 四动词 +
+* [`install_plugin`] / [`uninstall_plugin`] / [`enable_plugin`](crate::settings::installer::enable_plugin) / [`disable_plugin`] 四动词 +
 * [`gc_plugins`]。MCP 注入回调统一由 [`McpInstallHooks`]（Rust 把 Python 的四独立可选回调收进一个 trait）注入：
 * REPL 经 [`super::CliMcpHooks`] 从活跃 `Computer` 装配；Typer 非交互（#54）传 `None`（ledger-only，MCP 挂载
 * 延到下次 REPL boot 经批准框落地）。
@@ -34,8 +34,8 @@ use super::{
     EXIT_USER_ERROR,
 };
 use crate::settings::installer::{
-    disable_plugin, enable_plugin, install_plugin, uninstall_plugin, DisableOptions, EnableOptions,
-    InstallOptions, McpInstallHooks, PluginInstallError, UninstallOptions,
+    disable_plugin, enable_plugin_with_reclaim, install_plugin, uninstall_plugin, DisableOptions,
+    EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError, UninstallOptions,
 };
 use crate::settings::reconciler::{gc_plugins, list_orphan_plugins, McpTeardown};
 use crate::settings::scope::EnvMap;
@@ -259,11 +259,14 @@ pub async fn plugin_uninstall(
 /// 启用单个 plugin（廉价复原：重挂 server + 复活 skills）/ enable a plugin (cheap restore)。
 ///
 /// scope 契约：从 ledger 逐 scope 读；每条记录 register 之前先 `inject_inputs(installPath)`。
+/// `non_plugin_bundle_ids`：失败回滚的 §4.9.1-2 回收判据「非用户声明」数据源，MUST 由持有 `Computer`
+/// 的调用方供给（REPL）；一次性子命令无活跃 server（hooks=None）→ `None`（不摘）。
 pub async fn plugin_enable(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
     plugin_id: &str,
+    non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
     hooks: Option<&dyn McpInstallHooks>,
     json_output: bool,
 ) -> i32 {
@@ -286,7 +289,7 @@ pub async fn plugin_enable(
                 return plugin_err(&e.to_string(), json_output, EXIT_USER_ERROR, None);
             }
         }
-        let res = enable_plugin(
+        let res = enable_plugin_with_reclaim(
             plugin_id,
             registry,
             home,
@@ -296,6 +299,7 @@ pub async fn plugin_enable(
                 timeout: None,
                 env,
             },
+            non_plugin_bundle_ids,
             hooks,
         )
         .await;
@@ -666,7 +670,16 @@ mod tests {
             EXIT_USER_ERROR
         );
         assert_eq!(
-            plugin_enable(&mut registry, dir.path(), Some(&env), "x@y", None, true).await,
+            plugin_enable(
+                &mut registry,
+                dir.path(),
+                Some(&env),
+                "x@y",
+                None,
+                None,
+                true
+            )
+            .await,
             EXIT_USER_ERROR
         );
         assert_eq!(

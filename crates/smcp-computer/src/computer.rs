@@ -1610,6 +1610,9 @@ impl<S: Session> Computer<S> {
     /// bump **config** revision + `emit_update_config`（#115 R1：installer 据实际写盘返回 `changed`，幂等 re-enable
     /// 不虚假 bump / 不惊动 robot）；bundled server 若翻活经 hooks 走 [`Self::mount_server`] 另 bump capability（§12 R2 正交）。
     ///
+    /// **失败回滚（#286）**：经内部 seam 供给 `non_plugin_declared_bundle_ids` 全集——enable 失败且该 pid
+    /// 在任何 scope 都不再启用时，按 §4.9.1-2 回收其 bundled server；remount 对既有实例 existing-wins 不覆盖。
+    ///
     /// # Errors
     /// 见 [`PluginInstallError`]（未安装 / 冲突 / manifest / settings 写 / 注入）。
     pub async fn enable_plugin(
@@ -1635,10 +1638,20 @@ impl<S: Session> Computer<S> {
             timeout: options.timeout,
             env,
         };
+        // #286/#139：回收判据的「非用户声明」数据源 MUST 在取 `skill_registry` 写锁**之前**计算
+        //（同 disable/uninstall）——失败回滚时据此按 §4.9.1-2 回收本 plugin 的 bundled server。
+        let non_plugin = self.non_plugin_declared_bundle_ids(&home, env);
         let res = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::installer::enable_plugin(plugin_id, &mut reg, &home, effective, hooks)
-                .await
+            crate::settings::installer::enable_plugin_with_reclaim(
+                plugin_id,
+                &mut reg,
+                &home,
+                effective,
+                Some(&non_plugin),
+                hooks,
+            )
+            .await
         };
         match res {
             Ok(changed) => {

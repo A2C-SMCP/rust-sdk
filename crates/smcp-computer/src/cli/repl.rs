@@ -289,8 +289,19 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, Some(plugin), Some(marketplace)).await;
+            // #286：失败回滚的 §4.9.1-2 回收判据（同 disable）——MUST 在取 registry 写锁前由 Computer 供给。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
             let mut registry = reg_arc.write().await;
-            let code = plugin_enable(&mut registry, &home, None, id, Some(&hooks), json).await;
+            let code = plugin_enable(
+                &mut registry,
+                &home,
+                None,
+                id,
+                Some(&non_plugin),
+                Some(&hooks),
+                json,
+            )
+            .await;
             drop(registry);
             if code == EXIT_OK {
                 comp.mark_skills_dirty();
