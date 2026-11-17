@@ -6855,23 +6855,29 @@ mod tests {
             .with_skill_home(home)
             .with_blob_cache_root(tmp.path().join("blob"));
 
-        let err = computer
-            .add_marketplace(
-                "ssh:alice:PW_LEAK@example.com",
-                AddMarketplaceParams {
-                    no_clone: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            &err,
-            GovernanceError::InvalidUrl(source) if source == "<redacted-git-source>"
-        ));
-        let public_forms = format!("{err}\n{err:?}");
-        for secret in ["alice", "PW_LEAK", "example.com"] {
-            assert!(!public_forms.contains(secret), "{public_forms}");
+        for raw in [
+            "ssh:alice:PW_LEAK@example.com",
+            "ssh:/alice:PW_LEAK@example.com",
+            "file:alice:PW_LEAK@example.com",
+        ] {
+            let err = computer
+                .add_marketplace(
+                    raw,
+                    AddMarketplaceParams {
+                        no_clone: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &err,
+                GovernanceError::InvalidUrl(source) if source == "<redacted-git-source>"
+            ));
+            let public_forms = format!("{err}\n{err:?}");
+            for secret in ["alice", "PW_LEAK", "example.com"] {
+                assert!(!public_forms.contains(secret), "{raw}: {public_forms}");
+            }
         }
     }
 

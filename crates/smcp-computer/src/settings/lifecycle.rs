@@ -708,6 +708,8 @@ mod tests {
             "ssh:alice:PW_LEAK@example.com",
             "git:alice:PW_LEAK@host/repo.git",
             "ssh:alice%3APW_LEAK%40example.com",
+            "ssh:/alice:PW_LEAK@host",
+            "file:alice:PW_LEAK@host",
         ] {
             let err = resolve_marketplace_identity(raw, Some("valid-name")).unwrap_err();
             assert!(matches!(

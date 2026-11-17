@@ -54,9 +54,15 @@ pub(crate) fn git_url_for_display(raw: &str) -> String {
     if !matches!(parsed.scheme(), "ssh" | "git" | "http" | "https" | "file") {
         return REDACTED_GIT_SOURCE.to_string();
     }
-    // opaque（缺 `//`）URL 的 userinfo 会落在 path 里、`username()` 为空，原样序列化会回显
-    // 凭据（含 `%40` 编码形态）。合法 Git 源（`://` scheme 或 scp-like）不会 cannot-be-a-base。
-    if parsed.cannot_be_a_base() {
+    // 展示值只接受带 authority 且 host 非空的层级 URL：缺 `//`（`ssh:/alice:PW@host`）或
+    // 空 authority（`ssh:///alice:PW@host`）会把 userinfo 落进 path、`username()` 为空，
+    // 原样序列化会回显凭据（含 `%40` 编码与 query/fragment 残差）。file: 的 host 可为空
+    // （`file:///abs` 合法），但 raw 含 `@` 时无法与 userinfo 形态稳定区分 → fail-closed。
+    if parsed.scheme() == "file" {
+        if raw.contains('@') {
+            return REDACTED_GIT_SOURCE.to_string();
+        }
+    } else if !parsed.has_authority() || parsed.host_str().is_none() {
         return REDACTED_GIT_SOURCE.to_string();
     }
 
@@ -326,6 +332,9 @@ mod tests {
             "git@example.com://evil.example/repo.git",
             "ssh:alice:PW_LEAK@example.com",
             "git:alice:PW_LEAK@host/repo.git",
+            "ssh:/alice:PW_LEAK@host",
+            "ssh:///alice:PW_LEAK@host",
+            "file:alice:PW_LEAK@host",
             "@example.com:org/repo.git",
             "git@:org/repo.git",
             "git@example.com:",
@@ -375,6 +384,11 @@ mod tests {
             "git:alice:PW_LEAK@host/repo.git",
             "ssh:alice%3APW_LEAK%40example.com",
             "ssh:opaque?token=QUERY_LEAK#FRAGMENT_LEAK",
+            "ssh:/alice:PW_LEAK@host",
+            "ssh:///alice:PW_LEAK@host",
+            "file:alice:PW_LEAK@host",
+            "file:/alice:PW_LEAK@host",
+            "file:alice@host",
         ] {
             assert_eq!(git_url_for_display(source), REDACTED_GIT_SOURCE, "{source}");
         }
@@ -390,6 +404,9 @@ mod tests {
             git_url_for_display("git://alice:PW_LEAK@host/repo.git"),
             "git://host/repo.git"
         );
+        // file: host 可为空；合法 file 源不得被误杀。
+        assert_eq!(git_url_for_display("file:///abs/path"), "file:///abs/path");
+        assert_eq!(git_url_for_display("file://host/path"), "file://host/path");
     }
 
     #[test]
