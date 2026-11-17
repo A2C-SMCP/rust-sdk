@@ -2455,8 +2455,9 @@ mod tests {
         .expect("refresh=true 重装应成功");
     }
 
-    /// #278：0.5.0 旧卸载已删的 catalog 子树无法自愈（`git pull` 保留本地删除）——
-    /// 重装失败错误必须携带恢复指引（B 方案：不自动迁移，只给命令 + 文档）。
+    /// #278：0.5.1 之前版本卸载已删的 catalog 子树无法可靠自愈——重装失败错误必须携带恢复指引
+    /// （B 方案：不自动迁移，只给命令 + 文档）。install 在 materialize 阶段即失败（不会走到 staging
+    /// 的 git pull），`refresh` 标志只影响 staging，不改变本入口错误——这里验证两条入口都报同一提示。
     #[tokio::test]
     async fn install_missing_catalog_subtree_reports_recovery_hint_278() {
         let tmp = TempDir::new().unwrap();
@@ -2475,10 +2476,9 @@ mod tests {
         .await
         .unwrap();
 
-        // 模拟 0.5.0 旧卸载后果：共享 catalog 内的相对源子树被删。
+        // 模拟旧版卸载后果：共享 catalog 内的相对源子树被删。
         fs::remove_dir_all(home.join("marketplace/acme/plugins/audit")).unwrap();
 
-        // 默认与 refresh=true 都应失败（后者 git pull 保留本地删除），且错误带恢复指引。
         for refresh in [false, true] {
             let err = install_plugin(
                 "audit@acme",
@@ -2499,8 +2499,8 @@ mod tests {
                 "refresh={refresh} 须给级联移除命令: {msg}"
             );
             assert!(
-                msg.contains("marketplace add <git-url> --trust"),
-                "refresh={refresh} 须给重加命令: {msg}"
+                msg.contains("marketplace add <git-url> --trust --name <name>"),
+                "refresh={refresh} 须给带 --name 的重加命令: {msg}"
             );
             assert!(
                 msg.contains("plugin enable <plugin>@<name>"),
@@ -2513,6 +2513,40 @@ mod tests {
                 "refresh={refresh} 须给出可打开的文档 URL: {msg}"
             );
         }
+    }
+
+    /// #278 文档论断锚点：`marketplace refresh`（stage refresh=true）**不恢复**被本地删除的
+    /// catalog 子树——`git pull --ff-only` 无上游变化时成功、保留本地删除（仅在 pull 失败触发
+    /// 全量重 clone 时才可能恢复，故文档写「无法可靠自愈」）。此用例直接驱动 staging 层，
+    /// 不依赖 install 的 materialize 失败路径。
+    #[tokio::test]
+    async fn refresh_true_does_not_restore_deleted_catalog_subtree_278() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, source) = setup_installed_catalog(&tmp, false).await;
+        let rel = home.join("marketplace/acme/plugins/audit");
+        fs::remove_dir_all(&rel).unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let skills = stage_marketplace_skills(
+            "acme",
+            &source,
+            &mut reg,
+            &home,
+            MarketplaceStageOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            !rel.exists(),
+            "refresh 的 git pull 不得恢复本地删除的 catalog 子树（文档论断锚点）"
+        );
+        assert!(
+            !skills.iter().any(|s| s.starts_with("audit:")),
+            "缺失子树不应注册技能: {skills:?}"
+        );
     }
 
     /// 外部 Git clone：卸载仍删除 plugin 独占的 `.plugins/<mp>/<plugin>`，不碰共享 catalog。

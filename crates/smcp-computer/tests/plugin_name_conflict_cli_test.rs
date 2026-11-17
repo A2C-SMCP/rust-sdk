@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
 
 use serde_json::{json, Map};
 use tempfile::tempdir;
@@ -16,59 +15,9 @@ use smcp_computer::settings::store::{
 };
 use smcp_computer::settings::{InstalledPluginRecord, KnownMarketplaceEntry};
 
-fn git(args: &[&str], cwd: &Path) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", cwd)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .expect("git available");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// marketplace 源仓库（plugin `alpha` + skill `code-review`）。
-fn build_repo(repo: &Path, description: &str) -> String {
-    fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
-    fs::write(
-        repo.join(".tfrobot-plugin/marketplace.json"),
-        r#"{"plugins": [{"name": "alpha", "source": "./plugins/alpha"}]}"#,
-    )
-    .unwrap();
-    let skill = repo.join("plugins/alpha/skills/code-review");
-    fs::create_dir_all(&skill).unwrap();
-    fs::write(
-        skill.join("SKILL.md"),
-        format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
-    )
-    .unwrap();
-    git(&["init", "-q"], repo);
-    git(&["add", "-A"], repo);
-    git(&["commit", "-qm", "init"], repo);
-    format!("file://{}", repo.display())
-}
-
-fn run(home: &Path, skill_home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
-        .args(args)
-        .current_dir(home)
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
-        .env("A2C_SKILL_HOME", skill_home)
-        .output()
-        .expect("smcp-computer binary runs")
-}
+#[path = "common/cli_binary.rs"]
+mod cli_binary;
+use cli_binary::{build_relative_source_repo, json_stdout, run_binary};
 
 fn seed_intent(skill_home: &Path, pids: &[&str]) {
     let pids: Vec<String> = pids.iter().map(|s| s.to_string()).collect();
@@ -104,12 +53,6 @@ fn seed_ledger(skill_home: &Path, pid: &str, install_path: &Path) {
     .unwrap();
 }
 
-fn json_stdout(output: &Output) -> serde_json::Value {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout 应为 JSON: {e}; stdout={stdout}"))
-}
-
 #[test]
 fn plugin_install_duplicate_bare_plugin_reports_plugin_name_conflict() {
     let dir = tempdir().unwrap();
@@ -117,7 +60,7 @@ fn plugin_install_duplicate_bare_plugin_reports_plugin_name_conflict() {
     fs::create_dir_all(&skill_home).unwrap();
     seed_intent(&skill_home, &["alpha@mp-a"]);
 
-    let output = run(
+    let output = run_binary(
         dir.path(),
         &skill_home,
         &["plugin", "install", "alpha@mp-b", "--json"],
@@ -149,7 +92,7 @@ fn plugin_enable_duplicate_installed_plugin_reports_plugin_name_conflict() {
     fs::create_dir_all(&install).unwrap();
     seed_ledger(&skill_home, "alpha@mp-b", &install);
 
-    let output = run(
+    let output = run_binary(
         dir.path(),
         &skill_home,
         &["plugin", "enable", "alpha@mp-b", "--json"],
@@ -174,8 +117,8 @@ fn plugin_enable_installed_plugin_wins_over_add_only_marketplace() {
     let dir = tempdir().unwrap();
     let skill_home = dir.path().join("skill-home");
     fs::create_dir_all(&skill_home).unwrap();
-    let url_a = build_repo(&dir.path().join("mp-a"), "from mp-a");
-    let url_b = build_repo(&dir.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&dir.path().join("mp-a"), "from mp-a");
+    let url_b = build_relative_source_repo(&dir.path().join("mp-b"), "from mp-b");
     update_known_marketplaces(
         |f| {
             f.account.marketplaces.insert(
@@ -204,7 +147,7 @@ fn plugin_enable_installed_plugin_wins_over_add_only_marketplace() {
         &skill_home.join("marketplace/mp-b/plugins/alpha"),
     );
 
-    let output = run(
+    let output = run_binary(
         dir.path(),
         &skill_home,
         &["plugin", "enable", "alpha@mp-b", "--json"],
@@ -226,8 +169,8 @@ fn plugin_uninstall_then_install_other_marketplace_succeeds() {
     let dir = tempdir().unwrap();
     let skill_home = dir.path().join("skill-home");
     fs::create_dir_all(&skill_home).unwrap();
-    let url_a = build_repo(&dir.path().join("mp-a"), "from mp-a");
-    let url_b = build_repo(&dir.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&dir.path().join("mp-a"), "from mp-a");
+    let url_b = build_relative_source_repo(&dir.path().join("mp-b"), "from mp-b");
     update_known_marketplaces(
         |f| {
             for (name, url) in [("mp-a", &url_a), ("mp-b", &url_b)] {
@@ -245,7 +188,7 @@ fn plugin_uninstall_then_install_other_marketplace_succeeds() {
     )
     .unwrap();
 
-    let out = run(
+    let out = run_binary(
         dir.path(),
         &skill_home,
         &["plugin", "install", "alpha@mp-a", "--json"],
@@ -258,7 +201,7 @@ fn plugin_uninstall_then_install_other_marketplace_succeeds() {
     );
     assert_eq!(json_stdout(&out)["installed"], "alpha@mp-a");
 
-    let out = run(
+    let out = run_binary(
         dir.path(),
         &skill_home,
         &["plugin", "uninstall", "alpha@mp-a", "--json"],
@@ -270,7 +213,7 @@ fn plugin_uninstall_then_install_other_marketplace_succeeds() {
         "uninstall mp-a failed: stdout={stdout}"
     );
 
-    let out = run(
+    let out = run_binary(
         dir.path(),
         &skill_home,
         &["plugin", "install", "alpha@mp-b", "--json"],

@@ -3,74 +3,20 @@
 //! 覆盖：① install 失败错误携带恢复指引且不回显 marketplace 名/URL（占位符，零凭据泄漏）；
 //! ② 按迁移文档执行 `marketplace remove`（默认级联 + 撤销 trust）→ `marketplace add --trust`
 //! （重 clone）→ 重装成功。文档：`docs/computer/marketplace-0.5.1-migration.md`。
+//!
+//! git / 仓库夹具 / 二进制运行 helper 与 `plugin_name_conflict_cli_test.rs` 共用
+//! [`common/cli_binary.rs`](common/cli_binary.rs)。
 #![cfg(feature = "cli")]
 
 use std::fs;
-use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
 use tempfile::tempdir;
 
-fn git(args: &[&str], cwd: &Path) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", cwd)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .expect("git available");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// marketplace 源仓库：plugin `alpha` 用**相对 source**（0.5.0 旧卸载的受害者形态）。
-fn build_repo(repo: &Path) -> String {
-    fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
-    fs::write(
-        repo.join(".tfrobot-plugin/marketplace.json"),
-        r#"{"plugins": [{"name": "alpha", "source": "./plugins/alpha"}]}"#,
-    )
-    .unwrap();
-    let skill = repo.join("plugins/alpha/skills/code-review");
-    fs::create_dir_all(&skill).unwrap();
-    fs::write(
-        skill.join("SKILL.md"),
-        "---\nname: code-review\ndescription: recovery fixture\n---\nbody",
-    )
-    .unwrap();
-    git(&["init", "-q"], repo);
-    git(&["add", "-A"], repo);
-    git(&["commit", "-qm", "init"], repo);
-    format!("file://{}", repo.display())
-}
-
-fn run(home: &Path, skill_home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
-        .args(args)
-        .current_dir(home)
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
-        .env("A2C_SKILL_HOME", skill_home)
-        .output()
-        .expect("smcp-computer binary runs")
-}
-
-fn json_stdout(output: &Output) -> Value {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout 应为 JSON: {e}; stdout={stdout}"))
-}
+#[path = "common/cli_binary.rs"]
+mod cli_binary;
+use cli_binary::{build_relative_source_repo, json_stdout, run_binary};
 
 fn assert_ok(output: &Output, what: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -88,7 +34,7 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
     let home = dir.path();
     let skill_home = home.join("skill-home");
     fs::create_dir_all(&skill_home).unwrap();
-    let url = build_repo(&home.join("mp-src"));
+    let url = build_relative_source_repo(&home.join("mp-src"), "recovery fixture");
     // 名字取 token 形态：错误提示必须用占位符，绝不回显它（#279/#285 同源泄漏面）。
     let mp = "acme-ghp-fake-token";
     let pid = format!("alpha@{mp}");
@@ -98,7 +44,7 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
         .join("plugins/alpha/skills/code-review/SKILL.md");
 
     // ① add（非交互必须 --trust）→ ② install
-    let out = run(
+    let out = run_binary(
         home,
         &skill_home,
         &[
@@ -112,7 +58,7 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
         ],
     );
     assert_ok(&out, "marketplace add");
-    let out = run(home, &skill_home, &["plugin", "install", &pid, "--json"]);
+    let out = run_binary(home, &skill_home, &["plugin", "install", &pid, "--json"]);
     assert_ok(&out, "首次 install");
     assert_eq!(json_stdout(&out)["installed"], pid.as_str());
     assert!(catalog_skill.exists(), "catalog 内相对源 SKILL.md 应落盘");
@@ -127,7 +73,7 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
     .unwrap();
 
     // ④ 直接重装失败，错误给出恢复指引；不得回显 marketplace 名（含 token）或源 URL。
-    let out = run(home, &skill_home, &["plugin", "install", &pid, "--json"]);
+    let out = run_binary(home, &skill_home, &["plugin", "install", &pid, "--json"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
@@ -160,7 +106,7 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
     assert!(!msg.contains(&url), "不得回显源 URL: {msg}");
 
     // ⑤ 按文档：marketplace remove 默认级联卸载（无 --keep-plugins）。
-    let out = run(home, &skill_home, &["marketplace", "remove", mp, "--json"]);
+    let out = run_binary(home, &skill_home, &["marketplace", "remove", mp, "--json"]);
     assert_ok(&out, "marketplace remove");
     let v = json_stdout(&out);
     assert_eq!(v["removed"], mp, "{v}");
@@ -193,7 +139,7 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
     );
 
     // ⑥ 按文档 --trust 重新 add（重 clone）→ ⑦ 重装成功。
-    let out = run(
+    let out = run_binary(
         home,
         &skill_home,
         &[
@@ -207,7 +153,7 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
         ],
     );
     assert_ok(&out, "重新 add --trust");
-    let out = run(home, &skill_home, &["plugin", "install", &pid, "--json"]);
+    let out = run_binary(home, &skill_home, &["plugin", "install", &pid, "--json"]);
     assert_ok(&out, "恢复后重装");
     assert_eq!(json_stdout(&out)["installed"], pid.as_str());
     assert!(

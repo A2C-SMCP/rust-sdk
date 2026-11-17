@@ -959,17 +959,22 @@ pub(crate) async fn locate_plugin_root(
 
     if !plugin_root.is_dir() {
         // #278：0.5.1 之前的卸载会删除共享 catalog 子树（相对源插件），且 `marketplace refresh`
-        // 的 `git pull` 保留本地删除、无法自愈——错误里给出 remove + add + enable 恢复路径
-        // （B 方案，不自动迁移）。先提示确认上游路径存在：manifest 失真/手删目录也会落到同一
-        // 错误，此时级联 remove 只会无谓破坏安装与 trust。
+        // 的 `git pull` 保留本地删除、无法可靠自愈——错误里给出完整恢复链（B 方案，不自动迁移）：
+        // ① 先确认**上游**仓库仍有该路径（本地 clone 就是被破坏的 repo，看它会误判为 manifest 失真），
+        //    并记下 URL / 注册名 / 已装插件（remove 后 `marketplace info` 查不到 URL）；
+        // ② remove 默认级联卸载该 marketplace 全部插件并撤销 trust，`--keep-plugins` 会留孤儿账本；
+        // ③ 重加必须 `--name` 沿用原名，否则从 URL 派生新名、后续 `plugin install <plugin>@<原名>` 失败；
+        // ④ 逐插件重装 + 此前启用的重新 enable（install 不激活）。
         // 文案只用字面占位符：marketplace 名/相对路径可能内嵌 URL 派生凭据，一律不回显。
         let msg = if is_local {
             "plugin root not found after source resolution. This may be a marketplace catalog \
-             damaged by a pre-0.5.1 uninstall (relative-source plugins). If so, confirm the plugin \
-             path exists in the marketplace repo, then recover with: 'marketplace remove <name>' \
-             (WARNING: cascades uninstall of all plugins from that marketplace and revokes its \
-             trust), then 'marketplace add <git-url> --trust', then reinstall (and 'plugin enable \
-             <plugin>@<name>' if it was enabled). See \
+             damaged by a pre-0.5.1 uninstall (relative-source plugins). If so, first confirm the \
+             path exists in the upstream marketplace repo (not the local clone), and record the \
+             source URL, registered name and installed plugins ('marketplace info <name>', 'plugin \
+             list'). Recover with: 'marketplace remove <name>' (WARNING: cascades uninstall of ALL \
+             plugins from that marketplace and revokes its trust; do NOT pass --keep-plugins), then \
+             'marketplace add <git-url> --trust --name <name>' (keep the original name), reinstall \
+             each plugin, and 'plugin enable <plugin>@<name>' for plugins previously enabled. See \
              https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
         } else {
             "plugin root not found after source resolution"
@@ -1951,20 +1956,36 @@ mod tests {
             "须给出重加命令: {msg}"
         );
         assert!(
+            msg.contains("upstream marketplace repo (not the local clone)"),
+            "须要求查上游提交树（本地 clone 即被破坏 repo）: {msg}"
+        );
+        assert!(
+            msg.contains("record the source URL, registered name and installed plugins"),
+            "破坏性 remove 前须先记录 URL/注册名/已装插件: {msg}"
+        );
+        assert!(
             msg.contains("plugin enable <plugin>@<name>"),
             "须提醒 re-enable（install 不激活）: {msg}"
         );
         assert!(
-            msg.contains("cascades uninstall"),
-            "须警告级联卸载+撤销 trust: {msg}"
+            msg.contains("cascades uninstall of ALL plugins"),
+            "须警告级联卸载该 marketplace 全部插件: {msg}"
         );
         assert!(
-            msg.contains("confirm the plugin path exists"),
-            "须先提示确认为 catalog 破坏而非上游 manifest 失真: {msg}"
+            msg.contains("do NOT pass --keep-plugins"),
+            "须明示不要 --keep-plugins: {msg}"
+        );
+        assert!(
+            msg.contains("--trust --name <name>"),
+            "重加须带 --name 沿用原名（否则派生新名，install 失败）: {msg}"
+        );
+        assert!(
+            msg.contains("reinstall each plugin"),
+            "须要求逐插件重装: {msg}"
         );
         assert!(
             msg.contains("pre-0.5.1"),
-            "受影响版本须覆盖全部旧版本（0.3.1–0.5.0）: {msg}"
+            "受影响版本须覆盖全部旧版本（0.2.2–0.5.0）: {msg}"
         );
         assert!(
             msg.contains(
