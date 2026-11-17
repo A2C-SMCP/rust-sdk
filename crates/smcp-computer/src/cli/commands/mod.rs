@@ -574,6 +574,61 @@ mod tests {
         comp.shutdown().await.unwrap();
     }
 
+    /// #286 复审 N1：`CliMcpHooks` 的既有集**随本实例 register/remove 活更新**（CLI 逐记录 enable 复用
+    /// 同一实例时，后一条记录须看见前一条刚挂的 server；否则 existing-wins 失效、失败回滚误摘前序成果）。
+    #[tokio::test]
+    async fn cli_hooks_existing_tracks_live_register_and_remove_286() {
+        use crate::mcp_clients::model::{
+            MCPServerConfig, StdioServerConfig, StdioServerParameters,
+        };
+        use std::collections::HashMap;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let comp = Computer::new(
+            "live-existing",
+            SilentSession::new("t"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"));
+        comp.boot_up().await.unwrap();
+        let hooks = CliMcpHooks::new(&comp, None, None).await;
+        assert!(hooks.existing_servers().is_empty());
+
+        let cfg = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
+            connect_timeout_secs: None,
+            name: "live-srv".to_string(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg);
+        hooks.register_server(cfg).await.expect("mount");
+        assert!(
+            hooks.existing_servers().contains_key(&bid),
+            "register 成功后 MUST 进入既有集（existing-wins 依赖）"
+        );
+        hooks.remove_server(&bid).await.expect("unmount");
+        assert!(
+            !hooks.existing_servers().contains_key(&bid),
+            "remove 成功后 MUST 离开既有集"
+        );
+        comp.shutdown().await.unwrap();
+    }
+
     /// #100 item1：`new_remount` 从 ledger 建 `install_path → 归属` 索引；`inject_inputs` **按记录归属**
     /// 前缀化注入（plugin/marketplace 绑定为 `None`，仅靠 `roots` 才能命中——证明多-plugin 重挂正确前缀）。
     #[tokio::test]
