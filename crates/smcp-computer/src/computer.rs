@@ -6858,6 +6858,8 @@ mod tests {
         for raw in [
             "ssh:alice:PW_LEAK@example.com",
             "ssh:/alice:PW_LEAK@example.com",
+            "ssh:///alice:PW_LEAK@example.com",
+            "git:///alice:PW_LEAK@example.com",
             "file:alice:PW_LEAK@example.com",
         ] {
             let err = computer
@@ -6878,6 +6880,17 @@ mod tests {
             for secret in ["alice", "PW_LEAK", "example.com"] {
                 assert!(!public_forms.contains(secret), "{raw}: {public_forms}");
             }
+            // 拒绝发生在账本写入之前。
+            let known = crate::settings::store::load_known_marketplaces(
+                Some(computer.skill_home().as_path()),
+                None,
+            )
+            .account;
+            assert!(
+                known.marketplaces.is_empty(),
+                "{raw}: {:?}",
+                known.marketplaces
+            );
         }
     }
 

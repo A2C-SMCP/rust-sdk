@@ -185,6 +185,10 @@ pub fn normalize_marketplace_url(raw: &str) -> Option<String> {
 #[must_use]
 pub fn default_marketplace_name(url: &str) -> Option<String> {
     let raw = url.trim();
+    // #285：仅对合法 Git URL 派生；hostless/畸形（含公开函数直调）不得从 path slug 凭据。
+    if !is_valid_git_url(raw) {
+        return None;
+    }
     let segment = if raw.contains("://") {
         let parsed = Url::parse(raw).ok()?;
         if !matches!(parsed.scheme(), "ssh" | "git" | "http" | "https" | "file") {
@@ -581,6 +585,16 @@ mod tests {
             Some("https://github.com/acme/skills.git".to_string())
         );
         assert_eq!(normalize_marketplace_url("not a url"), None);
+        // #285：hostless 不得归一为合法 URL，也不得回落成 owner/repo 简写。
+        assert_eq!(
+            normalize_marketplace_url("ssh:///alice:PW_LEAK@example.com"),
+            None
+        );
+        assert_eq!(
+            normalize_marketplace_url("ssh:/alice:PW_LEAK@example.com"),
+            None
+        );
+        assert_eq!(normalize_marketplace_url("ssh:/foo"), None);
     }
 
     #[test]
@@ -602,6 +616,23 @@ mod tests {
         assert_eq!(
             default_marketplace_name("https://user:PW_SECRET@example.com?token=QUERY#FRAGMENT"),
             None
+        );
+        // #285：hostless 公开函数直调也不得从 path 派生（防凭据 slug）。
+        assert_eq!(
+            default_marketplace_name("ssh:///alice:PW_LEAK@example.com"),
+            None
+        );
+        assert_eq!(
+            default_marketplace_name("ssh:/alice:PW_LEAK@example.com"),
+            None
+        );
+        assert_eq!(
+            default_marketplace_name("git:///alice:PW_LEAK@example.com"),
+            None
+        );
+        assert_eq!(
+            default_marketplace_name("ssh://example.com/org/repo.git"),
+            Some("repo".to_string())
         );
     }
 
@@ -709,6 +740,8 @@ mod tests {
             "git:alice:PW_LEAK@host/repo.git",
             "ssh:alice%3APW_LEAK%40example.com",
             "ssh:/alice:PW_LEAK@host",
+            "ssh:///alice:PW_LEAK@host",
+            "git:///alice:PW_LEAK@host",
             "file:alice:PW_LEAK@host",
         ] {
             let err = resolve_marketplace_identity(raw, Some("valid-name")).unwrap_err();
