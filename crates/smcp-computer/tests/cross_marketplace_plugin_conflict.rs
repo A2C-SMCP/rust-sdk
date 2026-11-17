@@ -7,9 +7,6 @@
 //! 测试以外部 crate 身份链接 `smcp_computer`，仅经公开面驱动（治理 store 低层 seeding 与
 //! `governance_snapshot.rs` 同一豁免边界）。
 
-use std::path::Path;
-use std::process::Command;
-
 use serde_json::{json, Map};
 use tempfile::TempDir;
 
@@ -26,46 +23,9 @@ use smcp_computer::settings::{
     UninstallOptions,
 };
 
-fn git(args: &[&str], cwd: &Path) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", cwd)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .expect("git available");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// marketplace 源仓库：plugin `alpha` + skill `code-review`（合成 `alpha:code-review`）。
-fn build_repo(repo: &Path, description: &str) -> String {
-    std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
-    std::fs::write(
-        repo.join(".tfrobot-plugin/marketplace.json"),
-        r#"{"plugins": [{"name": "alpha", "source": "./plugins/alpha"}]}"#,
-    )
-    .unwrap();
-    let skill = repo.join("plugins/alpha/skills/code-review");
-    std::fs::create_dir_all(&skill).unwrap();
-    std::fs::write(
-        skill.join("SKILL.md"),
-        format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
-    )
-    .unwrap();
-    git(&["init", "-q"], repo);
-    git(&["add", "-A"], repo);
-    git(&["commit", "-qm", "init"], repo);
-    format!("file://{}", repo.display())
-}
+#[path = "common/cli_binary.rs"]
+mod cli_binary;
+use cli_binary::build_relative_source_repo;
 
 fn xdg_env(td: &TempDir) -> EnvMap {
     std::iter::once((
@@ -85,8 +45,8 @@ async fn legacy_double_install_reconcile_reports_and_enable_fails_closed() {
     let home = td.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let env = xdg_env(&td);
-    let url_a = build_repo(&td.path().join("mp-a"), "from mp-a");
-    let url_b = build_repo(&td.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&td.path().join("mp-a"), "from mp-a");
+    let url_b = build_relative_source_repo(&td.path().join("mp-b"), "from mp-b");
 
     update_known_marketplaces(
         |f| {
@@ -304,8 +264,8 @@ async fn add_conflict_surfaces_diagnostic_and_survives_reconcile_until_source_re
     let home = td.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let env = xdg_env(&td);
-    let url_a = build_repo(&td.path().join("mp-a"), "from mp-a");
-    let url_b = build_repo(&td.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&td.path().join("mp-a"), "from mp-a");
+    let url_b = build_relative_source_repo(&td.path().join("mp-b"), "from mp-b");
     let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
         .with_skill_home(home.clone())
         .with_blob_cache_root(td.path().join("blob"))

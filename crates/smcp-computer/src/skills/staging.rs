@@ -917,6 +917,9 @@ pub(crate) async fn locate_plugin_root(
     };
     let resolved = resolve_plugin_source(raw_source, plugin_root_base)
         .map_err(|e: SkillSourceError| SkillStagingError::new(e.to_string()))?;
+    // #278：只有 Local（marketplace clone 内相对源）根缺失才可能源于 0.5.0 旧卸载删除共享
+    // catalog 子树；Git 源 clone 后根缺失属 manifest/subdir/clone 问题，不能误导用户去 remove。
+    let is_local = matches!(&resolved, ResolvedPluginSource::Local(_));
 
     let (plugin_root, version_fallback) = match resolved {
         ResolvedPluginSource::Local(local) => {
@@ -955,9 +958,37 @@ pub(crate) async fn locate_plugin_root(
     };
 
     if !plugin_root.is_dir() {
-        return Err(SkillStagingError::new(
-            "plugin root not found after source resolution",
-        ));
+        // #278：0.5.1 之前的卸载会删除共享 catalog 子树（相对源插件），且 `marketplace refresh`
+        // 的 `git pull` 保留本地删除、无法可靠自愈——错误里给出完整恢复链（B 方案，不自动迁移）：
+        // ① 先确认**上游**仓库仍有该路径（本地 clone 就是被破坏的 repo，看它会误判为 manifest 失真），
+        //    并记下 URL / 注册名 / autoUpdate / 各插件 scope、projectPath、version。受损插件已被旧版
+        //    uninstall 移除安装意图与账本 → `plugin list`/`plugin info` 可能查不到，须从原安装命令或
+        //    shell 历史取；取不到就按默认 user scope / 当前版本恢复；
+        // ② remove 默认级联卸载该 marketplace 全部插件并撤销 trust，`--keep-plugins` 会留孤儿账本；
+        // ③ 重加必须 `--name` 沿用原名（否则从 URL 派生新名、旧 pid install 失败），autoUpdate 需重设；
+        // ④ 逐插件按原 scope 重装（project/local 以 cwd 作 projectPath，须在原项目目录执行；多 scope
+        //    各装一次）；`--version` 仅写回账本 version 字段、**不锁定内容**；此前启用的重新 enable。
+        // 文案只用字面占位符：marketplace 名/相对路径可能内嵌 URL 派生凭据，一律不回显。
+        let msg = if is_local {
+            "plugin root not found after source resolution. This may be a marketplace catalog \
+             damaged by a pre-0.5.1 uninstall (relative-source plugins). If so, first confirm the \
+             path exists in the upstream marketplace repo (not the local clone), and record the \
+             source URL, registered name, autoUpdate flag, and each plugin's scope/projectPath/\
+             version. Note: damaged plugins were already uninstalled by the old version, so \
+             'plugin list --available'/'plugin info' may no longer list them -- recover those \
+             values from your original install command or shell history, otherwise restore with \
+             the default scope and current version. Recover with: 'marketplace remove <name>' \
+             (WARNING: cascades uninstall of ALL plugins from that marketplace and revokes its \
+             trust; do NOT pass --keep-plugins), then 'marketplace add <git-url> --trust --name \
+             <name>' (keep the original name; add --auto-update if it was set), reinstall each \
+             plugin per original scope (project/local: run inside the original project directory; \
+             '--version' only restores the ledger version field, it does not pin content), and \
+             'plugin enable <plugin>@<name>' for plugins previously enabled. See \
+             https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
+        } else {
+            "plugin root not found after source resolution"
+        };
+        return Err(SkillStagingError::new(msg));
     }
     Ok((plugin_root, version_fallback))
 }
@@ -1929,6 +1960,157 @@ mod tests {
         assert_eq!(r.source, "marketplace:acme");
         assert_eq!(r.description, "review code");
         assert!(r.uri.is_none());
+    }
+
+    /// #278：相对 source 根缺失（0.5.1 之前版本的卸载删除 catalog 子树）→ 错误携带恢复指引；
+    /// marketplace 名 / 相对路径 / catalog 路径一律**不插值**（占位符，对抗 token 形态泄漏）。
+    #[tokio::test]
+    async fn locate_plugin_root_local_missing_reports_recovery_hint_278() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = tmp.path().join("catalog-ghp-fake-token");
+        fs::create_dir_all(&catalog).unwrap();
+        let entry = serde_json::json!({ "source": "./plugins/audit-ghp-fake-token" });
+        let err = locate_plugin_root(
+            "acme-ghp-fake-token",
+            "audit",
+            entry.as_object().unwrap(),
+            &catalog,
+            ".",
+            tmp.path(),
+            None,
+            false,
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .await
+        .expect_err("catalog 子树缺失应报错");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plugin root not found after source resolution"),
+            "保留原错误句: {msg}"
+        );
+        assert!(
+            msg.contains("marketplace remove <name>"),
+            "须给出级联移除命令: {msg}"
+        );
+        assert!(
+            msg.contains("marketplace add <git-url> --trust"),
+            "须给出重加命令: {msg}"
+        );
+        assert!(
+            msg.contains("upstream marketplace repo (not the local clone)"),
+            "须要求查上游提交树（本地 clone 即被破坏 repo）: {msg}"
+        );
+        assert!(
+            msg.contains("each plugin's scope/projectPath/version"),
+            "破坏性 remove 前须先记录 URL/注册名/插件/scope/projectPath/version: {msg}"
+        );
+        assert!(
+            msg.contains("plugin list --available"),
+            "默认 plugin list 隐藏 installed-disabled，须用 --available: {msg}"
+        );
+        assert!(
+            msg.contains("already uninstalled by the old version")
+                && msg.contains("may no longer list them"),
+            "受损插件已不在账本/意图，提示须说明查不到（caveat）: {msg}"
+        );
+        assert!(
+            msg.contains("original install command or shell history")
+                && msg.contains("the default scope and current version"),
+            "取不到历史值时须给默认恢复口径: {msg}"
+        );
+        assert!(
+            msg.contains("run inside the original project directory"),
+            "project/local scope 须在原项目目录执行（cwd 即 projectPath）: {msg}"
+        );
+        assert!(
+            msg.contains("does not pin content"),
+            "--version 仅恢复账本字段、不锁定内容: {msg}"
+        );
+        assert!(
+            msg.contains("--auto-update if it was set"),
+            "须提示恢复 autoUpdate: {msg}"
+        );
+        assert!(
+            msg.contains("plugin enable <plugin>@<name>"),
+            "须提醒 re-enable（install 不激活）: {msg}"
+        );
+        assert!(
+            msg.contains("cascades uninstall of ALL plugins"),
+            "须警告级联卸载该 marketplace 全部插件: {msg}"
+        );
+        assert!(
+            msg.contains("do NOT pass --keep-plugins"),
+            "须明示不要 --keep-plugins: {msg}"
+        );
+        assert!(
+            msg.contains("--trust --name <name>"),
+            "重加须带 --name 沿用原名（否则派生新名，install 失败）: {msg}"
+        );
+        assert!(
+            msg.contains("reinstall each plugin"),
+            "须要求逐插件重装: {msg}"
+        );
+        assert!(
+            msg.contains("pre-0.5.1"),
+            "受影响版本须覆盖全部旧版本（0.2.2–0.5.0）: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
+            ),
+            "发布物用户须能打开文档（绝对 URL，非仓库相对路径）: {msg}"
+        );
+        // 零泄漏：名字/路径中的 token 形态、catalog 绝对路径均不得回显。
+        assert!(
+            !msg.contains("ghp-fake-token"),
+            "不得回显名称/路径 token: {msg}"
+        );
+        assert!(
+            !msg.contains(&catalog.display().to_string()),
+            "不得回显 catalog 路径: {msg}"
+        );
+    }
+
+    /// #278：Git 源（clone 成功但 subdir 缺失）属 manifest/仓库问题，保持原错误句，不误加 catalog 指引。
+    #[tokio::test]
+    async fn locate_plugin_root_git_missing_subdir_keeps_generic_message_278() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "x").unwrap();
+        git(&["init", "-q"], &repo);
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("marketplace")).unwrap();
+        let entry = serde_json::json!({
+            "source": {"source": "git-subdir", "url": format!("file://{}", repo.display()), "path": "missing-sub"}
+        });
+        let err = locate_plugin_root(
+            "acme",
+            "audit",
+            entry.as_object().unwrap(),
+            &home.join("catalog"),
+            ".",
+            &home,
+            None,
+            true,
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .await
+        .expect_err("git-subdir 缺失应报错");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plugin root not found after source resolution"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("marketplace remove"),
+            "Git 源不得误加 catalog 恢复指引: {msg}"
+        );
     }
 
     #[tokio::test]

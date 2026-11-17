@@ -469,3 +469,15 @@ a2c> notify update
 - 确认 URL（协议/端口）可访问
 - 需要鉴权时，正确传 `--auth key:value` 或在 `socket connect` 后按系统流程处理
 - 必要时打开更详细日志（如果项目接入了 `tracing`/`RUST_LOG`，可用环境变量控制）
+
+### 10.4 重装报 `plugin root not found after source resolution`
+
+在 0.2.2–0.5.0（0.5.1 之前的全部版本）上卸载过「相对 source」插件时，marketplace catalog 内的插件
+子树可能已被旧版卸载删除，`marketplace refresh` 无法可靠自愈（`git pull` 通常保留本地删除）。先确认
+该插件路径在 **marketplace 上游仓库**确实存在（本地 clone 即被破坏 repo；上游 manifest 失真也会报
+同一错误），再按 [旧版本 → 0.5.1 升级迁移](./marketplace-0.5.1-migration.md) 恢复：
+
+1. `marketplace info <name>` + `plugin list --available` 记下源 URL、注册名、autoUpdate 与各插件的 scope/projectPath/version（`remove` 后 URL 查不到；含 token 的 URL 从自己的记录取；`plugin list` 默认隐藏 installed-disabled）。**真正受损的插件已被旧版卸载移除账本/安装意图，可能查不到——从其原安装命令/历史取，取不到按默认 user/当前版本恢复**
+2. `marketplace remove <name>`（默认级联卸载该 marketplace 下**所有**已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
+3. `marketplace add <git-url> --trust --name <name>`（重新 clone 并重新授予 trust；**必须用 `--name` 沿用原名**；原来开过 auto-update 的加 `--auto-update`）
+4. 逐一按原 scope `plugin install <plugin>@<name> --scope <scope>`——缺省 user；多 scope 每个 scope 各装一次；project/local 须在原项目目录执行（cwd 即 projectPath）；`--version` 仅恢复账本字段、不锁定内容。此前启用过的再 `plugin enable <plugin>@<name>`

@@ -1930,6 +1930,23 @@ mod tests {
         );
     }
 
+    /// 取 `git rev-parse HEAD`（#278 refresh 锚点：证明 pull 真执行）。
+    fn git_head(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git rev-parse HEAD: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// 构造源 git 仓库（marketplace.json + audit plugin：1 skill + 给定 bundled server 名集合），返回 git
     /// source。`servers` 空 = 无 server；文件名即挂载序（见 [`enumerate_bundled_server_files`](crate::skills::manifest)
     /// 的 `sort`）/ build a source repo with the given bundled server names。
@@ -2785,6 +2802,136 @@ mod tests {
         )
         .await
         .expect("refresh=true 重装应成功");
+    }
+
+    /// #278：0.5.1 之前版本卸载已删的 catalog 子树无法可靠自愈——重装失败错误必须携带恢复指引
+    /// （B 方案：不自动迁移，只给命令 + 文档）。install 在 materialize 阶段即失败（不会走到 staging
+    /// 的 git pull），`refresh` 标志只影响 staging，不改变本入口错误——这里验证两条入口都报同一提示。
+    #[tokio::test]
+    async fn install_missing_catalog_subtree_reports_recovery_hint_278() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, false).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 精确复现 0.5.0 破坏态：旧卸载同时删除账本/安装意图与共享 catalog 子树。
+        // 0.5.1 的 uninstall 已不再删共享子树（#271），故先 uninstall 再手删子树。
+        let removed = uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(removed, "首次卸载应实际移除账本记录");
+        let rel = home.join("marketplace/acme/plugins/audit");
+        assert!(
+            rel.exists(),
+            "#271 之后 uninstall 不得再删共享 catalog 子树"
+        );
+        fs::remove_dir_all(&rel).unwrap();
+
+        for refresh in [false, true] {
+            let err = install_plugin(
+                "audit@acme",
+                &mut reg,
+                &home,
+                InstallOptions {
+                    refresh,
+                    env: Some(&env),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("catalog 子树缺失时重装应失败");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("marketplace remove <name>"),
+                "refresh={refresh} 须给级联移除命令: {msg}"
+            );
+            assert!(
+                msg.contains("marketplace add <git-url> --trust --name <name>"),
+                "refresh={refresh} 须给带 --name 的重加命令: {msg}"
+            );
+            assert!(
+                msg.contains("plugin enable <plugin>@<name>"),
+                "refresh={refresh} 须提醒 re-enable（install 不激活）: {msg}"
+            );
+            assert!(
+                msg.contains(
+                    "https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
+                ),
+                "refresh={refresh} 须给出可打开的文档 URL: {msg}"
+            );
+        }
+    }
+
+    /// #278 文档论断锚点：`marketplace refresh`（stage refresh=true）**不恢复**被本地删除的
+    /// catalog 子树——`git pull --ff-only` 保留本地删除。为排除「refresh 根本没跑」的假绿，
+    /// 上游推进一个不触碰被删路径的 commit：断言 clone HEAD 前进到该 commit（证明 pull 执行），
+    /// 且被删子树仍缺失。（仅 pull 失败触发全量 re-clone 时才可能恢复，故文档写「无法可靠自愈」。）
+    /// 此用例直接驱动 staging 层，不依赖 install 的 materialize 失败路径。
+    #[tokio::test]
+    async fn refresh_true_pulls_upstream_but_keeps_deleted_catalog_subtree_278() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, source) = setup_installed_catalog(&tmp, false).await;
+        let catalog = home.join("marketplace/acme");
+        let rel = catalog.join("plugins/audit");
+        fs::remove_dir_all(&rel).unwrap();
+        let head_before = git_head(&catalog);
+
+        // 上游推进：新增与 plugins/audit 无关的文件并提交（pull 可成功且不触碰被删路径）。
+        let src_repo = tmp.path().join("repo");
+        fs::write(src_repo.join("UPSTREAM_CHANGELOG.md"), "advance\n").unwrap();
+        git(&["add", "-A"], &src_repo);
+        git(&["commit", "-qm", "upstream advance"], &src_repo);
+        let upstream_head = git_head(&src_repo);
+        assert_ne!(head_before, upstream_head, "夹具应制造上游新提交");
+
+        let mut reg = SkillRegistry::new();
+        let skills = stage_marketplace_skills(
+            "acme",
+            &source,
+            &mut reg,
+            &home,
+            MarketplaceStageOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            git_head(&catalog),
+            upstream_head,
+            "refresh 必须真实执行 git pull（clone HEAD 前进到上游），否则本用例为假绿"
+        );
+        assert!(
+            !rel.exists(),
+            "pull 成功后本地删除仍保留——refresh 不得恢复被删 catalog 子树（文档论断锚点）"
+        );
+        assert!(
+            !skills.iter().any(|s| s.starts_with("audit:")),
+            "缺失子树不应注册技能: {skills:?}"
+        );
     }
 
     /// 外部 Git clone：卸载仍删除 plugin 独占的 `.plugins/<mp>/<plugin>`，不碰共享 catalog。
