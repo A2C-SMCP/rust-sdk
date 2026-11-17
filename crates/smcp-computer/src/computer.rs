@@ -6847,6 +6847,41 @@ mod tests {
 
     // ── #94：Computer 级 marketplace / plugin 生命周期 API ───────────────────────
     #[tokio::test]
+    async fn computer_add_marketplace_opaque_scheme_error_does_not_echo_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        for raw in [
+            "ssh:alice:PW_LEAK@example.com",
+            "ssh:/alice:PW_LEAK@example.com",
+            "file:alice:PW_LEAK@example.com",
+        ] {
+            let err = computer
+                .add_marketplace(
+                    raw,
+                    AddMarketplaceParams {
+                        no_clone: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &err,
+                GovernanceError::InvalidUrl(source) if source == "<redacted-git-source>"
+            ));
+            let public_forms = format!("{err}\n{err:?}");
+            for secret in ["alice", "PW_LEAK", "example.com"] {
+                assert!(!public_forms.contains(secret), "{raw}: {public_forms}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn computer_marketplace_add_and_remove_no_clone() {
         use crate::settings::lifecycle::marketplace_name_taken;
         let tmp = tempfile::TempDir::new().unwrap();
