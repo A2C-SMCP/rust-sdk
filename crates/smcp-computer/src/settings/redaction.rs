@@ -389,6 +389,10 @@ mod tests {
             "file:alice:PW_LEAK@host",
             "file:/alice:PW_LEAK@host",
             "file:alice@host",
+            // file URL 的 has_authority() 恒 true、username() 恒空：raw 含 `@` 是唯一防线。
+            "file:////alice:PW_LEAK@host",
+            // 锁定 fail-closed 取舍：合法路径含 `@` 也占位（与 #273 known 守卫同口径）。
+            "file:///tmp/user@host/repo",
         ] {
             assert_eq!(git_url_for_display(source), REDACTED_GIT_SOURCE, "{source}");
         }
