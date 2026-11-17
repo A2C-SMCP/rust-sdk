@@ -50,10 +50,13 @@ git ls-tree -r <commit> -- plugins/xxx
    ```text
    marketplace info <name>
    plugin list --available
+   plugin info <plugin>@<name> --json
    ```
 
-   记录：**源 URL**、**注册名**、该 marketplace 下**已安装插件清单**（含每个插件的 **scope** 与是否
-   启用）、marketplace 的 **autoUpdate** 旗标。
+   记录：**源 URL**、**注册名**、该 marketplace 下**已安装插件清单**（含每个插件的 **scope**、
+   **projectPath**、**version** 与是否启用）、marketplace 的 **autoUpdate** 旗标。
+   `projectPath` / `version` / `commitSha` 只出现在 `plugin info --json` 的 `records[]` 里（文本模式
+   不打印 `projectPath`）；原安装用过 `--version` 锁定的，务必记下该值。
 
 1. 移除已被破坏的 marketplace（重新 clone 前必须做）：
 
@@ -75,11 +78,15 @@ git ls-tree -r <commit> -- plugins/xxx
 3. 逐一按**原 scope** 重装插件；此前启用过的再执行 enable：
 
    ```text
-   plugin install <plugin>@<name> --scope <scope>
+   plugin install <plugin>@<name> --scope <scope> [--version <version>]
    plugin enable <plugin>@<name>
    ```
 
-   未指定 `--scope` 时为 user；project/local scope 的插件必须显式给回原 scope。
+   - 未指定 `--scope` 时为 user。
+   - **多 scope 的插件要对每个 scope 各执行一次 `plugin install`**（一次只装一个 scope）。
+   - **project / local scope 必须以原项目目录为 cwd 执行**：CLI 把当前工作目录记为 `projectPath`，
+     不在原目录执行会装到错误路径。
+   - 原安装用 `--version` 锁定过的，按第 0 步记录的值回填 `--version`；否则会装到 marketplace 当前版本。
 
 ## 4. 验证
 
