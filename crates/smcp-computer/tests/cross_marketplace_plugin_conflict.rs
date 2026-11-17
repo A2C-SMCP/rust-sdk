@@ -25,7 +25,7 @@ use smcp_computer::settings::{
 
 #[path = "common/cli_binary.rs"]
 mod cli_binary;
-use cli_binary::{build_relative_source_repo, git};
+use cli_binary::build_relative_source_repo;
 
 fn xdg_env(td: &TempDir) -> EnvMap {
     std::iter::once((

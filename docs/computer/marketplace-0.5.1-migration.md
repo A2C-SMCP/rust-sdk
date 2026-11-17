@@ -45,14 +45,15 @@ git ls-tree -r <commit> -- plugins/xxx
 > **不要使用 `--keep-plugins`**——它只跳过级联卸载，仍会删除 clone 并撤销 trust，留下孤儿账本记录。
 
 0. 先记下恢复所需信息（`remove` 后 `marketplace info` 查不到 URL；展示值会脱敏凭据，含 token 的 URL
-   请从你自己的记录取）：
+   请从你自己的记录取。`plugin list` 默认只显示已启用插件，须加 `--available` 才含 installed-disabled）：
 
    ```text
    marketplace info <name>
-   plugin list
+   plugin list --available
    ```
 
-  记录：**源 URL**、**注册名**、该 marketplace 下**已安装插件清单**（以及各自是否启用）。
+   记录：**源 URL**、**注册名**、该 marketplace 下**已安装插件清单**（含每个插件的 **scope** 与是否
+   启用）、marketplace 的 **autoUpdate** 旗标。
 
 1. 移除已被破坏的 marketplace（重新 clone 前必须做）：
 
@@ -69,13 +70,16 @@ git ls-tree -r <commit> -- plugins/xxx
    - **必须带 `--name <name>` 沿用原注册名**：不指定时新名会从 URL 派生，与旧名不一致的
      `plugin install <plugin>@<name>` 会报 not added。
    - 非交互 / 脚本方式必须带 `--trust`；REPL 交互模式会弹 y/N 确认。
+   - 原来开启过 auto-update 的，加 `--auto-update`（或事后 `marketplace set <name> auto-update=true`）。
 
-3. 逐一重装插件；此前启用过的再执行 enable：
+3. 逐一按**原 scope** 重装插件；此前启用过的再执行 enable：
 
    ```text
-   plugin install <plugin>@<name>
+   plugin install <plugin>@<name> --scope <scope>
    plugin enable <plugin>@<name>
    ```
+
+   未指定 `--scope` 时为 user；project/local scope 的插件必须显式给回原 scope。
 
 ## 4. 验证
 
