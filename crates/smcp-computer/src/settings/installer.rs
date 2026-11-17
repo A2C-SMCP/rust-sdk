@@ -36,7 +36,8 @@
 //! ## 边界（文档化，非缺陷）/ Documented boundaries
 //! - 操作 **live session**：跨重启重挂 bundled server + `installed × enabled` 交集归 reconcile 接线层。
 //! - disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启靠 reconcile 重建。
-//!   uninstall 仅注销**活跃** SKILL；先 disable（orphan）再 uninstall 会残留内存孤儿条目，进程重启即清。
+//!   uninstall 自 #257 起连**孤儿**一并注销；#284 起**仅当该 pid 账本记录全部移除时**注销——指定 scope
+//!   卸载且其余 scope 记录仍在（retained）时 registry 完全不动（python#262 同口径）。
 //! - **非原子的 disable**：先写 settings 再摘 server / orphan skill；`remove_server` 抛错留半态——靠 reconcile 兜底。
 
 use std::collections::{HashMap, HashSet};
@@ -464,6 +465,9 @@ fn plugin_skill_names(registry: &SkillRegistry, marketplace: &str, plugin: &str)
 }
 
 /// 某 plugin 的 marketplace SKILL name（**含孤儿**，uninstall 清名用）/ All SKILL names incl. orphans。
+///
+/// **#284**：uninstall 仅在「该 pid 账本记录**全部移除**」时才以含孤儿枚举做注销；retained 记录仍在时
+/// registry 完全不动——新增拆除路径切勿照抄「必须清孤儿」而无此门控（python#262 同口径）。
 fn plugin_skill_names_all(
     registry: &SkillRegistry,
     marketplace: &str,
@@ -1244,7 +1248,8 @@ pub async fn install_plugin(
     Ok(record)
 }
 
-/// 卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills + 级联 stop+remove bundled server + 删账本记录）/ Uninstall。
+/// 卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills（**仅该 pid 账本记录全部移除时**）+ **按 retained
+/// 判据**回收 bundled server + 删账本记录）/ Uninstall。
 ///
 /// `scope=None` 删该 id 全部记录；指定 scope 仅删该 scope 记录。未安装 / 无匹配 → `false`（no-op）。
 ///
@@ -1256,6 +1261,14 @@ pub async fn install_plugin(
 /// 归 `marketplace remove` / reconcile / prune 清理。
 ///
 /// 协议 §4.9.1-3 的「停摘自足」指停摘名单在账本移除**之前**取得且仅依赖账本字段，与 installPath 树是否删除无关。
+///
+/// **#284 多 scope retained 语义**：文件（本单 §271）、server（§4.9.1-2）、skills 三者同源于 `retained`
+/// 记录集合，但粒度不同——文件看「retained 的 installPath 是否仍引用该 clone」、server 看「retained 声明的
+/// 依赖」、skills 看「是否还有 retained 记录」。故 retained 记录 installPath 缺失/损坏时文件侧会删 clone 而
+/// skills 仍保留，是**有意分叉**，勿把一侧改成另一侧。skills（含孤儿）与 source 冲突诊断仅在该 pid 账本记录
+/// **全部移除**时注销/清除；判据是「有无 retained 记录」而非「是否指定了 scope」（只装一个 scope 时指定该
+/// scope 卸载，记录即全部移除，照常注销）。server 回收把 retained 记录计入「仍有依赖者」，只有最后一份声明
+/// 该依赖的记录被移除时才回收。
 ///
 /// # Errors
 /// id 非法 / `remove_server` 失败 / 账本写失败 → [`PluginInstallError`]。
@@ -1358,16 +1371,32 @@ pub async fn uninstall_plugin(
 
     // #275：注销 active **与 orphan**（installed_disabled）条目——按 uninstall 指引换源后，名字须在本进程
     // 内立即释放，否则后续 install/enable 仍被 registry 守卫拒绝。
-    for name in plugin_skill_names_all(registry, &marketplace, &plugin) {
-        registry.unregister(&name);
+    //
+    // #284（mirror python#262 裁决 A）：拆除按「该 pid 账本记录是否全部移除」门控——指定 scope 卸载且其余
+    // scope 记录仍在（`retained` 非空）时 registry **完全不动**（active + orphan 原样、冲突诊断保留）。判据是
+    // 「有无 retained 记录」而**非**「是否指定了 scope」；否则同进程内技能消失、重启 boot 又按 retained 记录
+    // 重 stage——同一操作前后矛盾。全部记录移除时才连孤儿一并注销（#257 闭环）：disable → uninstall 的残留
+    // 孤儿会被跨 source 守卫当作「先到者」，令后续换源 install/enable 永久失败。
+    if retained.is_empty() {
+        for name in plugin_skill_names_all(registry, &marketplace, &plugin) {
+            registry.unregister(&name);
+        }
+        // 冲突诊断同理：plugin 仍在其他 scope 安装时，本 plugin × 本 source 的冲突仍成立。
+        clear_source_conflicts_for_plugin(registry, &plugin, &marketplace_source);
     }
-    clear_source_conflicts_for_plugin(registry, &plugin, &marketplace_source);
 
     if !options.keep_servers {
         if let Some(h) = hooks {
             // #139/§4.9.1-2 回收判据：无其他 plugin 依赖 ∧ 非用户声明。用户/宿主自有 server 永不连坐。
-            let other =
-                crate::settings::reconciler::other_plugin_mcp_deps(&installed.account, plugin_id);
+            // #284：同 pid 的 retained 记录（本次未移除的其他 scope）仍声明依赖 ⇒ 计入「仍有依赖者」，
+            // 只有最后一份声明该依赖的记录被移除时才回收。
+            let retained_records: Vec<InstalledPluginRecord> =
+                retained.iter().map(|r| (*r).clone()).collect();
+            let other = crate::settings::reconciler::other_plugin_mcp_deps_with_retained(
+                &installed.account,
+                plugin_id,
+                &retained_records,
+            );
             let mut reclaim = crate::settings::reconciler::reclaimable_mcp_deps(
                 &deps,
                 &other,
@@ -2520,6 +2549,244 @@ mod tests {
         assert!(hooks.removed.lock().unwrap().is_empty());
     }
 
+    // ---- #284：多 scope 卸载的 retained 语义（mirror python#262）--------------
+    /// 构造一条 marketplace 源 SKILL ref（`path` 须绝对）。
+    fn mk_skill_ref(name: &str, source: &str, path: &Path) -> smcp::A2CSkillRef {
+        smcp::A2CSkillRef {
+            name: name.to_string(),
+            source: source.to_string(),
+            uri: None,
+            path: path.to_string_lossy().into_owned(),
+            description: "d".to_string(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            tags: None,
+            version: None,
+            skill_metadata: None,
+        }
+    }
+
+    /// #284：预置**非空** registry（活跃 + 孤儿）与一条命中本 plugin × 本 source 的跨 source 冲突。
+    ///
+    /// 「保留」断言必须建立在非空 registry 上——空 registry 下 `unregister` 天然 no-op，回归会完全失明
+    /// （python#262 验收同款要求）。`register` 失败不抛、只返回 `false`，故必须断言返回值，否则 seed 静默
+    /// 失败时 `is_none` 型断言会假绿。
+    fn seed_registry_284(
+        reg: &mut SkillRegistry,
+        plugin: &str,
+        home: &Path,
+    ) -> SkillSourceConflict {
+        let source = format!("{SOURCE_MARKETPLACE}:acme");
+        assert!(
+            reg.register(mk_skill_ref(&format!("{plugin}:lint"), &source, home)),
+            "seed 失败：活跃技能未入册"
+        );
+        assert!(
+            reg.register(mk_skill_ref(&format!("{plugin}:old"), &source, home)),
+            "seed 失败：孤儿技能未入册"
+        );
+        assert!(
+            reg.mark_orphan(&format!("{plugin}:old")),
+            "seed 失败：孤儿标记未生效"
+        );
+        let conflict = SkillSourceConflict {
+            name: format!("{plugin}:clash"),
+            kept_source: "marketplace:other".to_string(),
+            rejected_source: source,
+        };
+        reg.record_source_conflicts([conflict.clone()]);
+        conflict
+    }
+
+    /// #284（mirror python#262 裁决 A）：指定 scope 卸载后 retained 记录仍声明依赖 → skills（active + 孤儿）
+    /// 与 source 冲突诊断原样保留、bundled server 不停摘；最后一份记录移除时才完整拆除。
+    #[tokio::test]
+    async fn uninstall_scoped_keeps_skills_servers_and_conflicts_284() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let hooks = RecordingHooks::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                scope: Some("project"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ledger_records(&home, &env, "audit@acme").len(), 2);
+        let conflict = seed_registry_284(&mut reg, "audit", &home);
+
+        // 只卸 project：retained（user）仍声明 audit-mcp → 技能与冲突原样、server 不回收。
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                scope: Some("project"),
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reg.resolve("audit:lint").is_some(),
+            "retained 记录仍在 → 活跃技能保留"
+        );
+        assert!(
+            reg.is_orphan("audit:old"),
+            "retained 记录仍在 → 孤儿原样保留（既不注销也不复活）"
+        );
+        assert!(
+            reg.source_conflicts().contains(&conflict),
+            "retained 记录仍在 → 本 plugin × 本 source 的冲突诊断不得清除"
+        );
+        assert!(
+            hooks.removed.lock().unwrap().is_empty(),
+            "retained 记录仍声明依赖 → server 按 retained 判据保留"
+        );
+        assert_eq!(ledger_records(&home, &env, "audit@acme").len(), 1);
+
+        // 卸最后一份记录：技能（含孤儿）完整注销、冲突清除、server 按 §4.9.1-2 回收。
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                scope: Some("user"),
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reg.all_refs()
+                .iter()
+                .all(|(r, _)| !r.name.starts_with("audit:")),
+            "全部 scope 移除 → active + 孤儿一并注销（#257 闭环）"
+        );
+        assert!(
+            reg.source_conflicts().is_empty(),
+            "全部 scope 移除 → 冲突诊断清除"
+        );
+        assert_eq!(
+            *hooks.removed.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "最后一个依赖者卸载 → server 回收"
+        );
+    }
+
+    /// #284：判据是「账本记录全部移除」而**非**「未指定 scope」——单 scope 账本指定该 scope 卸载也要清。
+    #[tokio::test]
+    async fn uninstall_specified_scope_last_record_clears_skills_284() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, false).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        seed_registry_284(&mut reg, "audit", &home);
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                scope: Some("user"),
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(reg.resolve("audit:lint").is_none());
+        assert!(!reg.is_orphan("audit:old"));
+        assert!(reg.source_conflicts().is_empty());
+    }
+
+    /// #284 回归锁（#257 闭环不因保留语义失效）：全量卸载（`scope=None`）连孤儿一并注销。
+    #[tokio::test]
+    async fn uninstall_full_clears_orphans_nonempty_registry_284() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, false).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        seed_registry_284(&mut reg, "audit", &home);
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reg.all_refs()
+                .iter()
+                .all(|(r, _)| !r.name.starts_with("audit:")),
+            "全量卸载 → 技能（含孤儿）完整注销"
+        );
+        assert!(reg.source_conflicts().is_empty());
+    }
+
     // ---- #271：相对源卸载保留共享 catalog / 多 scope / 可重装 -------------------
     /// 父子/同源目录：卸载 alpha 不得删除 beta（`./plugin/nested`）与 gamma（同 `./plugin`）依赖的文件。
     #[tokio::test]
@@ -2715,6 +2982,10 @@ mod tests {
                 .installed_plugins
                 .contains("audit@acme"),
             "仍有账本记录 → 安装意图保留"
+        );
+        assert!(
+            reg.is_orphan("audit:audit-skill"),
+            "#284：retained project 记录仍在 → 技能（installed_disabled 孤儿态）原样保留"
         );
     }
 
@@ -3169,6 +3440,10 @@ mod tests {
             Path::new(&project_path).exists(),
             "project 的 catalog 路径保留"
         );
+        assert!(
+            reg.is_orphan("audit:code-review"),
+            "#284：retained project 记录仍在 → 技能（孤儿态）保留（文件侧删 clone 与 skills 保留是有意分叉）"
+        );
 
         // 再卸尽：catalog 仍保留。
         uninstall_plugin(
@@ -3186,6 +3461,89 @@ mod tests {
         .unwrap();
         assert!(ledger_records(&home, &env, "audit@acme").is_empty());
         assert!(Path::new(&project_path).exists());
+        assert!(
+            !reg.contains("audit:code-review"),
+            "#284：全部 scope 移除 → 技能完整注销"
+        );
+    }
+
+    /// #284：retained 记录 installPath 缺失/畸形 → 文件侧按「不引用 ext clone」删除 clone，但 skills 判据只看
+    /// 记录存在性 ⇒ 保留。三者同源于 retained、粒度不同，是**有意分叉**（勿把一侧改成另一侧）。
+    #[tokio::test]
+    async fn uninstall_scoped_missing_retained_install_path_keeps_skills_284() {
+        let tmp = TempDir::new().unwrap();
+        let plugin_repo = tmp.path().join("plugin-repo");
+        let url = build_plugin_git_repo(&plugin_repo);
+        let repo = tmp.path().join("repo");
+        let source = build_marketplace_repo_with_entries(
+            &repo,
+            &[("audit", serde_json::json!({"source": "url", "url": url}))],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let ext_root = home.join("marketplace/.plugins/acme/audit");
+
+        let mut reg = SkillRegistry::new();
+        for opts in [
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            InstallOptions {
+                scope: Some("project"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+        ] {
+            install_plugin("audit@acme", &mut reg, &home, opts, None)
+                .await
+                .unwrap();
+        }
+        assert!(ext_root.exists());
+        assert!(reg.is_orphan("audit:code-review"));
+
+        // retained（project）记录的 installPath 置空（模拟缺失/畸形账本）。
+        update_installed_plugins(
+            |data: &mut InstalledPluginsFile| {
+                if let Some(recs) = data.account.plugins.get_mut("audit@acme") {
+                    for r in recs {
+                        if r.extra.get("scope").and_then(Value::as_str) == Some("project") {
+                            r.install_path = None;
+                        }
+                    }
+                }
+            },
+            Some(&home),
+            Some(&env),
+        )
+        .unwrap();
+
+        uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                scope: Some("user"),
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !ext_root.exists(),
+            "retained installPath 缺失 → 不算引用 ext clone，文件侧删除"
+        );
+        assert!(
+            reg.is_orphan("audit:code-review"),
+            "#284：skills 判据只看记录存在性 → 保留（有意分叉）"
+        );
+        assert_eq!(ledger_records(&home, &env, "audit@acme").len(), 1);
     }
 
     /// 真实 git-subdir 源：install → uninstall 删除整个独占 clone 根，共享 catalog 保留。

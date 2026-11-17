@@ -549,8 +549,26 @@ pub fn list_orphan_plugins(
 
 /// §4.9.1-2 回收判据「无其他 plugin 依赖 X」项：除 `exclude_pid` 外全部 plugin 声明依赖的并集 /
 /// union of every OTHER plugin's declared MCP deps。纯函数、只读账本自身字段（停摘自足）。
+///
+/// **不含同 pid 的 retained 记录**：`gc` 等整 pid 语义用本入口；`uninstall` 不论 scope 均走
+/// [`other_plugin_mcp_deps_with_retained`]（全 scope 移除时传空 slice）；`disable` 不删记录、按整 plugin
+/// 下线语义传空（#284）。
 #[must_use]
 pub fn other_plugin_mcp_deps(installed: &InstalledPlugins, exclude_pid: &str) -> HashSet<BundleId> {
+    other_plugin_mcp_deps_with_retained(installed, exclude_pid, &[])
+}
+
+/// 同 [`other_plugin_mcp_deps`]，但并入 `exclude_pid` 本次**未被移除**的 `retained_records`（#284，与
+/// python#262 同口径）/ Same as above plus this pid's retained (not removed) records。
+///
+/// 回收判据：X 回收 ⟺ **无任何剩余记录**（其他 plugin 的全部记录 + 同 pid retained 记录）声明依赖 X ∧ X 非
+/// 用户声明。指定 scope 卸载只删一个 scope 时，retained 记录仍声明依赖 ⇒ X MUST 保留；整 pid 移除传空 slice。
+#[must_use]
+pub fn other_plugin_mcp_deps_with_retained(
+    installed: &InstalledPlugins,
+    exclude_pid: &str,
+    retained_records: &[InstalledPluginRecord],
+) -> HashSet<BundleId> {
     let mut out: HashSet<BundleId> = HashSet::new();
     for (pid, records) in &installed.plugins {
         if pid == exclude_pid {
@@ -559,6 +577,9 @@ pub fn other_plugin_mcp_deps(installed: &InstalledPlugins, exclude_pid: &str) ->
         for rec in records {
             out.extend(rec.mcp_servers.iter().cloned());
         }
+    }
+    for rec in retained_records {
+        out.extend(rec.mcp_servers.iter().cloned());
     }
     out
 }
@@ -570,7 +591,7 @@ pub fn other_plugin_mcp_deps(installed: &InstalledPlugins, exclude_pid: &str) ->
 /// 原措辞把时点快照写进长期判据、是泄漏来源。
 ///
 /// - `deps`：本次 disable/uninstall/gc 的 plugin 所声明的依赖（`ledger_mcp_deps_of` 产出）。
-/// - `other_deps`：[`other_plugin_mcp_deps`] 产出。
+/// - `other_deps`：[`other_plugin_mcp_deps`] / [`other_plugin_mcp_deps_with_retained`] 产出。
 /// - `non_plugin_declared`：**带 `origin` 的运行期权威配置集中 `origin != plugin` 的 bundle_id 集**
 ///   （durable scopes + flag `--mcp-config` + embed 构造入参）——Discussion #32 裁决。**MUST 传全集**：
 ///   退回只读 mcp.json 声明面会让经 flag/embed 挂载的用户/宿主 server 被误判「非用户声明」而**连坐**停摘
@@ -779,6 +800,52 @@ mod recycle_criterion_tests_139 {
         assert!(
             other_plugin_mcp_deps(&installed, "a@mp").is_empty(),
             "排除自身 ⇒ 独占依赖可回收"
+        );
+    }
+
+    /// **#284（mirror python#262）**：scoped uninstall 的同 pid retained 记录仍声明依赖 ⇒ 计入「仍有依赖者」，
+    /// X 不可回收；retained 未声明 X ⇒ 照常回收（判据仍是「无任何剩余记录声明 ∧ 非用户声明」）。
+    #[test]
+    fn retained_records_are_dependents_284() {
+        let x = bid("x");
+        let mut installed = InstalledPlugins::default();
+        installed
+            .plugins
+            .insert("a@mp".into(), vec![rec_with(&["x"])]);
+
+        // retained（同 pid 另一 scope）仍声明 x → 不可回收。
+        let retained = vec![rec_with(&["x"])];
+        let other = other_plugin_mcp_deps_with_retained(&installed, "a@mp", &retained);
+        assert!(other.contains(&x), "retained 记录仍声明依赖 ⇒ 计入依赖者");
+        assert!(
+            reclaimable_mcp_deps(std::slice::from_ref(&x), &other, &HashSet::new()).is_empty(),
+            "retained 仍依赖 ⇒ X MUST 保留"
+        );
+
+        // retained 未声明 x → 无人再依赖，照常回收。
+        let retained_without = vec![rec_with(&[])];
+        let other = other_plugin_mcp_deps_with_retained(&installed, "a@mp", &retained_without);
+        assert_eq!(
+            reclaimable_mcp_deps(std::slice::from_ref(&x), &other, &HashSet::new()),
+            vec![x],
+            "无任何剩余记录声明 ⇒ X MUST 回收（无泄漏）"
+        );
+    }
+
+    /// 2 参 `other_plugin_mcp_deps` 等价于 retained 空 slice——整 pid 移除的既有语义不变（#284 additive）。
+    #[test]
+    fn two_arg_helper_equals_empty_retained_284() {
+        let mut installed = InstalledPlugins::default();
+        installed
+            .plugins
+            .insert("a@mp".into(), vec![rec_with(&["x"])]);
+        installed
+            .plugins
+            .insert("b@mp".into(), vec![rec_with(&["y"])]);
+        assert_eq!(
+            other_plugin_mcp_deps(&installed, "a@mp"),
+            other_plugin_mcp_deps_with_retained(&installed, "a@mp", &[]),
+            "2 参入口 MUST 委托空 retained"
         );
     }
 }

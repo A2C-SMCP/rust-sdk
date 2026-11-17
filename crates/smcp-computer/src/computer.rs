@@ -1773,8 +1773,8 @@ impl<S: Session> Computer<S> {
         }
     }
 
-    /// 卸载单个 plugin（删 plugin 独占外部 clone，共享 catalog 不删 + 注销 skills + 级联停摘 bundled server +
-    /// 删账本）/ uninstall。
+    /// 卸载单个 plugin（删 plugin 独占外部 clone，共享 catalog 不删 + 注销 skills（**仅该 pid 账本记录全部
+    /// 移除时**）+ 按 retained 判据停摘 bundled server + 删账本）/ uninstall。
     ///
     /// 未安装 / 无匹配 scope → `Ok(false)`（no-op）。
     ///
