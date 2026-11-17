@@ -6858,6 +6858,8 @@ mod tests {
         for raw in [
             "ssh:alice:PW_LEAK@example.com",
             "ssh:/alice:PW_LEAK@example.com",
+            "ssh:///alice:PW_LEAK@example.com",
+            "git:///alice:PW_LEAK@example.com",
             "file:alice:PW_LEAK@example.com",
         ] {
             let err = computer
@@ -6878,6 +6880,66 @@ mod tests {
             for secret in ["alice", "PW_LEAK", "example.com"] {
                 assert!(!public_forms.contains(secret), "{raw}: {public_forms}");
             }
+            // 拒绝发生在账本写入之前。
+            let known = crate::settings::store::load_known_marketplaces(
+                Some(computer.skill_home().as_path()),
+                None,
+            )
+            .account;
+            assert!(
+                known.marketplaces.is_empty(),
+                "{raw}: {:?}",
+                known.marketplaces
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_add_marketplace_credential_path_name_rejected_without_ledger_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        for raw in [
+            "file:///alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK",
+            "git@host:alice%3APW_LEAK%40example.com",
+            "file:///alice:PW_LEAK",
+            "file:///alice%3APW_LEAK%40example.com",
+        ] {
+            // 合法 URL / scp-like，但派生段含 userinfo 形态 → 拒绝派生名。
+            let err = computer
+                .add_marketplace(
+                    raw,
+                    AddMarketplaceParams {
+                        no_clone: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, GovernanceError::InvalidName(name) if name.is_empty()),
+                "{raw}: {err:?}"
+            );
+            let public_forms = format!("{err}\n{err:?}");
+            for secret in ["alice", "PW_LEAK", "alice-pw-leak", "pw-leak"] {
+                assert!(!public_forms.contains(secret), "{raw}: {public_forms}");
+            }
+            let known = crate::settings::store::load_known_marketplaces(
+                Some(computer.skill_home().as_path()),
+                None,
+            )
+            .account;
+            assert!(
+                known.marketplaces.is_empty(),
+                "{raw}: {:?}",
+                known.marketplaces
+            );
         }
     }
 

@@ -31,6 +31,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use smcp::utils::path_norm::{native_platform, normalize_path, PathPlatform};
 
@@ -207,11 +208,20 @@ pub fn is_valid_enabled_plugin_key(key: &str) -> bool {
 }
 
 /// git url 形态是否合规（scp-like 或 ssh/git/http(s)/file scheme）/ Whether a git url is well-formed.
+///
+/// #285：ssh/git/http(s) 必须带**非空 host**（拒绝 `ssh:///…`、`ssh:/…`）；`file:///abs` 例外
+/// 保持合法。该收紧是公开行为变更：hostless URL 不再被接受为 Git 源（防凭据被派生进名称）。
 pub fn is_valid_git_url(url: &str) -> bool {
     if url.trim().is_empty() {
         return false;
     }
-    GIT_URL_SCHEME_RE.is_match(url) || GIT_SCP_LIKE_RE.is_match(url)
+    if GIT_URL_SCHEME_RE.is_match(url) {
+        let Ok(parsed) = Url::parse(url) else {
+            return false;
+        };
+        return parsed.scheme() == "file" || parsed.host_str().is_some();
+    }
+    GIT_SCP_LIKE_RE.is_match(url)
 }
 
 /// 绝对路径判定：POSIX `/...` 或 Windows 盘符 `X:\` / `X:/` / Absolute path (POSIX or Windows drive).
@@ -754,7 +764,24 @@ mod tests {
             ("http://example.com/x.git", true),
             ("ssh://git@host:22/team/skills.git", true),
             ("git://host/path", true),
+            ("ssh://host/repo.git", true),
             ("file:///abs/path/repo", true),
+            ("file://host/path", true),
+            // #285：hostless（空 authority）不是合法 Git 源；file:///abs 例外保持合法。
+            ("ssh:///alice:PW_LEAK@example.com", false),
+            ("ssh:/alice:PW_LEAK@example.com", false),
+            ("git:///alice:PW_LEAK@example.com", false),
+            ("ssh://", false),
+            // Url::parse 失败分支：empty host / 非法端口。
+            ("ssh://user:pw@/repo", false),
+            ("ssh://host:notaport/repo", false),
+            // IPv6 host 与特殊 scheme 归一形态。
+            ("ssh://[::1]/repo.git", true),
+            ("ssh://[::1]:22/repo.git", true),
+            ("https:///hostless", true), // WHATWG 归一为 host=hostless
+            ("ssh://host:", true),       // WHATWG 归一为 ssh://host
+            ("http:///", false),         // Url::parse 失败（empty host）
+            ("file:/abs/repo", false),   // 缺 `://`
             ("not a url", false),
             ("ftp://host/x", false),
             ("", false),
@@ -1153,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_extra_marketplaces_bad_entry_filtered() {
-        let cases: [(&str, Value, &str); 5] = [
+        let cases: [(&str, Value, &str); 6] = [
             (
                 "Bad_Name",
                 json!({"source": {"type": "git", "url": "git@h:p"}}),
@@ -1167,6 +1194,11 @@ mod tests {
             (
                 "ok-mp",
                 json!({"source": {"type": "git", "url": "garbage"}}),
+                "extraKnownMarketplaces.ok-mp.source.url",
+            ),
+            (
+                "ok-mp",
+                json!({"source": {"type": "git", "url": "ssh:///alice:PW_LEAK@example.com"}}),
                 "extraKnownMarketplaces.ok-mp.source.url",
             ),
             (

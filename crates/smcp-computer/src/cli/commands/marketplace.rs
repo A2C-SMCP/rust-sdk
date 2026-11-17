@@ -692,6 +692,17 @@ mod tests {
     }
 
     #[test]
+    fn identity_error_for_hostless_url_contains_no_slug_or_credentials() {
+        let error =
+            resolve_marketplace_identity("ssh:///alice:PW_LEAK@example.com", None).unwrap_err();
+        let message = identity_error_message(&error);
+        assert!(message.contains("<redacted-git-source>"), "{message}");
+        for secret in ["alice", "PW_LEAK", "alice-pw-leak-example-com", "ssh:///"] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+
+    #[test]
     fn identity_error_cli_message_redacts_url_embedded_in_explicit_name() {
         let error = resolve_marketplace_identity(
             "acme/skills",
@@ -885,6 +896,45 @@ mod tests {
         assert!(load_mps(home, Some(&env)).marketplaces.is_empty());
         // 也未记录 trust。
         assert!(load_trusted(Some(&env)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_unsafe_source_rejected_without_trust_or_ledger_writes() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let env = test_env(home);
+        let mut registry = SkillRegistry::new();
+        for raw in [
+            // hostless scheme
+            "ssh:///alice:PW_LEAK@example.com",
+            "ssh:/alice:PW_LEAK@example.com",
+            "git:///alice:PW_LEAK@example.com",
+            // 合法 URL / scp-like，但派生段含 userinfo 形态（含无 `@` 尾部与 percent-encoded）
+            "file:///alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK",
+            "git@host:alice%3APW_LEAK%40example.com",
+            "file:///alice:PW_LEAK",
+            "file:///alice%3APW_LEAK%40example.com",
+        ] {
+            // --trust 不得绕过身份校验：hostless 必须在信任门与账本写入之前拒绝。
+            let code = marketplace_add(
+                &mut registry,
+                home,
+                Some(&env),
+                raw,
+                MarketplaceAddOptions {
+                    trust: true,
+                    no_clone: true,
+                    json_output: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(code, EXIT_USER_ERROR, "{raw}");
+            assert!(load_mps(home, Some(&env)).marketplaces.is_empty(), "{raw}");
+            assert!(load_trusted(Some(&env)).is_empty(), "{raw}");
+        }
     }
 
     #[tokio::test]

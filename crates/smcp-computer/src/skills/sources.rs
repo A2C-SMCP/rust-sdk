@@ -108,10 +108,11 @@ fn value_display(value: &Value) -> String {
 
 /// `owner/repo` 两段简写糖判定 / Whether `s` is an `owner/repo` shorthand。
 ///
-/// 等价正则 `^[^\s/]+/[^\s/]+$` 且非完整 URL（无 `://`）/ 非 scp-like（无 `@`）：恰两段，段内非空、
-/// 无空白。手写校验以与协议 crate `skill_name` 同范式（不引入额外正则全局态）。
+/// 等价正则 `^[^\s/]+/[^\s/]+$` 且非完整 URL（无 `://`）/ 非 scp-like（无 `@`）/ 无 `:`：恰两段，
+/// 段内非空、无空白。手写校验以与协议 crate `skill_name` 同范式（不引入额外正则全局态）。
+/// #285：`:` 兜住 `ssh:/foo` 这类 hostless scheme 残形，避免被误展开为 GitHub 简写。
 fn is_repo_shorthand(s: &str) -> bool {
-    if s.contains("://") || s.contains('@') {
+    if s.contains("://") || s.contains('@') || s.contains(':') {
         return false;
     }
     let mut parts = s.split('/');
@@ -565,6 +566,8 @@ mod tests {
         assert!(normalize_repo_shorthand("git@github.com:owner/repo", GITHUB_HOST).is_err());
         assert!(normalize_repo_shorthand("https://github.com/owner/repo", GITHUB_HOST).is_err());
         assert!(normalize_repo_shorthand("owner-only", GITHUB_HOST).is_err());
+        // #285：hostless scheme 残形不得被简写糖展开。
+        assert!(normalize_repo_shorthand("ssh:/foo", GITHUB_HOST).is_err());
     }
 
     // ---- marketplace_clone_url ----
