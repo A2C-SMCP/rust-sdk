@@ -194,7 +194,7 @@ pub fn entry_is_strict(entry: &Map<String, Value>) -> bool {
 
 /// marketplace entry 是否声明某组件字段（marketplace-v1：entry 字段即声明；空/缺/falsy 不算）/
 /// Whether a marketplace entry declares a component field。
-pub fn entry_declares_component(entry: &Map<String, Value>, field: &str) -> bool {
+pub(crate) fn entry_declares_component(entry: &Map<String, Value>, field: &str) -> bool {
     entry.get(field).is_some_and(json_truthy)
 }
 

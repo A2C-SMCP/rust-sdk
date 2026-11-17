@@ -590,8 +590,9 @@ struct EnablePreflight {
     expect_skills: bool,
     /// 可用安装根（诊断用）
     usable_roots: Vec<PathBuf>,
-    /// 跨记录 bundle_id 去重（多 scope 指向同一根不算身份坍缩）
-    seen: HashSet<BundleId>,
+    /// 跨记录 bundle_id 去重：仅**同根 + 同配置**（多 scope 指向同一根）允许合并；异根/异配置仍按
+    /// 身份坍缩硬错（保留 base 语义）。
+    seen: HashMap<BundleId, (PathBuf, MCPServerConfig)>,
 }
 
 /// enable 前置内容检查（纯读、零写盘）：**∀ 记录**安装根存在 ∧ 声明内容可投影。
@@ -627,7 +628,7 @@ fn preflight_enable_content(
             .filter(|s| !s.is_empty())
             .map(Path::new)
         else {
-            reasons.push("record has no installPath".to_string());
+            reasons.push("install_path_missing: record has no installPath".to_string());
             continue;
         };
         if !root.is_dir() {
@@ -641,17 +642,22 @@ fn preflight_enable_content(
         let actual: HashSet<BundleId> = loaded.iter().map(resolve_bundle_id).collect();
         let plugin_manifest = read_plugin_metadata(root);
         let strict = entry.as_ref().is_none_or(entry_is_strict);
+        // #274 复审 🟡6：strict=false + plugin.json 声明组件 = 畸形（§4.4），预检与 staging 同口径硬错，
+        // 不得把它误判成「真空白插件」。
+        if let Some(entry_map) = entry.as_ref() {
+            check_strict_conflict(entry_map, &plugin_manifest)?;
+        }
         let declared_components = manifest_declared_components(&plugin_manifest);
         // strict=false → entry 为权威组件集，plugin.json 的组件声明不参与（§4.4）。
         let declared_skills = entry
             .as_ref()
             .is_some_and(|e| entry_declares_component(e, "skills"))
             || (strict && declared_components.contains(&"skills"));
-        let declared_servers = !rec.mcp_servers.is_empty()
-            || entry
-                .as_ref()
-                .is_some_and(|e| entry_declares_component(e, "mcpServers"))
-            || (strict && declared_components.contains(&"mcpServers"));
+        // server 声明只有两条真实来源：账本记录 `mcpServers` 与（strict）plugin.json 的 `mcpServers`
+        // 组件；entry 级 `mcpServers` 无加载路径（bundled server 仅从 `<root>/mcp-servers/*.json` 读），
+        // 不计为声明。
+        let declared_servers =
+            !rec.mcp_servers.is_empty() || (strict && declared_components.contains(&"mcpServers"));
         if let Some(missing) = rec.mcp_servers.iter().find(|b| !actual.contains(*b)) {
             reasons.push(format!(
                 "declared_server_missing: recorded bundled server {:?} not projectable under {}",
@@ -682,8 +688,24 @@ fn preflight_enable_content(
         conflict_check(&loaded, existing, plugin_id)?;
         for cfg in loaded {
             let bid = resolve_bundle_id(&cfg);
-            if preflight.seen.insert(bid) {
-                preflight.servers.push(cfg);
+            match preflight.seen.get(&bid) {
+                None => {
+                    preflight
+                        .seen
+                        .insert(bid, (root.to_path_buf(), cfg.clone()));
+                    preflight.servers.push(cfg);
+                }
+                Some((seen_root, seen_cfg)) if seen_root.as_path() == root && seen_cfg == &cfg => {
+                    // 多 scope 指向同一根 + 同一配置：同一 server 的重复加载 → 去重（非身份坍缩）。
+                }
+                Some(_) => {
+                    return Err(McpServerNameConflictError(format!(
+                        "bundled server {:?} appears in multiple install records with different \
+                         install root or config (identity collapse across records)",
+                        bid.as_str()
+                    ))
+                    .into());
+                }
             }
         }
         preflight.expect_skills |= has_skills;
@@ -735,16 +757,76 @@ fn rollback_preflight_enable(
     }
 }
 
-/// 已写 `enabledPlugins=true` 后的失败：确定性回写 false（与 hook 回滚契约一致）。
-fn rollback_enabled_write(
+/// 已写 `enabledPlugins=true` 后的失败：恢复**调用前原值**（absent → 删键；true/false 原样回写），
+/// 不得把原 absent 升级成显式 false（会反向覆盖其他 scope 的 true，§2.4 / #274 复审 🟡2）。
+fn restore_enabled_plugin(
     plugin_id: &str,
     scope: &str,
     project_path: Option<&str>,
     env: Option<&EnvMap>,
+    prior: Option<bool>,
 ) {
-    if let Err(e) = write_enabled_plugin(plugin_id, false, scope, project_path, env) {
-        tracing::warn!(plugin = plugin_id, error = %e, "enable rollback: re-disable write failed (ledger may 残留 enabled=true)");
+    let res = match prior {
+        Some(v) => write_enabled_plugin(plugin_id, v, scope, project_path, env).map(|_| ()),
+        None => clear_enabled_plugin(plugin_id, scope, project_path, env),
+    };
+    if let Err(e) = res {
+        tracing::warn!(plugin = plugin_id, error = %e, "enable rollback: restore enabledPlugins failed (ledger may 残留 true)");
     }
+}
+
+/// 该 pid 是否在任一（账本记录涉及的）scope 仍有效启用：按 `user < project < local` 优先级合并各 scope
+/// 的 raw `enabledPlugins`（显式值覆盖下层；缺省不覆盖）。policy/managed 只读层不参与——SDK 不写它们。
+fn plugin_enabled_in_any_scope(
+    plugin_id: &str,
+    records: &[InstalledPluginRecord],
+    env: Option<&EnvMap>,
+) -> bool {
+    let mut effective: Option<bool> = None;
+    for scope in ["user", "project", "local"] {
+        if scope == "user" {
+            if let Some(v) = enabled_plugin_raw_value(plugin_id, scope, None, env) {
+                effective = Some(v);
+            }
+            continue;
+        }
+        let project_path = records.iter().find_map(|r| {
+            let rec_scope = r
+                .extra
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            (rec_scope == scope)
+                .then(|| r.extra.get("projectPath").and_then(Value::as_str))
+                .flatten()
+        });
+        let Some(pp) = project_path else { continue };
+        if let Some(v) = enabled_plugin_raw_value(plugin_id, scope, Some(pp), env) {
+            effective = Some(v);
+        }
+    }
+    effective == Some(true)
+}
+
+/// enable 失败后回滚 SKILL 投影：仅当该 pid 在**任何 scope 都不再启用**时才 orphan 全部活跃 SKILL；
+/// 仍有 scope 为 true 时保持原状（不得制造「enabled=true 零投影」，也不得反向打掉其他 scope 的投影；
+/// #274 复审 🔴1）。
+fn rollback_plugin_skills_on_failure(
+    registry: &mut SkillRegistry,
+    marketplace: &str,
+    plugin: &str,
+    plugin_id: &str,
+    records: &[InstalledPluginRecord],
+    env: Option<&EnvMap>,
+) {
+    if plugin_enabled_in_any_scope(plugin_id, records, env) {
+        tracing::info!(
+            plugin = plugin_id,
+            "enable rollback: another scope keeps plugin enabled; SKILL projection kept"
+        );
+        return;
+    }
+    orphan_plugin_skills(registry, marketplace, plugin);
 }
 
 /// 该 plugin 物化记录里全部声明依赖 **bundle_id**（跨 scope 记录并集）/ All declared dependency bundle_ids。
@@ -1422,9 +1504,7 @@ pub async fn disable_plugin(
             h.remove_server(id).await?;
         }
     }
-    for name in plugin_skill_names(registry, &marketplace, &plugin) {
-        registry.mark_orphan(&name);
-    }
+    orphan_plugin_skills(registry, &marketplace, &plugin);
     tracing::info!(
         plugin = plugin_id,
         scope,
@@ -1444,6 +1524,11 @@ pub async fn disable_plugin(
 ///
 /// **不做自动恢复**：内容缺失不触发 re-materialize / re-clone；补救方式是重新安装（与 Python 异常语义对齐）。
 ///
+/// **失败回滚（#274）**：恢复目标 scope 的 `enabledPlugins` **调用前原值**（absent → 删键，不升级成显式
+/// false）；仅当该 pid **在任何 scope 都不再启用**时才 orphan 本 plugin 的活跃 SKILL（其他 scope 仍 true 时
+/// 保留其投影）。⚠️ 已知边界：失败回滚**不摘除**此前已挂的 bundled server（enable 缺 `non_plugin_bundle_ids`
+/// 判据，盲摘会连坐用户/宿主 server）——运行期清理由 reconcile 兜底，跟进见 #286。
+///
 /// ⚠️ **scope 契约**：同 [`disable_plugin`]。
 ///
 /// # Returns
@@ -1451,7 +1536,8 @@ pub async fn disable_plugin(
 ///
 /// # Errors
 /// id 非法 / 未安装 / 内容不可投影（[`PluginInstallError::ContentUnavailable`]）/ manifest 畸形 / 冲突 /
-/// settings 写失败 / 注入失败 → [`PluginInstallError`]。任何失败均回滚到 `installed_disabled`。
+/// settings 写失败 / 注入失败 → [`PluginInstallError`]。任何失败均回滚 `enabledPlugins` 与 SKILL 投影到
+/// 调用前状态。
 pub async fn enable_plugin(
     plugin_id: &str,
     registry: &mut SkillRegistry,
@@ -1487,8 +1573,15 @@ pub async fn enable_plugin(
         {
             Ok(p) => p,
             Err(e) => {
-                orphan_plugin_skills(registry, &marketplace, &plugin);
                 rollback_preflight_enable(plugin_id, scope, options.project_path, env);
+                rollback_plugin_skills_on_failure(
+                    registry,
+                    &marketplace,
+                    &plugin,
+                    plugin_id,
+                    &records,
+                    env,
+                );
                 return Err(e);
             }
         };
@@ -1498,6 +1591,10 @@ pub async fn enable_plugin(
         usable_roots,
         ..
     } = preflight;
+
+    // 回滚基线：本 scope `enabledPlugins` **调用前原值**（absent / true / false），失败时精确还原
+    // （#274 复审 🟡2：原 absent 不得被升级成显式 false）。
+    let prior_enabled = enabled_plugin_raw_value(plugin_id, scope, options.project_path, env);
 
     // ② 写 enabledPlugins[id]=true（预检 + 冲突通过后）。`changed`＝真的从非-true→true（#115 R1）；
     //    幂等 re-enable（已 true）→ false。skill 复活 / server 重挂幂等、仍无条件跑（半态修复），仅
@@ -1509,8 +1606,15 @@ pub async fn enable_plugin(
     let (source, _commit_sha) = match resolve_marketplace_source(&marketplace, home, env) {
         Ok(v) => v,
         Err(e) => {
-            orphan_plugin_skills(registry, &marketplace, &plugin);
-            rollback_enabled_write(plugin_id, scope, options.project_path, env);
+            restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
+            rollback_plugin_skills_on_failure(
+                registry,
+                &marketplace,
+                &plugin,
+                plugin_id,
+                &records,
+                env,
+            );
             return Err(e);
         }
     };
@@ -1539,15 +1643,18 @@ pub async fn enable_plugin(
     let source_conflicts = take_own_source_conflicts(registry, &want_source, &skill_prefix);
     if !source_conflicts.is_empty() {
         *registry = snapshot;
-        // 回滚落定为**确定性禁用**（显式 false；原 absent 也写 false），与 #94 server-remount 回滚先例
-        // 一致；`changed == false`（原已 true）不改写，避免把幂等 re-enable 的失败升级成迁移。
+        // 恢复调用前原值（#274 复审 🟡2）；`changed == false`（原已 true）不改写。
         if changed {
-            if let Err(we) =
-                write_enabled_plugin(plugin_id, false, scope, options.project_path, env)
-            {
-                tracing::warn!(plugin = plugin_id, error = %we, "enable rollback: re-disable write failed after skill-source conflict (ledger may残留 enabled=true)");
-            }
+            restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
         }
+        rollback_plugin_skills_on_failure(
+            registry,
+            &marketplace,
+            &plugin,
+            plugin_id,
+            &records,
+            env,
+        );
         return Err(PluginNameConflictError {
             requested_pid: plugin_id.to_string(),
             plugin: plugin.clone(),
@@ -1558,8 +1665,17 @@ pub async fn enable_plugin(
         .into());
     }
     if expect_skills && staged.is_empty() {
-        orphan_plugin_skills(registry, &marketplace, &plugin);
-        rollback_enabled_write(plugin_id, scope, options.project_path, env);
+        // 恢复 staging 前的 registry 快照（#274 复审 🟡4），再按「是否仍有 scope 启用」决定 SKILL 投影。
+        *registry = snapshot;
+        restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
+        rollback_plugin_skills_on_failure(
+            registry,
+            &marketplace,
+            &plugin,
+            plugin_id,
+            &records,
+            env,
+        );
         return Err(PluginInstallError::ContentUnavailable {
             plugin_id: plugin_id.to_string(),
             detail: format!(
@@ -1570,8 +1686,8 @@ pub async fn enable_plugin(
 
     // ④ 重挂 servers——**原子回滚**（#94 点 4 / §10.6 回滚契约）：与 install 把账本写在最后不同，enable 先写
     //    `enabledPlugins=true`（步骤 ②）再挂 server，故 `register_server` 失败会留"标记已启用但 server 未挂"的
-    //    半态——Sub-B 的 boot 恢复会据此复活半装 plugin。失败 → 摘除本次已挂 server + 重新 orphan 本 plugin
-    //    skills + 回写 `enabledPlugins=false`（确定性禁用末态，优于精确还原前值：无论前值如何，失败即落定禁用）。
+    //    半态——Sub-B 的 boot 恢复会据此复活半装 plugin。失败 → 摘除本次已挂 server + 恢复调用前
+    //    `enabledPlugins` 原值 +（无任何 scope 仍启用时）orphan 本 plugin skills。
     if let Some(h) = hooks {
         // #139：回滚按 **bundle_id** 寻址——挂前取身份（cfg 随后 move 入 register_server）。同 plugin 内两个
         // 同名、显式异 bundle_id 的 server，回滚时精确摘本次已挂那条，不再字典序最小误摘（消解回滚破原子性）。
@@ -1587,12 +1703,19 @@ pub async fn enable_plugin(
                         tracing::warn!(bundle_id = %done.as_str(), error = %re, "enable rollback: remove_server failed");
                     }
                 }
-                orphan_plugin_skills(registry, &marketplace, &plugin);
-                // ⚠️ 已知窄边界：若**这一步**回写也失败（settings I/O 在回滚中途再挂），账本停在步骤 ② 的
-                //    `enabledPlugins=true`，server 已摘 + skills 已 orphan，末态即降级前要消灭的半启用态。属
-                //    "降级之上的再降级"，不再有更可靠的兜底——Sub-B 的 boot reconcile 须容此残窗（勿假设回滚后账本
-                //    必为 false）。原 hook 错（`e`）优先上抛；回写错仅 WARN（避免淹没根因）。
-                rollback_enabled_write(plugin_id, scope, options.project_path, env);
+                // ⚠️ 已知窄边界：若**这一步**回写也失败（settings I/O 在回滚中途再挂），账本可能停在步骤 ② 的
+                //    `enabledPlugins=true`，server 已摘 + skills 视其他 scope 而定，末态即降级前要消灭的半启用态。
+                //    属"降级之上的再降级"，不再有更可靠的兜底——Sub-B 的 boot reconcile 须容此残窗（勿假设回滚后
+                //    账本必为原值）。原 hook 错（`e`）优先上抛；回写错仅 WARN（避免淹没根因）。
+                restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
+                rollback_plugin_skills_on_failure(
+                    registry,
+                    &marketplace,
+                    &plugin,
+                    plugin_id,
+                    &records,
+                    env,
+                );
                 return Err(e.into());
             }
             remounted.push(bid);
@@ -3682,6 +3805,332 @@ mod tests {
         assert_eq!(enabled_flag(&env, "empty@acme"), Some(true));
     }
 
+    /// 🔴1：另一 scope 仍启用时，本 scope 失败回滚 MUST NOT orphan 其 SKILL 投影
+    /// （否则「合并 enabled=true + 零 SKILL」）。
+    #[tokio::test]
+    async fn enable_failing_scope_keeps_other_scope_enabled_and_skills_274() {
+        let tmp = TempDir::new().unwrap();
+        let plugin_repo = tmp.path().join("plugin-repo");
+        let url = build_plugin_git_repo(&plugin_repo);
+        let repo = tmp.path().join("repo");
+        let source_git = build_marketplace_repo_with_entries(
+            &repo,
+            &[("audit", serde_json::json!({"source": "url", "url": url}))],
+        );
+        let (home, env) = setup_home_with_catalog(&tmp, source_git.clone()).await;
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let mut reg = SkillRegistry::new();
+
+        // user：Git 源（外部 clone）。
+        let user_rec = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let ext_root = PathBuf::from(user_rec.install_path.unwrap());
+
+        // 上游改为相对源并 refresh 后装 project scope。
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins":[{"name":"audit","source":"./plugin"}]}"#,
+        )
+        .unwrap();
+        let skill = repo.join("plugin/skills/audit-skill");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: audit-skill\ndescription: audit\n---\nbody",
+        )
+        .unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "relative"], &repo);
+        let mut throwaway = SkillRegistry::new();
+        stage_marketplace_skills(
+            "acme",
+            &source_git,
+            &mut throwaway,
+            &home,
+            MarketplaceStageOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                scope: Some("project"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 先让 project scope 正常启用（skills 活跃、project flag=true）。
+        enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                scope: Some("project"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(reg.resolve("audit:audit-skill").is_some());
+        assert_eq!(
+            enabled_plugin_raw_value(
+                "audit@acme",
+                "project",
+                Some(project.to_str().unwrap()),
+                Some(&env)
+            ),
+            Some(true)
+        );
+
+        // 破坏 user 记录根 → enable(user) 预检失败。
+        fs::remove_dir_all(&ext_root).unwrap();
+        let err = enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                scope: Some("user"),
+                project_path: Some(project.to_str().unwrap()),
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::ContentUnavailable { .. }));
+        // 其他 scope 仍 true → SKILL 投影 MUST 保留（不得 orphan）。
+        assert_eq!(
+            enabled_plugin_raw_value(
+                "audit@acme",
+                "project",
+                Some(project.to_str().unwrap()),
+                Some(&env)
+            ),
+            Some(true),
+            "project scope 的 enabled=true 不得被失败回滚打掉"
+        );
+        assert!(
+            reg.resolve("audit:audit-skill").is_some(),
+            "仍有 scope 启用 → SKILL MUST 保持可解析（🔴1）"
+        );
+        assert_eq!(
+            enabled_plugin_raw_value("audit@acme", "user", None, Some(&env)),
+            None,
+            "失败 scope 原 absent → 保持 absent"
+        );
+    }
+
+    /// 🟡10：多 scope 同根 + 同配置的 bundled server 去重（不误判身份坍缩）。
+    #[tokio::test]
+    async fn enable_multi_scope_same_root_server_deduped_274() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        let rec = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let root_s = rec.install_path.unwrap();
+        // 第二条记录指向同一根（多 scope 常态）。
+        {
+            let root_s = root_s.clone();
+            store::update_installed_plugins(
+                move |data| {
+                    let mut extra = Map::new();
+                    extra.insert("scope".to_string(), Value::String("project".to_string()));
+                    data.account.plugins.get_mut("audit@acme").unwrap().push(
+                        InstalledPluginRecord {
+                            install_path: Some(root_s),
+                            mcp_servers: Vec::new(),
+                            extra,
+                        },
+                    );
+                },
+                Some(&home),
+                Some(&env),
+            )
+            .unwrap();
+        }
+
+        let hooks = RecordingHooks::new();
+        enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .expect("同根+同配置去重后应成功");
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "同一 server 只挂一次"
+        );
+        assert_eq!(enabled_flag(&env, "audit@acme"), Some(true));
+    }
+
+    /// 🟡5/🟡10：跨记录同 bundle_id 但**异根/异配置** → 仍按身份坍缩硬错（不静默首胜）。
+    #[tokio::test]
+    async fn enable_multi_scope_conflicting_server_config_errors_274() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        let rec = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let root = PathBuf::from(rec.install_path.unwrap());
+        let alt = tmp.path().join("alt-root");
+        fs::create_dir_all(alt.join("skills/code-review")).unwrap();
+        fs::copy(
+            root.join("skills/code-review/SKILL.md"),
+            alt.join("skills/code-review/SKILL.md"),
+        )
+        .unwrap();
+        fs::create_dir_all(alt.join("mcp-servers")).unwrap();
+        fs::write(
+            alt.join("mcp-servers/audit-mcp.json"),
+            r#"{"type":"stdio","name":"audit-mcp","server_parameters":{"command":"node-alt"}}"#,
+        )
+        .unwrap();
+        {
+            let alt_s = alt.to_string_lossy().into_owned();
+            store::update_installed_plugins(
+                move |data| {
+                    let mut extra = Map::new();
+                    extra.insert("scope".to_string(), Value::String("project".to_string()));
+                    data.account.plugins.get_mut("audit@acme").unwrap().push(
+                        InstalledPluginRecord {
+                            install_path: Some(alt_s),
+                            mcp_servers: vec![BundleId::try_from("audit-mcp".to_string()).unwrap()],
+                            extra,
+                        },
+                    );
+                },
+                Some(&home),
+                Some(&env),
+            )
+            .unwrap();
+        }
+
+        let err = enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, PluginInstallError::Conflict(_)),
+            "异根/异配置同 bundle_id 应硬错：{err:?}"
+        );
+        assert_ne!(enabled_flag(&env, "audit@acme"), Some(true));
+    }
+
+    /// 🟡11：entry 级 `skills` 声明存在、实际零投影 → 失败（声明态判据覆盖 entry 来源）。
+    #[tokio::test]
+    async fn enable_entry_declared_skills_missing_fails_274() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"plugins":[{"name":"audit","source":"./plugin","skills":["./custom-skills"]}]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join("plugin")).unwrap();
+        fs::write(repo.join("plugin/README.md"), "no conventional skills").unwrap();
+        git(&["init", "-q"], &repo);
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+        let source =
+            serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())});
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::ContentUnavailable { .. }));
+        assert!(
+            err.to_string().contains("no_projectable_content"),
+            "entry 声明 skills 而零投影：{err}"
+        );
+        assert_ne!(enabled_flag(&env, "audit@acme"), Some(true));
+    }
+
     #[tokio::test]
     async fn enable_declared_server_files_deleted_fails_274() {
         let tmp = TempDir::new().unwrap();
@@ -3766,7 +4215,11 @@ mod tests {
             err.to_string().contains("skills_not_staged"),
             "期望有 SKILL 却零注册：{err}"
         );
-        assert_eq!(enabled_flag(&env, "audit@acme"), Some(false));
+        assert_eq!(
+            enabled_flag(&env, "audit@acme"),
+            None,
+            "原 absent 精确还原为 absent（🟡2，不升级成显式 false）"
+        );
         assert!(reg.resolve("audit:code-review").is_none());
     }
 
@@ -3812,8 +4265,8 @@ mod tests {
         assert!(matches!(err, PluginInstallError::Precondition(_)));
         assert_eq!(
             enabled_flag(&env, "audit@acme"),
-            Some(false),
-            "写 true 后 resolve 失败必须回滚"
+            None,
+            "写 true 后 resolve 失败须恢复原值 absent（🟡2）"
         );
     }
 
@@ -4809,7 +5262,8 @@ mod tests {
         );
     }
 
-    /// 非 marketplace 源（user）占名仍 fail-closed：enable 回滚 enabledPlugins=false + registry 快照。
+    /// 非 marketplace 源（user）占名仍 fail-closed：enable 恢复 enabledPlugins 原值（absent → 删键）+
+    /// registry 快照。
     #[tokio::test]
     async fn enable_rolls_back_enabled_flag_on_non_marketplace_skill_conflict() {
         let tmp = TempDir::new().unwrap();
@@ -4841,7 +5295,11 @@ mod tests {
             &conflict.kind,
             PluginNameConflictKind::SkillSource { .. }
         ));
-        assert_eq!(enabled_flag(&env, "alpha@mp-b"), Some(false));
+        assert_eq!(
+            enabled_flag(&env, "alpha@mp-b"),
+            None,
+            "原 absent 精确还原为 absent（#274 🟡2）"
+        );
         assert_eq!(reg.resolve("alpha:code-review").unwrap().source, "user");
     }
 
