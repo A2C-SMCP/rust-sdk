@@ -778,9 +778,10 @@ fn restore_enabled_plugin(
 /// 该 pid 是否在任一（账本记录涉及的）scope 仍有效启用：按 `user < project < local` 优先级合并各 scope
 /// 的 raw `enabledPlugins`（显式值覆盖下层；缺省不覆盖）。policy/managed 只读层不参与——SDK 不写它们。
 ///
-/// project/local 的锚点优先取账本记录的 `projectPath`；记录缺失（如 rematerialize 后记录恒为
-/// `scope=user` 且无 projectPath）→ **回退调用方 `project_path`**（#286：否则无记录 scope 的
-/// `enabled=true` 不可见，失败回滚会误 orphan/误摘）。
+/// project/local 的锚点 = 账本记录 `projectPath` ∪ 调用方 `project_path`（去重、过滤空串）。记录缺失
+/// （如 rematerialize 后记录恒为 `scope=user` 且无 projectPath）时调用方 `project_path` 仍覆盖该 scope；
+/// 且同一 scope 的多层锚点**任一读到 `true` 即视为该 scope 启用**——回收门控取保守侧（宁可保留，不可
+/// 误摘；#286 复审 🟡2：记录锚 A 与调用方锚 B 不同项目时，只读 A 会误摘 B 仍需要的 server）。
 fn plugin_enabled_in_any_scope(
     plugin_id: &str,
     records: &[InstalledPluginRecord],
@@ -795,20 +796,37 @@ fn plugin_enabled_in_any_scope(
             }
             continue;
         }
-        let record_path = records.iter().find_map(|r| {
+        let mut anchors: Vec<&str> = Vec::new();
+        for r in records {
             let rec_scope = r
                 .extra
                 .get("scope")
                 .and_then(Value::as_str)
                 .unwrap_or("user");
-            (rec_scope == scope)
-                .then(|| r.extra.get("projectPath").and_then(Value::as_str))
-                .flatten()
-        });
-        let Some(pp) = record_path.or(project_path.filter(|s| !s.is_empty())) else {
-            continue;
-        };
-        if let Some(v) = enabled_plugin_raw_value(plugin_id, scope, Some(pp), env) {
+            if rec_scope != scope {
+                continue;
+            }
+            if let Some(pp) = r
+                .extra
+                .get("projectPath")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                anchors.push(pp);
+            }
+        }
+        if let Some(pp) = project_path.filter(|s| !s.is_empty()) {
+            anchors.push(pp);
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut scope_value: Option<bool> = None;
+        for pp in anchors.into_iter().filter(|pp| seen.insert(*pp)) {
+            if let Some(v) = enabled_plugin_raw_value(plugin_id, scope, Some(pp), env) {
+                // 同 scope 多锚点：任一 true 即 true（保守侧；显式 false 不覆盖其他锚的 true）。
+                scope_value = Some(scope_value.unwrap_or(false) || v);
+            }
+        }
+        if let Some(v) = scope_value {
             effective = Some(v);
         }
     }
@@ -865,7 +883,11 @@ async fn reclaim_failed_enable_servers(
         );
         return;
     }
-    let deps: Vec<BundleId> = bundled_servers_of(home, plugin_id, env)
+    // deps 取调用方已加载的 records 快照（不重复读账本、避免两时点视图）；other 仍须全量装载集。
+    let deps: Vec<BundleId> = records
+        .iter()
+        .flat_map(|r| r.mcp_servers.iter().cloned())
+        .collect::<HashSet<_>>()
         .into_iter()
         .collect();
     let installed = load_installed_plugins(Some(home), env);
@@ -1814,6 +1836,9 @@ pub(crate) async fn enable_plugin_with_reclaim(
     //    半态——Sub-B 的 boot 恢复会据此复活半装 plugin。失败 → 摘除本次已挂 server + 恢复调用前
     //    `enabledPlugins` 原值 +（无任何 scope 仍启用时）回收 server 并 orphan 本 plugin skills。
     if let Some(h) = hooks {
+        // #286 复审 🟡3：以 ④ 时点重新取既有集——CLI 逐记录循环复用同一 hooks 实例，上一条记录刚挂的
+        // server 须在此可见（否则会被当「本次新增」重复注册，失败回滚还会误摘前序记录的成果）。
+        let existing = h.existing_servers();
         // #139：回滚按 **bundle_id** 寻址——挂前取身份（cfg 随后 move 入 register_server）。同 plugin 内两个
         // 同名、显式异 bundle_id 的 server，回滚时精确摘本次已挂那条，不再字典序最小误摘（消解回滚破原子性）。
         let mut remounted: Vec<BundleId> = Vec::new();
@@ -5002,6 +5027,199 @@ mod tests {
             reg.resolve("audit:code-review").is_some(),
             "调用方 project_path 下 local=true 可见 → MUST 保留 SKILL 投影"
         );
+    }
+
+    /// 同 scope 多锚点（#286 复审 🟡2）：记录 projectPath=A 无值、调用方锚点 B 为 true → MUST 保留。
+    #[tokio::test]
+    async fn enable_failure_keeps_servers_from_caller_anchor_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let project_b = tmp.path().join("proj-b");
+        let project_a = tmp.path().join("proj-a");
+        fs::create_dir_all(&project_b).unwrap();
+        fs::create_dir_all(&project_a).unwrap();
+        let pb = project_b.to_str().unwrap();
+        let pa = project_a.to_str().unwrap();
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // 追加一条 project 记录，其 projectPath=A（A 下无任何 settings 值）。
+        store::update_installed_plugins(
+            |data| {
+                let recs = data.account.plugins.get_mut("audit@acme").unwrap();
+                let mut rec = recs[0].clone();
+                rec.extra
+                    .insert("scope".to_string(), Value::String("project".to_string()));
+                rec.extra
+                    .insert("projectPath".to_string(), Value::String(pa.to_string()));
+                recs.push(rec);
+            },
+            Some(&home),
+            Some(&env),
+        )
+        .unwrap();
+        // 调用方锚点 B 下 project=true（技能活跃、server 由 h2 的 existing 模拟已挂）。
+        enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                scope: Some("project"),
+                project_path: Some(pb),
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let root = PathBuf::from(
+            ledger_records(&home, &env, "audit@acme")[0]
+                .install_path
+                .clone()
+                .unwrap(),
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let h2 = RecordingHooks::new().with_existing(&["audit-mcp"]);
+        let err = enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                project_path: Some(pb),
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&HashSet::new()),
+            Some(&h2),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::ContentUnavailable { .. }));
+        assert!(
+            h2.removed.lock().unwrap().is_empty(),
+            "记录锚 A 无值但调用方锚 B=true → MUST 保留 server（只读记录锚会误摘）"
+        );
+        assert!(
+            reg.resolve("audit:code-review").is_some(),
+            "调用方锚 B 仍 enabled → SKILL 投影 MUST 保留"
+        );
+    }
+
+    /// skills_not_staged（写后失败、prior=absent）路径同样回收（#286 复审 🟡7）。
+    #[tokio::test]
+    async fn enable_skills_not_staged_reclaims_servers_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        let rec = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // 缺 frontmatter description → staging 零注册（预检 expect_skills 仍为 true）。
+        let root = PathBuf::from(rec.install_path.unwrap());
+        fs::write(
+            root.join("skills/code-review/SKILL.md"),
+            "---\nname: code-review\n---\nbody",
+        )
+        .unwrap();
+
+        let hooks = RecordingHooks::new().with_existing(&["audit-mcp"]);
+        let err = enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&HashSet::new()),
+            Some(&hooks),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::ContentUnavailable { .. }));
+        assert!(
+            err.to_string().contains("skills_not_staged"),
+            "期望 skills_not_staged：{err}"
+        );
+        assert_eq!(
+            *hooks.removed.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "写后失败且无 scope 启用 → MUST 回收 bundled server"
+        );
+    }
+
+    /// source-conflict（写后失败、prior=absent）路径同样回收，且顺序 MUST 为「先 restore 再读门控」
+    /// （先回收会读到步骤 ② 的 true 而漏摘；#286 复审 🟡7）。
+    #[tokio::test]
+    async fn enable_source_conflict_reclaims_servers_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // 用 user 源占名 → enable 的 staging 产生跨源冲突（#275 fail-closed）。
+        reg.unregister("audit:code-review");
+        assert!(reg.register(user_skill("audit:code-review")));
+
+        let hooks = RecordingHooks::new().with_existing(&["audit-mcp"]);
+        let err = enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&HashSet::new()),
+            Some(&hooks),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            plugin_name_conflict(&err).kind,
+            PluginNameConflictKind::SkillSource { .. }
+        ));
+        assert_eq!(
+            *hooks.removed.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "source-conflict 写后失败且无 scope 启用 → MUST 回收（restore 先于门控）"
+        );
+        assert_eq!(enabled_flag(&env, "audit@acme"), None);
+        assert_eq!(reg.resolve("audit:code-review").unwrap().source, "user");
     }
 
     // ---- v0.3.0 一次性迁移 / migration --------------------------------------

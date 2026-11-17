@@ -256,16 +256,33 @@ pub async fn plugin_uninstall(
     ))
 }
 
+/// 该记录的 enable 写盘锚点：记录自带 `projectPath` 优先；缺失（如 rematerialize 后记录恒为
+/// `scope=user`、无 projectPath）→ 回退调用方 `project_path_hint`（REPL 传进程 cwd）。#286/D：后者同时作为
+/// 失败回滚 any-scope 门控对 project/local scope 的锚点，避免「local 仍 enabled 却被误回收/误 orphan」。
+fn record_enable_project_path<'a>(
+    rec: &'a InstalledPluginRecord,
+    project_path_hint: Option<&'a str>,
+) -> Option<&'a str> {
+    rec.extra
+        .get("projectPath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or(project_path_hint)
+}
+
 /// 启用单个 plugin（廉价复原：重挂 server + 复活 skills）/ enable a plugin (cheap restore)。
 ///
 /// scope 契约：从 ledger 逐 scope 读；每条记录 register 之前先 `inject_inputs(installPath)`。
+/// `project_path_hint`：记录缺 `projectPath` 时的写盘/门控锚点（REPL 传 cwd；一次性子命令传 `None`）。
 /// `non_plugin_bundle_ids`：失败回滚的 §4.9.1-2 回收判据「非用户声明」数据源，MUST 由持有 `Computer`
 /// 的调用方供给（REPL）；一次性子命令无活跃 server（hooks=None）→ `None`（不摘）。
+#[allow(clippy::too_many_arguments)] // CLI handler：显式资源 + flags（同 plugin_disable 风格）
 pub async fn plugin_enable(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
     plugin_id: &str,
+    project_path_hint: Option<&str>,
     non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
     hooks: Option<&dyn McpInstallHooks>,
     json_output: bool,
@@ -295,7 +312,7 @@ pub async fn plugin_enable(
             home,
             EnableOptions {
                 scope: Some(scope_of(rec)),
-                project_path: rec.extra.get("projectPath").and_then(Value::as_str),
+                project_path: record_enable_project_path(rec, project_path_hint),
                 timeout: None,
                 env,
             },
@@ -631,6 +648,39 @@ mod tests {
         assert_eq!(split_plugin_id("figma@"), None);
     }
 
+    #[test]
+    fn record_enable_project_path_prefers_record_then_hint() {
+        // #286/D：记录缺 projectPath → 回退 REPL cwd；记录有值（非空）→ 记录优先；空串视同缺失。
+        let make = |pp: Option<&str>| InstalledPluginRecord {
+            install_path: None,
+            mcp_servers: Vec::new(),
+            extra: {
+                let mut m = Map::new();
+                m.insert("scope".to_string(), json!("user"));
+                if let Some(pp) = pp {
+                    m.insert("projectPath".to_string(), json!(pp));
+                }
+                m
+            },
+        };
+        assert_eq!(
+            record_enable_project_path(&make(None), Some("/cwd")),
+            Some("/cwd"),
+            "记录无 projectPath → 回退调用方锚点"
+        );
+        assert_eq!(
+            record_enable_project_path(&make(Some("/rec")), Some("/cwd")),
+            Some("/rec"),
+            "记录有 projectPath → 记录优先"
+        );
+        assert_eq!(
+            record_enable_project_path(&make(Some("")), Some("/cwd")),
+            Some("/cwd"),
+            "空串 projectPath 视同缺失"
+        );
+        assert_eq!(record_enable_project_path(&make(None), None), None);
+    }
+
     #[tokio::test]
     async fn install_invalid_id_is_user_error() {
         let dir = tempdir().unwrap();
@@ -675,6 +725,7 @@ mod tests {
                 dir.path(),
                 Some(&env),
                 "x@y",
+                None,
                 None,
                 None,
                 true

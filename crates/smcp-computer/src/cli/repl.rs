@@ -291,12 +291,16 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
             let hooks = CliMcpHooks::new(comp, Some(plugin), Some(marketplace)).await;
             // #286：失败回滚的 §4.9.1-2 回收判据（同 disable）——MUST 在取 registry 写锁前由 Computer 供给。
             let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
+            // #286/D：记录缺 projectPath（rematerialize 后恒 scope=user）时，以进程 cwd 作门控锚点覆盖
+            // project/local scope（与 install 分支同源锚定）。
+            let project_path_hint = cwd.as_deref().and_then(Path::to_str);
             let mut registry = reg_arc.write().await;
             let code = plugin_enable(
                 &mut registry,
                 &home,
                 None,
                 id,
+                project_path_hint,
                 Some(&non_plugin),
                 Some(&hooks),
                 json,
