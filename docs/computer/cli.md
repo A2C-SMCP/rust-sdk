@@ -477,7 +477,7 @@ a2c> notify update
 该插件路径在 **marketplace 上游仓库**确实存在（本地 clone 即被破坏 repo；上游 manifest 失真也会报
 同一错误），再按 [旧版本 → 0.5.1 升级迁移](./marketplace-0.5.1-migration.md) 恢复：
 
-1. `marketplace info <name>` + `plugin list --available` + `plugin info <plugin>@<name> --json` 记下源 URL、注册名、已装插件清单（含 scope/projectPath/version/是否启用）与 autoUpdate 旗标（`remove` 后 URL 查不到；含 token 的 URL 从自己的记录取；`plugin list` 默认隐藏 installed-disabled；projectPath/version 只在 `plugin info --json` 的 `records[]` 里）
+1. `marketplace info <name>` + `plugin list --available` 记下源 URL、注册名、autoUpdate 与各插件的 scope/projectPath/version（`remove` 后 URL 查不到；含 token 的 URL 从自己的记录取；`plugin list` 默认隐藏 installed-disabled）。**真正受损的插件已被旧版卸载移除账本/安装意图，可能查不到——从其原安装命令/历史取，取不到按默认 user/当前版本恢复**
 2. `marketplace remove <name>`（默认级联卸载该 marketplace 下**所有**已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
 3. `marketplace add <git-url> --trust --name <name>`（重新 clone 并重新授予 trust；**必须用 `--name` 沿用原名**；原来开过 auto-update 的加 `--auto-update`）
-4. 逐一按原 scope `plugin install <plugin>@<name> --scope <scope> [--version <version>]`——缺省 user；多 scope 每个 scope 各装一次；project/local 须在原项目目录执行（cwd 即 projectPath）；原 `--version` 回填。此前启用过的再 `plugin enable <plugin>@<name>`
+4. 逐一按原 scope `plugin install <plugin>@<name> --scope <scope>`——缺省 user；多 scope 每个 scope 各装一次；project/local 须在原项目目录执行（cwd 即 projectPath）；`--version` 仅恢复账本字段、不锁定内容。此前启用过的再 `plugin enable <plugin>@<name>`

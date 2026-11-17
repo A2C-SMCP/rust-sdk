@@ -50,13 +50,18 @@ git ls-tree -r <commit> -- plugins/xxx
    ```text
    marketplace info <name>
    plugin list --available
-   plugin info <plugin>@<name> --json
    ```
 
-   记录：**源 URL**、**注册名**、该 marketplace 下**已安装插件清单**（含每个插件的 **scope**、
-   **projectPath**、**version** 与是否启用）、marketplace 的 **autoUpdate** 旗标。
-   `projectPath` / `version` / `commitSha` 只出现在 `plugin info --json` 的 `records[]` 里（文本模式
-   不打印 `projectPath`）；原安装用过 `--version` 锁定的，务必记下该值。
+   记录：**源 URL**、**注册名**、marketplace 的 **autoUpdate** 旗标，以及各插件的 **scope** /
+   **projectPath** / **version**。
+
+   > ⚠️ **真正受损的插件通常已经查不到了**：旧版 uninstall 会同时删除该插件的账本记录与
+   > `installedPlugins` 安装意图，`plugin list` / `plugin info` 对子树缺失的那个插件会报
+   > not installed（或根本不列出）。这些值请从**原安装命令、shell 历史或备份**中取；取不到就按
+   > 默认 **user** scope、**当前版本**恢复，并接受与原来不完全一致。
+   >
+   > 插件仍在列时，`projectPath` / `version` / `commitSha` 只出现在 `plugin info --json` 的
+   > `records[]` 里（文本模式不打印 `projectPath`）。
 
 1. 移除已被破坏的 marketplace（重新 clone 前必须做）：
 
@@ -86,7 +91,9 @@ git ls-tree -r <commit> -- plugins/xxx
    - **多 scope 的插件要对每个 scope 各执行一次 `plugin install`**（一次只装一个 scope）。
    - **project / local scope 必须以原项目目录为 cwd 执行**：CLI 把当前工作目录记为 `projectPath`，
      不在原目录执行会装到错误路径。
-   - 原安装用 `--version` 锁定过的，按第 0 步记录的值回填 `--version`；否则会装到 marketplace 当前版本。
+   - `--version` 只写回账本 `version` 字段，**不会锁定或改变 source 内容**；需要与旧内容完全一致，
+     应在 marketplace 源仓库侧使用原 commit/ref（当前 CLI 无 catalog 版本锁定参数，见 #267 后续项）。
+     取不到历史值就按当前版本恢复。
 
 ## 4. 验证
 

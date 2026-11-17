@@ -34,19 +34,32 @@ pub fn git(args: &[&str], cwd: &Path) {
 ///
 /// 返回 `file://…` URL。
 pub fn build_relative_source_repo(repo: &Path, description: &str) -> String {
+    build_relative_source_repo_with_plugins(repo, &[("alpha", description)])
+}
+
+/// 多插件 marketplace 源仓库：每个插件一个相对 source `./plugins/<name>` + `skills/code-review`。
+///
+/// 返回 `file://…` URL。
+pub fn build_relative_source_repo_with_plugins(repo: &Path, plugins: &[(&str, &str)]) -> String {
     fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+    let entries: Vec<serde_json::Value> = plugins
+        .iter()
+        .map(|(name, _)| serde_json::json!({"name": name, "source": format!("./plugins/{name}")}))
+        .collect();
     fs::write(
         repo.join(".tfrobot-plugin/marketplace.json"),
-        r#"{"plugins": [{"name": "alpha", "source": "./plugins/alpha"}]}"#,
+        serde_json::to_string(&serde_json::json!({ "plugins": entries })).unwrap(),
     )
     .unwrap();
-    let skill = repo.join("plugins/alpha/skills/code-review");
-    fs::create_dir_all(&skill).unwrap();
-    fs::write(
-        skill.join("SKILL.md"),
-        format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
-    )
-    .unwrap();
+    for (name, description) in plugins {
+        let skill = repo.join("plugins").join(name).join("skills/code-review");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: code-review\ndescription: {description}\n---\nbody"),
+        )
+        .unwrap();
+    }
     git(&["init", "-q"], repo);
     git(&["add", "-A"], repo);
     git(&["commit", "-qm", "init"], repo);

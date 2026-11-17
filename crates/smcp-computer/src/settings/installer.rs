@@ -2493,8 +2493,28 @@ mod tests {
         .await
         .unwrap();
 
-        // 模拟旧版卸载后果：共享 catalog 内的相对源子树被删。
-        fs::remove_dir_all(home.join("marketplace/acme/plugins/audit")).unwrap();
+        // 精确复现 0.5.0 破坏态：旧卸载同时删除账本/安装意图与共享 catalog 子树。
+        // 0.5.1 的 uninstall 已不再删共享子树（#271），故先 uninstall 再手删子树。
+        let removed = uninstall_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            UninstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            &HashSet::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(removed, "首次卸载应实际移除账本记录");
+        let rel = home.join("marketplace/acme/plugins/audit");
+        assert!(
+            rel.exists(),
+            "#271 之后 uninstall 不得再删共享 catalog 子树"
+        );
+        fs::remove_dir_all(&rel).unwrap();
 
         for refresh in [false, true] {
             let err = install_plugin(

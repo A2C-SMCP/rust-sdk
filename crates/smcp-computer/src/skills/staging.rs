@@ -961,27 +961,29 @@ pub(crate) async fn locate_plugin_root(
         // #278：0.5.1 之前的卸载会删除共享 catalog 子树（相对源插件），且 `marketplace refresh`
         // 的 `git pull` 保留本地删除、无法可靠自愈——错误里给出完整恢复链（B 方案，不自动迁移）：
         // ① 先确认**上游**仓库仍有该路径（本地 clone 就是被破坏的 repo，看它会误判为 manifest 失真），
-        //    并记下 URL / 注册名 / 已装插件及 scope / projectPath / version / autoUpdate（remove 后
-        //    `marketplace info` 查不到 URL；`plugin list` 默认隐藏 installed-disabled，须 `--available`；
-        //    projectPath/version 只在 `plugin info <pid> --json` 的 records 里）；
+        //    并记下 URL / 注册名 / autoUpdate / 各插件 scope、projectPath、version。受损插件已被旧版
+        //    uninstall 移除安装意图与账本 → `plugin list`/`plugin info` 可能查不到，须从原安装命令或
+        //    shell 历史取；取不到就按默认 user scope / 当前版本恢复；
         // ② remove 默认级联卸载该 marketplace 全部插件并撤销 trust，`--keep-plugins` 会留孤儿账本；
         // ③ 重加必须 `--name` 沿用原名（否则从 URL 派生新名、旧 pid install 失败），autoUpdate 需重设；
         // ④ 逐插件按原 scope 重装（project/local 以 cwd 作 projectPath，须在原项目目录执行；多 scope
-        //    各装一次；原 `--version` 回填）+ 此前启用的重新 enable（install 不激活）。
+        //    各装一次）；`--version` 仅写回账本 version 字段、**不锁定内容**；此前启用的重新 enable。
         // 文案只用字面占位符：marketplace 名/相对路径可能内嵌 URL 派生凭据，一律不回显。
         let msg = if is_local {
             "plugin root not found after source resolution. This may be a marketplace catalog \
              damaged by a pre-0.5.1 uninstall (relative-source plugins). If so, first confirm the \
              path exists in the upstream marketplace repo (not the local clone), and record the \
-             source URL, registered name, installed plugins with their scopes, projectPath, \
-             version and the autoUpdate flag ('marketplace info <name>', 'plugin list \
-             --available', 'plugin info <plugin>@<name> --json'). Recover with: 'marketplace \
-             remove <name>' (WARNING: cascades uninstall of ALL plugins from that marketplace and \
-             revokes its trust; do NOT pass --keep-plugins), then 'marketplace add <git-url> \
-             --trust --name <name>' (keep the original name; add --auto-update if it was set), \
-             reinstall each plugin per original scope (project/local: run inside the recorded \
-             project directory; pass --version if one was used), and 'plugin enable \
-             <plugin>@<name>' for plugins previously enabled. See \
+             source URL, registered name, autoUpdate flag, and each plugin's scope/projectPath/\
+             version. Note: damaged plugins were already uninstalled by the old version, so \
+             'plugin list --available'/'plugin info' may no longer list them -- recover those \
+             values from your original install command or shell history, otherwise restore with \
+             the default scope and current version. Recover with: 'marketplace remove <name>' \
+             (WARNING: cascades uninstall of ALL plugins from that marketplace and revokes its \
+             trust; do NOT pass --keep-plugins), then 'marketplace add <git-url> --trust --name \
+             <name>' (keep the original name; add --auto-update if it was set), reinstall each \
+             plugin per original scope (project/local: run inside the original project directory; \
+             '--version' only restores the ledger version field, it does not pin content), and \
+             'plugin enable <plugin>@<name>' for plugins previously enabled. See \
              https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
         } else {
             "plugin root not found after source resolution"
@@ -1967,7 +1969,7 @@ mod tests {
             "须要求查上游提交树（本地 clone 即被破坏 repo）: {msg}"
         );
         assert!(
-            msg.contains("installed plugins with their scopes, projectPath, version"),
+            msg.contains("each plugin's scope/projectPath/version"),
             "破坏性 remove 前须先记录 URL/注册名/插件/scope/projectPath/version: {msg}"
         );
         assert!(
@@ -1975,16 +1977,22 @@ mod tests {
             "默认 plugin list 隐藏 installed-disabled，须用 --available: {msg}"
         );
         assert!(
-            msg.contains("plugin info <plugin>@<name> --json"),
-            "projectPath/version 仅在 plugin info --json 的 records 中: {msg}"
+            msg.contains("already uninstalled by the old version")
+                && msg.contains("may no longer list them"),
+            "受损插件已不在账本/意图，提示须说明查不到（caveat）: {msg}"
         );
         assert!(
-            msg.contains("run inside the recorded project directory"),
+            msg.contains("original install command or shell history")
+                && msg.contains("the default scope and current version"),
+            "取不到历史值时须给默认恢复口径: {msg}"
+        );
+        assert!(
+            msg.contains("run inside the original project directory"),
             "project/local scope 须在原项目目录执行（cwd 即 projectPath）: {msg}"
         );
         assert!(
-            msg.contains("pass --version if one was used"),
-            "原 --version 锁定须回填: {msg}"
+            msg.contains("does not pin content"),
+            "--version 仅恢复账本字段、不锁定内容: {msg}"
         );
         assert!(
             msg.contains("--auto-update if it was set"),
