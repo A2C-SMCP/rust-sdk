@@ -151,8 +151,10 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
         "须给重加命令: {msg}"
     );
     assert!(
-        msg.contains("docs/computer/marketplace-0.5.1-migration.md"),
-        "须指向迁移文档: {msg}"
+        msg.contains(
+            "https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
+        ),
+        "须给出发布物用户可打开的文档 URL: {msg}"
     );
     assert!(!msg.contains(mp), "不得回显 marketplace 名: {msg}");
     assert!(!msg.contains(&url), "不得回显源 URL: {msg}");
@@ -175,30 +177,22 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
         !skill_home.join("marketplace").join(mp).exists(),
         "remove 后 catalog clone 应被 prune"
     );
-    // 撤销 trust（迁移文档明示的副作用）：settings.json 不再含该名。
+    // 撤销 trust（迁移文档明示的副作用）：settings.json 的 trustedMarketplaces 不再含该名。
+    // 注意：非交互 `marketplace add` 无 `--trust` 一律拒绝（陈旧 trust 不豁免），故「不带 --trust
+    // 被拒」不能作为撤销凭据；这里直接解析 settings（add --trust 必然创建该文件）。
     let settings = home.join("xdg-config/a2c/settings.json");
-    if settings.exists() {
-        let text = fs::read_to_string(&settings).unwrap();
-        assert!(
-            !text.contains(mp),
-            "remove 后 trustedMarketplaces 不应保留: {text}"
-        );
-    }
-
-    // ⑥ 无 --trust 重新 add 应被拒（证明确实撤销了 trust）。
-    let out = run(
-        home,
-        &skill_home,
-        &["marketplace", "add", &url, "--name", mp, "--json"],
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "trust 撤销后非交互 add 应被拒; stdout={}",
-        String::from_utf8_lossy(&out.stdout)
+    let text = fs::read_to_string(&settings).expect("add --trust 后 settings.json 应存在");
+    let sv: Value = serde_json::from_str(&text).expect("settings.json 应为合法 JSON");
+    let still_trusted = sv["trustedMarketplaces"]
+        .as_array()
+        .map(|arr| arr.iter().any(|n| n == mp))
+        .unwrap_or(false);
+    assert!(
+        !still_trusted,
+        "remove 后 trustedMarketplaces 不应保留 {mp}: {sv}"
     );
 
-    // ⑦ 按文档 --trust 重新 add（重 clone）→ ⑧ 重装成功。
+    // ⑥ 按文档 --trust 重新 add（重 clone）→ ⑦ 重装成功。
     let out = run(
         home,
         &skill_home,

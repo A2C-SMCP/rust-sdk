@@ -472,10 +472,12 @@ a2c> notify update
 
 ### 10.4 重装报 `plugin root not found after source resolution`
 
-在 0.5.0 上卸载过「相对 source」插件时，marketplace catalog 内的插件子树可能已被旧版卸载删除，
-`marketplace refresh` 无法自愈（`git pull` 保留本地删除）。按
-[0.5.0 → 0.5.1 升级迁移](./marketplace-0.5.1-migration.md) 恢复：
+在 0.5.1 之前的版本（0.3.1–0.5.0）上卸载过「相对 source」插件时，marketplace catalog 内的插件子树
+可能已被旧版卸载删除，`marketplace refresh` 无法自愈（`git pull` 保留本地删除）。先确认该插件路径
+在 marketplace 仓库中确实存在（上游 manifest 失真也会报同一错误），再按
+[旧版本 → 0.5.1 升级迁移](./marketplace-0.5.1-migration.md) 恢复：
 
-1. `marketplace remove <name>`（默认级联卸载该 marketplace 下已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
-2. `marketplace add <git-url> --trust`（重新 clone 并重新授予 trust）
-3. `plugin install <plugin>@<name>`，此前启用过的再 `plugin enable <plugin>@<name>`
+1. `marketplace info <name>` 记下源 URL（`remove` 后即查不到；含 token 的 URL 从自己的记录取）
+2. `marketplace remove <name>`（默认级联卸载该 marketplace 下已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
+3. `marketplace add <git-url> --trust`（重新 clone 并重新授予 trust）
+4. `plugin install <plugin>@<name>`，此前启用过的再 `plugin enable <plugin>@<name>`

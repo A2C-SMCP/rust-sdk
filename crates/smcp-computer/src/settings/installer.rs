@@ -2503,8 +2503,14 @@ mod tests {
                 "refresh={refresh} 须给重加命令: {msg}"
             );
             assert!(
-                msg.contains("docs/computer/marketplace-0.5.1-migration.md"),
-                "refresh={refresh} 须指向迁移文档: {msg}"
+                msg.contains("plugin enable <plugin>@<name>"),
+                "refresh={refresh} 须提醒 re-enable（install 不激活）: {msg}"
+            );
+            assert!(
+                msg.contains(
+                    "https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
+                ),
+                "refresh={refresh} 须给出可打开的文档 URL: {msg}"
             );
         }
     }

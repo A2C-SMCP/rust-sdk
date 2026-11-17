@@ -958,15 +958,19 @@ pub(crate) async fn locate_plugin_root(
     };
 
     if !plugin_root.is_dir() {
-        // #278：0.5.0 旧卸载会删除共享 catalog 子树，且 `marketplace refresh` 的 `git pull`
-        // 保留本地删除、无法自愈——错误里直接给出 remove + add 恢复路径（B 方案，不自动迁移）。
+        // #278：0.5.1 之前的卸载会删除共享 catalog 子树（相对源插件），且 `marketplace refresh`
+        // 的 `git pull` 保留本地删除、无法自愈——错误里给出 remove + add + enable 恢复路径
+        // （B 方案，不自动迁移）。先提示确认上游路径存在：manifest 失真/手删目录也会落到同一
+        // 错误，此时级联 remove 只会无谓破坏安装与 trust。
         // 文案只用字面占位符：marketplace 名/相对路径可能内嵌 URL 派生凭据，一律不回显。
         let msg = if is_local {
             "plugin root not found after source resolution. This may be a marketplace catalog \
-             damaged by the 0.5.0 uninstall bug. Recover with: 'marketplace remove <name>' \
+             damaged by a pre-0.5.1 uninstall (relative-source plugins). If so, confirm the plugin \
+             path exists in the marketplace repo, then recover with: 'marketplace remove <name>' \
              (WARNING: cascades uninstall of all plugins from that marketplace and revokes its \
-             trust), then 'marketplace add <git-url> --trust', then reinstall. See \
-             docs/computer/marketplace-0.5.1-migration.md"
+             trust), then 'marketplace add <git-url> --trust', then reinstall (and 'plugin enable \
+             <plugin>@<name>' if it was enabled). See \
+             https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
         } else {
             "plugin root not found after source resolution"
         };
@@ -1911,7 +1915,7 @@ mod tests {
         assert!(r.uri.is_none());
     }
 
-    /// #278：相对 source 根缺失（0.5.0 卸载删 catalog 子树）→ 错误携带恢复指引；
+    /// #278：相对 source 根缺失（0.5.1 之前版本的卸载删除 catalog 子树）→ 错误携带恢复指引；
     /// marketplace 名 / 相对路径 / catalog 路径一律**不插值**（占位符，对抗 token 形态泄漏）。
     #[tokio::test]
     async fn locate_plugin_root_local_missing_reports_recovery_hint_278() {
@@ -1947,12 +1951,26 @@ mod tests {
             "须给出重加命令: {msg}"
         );
         assert!(
+            msg.contains("plugin enable <plugin>@<name>"),
+            "须提醒 re-enable（install 不激活）: {msg}"
+        );
+        assert!(
             msg.contains("cascades uninstall"),
             "须警告级联卸载+撤销 trust: {msg}"
         );
         assert!(
-            msg.contains("docs/computer/marketplace-0.5.1-migration.md"),
-            "须指向迁移文档: {msg}"
+            msg.contains("confirm the plugin path exists"),
+            "须先提示确认为 catalog 破坏而非上游 manifest 失真: {msg}"
+        );
+        assert!(
+            msg.contains("pre-0.5.1"),
+            "受影响版本须覆盖全部旧版本（0.3.1–0.5.0）: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "https://github.com/A2C-SMCP/rust-sdk/blob/v0.5.1/docs/computer/marketplace-0.5.1-migration.md"
+            ),
+            "发布物用户须能打开文档（绝对 URL，非仓库相对路径）: {msg}"
         );
         // 零泄漏：名字/路径中的 token 形态、catalog 绝对路径均不得回显。
         assert!(
