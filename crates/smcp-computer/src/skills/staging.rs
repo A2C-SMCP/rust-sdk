@@ -917,6 +917,9 @@ pub(crate) async fn locate_plugin_root(
     };
     let resolved = resolve_plugin_source(raw_source, plugin_root_base)
         .map_err(|e: SkillSourceError| SkillStagingError::new(e.to_string()))?;
+    // #278：只有 Local（marketplace clone 内相对源）根缺失才可能源于 0.5.0 旧卸载删除共享
+    // catalog 子树；Git 源 clone 后根缺失属 manifest/subdir/clone 问题，不能误导用户去 remove。
+    let is_local = matches!(&resolved, ResolvedPluginSource::Local(_));
 
     let (plugin_root, version_fallback) = match resolved {
         ResolvedPluginSource::Local(local) => {
@@ -955,9 +958,19 @@ pub(crate) async fn locate_plugin_root(
     };
 
     if !plugin_root.is_dir() {
-        return Err(SkillStagingError::new(
-            "plugin root not found after source resolution",
-        ));
+        // #278：0.5.0 旧卸载会删除共享 catalog 子树，且 `marketplace refresh` 的 `git pull`
+        // 保留本地删除、无法自愈——错误里直接给出 remove + add 恢复路径（B 方案，不自动迁移）。
+        // 文案只用字面占位符：marketplace 名/相对路径可能内嵌 URL 派生凭据，一律不回显。
+        let msg = if is_local {
+            "plugin root not found after source resolution. This may be a marketplace catalog \
+             damaged by the 0.5.0 uninstall bug. Recover with: 'marketplace remove <name>' \
+             (WARNING: cascades uninstall of all plugins from that marketplace and revokes its \
+             trust), then 'marketplace add <git-url> --trust', then reinstall. See \
+             docs/computer/marketplace-0.5.1-migration.md"
+        } else {
+            "plugin root not found after source resolution"
+        };
+        return Err(SkillStagingError::new(msg));
     }
     Ok((plugin_root, version_fallback))
 }
@@ -1896,6 +1909,101 @@ mod tests {
         assert_eq!(r.source, "marketplace:acme");
         assert_eq!(r.description, "review code");
         assert!(r.uri.is_none());
+    }
+
+    /// #278：相对 source 根缺失（0.5.0 卸载删 catalog 子树）→ 错误携带恢复指引；
+    /// marketplace 名 / 相对路径 / catalog 路径一律**不插值**（占位符，对抗 token 形态泄漏）。
+    #[tokio::test]
+    async fn locate_plugin_root_local_missing_reports_recovery_hint_278() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = tmp.path().join("catalog-ghp-fake-token");
+        fs::create_dir_all(&catalog).unwrap();
+        let entry = serde_json::json!({ "source": "./plugins/audit-ghp-fake-token" });
+        let err = locate_plugin_root(
+            "acme-ghp-fake-token",
+            "audit",
+            entry.as_object().unwrap(),
+            &catalog,
+            ".",
+            tmp.path(),
+            None,
+            false,
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .await
+        .expect_err("catalog 子树缺失应报错");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plugin root not found after source resolution"),
+            "保留原错误句: {msg}"
+        );
+        assert!(
+            msg.contains("marketplace remove <name>"),
+            "须给出级联移除命令: {msg}"
+        );
+        assert!(
+            msg.contains("marketplace add <git-url> --trust"),
+            "须给出重加命令: {msg}"
+        );
+        assert!(
+            msg.contains("cascades uninstall"),
+            "须警告级联卸载+撤销 trust: {msg}"
+        );
+        assert!(
+            msg.contains("docs/computer/marketplace-0.5.1-migration.md"),
+            "须指向迁移文档: {msg}"
+        );
+        // 零泄漏：名字/路径中的 token 形态、catalog 绝对路径均不得回显。
+        assert!(
+            !msg.contains("ghp-fake-token"),
+            "不得回显名称/路径 token: {msg}"
+        );
+        assert!(
+            !msg.contains(&catalog.display().to_string()),
+            "不得回显 catalog 路径: {msg}"
+        );
+    }
+
+    /// #278：Git 源（clone 成功但 subdir 缺失）属 manifest/仓库问题，保持原错误句，不误加 catalog 指引。
+    #[tokio::test]
+    async fn locate_plugin_root_git_missing_subdir_keeps_generic_message_278() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "x").unwrap();
+        git(&["init", "-q"], &repo);
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("marketplace")).unwrap();
+        let entry = serde_json::json!({
+            "source": {"source": "git-subdir", "url": format!("file://{}", repo.display()), "path": "missing-sub"}
+        });
+        let err = locate_plugin_root(
+            "acme",
+            "audit",
+            entry.as_object().unwrap(),
+            &home.join("catalog"),
+            ".",
+            &home,
+            None,
+            true,
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .await
+        .expect_err("git-subdir 缺失应报错");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plugin root not found after source resolution"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("marketplace remove"),
+            "Git 源不得误加 catalog 恢复指引: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -469,3 +469,13 @@ a2c> notify update
 - 确认 URL（协议/端口）可访问
 - 需要鉴权时，正确传 `--auth key:value` 或在 `socket connect` 后按系统流程处理
 - 必要时打开更详细日志（如果项目接入了 `tracing`/`RUST_LOG`，可用环境变量控制）
+
+### 10.4 重装报 `plugin root not found after source resolution`
+
+在 0.5.0 上卸载过「相对 source」插件时，marketplace catalog 内的插件子树可能已被旧版卸载删除，
+`marketplace refresh` 无法自愈（`git pull` 保留本地删除）。按
+[0.5.0 → 0.5.1 升级迁移](./marketplace-0.5.1-migration.md) 恢复：
+
+1. `marketplace remove <name>`（默认级联卸载该 marketplace 下已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
+2. `marketplace add <git-url> --trust`（重新 clone 并重新授予 trust）
+3. `plugin install <plugin>@<name>`，此前启用过的再 `plugin enable <plugin>@<name>`

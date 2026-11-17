@@ -2455,6 +2455,60 @@ mod tests {
         .expect("refresh=true 重装应成功");
     }
 
+    /// #278：0.5.0 旧卸载已删的 catalog 子树无法自愈（`git pull` 保留本地删除）——
+    /// 重装失败错误必须携带恢复指引（B 方案：不自动迁移，只给命令 + 文档）。
+    #[tokio::test]
+    async fn install_missing_catalog_subtree_reports_recovery_hint_278() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, false).await;
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 模拟 0.5.0 旧卸载后果：共享 catalog 内的相对源子树被删。
+        fs::remove_dir_all(home.join("marketplace/acme/plugins/audit")).unwrap();
+
+        // 默认与 refresh=true 都应失败（后者 git pull 保留本地删除），且错误带恢复指引。
+        for refresh in [false, true] {
+            let err = install_plugin(
+                "audit@acme",
+                &mut reg,
+                &home,
+                InstallOptions {
+                    refresh,
+                    env: Some(&env),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("catalog 子树缺失时重装应失败");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("marketplace remove <name>"),
+                "refresh={refresh} 须给级联移除命令: {msg}"
+            );
+            assert!(
+                msg.contains("marketplace add <git-url> --trust"),
+                "refresh={refresh} 须给重加命令: {msg}"
+            );
+            assert!(
+                msg.contains("docs/computer/marketplace-0.5.1-migration.md"),
+                "refresh={refresh} 须指向迁移文档: {msg}"
+            );
+        }
+    }
+
     /// 外部 Git clone：卸载仍删除 plugin 独占的 `.plugins/<mp>/<plugin>`，不碰共享 catalog。
     #[tokio::test]
     async fn uninstall_external_git_plugin_removes_clone_root_271() {
