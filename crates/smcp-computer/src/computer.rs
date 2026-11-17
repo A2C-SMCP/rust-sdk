@@ -6906,6 +6906,10 @@ mod tests {
         for raw in [
             "file:///alice:PW_LEAK@example.com",
             "git@host:alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK",
+            "git@host:alice%3APW_LEAK%40example.com",
+            "file:///alice:PW_LEAK",
+            "file:///alice%3APW_LEAK%40example.com",
         ] {
             // 合法 URL / scp-like，但派生段含 userinfo 形态 → 拒绝派生名。
             let err = computer

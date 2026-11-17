@@ -36,7 +36,8 @@ use crate::settings::installer::{
 };
 use crate::settings::reconciler::{prune_marketplaces, SkillGovernanceStore};
 use crate::settings::redaction::{
-    git_source_for_error, redact_git_urls_in_text, untrusted_name_for_display,
+    git_source_for_error, known_git_source_for_display, redact_git_urls_in_text,
+    untrusted_name_for_display, REDACTED_GIT_SOURCE,
 };
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
@@ -183,14 +184,20 @@ pub fn normalize_marketplace_url(raw: &str) -> Option<String> {
 
 /// 从 git URL 末段派生严格-kebab marketplace 名（去 `.git`、非字母数字折叠为 `-`）/ derive a kebab name。
 ///
-/// #285：仅对 [`is_valid_git_url`] 认可的源派生，且派生段含 `:`/`@`（userinfo 形态）时返回 `None`。
-/// 因此 hostless scheme、`host:repo`、`SSH://host/repo`、`file:/abs/repo` 等旧可派生形态不再产出名称
-/// （公开 API 行为收窄，见 PR / release notes）。
+/// #285：仅对 [`is_valid_git_url`] 认可且 known display 非占位符的源派生；派生段含 `:`/`@`/`%`
+/// （userinfo 形态与 percent-encoded 残形）时返回 `None`。因此 hostless scheme、`host:repo`、
+/// `SSH://host/repo`、`file:/abs/repo` 等旧可派生形态不再产出名称（公开 API 行为收窄，见 PR /
+/// release notes）。
 #[must_use]
 pub fn default_marketplace_name(url: &str) -> Option<String> {
     let raw = url.trim();
     // #285：仅对合法 Git URL 派生；hostless/畸形（含公开函数直调）不得从 path slug 凭据。
     if !is_valid_git_url(raw) {
+        return None;
+    }
+    // #285：与展示面同口径——known display 为占位符的源不得派生名称（scp/file 的 userinfo
+    // 形态；`file:///tmp/user@host/repo` 会保守拒绝，与 #279 一致）。
+    if known_git_source_for_display(raw) == REDACTED_GIT_SOURCE {
         return None;
     }
     let segment = if raw.contains("://") {
@@ -213,8 +220,8 @@ pub fn default_marketplace_name(url: &str) -> Option<String> {
             .to_string()
     };
     let seg = segment.strip_suffix(".git").unwrap_or(&segment);
-    // #285：派生段含 userinfo 形态（`:`/`@`）时 fail-closed；合法 repo 名不含这两个字符。
-    if seg.contains([':', '@']) {
+    // #285：派生段含 userinfo 形态（`:`/`@`）或 percent-encoded 残形（`%`）时 fail-closed。
+    if seg.contains([':', '@', '%']) {
         return None;
     }
 
@@ -649,6 +656,17 @@ mod tests {
         );
         assert_eq!(
             default_marketplace_name("git@host:alice:PW_LEAK@example.com"),
+            None
+        );
+        // scp 分支 rsplit(':') 只看最后一段：无 `@` 的 user:password 尾部与 percent-encoded 变体。
+        assert_eq!(default_marketplace_name("git@host:alice:PW_LEAK"), None);
+        assert_eq!(
+            default_marketplace_name("git@host:alice%3APW_LEAK%40example.com"),
+            None
+        );
+        assert_eq!(default_marketplace_name("file:///alice:PW_LEAK"), None);
+        assert_eq!(
+            default_marketplace_name("file:///alice%3APW_LEAK%40example.com"),
             None
         );
         assert_eq!(

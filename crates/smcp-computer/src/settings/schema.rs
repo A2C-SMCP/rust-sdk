@@ -779,6 +779,8 @@ mod tests {
             ("ssh://[::1]/repo.git", true),
             ("ssh://[::1]:22/repo.git", true),
             ("https:///hostless", true), // WHATWG 归一为 host=hostless
+            ("ssh://host:", true),       // WHATWG 归一为 ssh://host
+            ("http:///", false),         // Url::parse 失败（empty host）
             ("file:/abs/repo", false),   // 缺 `://`
             ("not a url", false),
             ("ftp://host/x", false),

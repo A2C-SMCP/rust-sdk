@@ -909,9 +909,13 @@ mod tests {
             "ssh:///alice:PW_LEAK@example.com",
             "ssh:/alice:PW_LEAK@example.com",
             "git:///alice:PW_LEAK@example.com",
-            // 合法 URL / scp-like，但派生段含 userinfo 形态
+            // 合法 URL / scp-like，但派生段含 userinfo 形态（含无 `@` 尾部与 percent-encoded）
             "file:///alice:PW_LEAK@example.com",
             "git@host:alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK",
+            "git@host:alice%3APW_LEAK%40example.com",
+            "file:///alice:PW_LEAK",
+            "file:///alice%3APW_LEAK%40example.com",
         ] {
             // --trust 不得绕过身份校验：hostless 必须在信任门与账本写入之前拒绝。
             let code = marketplace_add(
