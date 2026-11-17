@@ -996,14 +996,12 @@ async fn stage_one_plugin(
     check_strict_conflict(entry, &plugin_manifest)
         .map_err(|e: PluginManifestError| SkillStagingError::new(e.to_string()))?;
     let version = resolve_plugin_version(entry, &plugin_manifest, version_fallback.as_deref());
-    let override_dirs = resolve_skill_override_dirs(
+    let skill_dirs = plugin_skill_container_dirs(
         entry,
         &plugin_manifest,
         &plugin_root,
         entry_is_strict(entry),
     );
-    let mut skill_dirs = vec![plugin_root.join(SKILLS_SUBDIR)];
-    skill_dirs.extend(override_dirs);
     Ok(scan_and_register_plugin_skills(
         marketplace,
         plugin_name,
@@ -1012,6 +1010,41 @@ async fn stage_one_plugin(
         registry,
         seen,
     ))
+}
+
+/// plugin 的 SKILL 容器目录集合：约定 `<root>/skills` + 覆写目录（`entry.skills` 恒取，
+/// `plugin.json.skills` 仅 strict）/ SKILL container dirs for a plugin root。
+///
+/// 与 [`scan_and_register_plugin_skills`] 的扫描入口同源，供 enable 预检与 staging 共用，避免两套口径漂移。
+pub(crate) fn plugin_skill_container_dirs(
+    entry: &Map<String, Value>,
+    plugin_manifest: &Map<String, Value>,
+    plugin_root: &Path,
+    strict: bool,
+) -> Vec<PathBuf> {
+    let mut dirs = vec![plugin_root.join(SKILLS_SUBDIR)];
+    dirs.extend(resolve_skill_override_dirs(
+        entry,
+        plugin_manifest,
+        plugin_root,
+        strict,
+    ));
+    dirs
+}
+
+/// 容器目录中是否存在至少一个可投影 SKILL 包（`<dir>/<skill>/SKILL.md` 是文件）。
+///
+/// 镜像 [`scan_and_register_plugin_skills`] 的最小可投影判据（不解析 frontmatter）；用于 enable 预检判断
+/// 「插件声明的 skills 内容是否还在」，**不**替代 staging 的逐 skill 校验与降级。
+pub(crate) fn has_projectable_skill(skill_dirs: &[PathBuf]) -> bool {
+    skill_dirs.iter().filter(|d| d.is_dir()).any(|dir| {
+        std::fs::read_dir(dir).ok().is_some_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let p = entry.path();
+                p.is_dir() && p.join(SKILL_MD).is_file()
+            })
+        })
+    })
 }
 
 /// marketplace 源 staging 选项 / options for [`stage_marketplace_skills`]。

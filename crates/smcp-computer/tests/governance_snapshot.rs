@@ -94,6 +94,15 @@ fn seed_four_classes(td: &TempDir) {
     let install_b = td.path().join("plugins").join("b");
     std::fs::create_dir_all(&install_a).unwrap();
     std::fs::create_dir_all(&install_b).unwrap();
+    // b@mp 账本声明 `srv-b`：补有效 bundled server 文件，使 enable(b@mp) 代表**真实可用**插件。
+    // #274 后 enable 预检会拒绝「空根 + 声明 server 不可投影」的假成功形态（旧夹具正是该形态）。
+    let b_servers = install_b.join("mcp-servers");
+    std::fs::create_dir_all(&b_servers).unwrap();
+    std::fs::write(
+        b_servers.join("srv-b.json"),
+        r#"{"type":"stdio","name":"srv-b","server_parameters":{"command":"node"}}"#,
+    )
+    .unwrap();
 
     update_known_marketplaces(
         |f| {
