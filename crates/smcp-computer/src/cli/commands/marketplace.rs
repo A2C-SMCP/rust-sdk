@@ -899,15 +899,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_hostless_url_rejected_without_trust_or_ledger_writes() {
+    async fn add_unsafe_source_rejected_without_trust_or_ledger_writes() {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let env = test_env(home);
         let mut registry = SkillRegistry::new();
         for raw in [
+            // hostless scheme
             "ssh:///alice:PW_LEAK@example.com",
             "ssh:/alice:PW_LEAK@example.com",
             "git:///alice:PW_LEAK@example.com",
+            // 合法 URL / scp-like，但派生段含 userinfo 形态
+            "file:///alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK@example.com",
         ] {
             // --trust 不得绕过身份校验：hostless 必须在信任门与账本写入之前拒绝。
             let code = marketplace_add(

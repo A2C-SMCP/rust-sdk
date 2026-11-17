@@ -772,6 +772,14 @@ mod tests {
             ("ssh:/alice:PW_LEAK@example.com", false),
             ("git:///alice:PW_LEAK@example.com", false),
             ("ssh://", false),
+            // Url::parse 失败分支：empty host / 非法端口。
+            ("ssh://user:pw@/repo", false),
+            ("ssh://host:notaport/repo", false),
+            // IPv6 host 与特殊 scheme 归一形态。
+            ("ssh://[::1]/repo.git", true),
+            ("ssh://[::1]:22/repo.git", true),
+            ("https:///hostless", true), // WHATWG 归一为 host=hostless
+            ("file:/abs/repo", false),   // 缺 `://`
             ("not a url", false),
             ("ftp://host/x", false),
             ("", false),
@@ -1170,7 +1178,7 @@ mod tests {
 
     #[test]
     fn test_extra_marketplaces_bad_entry_filtered() {
-        let cases: [(&str, Value, &str); 5] = [
+        let cases: [(&str, Value, &str); 6] = [
             (
                 "Bad_Name",
                 json!({"source": {"type": "git", "url": "git@h:p"}}),
@@ -1184,6 +1192,11 @@ mod tests {
             (
                 "ok-mp",
                 json!({"source": {"type": "git", "url": "garbage"}}),
+                "extraKnownMarketplaces.ok-mp.source.url",
+            ),
+            (
+                "ok-mp",
+                json!({"source": {"type": "git", "url": "ssh:///alice:PW_LEAK@example.com"}}),
                 "extraKnownMarketplaces.ok-mp.source.url",
             ),
             (

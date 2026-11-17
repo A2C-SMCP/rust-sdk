@@ -566,6 +566,8 @@ mod tests {
         assert!(normalize_repo_shorthand("git@github.com:owner/repo", GITHUB_HOST).is_err());
         assert!(normalize_repo_shorthand("https://github.com/owner/repo", GITHUB_HOST).is_err());
         assert!(normalize_repo_shorthand("owner-only", GITHUB_HOST).is_err());
+        // #285：hostless scheme 残形不得被简写糖展开。
+        assert!(normalize_repo_shorthand("ssh:/foo", GITHUB_HOST).is_err());
     }
 
     // ---- marketplace_clone_url ----

@@ -182,6 +182,10 @@ pub fn normalize_marketplace_url(raw: &str) -> Option<String> {
 }
 
 /// 从 git URL 末段派生严格-kebab marketplace 名（去 `.git`、非字母数字折叠为 `-`）/ derive a kebab name。
+///
+/// #285：仅对 [`is_valid_git_url`] 认可的源派生，且派生段含 `:`/`@`（userinfo 形态）时返回 `None`。
+/// 因此 hostless scheme、`host:repo`、`SSH://host/repo`、`file:/abs/repo` 等旧可派生形态不再产出名称
+/// （公开 API 行为收窄，见 PR / release notes）。
 #[must_use]
 pub fn default_marketplace_name(url: &str) -> Option<String> {
     let raw = url.trim();
@@ -209,6 +213,10 @@ pub fn default_marketplace_name(url: &str) -> Option<String> {
             .to_string()
     };
     let seg = segment.strip_suffix(".git").unwrap_or(&segment);
+    // #285：派生段含 userinfo 形态（`:`/`@`）时 fail-closed；合法 repo 名不含这两个字符。
+    if seg.contains([':', '@']) {
+        return None;
+    }
 
     // `re.sub(r"[^a-z0-9]+", "-", seg.lower()).strip("-")`：小写后非 [a-z0-9] 连续段折叠为单 `-`。
     let mut slug = String::new();
@@ -634,6 +642,23 @@ mod tests {
             default_marketplace_name("ssh://example.com/org/repo.git"),
             Some("repo".to_string())
         );
+        // #285 复审：合法 URL 但派生段含 userinfo 形态 → None（防 file:/scp-like 凭据 slug）。
+        assert_eq!(
+            default_marketplace_name("file:///alice:PW_LEAK@example.com"),
+            None
+        );
+        assert_eq!(
+            default_marketplace_name("git@host:alice:PW_LEAK@example.com"),
+            None
+        );
+        assert_eq!(
+            default_marketplace_name("file:///abs/path/repo"),
+            Some("repo".to_string())
+        );
+        // 收窄集合 pin（公开 API 行为变更）：旧实现可派生、新守卫拒绝。
+        assert_eq!(default_marketplace_name("host:repo"), None);
+        assert_eq!(default_marketplace_name("SSH://host/repo"), None);
+        assert_eq!(default_marketplace_name("file:/abs/repo"), None);
     }
 
     #[test]
