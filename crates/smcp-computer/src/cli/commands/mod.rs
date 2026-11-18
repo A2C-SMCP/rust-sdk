@@ -284,6 +284,17 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
         self.existing.lock().expect("existing mutex").clone()
     }
 
+    /// 本 hook 的既有集恒为**运行期已挂载**（构造期快照自 manager + 本实例 register/remove 增量），
+    /// 显式声明为挂载权威（#286 复审 🟡5）。
+    fn mounted_servers(&self) -> std::collections::HashSet<BundleId> {
+        self.existing
+            .lock()
+            .expect("existing mutex")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError> {
         // 无 scope 路径（trait 必需方法 + 外部直接调用）：走公开 [`Computer::mount_server`]（裸 input 仅全局解析）。
         // plugin-bound 注册走 [`Self::register_server_with_input_scope`]。

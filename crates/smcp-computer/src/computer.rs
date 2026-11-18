@@ -1645,15 +1645,12 @@ impl<S: Session> Computer<S> {
         //    （disabled/待审批）被误当已挂载；③ 五层 settings 解析——门控覆盖 flag/policy 的 enabledPlugins；
         // ④ gate 锚点：调用方 project_path（写盘锚）回退本实例 config_dir。
         let non_plugin = self.non_plugin_declared_bundle_ids(&home, env);
-        let resolved_settings = self.resolved_runtime_settings();
+        // 🔴1：provider 在失败回滚后求值（不得在此快照——回滚写 false 须被读到）；🟡2：env 与本次
+        // enable 的读写同源（effective env，而非 config_env）。
+        let resolved_settings = || self.resolved_runtime_settings(env);
         let config_dir = self.config_dir();
         let gate_project_path = options.project_path.or_else(|| config_dir.to_str());
-        let mounted: HashSet<BundleId> = self
-            .list_mcp_servers()
-            .await
-            .iter()
-            .map(crate::mcp_clients::bundle_id::resolve_bundle_id)
-            .collect();
+        let mounted = self.mounted_bundle_ids().await;
         let reclaim_ctx = crate::settings::installer::EnableReclaimContext {
             gate_project_path,
             resolved_settings: Some(&resolved_settings),
@@ -1695,16 +1692,28 @@ impl<S: Session> Computer<S> {
     /// #286 复审 🟡4：enable 失败回滚的 any-scope 门控凭此覆盖 **flag（`--settings`）/policy** 的
     /// `enabledPlugins`（只读文件三层会漏掉高层显式 true）。每次现算、零持久态（与
     /// [`resolve_settings`](crate::settings::scope::resolve_settings) 同源）。
-    pub(crate) fn resolved_runtime_settings(&self) -> serde_json::Map<String, serde_json::Value> {
+    pub(crate) fn resolved_runtime_settings(
+        &self,
+        env: Option<&EnvMap>,
+    ) -> serde_json::Map<String, serde_json::Value> {
         let config_dir = self.config_dir();
-        let policy = resolve_policy_settings(None, None, None);
+        let policy = resolve_policy_settings(env, None, None);
         resolve_settings(ResolveSettingsArgs {
             cwd: Some(&config_dir),
-            env: self.config_env(),
+            env,
             flag_settings_path: self.flag_settings_path.as_deref(),
             policy_settings: Some(&policy),
         })
         .settings
+    }
+
+    /// 运行期**已挂载**的 bundle_id 集（manager 活跃集；existing-wins 权威，#286 复审 🔴1）。
+    pub(crate) async fn mounted_bundle_ids(&self) -> HashSet<BundleId> {
+        self.list_mcp_servers()
+            .await
+            .iter()
+            .map(crate::mcp_clients::bundle_id::resolve_bundle_id)
+            .collect()
     }
 
     /// #139/§4.9.1-2 回收判据「X 非用户声明」项的数据源：**带 origin 的运行期权威配置集中 `origin != plugin`
@@ -2101,7 +2110,9 @@ impl<S: Session> Computer<S> {
         if let Some(h) = hooks {
             // #139：去重按 **bundle_id**（身份键）——name 允许碰撞、非身份。同名不同 bundle_id 的合法 server
             // 不再互相隐身；同 bundle_id 已存在 → 既有/用户配置胜（首见胜，additive-only）。
-            let mut existing: HashSet<BundleId> = h.existing_servers().into_keys().collect();
+            // #286 复审 🟡3：挂载权威 = **运行期已挂载集**（声明面 hook 的 `existing_servers` 含
+            // disabled/待审批，用它跳过会复现「enabled 但零 server 投影」半态）。
+            let mut existing: HashSet<BundleId> = h.mounted_servers();
             let mut injected_roots: HashSet<PathBuf> = HashSet::new();
             // #214：重挂成功的 bundled server 收齐后经**统一批量启动器**一次启动（共享 Computer 级
             // 并发控件，避免恢复路径绕过上限；best-effort 降级语义见循环后 WARN）。
@@ -7132,6 +7143,8 @@ mod tests {
         injected_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
         existing: std::collections::HashSet<String>,
         fail_register: Option<String>,
+        /// `true` ⇒ `mounted_servers` 为空（模拟「声明面 hook」：existing 含未挂载声明）。
+        declaration_only: bool,
     }
     impl RecordingRemountHooks {
         fn new() -> Self {
@@ -7140,6 +7153,7 @@ mod tests {
                 injected_roots: std::sync::Mutex::new(Vec::new()),
                 existing: std::collections::HashSet::new(),
                 fail_register: None,
+                declaration_only: false,
             }
         }
         fn failing(name: &str) -> Self {
@@ -7155,6 +7169,11 @@ mod tests {
                 ..Self::new()
             }
         }
+        /// 声明面 hook：existing 只是声明（未挂载）→ mounted 权威为空（#286 复审 🟡3）。
+        fn declaration_only(mut self) -> Self {
+            self.declaration_only = true;
+            self
+        }
     }
     #[async_trait::async_trait]
     impl McpInstallHooks for RecordingRemountHooks {
@@ -7163,6 +7182,13 @@ mod tests {
                 .iter()
                 .filter_map(|n| BundleId::try_from(n.clone()).ok().map(|b| (b, n.clone())))
                 .collect()
+        }
+        fn mounted_servers(&self) -> std::collections::HashSet<BundleId> {
+            if self.declaration_only {
+                std::collections::HashSet::new()
+            } else {
+                self.existing_servers().into_keys().collect()
+            }
         }
         async fn register_server(
             &self,
@@ -7395,6 +7421,117 @@ mod tests {
             .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
             .await;
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
+    }
+
+    /// #286 复审 🟡3：reconcile 的 existing-wins 用**运行期挂载集**——声明面命中但未挂载仍应重挂。
+    #[tokio::test]
+    async fn reconcile_remount_ignores_declaration_only_existing_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        let comp_b = Computer::new("b286", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-286r"));
+        let hooks = RecordingRemountHooks::with_existing(&["audit-mcp"]).declaration_only();
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+        assert_eq!(report.remounted_servers, vec!["audit-mcp".to_string()]);
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "声明面命中但未挂载 → reconcile MUST 重挂（不得复现零投影半态）"
+        );
+    }
+
+    /// #286 复审 🟡4：Computer 注入 manager 已挂载集为 existing-wins 权威——hooks 声明面为空也不重挂已挂载实例。
+    #[tokio::test]
+    async fn enable_plugin_skips_remount_for_runtime_mounted_server_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_root = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg_root).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_root.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let comp = Computer::new("c286a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-286a"));
+        comp.boot_up().await.unwrap();
+        let server_cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "audit-mcp",
+            "server_parameters": {"command": "node"}
+        }))
+        .unwrap();
+        comp.mount_server(server_cfg).await.unwrap();
+        let hooks = RecordingRemountHooks::new();
+        comp.enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap();
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "运行期已挂载 → MUST existing-wins 跳过（Computer 注入 mounted_bundle_ids）"
+        );
+    }
+
+    /// #286 复审 🔴1/🟡4：Computer 注入五层解析 **provider**（含 flag）——flag-only enabled=true 时
+    /// 失败回滚 MUST 保留已挂 server（provider 在回滚后求值，且不得被回滚写 false 掩盖）。
+    #[tokio::test]
+    async fn enable_plugin_failure_keeps_server_for_flag_only_enabled_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_root = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg_root).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_root.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let flag_file = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag_file, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let comp = Computer::new("c286b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env)
+            .with_flag_settings_path(&flag_file)
+            .with_blob_cache_root(tmp.path().join("blob-286b"));
+        comp.boot_up().await.unwrap();
+        let server_cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "audit-mcp",
+            "server_parameters": {"command": "node"}
+        }))
+        .unwrap();
+        comp.mount_server(server_cfg).await.unwrap();
+        // 破坏安装根 → enable 预检失败。
+        let records = crate::settings::store::load_installed_plugins(Some(&home), None)
+            .account
+            .plugins
+            .get("audit@acme")
+            .cloned()
+            .unwrap();
+        let root = std::path::PathBuf::from(records[0].install_path.clone().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let hooks = MountingRemountHooks::new(&comp);
+        let err = comp
+            .enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
+        ));
+        assert!(
+            comp.list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "flag-only enabled=true → 失败回滚 MUST 保留 server（resolved provider 注入）"
+        );
     }
 
     /// #165 Option B（变异验证判据）：project-scope `enabledPlugins=true`（入 git、随仓库分发）激活的 plugin

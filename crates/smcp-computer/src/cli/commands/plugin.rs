@@ -300,8 +300,9 @@ pub async fn plugin_enable(
 ///
 /// scope 契约：从 ledger 逐 scope 读；每条记录 register 之前先 `inject_inputs(installPath)`。
 /// `project_path_hint`：记录缺 `projectPath` 时的写盘/门控锚点（REPL 传 cwd；一次性子命令传 `None`）。
-/// `resolved_settings`：运行期五层 settings 合并视图（`Computer::resolved_runtime_settings`）——门控覆盖
-/// flag/policy 的 `enabledPlugins`（🟡4）。
+/// `resolved_settings`：运行期五层 settings 合并视图的 **provider**（`Computer::resolved_runtime_settings`）——
+/// 门控覆盖 flag/policy 的 `enabledPlugins`（🟡4）；**MUST 在失败回滚后求值**（🔴1，见
+/// `EnableReclaimContext`）。
 /// `non_plugin_bundle_ids`：失败回滚的 §4.9.1-2 回收判据「非用户声明」数据源，MUST 由持有 `Computer`
 /// 的调用方供给（REPL）；一次性子命令无活跃 server（hooks=None）→ `None`（不摘）。
 #[allow(clippy::too_many_arguments)] // CLI handler：显式资源 + flags（同 plugin_disable 风格）
@@ -311,7 +312,7 @@ pub async fn plugin_enable_with_paths(
     env: Option<&EnvMap>,
     plugin_id: &str,
     project_path_hint: Option<&str>,
-    resolved_settings: Option<&Map<String, Value>>,
+    resolved_settings: Option<&dyn Fn() -> Map<String, Value>>,
     non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
     hooks: Option<&dyn McpInstallHooks>,
     json_output: bool,
@@ -797,6 +798,38 @@ mod tests {
         assert!(
             hooks_b.removed.lock().unwrap().is_empty(),
             "hint 未接线 → 门控看不到 project enabled=true，会误回收"
+        );
+
+        // C) resolved provider 接线：flag/policy-only true（文件三层无值）→ 门控保留（不回收）。
+        let dir_c = tempdir().unwrap();
+        let env_c = test_env(dir_c.path());
+        seed_plugin(dir_c.path(), &env_c, "figma@acme", "user");
+        let provider = || {
+            let mut ep = Map::new();
+            ep.insert("figma@acme".to_string(), Value::Bool(true));
+            let mut m = Map::new();
+            m.insert("enabledPlugins".to_string(), Value::Object(ep));
+            m
+        };
+        let hooks_c = RecordingHooks {
+            removed: Mutex::new(Vec::new()),
+        };
+        let code = plugin_enable_with_paths(
+            &mut SkillRegistry::new(),
+            dir_c.path(),
+            Some(&env_c),
+            "figma@acme",
+            None,
+            Some(&provider),
+            Some(&HashSet::new()),
+            Some(&hooks_c),
+            true,
+        )
+        .await;
+        assert_eq!(code, EXIT_USER_ERROR);
+        assert!(
+            hooks_c.removed.lock().unwrap().is_empty(),
+            "resolved provider 未接线 → flag/policy-only true 被忽略，会误回收"
         );
     }
 

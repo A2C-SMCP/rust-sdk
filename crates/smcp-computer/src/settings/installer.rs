@@ -232,6 +232,16 @@ pub trait McpInstallHooks: Send + Sync {
     /// 默认退化为 [`existing_servers`](Self::existing_servers) 的键集（兼容旧 hook，但要求其返回的是**实时
     /// 已挂载实例**）。若本 hook 的 `existing_servers` 含声明面（disabled / 待审批等），**MUST** 覆盖本方法
     /// 只返回已挂载者；`Computer::enable_plugin` 亦会直接注入 manager 活跃集，不依赖本方法。
+    ///
+    /// 声明面 hook 示例：
+    /// ```text
+    /// fn existing_servers(&self) -> HashMap<BundleId, ServerName> {
+    ///     self.declared.clone()            // 声明面（含未挂载）
+    /// }
+    /// fn mounted_servers(&self) -> HashSet<BundleId> {
+    ///     self.live_mounted.keys().cloned().collect()   // 运行期已挂载
+    /// }
+    /// ```
     fn mounted_servers(&self) -> HashSet<BundleId> {
         self.existing_servers().into_keys().collect()
     }
@@ -797,9 +807,11 @@ fn restore_enabled_plugin(
 pub(crate) struct EnableReclaimContext<'a> {
     /// 运行期锚点（CLI cwd / `Computer::config_dir`）：无五层解析结果时的 project/local 文件合并锚点。
     pub gate_project_path: Option<&'a str>,
-    /// 运行期五层 settings 合并视图（user<project<local<flag<policy，锚定运行期 cwd）；`Some` ⇒ 门控以它
-    /// 为运行期权威（覆盖 flag/policy 的 `enabledPlugins`）。
-    pub resolved_settings: Option<&'a Map<String, Value>>,
+    /// 运行期五层 settings 合并视图的 **provider**（user<project<local<flag<policy，锚定运行期 cwd）。
+    ///
+    /// **MUST 在失败回滚后求值**（门控读到的是本次回滚写出的状态），不得在 enable 开始前快照——否则
+    /// 「prior=true → 回滚写 false」仍会被旧快照的 true 掩盖，留下「磁盘 disabled、投影仍在」（#286 复审 🔴1）。
+    pub resolved_settings: Option<&'a dyn Fn() -> Map<String, Value>>,
     /// 运行期**已挂载** bundle_id 集（existing-wins 权威）。`None` ⇒ 回退 `hooks.mounted_servers()`。
     pub mounted_bundle_ids: Option<&'a HashSet<BundleId>>,
     /// §4.9.1-2 回收判据「非用户声明」集。`None` ⇒ 失败回滚 **MUST NOT** 摘任何 server。
@@ -819,14 +831,16 @@ fn plugin_enabled_in_any_scope(
     plugin_id: &str,
     records: &[InstalledPluginRecord],
     gate_project_path: Option<&str>,
-    resolved_settings: Option<&Map<String, Value>>,
+    resolved_settings: Option<&dyn Fn() -> Map<String, Value>>,
     env: Option<&EnvMap>,
 ) -> bool {
-    // ① 运行期五层解析（含 flag/policy）：Some(true) 保留。
-    let resolved = resolved_settings
-        .and_then(|s| s.get(FIELD_ENABLED_PLUGINS))
-        .and_then(|m| m.get(plugin_id))
-        .and_then(Value::as_bool);
+    // ① 运行期五层解析（含 flag/policy）：**失败回滚后求值**；Some(true) 保留。
+    let resolved = resolved_settings.and_then(|provider| {
+        provider()
+            .get(FIELD_ENABLED_PLUGINS)
+            .and_then(|m| m.get(plugin_id))
+            .and_then(Value::as_bool)
+    });
     if resolved == Some(true) {
         return true;
     }
@@ -5550,13 +5564,16 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
 
         // 解析视图（如 flag/policy 层）显式 true；文件三层无该键。
-        let mut ep = Map::new();
-        ep.insert("audit@acme".to_string(), Value::Bool(true));
-        let mut settings = Map::new();
-        settings.insert("enabledPlugins".to_string(), Value::Object(ep));
+        let settings_provider = || {
+            let mut ep = Map::new();
+            ep.insert("audit@acme".to_string(), Value::Bool(true));
+            let mut settings = Map::new();
+            settings.insert("enabledPlugins".to_string(), Value::Object(ep));
+            settings
+        };
         let h2 = RecordingHooks::new().with_existing(&["audit-mcp"]);
         let ctx = EnableReclaimContext {
-            resolved_settings: Some(&settings),
+            resolved_settings: Some(&settings_provider),
             non_plugin_bundle_ids: Some(&HashSet::new()),
             ..Default::default()
         };
@@ -5578,6 +5595,85 @@ mod tests {
             h2.removed.lock().unwrap().is_empty(),
             "五层解析 true（flag/policy）→ MUST 保留 server"
         );
+    }
+
+    /// 🔴1：resolved provider MUST 在**失败回滚后**求值——prior=true 回滚写 false 后不得被旧快照掩盖
+    /// （否则磁盘 installed_disabled、运行期 server/SKILL 仍在，违 §2.4）。
+    #[tokio::test]
+    async fn enable_failure_with_resolved_provider_evaluated_after_rollback_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        let hooks = RecordingHooks::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        let root = PathBuf::from(
+            ledger_records(&home, &env, "audit@acme")[0]
+                .install_path
+                .clone()
+                .unwrap(),
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // provider 模拟运行期解析：每次调用现读 settings（回滚后应读到 false/absent）。
+        let provider = || {
+            let mut settings = Map::new();
+            if let Some(v) = enabled_plugin_raw_value("audit@acme", "user", None, Some(&env)) {
+                let mut ep = Map::new();
+                ep.insert("audit@acme".to_string(), Value::Bool(v));
+                settings.insert("enabledPlugins".to_string(), Value::Object(ep));
+            }
+            settings
+        };
+        let h2 = RecordingHooks::new().with_existing(&["audit-mcp"]);
+        let ctx = EnableReclaimContext {
+            resolved_settings: Some(&provider),
+            non_plugin_bundle_ids: Some(&HashSet::new()),
+            ..Default::default()
+        };
+        let err = enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            ctx,
+            Some(&h2),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::ContentUnavailable { .. }));
+        assert_eq!(
+            *h2.removed.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "回滚后 provider=false → MUST 回收（快照语义会漏摘）"
+        );
+        assert_eq!(enabled_flag(&env, "audit@acme"), Some(false));
     }
 
     // ---- v0.3.0 一次性迁移 / migration --------------------------------------
