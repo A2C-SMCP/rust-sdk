@@ -221,7 +221,20 @@ pub trait McpInstallHooks: Send + Sync {
     ///
     /// #139/R4：由 `existing_server_names() -> HashSet<String>` 改按 **bundle_id 寻址**（display 名仅供
     /// 「依赖已满足」诊断呈现，非身份键）。`register_server` 与本方法结构性成对，杜绝 §10.6 静默旁路。
+    ///
+    /// ⚠️ 语义边界（#286 复审 🔴1）：本方法供**诊断/预检**，**不是** existing-wins 的挂载权威——部分 client
+    /// hook（如声明面 hook）会把 disabled / 待审批未挂载的声明也返回。跳过挂载的唯一权威是
+    /// [`mounted_servers`](Self::mounted_servers)。
     fn existing_servers(&self) -> HashMap<BundleId, ServerName>;
+
+    /// 运行期**已挂载**的 bundle_id 集（existing-wins 的挂载权威，§2.5-1；#286 复审 🔴1）。
+    ///
+    /// 默认退化为 [`existing_servers`](Self::existing_servers) 的键集（兼容旧 hook，但要求其返回的是**实时
+    /// 已挂载实例**）。若本 hook 的 `existing_servers` 含声明面（disabled / 待审批等），**MUST** 覆盖本方法
+    /// 只返回已挂载者；`Computer::enable_plugin` 亦会直接注入 manager 活跃集，不依赖本方法。
+    fn mounted_servers(&self) -> HashSet<BundleId> {
+        self.existing_servers().into_keys().collect()
+    }
     /// 注册 / 更新一个 server（含 `${input:}` 渲染）/ register or update a server。
     ///
     /// # Errors
@@ -775,62 +788,88 @@ fn restore_enabled_plugin(
     }
 }
 
-/// 该 pid 是否在任一（账本记录涉及的）scope 仍有效启用：按 `user < project < local` 优先级合并各 scope
-/// 的 raw `enabledPlugins`（显式值覆盖下层；缺省不覆盖）。policy/managed 只读层不参与——SDK 不写它们。
+/// enable 失败回滚的上下文（内部 seam，`#286`）：承载回收与门控所需的**运行期权威**。
 ///
-/// project/local 的锚点 = 账本记录 `projectPath` ∪ 调用方 `project_path`（去重、过滤空串）。记录缺失
-/// （如 rematerialize 后记录恒为 `scope=user` 且无 projectPath）时调用方 `project_path` 仍覆盖该 scope；
-/// 且同一 scope 的多层锚点**任一读到 `true` 即视为该 scope 启用**——回收门控取保守侧（宁可保留，不可
-/// 误摘；#286 复审 🟡2：记录锚 A 与调用方锚 B 不同项目时，只读 A 会误摘 B 仍需要的 server）。
+/// 全部字段缺省 = 不可用（公开 `enable_plugin` 路径）——不回收 server、existing-wins 退回 hook 的
+/// [`mounted_servers`](McpInstallHooks::mounted_servers)、门控只看文件三层（不读 flag/policy 层，见
+/// [`plugin_enabled_in_any_scope`]）。
+#[derive(Default)]
+pub(crate) struct EnableReclaimContext<'a> {
+    /// 运行期锚点（CLI cwd / `Computer::config_dir`）：无五层解析结果时的 project/local 文件合并锚点。
+    pub gate_project_path: Option<&'a str>,
+    /// 运行期五层 settings 合并视图（user<project<local<flag<policy，锚定运行期 cwd）；`Some` ⇒ 门控以它
+    /// 为运行期权威（覆盖 flag/policy 的 `enabledPlugins`）。
+    pub resolved_settings: Option<&'a Map<String, Value>>,
+    /// 运行期**已挂载** bundle_id 集（existing-wins 权威）。`None` ⇒ 回退 `hooks.mounted_servers()`。
+    pub mounted_bundle_ids: Option<&'a HashSet<BundleId>>,
+    /// §4.9.1-2 回收判据「非用户声明」集。`None` ⇒ 失败回滚 **MUST NOT** 摘任何 server。
+    pub non_plugin_bundle_ids: Option<&'a HashSet<BundleId>>,
+}
+
+/// 该 pid 是否在任一（运行期 + 账本记录涉及的）scope 仍有效启用。
+///
+/// **运行期权威优先**：`resolved_settings`（五层合并，含 flag/policy）`Some(true)` → 保留；未给时回退
+/// 「运行期锚点（`gate_project_path`）上的 user<project<local 文件合并」。**账本记录锚点只作 keep-only**：
+/// 记录 `projectPath` 上读到 `true` 也保留；其 `false` **MUST NOT** 否决运行期 `true`（#286 复审 🔴2：
+/// A 项目的显式 false 不得摘掉 B 运行期仍 enabled 的 server）。
+///
+/// 注：公开 `enable_plugin`（ctx 缺省）不读 flag/policy 层；嵌入方/CLI 经 [`EnableReclaimContext`] 提供
+/// `resolved_settings` 后完整覆盖五层（#286 复审 🟡4）。
 fn plugin_enabled_in_any_scope(
     plugin_id: &str,
     records: &[InstalledPluginRecord],
-    project_path: Option<&str>,
+    gate_project_path: Option<&str>,
+    resolved_settings: Option<&Map<String, Value>>,
     env: Option<&EnvMap>,
 ) -> bool {
-    let mut effective: Option<bool> = None;
-    for scope in ["user", "project", "local"] {
-        if scope == "user" {
-            if let Some(v) = enabled_plugin_raw_value(plugin_id, scope, None, env) {
-                effective = Some(v);
-            }
-            continue;
-        }
-        let mut anchors: Vec<&str> = Vec::new();
-        for r in records {
-            let rec_scope = r
-                .extra
-                .get("scope")
-                .and_then(Value::as_str)
-                .unwrap_or("user");
-            if rec_scope != scope {
-                continue;
-            }
-            if let Some(pp) = r
-                .extra
-                .get("projectPath")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                anchors.push(pp);
-            }
-        }
-        if let Some(pp) = project_path.filter(|s| !s.is_empty()) {
-            anchors.push(pp);
-        }
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut scope_value: Option<bool> = None;
-        for pp in anchors.into_iter().filter(|pp| seen.insert(*pp)) {
-            if let Some(v) = enabled_plugin_raw_value(plugin_id, scope, Some(pp), env) {
-                // 同 scope 多锚点：任一 true 即 true（保守侧；显式 false 不覆盖其他锚的 true）。
-                scope_value = Some(scope_value.unwrap_or(false) || v);
-            }
-        }
-        if let Some(v) = scope_value {
+    // ① 运行期五层解析（含 flag/policy）：Some(true) 保留。
+    let resolved = resolved_settings
+        .and_then(|s| s.get(FIELD_ENABLED_PLUGINS))
+        .and_then(|m| m.get(plugin_id))
+        .and_then(Value::as_bool);
+    if resolved == Some(true) {
+        return true;
+    }
+    // ② 无五层视图：运行期锚点上的文件三层合并（user < project < local）。
+    if resolved_settings.is_none() {
+        let mut effective: Option<bool> = None;
+        if let Some(v) = enabled_plugin_raw_value(plugin_id, "user", None, env) {
             effective = Some(v);
         }
+        if let Some(pp) = gate_project_path.filter(|s| !s.is_empty()) {
+            for scope in ["project", "local"] {
+                if let Some(v) = enabled_plugin_raw_value(plugin_id, scope, Some(pp), env) {
+                    effective = Some(v);
+                }
+            }
+        }
+        if effective == Some(true) {
+            return true;
+        }
     }
-    effective == Some(true)
+    // ③ keep-only：账本记录锚点读到 true（不得用其 false 否决运行期 true）。
+    for r in records {
+        let rec_scope = r
+            .extra
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if rec_scope != "project" && rec_scope != "local" {
+            continue;
+        }
+        let Some(pp) = r
+            .extra
+            .get("projectPath")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if enabled_plugin_raw_value(plugin_id, rec_scope, Some(pp), env) == Some(true) {
+            return true;
+        }
+    }
+    false
 }
 
 /// enable 失败后回滚 SKILL 投影：仅当该 pid 在**任何 scope 都不再启用**时才 orphan 全部活跃 SKILL；
@@ -842,10 +881,16 @@ fn rollback_plugin_skills_on_failure(
     plugin: &str,
     plugin_id: &str,
     records: &[InstalledPluginRecord],
-    project_path: Option<&str>,
+    ctx: &EnableReclaimContext<'_>,
     env: Option<&EnvMap>,
 ) {
-    if plugin_enabled_in_any_scope(plugin_id, records, project_path, env) {
+    if plugin_enabled_in_any_scope(
+        plugin_id,
+        records,
+        ctx.gate_project_path,
+        ctx.resolved_settings,
+        env,
+    ) {
         tracing::info!(
             plugin = plugin_id,
             "enable rollback: another scope keeps plugin enabled; SKILL projection kept"
@@ -860,23 +905,27 @@ fn rollback_plugin_skills_on_failure(
 /// **与 SKILL 同门控**：仅当该 pid 在**任何 scope 都不再启用**时才摘；另一 scope 仍 `true` → 保留既有实例。
 /// **判据必需**：`non_plugin_bundle_ids == None` ⇒ **MUST NOT** 摘除（盲摘会连坐用户/宿主自有 server）。
 /// 回收集合 = `reclaimable_mcp_deps(本 plugin 声明依赖, 其他 plugin 依赖, 非用户声明集)`；`skip` 为调用方
-/// 已精确摘除者（remount 失败路径的 `remounted`），避免重复摘除。摘除失败仅 WARN——best-effort，不掩盖原始
-/// 失败原因。
-#[allow(clippy::too_many_arguments)]
+/// **已成功摘除者**（register 失败路径的 `removed` 集），避免重复摘除（摘除失败者仍留给回收重试）。
+/// 摘除失败仅 WARN——best-effort，不掩盖原始失败原因。
 async fn reclaim_failed_enable_servers(
     plugin_id: &str,
     home: &Path,
     records: &[InstalledPluginRecord],
-    project_path: Option<&str>,
+    ctx: &EnableReclaimContext<'_>,
     env: Option<&EnvMap>,
-    non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
     hooks: Option<&dyn McpInstallHooks>,
     skip: &HashSet<BundleId>,
 ) {
-    let (Some(h), Some(non_plugin)) = (hooks, non_plugin_bundle_ids) else {
+    let (Some(h), Some(non_plugin)) = (hooks, ctx.non_plugin_bundle_ids) else {
         return;
     };
-    if plugin_enabled_in_any_scope(plugin_id, records, project_path, env) {
+    if plugin_enabled_in_any_scope(
+        plugin_id,
+        records,
+        ctx.gate_project_path,
+        ctx.resolved_settings,
+        env,
+    ) {
         tracing::info!(
             plugin = plugin_id,
             "enable rollback: another scope keeps plugin enabled; bundled servers kept"
@@ -971,7 +1020,7 @@ fn conflict_check(
                 plugin = plugin_id,
                 bundle_id = %bid.as_str(),
                 existing = %existing_name,
-                "#139/D3: declared MCP dependency already satisfied by an existing server; will reuse the existing instance (§2.5-1)"
+                "#139/D3: declared MCP dependency already present in the declaration set; remount decision uses the runtime mounted set (§2.5-1)"
             );
         }
     }
@@ -1606,8 +1655,10 @@ pub async fn disable_plugin(
 ///   `installed_disabled`，§2.4）；absent / `false` 保持不动（不无谓创建 settings 键）。
 /// - **写后失败**：精确还原目标 scope 的**调用前原值**（absent → 删键，不升级成显式 `false`）。
 /// - **投影回收（同门控）**：仅当该 pid **在任何 scope 都不再启用**时才 orphan 活跃 SKILL 并回收其
-///   bundled server（§4.9.1-2：无其他 plugin 依赖 ∧ 非用户声明）。公开入口不带回收判据（`None`）⇒
-///   **不摘 server**——判据须由持有运行期权威配置集的调用方经 `enable_plugin_with_reclaim` 供给。
+///   bundled server（§4.9.1-2：无其他 plugin 依赖 ∧ 非用户声明）。公开入口不带运行期权威
+///   （`EnableReclaimContext` 缺省）⇒ **不摘 server**、existing-wins 退回 hook 的
+///   [`McpInstallHooks::mounted_servers`]、门控只看文件三层——完整权威（回收判据 / manager 挂载集 /
+///   五层含 flag·policy 的 settings / 运行期锚点）须经 `enable_plugin_with_reclaim` 供给。
 ///
 /// ⚠️ **scope 契约**：同 [`disable_plugin`]。
 ///
@@ -1624,30 +1675,43 @@ pub async fn enable_plugin(
     options: EnableOptions<'_>,
     hooks: Option<&dyn McpInstallHooks>,
 ) -> Result<bool, PluginInstallError> {
-    enable_plugin_with_reclaim(plugin_id, registry, home, options, None, hooks).await
+    enable_plugin_with_reclaim(
+        plugin_id,
+        registry,
+        home,
+        options,
+        EnableReclaimContext::default(),
+        hooks,
+    )
+    .await
 }
 
-/// [`enable_plugin`] 的内部 seam（#286）：额外携带 §4.9.1-2 回收判据的「非用户声明」bundle_id 集。
+/// [`enable_plugin`] 的内部 seam（#286）：额外携带运行期权威（[`EnableReclaimContext`]）。
 ///
 /// - `non_plugin_bundle_ids == None` ⇒ 失败回滚 **MUST NOT** 摘除任何 server（公开入口即此形态——盲摘会
 ///   连坐用户/宿主自有 server）。
 /// - `Some(set)` ⇒ 失败且该 pid 在任何 scope 都不再启用时，摘除
 ///   `reclaimable_mcp_deps(本 plugin 声明依赖, 其他 plugin 依赖, set)`；另一 scope 仍 enabled ⇒ 保留既有实例。
 ///
-/// **existing-wins（§2.5-1）**：remount 对 `existing_servers()` 中已存在的 bundle_id 跳过（不覆盖既有实例），
-/// 故 register 失败回滚只摘**本次真实新增**者。
+/// **existing-wins（§2.5-1）**：remount 对**运行期已挂载**的 bundle_id 跳过（不覆盖既有实例）——权威 =
+/// `ctx.mounted_bundle_ids`，缺省回退 [`McpInstallHooks::mounted_servers`]；**不得**用 `existing_servers()`
+/// 的声明面判定（#286 复审 🔴1）。register 失败回滚只摘**本次真实新增**者。
 pub(crate) async fn enable_plugin_with_reclaim(
     plugin_id: &str,
     registry: &mut SkillRegistry,
     home: &Path,
     options: EnableOptions<'_>,
-    non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
+    ctx: EnableReclaimContext<'_>,
     hooks: Option<&dyn McpInstallHooks>,
 ) -> Result<bool, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
     let scope = options.scope.unwrap_or("user");
     let timeout = options.timeout.unwrap_or(DEFAULT_GIT_TIMEOUT);
     let env = options.env;
+    // 门控锚点：调用方运行期锚点优先；未提供 → 回退本次写盘锚（`options.project_path`），兼容 installer
+    // 直接调用与既有测试（Computer/CLI 恒显式传运行期锚点）。
+    let mut ctx = ctx;
+    ctx.gate_project_path = ctx.gate_project_path.or(options.project_path);
     let installed = load_installed_plugins(Some(home), env);
     let records = match installed.account.plugins.get(plugin_id) {
         Some(r) if !r.is_empty() => r.clone(),
@@ -1677,9 +1741,8 @@ pub(crate) async fn enable_plugin_with_reclaim(
                     plugin_id,
                     home,
                     &records,
-                    options.project_path,
+                    &ctx,
                     env,
-                    non_plugin_bundle_ids,
                     hooks,
                     &HashSet::new(),
                 )
@@ -1690,7 +1753,7 @@ pub(crate) async fn enable_plugin_with_reclaim(
                     &plugin,
                     plugin_id,
                     &records,
-                    options.project_path,
+                    &ctx,
                     env,
                 );
                 return Err(e);
@@ -1722,9 +1785,8 @@ pub(crate) async fn enable_plugin_with_reclaim(
                 plugin_id,
                 home,
                 &records,
-                options.project_path,
+                &ctx,
                 env,
-                non_plugin_bundle_ids,
                 hooks,
                 &HashSet::new(),
             )
@@ -1735,7 +1797,7 @@ pub(crate) async fn enable_plugin_with_reclaim(
                 &plugin,
                 plugin_id,
                 &records,
-                options.project_path,
+                &ctx,
                 env,
             );
             return Err(e);
@@ -1770,24 +1832,15 @@ pub(crate) async fn enable_plugin_with_reclaim(
         if changed {
             restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
         }
-        reclaim_failed_enable_servers(
-            plugin_id,
-            home,
-            &records,
-            options.project_path,
-            env,
-            non_plugin_bundle_ids,
-            hooks,
-            &HashSet::new(),
-        )
-        .await;
+        reclaim_failed_enable_servers(plugin_id, home, &records, &ctx, env, hooks, &HashSet::new())
+            .await;
         rollback_plugin_skills_on_failure(
             registry,
             &marketplace,
             &plugin,
             plugin_id,
             &records,
-            options.project_path,
+            &ctx,
             env,
         );
         return Err(PluginNameConflictError {
@@ -1803,24 +1856,15 @@ pub(crate) async fn enable_plugin_with_reclaim(
         // 恢复 staging 前的 registry 快照（#274 复审 🟡4），再按「是否仍有 scope 启用」决定 SKILL 投影。
         *registry = snapshot;
         restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
-        reclaim_failed_enable_servers(
-            plugin_id,
-            home,
-            &records,
-            options.project_path,
-            env,
-            non_plugin_bundle_ids,
-            hooks,
-            &HashSet::new(),
-        )
-        .await;
+        reclaim_failed_enable_servers(plugin_id, home, &records, &ctx, env, hooks, &HashSet::new())
+            .await;
         rollback_plugin_skills_on_failure(
             registry,
             &marketplace,
             &plugin,
             plugin_id,
             &records,
-            options.project_path,
+            &ctx,
             env,
         );
         return Err(PluginInstallError::ContentUnavailable {
@@ -1836,21 +1880,26 @@ pub(crate) async fn enable_plugin_with_reclaim(
     //    半态——Sub-B 的 boot 恢复会据此复活半装 plugin。失败 → 摘除本次已挂 server + 恢复调用前
     //    `enabledPlugins` 原值 +（无任何 scope 仍启用时）回收 server 并 orphan 本 plugin skills。
     if let Some(h) = hooks {
-        // #286 复审 🟡3：以 ④ 时点重新取既有集——CLI 逐记录循环复用同一 hooks 实例，上一条记录刚挂的
-        // server 须在此可见（否则会被当「本次新增」重复注册，失败回滚还会误摘前序记录的成果）。
-        let existing = h.existing_servers();
+        // #286 复审 🔴1：existing-wins 的权威 = **运行期已挂载集**（`ctx.mounted_bundle_ids`，缺省回退
+        // `hooks.mounted_servers()`）。`existing_servers()` 可能是**声明面**（disabled / 待审批未挂载）——
+        // 用它跳过会把「声明了但没挂」误当「已满足」，插件 enabled=true 却零 server 投影。
+        // 以 ④ 时点取（活集 hook 可见前序记录刚挂的 server；🟡3）。
+        let mounted: HashSet<BundleId> = match ctx.mounted_bundle_ids {
+            Some(m) => m.clone(),
+            None => h.mounted_servers(),
+        };
         // #139：回滚按 **bundle_id** 寻址——挂前取身份（cfg 随后 move 入 register_server）。同 plugin 内两个
         // 同名、显式异 bundle_id 的 server，回滚时精确摘本次已挂那条，不再字典序最小误摘（消解回滚破原子性）。
         let mut remounted: Vec<BundleId> = Vec::new();
         for cfg in servers {
             let bid = resolve_bundle_id(&cfg);
-            // #286/§2.5-1 existing-wins：依赖已由既有实例满足 → 复用、**不重挂**（不覆盖用户/宿主实例；
+            // #286/§2.5-1 existing-wins：运行期已有挂载实例 → 复用、**不重挂**（不覆盖用户/宿主实例；
             // 回滚集合也因此天然只含本次真实新增）。
-            if existing.contains_key(&bid) {
+            if mounted.contains(&bid) {
                 tracing::info!(
                     bundle_id = %bid.as_str(),
                     plugin = plugin_id,
-                    "enable: bundled server dependency already satisfied; keeping existing instance (skip remount)"
+                    "enable: bundled server already mounted at runtime; keeping existing instance (skip remount)"
                 );
                 continue;
             }
@@ -1872,14 +1921,7 @@ pub(crate) async fn enable_plugin_with_reclaim(
                 //    账本必为原值）。原 hook 错（`e`）优先上抛；回写错仅 WARN（避免淹没根因）。
                 restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
                 reclaim_failed_enable_servers(
-                    plugin_id,
-                    home,
-                    &records,
-                    options.project_path,
-                    env,
-                    non_plugin_bundle_ids,
-                    hooks,
-                    &removed,
+                    plugin_id, home, &records, &ctx, env, hooks, &removed,
                 )
                 .await;
                 rollback_plugin_skills_on_failure(
@@ -1888,7 +1930,7 @@ pub(crate) async fn enable_plugin_with_reclaim(
                     &plugin,
                     plugin_id,
                     &records,
-                    options.project_path,
+                    &ctx,
                     env,
                 );
                 return Err(e.into());
@@ -2299,6 +2341,14 @@ mod tests {
         async fn remove_server(&self, id: &BundleId) -> Result<(), McpHookError> {
             self.removed.lock().unwrap().push(id.as_str().to_string());
             Ok(())
+        }
+    }
+
+    /// #286：测试用回滚上下文（仅回收判据；gate/mounted/resolved 缺省）。
+    fn reclaim_ctx(non_plugin: Option<&HashSet<BundleId>>) -> EnableReclaimContext<'_> {
+        EnableReclaimContext {
+            non_plugin_bundle_ids: non_plugin,
+            ..Default::default()
         }
     }
 
@@ -4541,7 +4591,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&HashSet::new()),
+            reclaim_ctx(Some(&HashSet::new())),
             Some(&h2),
         )
         .await
@@ -4604,7 +4654,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            None, // 未提供回收判据
+            reclaim_ctx(None),
             Some(&h2),
         )
         .await
@@ -4685,7 +4735,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&HashSet::new()),
+            reclaim_ctx(Some(&HashSet::new())),
             Some(&h2),
         )
         .await
@@ -4757,7 +4807,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&non_plugin),
+            reclaim_ctx(Some(&non_plugin)),
             Some(&h2),
         )
         .await
@@ -4833,7 +4883,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&HashSet::new()),
+            reclaim_ctx(Some(&HashSet::new())),
             Some(&h2),
         )
         .await
@@ -5013,7 +5063,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&HashSet::new()),
+            reclaim_ctx(Some(&HashSet::new())),
             Some(&h2),
         )
         .await
@@ -5102,7 +5152,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&HashSet::new()),
+            reclaim_ctx(Some(&HashSet::new())),
             Some(&h2),
         )
         .await
@@ -5154,7 +5204,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&HashSet::new()),
+            reclaim_ctx(Some(&HashSet::new())),
             Some(&hooks),
         )
         .await
@@ -5204,7 +5254,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&HashSet::new()),
+            reclaim_ctx(Some(&HashSet::new())),
             Some(&hooks),
         )
         .await
@@ -5220,6 +5270,314 @@ mod tests {
         );
         assert_eq!(enabled_flag(&env, "audit@acme"), None);
         assert_eq!(reg.resolve("audit:code-review").unwrap().source, "user");
+    }
+
+    /// 🔴1：hook 报「声明面」命中（含 disabled/待审批未挂载）≠ 运行期已挂载——existing-wins 不得据此跳过；
+    /// 运行期 mounted 为空 ⇒ 插件仍须挂载。
+    #[tokio::test]
+    async fn enable_mounts_when_existing_is_declaration_only_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hooks = RecordingHooks::new().with_existing(&["audit-mcp"]); // 声明面命中
+        let mounted: HashSet<BundleId> = HashSet::new(); // 但运行期未挂载
+        let ctx = EnableReclaimContext {
+            mounted_bundle_ids: Some(&mounted),
+            ..Default::default()
+        };
+        enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            ctx,
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "声明面命中但未挂载 → MUST 挂载（不得留 enabled=true 零 server 投影）"
+        );
+    }
+
+    /// 🔴1 反向：`ctx.mounted_bundle_ids` 命中 ⇒ existing-wins 跳过（不依赖 hook 的声明面）。
+    #[tokio::test]
+    async fn enable_skips_mount_when_runtime_mounted_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hooks = RecordingHooks::new(); // 声明面为空
+        let mounted: HashSet<BundleId> =
+            std::iter::once(BundleId::try_from("audit-mcp".to_string()).unwrap()).collect();
+        let ctx = EnableReclaimContext {
+            mounted_bundle_ids: Some(&mounted),
+            ..Default::default()
+        };
+        enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            ctx,
+            Some(&hooks),
+        )
+        .await
+        .unwrap();
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "运行期已挂载 → MUST existing-wins 跳过（不覆盖既有实例）"
+        );
+    }
+
+    /// 🔴2：记录锚 A 的显式 false MUST NOT 否决运行期锚点（user=true）——否则误摘 B 仍需要的 server。
+    #[tokio::test]
+    async fn enable_failure_not_vetoed_by_non_runtime_project_false_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let project_a = tmp.path().join("proj-a");
+        let project_b = tmp.path().join("proj-b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+        let pa = project_a.to_str().unwrap();
+        let pb = project_b.to_str().unwrap();
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // 追加 project 记录（projectPath=A）；user scope 启用；A 显式 false。
+        store::update_installed_plugins(
+            |data| {
+                let recs = data.account.plugins.get_mut("audit@acme").unwrap();
+                let mut rec = recs[0].clone();
+                rec.extra
+                    .insert("scope".to_string(), Value::String("project".to_string()));
+                rec.extra
+                    .insert("projectPath".to_string(), Value::String(pa.to_string()));
+                recs.push(rec);
+            },
+            Some(&home),
+            Some(&env),
+        )
+        .unwrap();
+        enable_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        write_enabled_plugin("audit@acme", false, "project", Some(pa), Some(&env)).unwrap();
+        let root = PathBuf::from(
+            ledger_records(&home, &env, "audit@acme")[0]
+                .install_path
+                .clone()
+                .unwrap(),
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // 失败 scope=project（写盘锚 A）；运行期锚 B 无值、user=true → MUST 保留。
+        let h2 = RecordingHooks::new().with_existing(&["audit-mcp"]);
+        let ctx = EnableReclaimContext {
+            gate_project_path: Some(pb),
+            ..Default::default()
+        };
+        let err = enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                scope: Some("project"),
+                project_path: Some(pa),
+                env: Some(&env),
+                ..Default::default()
+            },
+            ctx,
+            Some(&h2),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::ContentUnavailable { .. }));
+        assert!(
+            h2.removed.lock().unwrap().is_empty(),
+            "非运行期项目 A 的显式 false MUST NOT 否决运行期 user=true"
+        );
+        assert_eq!(enabled_flag(&env, "audit@acme"), Some(true));
+        assert!(
+            reg.resolve("audit:code-review").is_some(),
+            "user scope 仍 enabled → SKILL 投影 MUST 保留"
+        );
+    }
+
+    /// 🟡5：prior=absent + 陈旧「已挂载」server 被 existing-wins 跳过 + 新 server 注册失败 →
+    /// 先摘本次新增；最终无 scope 启用 ⇒ 陈旧 server 也须完整回收（C）。
+    #[tokio::test]
+    async fn enable_register_failure_reclaims_stale_skipped_servers_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) =
+            setup_installed_catalog_servers(&tmp, &["alpha-mcp", "beta-mcp", "zeta-mcp"]).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // alpha 运行期已挂载（陈旧实例）→ skip；beta 本次新增；zeta 注册失败。
+        let hooks = RecordingHooks::new().failing_register("zeta-mcp");
+        let mounted: HashSet<BundleId> =
+            std::iter::once(BundleId::try_from("alpha-mcp".to_string()).unwrap()).collect();
+        let ctx = EnableReclaimContext {
+            mounted_bundle_ids: Some(&mounted),
+            non_plugin_bundle_ids: Some(&HashSet::new()),
+            ..Default::default()
+        };
+        let err = enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            ctx,
+            Some(&hooks),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::Hook(_)));
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["beta-mcp".to_string()],
+            "alpha 已挂载 skipped、beta 新增、zeta 失败"
+        );
+        let mut removed = hooks.removed.lock().unwrap().clone();
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![
+                "alpha-mcp".to_string(),
+                "beta-mcp".to_string(),
+                "zeta-mcp".to_string()
+            ],
+            "最终无 scope 启用 → 本次新增（beta）与陈旧 skipped（alpha）均回收"
+        );
+    }
+
+    /// 🟡4：五层解析（含 flag/policy）的 `enabledPlugins=true` 参与门控——文件三层为空也保留。
+    #[tokio::test]
+    async fn enable_failure_keeps_when_resolved_settings_true_286() {
+        let tmp = TempDir::new().unwrap();
+        let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
+        let env = cfg_env(&tmp, env);
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let root = PathBuf::from(
+            ledger_records(&home, &env, "audit@acme")[0]
+                .install_path
+                .clone()
+                .unwrap(),
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // 解析视图（如 flag/policy 层）显式 true；文件三层无该键。
+        let mut ep = Map::new();
+        ep.insert("audit@acme".to_string(), Value::Bool(true));
+        let mut settings = Map::new();
+        settings.insert("enabledPlugins".to_string(), Value::Object(ep));
+        let h2 = RecordingHooks::new().with_existing(&["audit-mcp"]);
+        let ctx = EnableReclaimContext {
+            resolved_settings: Some(&settings),
+            non_plugin_bundle_ids: Some(&HashSet::new()),
+            ..Default::default()
+        };
+        let err = enable_plugin_with_reclaim(
+            "audit@acme",
+            &mut reg,
+            &home,
+            EnableOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            ctx,
+            Some(&h2),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginInstallError::ContentUnavailable { .. }));
+        assert!(
+            h2.removed.lock().unwrap().is_empty(),
+            "五层解析 true（flag/policy）→ MUST 保留 server"
+        );
     }
 
     // ---- v0.3.0 一次性迁移 / migration --------------------------------------

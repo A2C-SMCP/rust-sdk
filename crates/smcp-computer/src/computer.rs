@@ -1610,8 +1610,10 @@ impl<S: Session> Computer<S> {
     /// bump **config** revision + `emit_update_config`（#115 R1：installer 据实际写盘返回 `changed`，幂等 re-enable
     /// 不虚假 bump / 不惊动 robot）；bundled server 若翻活经 hooks 走 [`Self::mount_server`] 另 bump capability（§12 R2 正交）。
     ///
-    /// **失败回滚（#286）**：经内部 seam 供给 `non_plugin_declared_bundle_ids` 全集——enable 失败且该 pid
-    /// 在任何 scope 都不再启用时，按 §4.9.1-2 回收其 bundled server；remount 对既有实例 existing-wins 不覆盖。
+    /// **失败回滚（#286）**：经内部 seam 供给运行期权威——`non_plugin_declared_bundle_ids` 全集（§4.9.1-2
+    /// 回收判据）、manager 活跃（已挂载）集（existing-wins 权威）、五层 settings 解析（门控含 flag/policy）、
+    /// gate 锚点（`options.project_path` → 本实例 `config_dir`）。enable 失败且该 pid 在任何 scope 都不再启用时，
+    /// 回收其 bundled server；remount 对已挂载实例 existing-wins 不覆盖。
     ///
     /// # Errors
     /// 见 [`PluginInstallError`]（未安装 / 冲突 / manifest / settings 写 / 注入）。
@@ -1638,9 +1640,26 @@ impl<S: Session> Computer<S> {
             timeout: options.timeout,
             env,
         };
-        // #286/#139：回收判据的「非用户声明」数据源 MUST 在取 `skill_registry` 写锁**之前**计算
-        //（同 disable/uninstall）——失败回滚时据此按 §4.9.1-2 回收本 plugin 的 bundled server。
+        // #286 复审 🔴1/🟡3/🟡4：MUST 在取 `skill_registry` 写锁**之前**备齐运行期权威（同 disable/uninstall）：
+        // ① 回收判据「非用户声明」全集；② manager 活跃（已挂载）集——existing-wins 唯一权威，避免声明面
+        //    （disabled/待审批）被误当已挂载；③ 五层 settings 解析——门控覆盖 flag/policy 的 enabledPlugins；
+        // ④ gate 锚点：调用方 project_path（写盘锚）回退本实例 config_dir。
         let non_plugin = self.non_plugin_declared_bundle_ids(&home, env);
+        let resolved_settings = self.resolved_runtime_settings();
+        let config_dir = self.config_dir();
+        let gate_project_path = options.project_path.or_else(|| config_dir.to_str());
+        let mounted: HashSet<BundleId> = self
+            .list_mcp_servers()
+            .await
+            .iter()
+            .map(crate::mcp_clients::bundle_id::resolve_bundle_id)
+            .collect();
+        let reclaim_ctx = crate::settings::installer::EnableReclaimContext {
+            gate_project_path,
+            resolved_settings: Some(&resolved_settings),
+            mounted_bundle_ids: Some(&mounted),
+            non_plugin_bundle_ids: Some(&non_plugin),
+        };
         let res = {
             let mut reg = self.skill_registry.write().await;
             crate::settings::installer::enable_plugin_with_reclaim(
@@ -1648,7 +1667,7 @@ impl<S: Session> Computer<S> {
                 &mut reg,
                 &home,
                 effective,
-                Some(&non_plugin),
+                reclaim_ctx,
                 hooks,
             )
             .await
@@ -1669,6 +1688,23 @@ impl<S: Session> Computer<S> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// 运行期五层 settings 合并视图（user<project<local<flag<policy，锚定本实例 `config_dir`）。
+    ///
+    /// #286 复审 🟡4：enable 失败回滚的 any-scope 门控凭此覆盖 **flag（`--settings`）/policy** 的
+    /// `enabledPlugins`（只读文件三层会漏掉高层显式 true）。每次现算、零持久态（与
+    /// [`resolve_settings`](crate::settings::scope::resolve_settings) 同源）。
+    pub(crate) fn resolved_runtime_settings(&self) -> serde_json::Map<String, serde_json::Value> {
+        let config_dir = self.config_dir();
+        let policy = resolve_policy_settings(None, None, None);
+        resolve_settings(ResolveSettingsArgs {
+            cwd: Some(&config_dir),
+            env: self.config_env(),
+            flag_settings_path: self.flag_settings_path.as_deref(),
+            policy_settings: Some(&policy),
+        })
+        .settings
     }
 
     /// #139/§4.9.1-2 回收判据「X 非用户声明」项的数据源：**带 origin 的运行期权威配置集中 `origin != plugin`

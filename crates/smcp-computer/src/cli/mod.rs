@@ -524,8 +524,8 @@ async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
             .await
         }
         PluginCmd::Enable { id, json } => {
-            // 无活跃 Computer（hooks=None）→ 无 server 可摘，回收判据/锚点均传 None。
-            plugin_enable(&mut registry, &home, None, &id, None, None, None, json).await
+            // 无活跃 Computer（hooks=None）→ 无 server 可摘；走旧签名 wrapper（无运行期权威）。
+            plugin_enable(&mut registry, &home, None, &id, None, json).await
         }
         PluginCmd::Disable { id, json } => {
             plugin_disable(&mut registry, &home, None, &id, &HashSet::new(), None, json).await

@@ -35,7 +35,8 @@ use super::{
 };
 use crate::settings::installer::{
     disable_plugin, enable_plugin_with_reclaim, install_plugin, uninstall_plugin, DisableOptions,
-    EnableOptions, InstallOptions, McpInstallHooks, PluginInstallError, UninstallOptions,
+    EnableOptions, EnableReclaimContext, InstallOptions, McpInstallHooks, PluginInstallError,
+    UninstallOptions,
 };
 use crate::settings::reconciler::{gc_plugins, list_orphan_plugins, McpTeardown};
 use crate::settings::scope::EnvMap;
@@ -270,19 +271,47 @@ fn record_enable_project_path<'a>(
         .or(project_path_hint)
 }
 
-/// 启用单个 plugin（廉价复原：重挂 server + 复活 skills）/ enable a plugin (cheap restore)。
-///
-/// scope 契约：从 ledger 逐 scope 读；每条记录 register 之前先 `inject_inputs(installPath)`。
-/// `project_path_hint`：记录缺 `projectPath` 时的写盘/门控锚点（REPL 传 cwd；一次性子命令传 `None`）。
-/// `non_plugin_bundle_ids`：失败回滚的 §4.9.1-2 回收判据「非用户声明」数据源，MUST 由持有 `Computer`
-/// 的调用方供给（REPL）；一次性子命令无活跃 server（hooks=None）→ `None`（不摘）。
-#[allow(clippy::too_many_arguments)] // CLI handler：显式资源 + flags（同 plugin_disable 风格）
+/// 启用单个 plugin（旧签名 wrapper，下游兼容）：无运行期权威——不回滚回收、existing-wins 退回
+/// `hooks.mounted_servers()`、门控只看文件三层。SDK 内带 `Computer` 的调用方请用
+/// [`plugin_enable_with_paths`]。
 pub async fn plugin_enable(
     registry: &mut SkillRegistry,
     home: &Path,
     env: Option<&EnvMap>,
     plugin_id: &str,
+    hooks: Option<&dyn McpInstallHooks>,
+    json_output: bool,
+) -> i32 {
+    plugin_enable_with_paths(
+        registry,
+        home,
+        env,
+        plugin_id,
+        None,
+        None,
+        None,
+        hooks,
+        json_output,
+    )
+    .await
+}
+
+/// 启用单个 plugin（带运行期权威的完整路径；#286）/ enable a plugin with runtime authority.
+///
+/// scope 契约：从 ledger 逐 scope 读；每条记录 register 之前先 `inject_inputs(installPath)`。
+/// `project_path_hint`：记录缺 `projectPath` 时的写盘/门控锚点（REPL 传 cwd；一次性子命令传 `None`）。
+/// `resolved_settings`：运行期五层 settings 合并视图（`Computer::resolved_runtime_settings`）——门控覆盖
+/// flag/policy 的 `enabledPlugins`（🟡4）。
+/// `non_plugin_bundle_ids`：失败回滚的 §4.9.1-2 回收判据「非用户声明」数据源，MUST 由持有 `Computer`
+/// 的调用方供给（REPL）；一次性子命令无活跃 server（hooks=None）→ `None`（不摘）。
+#[allow(clippy::too_many_arguments)] // CLI handler：显式资源 + flags（同 plugin_disable 风格）
+pub async fn plugin_enable_with_paths(
+    registry: &mut SkillRegistry,
+    home: &Path,
+    env: Option<&EnvMap>,
+    plugin_id: &str,
     project_path_hint: Option<&str>,
+    resolved_settings: Option<&Map<String, Value>>,
     non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
     hooks: Option<&dyn McpInstallHooks>,
     json_output: bool,
@@ -316,7 +345,13 @@ pub async fn plugin_enable(
                 timeout: None,
                 env,
             },
-            non_plugin_bundle_ids,
+            EnableReclaimContext {
+                gate_project_path: project_path_hint,
+                resolved_settings,
+                // CLI 无 manager 快照注入 → 回退 CliMcpHooks::mounted_servers（其既有集为运行期已挂载）。
+                mounted_bundle_ids: None,
+                non_plugin_bundle_ids,
+            },
             hooks,
         )
         .await;
@@ -681,6 +716,90 @@ mod tests {
         assert_eq!(record_enable_project_path(&make(None), None), None);
     }
 
+    /// 🟡5 CLI 接线：`plugin_enable_with_paths` MUST 把 `non_plugin`（回收）与 `project_path_hint`（门控
+    /// 锚点）传给 seam——删任一接线该测试变红。
+    #[tokio::test]
+    async fn plugin_enable_with_paths_wires_reclaim_and_hint_286() {
+        use crate::mcp_clients::model::{BundleId as TestBundleId, MCPServerConfig, ServerName};
+        use crate::settings::installer::McpHookError;
+        use std::sync::Mutex;
+
+        struct RecordingHooks {
+            removed: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl McpInstallHooks for RecordingHooks {
+            fn existing_servers(&self) -> HashMap<TestBundleId, ServerName> {
+                HashMap::new()
+            }
+            async fn register_server(&self, _cfg: MCPServerConfig) -> Result<(), McpHookError> {
+                Ok(())
+            }
+            async fn remove_server(&self, id: &TestBundleId) -> Result<(), McpHookError> {
+                self.removed.lock().unwrap().push(id.as_str().to_string());
+                Ok(())
+            }
+        }
+
+        // A) non_plugin 接线：预检失败（installPath 缺失）且无 scope 启用 → 回收 figma-mcp。
+        let dir_a = tempdir().unwrap();
+        let env_a = test_env(dir_a.path());
+        seed_plugin(dir_a.path(), &env_a, "figma@acme", "user");
+        let hooks_a = RecordingHooks {
+            removed: Mutex::new(Vec::new()),
+        };
+        let code = plugin_enable_with_paths(
+            &mut SkillRegistry::new(),
+            dir_a.path(),
+            Some(&env_a),
+            "figma@acme",
+            None,
+            None,
+            Some(&HashSet::new()),
+            Some(&hooks_a),
+            true,
+        )
+        .await;
+        assert_eq!(code, EXIT_USER_ERROR);
+        assert_eq!(
+            *hooks_a.removed.lock().unwrap(),
+            vec!["figma-mcp".to_string()],
+            "non_plugin 未接线 → 失败回滚不会回收 server"
+        );
+
+        // B) hint 接线：运行期锚点 project enabled=true → 门控保留（不回收）。
+        let dir_b = tempdir().unwrap();
+        let env_b = test_env(dir_b.path());
+        seed_plugin(dir_b.path(), &env_b, "figma@acme", "user");
+        let proj = dir_b.path().join("proj");
+        std::fs::create_dir_all(proj.join(".tfrobot")).unwrap();
+        std::fs::write(
+            proj.join(".tfrobot/settings.json"),
+            r#"{"enabledPlugins":{"figma@acme":true}}"#,
+        )
+        .unwrap();
+        let hooks_b = RecordingHooks {
+            removed: Mutex::new(Vec::new()),
+        };
+        let code = plugin_enable_with_paths(
+            &mut SkillRegistry::new(),
+            dir_b.path(),
+            Some(&env_b),
+            "figma@acme",
+            proj.to_str(),
+            None,
+            Some(&HashSet::new()),
+            Some(&hooks_b),
+            true,
+        )
+        .await;
+        assert_eq!(code, EXIT_USER_ERROR);
+        assert!(
+            hooks_b.removed.lock().unwrap().is_empty(),
+            "hint 未接线 → 门控看不到 project enabled=true，会误回收"
+        );
+    }
+
     #[tokio::test]
     async fn install_invalid_id_is_user_error() {
         let dir = tempdir().unwrap();
@@ -720,17 +839,7 @@ mod tests {
             EXIT_USER_ERROR
         );
         assert_eq!(
-            plugin_enable(
-                &mut registry,
-                dir.path(),
-                Some(&env),
-                "x@y",
-                None,
-                None,
-                None,
-                true
-            )
-            .await,
+            plugin_enable(&mut registry, dir.path(), Some(&env), "x@y", None, true).await,
             EXIT_USER_ERROR
         );
         assert_eq!(
