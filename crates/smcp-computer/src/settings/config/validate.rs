@@ -173,6 +173,10 @@ fn mcp_err(
 /// 的条目会被**从盘上移除**（这些条目运行期本就被 loader 忽略，故对运行行为无损；但对「保留原始编辑」而言是删）。
 /// migrate 只返回 `bool`、**不逐条回报**被规范化掉的内容——调用方若需预览「将被清理什么」，请先跑
 /// [`validate_config`]（其错误集即 settings 层将被丢弃的条目 + mcp 层 schema 问题）。
+///
+/// **#292 例外**：`migrate_config` 经规范化 + [`save_config`] 整体写落盘，
+/// project `readRoots` 仍会被剔除——这是 A+（保留 + WARN）的显式例外（有意有损规范化）；实体级
+/// `config::executor` 路径不剔除。
 pub fn migrate_config(config_dir: &Path) -> Result<bool, ConfigCrudError> {
     let doc = load_project_config_doc(config_dir)?;
     let normalized = normalize_doc(&doc);
@@ -405,6 +409,25 @@ mod tests {
         assert_eq!(
             read_json(&workdir_project_settings_path(&fx.wd))["extraKnownMarketplaces"]["mp"],
             json!({"source": {"type": "git", "url": "git@h:p"}, "autoUpdate": true})
+        );
+        // 第二次：已规范 → 幂等，无改写。
+        assert!(!migrate_config(&fx.wd).unwrap(), "已规范 → 第二次幂等无写");
+    }
+
+    #[test]
+    fn migrate_drops_project_read_roots_as_documented_exception() {
+        // #292 例外（有意有损规范化）：project `readRoots` 随 migrate 的 cleaned 形剔除。
+        // 变异锁：normalize 若改回 passthrough（或 save_config 不再剔除），本测试即红。
+        let fx = Fx::new();
+        write(
+            &workdir_project_settings_path(&fx.wd),
+            r#"{"readRoots":["/data"],"strictKnownMarketplaces":"not-a-bool"}"#,
+        );
+        assert!(migrate_config(&fx.wd).unwrap(), "非规范 → 第一次改写");
+        let after = read_json(&workdir_project_settings_path(&fx.wd));
+        assert!(
+            after.get("readRoots").is_none(),
+            "migrate 例外仍须剔除 project readRoots：{after}"
         );
         // 第二次：已规范 → 幂等，无改写。
         assert!(!migrate_config(&fx.wd).unwrap(), "已规范 → 第二次幂等无写");

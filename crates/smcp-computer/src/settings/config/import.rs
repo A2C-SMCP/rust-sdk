@@ -103,7 +103,10 @@ impl std::error::Error for ImportError {}
 /// 检查四类确定性错误（守 #107：**不取真实值**、不探测 secret 可解性 / 文件存在 / MCP 可启动——那是运行期）：
 /// 1. **schema**：`validate_server`（按 planned scope，与读侧同一道门）。
 /// 2. **write-target**：[`resolve_write_target`]（纯函数）的只读 origin / synthesized / unsupported。
-/// 3. **目标可读性**：executor 同款只读探针读既有目标文件（损坏 / IO）。
+/// 3. **目标可读性**：executor 同款**文件级**只读探针读既有目标文件（损坏 / IO）。注意：executor 自
+///    #292 起还会批前校验目标**容器畸形**（非对象/非数组），本 preflight **不**预测该类错误——import
+///    仍会零写失败（executor preflight 兜底），但分类可能落在 `Persist` 而非 `Preflight`
+///    （#267 跟进，issuecomment-6974980142）。
 /// 4. **`${input:<id>}` 可达**：引用的 input id 须在已声明 input 集（`snapshot.inputs`）内；`${env:}` 仅语法。
 ///
 /// 全程零写。返回预测的 `planned` + 汇总的 `diagnostics`。`ConfigContext.opts.upsert_new_scope` 决定新声明落点。
