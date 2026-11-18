@@ -27,7 +27,7 @@ use super::commands::marketplace::{
     marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
 };
 use super::commands::plugin::{
-    plugin_disable, plugin_enable, plugin_gc, plugin_info, plugin_install, plugin_list,
+    plugin_disable, plugin_enable_with_paths, plugin_gc, plugin_info, plugin_install, plugin_list,
     plugin_uninstall, PluginInstallOptions,
 };
 use super::commands::settings::{
@@ -289,8 +289,25 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, Some(plugin), Some(marketplace)).await;
+            // #286：失败回滚的 §4.9.1-2 回收判据（同 disable）——MUST 在取 registry 写锁前由 Computer 供给。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
+            // #286 🟡4：运行期五层 settings（含 flag/policy）provider 供门控——失败回滚后才求值（🔴1）；
+            // 🟡D：记录缺 projectPath（rematerialize 后恒 scope=user）时以进程 cwd 作门控锚点（同 install 分支）。
+            let resolved_settings = || comp.resolved_runtime_settings(None);
+            let project_path_hint = cwd.as_deref().and_then(Path::to_str);
             let mut registry = reg_arc.write().await;
-            let code = plugin_enable(&mut registry, &home, None, id, Some(&hooks), json).await;
+            let code = plugin_enable_with_paths(
+                &mut registry,
+                &home,
+                None,
+                id,
+                project_path_hint,
+                Some(&resolved_settings),
+                Some(&non_plugin),
+                Some(&hooks),
+                json,
+            )
+            .await;
             drop(registry);
             if code == EXIT_OK {
                 comp.mark_skills_dirty();

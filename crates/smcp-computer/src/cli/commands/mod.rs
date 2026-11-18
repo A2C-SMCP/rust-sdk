@@ -203,7 +203,9 @@ pub fn format_settings_errors(errors: &[crate::settings::SettingsValidationError
 /// 前缀化为 `<plugin>@<marketplace>/<id>` 注入 Computer 输入池（§9.3 D2）；卸载级联无需注入时传 `None`。
 ///
 /// `existing_server_names` 须同步返回（trait 约束），故在构造期**快照**当前 server 名集合——installer 的冲突
-/// 闸门在注册任何 bundled server 之前一次性读取，快照语义与之吻合。
+/// 闸门在注册任何 bundled server 之前一次性读取，快照语义与之吻合。**本实例成功挂载/摘除的 server 会同步
+/// 更新该集合**（#286 复审 🟡3）：CLI `plugin enable` 逐记录循环复用同一 hooks，后一条记录必须看见前一条
+/// 刚挂的 server（existing-wins 跳过），否则会重复注册并在失败回滚时误摘。
 ///
 /// **重挂场景**（[`new_remount`](Self::new_remount)，#100 治理恢复）：单次 `reconcile_governance` 会跨**多个**
 /// plugin 逐 server 回调，但本 hooks 只能持一份上下文。故 `roots`（`install_path → (plugin, marketplace)`）在
@@ -212,8 +214,9 @@ pub fn format_settings_errors(errors: &[crate::settings::SettingsValidationError
 /// plugin 场景 `roots` 为空、回退到构造期绑定的 `plugin`/`marketplace`。
 pub struct CliMcpHooks<'a, S: Session> {
     comp: &'a Computer<S>,
-    /// 构造期 server 快照：`bundle_id → display 名`（依赖预检输入；#139 由 name 集改 bundle_id 键）。
-    existing: HashMap<BundleId, ServerName>,
+    /// 既有 server 集：`bundle_id → display 名`（依赖预检输入；#139 由 name 集改 bundle_id 键）。
+    /// 构造期快照 + 本实例挂载/摘除的增量（#286 复审 🟡3：CLI 逐记录 enable 复用同一实例）。
+    existing: std::sync::Mutex<HashMap<BundleId, ServerName>>,
     plugin: Option<String>,
     marketplace: Option<String>,
     /// 重挂归属索引：`install_path → (plugin, marketplace)`（单 plugin 场景为空）/ remount ownership index。
@@ -235,7 +238,7 @@ impl<'a, S: Session> CliMcpHooks<'a, S> {
             .collect();
         CliMcpHooks {
             comp,
-            existing,
+            existing: std::sync::Mutex::new(existing),
             plugin,
             marketplace,
             roots: HashMap::new(),
@@ -267,7 +270,7 @@ impl<'a, S: Session> CliMcpHooks<'a, S> {
             .collect();
         CliMcpHooks {
             comp,
-            existing,
+            existing: std::sync::Mutex::new(existing),
             plugin: None,
             marketplace: None,
             roots,
@@ -278,17 +281,35 @@ impl<'a, S: Session> CliMcpHooks<'a, S> {
 #[async_trait]
 impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
     fn existing_servers(&self) -> HashMap<BundleId, ServerName> {
-        self.existing.clone()
+        self.existing.lock().expect("existing mutex").clone()
+    }
+
+    /// 本 hook 的既有集恒为**运行期已挂载**（构造期快照自 manager + 本实例 register/remove 增量），
+    /// 显式声明为挂载权威（#286 复审 🟡5）。
+    fn mounted_servers(&self) -> std::collections::HashSet<BundleId> {
+        self.existing
+            .lock()
+            .expect("existing mutex")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError> {
         // 无 scope 路径（trait 必需方法 + 外部直接调用）：走公开 [`Computer::mount_server`]（裸 input 仅全局解析）。
         // plugin-bound 注册走 [`Self::register_server_with_input_scope`]。
         // #113 S6：治理物化走**运行期挂载**（不落盘）——bundled server 归属 ledger 意图，不得写入 project mcp.json。
+        let bid = resolve_bundle_id(&cfg);
+        let name = cfg.name().to_string();
         self.comp
             .mount_server(cfg)
             .await
-            .map_err(|e| McpHookError(e.to_string()))
+            .map_err(|e| McpHookError(e.to_string()))?;
+        self.existing
+            .lock()
+            .expect("existing mutex")
+            .insert(bid, name);
+        Ok(())
     }
 
     async fn register_server_with_input_scope(
@@ -300,11 +321,18 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
         // 派生为 [`PluginScope`]，透传进 scope-aware [`Computer::mount_server_with_scope`]，使 plugin-bound server
         // 裸 `${input:<id>}` 按 `<P>@<M>/<id>` → 全局 `<id>` 序解析。分叉二裁决：客户端用标准生命周期即无感，
         // scope 从自有 ledger 派生、**不**经客户端可见 API。plugin_id 非法/None → 退化为无 scope（mount_server）。
+        let bid = resolve_bundle_id(&cfg);
+        let name = cfg.name().to_string();
         let scope = plugin_id.and_then(crate::inputs::plugin_pool::PluginScope::from_plugin_id);
         self.comp
             .mount_server_with_scope(cfg, scope)
             .await
-            .map_err(|e| McpHookError(e.to_string()))
+            .map_err(|e| McpHookError(e.to_string()))?;
+        self.existing
+            .lock()
+            .expect("existing mutex")
+            .insert(bid, name);
+        Ok(())
     }
 
     async fn remove_server(&self, id: &BundleId) -> Result<(), McpHookError> {
@@ -315,7 +343,10 @@ impl<S: Session> McpInstallHooks for CliMcpHooks<'_, S> {
             .unmount_server(id)
             .await
             .map(|_| ())
-            .map_err(|e| McpHookError(e.to_string()))
+            .map_err(|e| McpHookError(e.to_string()))?;
+        // 成功停摘（含本无实例）→ 从既有集移除，保持「现有集」语义（#286 复审 🟡3）。
+        self.existing.lock().expect("existing mutex").remove(id);
+        Ok(())
     }
 
     async fn inject_inputs(&self, plugin_root: &Path) -> Result<(), McpHookError> {
@@ -550,6 +581,61 @@ mod tests {
         assert!(
             msg.contains("figma@acme/token"),
             "scoped id should surface in error, got: {msg}"
+        );
+        comp.shutdown().await.unwrap();
+    }
+
+    /// #286 复审 N1：`CliMcpHooks` 的既有集**随本实例 register/remove 活更新**（CLI 逐记录 enable 复用
+    /// 同一实例时，后一条记录须看见前一条刚挂的 server；否则 existing-wins 失效、失败回滚误摘前序成果）。
+    #[tokio::test]
+    async fn cli_hooks_existing_tracks_live_register_and_remove_286() {
+        use crate::mcp_clients::model::{
+            MCPServerConfig, StdioServerConfig, StdioServerParameters,
+        };
+        use std::collections::HashMap;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let comp = Computer::new(
+            "live-existing",
+            SilentSession::new("t"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .with_skill_home(td.path().join("skills"))
+        .with_blob_cache_root(td.path().join("blob"));
+        comp.boot_up().await.unwrap();
+        let hooks = CliMcpHooks::new(&comp, None, None).await;
+        assert!(hooks.existing_servers().is_empty());
+
+        let cfg = MCPServerConfig::Stdio(StdioServerConfig {
+            env_file: None,
+            connect_timeout_secs: None,
+            name: "live-srv".to_string(),
+            bundle_id: None,
+            disabled: false,
+            forbidden_tools: vec![],
+            tool_meta: HashMap::new(),
+            default_tool_meta: None,
+            vrl: None,
+            server_parameters: StdioServerParameters {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+        });
+        let bid = crate::mcp_clients::bundle_id::resolve_bundle_id(&cfg);
+        hooks.register_server(cfg).await.expect("mount");
+        assert!(
+            hooks.existing_servers().contains_key(&bid),
+            "register 成功后 MUST 进入既有集（existing-wins 依赖）"
+        );
+        hooks.remove_server(&bid).await.expect("unmount");
+        assert!(
+            !hooks.existing_servers().contains_key(&bid),
+            "remove 成功后 MUST 离开既有集"
         );
         comp.shutdown().await.unwrap();
     }
