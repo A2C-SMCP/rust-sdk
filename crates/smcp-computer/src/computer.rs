@@ -7534,6 +7534,140 @@ mod tests {
         );
     }
 
+    /// #286 最终复审 1：生产入口（Computer）的 provider MUST 在**失败回滚后**求值——prior=true 时删除
+    /// 安装根再 enable：回滚写 false 后 must 回收已挂 server（enable 前快照会保留 → 半态）。
+    #[tokio::test]
+    async fn enable_plugin_failure_reclaims_after_rollback_via_computer_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_root = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg_root).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_root.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let comp = Computer::new("c286d", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-286d"));
+        comp.boot_up().await.unwrap();
+        let hooks = MountingRemountHooks::new(&comp);
+        comp.enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap();
+        assert!(
+            comp.list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "首次 enable 应挂上 audit-mcp"
+        );
+
+        // 删除安装根 → 再次 enable 预检失败（prior=true → 回滚写 false）。
+        let records = crate::settings::store::load_installed_plugins(Some(&home), None)
+            .account
+            .plugins
+            .get("audit@acme")
+            .cloned()
+            .unwrap();
+        let root = std::path::PathBuf::from(records[0].install_path.clone().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+        let err = comp
+            .enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
+        ));
+        assert!(
+            !comp
+                .list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "回滚后 provider=false → MUST 回收（快照语义会保留 → 磁盘 disabled 投影仍在）"
+        );
+    }
+
+    /// #286 最终复审 2：resolved provider MUST 用 **effective env**（`options.env`），而非 `config_env()`——
+    /// env_b 下 user=true、config_env=env_a 时，失败回滚 MUST 保留 server（用 config_env 解析会误回收）。
+    #[tokio::test]
+    async fn enable_plugin_failure_uses_effective_env_for_gate_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_a = tmp.path().join("cfg-a");
+        let cfg_b = tmp.path().join("cfg-b");
+        std::fs::create_dir_all(&cfg_a).unwrap();
+        std::fs::create_dir_all(&cfg_b).unwrap();
+        let env_a: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_a.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let env_b: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_b.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        // env_b 的 user settings：plugin 仍启用（另一 scope 不会被本次回滚触碰）。
+        let user_path = crate::settings::scope::user_settings_path(Some(&env_b));
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        std::fs::write(&user_path, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+
+        let comp = Computer::new("c286e", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env_a) // config_env 无任何 enabled 设置
+            .with_blob_cache_root(tmp.path().join("blob-286e"));
+        comp.boot_up().await.unwrap();
+        let server_cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "audit-mcp",
+            "server_parameters": {"command": "node"}
+        }))
+        .unwrap();
+        comp.mount_server(server_cfg).await.unwrap();
+        let records = crate::settings::store::load_installed_plugins(Some(&home), None)
+            .account
+            .plugins
+            .get("audit@acme")
+            .cloned()
+            .unwrap();
+        let root = std::path::PathBuf::from(records[0].install_path.clone().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // 失败 scope=project（写盘/回滚锚 wd2，无值）；门控以 effective env=env_b 解析 → user=true 保留。
+        let wd2 = tmp.path().join("wd2");
+        std::fs::create_dir_all(&wd2).unwrap();
+        let hooks = MountingRemountHooks::new(&comp);
+        let err = comp
+            .enable_plugin(
+                "audit@acme",
+                EnableOptions {
+                    scope: Some("project"),
+                    project_path: wd2.to_str(),
+                    env: Some(&env_b),
+                    ..Default::default()
+                },
+                Some(&hooks),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
+        ));
+        assert!(
+            comp.list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "effective env（env_b）的 user=true 必须被门控看见；用 config_env 会误回收"
+        );
+    }
+
     /// #165 Option B（变异验证判据）：project-scope `enabledPlugins=true`（入 git、随仓库分发）激活的 plugin
     /// bundled server **MUST 回落审批门 PENDING**——不自动挂载、入 `pending_bundled_servers`。删去 project-scope
     /// enable（origin 变 None / 非 Project）→ 恢复免批准直挂（回归守护）。镜像协议 §5 item 10 条件化 / 指南 §2.2。
