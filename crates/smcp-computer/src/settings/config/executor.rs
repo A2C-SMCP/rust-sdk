@@ -484,6 +484,16 @@ mod tests {
         read_roots_policy_warning(plan, &existing, prepared.touched_read_roots)
     }
 
+    /// 经生产执行路径（`execute_one_with`，注入捕获器）执行单条计划并返回捕获到的告警。
+    fn execute_and_capture(plan: &WritePlan) -> Vec<String> {
+        let captured = std::sync::Mutex::new(Vec::new());
+        execute_one_with(plan, |_, message| {
+            captured.lock().unwrap().push(message.to_string());
+        })
+        .unwrap();
+        captured.into_inner().unwrap()
+    }
+
     /// `{servers: {name: Set(cfg)}}` 顶层写 / a top-level server upsert op。
     fn server_set(name: &str, cfg: Value) -> WriteTargetOp {
         let inner: BTreeMap<String, WriteValue> =
@@ -1067,7 +1077,11 @@ mod tests {
             policy_warning_for(&plan).is_none(),
             "project mcp.json 上的 readRoots 不得触发 project settings 策略告警"
         );
-        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        let warnings = execute_and_capture(&plan);
+        assert!(
+            warnings.is_empty(),
+            "执行路径不得发射 readRoots 告警：{warnings:?}"
+        );
         let saved = read_json(&path);
         assert_eq!(saved["readRoots"], json!(["/stray"]), "{saved}");
         assert_eq!(saved["servers"]["srv"], json!({"type": "stdio"}));
@@ -1095,7 +1109,11 @@ mod tests {
             policy_warning_for(&plan).is_none(),
             "local settings 不得产生 project scope readRoots 告警"
         );
-        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        let warnings = execute_and_capture(&plan);
+        assert!(
+            warnings.is_empty(),
+            "执行路径不得发射 readRoots 告警：{warnings:?}"
+        );
         let saved = read_json(&path);
         assert_eq!(saved["readRoots"], json!(["/data"]), "{saved}");
         assert_eq!(saved["strictKnownMarketplaces"], json!(true));
@@ -1120,7 +1138,11 @@ mod tests {
             policy_warning_for(&plan).is_none(),
             "user settings 不得产生 project scope readRoots 告警"
         );
-        execute_write_plans(std::slice::from_ref(&plan)).unwrap();
+        let warnings = execute_and_capture(&plan);
+        assert!(
+            warnings.is_empty(),
+            "执行路径不得发射 readRoots 告警：{warnings:?}"
+        );
         let saved = read_json(&path);
         assert_eq!(saved["readRoots"], json!(["/x"]), "{saved}");
         assert_eq!(saved["keep"], json!(1));
@@ -1128,12 +1150,18 @@ mod tests {
 
     #[test]
     fn execute_one_binds_production_emitter() {
-        // 源锚守卫（同 #263 先例）：生产路径必须绑定真实发射器（tracing + cli stderr），而非测试
-        // 闭包。发射副作用在并行 lib 测试中不能确定性观测（全局 callsite interest 会被并发
-        // dispatcher 过滤，仓内既有捕获用例同样会偶发丢事件），故用源码锚锁定默认绑定。
+        // 源锚守卫（同 `mcp_clients/sse_client.rs` 先例）：生产路径必须绑定真实发射器
+        // （tracing + cli stderr），而非测试闭包。发射副作用在并行 lib 测试中不能确定性观测
+        // （全局 callsite interest 会被并发 dispatcher 过滤），故用源码锚锁定默认绑定。
+        //
+        // 🔴 必须只看 `#[cfg(test)]` 之前的生产段：needle 也出现在本测试的字面量里，整文件
+        // `contains` 会恒真（#293 架构师复审 🔴）。
         let src = include_str!("executor.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(production, _)| production);
         assert!(
-            src.contains("execute_one_with(plan, emit_project_read_roots_warning)"),
+            production.contains("execute_one_with(plan, emit_project_read_roots_warning)"),
             "execute_one 必须绑定生产 WARN 发射器"
         );
     }

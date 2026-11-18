@@ -415,6 +415,25 @@ mod tests {
     }
 
     #[test]
+    fn migrate_drops_project_read_roots_as_documented_exception() {
+        // #292 例外（有意有损规范化）：project `readRoots` 随 migrate 的 cleaned 形剔除。
+        // 变异锁：normalize 若改回 passthrough（或 save_config 不再剔除），本测试即红。
+        let fx = Fx::new();
+        write(
+            &workdir_project_settings_path(&fx.wd),
+            r#"{"readRoots":["/data"],"strictKnownMarketplaces":"not-a-bool"}"#,
+        );
+        assert!(migrate_config(&fx.wd).unwrap(), "非规范 → 第一次改写");
+        let after = read_json(&workdir_project_settings_path(&fx.wd));
+        assert!(
+            after.get("readRoots").is_none(),
+            "migrate 例外仍须剔除 project readRoots：{after}"
+        );
+        // 第二次：已规范 → 幂等，无改写。
+        assert!(!migrate_config(&fx.wd).unwrap(), "已规范 → 第二次幂等无写");
+    }
+
+    #[test]
     fn migrate_canonical_config_is_noop() {
         let fx = Fx::new();
         init_config(&fx.wd).unwrap();
