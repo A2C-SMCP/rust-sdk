@@ -139,7 +139,8 @@ pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIE
 /// 那是 `client:resolve_path` 的**读授权**：project settings 入 git、随仓库分发，clone 的仓库不得把
 /// 读授权扩到任意路径（如 `~/.ssh`）——`security.md` §读取通道安全与 `computer-management` §7
 /// 不变量 #7 明定仅受信 scope（`user`/`local`/`flag`/`policy`/`embed`）可设，**`project` scope
-/// 提供该键 MUST 被拒绝**（整字段不生效；写入期亦丢弃不落盘，#245）。
+/// 提供该键 MUST 被拒绝**（读面整字段不生效；实体级写入期不写该键、既有键保留并告警，不主动删除，
+/// #245/#292；整文档 `save_config` / `export_config` / `migrate_config` 例外仍按隐私/有损边界剔除）。
 ///
 /// [guide]: https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/develop/docs/guides/mcp-approval-gate-alignment.md
 pub const TRUSTED_SCOPE_ONLY_FIELDS: &[&str] = &[

@@ -26,10 +26,11 @@
 *   - `apply_write`（`scope.rs`）对**缺失父键**的 `WriteValue::Object{..Delete}` 会**物化空对象**（如
 *     `{"servers":{}}`），**不是**干净 noop。故落盘前须判 no-change 跳过写——但**字节级** `updated == existing`
 *     **不够**（`{"servers":{}}` ≠ `{}` 仍会误写）；正确规则是**语义比对**：剥离两侧的纯空对象脚手架后相等则跳过
-*     （`executor::apply_value_op` 实现）。否则本函数 Remove 的 fan-out 会在**从未声明该实体**的 scope 凭空建空
+*     （`executor::apply_value_updates` 实现）。否则本函数 Remove 的 fan-out 会在**从未声明该实体**的 scope 凭空建空
 *     `{"servers":{}}` 文件。
 *   - `StringSetInsert/Remove`：S3 读-改-写目标 scope 的该数组——insert **去重**、对**缺失字段** insert 则**新建数组**、
-*     对缺失成员/缺失字段 remove 为 **noop**。这两个 op 是本函数对「复用 `WriteValue`」的必要偏离（`WriteValue::Set`
+*     对缺失成员/缺失字段 remove 为 **noop**；目标字段**已存在且非数组** → 批前 `CorruptTarget`（不覆盖、不静默
+*     noop，整批零写；#292）。这两个 op 是本函数对「复用 `WriteValue`」的必要偏离（`WriteValue::Set`
 *     整体替换数组、无法表达成员增删，且 S1 未投影 `disabledMcpjsonServers` 现值故纯函数无法就地构造新数组）。
 *
 * 消费 S1（[`ComputerConfigSnapshot`]）：**只读 `provenance`（定 origin）**——#126 起本层不再读 `mcp.servers[].bundled`

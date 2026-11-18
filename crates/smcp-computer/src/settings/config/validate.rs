@@ -173,6 +173,10 @@ fn mcp_err(
 /// 的条目会被**从盘上移除**（这些条目运行期本就被 loader 忽略，故对运行行为无损；但对「保留原始编辑」而言是删）。
 /// migrate 只返回 `bool`、**不逐条回报**被规范化掉的内容——调用方若需预览「将被清理什么」，请先跑
 /// [`validate_config`]（其错误集即 settings 层将被丢弃的条目 + mcp 层 schema 问题）。
+///
+/// **#292 例外**：`migrate_config` 经规范化 + [`save_config`] 整体写落盘，
+/// project `readRoots` 仍会被剔除——这是 A+（保留 + WARN）的显式例外（有意有损规范化）；实体级
+/// `config::executor` 路径不剔除。
 pub fn migrate_config(config_dir: &Path) -> Result<bool, ConfigCrudError> {
     let doc = load_project_config_doc(config_dir)?;
     let normalized = normalize_doc(&doc);

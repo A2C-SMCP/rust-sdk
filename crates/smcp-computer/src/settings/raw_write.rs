@@ -10,6 +10,9 @@
 //! - `changed` / `wrote` = mutate 后与原始语义内容不同（无变化不写盘、不扰 mtime）。
 //! - **A+（2026-11-03 用户拍板）**：project scope 的 `readRoots` **保留原键 + WARN**，不做任何
 //!   写入期剔除；读面 `trusted-scope-only` 拒绝保持不动。主动删除用户数据与 raw 保真目标相反。
+//! - 容器 guard（[`ensure_object_container`] / [`ensure_array_container`]）与 WARN 通道亦被
+//!   `config::executor` 复用（#292）：executor 的批前目标容器校验、project `readRoots` 保留告警
+//!   与本模块同一语义。
 //!
 //! 注意：即使 no-op / corrupt，[`with_settings_lock`](super::store::with_settings_lock) 仍会创建父目录与
 //! `.lock` 旁车文件——「原文件不变」指 settings 数据文件本身；corrupt 文件**不备份、不删除**。
@@ -146,18 +149,44 @@ pub(crate) fn project_read_roots_warning(path: &Path, map: &Map<String, Value>) 
     })
 }
 
+/// 显式写/删 project `readRoots` 被忽略时的告警文案（#292）。
+///
+/// 与 [`project_read_roots_warning`] 的「读面忽略、盘上保留」区分：这里描述的是**写入被拒绝**，
+/// 避免调用方误以为新值已落盘、只是读时被过滤。`key_present` 区分旧键是否仍在盘上保留。
+pub(crate) fn project_read_roots_write_ignored_warning(path: &Path, key_present: bool) -> String {
+    if key_present {
+        format!(
+            "project scope readRoots write ignored (trusted-scope-only); \
+             existing key preserved on disk at {}",
+            path.display()
+        )
+    } else {
+        format!(
+            "project scope readRoots write ignored (trusted-scope-only); \
+             no readRoots key written at {}",
+            path.display()
+        )
+    }
+}
+
+/// 统一的 project `readRoots` WARN 发射器：tracing + cli feature 下 stderr（#292 起 executor 复用）。
+///
+/// CLI 未安装 tracing subscriber；写入期 WARN 必须对用户可见（A+）。stderr 关闭/管道断裂时不得
+/// panic：用 `writeln!` 并忽略结果。
+pub(crate) fn emit_project_read_roots_warning(path: &Path, message: &str) {
+    tracing::warn!(
+        field = FIELD_READ_ROOTS,
+        path = %path.display(),
+        "{}",
+        message
+    );
+    #[cfg(feature = "cli")]
+    let _ = writeln!(std::io::stderr(), "warning: {message}");
+}
+
 fn warn_project_read_roots(path: &Path, map: &Map<String, Value>) {
     if let Some(message) = project_read_roots_warning(path, map) {
-        tracing::warn!(
-            field = FIELD_READ_ROOTS,
-            path = %path.display(),
-            "{}",
-            message
-        );
-        // CLI 未安装 tracing subscriber；写入期 WARN 必须对用户可见（A+）。
-        // stderr 关闭/管道断裂时不得 panic：用 writeln! 并忽略结果。
-        #[cfg(feature = "cli")]
-        let _ = writeln!(std::io::stderr(), "warning: {message}");
+        emit_project_read_roots_warning(path, &message);
     }
 }
 
@@ -285,7 +314,6 @@ pub(crate) fn set_bool_field(
 }
 
 /// 校验目标键可安全做 object 深合并：缺失或已是 object → Ok；其它类型 → fail-closed。
-#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn ensure_object_container(
     map: &Map<String, Value>,
     key: &str,
@@ -294,6 +322,18 @@ pub(crate) fn ensure_object_container(
     match map.get(key) {
         None | Some(Value::Object(_)) => Ok(()),
         Some(_) => Err(malformed(path, key, "object")),
+    }
+}
+
+/// 校验目标键可安全做 array 集合成员增删：缺失或已是 array → Ok；其它类型 → fail-closed。
+pub(crate) fn ensure_array_container(
+    map: &Map<String, Value>,
+    key: &str,
+    path: &Path,
+) -> Result<(), RawWriteError> {
+    match map.get(key) {
+        None | Some(Value::Array(_)) => Ok(()),
+        Some(_) => Err(malformed(path, key, "array")),
     }
 }
 
@@ -479,6 +519,57 @@ mod tests {
             ensure_object_container(&map, "bad_obj", &path),
             Err(RawWriteError::MalformedTarget { .. })
         ));
+    }
+
+    #[test]
+    fn ensure_array_container_accepts_missing_and_array_and_rejects_non_array() {
+        let path = PathBuf::from("/tmp/settings.json");
+        let mut map = Map::new();
+        // 缺失 / 空数组 / 非空数组 → Ok（只校验，不物化）。
+        assert!(ensure_array_container(&map, "missing", &path).is_ok());
+        map.insert("empty".to_string(), json!([]));
+        map.insert("items".to_string(), json!(["a"]));
+        assert!(ensure_array_container(&map, "empty", &path).is_ok());
+        assert!(ensure_array_container(&map, "items", &path).is_ok());
+
+        // 非数组（含 null）→ MalformedTarget { expected: "array" }。
+        for (key, value) in [
+            ("obj", json!({})),
+            ("str", json!("x")),
+            ("num", json!(1)),
+            ("bool", json!(true)),
+            ("null", Value::Null),
+        ] {
+            map.insert(key.to_string(), value);
+            match ensure_array_container(&map, key, &path) {
+                Err(RawWriteError::MalformedTarget {
+                    path: p,
+                    key: k,
+                    expected,
+                }) => {
+                    assert_eq!(p, path);
+                    assert_eq!(k, key);
+                    assert_eq!(expected, "array");
+                }
+                other => panic!("expected MalformedTarget for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn project_read_roots_write_ignored_warning_reports_presence() {
+        let path = PathBuf::from("/tmp/settings.json");
+        let present = project_read_roots_write_ignored_warning(&path, true);
+        assert!(present.contains("readRoots"), "{present}");
+        assert!(present.contains("write ignored"), "{present}");
+        assert!(present.contains("existing key preserved"), "{present}");
+        assert!(present.contains("/tmp/settings.json"), "{present}");
+
+        let absent = project_read_roots_write_ignored_warning(&path, false);
+        assert!(absent.contains("readRoots"), "{absent}");
+        assert!(absent.contains("write ignored"), "{absent}");
+        assert!(absent.contains("no readRoots key written"), "{absent}");
+        assert!(absent.contains("/tmp/settings.json"), "{absent}");
     }
 
     #[test]
