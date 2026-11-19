@@ -45,14 +45,15 @@ async fn legacy_double_install_reconcile_reports_and_enable_fails_closed() {
     let home = td.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let env = xdg_env(&td);
-    let url_a = build_relative_source_repo(&td.path().join("mp-a"), "from mp-a");
-    let url_b = build_relative_source_repo(&td.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&td.path().join("mp-a"), "mp-a", "from mp-a");
+    let url_b = build_relative_source_repo(&td.path().join("mp-b"), "mp-b", "from mp-b");
 
     update_known_marketplaces(
         |f| {
             f.account.marketplaces.insert(
                 "mp-a".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": url_a}),
                     extra: Map::new(),
                 },
@@ -60,6 +61,7 @@ async fn legacy_double_install_reconcile_reports_and_enable_fails_closed() {
             f.account.marketplaces.insert(
                 "mp-b".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": url_b}),
                     extra: Map::new(),
                 },
@@ -264,8 +266,8 @@ async fn add_conflict_surfaces_diagnostic_and_survives_reconcile_until_source_re
     let home = td.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let env = xdg_env(&td);
-    let url_a = build_relative_source_repo(&td.path().join("mp-a"), "from mp-a");
-    let url_b = build_relative_source_repo(&td.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&td.path().join("mp-a"), "mp-a", "from mp-a");
+    let url_b = build_relative_source_repo(&td.path().join("mp-b"), "mp-b", "from mp-b");
     let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
         .with_skill_home(home.clone())
         .with_blob_cache_root(td.path().join("blob"))

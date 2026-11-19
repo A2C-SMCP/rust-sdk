@@ -57,6 +57,11 @@ const DOTDIR_SUBPATH: [&str; 2] = [".a2c", "skills"];
 #[cfg(unix)]
 pub const SKILL_HOME_MODE: u32 = 0o700;
 
+/// marketplace 工作目录命名空间（临时 clone / 待删备份；点前缀，账本名恒为 kebab，不会命中）。
+/// Work-dir namespaces under `<home>/marketplace/` — dot-prefixed so kebab marketplace names never collide.
+pub const MARKETPLACE_STAGING_NS: &str = ".staging";
+/// marketplace 待删备份命名空间（swap 前旧 clone 的临时落脚点）/ trash namespace for swapped-out clones。
+pub const MARKETPLACE_TRASH_NS: &str = ".trash";
 /// mcp source namespace 目录名 / mcp source-namespace dir name（skill.md §4）。
 pub const SOURCE_MCP: &str = "mcp";
 /// marketplace source namespace 目录名 / marketplace source-namespace dir name。
@@ -194,6 +199,13 @@ pub fn marketplace_skill_dir(home: &Path, repo: &str, inner: &[&str]) -> PathBuf
         path.push(seg);
     }
     path
+}
+
+/// marketplace 工作目录 / marketplace work dir：`<home>/marketplace/<ns>/<id>/`（#272）。
+///
+/// `ns` 取 [`MARKETPLACE_STAGING_NS`] / [`MARKETPLACE_TRASH_NS`]；`id` 由调用方保证唯一。
+pub fn marketplace_work_dir(home: &Path, ns: &str, id: &str) -> PathBuf {
+    home.join(SOURCE_MARKETPLACE).join(ns).join(id)
 }
 
 /// user 源安装目录 / user-source install dir：`<home>/user/<skill>/`。

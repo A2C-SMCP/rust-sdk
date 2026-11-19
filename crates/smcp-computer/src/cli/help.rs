@@ -160,7 +160,7 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
         "marketplace" => &[
             (
                 "marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]",
-                "添加 marketplace（首次 y/N trust）/ add",
+                "添加 marketplace（注册名取清单 name；--name 仅作期望名校验；首次 y/N trust）/ add",
             ),
             ("marketplace list [--json]", "列出已知 marketplace / list"),
             (

@@ -463,7 +463,7 @@ mod tests {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+            r#"{"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
         )
         .unwrap();
         let skill = repo.join("plugins/audit/skills/code-review");
@@ -513,6 +513,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: src_clone,
                         extra: Map::new(),
                     },
@@ -753,6 +754,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": bad}),
                         extra: Map::new(),
                     },
@@ -886,6 +888,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": bad}),
                         extra: Map::new(),
                     },
@@ -1227,7 +1230,7 @@ mod tests {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins":[{"name":"audit","source":"./plugins/audit"},{"name":"lint","source":"./plugins/lint"}]}"#,
+            r#"{"name":"acme","plugins":[{"name":"audit","source":"./plugins/audit"},{"name":"lint","source":"./plugins/lint"}]}"#,
         )
         .unwrap();
         for p in ["audit", "lint"] {
@@ -1261,6 +1264,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: src_clone,
                         extra: Map::new(),
                     },

@@ -32,15 +32,23 @@ pub fn git(args: &[&str], cwd: &Path) {
 
 /// marketplace 源仓库：plugin `alpha`（相对 source `./plugins/alpha`）+ skill `code-review`。
 ///
-/// 返回 `file://…` URL。
-pub fn build_relative_source_repo(repo: &Path, description: &str) -> String {
-    build_relative_source_repo_with_plugins(repo, &[("alpha", description)])
+/// `marketplace_name` 写入清单顶层 `name`（#272 起注册名以清单为准）；返回 `file://…` URL。
+pub fn build_relative_source_repo(
+    repo: &Path,
+    marketplace_name: &str,
+    description: &str,
+) -> String {
+    build_relative_source_repo_with_plugins(repo, marketplace_name, &[("alpha", description)])
 }
 
 /// 多插件 marketplace 源仓库：每个插件一个相对 source `./plugins/<name>` + `skills/code-review`。
 ///
-/// 返回 `file://…` URL。
-pub fn build_relative_source_repo_with_plugins(repo: &Path, plugins: &[(&str, &str)]) -> String {
+/// `marketplace_name` 写入清单顶层 `name`（#272 起注册名以清单为准）；返回 `file://…` URL。
+pub fn build_relative_source_repo_with_plugins(
+    repo: &Path,
+    marketplace_name: &str,
+    plugins: &[(&str, &str)],
+) -> String {
     fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
     let entries: Vec<serde_json::Value> = plugins
         .iter()
@@ -48,7 +56,8 @@ pub fn build_relative_source_repo_with_plugins(repo: &Path, plugins: &[(&str, &s
         .collect();
     fs::write(
         repo.join(".tfrobot-plugin/marketplace.json"),
-        serde_json::to_string(&serde_json::json!({ "plugins": entries })).unwrap(),
+        serde_json::to_string(&serde_json::json!({ "name": marketplace_name, "plugins": entries }))
+            .unwrap(),
     )
     .unwrap();
     for (name, description) in plugins {

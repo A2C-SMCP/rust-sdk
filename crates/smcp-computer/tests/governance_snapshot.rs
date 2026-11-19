@@ -30,6 +30,38 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
+/// 构造带顶层 `name` 的本地 git marketplace 仓库（#272：add 读清单定名）。
+fn build_git_catalog(repo: &Path, name: &str) -> String {
+    write(
+        &repo.join(".tfrobot-plugin/marketplace.json"),
+        &serde_json::to_string(&json!({"name": name, "plugins": []})).unwrap(),
+    );
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"][..],
+        &["commit", "-qm", "init"][..],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    format!("file://{}", repo.display())
+}
+
 /// user-scope（XDG）锚到 `<tmp>/xdg`，隔离宿主 `~/.config`。
 fn xdg_env(td: &TempDir) -> EnvMap {
     std::iter::once((
@@ -59,9 +91,14 @@ fn config_of(td: &TempDir) -> std::path::PathBuf {
 /// 写一个 marketplace catalog（`<dir>/.tfrobot-plugin/marketplace.json`，列出 plugin 名）。
 fn seed_catalog(dir: &Path, plugin_names: &[&str]) {
     let plugins: Vec<Value> = plugin_names.iter().map(|n| json!({ "name": n })).collect();
+    // 清单顶层 name 取 catalog 目录名（`<home>/marketplace/<name>` 的同名口径）。
+    let marketplace = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("test-marketplace");
     write(
         &dir.join(".tfrobot-plugin").join("marketplace.json"),
-        &serde_json::to_string(&json!({ "plugins": plugins })).unwrap(),
+        &serde_json::to_string(&json!({ "name": marketplace, "plugins": plugins })).unwrap(),
     );
 }
 
@@ -117,6 +154,7 @@ fn seed_four_classes(td: &TempDir) {
             f.account.marketplaces.insert(
                 "mp".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": "https://example.com/mp.git"}),
                     extra,
                 },
@@ -250,6 +288,7 @@ async fn scp_like_marketplace_source_shows_host_and_path_without_credentials() {
             f.account.marketplaces.insert(
                 "mp".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({
                         "type": "git",
                         "url": "deploy-token@example.com:org/repo.git?token=QUERY#FRAGMENT"
@@ -261,6 +300,7 @@ async fn scp_like_marketplace_source_shows_host_and_path_without_credentials() {
             f.account.marketplaces.insert(
                 "evil".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({
                         "type": "git",
                         "url": "git@example.com:https:/alice:PW_LEAK@example.com/repo.git"
@@ -459,6 +499,7 @@ async fn corrupt_marketplace_degrades_not_empties() {
                 let mut e = Map::new();
                 e.insert("installLocation".to_string(), json!(loc.to_string_lossy()));
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": "https://example.com/x.git"}),
                     extra: e,
                 }
@@ -492,21 +533,54 @@ async fn add_marketplace_is_observable() {
     computer.boot_up().await.unwrap();
 
     let mut events = computer.subscribe_events();
-    // no_clone：仅注册意图，离线可成功（不触网络）。
+    // #272：注册名来自清单 name；用本地 git 仓库（不触网络）。
+    let url = build_git_catalog(&td.path().join("repo"), "acme");
     let res = computer
         .add_marketplace(
-            "https://example.com/acme.git",
+            &url,
             smcp_computer::settings::AddMarketplaceParams {
                 name: Some("acme"),
-                no_clone: true,
                 ..Default::default()
             },
         )
         .await;
-    assert!(res.is_ok(), "no_clone add_marketplace 应离线成功: {res:?}");
+    assert!(res.is_ok(), "add_marketplace 应成功: {res:?}");
     assert!(
         wait_for_config_bump(&mut events).await,
         "add_marketplace 应发 ConfigRevisionBumped（#124 新增）"
+    );
+
+    computer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn idempotent_add_does_not_bump_config_revision() {
+    let td = TempDir::new().unwrap();
+    let computer = make_computer(&td);
+    computer.boot_up().await.unwrap();
+    let url = build_git_catalog(&td.path().join("repo"), "acme");
+    computer
+        .add_marketplace(
+            &url,
+            smcp_computer::settings::AddMarketplaceParams::default(),
+        )
+        .await
+        .unwrap();
+
+    // 确定性读数：幂等重复 add 前后 config revision 不变（不做 2s 广播等待）。
+    let rev_before = computer.config_revision();
+    let outcome = computer
+        .add_marketplace(
+            &url,
+            smcp_computer::settings::AddMarketplaceParams::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.changed && !outcome.created);
+    assert_eq!(
+        computer.config_revision(),
+        rev_before,
+        "同源幂等 add 不得 bump config revision"
     );
 
     computer.shutdown().await.unwrap();
@@ -645,6 +719,7 @@ fn seed_local_plugin_marketplace(td: &TempDir) -> std::path::PathBuf {
             f.account.marketplaces.insert(
                 "mp".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": "https://example.com/mp.git"}),
                     extra,
                 },
@@ -762,6 +837,7 @@ async fn available_remote_source_declared_is_unknown_not_empty() {
             f.account.marketplaces.insert(
                 "mp".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": "https://example.com/mp.git"}),
                     extra,
                 },
@@ -824,6 +900,7 @@ async fn available_plugin_corruption_degrades_per_item_not_siblings() {
             f.account.marketplaces.insert(
                 "mp".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": "https://example.com/mp.git"}),
                     extra,
                 },

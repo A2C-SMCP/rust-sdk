@@ -45,9 +45,10 @@ pub use home::{
 };
 
 pub use sources::{
-    marketplace_clone_url, normalize_repo_shorthand, resolve_plugin_source, GitCloneSpec,
-    LocalPluginSource, ResolvedPluginSource, SkillSourceError, CNB_HOST, DEFAULT_PLUGIN_ROOT,
-    GITHUB_HOST,
+    canonicalize_marketplace_source, compare_marketplace_sources, marketplace_clone_url,
+    normalize_repo_shorthand, resolve_plugin_source, GitCloneSpec, LocalPluginSource,
+    MarketplaceSourceRelation, ResolvedPluginSource, SkillSourceError, CNB_HOST,
+    DEFAULT_PLUGIN_ROOT, GITHUB_HOST,
 };
 
 pub use frontmatter::{parse_skill_frontmatter, strip_skill_frontmatter};
@@ -71,7 +72,7 @@ pub use manifest::{
 
 pub use staging::{
     stage_marketplace_skills, stage_mcp_skills, stage_user_skills, ArchiveFetcher,
-    DefaultArchiveFetcher, KnownMarketplaceRecord, KnownMarketplaceRecorder,
+    DefaultArchiveFetcher, KnownMarketplaceRecord, KnownMarketplaceRecorder, MarketplaceStageError,
     MarketplaceStageOptions, McpResource, SkillResourceManager, SkillStagingError,
     DEFAULT_GIT_TIMEOUT, MAX_ARCHIVE_DOWNLOAD_BYTES, MAX_ARCHIVE_MEMBERS, MAX_EXTRACTED_BYTES,
 };

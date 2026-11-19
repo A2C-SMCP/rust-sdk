@@ -479,5 +479,5 @@ a2c> notify update
 
 1. `marketplace info <name>` + `plugin list --available` 记下源 URL、注册名、autoUpdate 与各插件的 scope/projectPath/version（`remove` 后 URL 查不到；含 token 的 URL 从自己的记录取；`plugin list` 默认隐藏 installed-disabled）。**真正受损的插件已被旧版卸载移除账本/安装意图，可能查不到——从其原安装命令/历史取，取不到按默认 user/当前版本恢复**
 2. `marketplace remove <name>`（默认级联卸载该 marketplace 下**所有**已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
-3. `marketplace add <git-url> --trust --name <name>`（重新 clone 并重新授予 trust；**必须用 `--name` 沿用原名**；原来开过 auto-update 的加 `--auto-update`）
+3. `marketplace add <git-url> --trust`（重新 clone 并重新授予 trust；**注册名取清单顶层 `name`，`--name` 仅作期望名校验、不再改名**，清单名与旧名不同会导致旧 `<plugin>@<old-name>` 引用失效——见 [Marketplace 身份模型](./marketplace-identity.md)；原来开过 auto-update 的加 `--auto-update`）
 4. 逐一按原 scope `plugin install <plugin>@<name> --scope <scope>`——缺省 user；多 scope 每个 scope 各装一次；project/local 须在原项目目录执行（cwd 即 projectPath）；`--version` 仅恢复账本字段、不锁定内容。此前启用过的再 `plugin enable <plugin>@<name>`

@@ -113,7 +113,7 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
     match sub.as_str() {
         "add" => {
             let Some(url) = pos.first() else {
-                msg_warn("usage: marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]");
+                msg_warn("usage: marketplace add <git-url> [--name N (expected manifest name)] [--trust] [--auto-update] [--no-clone]");
                 return;
             };
             let no_clone = has_flag(&args, "--no-clone");

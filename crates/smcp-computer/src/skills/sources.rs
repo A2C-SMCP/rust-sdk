@@ -364,6 +364,58 @@ pub fn marketplace_clone_url(source: &Value) -> Result<String, SkillSourceError>
     }
 }
 
+// ---------------------------------------------------------------------------
+// marketplace source 同源判定 / marketplace source equivalence（#272，runtime-contract §5.14）
+// ---------------------------------------------------------------------------
+/// 两个 marketplace source 的可判定关系 / provable relation between two marketplace sources。
+///
+/// 协议不要求把同一仓库的不同写法归一为同源（`ssh://` / `https://` / scp-like / `.git` 后缀），
+/// **无法确定时 fail-closed**。本枚举只表达「能否证明同一 source」——`Unverifiable` 在同名注册场景
+/// 必须按拒绝处理；反查「同一 source 是否已用旧名注册」时只有 `Same` 才拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketplaceSourceRelation {
+    /// 可证明同一 source（归一 URL 逐字相等）/ provably the same source。
+    Same,
+    /// 无法证明同一 source（不同写法 / 形态非法）/ cannot prove equivalence。
+    Unverifiable,
+}
+
+/// 归一 marketplace source 的 git URL 供**逐字比较**（仅 `{type:"git", url}`）/ canonicalize for comparison。
+///
+/// 归一仅含：trim + `owner/repo` 简写按 GitHub 展开；**不**做 `.git` 后缀 / scheme / host / 大小写归一
+/// （协议不要求，写法不同即 `Unverifiable`，由调用方 fail-closed）。
+#[must_use]
+pub fn canonicalize_marketplace_source(source: &Value) -> Option<String> {
+    let map = source.as_object()?;
+    if map.get("type").and_then(Value::as_str) != Some("git") {
+        return None;
+    }
+    let url = map.get("url").and_then(Value::as_str)?.trim();
+    if url.is_empty() {
+        return None;
+    }
+    normalize_repo_shorthand(url, GITHUB_HOST)
+        .ok()
+        .or_else(|| is_valid_git_url(url).then(|| url.to_string()))
+}
+
+/// 判定两个 marketplace source 是否可证明同源 / compare two marketplace sources。
+///
+/// 任一侧形态非法或写法不同 → [`MarketplaceSourceRelation::Unverifiable`]。
+#[must_use]
+pub fn compare_marketplace_sources(
+    registered: &Value,
+    candidate: &Value,
+) -> MarketplaceSourceRelation {
+    match (
+        canonicalize_marketplace_source(registered),
+        canonicalize_marketplace_source(candidate),
+    ) {
+        (Some(a), Some(b)) if a == b => MarketplaceSourceRelation::Same,
+        _ => MarketplaceSourceRelation::Unverifiable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +634,62 @@ mod tests {
         assert!(marketplace_clone_url(&json!({"type": "github", "url": "owner/repo"})).is_err());
         assert!(marketplace_clone_url(&json!({"type": "git", "url": "bogus"})).is_err());
         assert!(marketplace_clone_url(&json!("https://h/r.git")).is_err());
+    }
+
+    // ---- 同源判定（#272 / runtime-contract §5.14）----
+    #[test]
+    fn marketplace_source_equivalence_is_conservative() {
+        let git = |url: &str| json!({"type": "git", "url": url});
+        // 逐字相同 → 可证明同源。
+        assert_eq!(
+            compare_marketplace_sources(
+                &git("https://example.com/team/skills.git"),
+                &git("https://example.com/team/skills.git")
+            ),
+            MarketplaceSourceRelation::Same
+        );
+        // trim 后相同 / owner-repo 简写与展开形式 → 可证明同源。
+        assert_eq!(
+            compare_marketplace_sources(
+                &git(" acme/skills "),
+                &git("https://github.com/acme/skills.git")
+            ),
+            MarketplaceSourceRelation::Same
+        );
+        // 不同写法一律不可判定（协议不要求归一，调用方 fail-closed）。
+        for (a, b) in [
+            (
+                "https://example.com/team/skills.git",
+                "https://example.com/team/skills",
+            ),
+            (
+                "git@example.com:team/skills.git",
+                "https://example.com/team/skills.git",
+            ),
+            ("file:///tmp/x/repo", "file:///tmp/x/repo/"),
+        ] {
+            assert_eq!(
+                compare_marketplace_sources(&git(a), &git(b)),
+                MarketplaceSourceRelation::Unverifiable,
+                "{a} vs {b}"
+            );
+        }
+        // 形态非法 → 不可判定。
+        assert_eq!(
+            compare_marketplace_sources(
+                &json!({"type": "github", "url": "acme/skills"}),
+                &git("https://github.com/acme/skills.git")
+            ),
+            MarketplaceSourceRelation::Unverifiable
+        );
+        assert_eq!(
+            compare_marketplace_sources(&git("bogus"), &git("https://example.com/team/skills.git")),
+            MarketplaceSourceRelation::Unverifiable
+        );
+        assert_eq!(
+            canonicalize_marketplace_source(&json!("https://h/r.git")),
+            None
+        );
     }
 
     #[test]

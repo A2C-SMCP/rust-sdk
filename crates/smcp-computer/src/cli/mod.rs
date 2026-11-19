@@ -153,12 +153,14 @@ pub enum IdentityCmd {
 pub enum MarketplaceCmd {
     Add {
         git_url: String,
+        /// Expected manifest name (validation only; the registered name comes from the manifest).
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         trust: bool,
         #[arg(long)]
         auto_update: bool,
+        /// Register intent only (requires an existing catalog and --name).
         #[arg(long)]
         no_clone: bool,
         #[arg(long)]

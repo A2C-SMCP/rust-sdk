@@ -36,12 +36,13 @@ fn catalog_subtree_deleted_recovery_via_remove_add_reinstall_278() {
     let skill_home = home.join("skill-home");
     fs::create_dir_all(&skill_home).unwrap();
     // 两个插件：alpha 为受损插件，beta 留在该 marketplace 下验证 remove 的级联卸载。
-    let url = build_relative_source_repo_with_plugins(
-        &home.join("mp-src"),
-        &[("alpha", "recovery fixture"), ("beta", "healthy fixture")],
-    );
     // 名字取 token 形态：错误提示必须用占位符，绝不回显它（#279/#285 同源泄漏面）。
     let mp = "acme-ghp-fake-token";
+    let url = build_relative_source_repo_with_plugins(
+        &home.join("mp-src"),
+        mp,
+        &[("alpha", "recovery fixture"), ("beta", "healthy fixture")],
+    );
     let pid = format!("alpha@{mp}");
     let beta_pid = format!("beta@{mp}");
     let catalog = skill_home.join("marketplace").join(mp);
