@@ -47,9 +47,10 @@ pub use installer::{
 
 pub use lifecycle::{
     add_marketplace, default_marketplace_name, marketplace_name_taken, normalize_marketplace_url,
-    refresh_marketplaces, remove_marketplace, resolve_marketplace_identity, AddMarketplaceParams,
-    GovernanceError, MarketplaceAddOutcome, MarketplaceIdentity, MarketplaceRefreshRow,
-    MarketplaceRemoveOutcome, RefreshStatus, RemoveMarketplaceParams,
+    refresh_marketplaces, remove_marketplace, resolve_marketplace_add_request,
+    AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceAddRequest,
+    MarketplaceRefreshDiagnostic, MarketplaceRefreshRow, MarketplaceRemoveOutcome,
+    RefreshDiagnosticCode, RefreshStatus, RemoveMarketplaceParams,
 };
 
 pub use mcp_config::{

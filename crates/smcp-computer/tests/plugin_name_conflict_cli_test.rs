@@ -117,13 +117,14 @@ fn plugin_enable_installed_plugin_wins_over_add_only_marketplace() {
     let dir = tempdir().unwrap();
     let skill_home = dir.path().join("skill-home");
     fs::create_dir_all(&skill_home).unwrap();
-    let url_a = build_relative_source_repo(&dir.path().join("mp-a"), "from mp-a");
-    let url_b = build_relative_source_repo(&dir.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&dir.path().join("mp-a"), "mp-a", "from mp-a");
+    let url_b = build_relative_source_repo(&dir.path().join("mp-b"), "mp-b", "from mp-b");
     update_known_marketplaces(
         |f| {
             f.account.marketplaces.insert(
                 "mp-a".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": url_a}),
                     extra: Map::new(),
                 },
@@ -131,6 +132,7 @@ fn plugin_enable_installed_plugin_wins_over_add_only_marketplace() {
             f.account.marketplaces.insert(
                 "mp-b".to_string(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": url_b}),
                     extra: Map::new(),
                 },
@@ -169,14 +171,15 @@ fn plugin_uninstall_then_install_other_marketplace_succeeds() {
     let dir = tempdir().unwrap();
     let skill_home = dir.path().join("skill-home");
     fs::create_dir_all(&skill_home).unwrap();
-    let url_a = build_relative_source_repo(&dir.path().join("mp-a"), "from mp-a");
-    let url_b = build_relative_source_repo(&dir.path().join("mp-b"), "from mp-b");
+    let url_a = build_relative_source_repo(&dir.path().join("mp-a"), "mp-a", "from mp-a");
+    let url_b = build_relative_source_repo(&dir.path().join("mp-b"), "mp-b", "from mp-b");
     update_known_marketplaces(
         |f| {
             for (name, url) in [("mp-a", &url_a), ("mp-b", &url_b)] {
                 f.account.marketplaces.insert(
                     name.to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": url}),
                         extra: Map::new(),
                     },

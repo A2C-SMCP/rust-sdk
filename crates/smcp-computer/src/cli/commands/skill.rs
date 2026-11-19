@@ -323,11 +323,17 @@ mod tests {
         );
     }
 
-    fn build_marketplace_repo(repo: &std::path::Path, description: &str) -> String {
+    fn build_marketplace_repo(
+        repo: &std::path::Path,
+        marketplace: &str,
+        description: &str,
+    ) -> String {
         std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         std::fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "alpha", "source": "./plugins/alpha"}]}"#,
+            format!(
+                r#"{{"name": "{marketplace}", "plugins": [{{"name": "alpha", "source": "./plugins/alpha"}}]}}"#
+            ),
         )
         .unwrap();
         let skill = repo.join("plugins/alpha/skills/code-review");
@@ -348,8 +354,8 @@ mod tests {
     async fn rebuild_registry_prioritizes_installed_marketplace_over_add_only() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let url_a = build_marketplace_repo(&dir.path().join("repo-a"), "from mp-a");
-        let url_b = build_marketplace_repo(&dir.path().join("repo-b"), "from mp-b");
+        let url_a = build_marketplace_repo(&dir.path().join("repo-a"), "mp-a", "from mp-a");
+        let url_b = build_marketplace_repo(&dir.path().join("repo-b"), "mp-b", "from mp-b");
         let mut throwaway = SkillRegistry::new();
         for (name, url) in [("mp-a", &url_a), ("mp-b", &url_b)] {
             stage_marketplace_skills(
@@ -370,6 +376,7 @@ mod tests {
                     f.account.marketplaces.insert(
                         name.to_string(),
                         crate::settings::reconciler::KnownMarketplaceEntry {
+                            manifest_name_baseline: None,
                             source: json!({"type": "git", "url": url}),
                             extra: Map::new(),
                         },

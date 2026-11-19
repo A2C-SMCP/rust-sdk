@@ -71,16 +71,46 @@ use crate::skills::staging::{
 // ===========================================================================
 /// `known_marketplaces.json` 单条 marketplace 记录 / one known-marketplace entry。
 ///
-/// 仅显式建模 reconciler 需读回的 `source`（sourceChanged 判定）；其余字段（installLocation / commitSha /
-/// autoUpdate / lastUpdated 等）经 `extra` 透传保真，归 store（#67）拥有。
+/// 显式建模 reconciler 需读回的 `source`（sourceChanged 判定）与 `manifestNameBaseline`（#272 refresh
+/// 改名检测 / #289 迁移依据）；其余字段（installLocation / commitSha / autoUpdate / lastUpdated 等）经
+/// `extra` 透传保真，归 store（#67）拥有。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KnownMarketplaceEntry {
     /// marketplace git 源（`{type, url}`）；sourceChanged 判定依据 / the recorded git source。
     #[serde(default)]
     pub source: Value,
+    /// 首次观测到的清单顶层 `name`（legacy 首次成功 refresh 记录；新 add 直接写注册名）。
+    ///
+    /// 仅作 refresh 改名检测与 #289 迁移依据，**不参与**注册名派生。
+    #[serde(
+        default,
+        rename = "manifestNameBaseline",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_baseline"
+    )]
+    pub manifest_name_baseline: Option<String>,
     /// 其余字段透传（store 拥有）/ passthrough fields owned by the store。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// 容错反序列化 `manifestNameBaseline`：非字符串 / 非严格 kebab → `None` + WARN。
+///
+/// **不能让畸形基线导致整份 entry 反序列化失败**——[`coerce_known_marketplaces`]（store）对失败会整份
+/// 回落空账本。WARN 不回显原始值（手编账本可能内嵌凭据）。
+fn deserialize_optional_baseline<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(match raw {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if is_valid_marketplace_name(s.trim()) => Some(s.trim().to_string()),
+        Some(_) => {
+            tracing::warn!("known_marketplaces: invalid manifestNameBaseline ignored");
+            None
+        }
+    })
 }
 
 /// `known_marketplaces.json` 全量 / the whole known-marketplaces file。
@@ -1324,7 +1354,10 @@ mod tests {
         std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         std::fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            format!(r#"{{"plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#),
+            // #272：清单顶层 name 与声明面 marketplace 名一致（reconcile 不读，但保持协议形状）。
+            format!(
+                r#"{{"name": "acme", "plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#
+            ),
         )
         .unwrap();
         let skill = repo.join(format!("plugins/{plugin}/skills/code-review"));

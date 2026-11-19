@@ -619,21 +619,42 @@ pub fn update_known_marketplaces(
     home: Option<&Path>,
     env: Option<&EnvMap>,
 ) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    // 单一 RMW 真相：委托 checked 变体（persist=true），避免两段加锁体漂移。
+    update_known_marketplaces_checked(home, env, |current| {
+        mutator(current);
+        (current.clone(), true)
+    })
+}
+
+/// 持锁 read-check-write `known_marketplaces.json`（#272 注册提交点）/ Locked checked RMW.
+///
+/// `work` 在**文件锁内**执行并返回 `(值, 是否持久化)`——唯一性/引用判定与插入在同一把锁内完成，
+/// 跨进程并发 add 不会双注册。`work` 内只做同步短操作（禁止 async / 嵌套 store 写）。
+///
+/// # Errors
+/// 锁 / I/O 失败 → [`SettingsStoreError`]。
+pub(crate) fn update_known_marketplaces_checked<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut KnownMarketplacesFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
     let path = known_marketplaces_path(home, env);
     with_file_lock(
         &path,
         DEFAULT_LOCK_RETRIES,
         DEFAULT_LOCK_BACKOFF_BASE,
         DEFAULT_LOCK_BACKOFF_MAX,
-        || -> io::Result<KnownMarketplacesFile> {
+        || -> io::Result<T> {
             let mut current = match read_jsonc_with_recovery(&path) {
                 Some(data) => coerce_known_marketplaces(&data, &path),
                 None => empty_known_marketplaces(),
             };
-            mutator(&mut current);
-            current.version = MATERIALIZED_VERSION;
-            atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
-            Ok(current)
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
         },
     )?
     .map_err(|e| SettingsStoreError::io(&path, e))
@@ -794,7 +815,7 @@ fn resolve_last_updated(prior: Option<String>, changed: bool, now: &str) -> Stri
 }
 
 /// `clone_dir.resolve()` 等价：canonicalize（解析 symlink + 绝对化），失败回退词法归一 / resolve display path。
-fn resolve_install_location(path: &Path) -> String {
+pub(crate) fn resolve_install_location(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| normalize_lexical(path))
         .display()
@@ -858,41 +879,50 @@ impl FileSkillGovernanceStore {
 
 impl KnownMarketplaceRecorder for FileSkillGovernanceStore {
     fn record(&self, rec: KnownMarketplaceRecord<'_>) {
-        let now = now_iso8601();
-        let res = update_known_marketplaces(
-            |file| {
-                let prior = file
-                    .account
-                    .marketplaces
-                    .get(rec.name)
-                    .and_then(|e| e.extra.get("lastUpdated"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let last_updated = resolve_last_updated(prior, rec.changed, &now);
+        self.record_with_baseline(rec, None);
+    }
 
-                let mut extra = Map::new();
-                extra.insert(
-                    "installLocation".to_string(),
-                    Value::String(resolve_install_location(rec.install_location)),
-                );
-                extra.insert("lastUpdated".to_string(), Value::String(last_updated));
-                if let Some(sha) = rec.commit_sha {
-                    extra.insert("commitSha".to_string(), Value::String(sha.to_string()));
-                }
-                if rec.auto_update {
-                    extra.insert("autoUpdate".to_string(), Value::Bool(true));
-                }
-                file.account.marketplaces.insert(
-                    rec.name.to_string(),
-                    KnownMarketplaceEntry {
-                        source: rec.source.clone(),
-                        extra,
-                    },
-                );
-            },
-            Some(&self.home),
-            self.env(),
-        );
+    fn record_with_baseline(&self, rec: KnownMarketplaceRecord<'_>, baseline: Option<&str>) {
+        let now = now_iso8601();
+        let res = update_known_marketplaces_checked(Some(&self.home), self.env(), |file| {
+            let prior = file.account.marketplaces.get(rec.name).cloned();
+            let prior_last_updated = prior
+                .as_ref()
+                .and_then(|e| e.extra.get("lastUpdated"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let last_updated = resolve_last_updated(prior_last_updated, rec.changed, &now);
+
+            // 以 prior extra 为基底：保留未知扩展键（#272），并清除 recorder 管理的键后重写。
+            let mut extra = prior.as_ref().map(|e| e.extra.clone()).unwrap_or_default();
+            for key in ["installLocation", "lastUpdated", "commitSha", "autoUpdate"] {
+                extra.remove(key);
+            }
+            extra.insert(
+                "installLocation".to_string(),
+                Value::String(resolve_install_location(rec.install_location)),
+            );
+            extra.insert("lastUpdated".to_string(), Value::String(last_updated));
+            if let Some(sha) = rec.commit_sha {
+                extra.insert("commitSha".to_string(), Value::String(sha.to_string()));
+            }
+            if rec.auto_update {
+                extra.insert("autoUpdate".to_string(), Value::Bool(true));
+            }
+            // #272：新值优先；未提供时保留既有基线（legacy 首次 refresh 由调用方提供）。
+            let manifest_name_baseline = baseline
+                .map(str::to_string)
+                .or_else(|| prior.and_then(|e| e.manifest_name_baseline));
+            file.account.marketplaces.insert(
+                rec.name.to_string(),
+                KnownMarketplaceEntry {
+                    source: rec.source.clone(),
+                    manifest_name_baseline,
+                    extra,
+                },
+            );
+            ((), true)
+        });
         if let Err(e) = res {
             // 失败降级铁律：物化记录是诊断 / 对账元数据，丢失靠下次 reconcile 重建，不阻断 staging。
             tracing::error!(marketplace = %rec.name, error = %e, "failed to record known_marketplaces.json");
@@ -1109,6 +1139,7 @@ mod tests {
         file.account.marketplaces.insert(
             "acme".to_string(),
             KnownMarketplaceEntry {
+                manifest_name_baseline: None,
                 source: json!({"type": "git", "url": "https://example.com/acme.git"}),
                 extra: {
                     let mut m = Map::new();
@@ -1293,6 +1324,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "beta".into(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": "b"}),
                         extra: Map::new(),
                     },
@@ -1318,6 +1350,7 @@ mod tests {
             km.marketplaces.insert(
                 "gamma".into(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": "g"}),
                     extra: Map::new(),
                 },
@@ -1378,5 +1411,128 @@ mod tests {
         // commitSha / autoUpdate 在本次（无 sha + autoUpdate=false）整条替换后不再出现
         assert!(e2.extra.get("commitSha").is_none());
         assert!(e2.extra.get("autoUpdate").is_none());
+    }
+
+    // ---- #272 manifestNameBaseline / baseline recorder ---------------
+    #[test]
+    fn manifest_name_baseline_roundtrip_and_tolerance() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let path = known_marketplaces_path(Some(home), None);
+        update_known_marketplaces(
+            |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    KnownMarketplaceEntry {
+                        source: json!({"type": "git", "url": "https://example.com/acme.git"}),
+                        manifest_name_baseline: Some("team-tools".to_string()),
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools")
+        );
+        // 物化文件带 JSONC 写保护头，用 store 自己的容错读取。
+        let mut raw = read_jsonc_with_recovery(&path).expect("ledger file parses");
+        assert_eq!(
+            raw["marketplaces"]["acme"]["manifestNameBaseline"],
+            json!("team-tools")
+        );
+
+        // 畸形基线 → None + 整份账本不得被清空。
+        raw["marketplaces"]["acme"]["manifestNameBaseline"] = json!("Bad_Name");
+        std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(loaded.marketplaces.len(), 1);
+        assert!(loaded.marketplaces["acme"].manifest_name_baseline.is_none());
+    }
+
+    #[test]
+    fn recorder_preserves_and_updates_baseline() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let store = FileSkillGovernanceStore::new(home);
+        let source = json!({"type": "git", "url": "https://example.com/acme.git"});
+        let clone_dir = home.join("marketplace/acme");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        let record = |changed: bool| KnownMarketplaceRecord {
+            name: "acme",
+            source: &source,
+            install_location: &clone_dir,
+            commit_sha: None,
+            auto_update: false,
+            changed,
+        };
+
+        store.record_with_baseline(record(true), Some("team-tools"));
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools")
+        );
+
+        // 不带 baseline 的后续 record → 保留既有基线。
+        store.record(record(false));
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools")
+        );
+
+        // 显式新基线 → 覆盖。
+        store.record_with_baseline(record(true), Some("team-tools-v2"));
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools-v2")
+        );
+    }
+
+    #[test]
+    fn checked_update_persists_only_when_requested() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let path = known_marketplaces_path(Some(home), None);
+        let value = update_known_marketplaces_checked(Some(home), None, |file| {
+            file.account
+                .marketplaces
+                .insert("ghost".to_string(), KnownMarketplaceEntry::default());
+            (7u32, false)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert!(!path.exists(), "persist=false must not write the ledger");
+
+        update_known_marketplaces_checked(Some(home), None, |file| {
+            file.account.marketplaces.insert(
+                "acme".to_string(),
+                KnownMarketplaceEntry {
+                    source: json!({"type": "git", "url": "https://example.com/acme.git"}),
+                    manifest_name_baseline: Some("acme".to_string()),
+                    extra: Map::new(),
+                },
+            );
+            ((), true)
+        })
+        .unwrap();
+        assert!(load_known_marketplaces(Some(home), None)
+            .account
+            .marketplaces
+            .contains_key("acme"));
     }
 }

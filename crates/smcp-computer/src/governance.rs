@@ -986,11 +986,16 @@ mod tests {
     }
     fn seed_catalog(dir: &Path, names: &[&str]) {
         let plugins: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+        // 清单顶层 name 取 catalog 目录名（`<home>/marketplace/<name>` 的同名口径）。
+        let marketplace = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("test-marketplace");
         let p = dir.join(".tfrobot-plugin").join("marketplace.json");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(
             &p,
-            serde_json::to_string(&json!({ "plugins": plugins })).unwrap(),
+            serde_json::to_string(&json!({ "name": marketplace, "plugins": plugins })).unwrap(),
         )
         .unwrap();
     }
@@ -1045,6 +1050,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "mp".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type":"git","url":"https://x/y.git"}),
                         extra: e,
                     },
@@ -1086,6 +1092,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "x=https://alice:PW_NAME@secret.example/repo.git".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({
                             "type": "git",
                             "url": "https://bob:PW_URL@example.com/r.git?token=QUERY#FRAGMENT"
@@ -1109,6 +1116,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "safe".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": "https://example.com/safe.git"}),
                         extra: Map::from_iter([(
                             "installLocation".to_string(),
@@ -1212,6 +1220,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "mp".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type":"git","url":"https://x/y.git"}),
                         extra: e,
                     },

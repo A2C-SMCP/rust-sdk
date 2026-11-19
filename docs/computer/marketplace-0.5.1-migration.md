@@ -72,12 +72,13 @@ git ls-tree -r <commit> -- plugins/xxx
 2. 重新添加并重新 clone，同时重新授予 trust：
 
    ```text
-   marketplace add <git-url> --trust --name <name>
+   marketplace add <git-url> --trust
    ```
 
-   - **必须带 `--name <name>` 沿用原注册名**：不指定时新名会从 URL 派生，与旧名不一致的
-     `plugin install <plugin>@<name>` 会报 not added。
-   - 非交互 / 脚本方式必须带 `--trust`；REPL 交互模式会弹 y/N 确认。
+   - **注册名取 marketplace.json 顶层 `name`（#272）**：`--name` 不再用于改名，只作期望名校验。
+     若清单名与你原来的注册名（URL 派生名）不同，`<plugin>@<old-name>` 引用会失效——请先在上游清单
+     确认 name；需要把引用迁到新名时见 [Marketplace 身份模型](marketplace-identity.md) 与 #289 迁移。
+   - 非交互 / 脚本方式必须带 `--trust`；REPL 交互模式会按脱敏 URL 弹 y/N 确认。
    - 原来开启过 auto-update 的，加 `--auto-update`（或事后 `marketplace set <name> auto-update=true`）。
 
 3. 逐一按**原 scope** 重装插件；此前启用过的再执行 enable：

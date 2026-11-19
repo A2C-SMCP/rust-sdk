@@ -1459,9 +1459,10 @@ impl<S: Session> Computer<S> {
     /// 发 [`ComputerEvent::ConfigRevisionBumped`]，使 GUI 无需轮询内部文件即可观察治理生命周期变更）+ fire-and-forget
     /// socketio `update_config` 通知（未连接 → `InvalidState` 静默，绝不 panic）。
     ///
-    /// **调用契约（无虚假 bump）**：仅在 mutator **成功且确有内容变更**的路径调用——`add_marketplace` / `remove_marketplace`
-    /// 对重复/未知目标返 `Err`（[`GovernanceError::DuplicateMarketplace`] / `UnknownMarketplace`）、`install_plugin`
-    /// 成功即真实（重）物化账本、`uninstall_plugin` 仅在 `Ok(true)`（确有移除）调用，故成功即真变，无需再门控。
+    /// **调用契约（无虚假 bump）**：仅在 mutator **成功且确有内容变更**的路径调用——`add_marketplace` 对
+    /// 同名异源 / 未知等目标返 `Err`、**同源重复 add 幂等返回 `changed=false`**（调用方据此跳过本函数）、
+    /// `remove_marketplace` 对未知目标返 `Err`、`install_plugin` 成功即真实（重）物化账本、
+    /// `uninstall_plugin` 仅在 `Ok(true)`（确有移除）调用，故成功即真变，无需再门控。
     /// 这与 `enable/disable_plugin` **刻意**用 `changed` 门控（#115 R1：re-enable 已启用者是返 `Ok` 的**真 no-op**、
     /// 须避免虚假 bump）的差异**是有意的**——install/uninstall/add/remove 的成功语义本身已排除 no-op。§12 R2：
     /// config ⊥ capability——bundled server 重挂的能力变化由 MCP start/stop 各自 bump capability，与此正交。
@@ -1470,30 +1471,49 @@ impl<S: Session> Computer<S> {
         let _ = self.emit_update_config().await;
     }
 
-    /// 添加 marketplace（归一 URL + 派生名 + clone/stage 或仅注册意图）/ add a marketplace。
+    /// 添加 marketplace（clone → 读清单顶层 `name` 定名 → 账本锁内唯一性/引用认领 → 原子 swap/注册）。
     ///
-    /// 信任门（user-scope `trustedMarketplaces`）由产品 client 在调用前自理——**不**属 `skill_home` 治理边界。
+    /// #272：注册名取清单 `name`；`AddMarketplaceParams.name` 仅作**期望名校验**（不覆盖）。同源重复
+    /// add 幂等（`changed=false`）；同名异源 / 同源旧名 / 残留引用 fail-closed；`no_clone` 仅在已有
+    /// catalog + 期望名匹配 + 同源可证时成功。信任门（user-scope `trustedMarketplaces`）由产品 client
+    /// 在调用前自理——**不**属 `skill_home` 治理边界。
     ///
     /// # Errors
-    /// 见 [`GovernanceError`]（非法 URL/名、重名、clone 失败、账本写失败）。
+    /// 见 [`GovernanceError`]（非法 URL/名、清单名校验失败、同名冲突、clone/账本失败）。
     pub async fn add_marketplace(
         &self,
         git_url: &str,
         params: AddMarketplaceParams<'_>,
     ) -> Result<MarketplaceAddOutcome, GovernanceError> {
         let home = self.skill_home();
+        // #121/#272：引用守卫的 settings 解析必须锚定**本实例**（不是宿主 ambient env/cwd）。
+        let instance_dir = self.config_dir();
+        let params = AddMarketplaceParams {
+            config_cwd: Some(instance_dir.as_path()),
+            ..params
+        };
         let (res, conflicts) = {
             let mut reg = self.skill_registry.write().await;
-            let res =
-                crate::settings::lifecycle::add_marketplace(&mut reg, &home, None, git_url, params)
-                    .await;
+            let res = crate::settings::lifecycle::add_marketplace(
+                &mut reg,
+                &home,
+                self.config_env(),
+                git_url,
+                params,
+            )
+            .await;
             // #275：add 阶段被跨源守卫拒绝的 SKILL 不静默——即时写结构化诊断（仅发仍成立的冲突；
             // 保留记录供 reconcile 复核，不在此 drain）。
             let known = crate::settings::store::load_known_marketplaces(Some(&home), None).account;
             let conflicts = live_skill_source_conflicts(&reg, &known, reg.source_conflicts());
             (res, conflicts)
         };
-        if res.is_ok() {
+        // #272：同源重复 add 幂等（`changed=false`）不得虚假 bump / 标脏 / 重发冲突诊断；
+        // 但幂等 add 顺带更新旗标（如 `--auto-update`）属于真实状态变更，仍需通知。
+        if res
+            .as_ref()
+            .is_ok_and(|outcome| outcome.changed || outcome.flags_updated)
+        {
             self.record_skill_source_conflicts(&conflicts);
             self.mark_skills_dirty();
             self.emit_governance_config_change().await;
@@ -6971,7 +6991,7 @@ mod tests {
             "file:///alice:PW_LEAK",
             "file:///alice%3APW_LEAK%40example.com",
         ] {
-            // 合法 URL / scp-like，但派生段含 userinfo 形态 → 拒绝派生名。
+            // #272：注册名只来自清单 name；这些 URL 形态在不可定名时一律 validation 拒绝（不派生）。
             let err = computer
                 .add_marketplace(
                     raw,
@@ -6983,7 +7003,12 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(&err, GovernanceError::InvalidName(name) if name.is_empty()),
+                matches!(
+                    &err,
+                    GovernanceError::Validation(
+                        crate::skills::MarketplaceStageError::ManifestNameMissing
+                    )
+                ),
                 "{raw}: {err:?}"
             );
             let public_forms = format!("{err}\n{err:?}");
@@ -7004,40 +7029,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_marketplace_add_and_remove_no_clone() {
+    async fn computer_marketplace_add_and_remove() {
         use crate::settings::lifecycle::marketplace_name_taken;
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         // 不 boot_up：add/remove 只需 skill_registry 写锁 + skill_home（运行期只读、override 即足）。
+        // #272：引用守卫读实例 settings，注入隔离 XDG 避免宿主 ~/.config。
         let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home.clone())
-            .with_blob_cache_root(tmp.path().join("blob"));
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_config_env({
+                let env: EnvMap = std::iter::once((
+                    "XDG_CONFIG_HOME".to_string(),
+                    tmp.path().join("xdg").to_string_lossy().into_owned(),
+                ))
+                .collect();
+                env
+            });
 
         // 产品 client 经 Computer 方法添加 marketplace——**不**直接触碰 SkillRegistry，得结构化结果。
+        let url = build_marketplace_repo95(&tmp.path().join("repo"));
         let outcome = computer
-            .add_marketplace(
-                "acme/skills",
-                AddMarketplaceParams {
-                    no_clone: true,
-                    ..Default::default()
-                },
-            )
+            .add_marketplace(&url, AddMarketplaceParams::default())
             .await
             .unwrap();
-        assert_eq!(outcome.name, "skills");
-        assert!(outcome.no_clone);
+        assert_eq!(outcome.name, "acme");
+        assert!(outcome.changed);
         // 账本落在构造期固定的 skill_home 边界内。
-        assert!(marketplace_name_taken(
-            &computer.skill_home(),
-            None,
-            "skills"
-        ));
+        assert!(marketplace_name_taken(&computer.skill_home(), None, "acme"));
 
         // 移除（保留 plugin 记录）→ prune 账本条目。
         let removed = computer
             .remove_marketplace(
-                "skills",
+                "acme",
                 RemoveMarketplaceParams {
                     keep_plugins: true,
                     hooks: None,
@@ -7045,12 +7070,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(removed.name, "skills");
+        assert_eq!(removed.name, "acme");
         assert!(removed.kept_plugins);
         assert!(!marketplace_name_taken(
             &computer.skill_home(),
             None,
-            "skills"
+            "acme"
         ));
 
         // 未知 marketplace → 结构化错误。
@@ -7112,7 +7137,7 @@ mod tests {
         std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         std::fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+            r#"{"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
         )
         .unwrap();
         let skill = repo.join("plugins/audit/skills/code-review");
@@ -7276,7 +7301,15 @@ mod tests {
         let url = build_marketplace_repo95(&tmp.path().join("repo"));
         let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home.clone())
-            .with_blob_cache_root(tmp.path().join("blob-a"));
+            .with_blob_cache_root(tmp.path().join("blob-a"))
+            .with_config_env({
+                let env: EnvMap = std::iter::once((
+                    "XDG_CONFIG_HOME".to_string(),
+                    tmp.path().join("xdg").to_string_lossy().into_owned(),
+                ))
+                .collect();
+                env
+            });
         comp_a
             .add_marketplace(
                 &url,
@@ -7315,7 +7348,15 @@ mod tests {
         // ── 重启前：Computer A 添加 marketplace（真实 clone）+ 安装 plugin（写 installed_plugins.json）。
         let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home.clone())
-            .with_blob_cache_root(tmp.path().join("blob-a"));
+            .with_blob_cache_root(tmp.path().join("blob-a"))
+            .with_config_env({
+                let env: EnvMap = std::iter::once((
+                    "XDG_CONFIG_HOME".to_string(),
+                    tmp.path().join("xdg").to_string_lossy().into_owned(),
+                ))
+                .collect();
+                env
+            });
         comp_a
             .add_marketplace(
                 &url,

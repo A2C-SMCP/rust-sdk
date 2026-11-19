@@ -2214,7 +2214,7 @@ mod tests {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+            r#"{"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
         )
         .unwrap();
         let skill = repo.join("plugins/audit/skills/code-review");
@@ -2300,6 +2300,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: src_clone,
                         extra: Map::new(),
                     },
@@ -2322,7 +2323,8 @@ mod tests {
             .collect();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            serde_json::to_string(&serde_json::json!({"plugins": plugins})).unwrap(),
+            serde_json::to_string(&serde_json::json!({"name": "acme", "plugins": plugins}))
+                .unwrap(),
         )
         .unwrap();
         for (name, source) in entries {
@@ -3378,8 +3380,8 @@ mod tests {
                 "refresh={refresh} 须给级联移除命令: {msg}"
             );
             assert!(
-                msg.contains("marketplace add <git-url> --trust --name <name>"),
-                "refresh={refresh} 须给带 --name 的重加命令: {msg}"
+                msg.contains("marketplace add <git-url> --trust"),
+                "refresh={refresh} 须给重加命令（注册名取清单 name）: {msg}"
             );
             assert!(
                 msg.contains("plugin enable <plugin>@<name>"),
@@ -3602,7 +3604,7 @@ mod tests {
         // 上游 marketplace 改为相对源并 refresh（模拟跨 scope 源类型变化）。
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins":[{"name":"audit","source":"./plugin"}]}"#,
+            r#"{"name":"acme","plugins":[{"name":"audit","source":"./plugin"}]}"#,
         )
         .unwrap();
         let skill = repo.join("plugin/skills/audit-skill");
@@ -4509,7 +4511,7 @@ mod tests {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins":[{"name":"empty","source":"./empty"}]}"#,
+            r#"{"name":"acme","plugins":[{"name":"empty","source":"./empty"}]}"#,
         )
         .unwrap();
         fs::create_dir_all(repo.join("empty")).unwrap();
@@ -4584,7 +4586,7 @@ mod tests {
         // 上游改为相对源并 refresh 后装 project scope。
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins":[{"name":"audit","source":"./plugin"}]}"#,
+            r#"{"name":"acme","plugins":[{"name":"audit","source":"./plugin"}]}"#,
         )
         .unwrap();
         let skill = repo.join("plugin/skills/audit-skill");
@@ -4830,7 +4832,7 @@ mod tests {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins":[{"name":"audit","source":"./plugin","skills":["./custom-skills"]}]}"#,
+            r#"{"name":"acme","plugins":[{"name":"audit","source":"./plugin","skills":["./custom-skills"]}]}"#,
         )
         .unwrap();
         fs::create_dir_all(repo.join("plugin")).unwrap();
@@ -6584,9 +6586,16 @@ mod tests {
     /// 构造含指定 plugin 的 marketplace 源仓库（plugin 名可变，供跨 marketplace 同名用）。
     fn build_plugin_repo(repo: &Path, plugin: &str, description: &str) -> Value {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        // 清单顶层 name 取仓库目录名（调用方按 `<repo-stem>` 注册 marketplace）。
+        let marketplace = repo
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("test-marketplace");
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            format!(r#"{{"plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#),
+            format!(
+                r#"{{"name": "{marketplace}", "plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#
+            ),
         )
         .unwrap();
         let skill = repo.join(format!("plugins/{plugin}/skills/code-review"));
@@ -6605,13 +6614,21 @@ mod tests {
     /// 一个 marketplace 含多个 plugin（R1：同源其它已装 plugin 不得当保护伞）。
     fn build_multi_plugin_repo(repo: &Path, plugins: &[(&str, &str)]) -> Value {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        // 清单顶层 name 取仓库目录名（调用方按 `<repo-stem>` 注册 marketplace）。
+        let marketplace = repo
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("test-marketplace");
         let entries: Vec<String> = plugins
             .iter()
             .map(|(plugin, _)| format!(r#"{{"name": "{plugin}", "source": "./plugins/{plugin}"}}"#))
             .collect();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            format!(r#"{{"plugins": [{}]}}"#, entries.join(",")),
+            format!(
+                r#"{{"name": "{marketplace}", "plugins": [{}]}}"#,
+                entries.join(",")
+            ),
         )
         .unwrap();
         for (plugin, description) in plugins {
@@ -6650,6 +6667,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     mp,
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: src,
                         extra: Map::new(),
                     },

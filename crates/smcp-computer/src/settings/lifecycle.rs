@@ -39,14 +39,21 @@ use crate::settings::redaction::{
     git_source_for_error, known_git_source_for_display, redact_git_urls_in_text,
     untrusted_name_for_display, REDACTED_GIT_SOURCE,
 };
-use crate::settings::scope::EnvMap;
+use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::settings::store::{
-    installed_marketplace_order, load_installed_plugins, load_known_marketplaces,
-    update_known_marketplaces, FileSkillGovernanceStore, SettingsStoreError,
+    installed_marketplace_order, load_installed_plugins, load_installed_plugins_intent,
+    load_known_marketplaces, resolve_install_location, update_known_marketplaces_checked,
+    FileSkillGovernanceStore, SettingsStoreError,
 };
 use crate::settings::{is_valid_git_url, is_valid_marketplace_name, KnownMarketplaceEntry};
+use crate::skills::staging::{
+    commit_prepared_marketplace, git_remote_origin, materialize_marketplace_clone,
+    prepare_marketplace_add, refresh_marketplace_clone, same_source_url,
+    MarketplaceMaterializeOptions, DEFAULT_GIT_TIMEOUT,
+};
 use crate::skills::{
-    normalize_repo_shorthand, stage_marketplace_skills, MarketplaceStageOptions, SkillRegistry,
+    compare_marketplace_sources, marketplace_skill_dir, normalize_repo_shorthand,
+    read_marketplace_manifest, MarketplaceSourceRelation, MarketplaceStageError, SkillRegistry,
     GITHUB_HOST,
 };
 
@@ -63,12 +70,35 @@ pub enum GovernanceError {
     /// 既非合法 git URL 也非 `owner/repo` 简写 / not a well-formed git URL or `owner/repo` shorthand。
     #[error("not a well-formed git url or owner/repo shorthand: {0:?}")]
     InvalidUrl(String),
-    /// 非法 marketplace 名；空串表示未提供显式名且 URL 无法派生合法名 / invalid marketplace name。
+    /// 非法 marketplace 名（显式期望名不合严格 kebab）/ invalid marketplace name。
     #[error("invalid marketplace name: {0:?}")]
     InvalidName(String),
-    /// marketplace 名已存在（add 拒绝覆盖）/ marketplace name already exists。
-    #[error("marketplace name conflict: {0:?} already exists")]
+    /// 清单名缺失/非法、期望名不匹配等 #272 校验失败 / manifest-identity validation failure。
+    #[error(transparent)]
+    Validation(#[from] MarketplaceStageError),
+    /// marketplace 名已存在（同名不同源，add 拒绝覆盖；提示 remove 旧源）/ name already exists。
+    #[error(
+        "marketplace name conflict: {0:?} is already registered from a different source; remove it first"
+    )]
     DuplicateMarketplace(String),
+    /// 同名但无法证明是否同源（fail-closed）/ same name, source equivalence unverifiable。
+    #[error(
+        "cannot verify whether this source matches the registered source for {0:?}; refusing (fail-closed)"
+    )]
+    SourceEquivalenceUnknown(String),
+    /// 同一 source 已用另一注册名注册（拒绝一源多名）/ source already registered under another name。
+    #[error(
+        "this source is already registered as marketplace {existing:?}; remove it before adding under another name"
+    )]
+    SourceAlreadyRegistered { existing: String },
+    /// remove 后同名 re-add，但仍存在 `<plugin>@<name>` 意图引用 / dangling plugin references。
+    #[error(
+        "marketplace name {name:?} is still referenced by installed or enabled plugins: {plugin_ids:?}"
+    )]
+    MarketplaceNameReferenced {
+        name: String,
+        plugin_ids: Vec<String>,
+    },
     /// 未知 marketplace（refresh/remove 目标不存在）/ unknown marketplace。
     #[error("unknown marketplace: {0:?}")]
     UnknownMarketplace(String),
@@ -97,17 +127,28 @@ pub struct MarketplaceAddOutcome {
     pub skills: Vec<String>,
     /// 仅注册意图、未 clone（`--no-clone`）/ registered intent only, not cloned。
     pub no_clone: bool,
+    /// 本次是否实际改变了状态（同源重复 add 幂等 → `false`）/ whether anything actually changed。
+    pub changed: bool,
+    /// 本次是否**新建**了注册（幂等 / 自愈路径 → `false`）/ whether this call created the registration。
+    ///
+    /// CLI 在 trust 写失败时只回滚 `created == true` 的注册，绝不 prune 既有注册。
+    pub created: bool,
+    /// 幂等 add 是否顺带更新了账本旗标（如 `--auto-update`）/ whether flags were updated on an idempotent add。
+    pub flags_updated: bool,
 }
 
 /// 单个 marketplace 的 refresh 结果分类 / per-marketplace refresh classification。
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshStatus {
-    /// commitSha 变化（拉到新内容）/ commit changed。
+    /// commit 变化（拉到新内容）/ commit changed。
     Updated,
-    /// commitSha 未变 / unchanged。
+    /// commit 未变 / unchanged。
     Unchanged,
     /// 目标 marketplace 不在 `known_marketplaces`（视为失败）/ target not known (treated as failed)。
     Missing,
+    /// 来料清单名与基线不一致 / 缺失 / 非法 → 拒绝，旧注册与内容保留（#272）。
+    Rejected,
 }
 
 impl RefreshStatus {
@@ -118,8 +159,53 @@ impl RefreshStatus {
             RefreshStatus::Updated => "updated",
             RefreshStatus::Unchanged => "unchanged",
             RefreshStatus::Missing => "missing",
+            RefreshStatus::Rejected => "rejected",
         }
     }
+}
+
+/// refresh 行的结构化诊断类别 / structured refresh diagnostic codes。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshDiagnosticCode {
+    /// 来料清单名与基线不一致（拒绝）。
+    ManifestNameChanged,
+    /// 来料清单顶层 `name` 缺失（拒绝 / legacy 保留旧名）。
+    ManifestNameMissing,
+    /// 来料清单顶层 `name` 非法（拒绝 / legacy 保留旧名）。
+    ManifestNameInvalid,
+    /// 来料清单存在但不可读/损坏（保留旧内容；给行诊断，避免静默 unchanged）。
+    ManifestUnreadable,
+    /// legacy 注册首次 refresh 记录基线（清单名与注册名不同；advisory）。
+    LegacyManifestNameMismatch,
+    /// legacy 注册 refresh 遇清单缺失顶层 name（保留旧名；advisory）。
+    LegacyManifestNameMissing,
+    /// legacy 注册 refresh 遇清单顶层 name 非法（保留旧名；advisory）。
+    LegacyManifestNameInvalid,
+}
+
+impl RefreshDiagnosticCode {
+    /// 稳定串形 / stable string form。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefreshDiagnosticCode::ManifestNameChanged => "manifest_name_changed",
+            RefreshDiagnosticCode::ManifestNameMissing => "manifest_name_missing",
+            RefreshDiagnosticCode::ManifestNameInvalid => "manifest_name_invalid",
+            RefreshDiagnosticCode::ManifestUnreadable => "manifest_unreadable",
+            RefreshDiagnosticCode::LegacyManifestNameMismatch => "legacy_manifest_name_mismatch",
+            RefreshDiagnosticCode::LegacyManifestNameMissing => "legacy_manifest_name_missing",
+            RefreshDiagnosticCode::LegacyManifestNameInvalid => "legacy_manifest_name_invalid",
+        }
+    }
+}
+
+/// 逐 marketplace refresh 诊断（已脱敏、可展示）/ per-row refresh diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceRefreshDiagnostic {
+    /// 结构化类别 / structured code。
+    pub code: RefreshDiagnosticCode,
+    /// 可展示文案 / display message。
+    pub message: String,
 }
 
 /// `refresh_marketplaces` 的逐 marketplace 行 / one row per marketplace refreshed。
@@ -131,6 +217,8 @@ pub struct MarketplaceRefreshRow {
     pub status: RefreshStatus,
     /// 注册的 SKILL 数 / number of SKILLs registered。
     pub skills: usize,
+    /// 拒绝 / legacy advisory 的结构化诊断 / structured diagnostic.
+    pub diagnostic: Option<MarketplaceRefreshDiagnostic>,
 }
 
 /// `remove_marketplace` 成功结果 / successful remove outcome。
@@ -152,12 +240,16 @@ pub struct MarketplaceRemoveOutcome {
 /// `add_marketplace` 编排参数（**不含** trust / confirm / json——那些是 CLI 表现层）/ add params。
 #[derive(Default)]
 pub struct AddMarketplaceParams<'a> {
-    /// 显式 marketplace 名（缺省经 [`default_marketplace_name`] 派生）/ explicit name。
+    /// **期望清单名**（D6 B：仅作校验，不覆盖清单 `name`）/ expected manifest name (validation only)。
+    ///
+    /// #272 起注册名恒为 marketplace.json 顶层 `name`；本字段不匹配时返回 `Validation` 错误。
     pub name: Option<&'a str>,
     /// 物化记录的 autoUpdate / autoUpdate flag。
     pub auto_update: bool,
-    /// 仅注册意图、不 clone（§4.2 debug 用）/ register intent only。
+    /// 仅注册意图、不 clone（#272 起要求已有 catalog + 显式期望名）/ register intent only。
     pub no_clone: bool,
+    /// 引用守卫的 cwd 锚（project/local `enabledPlugins`；`None` → 进程 cwd）。
+    pub config_cwd: Option<&'a Path>,
 }
 
 /// `remove_marketplace` 编排参数 / remove params。
@@ -183,6 +275,9 @@ pub fn normalize_marketplace_url(raw: &str) -> Option<String> {
 }
 
 /// 从 git URL 末段派生严格-kebab marketplace 名（去 `.git`、非字母数字折叠为 `-`）/ derive a kebab name。
+///
+/// **#272 legacy 工具**：`add_marketplace` 不再使用 URL 派生名（注册名取清单顶层 `name`）；本函数
+/// 保留供存量诊断 / 迁移工具使用（release notes 标注行为未变、用途收窄）。
 ///
 /// #285：仅对 [`is_valid_git_url`] 认可且 known display 非占位符的源派生；派生段含 `:`/`@`/`%`
 /// （userinfo 形态与 percent-encoded 残形）时返回 `None`。因此 hostless scheme、`host:repo`、
@@ -241,35 +336,33 @@ pub fn default_marketplace_name(url: &str) -> Option<String> {
     (!slug.is_empty() && is_valid_marketplace_name(&slug)).then_some(slug)
 }
 
-/// 解析后的 marketplace 身份（归一 URL + 合法名）/ resolved marketplace identity。
+/// add 请求（归一 URL + 期望清单名）/ Add request: normalized URL + expected manifest name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarketplaceIdentity {
-    /// 合法 marketplace 名 / valid marketplace name。
-    pub name: String,
+pub struct MarketplaceAddRequest {
     /// 归一后的 git URL / normalized git URL。
     pub url: String,
+    /// 期望清单名（D6 B：仅校验，不派生、不覆盖）/ expected manifest name。
+    pub expected_name: Option<String>,
 }
 
-/// 把原始 `git_url` + 可选显式名解析为 [`MarketplaceIdentity`]（归一 + 派生 + 校验）/ resolve identity。
+/// 归一 URL 并校验期望名单（**纯函数、不触盘、不派生名**）/ Normalize URL + validate expected name。
 ///
-/// **纯函数**（不触盘）：CLI 信任门与 [`Computer`](crate::computer::Computer) 级 API 共用，确保两路同一身份语义。
+/// #272：注册名必须来自清单顶层 `name`，本函数只做 URL 归一与期望名语法校验。
 ///
 /// # Errors
-/// URL 非法 → [`GovernanceError::InvalidUrl`]（安全展示值）；无法派生/非法名 →
-/// [`GovernanceError::InvalidName`]（显式名安全展示值；无显式名时为空串）。
-pub fn resolve_marketplace_identity(
+/// URL 非法 → [`GovernanceError::InvalidUrl`]；期望名非法 → [`GovernanceError::InvalidName`]。
+pub fn resolve_marketplace_add_request(
     git_url: &str,
-    explicit_name: Option<&str>,
-) -> Result<MarketplaceIdentity, GovernanceError> {
+    expected_name: Option<&str>,
+) -> Result<MarketplaceAddRequest, GovernanceError> {
     let url = normalize_marketplace_url(git_url)
         .ok_or_else(|| GovernanceError::InvalidUrl(git_source_for_error(git_url)))?;
-    let name = match explicit_name {
-        Some(name) if is_valid_marketplace_name(name) => name.to_string(),
+    let expected_name = match expected_name {
+        Some(name) if is_valid_marketplace_name(name) => Some(name.to_string()),
         Some(name) => return Err(GovernanceError::InvalidName(redact_git_urls_in_text(name))),
-        None => default_marketplace_name(&url)
-            .ok_or_else(|| GovernanceError::InvalidName(String::new()))?,
+        None => None,
     };
-    Ok(MarketplaceIdentity { name, url })
+    Ok(MarketplaceAddRequest { url, expected_name })
 }
 
 // ---------------------------------------------------------------------------
@@ -295,91 +388,174 @@ pub fn marketplace_name_taken(home: &Path, env: Option<&EnvMap>, name: &str) -> 
 // ---------------------------------------------------------------------------
 // 编排：add / refresh / remove
 // ---------------------------------------------------------------------------
-/// 注册意图（`no_clone`）或 stage（clone + 注册 SKILL）一个**已解析身份**的 marketplace / register-or-stage。
-///
-/// 本函数是 add 的"变更核心"：身份解析与重名校验由调用方先行（CLI 在信任门前、Computer 级在本模块
-/// [`add_marketplace`] 内），以保留"重名先于信任提示"的既有时序。
-///
-/// # Errors
-/// `no_clone` 写账本失败 → [`GovernanceError::Store`]；clone/stage 降级未落账 → [`GovernanceError::CloneFailed`]。
-///
-/// 仅 `pub(crate)`：这是"已解析身份 + 已重名校验"后的**变更核心建筑块**，公开会诱使调用方跳过 dup 校验
-/// （footgun）。crate 内由 [`add_marketplace`]（Computer 路）与 CLI handler（信任门后）组合调用；外部消费方
-/// 用 [`add_marketplace`] / [`Computer::add_marketplace`](crate::computer::Computer::add_marketplace)。
-pub(crate) async fn register_or_stage_marketplace(
-    registry: &mut SkillRegistry,
-    home: &Path,
-    env: Option<&EnvMap>,
-    identity: &MarketplaceIdentity,
-    params: &AddMarketplaceParams<'_>,
-) -> Result<MarketplaceAddOutcome, GovernanceError> {
-    let MarketplaceIdentity { name, url } = identity;
-
-    if params.no_clone {
-        // 仅注册意图（不推荐，§4.2 debug 用）：记 known_marketplaces 但不 clone/stage。
-        let name_for_write = name.clone();
-        let url_for_write = url.clone();
-        let auto = params.auto_update;
-        update_known_marketplaces(
-            move |file| {
-                let mut extra = Map::new();
-                extra.insert("installLocation".to_string(), json!(""));
-                extra.insert("autoUpdate".to_string(), json!(auto));
-                file.account.marketplaces.insert(
-                    name_for_write,
-                    KnownMarketplaceEntry {
-                        source: json!({ "type": "git", "url": url_for_write }),
-                        extra,
-                    },
-                );
-            },
-            Some(home),
-            env,
-        )?;
-        return Ok(MarketplaceAddOutcome {
-            name: name.clone(),
-            url: url.clone(),
-            skills: Vec::new(),
-            no_clone: true,
-        });
-    }
-
-    let source = json!({ "type": "git", "url": url });
-    let store = make_store(home, env);
-    let registered = stage_marketplace_skills(
-        name,
-        &source,
-        registry,
-        home,
-        MarketplaceStageOptions {
-            plugin_filter: None,
-            auto_update: params.auto_update,
-            refresh: false,
-            timeout: None,
-            env,
-            recorder: Some(store.as_recorder()),
-        },
-    )
-    .await;
-
-    // 成功判定：stage 失败降级（不抛、返回空 + 不写 known_marketplaces）；据物化记录是否落盘判定。
-    if !marketplace_name_taken(home, env, name) {
-        return Err(GovernanceError::CloneFailed(name.clone()));
-    }
-    Ok(MarketplaceAddOutcome {
-        name: name.clone(),
-        url: url.clone(),
-        skills: registered,
-        no_clone: false,
-    })
+/// 注册认领结果 / registration claim result。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationClaim {
+    /// 同名同源已注册（幂等；`flags_updated` = 本次顺带更新了 autoUpdate 等旗标）。
+    Idempotent {
+        /// 本次是否更新了账本旗标（决定事件/回显）。
+        flags_updated: bool,
+    },
+    /// 本次插入账本 / inserted by this call。
+    Inserted,
 }
 
-/// 添加 marketplace（解析身份 + 重名校验 + register-or-stage）——非 CLI 高层入口 / add a marketplace。
+/// 引用守卫：列出指向 `name` 的 `<plugin>@<name>` 意图引用（install intent ∪ 合并 settings）/ intent refs。
+///
+/// 不论 `enabledPlugins` 值为 true / false 都算意图引用（fail-closed，协议 §5.14 remove/re-add 守卫）。
+fn marketplace_intent_references(
+    home: &Path,
+    env: Option<&EnvMap>,
+    config_cwd: Option<&Path>,
+    name: &str,
+) -> Vec<String> {
+    let suffix = format!("@{name}");
+    let mut refs: Vec<String> = load_installed_plugins_intent(Some(home), env)
+        .account
+        .installed_plugins
+        .iter()
+        .filter(|id| id.ends_with(&suffix))
+        .cloned()
+        .collect();
+    let cwd = config_cwd
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    let settings = resolve_settings(ResolveSettingsArgs {
+        cwd: cwd.as_deref(),
+        env,
+        flag_settings_path: None,
+        policy_settings: None,
+    });
+    if let Some(Value::Object(map)) = settings.settings.get("enabledPlugins") {
+        for key in map.keys() {
+            if key.ends_with(&suffix) && !refs.iter().any(|r| r == key) {
+                refs.push(key.clone());
+            }
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs.into_iter()
+        .map(|id| untrusted_name_for_display(&id))
+        .collect()
+}
+
+/// 在账本文件锁内认领注册名（#272「注册提交点」）/ Claim the registration name under the ledger lock。
+///
+/// 锁内完成：同名同源 → 幂等；同名不可判定同源 → fail-closed；同源旧名 → 拒绝；残留引用 → 拒绝；
+/// 否则插入账本（`manifestNameBaseline = name`）。clone 在锁外，锁内不信任任何预检。
+#[allow(clippy::too_many_arguments)]
+fn claim_marketplace_registration(
+    home: &Path,
+    env: Option<&EnvMap>,
+    final_dir: &Path,
+    name: &str,
+    source: &Value,
+    auto_update: bool,
+    config_cwd: Option<&Path>,
+    skip_reference_guard: bool,
+) -> Result<RegistrationClaim, GovernanceError> {
+    let target = resolve_install_location(final_dir);
+    let decision = update_known_marketplaces_checked(Some(home), env, |file| {
+        let mut persist = false;
+        let decision: Result<RegistrationClaim, GovernanceError> = (|| {
+            if let Some(existing) = file.account.marketplaces.get(name) {
+                // 同名：只有可证明同源才幂等；不同 / 无法判定一律 fail-closed 拒绝（§5.14）。
+                if compare_marketplace_sources(&existing.source, source)
+                    != MarketplaceSourceRelation::Same
+                {
+                    return Err(GovernanceError::DuplicateMarketplace(name.to_string()));
+                }
+                // 幂等 add 也应用本次 `--auto-update`（不静默丢弃用户意图）。
+                let needs_auto = auto_update
+                    && existing.extra.get("autoUpdate").and_then(Value::as_bool) != Some(true);
+                if needs_auto {
+                    if let Some(entry) = file.account.marketplaces.get_mut(name) {
+                        entry
+                            .extra
+                            .insert("autoUpdate".to_string(), Value::Bool(true));
+                    }
+                    persist = true;
+                }
+                return Ok(RegistrationClaim::Idempotent {
+                    flags_updated: needs_auto,
+                });
+            }
+            if let Some(existing) = file
+                .account
+                .marketplaces
+                .iter()
+                .find(|(n, e)| {
+                    n.as_str() != name
+                        && compare_marketplace_sources(&e.source, source)
+                            == MarketplaceSourceRelation::Same
+                })
+                .map(|(n, _)| n.clone())
+            {
+                return Err(GovernanceError::SourceAlreadyRegistered {
+                    existing: untrusted_name_for_display(&existing),
+                });
+            }
+            // no_clone 已用 catalog origin 证明同源：重注册是恢复既有绑定，不是换源，豁免引用守卫
+            // （§5.14 只要求「同名不同源」拒绝）。
+            if !skip_reference_guard {
+                let refs = marketplace_intent_references(home, env, config_cwd, name);
+                if !refs.is_empty() {
+                    return Err(GovernanceError::MarketplaceNameReferenced {
+                        name: name.to_string(),
+                        plugin_ids: refs,
+                    });
+                }
+            }
+            let mut extra = Map::new();
+            extra.insert("installLocation".to_string(), Value::String(target.clone()));
+            if auto_update {
+                extra.insert("autoUpdate".to_string(), Value::Bool(true));
+            }
+            file.account.marketplaces.insert(
+                name.to_string(),
+                KnownMarketplaceEntry {
+                    source: source.clone(),
+                    manifest_name_baseline: Some(name.to_string()),
+                    extra,
+                },
+            );
+            Ok(RegistrationClaim::Inserted)
+        })();
+        if matches!(decision, Ok(RegistrationClaim::Inserted)) {
+            persist = true;
+        }
+        (decision, persist)
+    })?;
+    decision
+}
+
+/// swap 失败补偿：删除本次刚插入的账本项（仅当 source 仍相同）/ Compensate a failed registration swap。
+fn rollback_marketplace_registration(
+    home: &Path,
+    env: Option<&EnvMap>,
+    name: &str,
+    source: &Value,
+) {
+    let _ = update_known_marketplaces_checked(Some(home), env, |file| {
+        if let Some(existing) = file.account.marketplaces.get(name) {
+            if compare_marketplace_sources(&existing.source, source)
+                == MarketplaceSourceRelation::Same
+            {
+                file.account.marketplaces.shift_remove(name);
+                return ((), true);
+            }
+        }
+        ((), false)
+    });
+}
+
+/// 添加 marketplace（clone/读清单定名 + 锁内认领 + swap + 注册）——非 CLI 高层入口 / add a marketplace。
 ///
 /// 信任门由 CLI/产品 client 在调用前自理（user-scope 决策，不属 `skill_home` 治理边界）。
 ///
 /// # Errors
-/// 见 [`GovernanceError`]（非法 URL/名、重名、clone 失败、账本写失败）。
+/// 见 [`GovernanceError`]（非法 URL/名、清单名校验失败、同名冲突、clone/账本失败）。
 pub async fn add_marketplace(
     registry: &mut SkillRegistry,
     home: &Path,
@@ -387,14 +563,177 @@ pub async fn add_marketplace(
     git_url: &str,
     params: AddMarketplaceParams<'_>,
 ) -> Result<MarketplaceAddOutcome, GovernanceError> {
-    let identity = resolve_marketplace_identity(git_url, params.name)?;
-    if marketplace_name_taken(home, env, &identity.name) {
-        return Err(GovernanceError::DuplicateMarketplace(identity.name));
+    let request = resolve_marketplace_add_request(git_url, params.name)?;
+    let source = json!({ "type": "git", "url": request.url.clone() });
+    if params.no_clone {
+        let Some(expected) = request.expected_name.clone() else {
+            return Err(MarketplaceStageError::ManifestNameMissing.into());
+        };
+        let final_dir = marketplace_skill_dir(home, &expected, &[]);
+        let manifest = read_marketplace_manifest(&final_dir)
+            .map_err(|_| GovernanceError::Validation(MarketplaceStageError::ManifestUnreadable))?;
+        let name = crate::skills::manifest::marketplace_manifest_name(&manifest).map_err(|e| {
+            GovernanceError::Validation(match e {
+                crate::skills::manifest::ManifestNameError::Missing => {
+                    MarketplaceStageError::ManifestNameMissing
+                }
+                crate::skills::manifest::ManifestNameError::Invalid => {
+                    MarketplaceStageError::ManifestNameInvalid
+                }
+            })
+        })?;
+        if name != expected {
+            return Err(MarketplaceStageError::ExpectedNameMismatch {
+                expected,
+                actual: name,
+            }
+            .into());
+        }
+        let Some(origin) = git_remote_origin(&final_dir, DEFAULT_GIT_TIMEOUT, env).await else {
+            return Err(GovernanceError::SourceEquivalenceUnknown(name));
+        };
+        let origin_source = json!({ "type": "git", "url": origin.clone() });
+        if !same_source_url(&request.url, &origin)
+            && compare_marketplace_sources(&origin_source, &source)
+                != MarketplaceSourceRelation::Same
+        {
+            return Err(GovernanceError::SourceEquivalenceUnknown(name));
+        }
+        let claim = claim_marketplace_registration(
+            home,
+            env,
+            &final_dir,
+            &name,
+            &source,
+            params.auto_update,
+            params.config_cwd,
+            // 同源已证（catalog origin）：恢复既有绑定，豁免引用守卫。
+            true,
+        )?;
+        let flags_updated = match claim {
+            RegistrationClaim::Idempotent { flags_updated } => flags_updated,
+            RegistrationClaim::Inserted => false,
+        };
+        return Ok(MarketplaceAddOutcome {
+            name,
+            url: request.url,
+            skills: Vec::new(),
+            no_clone: true,
+            changed: matches!(claim, RegistrationClaim::Inserted),
+            created: matches!(claim, RegistrationClaim::Inserted),
+            flags_updated,
+        });
     }
-    register_or_stage_marketplace(registry, home, env, &identity, &params).await
+
+    let prepared =
+        prepare_marketplace_add(&source, request.expected_name.as_deref(), home, None, env)
+            .await
+            .map_err(|e| match e {
+                // clone 失败保留网络错分类（CLI → 退出码 2）；注册名尚未知，载荷为空串。
+                MarketplaceStageError::CloneFailed { marketplace } => {
+                    GovernanceError::CloneFailed(marketplace)
+                }
+                other => GovernanceError::Validation(other),
+            })?;
+    let name = prepared.manifest_name.clone();
+    let final_dir = marketplace_skill_dir(home, &name, &[]);
+    let claim = claim_marketplace_registration(
+        home,
+        env,
+        &final_dir,
+        &name,
+        &source,
+        params.auto_update,
+        params.config_cwd,
+        // 普通 add：强制引用守卫（remove/re-add 不得静默重绑）。
+        false,
+    )?;
+    let store = make_store(home, env);
+    match claim {
+        RegistrationClaim::Idempotent { flags_updated } => {
+            // 同源重复 add 幂等；仅当 clone 树缺失时自愈（swap staging 并重新物化）。
+            if final_dir.exists() {
+                return Ok(MarketplaceAddOutcome {
+                    name,
+                    url: request.url,
+                    skills: Vec::new(),
+                    no_clone: false,
+                    changed: false,
+                    created: false,
+                    flags_updated,
+                });
+            }
+            let committed = commit_prepared_marketplace(prepared, home)?;
+            let skills = materialize_marketplace_clone(
+                &name,
+                &source,
+                &committed.dir,
+                registry,
+                home,
+                MarketplaceMaterializeOptions {
+                    auto_update: params.auto_update,
+                    changed: true,
+                    refresh: false,
+                    env,
+                    recorder: Some(store.as_recorder()),
+                    manifest_name_baseline: None,
+                },
+            )
+            .await;
+            committed.discard_trash();
+            Ok(MarketplaceAddOutcome {
+                name,
+                url: request.url,
+                skills,
+                no_clone: false,
+                changed: true,
+                created: false,
+                flags_updated,
+            })
+        }
+        RegistrationClaim::Inserted => {
+            let committed = match commit_prepared_marketplace(prepared, home) {
+                Ok(c) => c,
+                Err(e) => {
+                    rollback_marketplace_registration(home, env, &name, &source);
+                    return Err(e.into());
+                }
+            };
+            let skills = materialize_marketplace_clone(
+                &name,
+                &source,
+                &committed.dir,
+                registry,
+                home,
+                MarketplaceMaterializeOptions {
+                    auto_update: params.auto_update,
+                    changed: true,
+                    refresh: false,
+                    env,
+                    recorder: Some(store.as_recorder()),
+                    manifest_name_baseline: Some(&name),
+                },
+            )
+            .await;
+            committed.discard_trash();
+            Ok(MarketplaceAddOutcome {
+                name,
+                url: request.url,
+                skills,
+                no_clone: false,
+                changed: true,
+                created: true,
+                flags_updated: false,
+            })
+        }
+    }
 }
 
-/// 刷新 marketplace（`git pull` 失败则全量重 clone；逐 marketplace 对账分类）/ refresh marketplaces。
+/// 刷新 marketplace（先 fetch 校验来料清单，再 ff / 重 clone 提交；逐 marketplace 对账分类）/ refresh。
+///
+/// #272：提交前用 `git show FETCH_HEAD:<manifest>` 校验清单名（shallow clone 会先 `--unshallow` 以支持
+/// ff）；改名/缺失/非法 → [`RefreshStatus::Rejected`] + 诊断，旧注册/内容/能力保留。网络/I/O 失败保持
+/// 既有 `unchanged` 语义。
 ///
 /// `target == "all"` → 全部已知 marketplace；否则单个目标。未知目标 → [`RefreshStatus::Missing`] 行
 /// （**不**整体报错，对齐既有 CLI 语义：refresh 永远成功，失败逐行汇报）。
@@ -430,10 +769,11 @@ pub async fn refresh_marketplaces(
                 name: untrusted_name_for_display(nm),
                 status: RefreshStatus::Missing,
                 skills: 0,
+                diagnostic: None,
             });
             continue;
         };
-        let before = rec.extra.get("commitSha").cloned();
+        let baseline = rec.manifest_name_baseline.clone();
         let source = rec.source.clone();
         let auto = rec
             .extra
@@ -441,35 +781,88 @@ pub async fn refresh_marketplaces(
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let store = make_store(home, env);
-        let registered = stage_marketplace_skills(
+        let outcome = refresh_marketplace_clone(
             nm,
             &source,
             registry,
             home,
-            MarketplaceStageOptions {
-                plugin_filter: None,
-                auto_update: auto,
-                refresh: true,
-                timeout: None,
-                env,
-                recorder: Some(store.as_recorder()),
-            },
+            baseline.as_deref(),
+            auto,
+            DEFAULT_GIT_TIMEOUT,
+            env,
+            Some(store.as_recorder()),
         )
         .await;
-        let after_sha = load_known_marketplaces(Some(home), env)
-            .account
-            .marketplaces
-            .get(nm)
-            .and_then(|r| r.extra.get("commitSha").cloned());
-        let status = if after_sha != before {
-            RefreshStatus::Updated
-        } else {
-            RefreshStatus::Unchanged
-        };
+        let (status, diagnostic) =
+            match &outcome.failure {
+                None => {
+                    let status = if outcome.changed {
+                        RefreshStatus::Updated
+                    } else {
+                        RefreshStatus::Unchanged
+                    };
+                    let diagnostic = outcome.advisory.as_ref().map(|(kind, message)| {
+                        MarketplaceRefreshDiagnostic {
+                            code: match kind {
+                                crate::skills::staging::ManifestAdvisory::Mismatch => {
+                                    RefreshDiagnosticCode::LegacyManifestNameMismatch
+                                }
+                                crate::skills::staging::ManifestAdvisory::Missing => {
+                                    RefreshDiagnosticCode::LegacyManifestNameMissing
+                                }
+                                crate::skills::staging::ManifestAdvisory::Invalid => {
+                                    RefreshDiagnosticCode::LegacyManifestNameInvalid
+                                }
+                            },
+                            message: redact_git_urls_in_text(message),
+                        }
+                    });
+                    (status, diagnostic)
+                }
+                Some(failure @ MarketplaceStageError::ManifestNameChanged { .. }) => (
+                    RefreshStatus::Rejected,
+                    Some(MarketplaceRefreshDiagnostic {
+                        code: RefreshDiagnosticCode::ManifestNameChanged,
+                        message: failure.to_string(),
+                    }),
+                ),
+                Some(failure @ MarketplaceStageError::ManifestNameMissing) => (
+                    RefreshStatus::Rejected,
+                    Some(MarketplaceRefreshDiagnostic {
+                        code: RefreshDiagnosticCode::ManifestNameMissing,
+                        message: failure.to_string(),
+                    }),
+                ),
+                Some(failure @ MarketplaceStageError::ManifestNameInvalid) => (
+                    RefreshStatus::Rejected,
+                    Some(MarketplaceRefreshDiagnostic {
+                        code: RefreshDiagnosticCode::ManifestNameInvalid,
+                        message: failure.to_string(),
+                    }),
+                ),
+                // 清单存在但损坏：旧内容保留（状态维持 unchanged），但必须给出可见诊断。
+                Some(failure @ MarketplaceStageError::ManifestUnreadable) => (
+                    RefreshStatus::Unchanged,
+                    Some(MarketplaceRefreshDiagnostic {
+                        code: RefreshDiagnosticCode::ManifestUnreadable,
+                        message: failure.to_string(),
+                    }),
+                ),
+                Some(failure) => {
+                    // 网络 / I/O 失败保持既有 `unchanged` 语义（逐行汇报、不整体报错）。
+                    tracing::error!(
+                        marketplace = %untrusted_name_for_display(nm),
+                        error = %failure,
+                        "marketplace refresh failed"
+                    );
+                    (RefreshStatus::Unchanged, None)
+                }
+            };
         rows.push(MarketplaceRefreshRow {
             name: untrusted_name_for_display(nm),
             status,
-            skills: registered.len(),
+            skills: outcome.registered.len(),
+            diagnostic,
         });
     }
     rows
@@ -557,6 +950,7 @@ mod tests {
     // `cargo test-ws`（默认特性、无 cli）将无法编译——而这恰会反噬本特性"GUI 无需 cli feature"的目标。
     // marketplace 账本（known_marketplaces.json）落在 `home`（skill_home）内，故 `env = None` 即完全 hermetic。
     use super::*;
+    use crate::settings::store::update_known_marketplaces;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tracing::instrument::WithSubscriber;
@@ -680,19 +1074,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_identity_maps_errors() {
+    fn resolve_add_request_normalizes_url_and_expected_name() {
         // 非法 URL → InvalidUrl。
         assert!(matches!(
-            resolve_marketplace_identity("not a url", None),
+            resolve_marketplace_add_request("not a url", None),
             Err(GovernanceError::InvalidUrl(_))
         ));
-        // 合法 URL + 派生名。
-        let id = resolve_marketplace_identity("acme/skills", None).unwrap();
-        assert_eq!(id.name, "skills");
-        assert_eq!(id.url, "https://github.com/acme/skills.git");
-        // 显式名覆盖派生。
-        let id2 = resolve_marketplace_identity("acme/skills", Some("custom")).unwrap();
-        assert_eq!(id2.name, "custom");
+        // 合法 URL 归一；无期望名（注册名由清单决定）→ None。
+        let request = resolve_marketplace_add_request("acme/skills", None).unwrap();
+        assert_eq!(request.url, "https://github.com/acme/skills.git");
+        assert!(request.expected_name.is_none());
+        // 显式名 = 期望清单名（仅校验，不覆盖）。
+        let request = resolve_marketplace_add_request("acme/skills", Some("custom")).unwrap();
+        assert_eq!(request.expected_name.as_deref(), Some("custom"));
+        assert_eq!(request.url, "https://github.com/acme/skills.git");
     }
 
     #[tokio::test]
@@ -744,16 +1139,9 @@ mod tests {
             "x=alice@my_host:org/repo.git",
             "x=用户@例子.公司:org/repo.git",
         ]
-        .map(|name| resolve_marketplace_identity("acme/skills", Some(name)).unwrap_err());
+        .map(|name| resolve_marketplace_add_request("acme/skills", Some(name)).unwrap_err());
 
-        let derived = resolve_marketplace_identity(
-            "https://user:PW_SECRET@example.com?token=QUERY#FRAGMENT",
-            None,
-        )
-        .unwrap_err();
-        assert!(matches!(&derived, GovernanceError::InvalidName(name) if name.is_empty()));
-
-        for error in explicit_errors.into_iter().chain(std::iter::once(derived)) {
+        for error in explicit_errors {
             let rendered = format!("{error}\n{error:?}");
             for secret in [
                 "user",
@@ -787,7 +1175,7 @@ mod tests {
             "git:///alice:PW_LEAK@host",
             "file:alice:PW_LEAK@host",
         ] {
-            let err = resolve_marketplace_identity(raw, Some("valid-name")).unwrap_err();
+            let err = resolve_marketplace_add_request(raw, Some("valid-name")).unwrap_err();
             assert!(matches!(
                 &err,
                 GovernanceError::InvalidUrl(source) if source == "<redacted-git-source>"
@@ -800,17 +1188,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_no_clone_registers_intent_and_returns_outcome() {
+    async fn add_no_clone_requires_existing_catalog_and_matching_manifest() {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let mut registry = SkillRegistry::new();
+        let repo = dir.path().join("repo");
+        let source = build_repo(&repo, "skills");
+        let url = source["url"].as_str().unwrap().to_string();
 
+        // ① 无 catalog + 显式期望名 → validation（D5：不凭空占名）。
+        let err = add_marketplace(
+            &mut registry,
+            home,
+            Some(&test_env(home)),
+            &url,
+            AddMarketplaceParams {
+                name: Some("skills"),
+                no_clone: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                GovernanceError::Validation(MarketplaceStageError::ManifestUnreadable)
+            ),
+            "{err:?}"
+        );
+        assert!(!marketplace_name_taken(home, None, "skills"));
+
+        // ② 无期望名 → validation（无法在注册前确定清单名）。
+        let err = add_marketplace(
+            &mut registry,
+            home,
+            Some(&test_env(home)),
+            &url,
+            AddMarketplaceParams {
+                no_clone: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                GovernanceError::Validation(MarketplaceStageError::ManifestNameMissing)
+            ),
+            "{err:?}"
+        );
+
+        // ③ 已有 catalog（账本丢失后重建）：先正常 add 再删账本 → no_clone 只回填账本。
+        add_marketplace(
+            &mut registry,
+            home,
+            Some(&test_env(home)),
+            &url,
+            AddMarketplaceParams::default(),
+        )
+        .await
+        .unwrap();
+        let ledger = crate::settings::store::known_marketplaces_path(Some(home), None);
+        std::fs::remove_file(&ledger).unwrap();
         let outcome = add_marketplace(
             &mut registry,
             home,
-            None,
-            "acme/skills",
+            Some(&test_env(home)),
+            &url,
             AddMarketplaceParams {
+                name: Some("skills"),
                 no_clone: true,
                 ..Default::default()
             },
@@ -818,28 +1266,79 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.name, "skills");
-        assert!(outcome.no_clone);
+        assert!(outcome.no_clone && outcome.changed);
         assert!(outcome.skills.is_empty());
         assert!(marketplace_name_taken(home, None, "skills"));
+        let rec = load_known_marketplaces(Some(home), None)
+            .account
+            .marketplaces
+            .get("skills")
+            .cloned()
+            .unwrap();
+        assert_eq!(rec.manifest_name_baseline.as_deref(), Some("skills"));
     }
 
     #[tokio::test]
-    async fn add_duplicate_is_structured_error() {
+    async fn add_same_name_different_source_is_rejected_and_same_source_is_idempotent() {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let mut registry = SkillRegistry::new();
-        let mk = || AddMarketplaceParams {
-            no_clone: true,
-            ..Default::default()
-        };
-        add_marketplace(&mut registry, home, None, "acme/skills", mk())
-            .await
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        // 仓库名不同、清单名相同（都以清单 name 为唯一注册键）。
+        let src_a = build_repo(&repo_a, "skills");
+        let src_b = build_repo(&repo_b, "skills");
+        let url_a = src_a["url"].as_str().unwrap().to_string();
+        let url_b = src_b["url"].as_str().unwrap().to_string();
+
+        let first = add_marketplace(
+            &mut registry,
+            home,
+            None,
+            &url_a,
+            AddMarketplaceParams::default(),
+        )
+        .await
+        .unwrap();
+        assert!(first.changed);
+        assert_eq!(first.name, "skills");
+
+        // 同源重复 add → 幂等（无写入、内容不变）。
+        let again = add_marketplace(
+            &mut registry,
+            home,
+            None,
+            &url_a,
+            AddMarketplaceParams::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!again.changed);
+        assert!(again.skills.is_empty());
+
+        // 同名不同源 → DuplicateMarketplace，既有注册与内容保持不变。
+        let err = add_marketplace(
+            &mut registry,
+            home,
+            None,
+            &url_b,
+            AddMarketplaceParams::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, GovernanceError::DuplicateMarketplace(n) if n == "skills"),
+            "{err:?}"
+        );
+        let rec = load_known_marketplaces(Some(home), None)
+            .account
+            .marketplaces
+            .get("skills")
+            .cloned()
             .unwrap();
-        // 同名再加（不同 owner，相同派生名）→ DuplicateMarketplace。
-        assert!(matches!(
-            add_marketplace(&mut registry, home, None, "other/skills", mk()).await,
-            Err(GovernanceError::DuplicateMarketplace(n)) if n == "skills"
-        ));
+        assert_eq!(rec.source["url"].as_str(), Some(url_a.as_str()));
+        assert_eq!(rec.manifest_name_baseline.as_deref(), Some("skills"));
+        assert!(registry.contains("audit:code-review"));
     }
 
     #[tokio::test]
@@ -901,6 +1400,7 @@ mod tests {
                 data.account.marketplaces.insert(
                     raw_name.to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": "https://example.com/repo.git"}),
                         extra: Map::new(),
                     },
@@ -939,21 +1439,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_after_no_clone_add_prunes_entry() {
+    async fn remove_after_ledger_seed_prunes_entry() {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let mut registry = SkillRegistry::new();
-        add_marketplace(
-            &mut registry,
-            home,
-            None,
-            "acme/skills",
-            AddMarketplaceParams {
-                no_clone: true,
-                ..Default::default()
+        update_known_marketplaces(
+            |data| {
+                data.account.marketplaces.insert(
+                    "skills".to_string(),
+                    KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
+                        source: json!({"type": "git", "url": "https://example.com/skills.git"}),
+                        extra: Map::new(),
+                    },
+                );
             },
+            Some(home),
+            None,
         )
-        .await
         .unwrap();
         assert!(marketplace_name_taken(home, None, "skills"));
 
@@ -1007,12 +1510,14 @@ mod tests {
         );
     }
 
-    /// 构造 marketplace 源仓库（audit plugin：1 skill）→ git source value。
-    fn build_repo(repo: &Path) -> Value {
+    /// 构造 marketplace 源仓库（audit plugin：1 skill + 清单顶层 `marketplace` 名）→ git source value。
+    fn build_repo(repo: &Path, marketplace: &str) -> Value {
         std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         std::fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+            format!(
+                r#"{{"name": "{marketplace}", "plugins": [{{"name": "audit", "source": "./plugins/audit"}}]}}"#
+            ),
         )
         .unwrap();
         let skill = repo.join("plugins/audit/skills/code-review");
@@ -1094,17 +1599,28 @@ mod tests {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let mut registry = SkillRegistry::new();
-        let mk = || AddMarketplaceParams {
-            no_clone: true,
-            ..Default::default()
-        };
         // 两个 marketplace：skills（待移除，下挂 audit@skills 带 bundled server）+ my-skills（须保留 x@my-skills）。
-        add_marketplace(&mut registry, home, None, "acme/skills", mk())
-            .await
-            .unwrap();
-        add_marketplace(&mut registry, home, None, "acme/my-skills", mk())
-            .await
-            .unwrap();
+        // 直接播种账本（remove 不要求 clone 存在）。
+        update_known_marketplaces(
+            |data| {
+                for name in ["skills", "my-skills"] {
+                    data.account.marketplaces.insert(
+                        name.to_string(),
+                        KnownMarketplaceEntry {
+                            manifest_name_baseline: None,
+                            source: json!({
+                                "type": "git",
+                                "url": format!("https://example.com/{name}.git")
+                            }),
+                            extra: Map::new(),
+                        },
+                    );
+                }
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
         seed_installed(home, "audit@skills", &["audit-mcp"]);
         seed_installed(home, "x@my-skills", &["x-mcp"]); // 后缀 @my-skills，不应被 @skills 命中
 
@@ -1153,7 +1669,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let repo = dir.path().join("repo");
-        let source = build_repo(&repo);
+        let source = build_repo(&repo, "acme");
         let url = source
             .get("url")
             .and_then(Value::as_str)
@@ -1165,7 +1681,7 @@ mod tests {
         add_marketplace(
             &mut registry,
             home,
-            None,
+            Some(&test_env(home)),
             &url,
             AddMarketplaceParams {
                 name: Some("acme"),
@@ -1201,13 +1717,10 @@ mod tests {
         );
     }
 
-    // ---- 🟡3a：尾段仅 ".git" → 派生空名 → InvalidName（纯函数级触发）----
+    // ---- 🟡3a：尾段仅 ".git" → URL 派生工具返回 None（legacy helper；add 不再派生名）----
     #[test]
-    fn resolve_identity_dotgit_only_tail_is_invalid_name() {
-        assert!(matches!(
-            resolve_marketplace_identity("https://example.com/.git", None),
-            Err(GovernanceError::InvalidName(name)) if name.is_empty()
-        ));
+    fn default_name_dotgit_only_tail_is_none() {
+        assert_eq!(default_marketplace_name("https://example.com/.git"), None);
     }
 
     // ---- 🟡3b：clone 不可达（stage 降级未落账）→ CloneFailed ----
@@ -1229,9 +1742,10 @@ mod tests {
         )
         .await
         .unwrap_err();
+        // #272：clone 在读完清单前发生，注册名尚未知（空串）；仍须保持网络错分类。
         assert!(matches!(
-            err,
-            GovernanceError::CloneFailed(name) if name == "acme"
+            &err,
+            GovernanceError::CloneFailed(name) if name.is_empty()
         ));
         // 降级铁律：未落 known_marketplaces。
         assert!(!marketplace_name_taken(home, None, "acme"));
@@ -1241,9 +1755,16 @@ mod tests {
 
     fn build_plugin_repo(repo: &Path, plugin: &str, description: &str) -> Value {
         std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        // 清单顶层 name 取仓库目录名（调用方按 `<repo-stem>` 注册 marketplace）。
+        let marketplace = repo
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("test-marketplace");
         std::fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            format!(r#"{{"plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#),
+            format!(
+                r#"{{"name": "{marketplace}", "plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#
+            ),
         )
         .unwrap();
         let skill = repo.join(format!("plugins/{plugin}/skills/code-review"));
