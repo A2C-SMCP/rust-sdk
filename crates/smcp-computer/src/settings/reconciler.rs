@@ -21,8 +21,18 @@
 //! - **additive-only 只增不删**：对账返回只有 `{installed, updated, up_to_date, failed, skipped}`、**无 removed**。
 //!   「声明没、物化有」的条目**完全不动**（绝不自动清理）；孤儿留待 §7.3 显式 [`prune_marketplaces`] /
 //!   [`gc_plugins`] 清。
+//! - **同名不同源拒绝**（runtime-contract §5.14 / #294）：声明面 marketplace source 与账本记录不一致时
+//!   **拒绝**——不注销 SKILL、不删 clone 树、不 stage/pull；旧注册、旧物化内容与旧运行时能力保持 active。
+//!   拒绝归 `failed` 并记 `reason="marketplace_source_conflict"` 的结构化 ERROR；换源必须显式
+//!   [`prune_marketplaces`] / lifecycle remove 后 re-add，且既有 `<plugin>@<name>` 意图引用须先移除
+//!   （§5.14 ④，由 #272 的 remove/add 语义执行）。同源判定为精确 JSON `Value` 相等（canonical 归一化归
+//!   #272）；已注册名的新声明 source 不可克隆时同样拒绝（`reason="marketplace_source_unusable"`，fail-closed）。
+//!   **前置契约**：拒绝分支不 stage——本函数只保留调用方传入的 `SkillRegistry` 现状。用空 Registry 做启动
+//!   对账的调用方须先跑 [`recover_marketplace_skills`](super::recovery::recover_marketplace_skills) 或传入
+//!   既有 Registry，否则被拒 marketplace 的旧 SKILL 不会出现在该 Registry（账本与 clone 树不受影响）。
 //! - **失败降级铁律**（§7.2）：git clone/pull 失败 → 记 ERROR、不阻断其余、对 Agent 不可见（不入 Registry）；
-//!   本模块**不**向调用方抛 git/IO 异常（沿用 [`stage_marketplace_skills`] 的吞错降级）。
+//!   本模块**不**向调用方抛 git/IO 异常（沿用 [`stage_marketplace_skills`] 的吞错降级）。§5.14 拒绝**不是**
+//!   clone/pull 失败：旧能力保持 active、不降级。
 //!
 //! 存储接缝 / Store seam（#67 / #68 边界）：本模块经 [`SkillGovernanceStore`] 读/改
 //! `known_marketplaces.json` 与 `installed_plugins.json`，**不**自持久化逻辑——原子写 + 恢复归 **#67 SET-04**，
@@ -45,10 +55,12 @@ use serde_json::{Map, Value};
 use smcp::utils::path::{is_within, normalize_lexical};
 
 use crate::mcp_clients::model::BundleId;
+use crate::settings::redaction::{git_url_for_display, REDACTED_GIT_SOURCE};
 use crate::settings::schema::{is_valid_enabled_plugin_key, is_valid_marketplace_name};
 use crate::settings::scope::EnvMap;
 use crate::skills::home::{marketplace_skill_dir, SOURCE_MARKETPLACE};
 use crate::skills::registry::SkillRegistry;
+use crate::skills::sources::marketplace_clone_url;
 use crate::skills::staging::{
     external_plugin_dir, stage_marketplace_skills, KnownMarketplaceRecorder,
     MarketplaceStageOptions, DEFAULT_GIT_TIMEOUT, EXTERNAL_PLUGINS_NS,
@@ -172,17 +184,30 @@ pub trait McpTeardown: Send + Sync {
 ///
 /// 各 marketplace 名互斥地归入 installed / updated / up_to_date / failed / skipped 之一；
 /// `registered_skills` 汇总本次成功注册 / 刷新的全部 SKILL 名（供 watcher / emit diff）。
+///
+/// `failed` 是一个并集：clone/pull 失败（降级）**或** §5.14 source 拒绝（同名不同源 / 声明 source 不可克隆；
+/// 旧注册保留、不降级）；后者 reason 只在 ERROR 日志的结构化字段中
+/// （`marketplace_source_conflict` / `marketplace_source_unusable`），本结构不加字段以保 API 稳定。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// 本次新 clone 的 marketplace / newly cloned。
     pub installed: Vec<String>,
-    /// autoUpdate pull / sourceChanged 重 clone / updated。
+    /// autoUpdate pull / 显式 refresh 的 pull / updated（source 冲突项不 pull，见 [`reconcile`]）。
     pub updated: Vec<String>,
     /// 声明且已在、未刷新 / declared and present, not refreshed。
     pub up_to_date: Vec<String>,
-    /// 声明但 stage 后 clone 树仍缺失（clone 失败，已降级）/ failed (degraded)。
+    /// 本次**声明但未应用**的 marketplace，两种原因并列：① stage 后 clone 树仍缺失（clone/pull 失败，
+    /// 可重试，已降级）；② §5.14 同名不同源 / 声明 source 不可克隆（**不可重试**的 validation 冲突，旧注册、
+    /// 旧内容、旧能力保持 active、**不**降级）。② 的 reason 只在 ERROR 日志的结构化字段中。
+    ///
+    /// 调用方 MUST NOT 把本列表当作「该 marketplace 的旧注册已失效」：② 的旧注册仍 active（**前提**：调用方
+    /// 传入的 `SkillRegistry` 已含旧物化，或启动时已先跑 recovery——拒绝分支不 stage，空 Registry 下旧 SKILL
+    /// 不会出现）；也 MUST NOT 对 ② 做无界重试（须先修配置并显式 remove + re-add）。
+    /// / declared but not applied: clone failure (retryable, degraded) or §5.14 source conflict
+    /// (non-retryable validation; old registration stays active only if the caller supplied the existing
+    /// Registry or ran recovery first — the rejection path never stages).
     pub failed: Vec<String>,
-    /// 预留（trust 门控落 #68 / strict 延后）/ reserved。
+    /// 预留（trust 门控落 #68 / strict 延后）/ reserved。§5.14 拒绝 MUST NOT 占用本桶。
     pub skipped: Vec<String>,
     /// 本次成功注册 / 刷新的全部 SKILL 名 / all registered skill names。
     pub registered_skills: Vec<String>,
@@ -194,6 +219,7 @@ pub struct ReconcileOptions<'a> {
     /// git 子进程 / 物化文件路径解析环境（`None` → 进程环境）/ git env。
     pub env: Option<&'a EnvMap>,
     /// `true` = 显式 sync：对**全部**已存在 clone 走 pull（不止 autoUpdate 项）；仍 additive-only。
+    /// 声明面 source 与账本冲突的项**不** pull（§5.14 拒绝优先，见 [`reconcile`]）。
     pub refresh: bool,
     /// 单次 git 操作超时（`None` → [`DEFAULT_GIT_TIMEOUT`]）/ per-op git timeout。
     pub timeout: Option<Duration>,
@@ -360,7 +386,8 @@ pub(crate) fn remove_plugin_install_path(
 ///
 /// 按 `A2CSkillRef.source == "marketplace:<mp>"` 反查（marketplace SKILL name 形如 `<plugin>:<skill>`，
 /// `plugin` 给定时再按 `<plugin>:` 前缀过滤）。**含孤儿**：installed_disabled plugin 的 SKILL 在 Registry
-/// 中保留为 orphan（不投影但占名），source 变更 / prune / gc 时必须一并注销，否则同名跨源守卫会阻止换源。
+/// 中保留为 orphan（不投影但占名），prune / gc（显式删除入口）时必须一并注销，否则同名跨源守卫会阻止换源。
+/// **§5.14 同名不同源拒绝路径 MUST NOT 调用本函数**——旧注册的 SKILL（含孤儿）必须保持可用。
 fn unregister_marketplace_skills(
     registry: &mut SkillRegistry,
     marketplace: &str,
@@ -383,17 +410,44 @@ fn unregister_marketplace_skills(
 // ===========================================================================
 // 启动对账（additive-only）/ Startup reconcile (additive-only)
 // ===========================================================================
+/// 「同名不同源」拒绝的稳定 reason 字段值（结构化 ERROR 日志；MUST NOT 复用为 `skipped`）。
+const REASON_SOURCE_CONFLICT: &str = "marketplace_source_conflict";
+
+/// 已注册名对应的声明 source 不可用（与账本同形但非合法 git source）时的 fail-closed reason。
+///
+/// 两侧「同样不可用」无法证明同源（§5.14「无法确定时 MUST fail-closed」）→ 视为注册被拒。
+const REASON_SOURCE_UNUSABLE: &str = "marketplace_source_unusable";
+
+/// marketplace source Value → 安全展示值（日志/诊断边界）。
+///
+/// 只取 `url` 子字段并经 [`git_url_for_display`] 脱敏（userinfo / query / fragment 一律移除）；
+/// 非对象或缺 `url` → [`REDACTED_GIT_SOURCE`] fail-closed。**不可**对整个 JSON 文本做
+/// `redact_git_urls_in_text`：token 以空白划分，尾随 `"}` 会并入 URL 破坏展示。
+fn source_for_log(source: &Value) -> String {
+    source
+        .get("url")
+        .and_then(Value::as_str)
+        .map(git_url_for_display)
+        .unwrap_or_else(|| REDACTED_GIT_SOURCE.to_string())
+}
+
 /// 对账声明的 marketplace 与物化 clone 树（additive-only）/ Reconcile declared vs materialized。
 ///
 /// 四分支（§7.1 step 3）/ Four branches:
 /// - **missing**（declared∖materialized）→ clone（[`stage_marketplace_skills`] 缺失即 clone）。
-/// - **sourceChanged**（`record.source != decl.source`）→ 先 `rmtree` 旧 clone 树（含外部 plugin 树）再重 clone
-///   （reconciler 兜底：staging 仅 pull 不换库）。
-/// - **autoUpdate**（`decl.autoUpdate == true` 或显式 `refresh`）→ `git pull`。
+/// - **sourceChanged**（`record.source != decl.source`）→ **拒绝**（runtime-contract §5.14）：不注销 SKILL、不
+///   `rmtree`、不 stage/pull，归 `failed` 并记 `reason="marketplace_source_conflict"` 的 ERROR；旧注册、旧物化
+///   内容与旧运行时能力保持 active。换源必须显式 [`prune_marketplaces`] / lifecycle remove 后 re-add，且既有
+///   `<plugin>@<name>` 意图引用须先移除（§5.14 ④，由 #272 的 remove/add 语义执行）。
+///   同源判定为精确 JSON `Value` 相等（canonical 归一化归 #272）；已注册名的新声明 source 不可克隆时同样
+///   拒绝（`reason="marketplace_source_unusable"`，fail-closed——无法证明同源）。
+/// - **autoUpdate**（`decl.autoUpdate == true` 或显式 `refresh`）→ `git pull`（source 冲突项不 pull，拒绝优先）。
 /// - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 [`prune_marketplaces`] 显式清）。
 ///
 /// 每个 declared marketplace 物化其 `enabledPlugins` 中**启用**的 plugin 的 SKILL；禁用 / 未声明 plugin 不注册。
-/// 失败降级：stage 吞错返回空 → 本函数据 clone 树是否存在判 `failed`。
+/// 失败降级：stage 吞错返回空且 clone 树缺失 → 归 `failed`（降级）；若 stage 失败但 clone 树仍在（如 pull 成功
+/// 而 manifest 解析失败），沿用既有行为归 `up_to_date` / `updated`（既有表述边界，另行跟进）。§5.14 拒绝同样归
+/// `failed`，但它**不是** clone/pull 失败——旧能力保持 active、不降级，见 [`ReconcileReport::failed`]。
 pub async fn reconcile(
     registry: &mut SkillRegistry,
     home: &Path,
@@ -409,25 +463,37 @@ pub async fn reconcile(
 
     let mut report = ReconcileReport::default();
     let empty_source = Value::Object(Map::new());
-    let ext_root = home.join(SOURCE_MARKETPLACE).join(EXTERNAL_PLUGINS_NS);
 
     for (name, decl) in &declared_mps {
         let source = decl.get("source").cloned().unwrap_or(Value::Null);
-        let record = materialized.get(name);
-        let source_changed = record.is_some_and(|r| r.source != source);
-        let clone_dir = marketplace_skill_dir(home, name, &[]);
 
-        if source_changed {
-            // 源已变更：旧 clone 是「别的仓库」，必须 wipe 后重 clone（stage 只 pull 不换库）。
-            tracing::info!(
+        // §5.14 / #294：一名一源；声明面换源 MUST 拒绝（validation），MUST NOT 静默覆盖/替换。
+        // 守卫在任何 unregister / rmtree / stage / pull 之前；旧注册、旧物化内容与旧能力保持 active。
+        // 精确 `Value` 不等即拒绝（fail-closed）：归一化（同一仓库不同写法）归 #272 的身份语义。
+        // 已注册名 + 声明 source 不可用（两侧同为 null / `{}` 等）同样无法证明同源 → fail-closed 拒绝，
+        // 否则 stage 空转后会被误报为 up_to_date / updated（看似成功但什么都没应用）。
+        let record = materialized.get(name);
+        let source_conflict = record.is_some_and(|r| r.source != source);
+        let source_unusable = record.is_some() && marketplace_clone_url(&source).is_err();
+        if source_conflict || source_unusable {
+            let registered = record.map_or(Value::Null, |r| r.source.clone());
+            let reason = if source_conflict {
+                REASON_SOURCE_CONFLICT
+            } else {
+                REASON_SOURCE_UNUSABLE
+            };
+            tracing::error!(
                 marketplace = %name,
-                "reconcile: marketplace source changed, wiping stale clone for re-clone"
+                reason = reason,
+                registered_source = %source_for_log(&registered),
+                declared_source = %source_for_log(&source),
+                "reconcile: rejected marketplace source (different or unusable source; explicit remove + re-add required)"
             );
-            unregister_marketplace_skills(registry, name, None);
-            safe_rmtree(&clone_dir, home);
-            safe_rmtree(&ext_root.join(name), home);
+            report.failed.push(name.clone());
+            continue;
         }
 
+        let clone_dir = marketplace_skill_dir(home, name, &[]);
         let present_before = clone_dir.exists();
         let auto_update = decl
             .get("autoUpdate")
@@ -461,8 +527,6 @@ pub async fn reconcile(
 
         if !clone_dir.exists() {
             report.failed.push(name.clone());
-        } else if source_changed {
-            report.updated.push(name.clone());
         } else if !present_before {
             report.installed.push(name.clone());
         } else if do_refresh {
@@ -856,8 +920,9 @@ mod tests {
     use crate::skills::staging::KnownMarketplaceRecord;
     use smcp::A2CSkillRef;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber;
 
     // ---- 内存 store 替身 / in-memory store fake -------------------------------
     #[derive(Default)]
@@ -1250,24 +1315,84 @@ mod tests {
     }
 
     fn make_marketplace_repo(root: &Path, url_skill_desc: &str) -> PathBuf {
+        make_marketplace_repo_with_plugin(root, "audit", url_skill_desc)
+    }
+
+    /// 指定 plugin 名的 marketplace 仓库（多 marketplace 用例避免跨源同名 SKILL 冲突）。
+    fn make_marketplace_repo_with_plugin(root: &Path, plugin: &str, skill_desc: &str) -> PathBuf {
         let repo = root.join("repo");
         std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         std::fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+            format!(r#"{{"plugins": [{{"name": "{plugin}", "source": "./plugins/{plugin}"}}]}}"#),
         )
         .unwrap();
-        let skill = repo.join("plugins/audit/skills/code-review");
+        let skill = repo.join(format!("plugins/{plugin}/skills/code-review"));
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
-            format!("---\nname: code-review\ndescription: {url_skill_desc}\n---\nbody"),
+            format!("---\nname: code-review\ndescription: {skill_desc}\n---\nbody"),
         )
         .unwrap();
         git(&["init", "-q"], &repo);
         git(&["add", "-A"], &repo);
         git(&["commit", "-qm", "init"], &repo);
         repo
+    }
+
+    /// 同源上游更新：改写 plugin 的 SKILL 描述并提交（`refresh`/`autoUpdate` 收敛用）。
+    fn commit_skill_desc(repo: &Path, plugin: &str, skill_desc: &str) {
+        let skill = repo.join(format!("plugins/{plugin}/skills/code-review/SKILL.md"));
+        std::fs::write(
+            skill,
+            format!("---\nname: code-review\ndescription: {skill_desc}\n---\nbody"),
+        )
+        .unwrap();
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "update"], repo);
+    }
+
+    // ---- 日志捕获（结构化诊断断言）/ captured logs ---------------------------
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `(捕获器, subscriber)`：`fut.with_subscriber(sub).await` 后读 [`CapturedLogs::contents`]。
+    fn capture_subscriber() -> (
+        CapturedLogs,
+        impl tracing::Subscriber + Send + Sync + 'static,
+    ) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        (logs, subscriber)
     }
 
     #[tokio::test]
@@ -1299,7 +1424,177 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_source_changed_reclones() {
+    async fn reconcile_source_changed_rejects_and_preserves_old_registration() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let repo_b = make_marketplace_repo(&tmp.path().join("b"), "from B");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let url_b = format!("file://{}", repo_b.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let r1 = reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default()).await;
+        assert_eq!(r1.installed, vec!["acme".to_string()]);
+
+        // 旧态哨兵：catalog clone 树、外部 plugin 树、该源 orphan SKILL。
+        let clone_dir = marketplace_skill_dir(&home, "acme", &[]);
+        let skill_md = clone_dir.join("plugins/audit/skills/code-review/SKILL.md");
+        assert!(std::fs::read_to_string(&skill_md)
+            .unwrap()
+            .contains("from A"));
+        std::fs::write(clone_dir.join("SENTINEL-CLONE"), b"keep").unwrap();
+        let ext_dir = home
+            .join(SOURCE_MARKETPLACE)
+            .join(EXTERNAL_PLUGINS_NS)
+            .join("acme");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("SENTINEL-EXT"), b"keep").unwrap();
+        reg.register(mp_ref("legacy:old", "acme", &clone_dir));
+
+        // 声明面换源（同名不同源）→ §5.14 拒绝；旧注册 / 旧内容 / 旧能力保持不变。
+        let d_b = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_b}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let r2 = reconcile(&mut reg, &home, &d_b, &store, ReconcileOptions::default()).await;
+        assert_eq!(r2.failed, vec!["acme".to_string()]);
+        assert!(
+            r2.installed.is_empty() && r2.updated.is_empty() && r2.up_to_date.is_empty(),
+            "拒绝不得落入其它桶：{r2:?}"
+        );
+        assert!(r2.skipped.is_empty(), "拒绝不得占用 trust 预留桶：{r2:?}");
+        assert!(r2.registered_skills.is_empty());
+
+        // 旧能力：registry 旧 SKILL（含 orphan）仍在，描述仍是旧源内容。
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A"
+        );
+        assert!(reg.contains("legacy:old"), "旧源 orphan 不得被注销");
+        // 旧内容：clone 树未被 wipe / 无新源内容；外部 plugin 树未被删。
+        assert!(clone_dir.join("SENTINEL-CLONE").exists());
+        assert!(ext_dir.join("SENTINEL-EXT").exists());
+        assert!(std::fs::read_to_string(&skill_md)
+            .unwrap()
+            .contains("from A"));
+        // 旧注册：账本 source 仍是 A（未被 recorder 静默改写）。
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            serde_json::json!({"type": "git", "url": url_a})
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_is_idempotent_and_old_source_converges() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let repo_b = make_marketplace_repo(&tmp.path().join("b"), "from B");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let url_b = format!("file://{}", repo_b.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let d_b = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_b}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        // 连续两次声明 B 都拒绝（确定性、不污染后续）。
+        for round in 0..2 {
+            let r = reconcile(&mut reg, &home, &d_b, &store, ReconcileOptions::default()).await;
+            assert_eq!(r.failed, vec!["acme".to_string()], "round {round}");
+            assert!(r.updated.is_empty() && r.up_to_date.is_empty());
+        }
+
+        // 回到旧源 A → 正常收敛（up_to_date），旧注册未受损。
+        let r3 = reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default()).await;
+        assert_eq!(r3.up_to_date, vec!["acme".to_string()]);
+        assert!(r3.failed.is_empty());
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_wins_over_refresh_and_never_pulls() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let repo_b = make_marketplace_repo(&tmp.path().join("b"), "from B");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let url_b = format!("file://{}", repo_b.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        // 旧源上游有新内容：拒绝优先，既不得换到 B，也不得对旧 clone 执行 pull。
+        commit_skill_desc(&repo_a, "audit", "from A v2");
+        let d_b = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_b}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let r = reconcile(
+            &mut reg,
+            &home,
+            &d_b,
+            &store,
+            ReconcileOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert!(r.updated.is_empty() && r.registered_skills.is_empty());
+        let skill_md = marketplace_skill_dir(&home, "acme", &[])
+            .join("plugins/audit/skills/code-review/SKILL.md");
+        let text = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(
+            text.contains("from A") && !text.contains("from A v2"),
+            "拒绝不得触发 pull：{text}"
+        );
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A"
+        );
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            serde_json::json!({"type": "git", "url": url_a})
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_fail_closed_on_malformed_declared_source() {
         let tmp = TempDir::new().unwrap();
         let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
         let home = tmp.path().join("home");
@@ -1312,23 +1607,491 @@ mod tests {
             "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
             "enabledPlugins": {"audit@acme": true}
         }));
-        let r1 = reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default()).await;
-        assert_eq!(r1.installed, vec!["acme".to_string()]);
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
 
-        // 换源（另一个 repo，url 不同）→ sourceChanged → wipe + 重 clone → updated。
+        // 声明缺失 / null / 非对象 → 无法证明同源 → fail-closed 拒绝，旧态保持。
+        for decl in [
+            serde_json::json!({}),
+            serde_json::json!({"source": null}),
+            serde_json::json!({"source": "not-an-object"}),
+            serde_json::json!({"source": ["x"]}),
+        ] {
+            let mut mps = Map::new();
+            mps.insert("acme".to_string(), decl.clone());
+            let mut raw = Map::new();
+            raw.insert("extraKnownMarketplaces".to_string(), Value::Object(mps));
+            raw.insert(
+                "enabledPlugins".to_string(),
+                serde_json::json!({"audit@acme": true}),
+            );
+            let d = declared(Value::Object(raw));
+
+            let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+            assert_eq!(r.failed, vec!["acme".to_string()], "decl={decl}");
+            assert!(
+                r.installed.is_empty() && r.updated.is_empty() && r.up_to_date.is_empty(),
+                "decl={decl}"
+            );
+            assert_eq!(
+                reg.resolve("audit:code-review").unwrap().description,
+                "from A",
+                "decl={decl}"
+            );
+            assert_eq!(
+                store.load_known_marketplaces().marketplaces["acme"].source,
+                serde_json::json!({"type": "git", "url": url_a}),
+                "decl={decl}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_fail_closed_on_unrecorded_registered_source() {
+        // 账本记录存在但 source 缺失 / 空对象（无法证明同源）→ fail-closed 拒绝，旧物化保持。
+        for ledger_source in [serde_json::json!(null), serde_json::json!({})] {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let store = MemStore::default();
+            let mut reg = SkillRegistry::new();
+
+            let clone_dir = marketplace_skill_dir(&home, "acme", &[]);
+            std::fs::create_dir_all(&clone_dir).unwrap();
+            std::fs::write(clone_dir.join("SENTINEL-CLONE"), b"keep").unwrap();
+            reg.register(mp_ref("audit:code-review", "acme", &clone_dir));
+            store.record(KnownMarketplaceRecord {
+                name: "acme",
+                source: &ledger_source,
+                install_location: &clone_dir,
+                commit_sha: Some("deadbeef"),
+                auto_update: false,
+                changed: true,
+            });
+
+            let repo = make_marketplace_repo(&tmp.path().join("a"), "from A");
+            let url_a = format!("file://{}", repo.display());
+            let d = declared(serde_json::json!({
+                "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+                "enabledPlugins": {"audit@acme": true}
+            }));
+            let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+            assert_eq!(r.failed, vec!["acme".to_string()], "ledger={ledger_source}");
+            assert!(
+                r.installed.is_empty() && r.updated.is_empty() && r.up_to_date.is_empty(),
+                "ledger={ledger_source}"
+            );
+            assert!(clone_dir.join("SENTINEL-CLONE").exists());
+            assert!(reg.contains("audit:code-review"));
+            assert_eq!(
+                store.load_known_marketplaces().marketplaces["acme"].source,
+                ledger_source
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_fail_closed_on_equal_unusable_sources() {
+        // 账本与声明「同形但都不可用」：无法证明同源 → fail-closed 拒绝，不得因 `==` 放行后把空转
+        // stage 误报成 up_to_date / updated。含对象形态（非 git / 非法 url）以钉死 marketplace_clone_url
+        // 谓词——防实现被弱化为 `!source.is_object()` 后本用例仍绿。
+        for unusable in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"type": "github", "url": "owner/repo"}),
+            serde_json::json!({"type": "git", "url": "bogus"}),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let store = MemStore::default();
+            let mut reg = SkillRegistry::new();
+
+            let clone_dir = marketplace_skill_dir(&home, "acme", &[]);
+            std::fs::create_dir_all(&clone_dir).unwrap();
+            std::fs::write(clone_dir.join("SENTINEL-CLONE"), b"keep").unwrap();
+            reg.register(mp_ref("audit:code-review", "acme", &clone_dir));
+            store.record(KnownMarketplaceRecord {
+                name: "acme",
+                source: &unusable,
+                install_location: &clone_dir,
+                commit_sha: Some("deadbeef"),
+                auto_update: false,
+                changed: true,
+            });
+
+            let d = declared(serde_json::json!({
+                "extraKnownMarketplaces": {"acme": {"source": unusable}},
+                "enabledPlugins": {"audit@acme": true}
+            }));
+            let (logs, subscriber) = capture_subscriber();
+            let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default())
+                .with_subscriber(subscriber)
+                .await;
+            assert_eq!(r.failed, vec!["acme".to_string()], "source={unusable}");
+            assert!(
+                r.installed.is_empty() && r.updated.is_empty() && r.up_to_date.is_empty(),
+                "不得把空转 stage 报成成功：{r:?}"
+            );
+            assert!(r.skipped.is_empty());
+            assert!(r.registered_skills.is_empty());
+            assert!(clone_dir.join("SENTINEL-CLONE").exists());
+            assert!(reg.contains("audit:code-review"));
+            // 账本 source 不得被改写（仍与声明同形的不可用值）。
+            assert_eq!(
+                store.load_known_marketplaces().marketplaces["acme"].source,
+                unusable
+            );
+            let rendered = logs.contents();
+            assert!(
+                rendered.contains("marketplace_source_unusable"),
+                "reason 应可区分不可用 source：{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_with_empty_registry_does_not_stage() {
+        // 前置契约：拒绝分支不 stage——空 Registry 调用时旧 SKILL 不会出现（调用方须先跑 recovery 或
+        // 传入既有 Registry），但账本与旧 clone 必须原样保持、不得凭空 clone 新源。
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new(); // 空 Registry（模拟启动对账未先跑 recovery）
+
+        let clone_dir = marketplace_skill_dir(&home, "acme", &[]);
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        std::fs::write(clone_dir.join("SENTINEL-CLONE"), b"keep").unwrap();
+        let source_a = serde_json::json!({"type": "git", "url": "file:///tmp/does-not-matter-a"});
+        store.record(KnownMarketplaceRecord {
+            name: "acme",
+            source: &source_a,
+            install_location: &clone_dir,
+            commit_sha: Some("deadbeef"),
+            auto_update: false,
+            changed: true,
+        });
+
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {
+                "type": "git", "url": "file:///tmp/does-not-matter-b"
+            }}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert!(
+            r.installed.is_empty() && r.updated.is_empty() && r.up_to_date.is_empty(),
+            "拒绝分支不得 stage：{r:?}"
+        );
+        assert!(r.registered_skills.is_empty());
+        assert!(reg.is_empty(), "空 Registry 应保持为空（拒绝分支不注册）");
+        assert!(clone_dir.join("SENTINEL-CLONE").exists());
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            source_a
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_wins_over_auto_update_and_never_pulls() {
+        // 声明级 autoUpdate=true 同样不得绕过 §5.14 拒绝（守卫先于 do_refresh 计算）。
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
         let repo_b = make_marketplace_repo(&tmp.path().join("b"), "from B");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
         let url_b = format!("file://{}", repo_b.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        commit_skill_desc(&repo_a, "audit", "from A v2");
+        let d_b = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {
+                "source": {"type": "git", "url": url_b},
+                "autoUpdate": true
+            }},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let r = reconcile(&mut reg, &home, &d_b, &store, ReconcileOptions::default()).await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert!(r.updated.is_empty() && r.registered_skills.is_empty());
+        let skill_md = marketplace_skill_dir(&home, "acme", &[])
+            .join("plugins/audit/skills/code-review/SKILL.md");
+        let text = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(
+            text.contains("from A") && !text.contains("from A v2"),
+            "autoUpdate 也不得触发 pull：{text}"
+        );
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            serde_json::json!({"type": "git", "url": url_a})
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_compares_whole_source_shape() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        // 同 url 但形状不同（多余 ref 键）：无法判定同源 → fail-closed 拒绝（归一化归 #272）。
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {
+                "type": "git", "url": url_a, "ref": "main"
+            }}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert!(r.updated.is_empty() && r.up_to_date.is_empty());
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            serde_json::json!({"type": "git", "url": url_a})
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_logs_stable_reason_and_redacts_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        // 声明面带凭据 URL：日志必须给稳定 reason 且脱敏（归 reject 前置，不发网络请求）。
+        // 用不会出现在临时路径 / 系统用户名中的唯一 token，避免 `!contains` 断言误报。
+        let secret_url = "https://u294tok:SEKRETQW7@example.com/acme/repo.git";
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": secret_url}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let (logs, subscriber) = capture_subscriber();
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default())
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+
+        let rendered = logs.contents();
+        assert!(
+            rendered.contains("marketplace_source_conflict"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("https://example.com/acme/repo.git"),
+            "{rendered}"
+        );
+        for secret in ["u294tok", "SEKRETQW7"] {
+            assert!(!rendered.contains(secret), "日志泄露 {secret}：{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_after_explicit_prune_installs_new_source() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let repo_b = make_marketplace_repo(&tmp.path().join("b"), "from B");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let url_b = format!("file://{}", repo_b.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
         let d_b = declared(serde_json::json!({
             "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_b}}},
             "enabledPlugins": {"audit@acme": true}
         }));
-        let r2 = reconcile(&mut reg, &home, &d_b, &store, ReconcileOptions::default()).await;
-        assert_eq!(r2.updated, vec!["acme".to_string()]);
-        assert!(r2.installed.is_empty() && r2.up_to_date.is_empty());
-        // 新内容生效（描述来自 repo_b）。
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_b, &store, ReconcileOptions::default())
+                .await
+                .failed,
+            vec!["acme".to_string()]
+        );
+
+        // 显式 remove（prune）后同名不同源 re-add：新注册成立，内容来自新源。
+        let removed = prune_marketplaces(&["acme".to_string()], &mut reg, &home, &store);
+        assert_eq!(removed, vec!["acme".to_string()]);
+        assert!(!reg.contains("audit:code-review"));
+        assert!(!store
+            .load_known_marketplaces()
+            .marketplaces
+            .contains_key("acme"));
+
+        // §5.14 ④ 的 `<plugin>@<name>` 意图引用门属 #272 的 remove/add 语义；此处不引入引用（无
+        // `enabledPlugins`），只钉死 reconcile 层「显式 remove 后同名不同源 re-add 成立」。
+        let d_b_unreferenced = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_b}}}
+        }));
+        let r3 = reconcile(
+            &mut reg,
+            &home,
+            &d_b_unreferenced,
+            &store,
+            ReconcileOptions::default(),
+        )
+        .await;
+        assert_eq!(r3.installed, vec!["acme".to_string()]);
+        assert!(r3.failed.is_empty());
+        // 新内容已物化（B 的 SKILL 描述）；本声明未启用 plugin，故不产生注册。
+        let skill_md = marketplace_skill_dir(&home, "acme", &[])
+            .join("plugins/audit/skills/code-review/SKILL.md");
+        assert!(std::fs::read_to_string(&skill_md)
+            .unwrap()
+            .contains("from B"));
+        assert!(r3.registered_skills.is_empty());
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            serde_json::json!({"type": "git", "url": url_b})
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_source_conflict_does_not_abort_other_marketplaces() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let repo_b = make_marketplace_repo(&tmp.path().join("b"), "from B");
+        let repo_beta =
+            make_marketplace_repo_with_plugin(&tmp.path().join("beta"), "lint", "beta skill");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let url_b = format!("file://{}", repo_b.display());
+        let url_beta = format!("file://{}", repo_beta.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        // 同轮：acme 换源被拒 + 新 beta 正常安装（continue 不得变 break）。
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {
+                "acme": {"source": {"type": "git", "url": url_b}},
+                "beta": {"source": {"type": "git", "url": url_beta}}
+            },
+            "enabledPlugins": {"audit@acme": true, "lint@beta": true}
+        }));
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert_eq!(r.installed, vec!["beta".to_string()]);
+        assert!(
+            reg.contains("lint:code-review"),
+            "其它 marketplace 应照常安装"
+        );
         assert_eq!(
             reg.resolve("audit:code-review").unwrap().description,
-            "from B"
+            "from A"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_same_source_refresh_updates_content() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        // 同源上游更新 → refresh 正常收敛（不得被 §5.14 拒绝误伤）。
+        commit_skill_desc(&repo_a, "audit", "from A v2");
+        let r = reconcile(
+            &mut reg,
+            &home,
+            &d_a,
+            &store,
+            ReconcileOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(r.updated, vec!["acme".to_string()]);
+        assert!(r.failed.is_empty());
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A v2"
+        );
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            serde_json::json!({"type": "git", "url": url_a})
         );
     }
 
