@@ -261,7 +261,12 @@ pub struct ReconcileOptions<'a> {
 /// 从单一声明视图取合法 marketplace 声明 / Extract valid marketplace declarations（保声明顺序）。
 ///
 /// 跳过非法名（非 strict-kebab）/ 非对象条目（记 WARN）；返回 `(name, decl)` 列表。
-fn declared_marketplaces(declared: &Map<String, Value>) -> Vec<(String, Map<String, Value>)> {
+///
+/// `pub(crate)`：boot 恢复（[`recover_marketplace_skills`](crate::settings::recovery::recover_marketplace_skills)）
+/// 复用同一提取器做 §5.14 声明面换源检测，保证与 [`reconcile`] 同形（#295）。
+pub(crate) fn declared_marketplaces(
+    declared: &Map<String, Value>,
+) -> Vec<(String, Map<String, Value>)> {
     let Some(Value::Object(raw)) = declared.get("extraKnownMarketplaces") else {
         return Vec::new();
     };
@@ -441,7 +446,9 @@ fn unregister_marketplace_skills(
 // 启动对账（additive-only）/ Startup reconcile (additive-only)
 // ===========================================================================
 /// 「同名不同源」拒绝的稳定 reason 字段值（结构化 ERROR 日志；MUST NOT 复用为 `skipped`）。
-const REASON_SOURCE_CONFLICT: &str = "marketplace_source_conflict";
+///
+/// `pub(crate)`：boot 恢复的声明面换源检测（#295）用同一 reason 值，两条路径日志可统一检索。
+pub(crate) const REASON_SOURCE_CONFLICT: &str = "marketplace_source_conflict";
 
 /// 已注册名对应的声明 source 不可用（与账本同形但非合法 git source）时的 fail-closed reason。
 ///
@@ -453,7 +460,9 @@ const REASON_SOURCE_UNUSABLE: &str = "marketplace_source_unusable";
 /// 只取 `url` 子字段并经 [`git_url_for_display`] 脱敏（userinfo / query / fragment 一律移除）；
 /// 非对象或缺 `url` → [`REDACTED_GIT_SOURCE`] fail-closed。**不可**对整个 JSON 文本做
 /// `redact_git_urls_in_text`：token 以空白划分，尾随 `"}` 会并入 URL 破坏展示。
-fn source_for_log(source: &Value) -> String {
+///
+/// `pub(crate)`：boot 恢复的声明面换源报告（#295）复用同一脱敏边界。
+pub(crate) fn source_for_log(source: &Value) -> String {
     source
         .get("url")
         .and_then(Value::as_str)

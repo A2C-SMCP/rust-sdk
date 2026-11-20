@@ -423,6 +423,14 @@ pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: O
             "⚠ marketplace {marketplace:?} degraded during governance recovery (skills/servers not restored)"
         ));
     }
+    // #295：声明面换源被拒（§5.14）——旧能力仍按注册源恢复，故与上面的 degraded 文案分开。
+    for conflict in &report.marketplace_source_conflicts {
+        msg_warn(&format!(
+            "⚠ marketplace {:?}: declared source differs from registered source; declaration rejected \
+             (skills restored from the registered source; remove + re-add the marketplace to switch sources)",
+            conflict.marketplace
+        ));
+    }
 }
 
 /// hermetic 测试环境映射：user settings 落 `home/.config`（XDG_CONFIG_HOME）、HOME 兜底，避免污染真实用户配置。

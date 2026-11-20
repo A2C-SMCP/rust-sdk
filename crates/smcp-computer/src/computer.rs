@@ -2943,11 +2943,15 @@ impl<S: Session> Computer<S> {
             );
         }
         let recovery = self.reconcile_governance(None, None).await;
-        if !recovery.restored_plugins.is_empty() || !recovery.failed_marketplaces.is_empty() {
+        if !recovery.restored_plugins.is_empty()
+            || !recovery.failed_marketplaces.is_empty()
+            || !recovery.marketplace_source_conflicts.is_empty()
+        {
             info!(
                 restored_plugins = recovery.restored_plugins.len(),
                 restored_skills = recovery.restored_skills.len(),
                 failed_marketplaces = recovery.failed_marketplaces.len(),
+                marketplace_source_conflicts = recovery.marketplace_source_conflicts.len(),
                 "governance boot recovery complete"
             );
         }
@@ -7424,6 +7428,47 @@ mod tests {
             .await
             .resolve("audit:code-review")
             .is_some());
+    }
+
+    /// #295：声明面换源 → boot recovery 报结构化冲突；旧能力按注册源恢复；**不降级**。
+    #[tokio::test]
+    async fn reconcile_governance_source_conflict_reports_without_degrading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        // 另一个可 clone 的源（不得被使用）。
+        let other_url = build_marketplace_repo95(&tmp.path().join("repo-b"));
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let declared = serde_json::json!({
+            "enabledPlugins": { "audit@acme": true },
+            "extraKnownMarketplaces": { "acme": { "source": { "type": "git", "url": other_url } } }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let report = comp_b.reconcile_governance(None, Some(&declared)).await;
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert_eq!(report.marketplace_source_conflicts[0].marketplace, "acme");
+        assert!(report.failed_marketplaces.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+
+        // §5.14：validation 拒绝不得降级——生命周期不落 Degraded，诊断集无 MarketplaceSyncFailed。
+        let status = comp_b.status().await;
+        assert_ne!(status.lifecycle, LifecycleState::Degraded);
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .all(|d| d.code != DiagnosticCode::MarketplaceSyncFailed),
+            "声明冲突不得映射为 degraded 诊断：{:?}",
+            status.diagnostics
+        );
     }
 
     /// 阶段二：给定 hooks → 重挂 bundled MCP server；report.remounted_servers 命中 + hook 收到注册 + 幂等。
