@@ -2006,9 +2006,11 @@ impl<S: Session> Computer<S> {
     ///
     /// ## 参数 / Params
     /// - `hooks`：`None` = skills-only（boot 默认）；`Some` = client 经 hooks 重挂 bundled MCP server。
-    /// - `declared`：`enabledPlugins` 合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。
-    ///   `None` → 内部解析（进程 cwd 的 user/project/local/policy，**无** `--settings` flag scope）；CLI 参考
-    ///   接线传 **flag-aware** 视图使 `--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效。
+    /// - `declared`：合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。恢复阶段读
+    ///   `enabledPlugins`（启用门控）**与 `extraKnownMarketplaces`（#295 §5.14 声明面换源检测）**——只传
+    ///   `enabledPlugins` 的调用方不会得到换源冲突诊断（声明变更仍被忽略、不报错）。`None` → 内部解析
+    ///   （进程 cwd 的 user/project/local/policy，**无** `--settings` flag scope）；CLI 参考接线传
+    ///   **flag-aware** 视图使 `--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效。
     ///
     /// 返回 [`GovernanceRecoveryReport`]（恢复 / 跳过 / 降级明细，供观测与测试）。
     pub async fn reconcile_governance(
@@ -2943,11 +2945,15 @@ impl<S: Session> Computer<S> {
             );
         }
         let recovery = self.reconcile_governance(None, None).await;
-        if !recovery.restored_plugins.is_empty() || !recovery.failed_marketplaces.is_empty() {
+        if !recovery.restored_plugins.is_empty()
+            || !recovery.failed_marketplaces.is_empty()
+            || !recovery.marketplace_source_conflicts.is_empty()
+        {
             info!(
                 restored_plugins = recovery.restored_plugins.len(),
                 restored_skills = recovery.restored_skills.len(),
                 failed_marketplaces = recovery.failed_marketplaces.len(),
+                marketplace_source_conflicts = recovery.marketplace_source_conflicts.len(),
                 "governance boot recovery complete"
             );
         }
@@ -7424,6 +7430,52 @@ mod tests {
             .await
             .resolve("audit:code-review")
             .is_some());
+    }
+
+    /// #295：声明面换源 → boot recovery 报结构化冲突；旧能力按注册源恢复；**不降级**。
+    #[tokio::test]
+    async fn reconcile_governance_source_conflict_reports_without_degrading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        // 另一个可 clone 的源（不得被使用）。
+        let other_url = build_marketplace_repo95(&tmp.path().join("repo-b"));
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let declared = serde_json::json!({
+            "enabledPlugins": { "audit@acme": true },
+            "extraKnownMarketplaces": { "acme": { "source": { "type": "git", "url": other_url } } }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let report = comp_b.reconcile_governance(None, Some(&declared)).await;
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert_eq!(report.marketplace_source_conflicts[0].marketplace, "acme");
+        assert!(report.failed_marketplaces.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+
+        // §5.14：validation 拒绝不得降级——直接断言 boot 降级判定所用的谓词（`has_degraded`），
+        // 而非 lifecycle（本用例未 boot，初态 Created 下 `!= Degraded` 恒真、无覆盖力）。
+        assert!(
+            !comp_b.status.has_degraded(),
+            "声明冲突不得产生 Degraded 诊断：{:?}",
+            comp_b.status().await.diagnostics
+        );
+        let status = comp_b.status().await;
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .all(|d| d.code != DiagnosticCode::MarketplaceSyncFailed),
+            "声明冲突不得映射为 degraded 诊断：{:?}",
+            status.diagnostics
+        );
     }
 
     /// 阶段二：给定 hooks → 重挂 bundled MCP server；report.remounted_servers 命中 + hook 收到注册 + 幂等。

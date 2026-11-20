@@ -79,6 +79,7 @@ pub use reconciler::{
 pub use recovery::{
     collect_enabled_bundled_servers, recover_marketplace_skills,
     rematerialize_missing_ledger_records, BundledServerRecord, GovernanceRecoveryReport,
+    MarketplaceSourceConflict,
 };
 
 pub use schema::{
