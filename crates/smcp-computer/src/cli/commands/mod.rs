@@ -423,11 +423,12 @@ pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: O
             "⚠ marketplace {marketplace:?} degraded during governance recovery (skills/servers not restored)"
         ));
     }
-    // #295：声明面换源被拒（§5.14）——旧能力仍按注册源恢复，故与上面的 degraded 文案分开。
+    // #295：声明面换源被拒（§5.14）——注册源保持生效，故与上面的 degraded 文案分开。
+    // 文案不断言「skills restored」：disabled-only / 未安装的冲突不会恢复任何 skill。
     for conflict in &report.marketplace_source_conflicts {
         msg_warn(&format!(
             "⚠ marketplace {:?}: declared source differs from registered source; declaration rejected \
-             (skills restored from the registered source; remove + re-add the marketplace to switch sources)",
+             (keeping the registered source; remove + re-add the marketplace to switch sources)",
             conflict.marketplace
         ));
     }

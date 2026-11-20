@@ -86,7 +86,8 @@ use crate::skills::{compare_marketplace_sources, MarketplaceSourceRelation};
 /// 声明面 source 与已注册 source 冲突（§5.14「同名不同源」validation 拒绝）/ declared-vs-registered conflict。
 ///
 /// boot 恢复检测到声明面给**已注册名**换源时产生：**声明变更被拒**（不静默沿用）、但恢复仍按**注册 source**
-/// 重建（旧能力保留；不 wipe / 不重 clone）。换源须显式 remove + re-add（§5.14 ④）。
+/// 重建（旧能力保留）。**已存在 clone 树不 wipe、不按声明源重 clone**；clone 缺失时仍从注册 source
+/// clone。换源须显式 remove + re-add（§5.14 ④）。
 ///
 /// ⚠️ 字段只存**脱敏展示值**（git URL 的 userinfo / query / fragment 已剥离；账本是不可信输入），
 /// **不可**用于身份比较——同源判定以原始 `source` 值为准。
@@ -208,6 +209,12 @@ pub fn plugin_enabled_origin(
 /// marketplace 分组启用 plugin，逐 marketplace 经 [`stage_marketplace_skills`]（`refresh = false`、
 /// `plugin_filter = 启用 plugin 名`、`recorder = None` 不改账本）重挂。enabled 门控见模块文档。
 ///
+/// **声明面换源检测（#295，§5.14）**：`declared` 中的 `extraKnownMarketplaces` 与 `known_marketplaces`
+/// 的注册 source 比对；给已注册名换源者**拒绝声明变更**、记入
+/// [`GovernanceRecoveryReport::marketplace_source_conflicts`]，恢复仍按注册 source（旧能力保留）。
+/// ⚠️ 调用方传入的 `declared` 需含 `extraKnownMarketplaces` 才会产生该诊断；只传 `enabledPlugins`
+/// 时换源声明仍被忽略且不报告。
+///
 /// **持锁契约**：调用方持 `skill_registry` 写锁传入 `&mut SkillRegistry`；本函数内 stage 含 git await，写锁
 /// 跨 await（与 install/enable/refresh 同构，boot 期无并发故安全）。MCP server 重挂**不**在此（见
 /// [`collect_enabled_bundled_servers`]），以便调用方释放写锁后再经 hooks 重挂、断开 ABBA。
@@ -247,6 +254,8 @@ pub async fn recover_marketplace_skills(
     // 检测范围 = declared ∩ known **全量**（不只 enabled 分组——reconcile() 当前无生产调用点，
     // disabled-only 的声明冲突否则无人报告）。同源判定与 #272 注册面一致：`Same` 才算同源，
     // `Unverifiable`（含写法不同 / 形态非法）一律 fail-closed 视为冲突。
+    // ⚠️ 已知不一致（隔离审查 🟡）：`reconcile()` 仍按精确 `Value` 相等（#294 已钉其形状测试），
+    // 两种入口对「可证明等价写法」的裁决可能不同；谓词统一另行跟进，本单不改 reconcile 行为。
     for (name, decl) in &declared_marketplaces(declared) {
         let Some(record) = known.marketplaces.get(name) else {
             // 未注册的声明 → 非「同名不同源」，归 reconcile 的 missing 分支（boot 不 clone 新源）。
@@ -1144,6 +1153,55 @@ mod tests {
             report.restored_skills,
             vec!["audit:code-review".to_string()]
         );
+    }
+
+    /// 检测范围含「已注册但从未安装」：intent 无任何 pid 也须报告声明冲突、且零恢复。
+    #[tokio::test]
+    async fn recover_known_but_uninstalled_marketplace_reports_source_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let source_a = build_source_repo(&tmp.path().join("repo"));
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        // catalog 物化 + 写 known（**不** install：installedPlugins 意图为空）。
+        let mut throwaway = SkillRegistry::new();
+        stage(
+            "acme",
+            &source_a,
+            &mut throwaway,
+            &home,
+            MarketplaceStageOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let src_clone = source_a.clone();
+        update_known_marketplaces(
+            move |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
+                        source: src_clone,
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+        let source_b = build_source_repo_with_desc(&tmp.path().join("repo-b"), "from B");
+
+        let mut fresh = SkillRegistry::new();
+        let declared = declared_with_marketplace(Map::new(), "acme", source_b);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert!(report.failed_marketplaces.is_empty());
+        assert!(report.restored_plugins.is_empty());
+        assert!(report.restored_skills.is_empty());
+        assert!(fresh.is_empty());
     }
 
     /// 同源判定经 canonicalize（trim）：等价写法不报冲突——钉 #272 谓词（杀「严格 JSON 相等」变异）。

@@ -2006,9 +2006,11 @@ impl<S: Session> Computer<S> {
     ///
     /// ## 参数 / Params
     /// - `hooks`：`None` = skills-only（boot 默认）；`Some` = client 经 hooks 重挂 bundled MCP server。
-    /// - `declared`：`enabledPlugins` 合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。
-    ///   `None` → 内部解析（进程 cwd 的 user/project/local/policy，**无** `--settings` flag scope）；CLI 参考
-    ///   接线传 **flag-aware** 视图使 `--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效。
+    /// - `declared`：合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。恢复阶段读
+    ///   `enabledPlugins`（启用门控）**与 `extraKnownMarketplaces`（#295 §5.14 声明面换源检测）**——只传
+    ///   `enabledPlugins` 的调用方不会得到换源冲突诊断（声明变更仍被忽略、不报错）。`None` → 内部解析
+    ///   （进程 cwd 的 user/project/local/policy，**无** `--settings` flag scope）；CLI 参考接线传
+    ///   **flag-aware** 视图使 `--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效。
     ///
     /// 返回 [`GovernanceRecoveryReport`]（恢复 / 跳过 / 降级明细，供观测与测试）。
     pub async fn reconcile_governance(
@@ -7458,9 +7460,14 @@ mod tests {
             vec!["audit:code-review".to_string()]
         );
 
-        // §5.14：validation 拒绝不得降级——生命周期不落 Degraded，诊断集无 MarketplaceSyncFailed。
+        // §5.14：validation 拒绝不得降级——直接断言 boot 降级判定所用的谓词（`has_degraded`），
+        // 而非 lifecycle（本用例未 boot，初态 Created 下 `!= Degraded` 恒真、无覆盖力）。
+        assert!(
+            !comp_b.status.has_degraded(),
+            "声明冲突不得产生 Degraded 诊断：{:?}",
+            comp_b.status().await.diagnostics
+        );
         let status = comp_b.status().await;
-        assert_ne!(status.lifecycle, LifecycleState::Degraded);
         assert!(
             status
                 .diagnostics
