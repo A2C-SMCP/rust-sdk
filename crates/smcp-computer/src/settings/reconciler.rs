@@ -445,9 +445,11 @@ fn unregister_marketplace_skills(
 // ===========================================================================
 // 启动对账（additive-only）/ Startup reconcile (additive-only)
 // ===========================================================================
-/// 「同名不同源」拒绝的稳定 reason 字段值（结构化 ERROR 日志；MUST NOT 复用为 `skipped`）。
+/// 「同名不同源」拒绝的稳定 reason 字段值（MUST NOT 复用为 `skipped`）。
 ///
 /// `pub(crate)`：boot 恢复的声明面换源检测（#295）用同一 reason 值，两条路径日志可统一检索。
+/// 日志级别不同：`reconcile()` = ERROR（拒绝注册尝试）/ boot recovery = WARN（声明变更被拒、
+/// 旧能力仍按注册源恢复、不降级）。
 pub(crate) const REASON_SOURCE_CONFLICT: &str = "marketplace_source_conflict";
 
 /// 已注册名对应的声明 source 不可用（与账本同形但非合法 git source）时的 fail-closed reason。

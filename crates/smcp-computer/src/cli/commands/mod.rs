@@ -424,14 +424,26 @@ pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: O
         ));
     }
     // #295：声明面换源被拒（§5.14）——注册源保持生效，故与上面的 degraded 文案分开。
-    // 文案不断言「skills restored」：disabled-only / 未安装的冲突不会恢复任何 skill。
     for conflict in &report.marketplace_source_conflicts {
-        msg_warn(&format!(
-            "⚠ marketplace {:?}: declared source differs from registered source; declaration rejected \
-             (keeping the registered source; remove + re-add the marketplace to switch sources)",
-            conflict.marketplace
-        ));
+        msg_warn(&marketplace_source_conflict_line(conflict));
     }
+}
+
+/// #295 声明面换源被拒（§5.14）的 CLI 提示行（纯格式化，供单测——呈现半程的可断言守护同 #143）/
+/// source-conflict warning line.
+///
+/// 判据是 `compare_marketplace_sources != Same`，既覆盖「确实不同源」也覆盖「无法证明等价」（scp vs https
+/// 等写法差异 → fail-closed），故文案写「differs from, or cannot be proven equivalent to」而非断言不同。
+/// 不断言 `skills restored`：disabled-only / 未安装的冲突不会恢复任何 skill。仅展示注册名（不含源 URL）。
+fn marketplace_source_conflict_line(
+    conflict: &crate::settings::MarketplaceSourceConflict,
+) -> String {
+    format!(
+        "⚠ marketplace {:?}: declared source differs from, or cannot be proven equivalent to, the \
+         registered source; declaration rejected (keeping the registered source; remove + re-add the \
+         marketplace to switch sources)",
+        conflict.marketplace
+    )
 }
 
 /// hermetic 测试环境映射：user settings 落 `home/.config`（XDG_CONFIG_HOME）、HOME 兜底，避免污染真实用户配置。
@@ -452,6 +464,26 @@ mod tests {
     use super::*;
     use crate::computer::{Computer, SilentSession};
     use crate::settings::{SettingsScope, SettingsValidationError};
+
+    /// #295：冲突提示文案需覆盖「无法证明等价」的 fail-closed 情形（scp vs https 等写法差异），
+    /// 不得断言「源不同」；且只展示注册名、不带 URL。
+    #[test]
+    fn marketplace_source_conflict_line_covers_unverifiable_and_omits_urls() {
+        let conflict = crate::settings::MarketplaceSourceConflict {
+            marketplace: "acme".to_string(),
+            registered_source_display: "https://example.com/acme.git".to_string(),
+            declared_source_display: "<redacted-git-source>".to_string(),
+        };
+        let line = marketplace_source_conflict_line(&conflict);
+        assert!(line.contains("cannot be proven equivalent to"), "{line}");
+        assert!(line.contains("\"acme\""), "{line}");
+        assert!(line.contains("remove + re-add"), "{line}");
+        assert!(!line.contains("https://"), "提示不得回显源 URL：{line}");
+        assert!(
+            !line.contains("skills restored"),
+            "提示不得承诺恢复：{line}"
+        );
+    }
 
     /// #143：`format_settings_errors` 的文案与 scope/field 拼装（呈现半程的可断言守护——`run_mcp_approval`
     /// 是 `Session`-泛型异步副作用函数，无法直接断言其打印；抽纯函数即为此）。

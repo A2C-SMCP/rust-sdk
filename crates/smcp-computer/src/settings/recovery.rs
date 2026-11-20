@@ -90,15 +90,18 @@ use crate::skills::{compare_marketplace_sources, MarketplaceSourceRelation};
 /// clone。换源须显式 remove + re-add（§5.14 ④）。
 ///
 /// ⚠️ 字段只存**脱敏展示值**（git URL 的 userinfo / query / fragment 已剥离；账本是不可信输入），
-/// **不可**用于身份比较——同源判定以原始 `source` 值为准。
+/// **不可**用于身份比较——同源判定以原始 `source` 值为准。无法安全展示的形态（scp-like / 畸形 URL）
+/// 显示为 `<redacted-git-source>` 占位符。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MarketplaceSourceConflict {
     /// 冲突的 marketplace 注册名 / marketplace registration name.
     pub marketplace: String,
-    /// 已注册（保留生效）source 的脱敏展示值 / redacted display of the registered (kept) source.
+    /// 已注册（保留生效）source 的脱敏展示值；scp-like / 畸形 URL → `<redacted-git-source>` /
+    /// redacted display of the registered (kept) source.
     pub registered_source_display: String,
-    /// 声明面声明但被拒绝的 source 的脱敏展示值 / redacted display of the declared (rejected) source.
+    /// 声明面声明但被拒绝的 source 的脱敏展示值；scp-like / 畸形 URL → `<redacted-git-source>` /
+    /// redacted display of the declared (rejected) source.
     pub declared_source_display: String,
 }
 
@@ -506,7 +509,52 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber;
+
+    // ---- 日志捕获（结构化 WARN 断言）/ captured logs ---------------------------
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `(捕获器, subscriber)`：`fut.with_subscriber(sub).await` 后读 [`CapturedLogs::contents`]。
+    fn capture_subscriber() -> (
+        CapturedLogs,
+        impl tracing::Subscriber + Send + Sync + 'static,
+    ) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        (logs, subscriber)
+    }
 
     fn git(args: &[&str], cwd: &Path) {
         let out = Command::new("git")
@@ -1302,6 +1350,63 @@ mod tests {
             !format!("{report:?}").contains("sekret"),
             "Debug 输出不得含凭据"
         );
+    }
+
+    /// 双侧脱敏 + 结构化 WARN：注册侧（账本，不可信输入）与声明侧带凭据 URL 都必须脱敏；
+    /// WARN 必须携 `reason=marketplace_source_conflict` 供统一检索。
+    #[tokio::test]
+    async fn recover_conflict_redacts_both_sides_and_warn_is_structured() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _source_a) = setup_installed(&tmp).await;
+        // 覆盖账本：注册侧（不可信输入）与声明侧都带 userinfo 凭据。
+        update_known_marketplaces(
+            move |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
+                        source: json!({
+                            "type": "git",
+                            "url": "https://reg-user:reg-sekret@example.com/acme.git"
+                        }),
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+
+        let mut fresh = SkillRegistry::new();
+        let declared = declared_with_marketplace(
+            declared_enabled(&["audit@acme"]),
+            "acme",
+            json!({"type": "git", "url": "https://dec-user:dec-sekret@example.com/other.git"}),
+        );
+        let (logs, subscriber) = capture_subscriber();
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared)
+            .with_subscriber(subscriber)
+            .await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        let conflict = &report.marketplace_source_conflicts[0];
+        for shown in [
+            &conflict.registered_source_display,
+            &conflict.declared_source_display,
+        ] {
+            assert!(!shown.contains("sekret"), "凭据泄露：{shown}");
+            assert!(!shown.contains('@'), "userinfo 未剥离：{shown}");
+        }
+        assert!(!format!("{report:?}").contains("sekret"), "Debug 泄露");
+
+        let text = logs.contents();
+        assert!(
+            text.contains("marketplace_source_conflict"),
+            "WARN 缺结构化 reason：{text}"
+        );
+        assert!(text.contains("recover:"), "WARN 消息前缀缺失：{text}");
+        assert!(!text.contains("sekret"), "tracing 日志不得含凭据：{text}");
     }
 
     /// 冲突 + 注册源不可达（clone 丢失且源仓库已删）→ conflict 与 failed 并存、不 panic。
