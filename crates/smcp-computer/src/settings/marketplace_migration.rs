@@ -57,9 +57,9 @@ use crate::settings::store::{
     empty_installed_plugins, empty_installed_plugins_intent, empty_known_marketplaces,
     installed_plugins_intent_path, installed_plugins_path, known_marketplaces_path,
     load_installed_plugins_intent_strict, load_installed_plugins_strict,
-    load_known_marketplaces_strict, try_update_installed_plugins_intent,
-    update_installed_plugins_checked, update_known_marketplaces_checked, with_file_lock,
-    SettingsStoreError, DEFAULT_LOCK_BACKOFF_BASE, DEFAULT_LOCK_BACKOFF_MAX,
+    load_known_marketplaces_strict, try_update_installed_plugins_intent_strict,
+    update_installed_plugins_checked_strict, update_known_marketplaces_checked_strict,
+    with_file_lock, SettingsStoreError, DEFAULT_LOCK_BACKOFF_BASE, DEFAULT_LOCK_BACKOFF_MAX,
 };
 use crate::skills::home::{marketplace_skill_dir, SOURCE_MARKETPLACE};
 use crate::skills::manifest::{
@@ -141,6 +141,8 @@ pub enum MigrationReason {
     ConcurrentChange,
     /// 前一项失败，本项未尝试 / not attempted after an earlier failure。
     NotAttempted,
+    /// 写入期 I/O 错误（保留类别，不误报状态损坏）/ I/O error during write。
+    IoError,
 }
 
 /// 单个 marketplace 的计划/报告条目 / one planned or reported item。
@@ -169,6 +171,9 @@ pub struct MigrationItem {
     pub(crate) source_value: Value,
     #[serde(skip)]
     pub(crate) pids: Vec<String>,
+    /// intent ∪ ledger 的已装 pid（不含仅 user enabled 的陈旧键；secret 枚举用）。
+    #[serde(skip)]
+    pub(crate) installed_pids: Vec<String>,
     #[serde(skip)]
     pub(crate) secret_plans: Vec<SecretPlan>,
     #[serde(skip)]
@@ -314,7 +319,10 @@ impl MarketplaceMigrationReport {
                     MigrationAction::Rename | MigrationAction::BaselineOnly | MigrationAction::NoOp
                 )
             })
-            || self.manual.iter().any(|m| m.effect == "will-be-inactive");
+            || self
+                .manual
+                .iter()
+                .any(|m| matches!(m.effect.as_str(), "will-be-inactive" | "stale-trust"));
         if partial {
             MigrationStatus::Partial
         } else {
@@ -578,6 +586,7 @@ fn load_context(
             env_renames: Vec::new(),
             source_value: entry.source.clone(),
             pids: Vec::new(),
+            installed_pids: Vec::new(),
             secret_plans: Vec::new(),
             install_paths: Vec::new(),
         };
@@ -676,7 +685,8 @@ fn load_context(
             &catalog,
             &old,
             &manifest_name,
-            &item.pids,
+            &item.installed_pids,
+            &item.install_paths,
             secrets,
         ) {
             Ok((secrets_plan, env_renames, secret_count)) => {
@@ -783,17 +793,18 @@ fn collect_pids_and_paths(
     old: &str,
 ) {
     let suffix = format!("@{old}");
-    let mut pids: BTreeSet<String> = BTreeSet::new();
+    let mut installed_pids: BTreeSet<String> = BTreeSet::new();
     for pid in &intent.account.installed_plugins {
         if pid.ends_with(&suffix) {
-            pids.insert(pid.clone());
+            installed_pids.insert(pid.clone());
         }
     }
     for pid in ledger.account.plugins.keys() {
         if pid.ends_with(&suffix) {
-            pids.insert(pid.clone());
+            installed_pids.insert(pid.clone());
         }
     }
+    let mut pids: BTreeSet<String> = installed_pids.clone();
     if let Some(Value::Object(enabled)) = user_map.get(FIELD_ENABLED_PLUGINS) {
         for pid in enabled.keys() {
             if pid.ends_with(&suffix) {
@@ -816,10 +827,12 @@ fn collect_pids_and_paths(
             }
         }
     }
+    item.installed_pids = installed_pids.into_iter().collect();
     item.pids = pids.into_iter().collect();
     item.plugins = plugins.into_iter().collect();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_secrets(
     home: &Path,
     manifest: &Map<String, Value>,
@@ -827,6 +840,7 @@ fn plan_secrets(
     old: &str,
     new: &str,
     installed_pids: &[String],
+    install_paths: &[(String, String)],
     secrets: &SecretStore,
 ) -> Result<(Vec<SecretPlan>, Vec<EnvRename>, usize), MigrationReason> {
     let installed_plugins: HashSet<&str> = installed_pids
@@ -835,12 +849,14 @@ fn plan_secrets(
         .collect();
     let mut plans: Vec<SecretPlan> = Vec::new();
     let mut envs: Vec<EnvRename> = Vec::new();
+    let mut processed: HashSet<String> = HashSet::new();
 
+    // 1) 当前清单内的 plugin（含未安装，覆盖历史卸载残留 secret）。
     for entry in iter_plugin_entries(manifest) {
         let Some(plugin) = entry.get("name").and_then(Value::as_str) else {
             continue;
         };
-        if plugin.is_empty() {
+        if plugin.is_empty() || processed.contains(plugin) {
             continue;
         }
         let Some(raw_source) = entry.get("source") else {
@@ -884,31 +900,29 @@ fn plan_secrets(
                 continue;
             }
         };
-        let inputs_path = root.join(MCP_SERVERS_SUBDIR).join(MCP_INPUTS_FILENAME);
-        let Some(defs) = read_input_defs_strict(&inputs_path)? else {
+        collect_secret_inputs(&root, plugin, old, new, &mut plans, &mut envs)?;
+        processed.insert(plugin.to_string());
+    }
+
+    // 2) 已装但清单已移除/改名的 plugin：按账本 installPath 枚举（🔴2）。
+    for pid in installed_pids {
+        let Some(plugin) = pid.strip_suffix(&format!("@{old}")) else {
             continue;
         };
-        for def in defs {
-            let input: MCPServerInput =
-                serde_json::from_value(def).map_err(|_| MigrationReason::SecretInputsUnreadable)?;
-            let input_id = input.id().to_string();
-            let old_key = prefix_input_id(plugin, old, &input_id);
-            let new_key = prefix_input_id(plugin, new, &input_id);
-            envs.push(EnvRename {
-                old: env_var_name(&old_key),
-                new: env_var_name(&new_key),
-            });
-            let is_password =
-                matches!(&input, MCPServerInput::PromptString(p) if p.password.unwrap_or(false));
-            if is_password {
-                plans.push(SecretPlan {
-                    plugin: plugin.to_string(),
-                    input_id,
-                    old_key,
-                    new_key,
-                });
-            }
+        if plugin.is_empty() || processed.contains(plugin) {
+            continue;
         }
+        let root = install_paths
+            .iter()
+            .filter(|(p, _)| p == pid)
+            .map(|(_, path)| PathBuf::from(path))
+            .find(|path| path.is_dir());
+        let Some(root) = root else {
+            // 已装但既无清单条目、也无可用 installPath：无法确认是否藏有 secret → fail-closed。
+            return Err(MigrationReason::PluginRootUnreadable);
+        };
+        collect_secret_inputs(&root, plugin, old, new, &mut plans, &mut envs)?;
+        processed.insert(plugin.to_string());
     }
 
     if plans.is_empty() {
@@ -936,6 +950,43 @@ fn plan_secrets(
     envs.sort_by(|a, b| a.old.cmp(&b.old));
     envs.dedup_by(|a, b| a.old == b.old && a.new == b.new);
     Ok((plans, envs, count))
+}
+
+/// 从一个 plugin 根读 inputs.json 并收集 password inputs / env 变量名。
+fn collect_secret_inputs(
+    root: &Path,
+    plugin: &str,
+    old: &str,
+    new: &str,
+    plans: &mut Vec<SecretPlan>,
+    envs: &mut Vec<EnvRename>,
+) -> Result<(), MigrationReason> {
+    let inputs_path = root.join(MCP_SERVERS_SUBDIR).join(MCP_INPUTS_FILENAME);
+    let Some(defs) = read_input_defs_strict(&inputs_path)? else {
+        return Ok(());
+    };
+    for def in defs {
+        let input: MCPServerInput =
+            serde_json::from_value(def).map_err(|_| MigrationReason::SecretInputsUnreadable)?;
+        let input_id = input.id().to_string();
+        let old_key = prefix_input_id(plugin, old, &input_id);
+        let new_key = prefix_input_id(plugin, new, &input_id);
+        envs.push(EnvRename {
+            old: env_var_name(&old_key),
+            new: env_var_name(&new_key),
+        });
+        let is_password =
+            matches!(&input, MCPServerInput::PromptString(p) if p.password.unwrap_or(false));
+        if is_password {
+            plans.push(SecretPlan {
+                plugin: plugin.to_string(),
+                input_id,
+                old_key,
+                new_key,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// 严格读 `mcp-servers/inputs.json`：缺失 → `None`；畸形 → Err（不静默跳过）。
@@ -1153,7 +1204,53 @@ fn collect_manual_references(
     if renames.is_empty() {
         return Vec::new();
     }
+    // 本事务涉及 pid 的 old→new 目标（含「已完成项的新 pid → 自身」），只覆盖迁移范围内的 pid，
+    // 避免把目标 marketplace 上本来就有、与本次改名无关的 project 插件误报为失活。
+    let mut pid_targets: BTreeMap<String, String> = BTreeMap::new();
+    for item in items {
+        if item.action != MigrationAction::Rename {
+            continue;
+        }
+        let new = item.new_name.as_deref().unwrap_or(&item.old_name);
+        let old_suffix = format!("@{}", item.old_name);
+        for pid in &item.pids {
+            if let Some(plugin) = pid.strip_suffix(&old_suffix) {
+                let target = format!("{plugin}@{new}");
+                pid_targets.insert(pid.clone(), target.clone());
+                // resume 时已完成项的账本/意图已是新 pid。
+                pid_targets.insert(target, format!("{plugin}@{new}"));
+            }
+        }
+    }
     let mut refs: Vec<ManualReference> = Vec::new();
+    // project/local-only 记录：迁移不会写 project/local enabledPlugins → 迁移后失活，必须显著报告。
+    for (pid, records) in &ledger.account.plugins {
+        let Some(new_pid) = pid_targets.get(pid) else {
+            continue;
+        };
+        let all_project_local = !records.is_empty()
+            && records.iter().all(|r| {
+                matches!(
+                    r.extra
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user"),
+                    "project" | "local"
+                )
+            });
+        if all_project_local {
+            let pp = records
+                .iter()
+                .find_map(|r| r.extra.get("projectPath").and_then(Value::as_str))
+                .unwrap_or("<project/local scope>");
+            refs.push(ManualReference {
+                file: pp.to_string(),
+                pointer: format!("/enabledPlugins/{new_pid}"),
+                effect: "will-be-inactive".to_string(),
+                suggested: new_pid.clone(),
+            });
+        }
+    }
     // user scope：enabled/trusted/blocked 会被改写；extraKnown 默认只报告。
     if !update_declarations {
         // user_scope=true：只报 user `extraKnownMarketplaces`（enabled/trusted/blocked 会被自动改写）。
@@ -1243,7 +1340,7 @@ fn scan_settings_map(
                         out.push(ManualReference {
                             file: file.clone(),
                             pointer: format!("/{field}/{idx}"),
-                            effect: "stale-declaration".to_string(),
+                            effect: "stale-trust".to_string(),
                             suggested: (*new).to_string(),
                         });
                     }
@@ -1514,6 +1611,7 @@ fn apply_fresh(
             .join("items")
             .join(safe_dir_name(&plan_item.old_name));
         snapshot_item_files(home, env, &item_dir)?;
+        let mut progress = ItemProgress::default();
         match apply_one_item(
             home,
             env,
@@ -1521,6 +1619,7 @@ fn apply_fresh(
             plan_item,
             secrets,
             &mut warnings,
+            &mut progress,
             fail_after,
         ) {
             Ok(()) => {
@@ -1531,15 +1630,22 @@ fn apply_fresh(
             }
             Err(reason) => {
                 failed = true;
-                // 当前项回滚：反向 rename + 还原 before-image；已 set 的 secret 由 apply_one_item 清理。
-                let _ = rollback_item_on_failure(
+                // 当前项回滚：仅还原本项已写文件；未写文件若被外部改动则拒绝盲还原。
+                let reason = match rollback_item_on_failure(
                     home,
                     env,
                     &ctx.user_path,
                     plan_item,
                     &item_dir,
                     &backup_dir,
-                );
+                    &progress,
+                ) {
+                    Ok(()) => reason,
+                    Err(e) => {
+                        tracing::error!(error = %e, "per-item rollback failed; journal kept");
+                        MigrationReason::ConcurrentChange
+                    }
+                };
                 let mut aborted = plan_item.clone();
                 aborted.action = MigrationAction::Blocked;
                 aborted.reason = Some(reason);
@@ -1588,6 +1694,28 @@ fn apply_fresh(
     Ok(report)
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ItemProgress {
+    renamed_dirs: bool,
+    wrote_known: bool,
+    wrote_intent: bool,
+    wrote_ledger: bool,
+    wrote_settings: bool,
+}
+
+impl ItemProgress {
+    fn wrote(&self, key: &str) -> bool {
+        match key {
+            "known_marketplaces.json" => self.wrote_known,
+            "installed_plugins_intent.json" => self.wrote_intent,
+            "installed_plugins.json" => self.wrote_ledger,
+            "settings.json" => self.wrote_settings,
+            _ => false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_one_item(
     home: &Path,
     env: Option<&EnvMap>,
@@ -1595,6 +1723,7 @@ fn apply_one_item(
     item: &MigrationItem,
     secrets: &SecretStore,
     warnings: &mut Vec<String>,
+    progress: &mut ItemProgress,
     fail_after: Option<&str>,
 ) -> Result<(), MigrationReason> {
     // 本项已 set 的新 secret 键：任一步失败统一清理（崩溃场景由 resume/rollback 清理）。
@@ -1606,6 +1735,7 @@ fn apply_one_item(
         item,
         secrets,
         warnings,
+        progress,
         fail_after,
         &mut newly_set,
     );
@@ -1625,6 +1755,7 @@ fn apply_one_item_inner(
     item: &MigrationItem,
     secrets: &SecretStore,
     warnings: &mut Vec<String>,
+    progress: &mut ItemProgress,
     fail_after: Option<&str>,
     newly_set: &mut Vec<SecretPlan>,
 ) -> Result<(), MigrationReason> {
@@ -1653,12 +1784,14 @@ fn apply_one_item_inner(
                     }
                     continue;
                 }
-                if !secrets.set(&plan.new_key, &old_val)
-                    || secrets.get(&plan.new_key).as_deref() != Some(old_val.as_str())
-                {
+                if !secrets.set(&plan.new_key, &old_val) {
                     return Err(MigrationReason::KeyringUnavailable);
                 }
+                // set 成功即登记（回读失败时 wrapper 才能清理这个新键，避免孤儿）。
                 newly_set.push(plan.clone());
+                if secrets.get(&plan.new_key).as_deref() != Some(old_val.as_str()) {
+                    return Err(MigrationReason::KeyringUnavailable);
+                }
             }
         }
         if fail_after == Some("after-secrets") {
@@ -1681,6 +1814,7 @@ fn apply_one_item_inner(
             .join(new);
         // 外部 plugin 树可以不存在（无 Git 源插件）：neither → no-op。
         rename_dir_if_needed(&old_ext, &new_ext, false)?;
+        progress.renamed_dirs = true;
         if fail_after == Some("after-rename") {
             return Err(MigrationReason::StateCorrupt);
         }
@@ -1688,6 +1822,7 @@ fn apply_one_item_inner(
 
     // 3) known_marketplaces RMW。
     write_known_item(home, env, item)?;
+    progress.wrote_known = true;
     if fail_after == Some("after-known") {
         return Err(MigrationReason::StateCorrupt);
     }
@@ -1695,13 +1830,16 @@ fn apply_one_item_inner(
     if item.action == MigrationAction::Rename {
         // 4) intent RMW（seed 已在事务开头一次性完成）。
         write_intent_item(home, env, item, &ctx.preserved_intent_ids)?;
+        progress.wrote_intent = true;
         // 5) ledger RMW。
         write_ledger_item(home, env, item)?;
+        progress.wrote_ledger = true;
         if fail_after == Some("after-ledger") {
             return Err(MigrationReason::StateCorrupt);
         }
         // 6) user settings RMW。
         write_user_settings_item(home, env, item, ctx.update_declarations)?;
+        progress.wrote_settings = true;
         // 7) 验证。
         verify_item(home, env, item)?;
         // 8) 删除旧 secret（失败仅告警）。
@@ -1745,7 +1883,7 @@ fn write_known_item(
     let source = item.source_value.clone();
     let new_dir = marketplace_skill_dir(home, &new, &[]);
     let mut err: Option<MigrationReason> = None;
-    update_known_marketplaces_checked(Some(home), env, |file| {
+    update_known_marketplaces_checked_strict(Some(home), env, |file| {
         let Some(mut entry) = file.account.marketplaces.shift_remove(&old) else {
             // 幂等：已知新键已就位。
             if file.account.marketplaces.contains_key(&new) {
@@ -1795,7 +1933,7 @@ fn write_known_item(
         file.account.marketplaces.insert(new.clone(), entry);
         ((), true)
     })
-    .map_err(|_| MigrationReason::StateCorrupt)?;
+    .map_err(settings_store_reason)?;
     if let Some(e) = err {
         return Err(e);
     }
@@ -1820,7 +1958,7 @@ fn write_intent_item(
         })
         .collect();
     let mut err: Option<MigrationReason> = None;
-    let res = try_update_installed_plugins_intent(
+    let res = try_update_installed_plugins_intent_strict(
         |file| {
             // tolerant coerce 会丢弃 no-`@` local-only id；写回时显式保留。
             for pid in preserved_ids {
@@ -1851,7 +1989,7 @@ fn write_intent_item(
         Some(home),
         env,
     )
-    .map_err(|_| MigrationReason::StateCorrupt)?;
+    .map_err(settings_store_reason)?;
     if res.is_none() {
         return Err(err.unwrap_or(MigrationReason::ConcurrentChange));
     }
@@ -1875,7 +2013,7 @@ fn write_ledger_item(
         })
         .collect();
     let mut err: Option<MigrationReason> = None;
-    update_installed_plugins_checked(Some(home), env, |file| {
+    update_installed_plugins_checked_strict(Some(home), env, |file| {
         let suffix = format!("@{new}");
         for pid in file.account.plugins.keys() {
             if pid.ends_with(&suffix) && !source_pids.contains(pid) && !owned_new.contains(pid) {
@@ -1908,7 +2046,7 @@ fn write_ledger_item(
         file.account.plugins = rebuilt;
         ((), true)
     })
-    .map_err(|_| MigrationReason::StateCorrupt)?;
+    .map_err(settings_store_reason)?;
     if let Some(e) = err {
         return Err(e);
     }
@@ -2067,7 +2205,7 @@ fn write_user_settings_item(
         }
         Ok(())
     })
-    .map_err(|_| MigrationReason::StateCorrupt)?;
+    .map_err(raw_write_reason)?;
     if let Some(e) = err {
         return Err(e);
     }
@@ -2081,8 +2219,7 @@ fn verify_item(
 ) -> Result<(), MigrationReason> {
     let old = item.old_name.as_str();
     let new = item.new_name.as_deref().unwrap_or(old);
-    let known = load_known_marketplaces_strict(Some(home), env)
-        .map_err(|_| MigrationReason::StateCorrupt)?;
+    let known = load_known_marketplaces_strict(Some(home), env).map_err(settings_store_reason)?;
     if item.action == MigrationAction::Rename
         && (known.account.marketplaces.contains_key(old)
             || !marketplace_skill_dir(home, new, &[]).is_dir())
@@ -2098,15 +2235,15 @@ fn verify_item(
         return Err(MigrationReason::StateCorrupt);
     }
     if item.action == MigrationAction::Rename {
-        let intent = load_installed_plugins_intent_strict(Some(home), env)
-            .map_err(|_| MigrationReason::StateCorrupt)?;
+        let intent =
+            load_installed_plugins_intent_strict(Some(home), env).map_err(settings_store_reason)?;
         for pid in &item.pids {
             if intent.account.installed_plugins.contains(pid) {
                 return Err(MigrationReason::StateCorrupt);
             }
         }
-        let ledger = load_installed_plugins_strict(Some(home), env)
-            .map_err(|_| MigrationReason::StateCorrupt)?;
+        let ledger =
+            load_installed_plugins_strict(Some(home), env).map_err(settings_store_reason)?;
         if item
             .pids
             .iter()
@@ -2161,18 +2298,20 @@ fn verify_all(
 // ---------------------------------------------------------------------------
 // 逐项回滚 / Per-item rollback
 // ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)]
 fn rollback_item_on_failure(
     home: &Path,
     env: Option<&EnvMap>,
     user_path: &Path,
     item: &MigrationItem,
     item_backup_dir: &Path,
-    global_backup_dir: &Path,
+    _global_backup_dir: &Path,
+    progress: &ItemProgress,
 ) -> Result<(), MarketplaceMigrationError> {
     let old = item.old_name.as_str();
     let new = item.new_name.as_deref().unwrap_or(old);
-    if item.action == MigrationAction::Rename {
-        // 反向 rename（外部树先、clone 后），仅当 new 在且 old 不在。
+    if item.action == MigrationAction::Rename && progress.renamed_dirs {
+        // 反向 rename（外部树先、clone 后）。
         let pairs = [
             (
                 home.join(SOURCE_MARKETPLACE)
@@ -2189,18 +2328,42 @@ fn rollback_item_on_failure(
         ];
         for (from, to) in pairs {
             if from.exists() && !to.exists() {
-                let _ = std::fs::rename(&from, &to);
+                std::fs::rename(&from, &to).map_err(|e| io_err(&from, e))?;
             }
         }
     }
-    // 还原逐项 before-image：snapshot 存在则还原；不存在 = 该项开始时文件不存在 → 删除本项创建的文件。
-    let _ = global_backup_dir;
+    // 只还原本项确实写过的文件；未写文件与 before-image 不一致 → 外部改动，拒绝盲还原。
     for (key, path) in authority_paths(home, env) {
-        let from = item_backup_dir.join(key);
-        if let Ok(bytes) = std::fs::read(&from) {
-            let _ = atomic_write_bytes(&path, &bytes);
-        } else if path.is_file() {
-            let _ = std::fs::remove_file(&path);
+        let snapshot = item_backup_dir.join(key);
+        let snapshot_exists = snapshot.is_file();
+        if progress.wrote(key) {
+            if snapshot_exists {
+                let bytes = std::fs::read(&snapshot).map_err(|e| io_err(&snapshot, e))?;
+                atomic_write_bytes(&path, &bytes).map_err(|e| io_err(&path, e))?;
+            } else if path.is_file() {
+                std::fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
+            }
+        } else {
+            let current_hash = if path.is_file() {
+                Some(hex(&std::fs::read(&path).map_err(|e| io_err(&path, e))?))
+            } else {
+                None
+            };
+            let snapshot_hash = if snapshot_exists {
+                Some(hex(
+                    &std::fs::read(&snapshot).map_err(|e| io_err(&snapshot, e))?
+                ))
+            } else {
+                None
+            };
+            if current_hash != snapshot_hash {
+                return Err(MarketplaceMigrationError::ConcurrentChange {
+                    detail: format!(
+                        "{} changed outside the migration item; refusing to restore",
+                        path.display()
+                    ),
+                });
+            }
         }
     }
     let _ = user_path;
@@ -2372,6 +2535,38 @@ fn current_hashes(
     Ok(out)
 }
 
+/// 从账本记录推导「可回填 user enabledPlugins」的 pid：存在 user/default scope 记录（或缺省 scope）。
+fn ledger_user_backfill_pids(
+    home: &Path,
+    env: Option<&EnvMap>,
+) -> Result<Vec<String>, MarketplaceMigrationError> {
+    let ledger = crate::settings::store::load_installed_plugins_strict(Some(home), env)?;
+    let mut pids = Vec::new();
+    for (pid, records) in &ledger.account.plugins {
+        if !pid.contains('@') {
+            continue;
+        }
+        let mut has_user_scope = records.is_empty();
+        for rec in records {
+            let scope = rec
+                .extra
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            if matches!(scope, "user" | "default") {
+                has_user_scope = true;
+                break;
+            }
+        }
+        if has_user_scope {
+            pids.push(pid.clone());
+        }
+    }
+    pids.sort();
+    pids.dedup();
+    Ok(pids)
+}
+
 /// 把 user-scope `enabledPlugins[pid] = true`（仅 absent；不写 project/local）。
 fn backfill_enabled_plugins(
     home: &Path,
@@ -2395,6 +2590,28 @@ fn backfill_enabled_plugins(
     Ok(())
 }
 
+fn settings_store_reason(error: SettingsStoreError) -> MigrationReason {
+    match error {
+        SettingsStoreError::Lock { .. } => MigrationReason::ConcurrentChange,
+        SettingsStoreError::Io { source, .. } => {
+            if source.kind() == io::ErrorKind::InvalidData {
+                MigrationReason::StateCorrupt
+            } else {
+                MigrationReason::IoError
+            }
+        }
+    }
+}
+
+fn raw_write_reason(error: raw_write::RawWriteError) -> MigrationReason {
+    match error {
+        raw_write::RawWriteError::Store(e) => settings_store_reason(e),
+        raw_write::RawWriteError::Io { .. } => MigrationReason::IoError,
+        raw_write::RawWriteError::Corrupt { .. }
+        | raw_write::RawWriteError::MalformedTarget { .. } => MigrationReason::StateCorrupt,
+    }
+}
+
 fn raw_write_error_to_migration(error: raw_write::RawWriteError) -> MarketplaceMigrationError {
     match error {
         raw_write::RawWriteError::Store(e) => e.into(),
@@ -2416,12 +2633,23 @@ fn raw_write_error_to_migration(error: raw_write::RawWriteError) -> MarketplaceM
 }
 
 /// 从当前 intent 回填 user-scope enabledPlugins（resume 半 seed 窗口幂等修复）。
+///
+/// intent 的已装集合包含 project/local-only pid（安装意图是全局的），但 user 启用意图只能回填
+/// 有 **user/default scope 账本记录**的 pid——否则 resume 会把 project 插件全局启用（🔴1）。
 fn backfill_enabled_from_intent(
     home: &Path,
     env: Option<&EnvMap>,
 ) -> Result<(), MarketplaceMigrationError> {
     let intent = crate::settings::store::load_installed_plugins_intent_strict(Some(home), env)?;
-    let pids: Vec<String> = intent.account.installed_plugins.iter().cloned().collect();
+    let user_scope: std::collections::HashSet<String> =
+        ledger_user_backfill_pids(home, env)?.into_iter().collect();
+    let pids: Vec<String> = intent
+        .account
+        .installed_plugins
+        .iter()
+        .filter(|pid| user_scope.contains(*pid))
+        .cloned()
+        .collect();
     backfill_enabled_plugins(home, env, &pids)
 }
 
@@ -2439,21 +2667,25 @@ fn seed_intent_if_missing(
         return Ok(());
     }
     let seed = ctx.seed_intent_pids.clone();
-    backfill_enabled_plugins(home, env, &seed)?;
+    // 只回填 user/default scope 的已装 pid；project/local-only 不得全局启用（🔴1）。
+    let user_backfill = ledger_user_backfill_pids(home, env)?;
+    backfill_enabled_plugins(home, env, &user_backfill)?;
     if fail_after == Some("after-seed-settings") {
         return Err(MarketplaceMigrationError::ConcurrentChange {
             detail: "simulated crash between seed writes".to_string(),
         });
     }
-    crate::settings::store::update_installed_plugins_intent(
+    crate::settings::store::try_update_installed_plugins_intent_strict(
         |file| {
             for pid in &seed {
                 file.account.installed_plugins.insert(pid.clone());
             }
+            true
         },
         Some(home),
         env,
-    )?;
+    )
+    .map_err(MarketplaceMigrationError::from)?;
     Ok(())
 }
 
@@ -2568,11 +2800,11 @@ fn resume_from_journal(
         meta.post_hashes = current_hashes(home, env, &ctx.user_path)?;
         let _ = write_journal(home, &meta);
     }
-    let manual = if ctx.plan.manual.is_empty() {
-        manual_for_journal(home, env, cwd, &meta)
-    } else {
-        ctx.plan.manual.clone()
-    };
+    // fresh plan 与 journal 重建的 manual 取并集（混态不丢已完成项的 will-be-inactive）。
+    let mut manual = ctx.plan.manual.clone();
+    manual.extend(manual_for_journal(home, env, cwd, &meta));
+    manual.sort_by(|a, b| (&a.file, &a.pointer).cmp(&(&b.file, &b.pointer)));
+    manual.dedup_by(|a, b| a.file == b.file && a.pointer == b.pointer);
     let mut report_items: Vec<MigrationItem> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut failed = false;
@@ -2610,7 +2842,17 @@ fn resume_from_journal(
             .join("items")
             .join(format!("{}-resume", safe_dir_name(&item.old_name)));
         snapshot_item_files(home, env, &item_dir)?;
-        match apply_one_item(home, env, &ctx, &item, secrets, &mut warnings, None) {
+        let mut progress = ItemProgress::default();
+        match apply_one_item(
+            home,
+            env,
+            &ctx,
+            &item,
+            secrets,
+            &mut warnings,
+            &mut progress,
+            None,
+        ) {
             Ok(()) => {
                 report_items.push(item);
                 update_meta_item(&mut meta, &meta_item.old, "done");
@@ -2619,14 +2861,21 @@ fn resume_from_journal(
             }
             Err(reason) => {
                 failed = true;
-                let _ = rollback_item_on_failure(
+                let reason = match rollback_item_on_failure(
                     home,
                     env,
                     &ctx.user_path,
                     &item,
                     &item_dir,
                     backup_dir,
-                );
+                    &progress,
+                ) {
+                    Ok(()) => reason,
+                    Err(e) => {
+                        tracing::error!(error = %e, "per-item rollback failed; journal kept");
+                        MigrationReason::ConcurrentChange
+                    }
+                };
                 meta.phase = "aborted".to_string();
                 meta.post_hashes = current_hashes(home, env, &ctx.user_path).unwrap_or_default();
                 let mut aborted = item;
@@ -2711,6 +2960,7 @@ fn manual_for_journal(
             env_renames: Vec::new(),
             source_value: Value::Null,
             pids: m.pids.clone(),
+            installed_pids: m.pids.clone(),
             secret_plans: Vec::new(),
             install_paths: Vec::new(),
         })
@@ -2753,6 +3003,7 @@ fn synthesized_item(meta_item: &MetaItem, ctx: &PlanContext) -> MigrationItem {
         env_renames: Vec::new(),
         source_value,
         pids: meta_item.pids.clone(),
+        installed_pids: meta_item.pids.clone(),
         secret_plans: meta_item
             .secret_keys
             .iter()
@@ -2805,12 +3056,40 @@ fn verify_resume_hashes(
             seed_window = current_set == expected;
         }
         if current != pre && current != post && !seed_window {
-            return Err(MarketplaceMigrationError::ConcurrentChange {
-                detail: format!(
-                    "{} changed after the interrupted migration; roll back or retry manually",
-                    path.display()
-                ),
-            });
+            // item 粒度放行：当前文件等于某个 item 的 before-image（硬崩于 item 中途/边界）。
+            let mut item_match = false;
+            for item in &meta.items {
+                let base = safe_dir_name(&item.old);
+                for dir in [base.clone(), format!("{base}-resume")] {
+                    let dir_path = PathBuf::from(&meta.backup_dir).join("items").join(dir);
+                    if !dir_path.is_dir() {
+                        continue;
+                    }
+                    let snapshot = dir_path.join(file.key.as_str());
+                    let snapshot_hash = if snapshot.is_file() {
+                        Some(hex(
+                            &std::fs::read(&snapshot).map_err(|e| io_err(&snapshot, e))?
+                        ))
+                    } else {
+                        None
+                    };
+                    if current == snapshot_hash {
+                        item_match = true;
+                        break;
+                    }
+                }
+                if item_match {
+                    break;
+                }
+            }
+            if !item_match {
+                return Err(MarketplaceMigrationError::ConcurrentChange {
+                    detail: format!(
+                        "{} changed after the interrupted migration; roll back or retry manually",
+                        path.display()
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -3452,15 +3731,34 @@ mod tests {
     }
 
     fn seed_unit_with_ledger(home: &Path, old: &str, manifest: &str, plugin: &str) {
+        seed_unit_with_ledger_scoped(home, old, manifest, plugin, "user", None);
+    }
+
+    fn seed_unit_with_ledger_scoped(
+        home: &Path,
+        old: &str,
+        manifest: &str,
+        plugin: &str,
+        scope: &str,
+        project_path: Option<&Path>,
+    ) {
         seed_unit(home, old, manifest);
         let pid = format!("{plugin}@{old}");
         let install = marketplace_skill_dir(home, old, &[])
             .join("plugins")
             .join(plugin);
+        // secret 枚举会读已装 pid 的 installPath；根不存在 ⇒ Blocked（fail-closed）。
+        std::fs::create_dir_all(&install).unwrap();
         update_installed_plugins(
             |file| {
                 let mut extra = Map::new();
-                extra.insert("scope".to_string(), Value::String("user".to_string()));
+                extra.insert("scope".to_string(), Value::String(scope.to_string()));
+                if let Some(project_path) = project_path {
+                    extra.insert(
+                        "projectPath".to_string(),
+                        Value::String(project_path.to_string_lossy().into_owned()),
+                    );
+                }
                 file.account.plugins.insert(
                     pid,
                     vec![InstalledPluginRecord {
@@ -3504,6 +3802,97 @@ mod tests {
         assert_eq!(resumed.status(), MigrationStatus::Ok, "{resumed:?}");
         let user = raw_write::read_strict_map(&user_settings_path(Some(&env))).unwrap();
         assert_eq!(user["enabledPlugins"]["alpha@team-tools"], true);
+    }
+
+    #[test]
+    fn resume_does_not_user_enable_project_only_plugin() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = td.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        seed_unit_with_ledger_scoped(
+            &home,
+            "old-name",
+            "team-tools",
+            "alpha",
+            "project",
+            Some(&project),
+        );
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let ctx = load_context(
+            &home,
+            Some(&env),
+            Some(&project),
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let _ = apply_fresh(&ctx, Some(&env), &secrets, Some("after-seed-settings")).unwrap_err();
+        // resume 会重跑 seed 与 intent→enabled 回填；project-only pid 不得因此被全局启用（🔴1）。
+        let resumed =
+            resume_marketplace_name_migration(&home, Some(&env), Some(&project), &secrets).unwrap();
+        assert_eq!(resumed.status(), MigrationStatus::Partial, "{resumed:?}");
+        let user_path = user_settings_path(Some(&env));
+        if user_path.is_file() {
+            let user = raw_write::read_strict_map(&user_path).unwrap();
+            let enabled = user.get(FIELD_ENABLED_PLUGINS).and_then(Value::as_object);
+            assert!(
+                enabled.is_none_or(|m| {
+                    !m.contains_key("alpha@old-name") && !m.contains_key("alpha@team-tools")
+                }),
+                "project-scope plugin must not be user-enabled: {user:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_reports_done_project_item_will_be_inactive() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = td.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        seed_unit_with_ledger_scoped(
+            &home,
+            "old-name",
+            "team-tools",
+            "alpha",
+            "project",
+            Some(&project),
+        );
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let report = apply_marketplace_name_migration(
+            &home,
+            Some(&env),
+            Some(&project),
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        assert_eq!(report.status(), MigrationStatus::Partial, "{report:?}");
+        let backup_dir = PathBuf::from(&report.backup.unwrap().path);
+        let mut meta: MigrationMeta =
+            serde_json::from_str(&std::fs::read_to_string(backup_dir.join("backup.json")).unwrap())
+                .unwrap();
+        // 模拟「项已完成、journal 仍残留」：resume 的 fresh plan 已看不到旧名，
+        // manual 必须由 journal 重建，否则已完成项的 project 失活不再提示。
+        meta.phase = "aborted".to_string();
+        meta.post_hashes =
+            current_hashes(&home, Some(&env), &user_settings_path(Some(&env))).unwrap();
+        write_journal(&home, &meta).unwrap();
+        let resumed =
+            resume_marketplace_name_migration(&home, Some(&env), Some(&project), &secrets).unwrap();
+        assert_eq!(resumed.status(), MigrationStatus::Partial, "{resumed:?}");
+        assert!(
+            resumed
+                .manual
+                .iter()
+                .any(|m| { m.effect == "will-be-inactive" && m.suggested == "alpha@team-tools" }),
+            "done project item must still be reported: {resumed:?}"
+        );
     }
 
     #[test]
@@ -3618,6 +4007,45 @@ mod tests {
     }
 
     #[test]
+    fn write_known_refuses_corrupt_file_without_rename_backup() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-name", "team-tools");
+        let known_path = known_marketplaces_path(Some(&home), None);
+        std::fs::write(&known_path, "{ not json").unwrap();
+        let before = std::fs::read(&known_path).unwrap();
+        let item = MigrationItem {
+            old_name: "old-name".to_string(),
+            new_name: Some("team-tools".to_string()),
+            action: MigrationAction::Rename,
+            reason: None,
+            source: String::new(),
+            plugins: Vec::new(),
+            secrets: 0,
+            baseline: None,
+            env_renames: Vec::new(),
+            source_value: json!({"type": "git", "url": "https://example.com/org/repo.git"}),
+            pids: Vec::new(),
+            installed_pids: Vec::new(),
+            secret_plans: Vec::new(),
+            install_paths: Vec::new(),
+        };
+        let err = write_known_item(&home, None, &item).unwrap_err();
+        assert_eq!(err, MigrationReason::StateCorrupt);
+        assert_eq!(before, std::fs::read(&known_path).unwrap());
+        let names: Vec<String> = std::fs::read_dir(&home)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains(".corrupt-")),
+            "corrupt file must not be renamed: {names:?}"
+        );
+    }
+
+    #[test]
     fn rollback_rejects_drifted_state() {
         let td = TempDir::new().unwrap();
         let home = td.path().join("home");
@@ -3644,6 +4072,57 @@ mod tests {
             err,
             MarketplaceMigrationError::RollbackDrift { .. }
         ));
+    }
+
+    #[test]
+    fn item_rollback_refuses_untouched_file_that_drifted() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env = unit_env(&td);
+        // 本项未写过 settings，但迁移窗口内外部创建了 settings（与 item before-image 不一致）：
+        // per-item 回滚必须拒绝盲还原，而不是覆盖外部写入。
+        let user_path = user_settings_path(Some(&env));
+        raw_write::update_raw_settings(&user_path, false, |map| {
+            map.insert(FIELD_ENABLED_PLUGINS.to_string(), Value::Object(Map::new()));
+            Ok(())
+        })
+        .unwrap();
+        let item = MigrationItem {
+            old_name: "old-name".to_string(),
+            new_name: Some("team-tools".to_string()),
+            action: MigrationAction::Rename,
+            reason: None,
+            source: String::new(),
+            plugins: Vec::new(),
+            secrets: 0,
+            baseline: None,
+            env_renames: Vec::new(),
+            source_value: Value::Null,
+            pids: Vec::new(),
+            installed_pids: Vec::new(),
+            secret_plans: Vec::new(),
+            install_paths: Vec::new(),
+        };
+        let item_dir = td.path().join("item-backup");
+        std::fs::create_dir_all(&item_dir).unwrap();
+        let err = rollback_item_on_failure(
+            &home,
+            Some(&env),
+            &user_path,
+            &item,
+            &item_dir,
+            &td.path().join("global"),
+            &ItemProgress::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MarketplaceMigrationError::ConcurrentChange { .. }
+        ));
+        // 外部写入保持原样。
+        let user = raw_write::read_strict_map(&user_path).unwrap();
+        assert!(user.get(FIELD_ENABLED_PLUGINS).is_some());
     }
 
     #[test]

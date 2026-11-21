@@ -67,13 +67,16 @@ marketplace migrate --apply --update-declarations
 - `<A2C_SKILL_HOME>/marketplace/<旧名>` 与 `marketplace/.plugins/<旧名>` 目录改名；
 - plugin-scoped **secret**：keyring 键 `<plugin>@<旧名>/<id>` → `<plugin>@<新名>/<id>`
   （先写新键、验证后删旧键；keyring 不可用且有 password input 时该 marketplace 整体跳过、零写入）。
+  清单里已移除、但账本仍有安装记录的 plugin 也会按 `installPath` 枚举并重键；根不可读时该
+  marketplace 记 `blocked`（无法确认是否藏有 secret），exit 3。
 
 ### 不会改什么（需要你手动处理）
 
 - **project / local scope** 的 `enabledPlugins` / `trustedMarketplaces` / `blockedMarketplaces` /
   `extraKnownMarketplaces`：输出里逐条列出文件与键路径。**旧 `enabledPlugins` 键在迁移后会失活**
   （报告标记 `will-be-inactive`，命令 exit 3）——请在对应项目的 `.tfrobot/settings.json` /
-  `.tfrobot/settings.local.json` 中改成新键，或改用 user scope。
+  `.tfrobot/settings.local.json` 中改成新键，或改用 user scope。旧 `trustedMarketplaces` /
+  `blockedMarketplaces` 名在迁移后会失效（报告标记 `stale-trust`，同样 exit 3），需手动改成新名。
 - **policy / flag scope** 的同名引用：迁移无法可靠定位这些来源（flag 路径由启动参数决定、policy 由系统管理），请自行核对并更新。
 - **环境变量**：`A2C_SMCP_<ENV_SEGMENT>` 的变量名随 scoped id 变化（secret 与非 secret 都变），
   输出里给出 old/new 变量名；迁移无法修改宿主环境。
@@ -95,7 +98,9 @@ clone 缺失、清单缺失或不可读、清单名缺失/非法 → 该 marketp
   marketplace migrate --resume
   ```
 
-  续做（按 journal 的旧名→新名映射，幂等；若期间文件被外部修改会拒绝）。
+  续做（按 journal 的旧名→新名映射，幂等；若期间文件被外部修改会拒绝）。中断发生在
+  marketplace **项边界**时，`--resume` 接受该项的 item 级 before-image 快照；项内文件已被外部
+  修改则仍拒绝。
 - 回滚到迁移前：
 
   ```text
@@ -117,7 +122,9 @@ clone 缺失、清单缺失或不可读、清单名缺失/非法 → 该 marketp
 | `bare_name_clash` | 同一裸 plugin 名已从其他 marketplace 安装：先卸载其中一个 |
 | `install_path_unexpected` | 账本 `installPath` 不在预期目录（手编/异常迁移痕迹）：核对 `<A2C_SKILL_HOME>/marketplace` 后再处理，本命令不做部分改写 |
 | `keyring_unavailable` | 当前环境没有可用的系统钥匙串：在带钥匙串的桌面会话中重试；不要用无 keyring 的 CI 环境迁移带 secret 的 marketplace |
+| `plugin_root_unreadable` | 已装 plugin 的 `installPath` 不存在 / 不可读，无法确认是否藏有 secret：修复账本路径或先卸载该 plugin 后重试 |
 | `exit 3` + `will-be-inactive` | 按第 4 节手动更新 project/local 的 `enabledPlugins` 键 |
+| `exit 3` + `stale-trust` | 按第 4 节手动更新 project/local 的 `trustedMarketplaces` / `blockedMarketplaces` 旧名 |
 
 > 迁移完成后，`marketplace refresh` 会以新 baseline 校验清单名；上游再次改名仍会被拒绝（协议
 > §5.14），不会再静默漂移。

@@ -76,8 +76,13 @@ D1 已退役明文存储，无迁移面；env 注入值（`A2C_SMCP_<ENV_SEGMENT
    文件的**原始字节**（`known_marketplaces.json` 的 source URL / user settings 内容会原样落盘，回滚
    依赖这些字节；**keyring secret 值不备份**），记录 **pre-hash**，写 journal（phase=prepared）。执行前复核当前
    hash == journal pre-hash，不一致 → `ConcurrentChange` abort。
-2. **secret 重键（先于目录/文件改写）**：枚举清单内 plugin 的 `mcp-servers/inputs.json`（严格解析；
-   畸形 / 已装 plugin 根不可读 → 保守 abort）。`password:true` inputs：
+2. **secret 重键（先于目录/文件改写）**：枚举两类 plugin 的 `mcp-servers/inputs.json`（严格解析；
+   畸形 / 已装 plugin 根不可读 → 保守 abort）：
+   - 当前清单内全部 plugin（含未安装，覆盖历史卸载残留 secret）；
+   - 已装但已从清单移除/改名的 plugin——按账本 `installPath` 定位（键名中的 plugin 段取 pid 前缀）；
+     既无清单条目又无可用 `installPath` → 该 marketplace abort（无法证明无 secret）。
+
+   `password:true` inputs：
    - keyring 不可用 → **abort 该 marketplace、零写入**（无法证明旧 secret 不存在）；
    - 目标键已存在且值不同 → **abort**（不覆盖既有 secret）；
    - `get(old)` → `set(new)` → 回读校验；**中途失败删除本次已 set 的新键**；
@@ -93,7 +98,10 @@ D1 已退役明文存储，无迁移面；env 注入值（`A2C_SMCP_<ENV_SEGMENT
    phase=done → 删除 journal，保留备份。
 
 **失败处理**：当前 marketplace 按逐项 before-image + 反向 rename 回滚，已 set 的新 secret 删除；
-已完成项保留；journal 留在 `aborted`，可 `--resume` 续做或 `--rollback` 整体还原。不做自动半回滚全部。
+回滚前先比对「未写文件」的当前 hash 与 item before-image，漂移则拒绝盲还原（`ConcurrentChange`）；
+反向 rename / 还原失败会向上传播（不吞错），并以 `ConcurrentChange` 标记该项。已完成项保留；journal
+留在 `aborted`，可 `--resume` 续做或 `--rollback` 整体还原。不做自动半回滚全部。项内 store / raw RMW
+错误按原因分类：锁冲突 → `ConcurrentChange`、`InvalidData` → `StateCorrupt`、其余 I/O → `IoError`。
 
 ## 5. journal / 备份 / 恢复 / 回滚
 
@@ -102,9 +110,18 @@ D1 已退役明文存储，无迁移面；env 注入值（`A2C_SMCP_<ENV_SEGMENT
   备份目录内 `backup.json` 同步一份，供回滚。
 - `--apply` 遇残留 journal → 报错并提示 `--resume` / `--rollback`；`--resume` 以 **journal 的
   old/new 映射**驱动（崩溃后旧目录可能已不在，不重新按旧名检测），每步先复查磁盘成员关系；
-  续做前校验当前文件 hash == pre-hash 或最近 post-hash，否则拒绝（并发修改）。pre-v0.3.0 seed 的
-  崩溃窗口对 intent 做集合等值校验（须恰等于 journal.seed_pids）；对 settings.json 只做幂等回填
-  （or_insert 不覆盖既有值），窗口内外部修改可能被接受——属极窄窗口的已知边界。
+  续做前校验当前文件 hash == pre-hash 或最近 post-hash，**或该项 before-image 的 item 级快照**
+  （`backupDir/items/<old>/`）——中断在项边界时允许从 item 级快照继续，否则拒绝（并发修改）。
+  pre-v0.3.0 seed 的崩溃窗口对 intent 做集合等值校验（须恰等于 journal.seed_pids）；对 settings.json
+  只做幂等回填（or_insert 不覆盖既有值），窗口内外部修改可能被接受——属极窄窗口的已知边界。
+  resume 的手动引用取 **fresh plan ∪ journal 重建项**（按 file + pointer 去重）：已完成项在 fresh
+  plan 里已看不到旧名，仍能从 journal 重建 `will-be-inactive` / `stale-trust` 报告。
+- **pre-v0.3.0 seed 的 scope 边界**：只把账本中 **user/default scope** 的记录回填为 user
+  `enabledPlugins=true`（缺 scope 视为 user）；project/local-only 的已装 pid 仍进安装意图，但**不写**
+  user 启用意图，改为输出 `will-be-inactive` 并 exit 3（迁移后需用户在该 scope 手动启用）。
+  seed 写序为 settings → intent，并在 resume 时按 journal 幂等重跑，避免「intent 已在、启用回填丢失」；
+  resume 的 intent→enabled 回填同样只覆盖有 user/default scope 账本记录的 pid（防止 project-only
+  插件借 resume 被全局启用）。
 - `--rollback <timestamp>`：done/aborted 状态校验当前文件 hash == 迁移后 post-hash（未被迁移写过的
   文件 == pre-hash），不符 → `RollbackDrift` 不覆盖用户改动；prepared/applying 中断态也可执行：
   要求 journal.timestamp == 请求的 backup（防旧备份覆盖在途迁移），跳过漂移校验、恢复预迁移备份 +
@@ -126,7 +143,10 @@ smcp-computer marketplace migrate [--apply] [--update-declarations] [--json]
   apply 报告另含 `warnings`。
 - 退出码：`0` 成功 / 无操作；`1` 冲突或命令级错误（沿用 `EXIT_USER_ERROR`；提案原写 2 与既有
   `EXIT_NETWORK_ERROR` 语义冲突，本实现改为 1）；`3` 部分完成（unresolved / blocked /
-  keyring-abort / project-local `enabledPlugins` 失活诊断，新增 `EXIT_PARTIAL`）。
+  keyring-abort / project-local `enabledPlugins` 失活 / project-local `trustedMarketplaces` /
+  `blockedMarketplaces` 旧名失效诊断，新增 `EXIT_PARTIAL`）。
+- REPL 内只允许 dry-run：`--apply` / `--resume` / `--rollback` 直接拒绝并提示在 shell 执行
+  （事务性迁移不放进交互式 REPL），`--rollback` 缺 timestamp 同样拒绝。
 - 名称展示一律经 `untrusted_name_for_display`，source 经脱敏助手；journal/备份保存权威文件
   **原字节**（可能含 source URL / settings 内容），权限 0700/0600，**不含 keyring secret 值**。
 
@@ -149,12 +169,14 @@ smcp-computer marketplace migrate [--apply] [--update-declarations] [--json]
 
 ## 9. 测试覆盖
 
-- 库级：`crates/smcp-computer/tests/marketplace_name_migration.rs`（33 用例）——dry-run 零写、
+- 库级：`crates/smcp-computer/tests/marketplace_name_migration.rs`（40 用例）——dry-run 零写、
   全量 apply、幂等、冲突四类、离线 grandfather、baseline mismatch、secret 重键 / keyring 不可用 /
-  目标键冲突、installPath 越界、损坏状态零写、多 scope + 未知字段保真、外部树改名、同源合并、
-  大小写冲突、rollback。
-- 模块单测（17）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
-  resume、rollback drift、半 seed 恢复、seed 窗口外来 intent 拒绝。
-- CLI 级（10）：`crates/smcp-computer/tests/marketplace_name_migration_cli_test.rs`——默认 dry-run、
+  目标键冲突 / 清单移除后经账本 installPath 重键、installPath 越界、损坏状态零写、多 scope +
+  未知字段保真、外部树改名、同源合并、大小写冲突、rollback、pre-v0.3 seed（user 回填 / project
+  不回填）、project stale trust（exit 3）、resume item 级快照。
+- 模块单测（21）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
+  resume、rollback drift、per-item 回滚拒绝漂移文件、半 seed 恢复、seed 窗口外来 intent 拒绝、
+  resume 不把 project-only plugin 写进 user 启用意图、resume 仍报告已完成项的 project 失活。
+- CLI 级（11）：`crates/smcp-computer/tests/marketplace_name_migration_cli_test.rs`——默认 dry-run、
   apply + backup、冲突 exit 1、unresolved exit 3、resume 无 journal exit 1、rollback、help flags、
-  user settings 隔离、cwd project 诊断（exit 3）。
+  user settings 隔离、cwd project 诊断（exit 3）、project stale trust stderr 告警（exit 3）。

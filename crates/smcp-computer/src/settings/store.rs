@@ -875,11 +875,12 @@ pub fn update_installed_plugins(
     .map_err(|e| SettingsStoreError::io(&path, e))
 }
 
-/// 持锁 read-check-write `installed_plugins.json`（仿 [`update_known_marketplaces_checked`]）。
-///
-/// `work` 在文件锁内执行并返回 `(值, 是否持久化)`；供迁移在锁内复核目标 pid 后决定写入，
-/// 避免「无变化也重写」与跨进程 TOCTOU。
-pub(crate) fn update_installed_plugins_checked<T>(
+fn store_error_to_io(error: SettingsStoreError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// 严格版 `installed_plugins` checked RMW：损坏状态 fail-closed（不触发 `.corrupt` 改名）。
+pub(crate) fn update_installed_plugins_checked_strict<T>(
     home: Option<&Path>,
     env: Option<&EnvMap>,
     work: impl FnOnce(&mut InstalledPluginsFile) -> (T, bool),
@@ -891,8 +892,10 @@ pub(crate) fn update_installed_plugins_checked<T>(
         DEFAULT_LOCK_BACKOFF_BASE,
         DEFAULT_LOCK_BACKOFF_MAX,
         || -> io::Result<T> {
-            let mut current = match read_jsonc_with_recovery(&path) {
-                Some(data) => coerce_installed_plugins(&data, &path),
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => {
+                    coerce_installed_plugins_strict(&data, &path).map_err(store_error_to_io)?
+                }
                 None => empty_installed_plugins(),
             };
             let (out, persist) = work(&mut current);
@@ -901,6 +904,65 @@ pub(crate) fn update_installed_plugins_checked<T>(
                 atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
             }
             Ok(out)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 严格版 `known_marketplaces` checked RMW：损坏状态 fail-closed。
+pub(crate) fn update_known_marketplaces_checked_strict<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut KnownMarketplacesFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
+    let path = known_marketplaces_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<T> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => {
+                    coerce_known_marketplaces_strict(&data, &path).map_err(store_error_to_io)?
+                }
+                None => empty_known_marketplaces(),
+            };
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 严格版 intent 可中止 RMW：损坏状态 fail-closed。
+pub(crate) fn try_update_installed_plugins_intent_strict(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile) -> bool,
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<Option<InstalledPluginsIntentFile>, SettingsStoreError> {
+    let path = installed_plugins_intent_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<Option<InstalledPluginsIntentFile>> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => coerce_installed_plugins_intent_strict(&data, &path)
+                    .map_err(store_error_to_io)?,
+                None => empty_installed_plugins_intent(),
+            };
+            if !mutator(&mut current) {
+                return Ok(None);
+            }
+            current.version = MATERIALIZED_VERSION;
+            atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            Ok(Some(current))
         },
     )?
     .map_err(|e| SettingsStoreError::io(&path, e))

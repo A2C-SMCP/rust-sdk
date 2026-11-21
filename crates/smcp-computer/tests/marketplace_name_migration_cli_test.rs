@@ -293,6 +293,37 @@ fn cli_scans_current_project_settings_and_exits_3() {
 }
 
 #[test]
+fn cli_project_stale_trust_warns_on_stderr_and_exits_3() {
+    let td = TempDir::new().unwrap();
+    let (home, skill_home, env) = setup(&td);
+    seed_legacy(&skill_home, &env, "old-name", "team-tools");
+    let project_settings = home.join(".tfrobot/settings.json");
+    fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
+    fs::write(
+        &project_settings,
+        serde_json::to_string(&json!({"trustedMarketplaces": ["old-name"]})).unwrap(),
+    )
+    .unwrap();
+    let out = cli_binary::run_binary(&home, &skill_home, &["marketplace", "migrate"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stale-trust") && stderr.contains("trustedMarketplaces"),
+        "stale trust must be a stderr warning: {stderr}"
+    );
+    // dry-run 不写 project settings。
+    assert_eq!(
+        read_json(&project_settings)["trustedMarketplaces"][0],
+        "old-name"
+    );
+}
+
+#[test]
 fn cli_interrupted_rollback_exits_0_with_note() {
     let td = TempDir::new().unwrap();
     let (home, skill_home, env) = setup(&td);

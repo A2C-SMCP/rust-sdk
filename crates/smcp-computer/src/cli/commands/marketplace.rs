@@ -808,7 +808,10 @@ fn emit_migration_plan(
                 MigrationAction::Rename | MigrationAction::BaselineOnly | MigrationAction::NoOp
             )
         })
-        || plan.manual.iter().any(|m| m.effect == "will-be-inactive")
+        || plan
+            .manual
+            .iter()
+            .any(|m| matches!(m.effect.as_str(), "will-be-inactive" | "stale-trust"))
     {
         MigrationStatus::Partial
     } else {
@@ -868,7 +871,8 @@ fn emit_migration_plan(
                 manual.effect,
                 untrusted_name_for_display(&manual.suggested)
             );
-            if manual.effect == "will-be-inactive" {
+            // 迁移后必须人工处理的引用（失活 / 失效 trust）走 stderr 告警，不能只藏在 dim 输出里。
+            if matches!(manual.effect.as_str(), "will-be-inactive" | "stale-trust") {
                 eprintln!("warning:{line}");
             } else {
                 msg_dim(&line);

@@ -201,15 +201,34 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
             marketplace_set(&home, None, &pos[0], key, value, json);
         }
         "migrate" => {
-            // 离线迁移：REPL 里也提醒先停止其它实例；--rollback 取 flag 值。
+            // 写入路径只在非交互 CLI 提供；REPL 仅 dry-run（或明确报 usage），避免与 clap 约束分叉。
+            if has_flag(&args, "--apply") {
+                msg_warn(
+                    "marketplace migrate --apply is only supported in the non-interactive CLI \
+                     (run: smcp-computer marketplace migrate --apply)",
+                );
+                return;
+            }
+            let has_rollback_flag = args.iter().any(|a| a == "--rollback");
             let rollback = flag_value(&args, "--rollback");
+            if has_rollback_flag && rollback.is_none() {
+                msg_warn("usage: marketplace migrate --rollback <timestamp>");
+                return;
+            }
+            if rollback.is_some() || has_flag(&args, "--resume") {
+                msg_warn(
+                    "marketplace migrate --resume/--rollback are only supported in the \
+                     non-interactive CLI",
+                );
+                return;
+            }
             let code = marketplace_migrate(
                 &home,
                 None,
-                has_flag(&args, "--apply"),
+                false,
                 has_flag(&args, "--update-declarations"),
-                has_flag(&args, "--resume"),
-                rollback.as_deref(),
+                false,
+                None,
                 json,
             );
             if code == EXIT_OK || code == EXIT_PARTIAL {
