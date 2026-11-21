@@ -73,8 +73,8 @@ use crate::skills::registry::SkillRegistry;
 use crate::skills::sources::marketplace_clone_url;
 use crate::skills::staging::{
     external_plugin_dir, refresh_marketplace_clone, stage_marketplace_skills,
-    KnownMarketplaceRecorder, MarketplaceStageError, MarketplaceStageOptions,
-    MarketplaceStageOutcome, DEFAULT_GIT_TIMEOUT, EXTERNAL_PLUGINS_NS,
+    KnownMarketplaceRecorder, MarketplaceStageOptions, MarketplaceStageOutcome,
+    DEFAULT_GIT_TIMEOUT, EXTERNAL_PLUGINS_NS,
 };
 
 // ===========================================================================
@@ -505,27 +505,8 @@ pub(crate) const REASON_SOURCE_CONFLICT: &str = "marketplace_source_conflict";
 /// 两侧「同样不可用」无法证明同源（§5.14「无法确定时 MUST fail-closed」）→ 视为注册被拒。
 const REASON_SOURCE_UNUSABLE: &str = "marketplace_source_unusable";
 
-/// refresh 来料清单改名（§5.14 refresh 改名 MUST 拒绝；旧注册/内容/能力保留）/ manifest renamed。
-const REASON_MANIFEST_NAME_CHANGED: &str = "marketplace_manifest_name_changed";
-/// refresh 来料清单缺失顶层 `name`（有 baseline 时 fail-closed）/ incoming manifest missing name。
-const REASON_MANIFEST_NAME_MISSING: &str = "marketplace_manifest_name_missing";
-/// refresh 来料清单 `name` 非法（有 baseline 时 fail-closed）/ incoming manifest name invalid。
-const REASON_MANIFEST_NAME_INVALID: &str = "marketplace_manifest_name_invalid";
-/// refresh 来料清单存在但不可读/损坏（预校验拒绝，不落盘）/ incoming manifest unreadable。
-const REASON_MANIFEST_UNREADABLE: &str = "marketplace_manifest_unreadable";
 /// 账本+clone 均缺失时仍存在 `installedPlugins` 意图引用（§5.14 remove/re-add 守卫）/ dangling refs。
 pub(crate) const REASON_DANGLING_REFERENCES: &str = "marketplace_dangling_references";
-
-/// 该 stage 失败是否属「清单身份预校验拒绝」（§5.14 validation：旧注册/内容/能力必须保留、不降级）。
-fn is_manifest_identity_rejection(failure: &MarketplaceStageError) -> Option<&'static str> {
-    match failure {
-        MarketplaceStageError::ManifestNameChanged { .. } => Some(REASON_MANIFEST_NAME_CHANGED),
-        MarketplaceStageError::ManifestNameMissing => Some(REASON_MANIFEST_NAME_MISSING),
-        MarketplaceStageError::ManifestNameInvalid => Some(REASON_MANIFEST_NAME_INVALID),
-        MarketplaceStageError::ManifestUnreadable => Some(REASON_MANIFEST_UNREADABLE),
-        _ => None,
-    }
-}
 
 /// marketplace source Value → 安全展示值（日志/诊断边界）。
 ///
@@ -577,6 +558,8 @@ pub async fn reconcile(
     // 对账前快照物化状态（stage 会在循环内经 recorder 回写，故先取基线分类）。
     let known = store.load_known_marketplaces();
     let materialized = &known.marketplaces;
+    // #267 re-add 门只读安装意图：reconcile 期间不会写 intent，循环外读一次即可（避免 N 次文件读）。
+    let installed_intent = store.load_installed_plugins_intent();
 
     let mut report = ReconcileReport::default();
     let empty_source = Value::Object(Map::new());
@@ -624,8 +607,7 @@ pub async fn reconcile(
         // 仅以**安装意图**为判据：declared `enabledPlugins` 是 reconcile 的期望态驱动（首次声明式安装
         // 同样携带），把它计入会把首次安装全部误拒；enabledPlugins 的引用守卫由 add 路径（claim）承担。
         if record.is_none() && !present_before {
-            let intent = store.load_installed_plugins_intent();
-            let refs = intent_reference_ids(name, &intent, None);
+            let refs = intent_reference_ids(name, &installed_intent, None);
             if !refs.is_empty() {
                 let shown: Vec<String> = refs
                     .iter()
@@ -687,9 +669,7 @@ pub async fn reconcile(
             .await;
             MarketplaceStageOutcome {
                 registered,
-                changed: false,
-                failure: None,
-                advisory: None,
+                ..MarketplaceStageOutcome::default()
             }
         };
         if let Some((kind, message)) = &outcome.advisory {
@@ -705,7 +685,7 @@ pub async fn reconcile(
             .extend(outcome.registered.iter().cloned());
 
         if let Some(failure) = &outcome.failure {
-            if let Some(reason) = is_manifest_identity_rejection(failure) {
+            if let Some(reason) = failure.manifest_identity_reason() {
                 // §5.14：拒绝分支未提交任何内容——不注销 SKILL、不删 clone、不写账本；旧注册/内容/能力
                 // 保持 active（validation，不进 degraded）。
                 tracing::error!(
@@ -2922,5 +2902,133 @@ mod tests {
             reg.resolve("audit:code-review").unwrap().description,
             "from A v2"
         );
+    }
+
+    /// #267 审查 🟡7(c)：来料清单「缺 name / 非法 name / 损坏 JSON」在 baseline 已钉住时均归 failed，
+    /// 各自输出稳定 reason，且 catalog/旧能力零推进（与改名同级的 §5.14 validation 拒绝）。
+    #[tokio::test]
+    async fn reconcile_manifest_identity_failures_classified_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_marketplace_repo(tmp.path(), "from A");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url = format!("file://{}", repo.display());
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {
+                "source": {"type": "git", "url": url},
+                "autoUpdate": true
+            }},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+        let r1 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r1.installed, vec!["acme".to_string()]);
+        let clone = marketplace_skill_dir(&home, "acme", &[]);
+        let head = git_head(&clone);
+        let manifest = repo.join(".tfrobot-plugin/marketplace.json");
+
+        // 缺 name。
+        std::fs::write(&manifest, r#"{"plugins": []}"#).unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "missing-name"], &repo);
+        let (logs, subscriber) = capture_subscriber();
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default())
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert!(
+            logs.contents()
+                .contains("marketplace_manifest_name_missing"),
+            "{}",
+            logs.contents()
+        );
+        assert_eq!(git_head(&clone), head);
+
+        // 非法 name。
+        std::fs::write(&manifest, r#"{"name": "Bad Name", "plugins": []}"#).unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "invalid-name"], &repo);
+        let (logs, subscriber) = capture_subscriber();
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default())
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert!(
+            logs.contents()
+                .contains("marketplace_manifest_name_invalid"),
+            "{}",
+            logs.contents()
+        );
+        assert_eq!(git_head(&clone), head);
+
+        // 损坏 JSON（存在但不可读）。
+        std::fs::write(&manifest, "{not-json").unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "corrupt"], &repo);
+        let (logs, subscriber) = capture_subscriber();
+        let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default())
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(r.failed, vec!["acme".to_string()]);
+        assert!(
+            logs.contents().contains("marketplace_manifest_unreadable"),
+            "{}",
+            logs.contents()
+        );
+        assert_eq!(git_head(&clone), head, "所有身份拒绝都不得推进 catalog");
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A",
+            "旧能力保持 active"
+        );
+    }
+
+    /// #267 审查 🟡：same-commit 复用路径不得被**工作树脏改动**绕过——本地把 clone 的清单改成
+    /// 改名版（上游 HEAD 未变）也必须拒绝，旧能力保留。
+    #[tokio::test]
+    async fn reconcile_rejects_dirty_worktree_manifest_rename_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_marketplace_repo(tmp.path(), "from A");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url = format!("file://{}", repo.display());
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {
+                "source": {"type": "git", "url": url},
+                "autoUpdate": true
+            }},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+        let r1 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r1.installed, vec!["acme".to_string()]);
+
+        // 本地脏改动 clone 的工作树清单（上游 HEAD 不变 → incoming_sha == head 的 same-commit 路径）。
+        let clone = marketplace_skill_dir(&home, "acme", &[]);
+        let manifest = clone.join(".tfrobot-plugin/marketplace.json");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("\"acme\"", "\"acme-v2\"");
+        std::fs::write(&manifest, text).unwrap();
+        let head = git_head(&clone);
+
+        let (logs, subscriber) = capture_subscriber();
+        let r2 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default())
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(r2.failed, vec!["acme".to_string()]);
+        assert!(
+            logs.contents()
+                .contains("marketplace_manifest_name_changed"),
+            "{}",
+            logs.contents()
+        );
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A"
+        );
+        assert_eq!(git_head(&clone), head, "拒绝不得提交 / 推进");
     }
 }

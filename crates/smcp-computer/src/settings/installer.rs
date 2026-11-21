@@ -63,8 +63,8 @@ use crate::settings::scope::{
 };
 use crate::settings::store::{
     self, load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
-    update_installed_plugins, update_installed_plugins_intent, InstalledPluginsFile,
-    SettingsStoreError,
+    update_installed_plugins, update_installed_plugins_intent, update_known_marketplaces,
+    InstalledPluginsFile, SettingsStoreError,
 };
 use crate::skills::home::{marketplace_skill_dir, SOURCE_MARKETPLACE};
 use crate::skills::manifest::{
@@ -75,8 +75,8 @@ use crate::skills::manifest::{
 use crate::skills::registry::{SkillRegistry, SkillSourceConflict};
 use crate::skills::staging::{
     has_projectable_skill, locate_plugin_root, plugin_skill_container_dirs,
-    refresh_marketplace_working_copy, stage_marketplace_skills, MarketplaceStageError,
-    MarketplaceStageOptions, SkillStagingError, DEFAULT_GIT_TIMEOUT,
+    refresh_marketplace_working_copy, stage_marketplace_skills, MarketplaceStageOptions,
+    MarketplaceWorkingCopy, SkillStagingError, DEFAULT_GIT_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
@@ -1304,6 +1304,10 @@ pub async fn install_plugin(
     // ⓪' #267 / §5.14：`refresh=true` 时先刷新/校验 catalog 工作副本（来料清单名），失败在**任何**物化
     //    （含外部 plugin clone）与 registry 变更之前返回。catalog 未 clone 时跳过，保留 materialize_plugin
     //    既有的 Precondition 文案。
+    //
+    //    `refreshed_working_copy` 存活到 install 全成功才 `discard_trash`（🟡6）：后续 materialize/账本
+    //    失败时旧 catalog 仍留在 `.trash`（24h sweep 清理），不会被提前不可逆删除。
+    let mut refreshed_working_copy: Option<MarketplaceWorkingCopy> = None;
     if options.refresh && marketplace_skill_dir(home, &marketplace, &[]).is_dir() {
         let resolved = resolve_marketplace_source(&marketplace, home, env)?;
         match refresh_marketplace_working_copy(
@@ -1316,24 +1320,64 @@ pub async fn install_plugin(
         )
         .await
         {
-            Ok(copy) => copy.discard_trash(),
-            Err(failure) => match &failure {
-                // §5.14 refresh 改名 / 清单坏：validation 拒绝，旧注册/内容/能力保持 active。
-                MarketplaceStageError::ManifestNameChanged { .. }
-                | MarketplaceStageError::ManifestNameMissing
-                | MarketplaceStageError::ManifestNameInvalid
-                | MarketplaceStageError::ManifestUnreadable => {
+            Ok(copy) => {
+                // legacy（baseline None）首次观测：钉住来料清单名，否则改名永远不被后续 refresh 检测
+                // （与 `marketplace refresh` / reconcile 的 `record_with_baseline` 同语义，#267 审查 🔴）。
+                if resolved.manifest_name_baseline.is_none() {
+                    if let Some(baseline) = copy.applied_baseline.as_deref() {
+                        let mp = marketplace.clone();
+                        let new_baseline = baseline.to_string();
+                        if let Err(e) = update_known_marketplaces(
+                            move |file| {
+                                if let Some(entry) = file.account.marketplaces.get_mut(&mp) {
+                                    if entry.manifest_name_baseline.is_none() {
+                                        entry.manifest_name_baseline = Some(new_baseline);
+                                    }
+                                }
+                            },
+                            Some(home),
+                            env,
+                        ) {
+                            tracing::warn!(
+                                marketplace = %marketplace,
+                                error = %e,
+                                "install: failed to pin manifestNameBaseline (degraded)"
+                            );
+                        }
+                    }
+                }
+                if let Some((kind, message)) = &copy.advisory {
+                    tracing::warn!(
+                        marketplace = %marketplace,
+                        advisory = ?kind,
+                        message = %message,
+                        "install: legacy manifest-name advisory"
+                    );
+                }
+                refreshed_working_copy = Some(copy);
+            }
+            Err(failure) => {
+                // §5.14 refresh 改名 / 清单坏：validation 拒绝（稳定 reason 日志 + 结构化错误），旧注册/
+                // 内容/能力保持 active。
+                if let Some(reason) = failure.manifest_identity_reason() {
+                    tracing::error!(
+                        marketplace = %marketplace,
+                        reason = reason,
+                        error = %failure,
+                        "install: rejected marketplace refresh by manifest identity pre-check \
+                         (existing registration/content kept)"
+                    );
                     return Err(PluginInstallError::Staging(SkillStagingError(
                         failure.to_string(),
                     )));
                 }
                 // 网络 / I-O：失败降级铁律——保留旧 catalog 继续（不应用未校验内容）。
-                _ => tracing::error!(
+                tracing::error!(
                     marketplace = %marketplace,
                     error = %failure,
                     "install: marketplace refresh failed; continuing with the existing catalog (degraded)"
-                ),
-            },
+                );
+            }
         }
     }
 
@@ -1436,6 +1480,10 @@ pub async fn install_plugin(
 
     // ⑧：★再写账本（派生缓存，仅全成功；与账本重建复用 [`write_ledger_record`]）
     let record = write_ledger_record(home, plugin_id, scope, options.project_path, &m, env)?;
+    // #267 审查 🟡6：install 全成功后才清理 swap 出的旧 catalog 备份；失败路径保留 `.trash` 供恢复。
+    if let Some(copy) = &refreshed_working_copy {
+        copy.discard_trash();
+    }
     tracing::info!(
         plugin = plugin_id,
         skills_staged = staged_skills.len(),
@@ -7475,5 +7523,182 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(desc(&reg), "review code v2");
+    }
+
+    /// 改 marketplace.json 的清单名并提交（install 改名路径用）。
+    fn rename_manifest(repo: &Path, new_name: &str) {
+        let manifest = repo.join(".tfrobot-plugin/marketplace.json");
+        // JSON 级改 name（字符串替换无法处理连续改名：`"acme-v2"` 不含完整 token `"acme"`）。
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        value["name"] = serde_json::json!(new_name);
+        fs::write(&manifest, serde_json::to_string(&value).unwrap()).unwrap();
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "rename"], repo);
+    }
+
+    /// #267 审查 🔴：legacy（baseline None）install refresh 拉到改名清单 → 接受（legacy  grandfather）
+    /// 但**必须钉住新基线**并给 advisory；此后再次改名即被拒绝（守卫收敛）。
+    #[tokio::test]
+    async fn install_refresh_legacy_pins_baseline_then_rejects_next_rename_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let source = build_source_repo_with_servers(&repo, &[]);
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        // setup 默认 baseline None（= pre-#272 legacy 注册），不 pin。
+
+        let mut reg = SkillRegistry::new();
+        rename_manifest(&repo, "acme-v2");
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("legacy 首次观测改名应接受（保留旧注册名）");
+
+        let entry = load_known_marketplaces(Some(&home), Some(&env))
+            .account
+            .marketplaces
+            .get("acme")
+            .cloned()
+            .expect("注册保留");
+        assert_eq!(
+            entry.manifest_name_baseline.as_deref(),
+            Some("acme-v2"),
+            "legacy 首次 refresh 必须钉住来料清单名（否则改名守卫永不收敛）"
+        );
+
+        // 基线已钉住 → 下一次改名被拒绝，catalog 不再推进。
+        let clone = home.join("marketplace").join("acme");
+        let head = git_head(&clone);
+        rename_manifest(&repo, "acme-v3");
+        let err = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("manifest name changed"), "{err}");
+        assert_eq!(git_head(&clone), head, "拒绝不得再推进 catalog");
+    }
+
+    /// #267 审查 🟡7(a)：install refresh 的 ⓪' 网络失败 → 保留旧 catalog 继续（降级），install 成功。
+    #[tokio::test]
+    async fn install_refresh_network_failure_degrades_to_existing_catalog_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let source = build_source_repo_with_servers(&repo, &[]);
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        pin_baseline(&home, &env, "acme");
+
+        // 上游不可达：fetch / staged clone 均失败 → 走降级分支。
+        fs::remove_dir_all(&repo).unwrap();
+
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("网络失败必须降级为使用旧 catalog，而不是拒绝安装");
+        assert_eq!(
+            reg.all_refs()
+                .into_iter()
+                .find(|(r, _)| r.name == "audit:code-review")
+                .map(|(r, _)| r.description)
+                .as_deref(),
+            Some("review code"),
+            "旧 catalog 内容应继续可用"
+        );
+    }
+
+    /// #267 审查 🟡7(d)：install refresh 的改名拒绝发生在 `materialize_plugin` 之前——外部 Git plugin
+    /// clone 不得被提前推进。
+    #[tokio::test]
+    async fn install_refresh_rename_rejection_does_not_touch_external_plugin_clone_267() {
+        let tmp = TempDir::new().unwrap();
+        // 外部 plugin 源（独立 git 仓库）。
+        let ext_repo = tmp.path().join("ext-plugin");
+        let skill = ext_repo.join("skills/code-review");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: ext code\n---\nbody",
+        )
+        .unwrap();
+        git(&["init", "-q"], &ext_repo);
+        git(&["add", "-A"], &ext_repo);
+        git(&["commit", "-qm", "init"], &ext_repo);
+        let ext_url = format!("file://{}", ext_repo.display());
+
+        // marketplace 清单指向外部 git plugin。
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            format!(
+                r#"{{"name": "acme", "plugins": [{{"name": "audit", "source": {{"source": "url", "url": "{ext_url}"}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        git(&["init", "-q"], &repo);
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+        let source =
+            serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())});
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        pin_baseline(&home, &env, "acme");
+
+        let ext_clone = home.join("marketplace/.plugins/acme/audit");
+        let ext_head = git_head(&ext_clone);
+        let catalog_head = git_head(&home.join("marketplace/acme"));
+
+        rename_manifest(&repo, "acme-v2");
+        let mut reg = SkillRegistry::new();
+        let err = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("manifest name changed"), "{err}");
+        assert_eq!(
+            git_head(&ext_clone),
+            ext_head,
+            "改名拒绝必须发生在外部 plugin clone 之前"
+        );
+        assert_eq!(
+            git_head(&home.join("marketplace/acme")),
+            catalog_head,
+            "改名拒绝不得推进 catalog"
+        );
     }
 }

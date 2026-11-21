@@ -1329,6 +1329,32 @@ pub enum MarketplaceStageError {
     ExpectedNameMismatch { expected: String, actual: String },
 }
 
+/// refresh 来料清单改名（§5.14 refresh 改名 MUST 拒绝；旧注册/内容/能力保留）/ manifest renamed。
+pub(crate) const REASON_MANIFEST_NAME_CHANGED: &str = "marketplace_manifest_name_changed";
+/// refresh 来料清单缺失顶层 `name`（有 baseline 时 fail-closed）/ incoming manifest missing name。
+pub(crate) const REASON_MANIFEST_NAME_MISSING: &str = "marketplace_manifest_name_missing";
+/// refresh 来料清单 `name` 非法（有 baseline 时 fail-closed）/ incoming manifest name invalid。
+pub(crate) const REASON_MANIFEST_NAME_INVALID: &str = "marketplace_manifest_name_invalid";
+/// refresh 来料清单存在但不可读/损坏（预校验拒绝，不落盘）/ incoming manifest unreadable。
+pub(crate) const REASON_MANIFEST_UNREADABLE: &str = "marketplace_manifest_unreadable";
+
+impl MarketplaceStageError {
+    /// 「清单身份预校验拒绝」的稳定 reason（§5.14 validation）/ Stable reason for identity rejections.
+    ///
+    /// `Some` = 拒绝分支**未提交任何内容**（旧注册/内容/能力必须保留、不降级）；`None` = 其它失败
+    /// （clone / I-O / 配置 / 期望名不匹配），可走既有降级语义。**单一权威**：reconcile / install 的
+    /// 失败分类与结构化日志均经此方法，避免多处 `match` 漂移（#267 审查 🟡）。
+    pub(crate) fn manifest_identity_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::ManifestNameChanged { .. } => Some(REASON_MANIFEST_NAME_CHANGED),
+            Self::ManifestNameMissing => Some(REASON_MANIFEST_NAME_MISSING),
+            Self::ManifestNameInvalid => Some(REASON_MANIFEST_NAME_INVALID),
+            Self::ManifestUnreadable => Some(REASON_MANIFEST_UNREADABLE),
+            _ => None,
+        }
+    }
+}
+
 /// marketplace 注册 / stage 的结构化结果 / Structured marketplace staging outcome。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MarketplaceStageOutcome {
@@ -1787,20 +1813,21 @@ async fn fetch_incoming_manifest(
     }
 }
 
-/// `git merge --ff-only FETCH_HEAD`（只提交已校验的 commit）/ Fast-forward to the validated commit.
-async fn fast_forward_to_fetched(
+/// `git merge --ff-only <sha>`（只提交**已校验**的 commit）/ Fast-forward to the validated commit sha.
+///
+/// **必须传显式 sha 而非 `FETCH_HEAD`**：同一 home 的 clone 可能被并发 git 操作（另一进程的
+/// `marketplace refresh` / install / reconcile）改写 `FETCH_HEAD`；按可变引用 merge 会 ff 到未经本进程
+/// 校验清单的 commit，绕过 §5.14 改名守卫（#267 审查 🟡）。
+async fn fast_forward_to(
     clone_dir: &Path,
+    sha: &str,
     timeout: Duration,
     env: Option<&EnvMap>,
 ) -> Result<(), SkillStagingError> {
     let dir = clone_dir.to_string_lossy().into_owned();
-    run_git(
-        &["-C", &dir, "merge", "--ff-only", "FETCH_HEAD"],
-        timeout,
-        env,
-    )
-    .await
-    .map(|_| ())
+    run_git(&["-C", &dir, "merge", "--ff-only", sha], timeout, env)
+        .await
+        .map(|_| ())
 }
 
 /// catalog 工作副本刷新结果（**未物化**——SKILL 注册由调用方决定）/ A refreshed catalog working copy.
@@ -1856,15 +1883,37 @@ pub(crate) async fn refresh_marketplace_working_copy(
 
     if clone_dir.exists() {
         let head = git_head_sha(&clone_dir, timeout, env).await;
+        // #267 审查 🟡：物化读取的是**工作树**清单。先校验工作树（本地脏改动 / 崩溃残留不得绕过
+        // §5.14 改名守卫）；本地清单不合法时在**任何提交之前**拒绝。
+        let manifest_path = clone_dir
+            .join(crate::skills::manifest::MARKETPLACE_MANIFEST_DIR)
+            .join(crate::skills::manifest::MARKETPLACE_MANIFEST);
+        let local_manifest = read_marketplace_manifest(&clone_dir).ok();
+        let local_decision = apply_manifest_policy(
+            name,
+            baseline,
+            local_manifest.as_ref(),
+            manifest_path.is_file(),
+        )?;
+
         if let Ok((incoming, incoming_present, incoming_sha)) =
             fetch_incoming_manifest(&clone_dir, timeout, env).await
         {
-            let decision =
+            let incoming_decision =
                 apply_manifest_policy(name, baseline, incoming.as_ref(), incoming_present)?;
-            let same_commit = incoming_sha.is_some() && incoming_sha == head;
+            let same_commit = incoming_sha
+                .as_deref()
+                .is_some_and(|sha| Some(sha) == head.as_deref());
             let mut changed = false;
             if !same_commit {
-                if fast_forward_to_fetched(&clone_dir, timeout, env)
+                // #267 审查 🟡：只 ff 到**校验过的 sha**（FETCH_HEAD 可被并发 fetch 改写）。
+                let Some(validated_sha) = incoming_sha else {
+                    return refresh_working_copy_via_staged_clone(
+                        name, source, home, baseline, timeout, env,
+                    )
+                    .await;
+                };
+                if fast_forward_to(&clone_dir, &validated_sha, timeout, env)
                     .await
                     .is_err()
                 {
@@ -1876,11 +1925,21 @@ pub(crate) async fn refresh_marketplace_working_copy(
                 }
                 changed = true;
             }
+            // same-commit 时物化读工作树 → 以工作树裁决为准；发生 ff 后工作树即来料 commit → 以
+            // 来料裁决为准。
+            let (applied_baseline, advisory) = if same_commit {
+                (local_decision.applied_baseline, local_decision.advisory)
+            } else {
+                (
+                    incoming_decision.applied_baseline,
+                    incoming_decision.advisory,
+                )
+            };
             return Ok(MarketplaceWorkingCopy {
                 dir: clone_dir,
                 changed,
-                applied_baseline: decision.applied_baseline,
-                advisory: decision.advisory,
+                applied_baseline,
+                advisory,
                 committed: None,
             });
         }
