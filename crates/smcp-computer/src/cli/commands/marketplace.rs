@@ -254,6 +254,8 @@ pub struct MarketplaceAddOptions<'a> {
     pub no_clone: bool,
     /// 首见信任确认回调（REPL session y/N；Typer 非交互 `None`）/ first-trust confirm callback。
     pub confirm: Option<&'a dyn Confirm>,
+    /// 引用守卫的 flag 层 settings 文件（`--settings`，已归一；`None` = 无 flag 层，#267）。
+    pub flag_settings_path: Option<&'a Path>,
     /// 结构化输出 / JSON output。
     pub json_output: bool,
 }
@@ -309,6 +311,8 @@ pub async fn marketplace_add(
             auto_update: opts.auto_update,
             no_clone: opts.no_clone,
             config_cwd: None,
+            flag_settings_path: opts.flag_settings_path,
+            policy_settings: None,
         },
     )
     .await

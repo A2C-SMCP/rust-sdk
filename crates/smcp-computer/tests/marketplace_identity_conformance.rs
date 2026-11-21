@@ -543,6 +543,143 @@ async fn readd_blocked_by_enabled_plugins_reference() {
     );
 }
 
+/// #267：flag 层（`--settings`）`enabledPlugins` 引用同样触发守卫；无 flag 层时同一操作放行。
+#[tokio::test]
+async fn readd_blocked_by_flag_layer_reference() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    let repo_a = td.path().join("repo-a");
+    let repo_b = td.path().join("repo-b");
+    let url_a = build_repo(&repo_a, Some("team-tools"), "from-a");
+    let url_b = build_repo(&repo_b, Some("team-tools"), "from-b");
+    let mut reg = SkillRegistry::new();
+    add_marketplace(
+        &mut reg,
+        &home,
+        Some(&env),
+        &url_a,
+        AddMarketplaceParams::default(),
+    )
+    .await
+    .unwrap();
+    remove_marketplace(
+        &mut reg,
+        &home,
+        Some(&env),
+        "team-tools",
+        RemoveMarketplaceParams {
+            keep_plugins: false,
+            hooks: None,
+        },
+        &HashSet::new(),
+    )
+    .await
+    .unwrap();
+
+    let flag = td.path().join("flag-settings.json");
+    fs::write(&flag, r#"{"enabledPlugins": {"alpha@team-tools": false}}"#).unwrap();
+    let err = add_marketplace(
+        &mut reg,
+        &home,
+        Some(&env),
+        &url_b,
+        AddMarketplaceParams {
+            flag_settings_path: Some(&flag),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            GovernanceError::MarketplaceNameReferenced { name, plugin_ids }
+                if name == "team-tools" && plugin_ids.iter().any(|p| p == "alpha@team-tools")
+        ),
+        "{err:?}"
+    );
+
+    // 同一操作、无 flag 层 → 正常注册（证明拒绝来自 flag 层，不是其它副作用）。
+    add_marketplace(
+        &mut reg,
+        &home,
+        Some(&env),
+        &url_b,
+        AddMarketplaceParams::default(),
+    )
+    .await
+    .unwrap();
+}
+
+/// #267：policy 层 `enabledPlugins` 引用同样触发守卫；flag ∪ policy 引用并集去重。
+#[tokio::test]
+async fn readd_blocked_by_policy_layer_reference_and_union_dedup() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    let repo_a = td.path().join("repo-a");
+    let repo_b = td.path().join("repo-b");
+    let url_a = build_repo(&repo_a, Some("team-tools"), "from-a");
+    let url_b = build_repo(&repo_b, Some("team-tools"), "from-b");
+    let mut reg = SkillRegistry::new();
+    add_marketplace(
+        &mut reg,
+        &home,
+        Some(&env),
+        &url_a,
+        AddMarketplaceParams::default(),
+    )
+    .await
+    .unwrap();
+    remove_marketplace(
+        &mut reg,
+        &home,
+        Some(&env),
+        "team-tools",
+        RemoveMarketplaceParams {
+            keep_plugins: false,
+            hooks: None,
+        },
+        &HashSet::new(),
+    )
+    .await
+    .unwrap();
+
+    let flag = td.path().join("flag-settings.json");
+    fs::write(&flag, r#"{"enabledPlugins": {"alpha@team-tools": true}}"#).unwrap();
+    let policy: Map<String, Value> =
+        json!({"enabledPlugins": {"alpha@team-tools": true, "beta@team-tools": false}})
+            .as_object()
+            .unwrap()
+            .clone();
+    let err = add_marketplace(
+        &mut reg,
+        &home,
+        Some(&env),
+        &url_b,
+        AddMarketplaceParams {
+            flag_settings_path: Some(&flag),
+            policy_settings: Some(&policy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    let GovernanceError::MarketplaceNameReferenced { name, plugin_ids } = &err else {
+        panic!("expect MarketplaceNameReferenced, got {err:?}");
+    };
+    assert_eq!(name, "team-tools");
+    // flag ∪ policy，true/false 均算，alpha 去重。
+    assert_eq!(
+        plugin_ids,
+        &vec![
+            "alpha@team-tools".to_string(),
+            "beta@team-tools".to_string()
+        ]
+    );
+}
+
 /// 仓库名 ≠ 清单名 → 注册名、clone 目录、skill source 全用清单名。
 #[tokio::test]
 async fn add_uses_manifest_name_not_repo_slug() {

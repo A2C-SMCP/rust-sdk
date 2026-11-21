@@ -34,7 +34,8 @@ use url::Url;
 use crate::settings::installer::{
     uninstall_plugin, McpInstallHooks, PluginInstallError, UninstallOptions,
 };
-use crate::settings::reconciler::{prune_marketplaces, SkillGovernanceStore};
+use crate::settings::policy::resolve_policy_settings;
+use crate::settings::reconciler::{intent_reference_ids, prune_marketplaces, SkillGovernanceStore};
 use crate::settings::redaction::{
     git_source_for_error, known_git_source_for_display, redact_git_urls_in_text,
     untrusted_name_for_display, REDACTED_GIT_SOURCE,
@@ -250,6 +251,16 @@ pub struct AddMarketplaceParams<'a> {
     pub no_clone: bool,
     /// 引用守卫的 cwd 锚（project/local `enabledPlugins`；`None` → 进程 cwd）。
     pub config_cwd: Option<&'a Path>,
+    /// 引用守卫的 flag 层 settings 文件（`--settings`；`None` = 无 flag 层，#267）。
+    ///
+    /// `Computer::add_marketplace` 包装时由实例的 `normalized_flag_settings_path()` **覆盖**；本字段
+    /// 供自由函数调用方 / CLI / 测试注入。
+    pub flag_settings_path: Option<&'a Path>,
+    /// 引用守卫的 policy 层视图（`None` → 由 `env` 经 `resolve_policy_settings` 现解析，#267）。
+    ///
+    /// `Computer::add_marketplace` 包装时由实例 policy 视图**覆盖**（宿主不得注入空/过期视图绕过守卫）；
+    /// 本字段供自由函数调用方 / 测试注入（注入即视为 hermetic 测试来源）。
+    pub policy_settings: Option<&'a Map<String, Value>>,
 }
 
 /// `remove_marketplace` 编排参数 / remove params。
@@ -400,41 +411,47 @@ enum RegistrationClaim {
     Inserted,
 }
 
-/// 引用守卫：列出指向 `name` 的 `<plugin>@<name>` 意图引用（install intent ∪ 合并 settings）/ intent refs。
+/// 引用守卫：列出指向 `name` 的 `<plugin>@<name>` 意图引用（install intent ∪ 五层 settings）/ intent refs。
 ///
 /// 不论 `enabledPlugins` 值为 true / false 都算意图引用（fail-closed，协议 §5.14 remove/re-add 守卫）。
+///
+/// # 层覆盖（#267）
+/// `enabledPlugins` 走**五层**合并视图（user < project < local < flag < policy）：
+/// - `flag_settings_path`（`--settings`，次高）由调用方注入；`None` = 无 flag 层；
+/// - `policy_settings` 由调用方注入（已按 policy scope 校验的 first-source-wins 视图）；`None` 时本函数
+///   经 [`resolve_policy_settings`] 按 `env` 现解析（与 `Computer::resolved_runtime_settings` 同源）。
+///
+/// # 锁纪律（#267）
+/// 本函数会读 settings 文件 / policy plist——**必须在 `known_marketplaces` 账本锁之外调用**；锁内只允许
+/// 对结果 `refs.is_empty()` 做判定（见 [`claim_marketplace_registration`]）。
 fn marketplace_intent_references(
     home: &Path,
     env: Option<&EnvMap>,
     config_cwd: Option<&Path>,
     name: &str,
+    flag_settings_path: Option<&Path>,
+    policy_settings: Option<&Map<String, Value>>,
 ) -> Vec<String> {
-    let suffix = format!("@{name}");
-    let mut refs: Vec<String> = load_installed_plugins_intent(Some(home), env)
-        .account
-        .installed_plugins
-        .iter()
-        .filter(|id| id.ends_with(&suffix))
-        .cloned()
-        .collect();
+    let intent = load_installed_plugins_intent(Some(home), env).account;
     let cwd = config_cwd
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok());
+    // policy 视图：调用方注入优先（测试 hermetic）；否则按 env 现解析（与 Computer 同源）。
+    let resolved_policy;
+    let policy = match policy_settings {
+        Some(p) => p,
+        None => {
+            resolved_policy = resolve_policy_settings(env, None, None);
+            &resolved_policy
+        }
+    };
     let settings = resolve_settings(ResolveSettingsArgs {
         cwd: cwd.as_deref(),
         env,
-        flag_settings_path: None,
-        policy_settings: None,
+        flag_settings_path,
+        policy_settings: Some(policy),
     });
-    if let Some(Value::Object(map)) = settings.settings.get("enabledPlugins") {
-        for key in map.keys() {
-            if key.ends_with(&suffix) && !refs.iter().any(|r| r == key) {
-                refs.push(key.clone());
-            }
-        }
-    }
-    refs.sort();
-    refs.dedup();
+    let refs = intent_reference_ids(name, &intent, settings.settings.get("enabledPlugins"));
     refs.into_iter()
         .map(|id| untrusted_name_for_display(&id))
         .collect()
@@ -444,6 +461,10 @@ fn marketplace_intent_references(
 ///
 /// 锁内完成：同名同源 → 幂等；同名不可判定同源 → fail-closed；同源旧名 → 拒绝；残留引用 → 拒绝；
 /// 否则插入账本（`manifestNameBaseline = name`）。clone 在锁外，锁内不信任任何预检。
+///
+/// # 锁纪律（#267）
+/// `references` 由调用方在**账本锁之外**解析（五层 settings 读取昂贵且可能嵌套文件锁）；锁内只做
+/// `is_empty()` 判定，不在此重新解析 settings。
 #[allow(clippy::too_many_arguments)]
 fn claim_marketplace_registration(
     home: &Path,
@@ -452,7 +473,7 @@ fn claim_marketplace_registration(
     name: &str,
     source: &Value,
     auto_update: bool,
-    config_cwd: Option<&Path>,
+    references: &[String],
     skip_reference_guard: bool,
 ) -> Result<RegistrationClaim, GovernanceError> {
     let target = resolve_install_location(final_dir);
@@ -498,14 +519,11 @@ fn claim_marketplace_registration(
             }
             // no_clone 已用 catalog origin 证明同源：重注册是恢复既有绑定，不是换源，豁免引用守卫
             // （§5.14 只要求「同名不同源」拒绝）。
-            if !skip_reference_guard {
-                let refs = marketplace_intent_references(home, env, config_cwd, name);
-                if !refs.is_empty() {
-                    return Err(GovernanceError::MarketplaceNameReferenced {
-                        name: name.to_string(),
-                        plugin_ids: refs,
-                    });
-                }
+            if !skip_reference_guard && !references.is_empty() {
+                return Err(GovernanceError::MarketplaceNameReferenced {
+                    name: name.to_string(),
+                    plugin_ids: references.to_vec(),
+                });
             }
             let mut extra = Map::new();
             extra.insert("installLocation".to_string(), Value::String(target.clone()));
@@ -606,8 +624,8 @@ pub async fn add_marketplace(
             &name,
             &source,
             params.auto_update,
-            params.config_cwd,
-            // 同源已证（catalog origin）：恢复既有绑定，豁免引用守卫。
+            // 同源已证（catalog origin）：恢复既有绑定，豁免引用守卫（无需解析五层引用）。
+            &[],
             true,
         )?;
         let flags_updated = match claim {
@@ -637,6 +655,15 @@ pub async fn add_marketplace(
             })?;
     let name = prepared.manifest_name.clone();
     let final_dir = marketplace_skill_dir(home, &name, &[]);
+    // #267 锁纪律：五层 settings 引用在账本锁**之外**解析；锁内只判空。
+    let references = marketplace_intent_references(
+        home,
+        env,
+        params.config_cwd,
+        &name,
+        params.flag_settings_path,
+        params.policy_settings,
+    );
     let claim = claim_marketplace_registration(
         home,
         env,
@@ -644,7 +671,7 @@ pub async fn add_marketplace(
         &name,
         &source,
         params.auto_update,
-        params.config_cwd,
+        &references,
         // 普通 add：强制引用守卫（remove/re-add 不得静默重绑）。
         false,
     )?;
@@ -677,6 +704,7 @@ pub async fn add_marketplace(
                     env,
                     recorder: Some(store.as_recorder()),
                     manifest_name_baseline: None,
+                    plugin_filter: None,
                 },
             )
             .await;
@@ -712,6 +740,7 @@ pub async fn add_marketplace(
                     env,
                     recorder: Some(store.as_recorder()),
                     manifest_name_baseline: Some(&name),
+                    plugin_filter: None,
                 },
             )
             .await;
@@ -791,6 +820,9 @@ pub async fn refresh_marketplaces(
             DEFAULT_GIT_TIMEOUT,
             env,
             Some(store.as_recorder()),
+            // CLI `marketplace refresh`：全量 plugin、外部 plugin 源重 clone（既有语义）。
+            None,
+            true,
         )
         .await;
         let (status, diagnostic) =

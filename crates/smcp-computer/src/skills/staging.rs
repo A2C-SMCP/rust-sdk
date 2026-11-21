@@ -1135,6 +1135,13 @@ pub struct MarketplaceStageOptions<'a> {
 ///
 /// 失败降级铁律：clone/pull/解析/物化失败 → 记 ERROR、该源 / 该 plugin 不入 Registry、**不** panic、**不**阻断其余。
 /// 返回本次成功注册 / 刷新的 SKILL name 列表。
+///
+/// # ⚠️ 低层原语（#267 审查 🟡6）
+/// `refresh = true` 时本函数走**原地 `git pull`**，**不**执行 §5.14 来料清单名预校验。管理入口
+/// （`marketplace refresh` / `reconcile` / `install_plugin{refresh:true}`）MUST NOT 直接以
+/// `refresh=true` 调用本函数——它们必须经 `refresh_marketplace_working_copy` / `refresh_marketplace_clone`
+/// 的守卫路径（fetch → 清单校验 → ff / staged swap）。本函数保留 `refresh=true` 仅用于测试夹具与
+/// 非管理场景的底层复用；直接使用会绕过改名守卫。
 pub async fn stage_marketplace_skills(
     name: &str,
     source: &Value,
@@ -1327,6 +1334,32 @@ pub enum MarketplaceStageError {
     /// 显式期望名与清单名不一致（`AddMarketplaceParams.name`，D6 B）。
     #[error("expected marketplace name {expected:?} does not match manifest name {actual:?}")]
     ExpectedNameMismatch { expected: String, actual: String },
+}
+
+/// refresh 来料清单改名（§5.14 refresh 改名 MUST 拒绝；旧注册/内容/能力保留）/ manifest renamed。
+pub(crate) const REASON_MANIFEST_NAME_CHANGED: &str = "marketplace_manifest_name_changed";
+/// refresh 来料清单缺失顶层 `name`（有 baseline 时 fail-closed）/ incoming manifest missing name。
+pub(crate) const REASON_MANIFEST_NAME_MISSING: &str = "marketplace_manifest_name_missing";
+/// refresh 来料清单 `name` 非法（有 baseline 时 fail-closed）/ incoming manifest name invalid。
+pub(crate) const REASON_MANIFEST_NAME_INVALID: &str = "marketplace_manifest_name_invalid";
+/// refresh 来料清单存在但不可读/损坏（预校验拒绝，不落盘）/ incoming manifest unreadable。
+pub(crate) const REASON_MANIFEST_UNREADABLE: &str = "marketplace_manifest_unreadable";
+
+impl MarketplaceStageError {
+    /// 「清单身份预校验拒绝」的稳定 reason（§5.14 validation）/ Stable reason for identity rejections.
+    ///
+    /// `Some` = 拒绝分支**未提交任何内容**（旧注册/内容/能力必须保留、不降级）；`None` = 其它失败
+    /// （clone / I-O / 配置 / 期望名不匹配），可走既有降级语义。**单一权威**：reconcile / install 的
+    /// 失败分类与结构化日志均经此方法，避免多处 `match` 漂移（#267 审查 🟡）。
+    pub(crate) fn manifest_identity_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::ManifestNameChanged { .. } => Some(REASON_MANIFEST_NAME_CHANGED),
+            Self::ManifestNameMissing => Some(REASON_MANIFEST_NAME_MISSING),
+            Self::ManifestNameInvalid => Some(REASON_MANIFEST_NAME_INVALID),
+            Self::ManifestUnreadable => Some(REASON_MANIFEST_UNREADABLE),
+            _ => None,
+        }
+    }
 }
 
 /// marketplace 注册 / stage 的结构化结果 / Structured marketplace staging outcome。
@@ -1596,6 +1629,7 @@ pub(crate) async fn prepare_marketplace_add(
 }
 
 /// 已提交的 marketplace clone（含被换下的旧 clone 备份）/ A committed clone with its displaced backup.
+#[derive(Debug)]
 pub(crate) struct CommittedMarketplace {
     /// 就位目录 `<home>/marketplace/<name>`。
     pub dir: PathBuf,
@@ -1673,6 +1707,8 @@ pub(crate) struct MarketplaceMaterializeOptions<'a> {
     pub recorder: Option<&'a dyn KnownMarketplaceRecorder>,
     /// 本次应写入的 `manifestNameBaseline`（`None` = 保留既有）。
     pub manifest_name_baseline: Option<&'a str>,
+    /// 仅物化这些 plugin（`None` = 全量；#267 reconcile/install 传 enabled/单 plugin）。
+    pub plugin_filter: Option<&'a HashSet<String>>,
 }
 
 /// 从**已就位**的 clone 记录账本并 stage plugins（无 git clone/pull）/ Record + stage from a committed clone.
@@ -1714,7 +1750,7 @@ pub(crate) async fn materialize_marketplace_clone(
         clone_dir,
         registry,
         home,
-        None,
+        options.plugin_filter,
         commit_sha.as_deref(),
         options.refresh,
         timeout,
@@ -1723,9 +1759,13 @@ pub(crate) async fn materialize_marketplace_clone(
     .await
 }
 
-/// `git fetch` 后读来料清单（`FETCH_HEAD:<manifest>`），返回（清单, FETCH_HEAD sha）/ Fetch incoming manifest.
+/// `git fetch` 后读来料清单（绑定 `rev-parse` 得到的 **sha**），返回（清单, 该 commit 是否存在清单, sha）。
 ///
-/// 清单在来料 commit 中缺失 → `(None, sha)`；fetch/解析失败 → `Err`（调用方回退 staged clone）。
+/// 清单在来料 commit 中缺失 → `(None, false, sha)`；fetch/解析失败 → `Err`（调用方回退 staged clone）。
+///
+/// **身份绑定（#267 审查 🔴）**：清单读取必须用 `rev-parse FETCH_HEAD` 得到的**显式 sha**，而不是可变的
+/// `FETCH_HEAD` 引用——并发 fetch 可在 rev-parse 与 show 之间改写 `FETCH_HEAD`，令「校验的清单」与
+/// 「提交的 commit」脱钩。仅在 sha 无法解析（`None`）时才回退 `FETCH_HEAD`（此时调用方也不会 ff）。
 ///
 /// **shallow clone 先 `--unshallow`**：`--depth 1` fetch 会把来料 tip 变成 shallow root，随后
 /// `merge --ff-only` 报 unrelated histories（实测），ff 提交路径失效；unshallow 一次后增量 fetch 可正常 ff。
@@ -1754,13 +1794,32 @@ async fn fetch_incoming_manifest(
         .trim()
         .to_string();
     let sha = (!sha.is_empty()).then_some(sha);
+    let (manifest, present) =
+        read_manifest_at_commit(clone_dir, sha.as_deref(), timeout, env).await?;
+    Ok((manifest, present, sha))
+}
+
+/// 读指定 commit 的 marketplace 清单（`sha` 给定时**绑定该 sha**，`None` 才回退 `FETCH_HEAD`）。
+///
+/// 返回 `(清单, 该 commit 中清单文件是否存在)`：解析失败 → `Err`；文件缺失 → `(None, false)`；
+/// 存在但不可读（`git show` 失败且 cat-file 命中）→ `(None, true)`。
+///
+/// 抽为独立函数供并发回归测试直接调用：先 fetch 得到 sha X，再让 `FETCH_HEAD` 指向 Y，断言按 X 读取。
+async fn read_manifest_at_commit(
+    clone_dir: &Path,
+    sha: Option<&str>,
+    timeout: Duration,
+    env: Option<&EnvMap>,
+) -> Result<(Option<Map<String, Value>>, bool), SkillStagingError> {
+    let dir = clone_dir.to_string_lossy().into_owned();
+    let commit = sha.unwrap_or("FETCH_HEAD");
     let path = format!(
         "{}/{}",
         crate::skills::manifest::MARKETPLACE_MANIFEST_DIR,
         crate::skills::manifest::MARKETPLACE_MANIFEST
     );
     match run_git(
-        &["-C", &dir, "show", &format!("FETCH_HEAD:{path}")],
+        &["-C", &dir, "show", &format!("{commit}:{path}")],
         timeout,
         env,
     )
@@ -1769,42 +1828,219 @@ async fn fetch_incoming_manifest(
         Ok(text) => {
             let manifest = parse_marketplace_manifest(&text)
                 .map_err(|e| SkillStagingError::new(e.to_string()))?;
-            Ok((Some(manifest), true, sha))
+            Ok((Some(manifest), true))
         }
         Err(_) => {
-            // `git show` 失败：用 cat-file 区分「文件缺失」与「存在但读取失败」。
+            // `git show` 失败：用 cat-file 区分「文件缺失」与「存在但读取失败」（同一 commit 绑定）。
             let present = run_git(
-                &["-C", &dir, "cat-file", "-e", &format!("FETCH_HEAD:{path}")],
+                &["-C", &dir, "cat-file", "-e", &format!("{commit}:{path}")],
                 timeout,
                 env,
             )
             .await
             .is_ok();
-            Ok((None, present, sha))
+            Ok((None, present))
         }
     }
 }
 
-/// `git merge --ff-only FETCH_HEAD`（只提交已校验的 commit）/ Fast-forward to the validated commit.
-async fn fast_forward_to_fetched(
+/// `git merge --ff-only <sha>`（只提交**已校验**的 commit）/ Fast-forward to the validated commit sha.
+///
+/// **必须传显式 sha 而非 `FETCH_HEAD`**：同一 home 的 clone 可能被并发 git 操作（另一进程的
+/// `marketplace refresh` / install / reconcile）改写 `FETCH_HEAD`；按可变引用 merge 会 ff 到未经本进程
+/// 校验清单的 commit，绕过 §5.14 改名守卫（#267 审查 🟡）。
+async fn fast_forward_to(
     clone_dir: &Path,
+    sha: &str,
     timeout: Duration,
     env: Option<&EnvMap>,
 ) -> Result<(), SkillStagingError> {
     let dir = clone_dir.to_string_lossy().into_owned();
-    run_git(
-        &["-C", &dir, "merge", "--ff-only", "FETCH_HEAD"],
-        timeout,
-        env,
-    )
-    .await
-    .map(|_| ())
+    run_git(&["-C", &dir, "merge", "--ff-only", sha], timeout, env)
+        .await
+        .map(|_| ())
 }
 
-/// refresh 单个 marketplace：先取来料清单校验，再提交（#272 / runtime-contract §5.14）。
+/// catalog 工作副本刷新结果（**未物化**——SKILL 注册由调用方决定）/ A refreshed catalog working copy.
+///
+/// `committed.is_some()` = 本次经 staged clone swap（携带待清理的旧树 `.trash`）；`None` = 既有 clone
+/// fast-forward（或同 commit 无变化）。调用方在物化/使用完毕后调 [`discard_trash`](Self::discard_trash)。
+#[derive(Debug)]
+pub(crate) struct MarketplaceWorkingCopy {
+    /// 就位目录 `<home>/marketplace/<name>`。
+    pub dir: PathBuf,
+    /// 本次是否实际提交了新内容（clone / ff / swap）。
+    pub changed: bool,
+    /// 本次应写入/保留的 `manifestNameBaseline`（`None` = 不写，保留既有）。
+    pub applied_baseline: Option<String>,
+    /// 成功路径的 legacy advisory（类别 + 已可安全展示的文案）。
+    pub advisory: Option<(ManifestAdvisory, String)>,
+    /// swap 路径的被替换旧树（需在锁外/物化后清理）。
+    committed: Option<CommittedMarketplace>,
+}
+
+impl MarketplaceWorkingCopy {
+    /// 删除 swap 路径遗留的旧 clone 备份（fast-forward 路径 no-op）。
+    pub(crate) fn discard_trash(&self) {
+        if let Some(c) = &self.committed {
+            c.discard_trash();
+        }
+    }
+}
+
+/// refresh 单个 marketplace 的 **catalog 工作副本**：fetch → 校验来料清单 → ff / staged swap
+/// （#272 / runtime-contract §5.14）。**不**注册 SKILL、**不**写账本。
+///
+/// `baseline = Some(b)` → 来料清单名必须等于 `b`，否则结构化失败且不碰工作树；`None` → legacy，
+/// 接受改名并返回 `applied_baseline` + advisory。
+///
+/// 该半部供两条路径复用：① [`refresh_marketplace_clone`]（refresh/reconcile：刷新后物化）；
+/// ② `install_plugin{refresh:true}` 的**物化前改名校验**（拒绝时任何外部 plugin clone / registry 都未触碰）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refresh_marketplace_working_copy(
+    name: &str,
+    source: &Value,
+    home: &Path,
+    baseline: Option<&str>,
+    timeout: Duration,
+    env: Option<&EnvMap>,
+) -> Result<MarketplaceWorkingCopy, MarketplaceStageError> {
+    if !is_valid_marketplace_name(name) {
+        return Err(MarketplaceStageError::InvalidRegisteredName);
+    }
+    if marketplace_clone_url(source).is_err() {
+        return Err(MarketplaceStageError::SourceInvalid);
+    }
+    let clone_dir = marketplace_skill_dir(home, name, &[]);
+
+    if clone_dir.exists() {
+        let head = git_head_sha(&clone_dir, timeout, env).await;
+        // #267 审查 🟡：物化读取的是**工作树**清单，须校验；但本地不合法不应判死刑——先看上游来料：
+        //   - 来料合法而本地不合法（脏改名 / 损坏 / 缺失）→ staged clone 强制替换工作树（自愈）；
+        //   - 来料也不合法 → 以来料拒绝（§5.14）；
+        //   - fetch 失败 + 本地不合法 → fail-closed 本地身份拒绝（不得让脏工作树进入物化）；
+        //   - fetch 失败 + 本地合法 → 既有 staged clone 回退。
+        let manifest_path = clone_dir
+            .join(crate::skills::manifest::MARKETPLACE_MANIFEST_DIR)
+            .join(crate::skills::manifest::MARKETPLACE_MANIFEST);
+        let local_manifest = read_marketplace_manifest(&clone_dir).ok();
+        let local = apply_manifest_policy(
+            name,
+            baseline,
+            local_manifest.as_ref(),
+            manifest_path.is_file(),
+        );
+
+        match fetch_incoming_manifest(&clone_dir, timeout, env).await {
+            Ok((incoming, incoming_present, incoming_sha)) => {
+                let incoming_decision =
+                    apply_manifest_policy(name, baseline, incoming.as_ref(), incoming_present)?;
+                if let Err(local_failure) = local {
+                    // 上游来料合法、本地不合法 → staged swap 自愈；swap 失败也不得回落脏工作树。
+                    return match refresh_working_copy_via_staged_clone(
+                        name, source, home, baseline, timeout, env,
+                    )
+                    .await
+                    {
+                        Ok(copy) => Ok(copy),
+                        Err(_) => Err(local_failure),
+                    };
+                }
+                let same_commit = incoming_sha
+                    .as_deref()
+                    .is_some_and(|sha| Some(sha) == head.as_deref());
+                let mut changed = false;
+                if !same_commit {
+                    // #267 审查 🟡：只 ff 到**校验过的 sha**（FETCH_HEAD 可被并发 fetch 改写）。
+                    let Some(validated_sha) = incoming_sha else {
+                        return refresh_working_copy_via_staged_clone(
+                            name, source, home, baseline, timeout, env,
+                        )
+                        .await;
+                    };
+                    if fast_forward_to(&clone_dir, &validated_sha, timeout, env)
+                        .await
+                        .is_err()
+                    {
+                        // 非 ff / 本地修改 / shallow 历史不可判定 → staged clone 重新校验后 swap。
+                        return refresh_working_copy_via_staged_clone(
+                            name, source, home, baseline, timeout, env,
+                        )
+                        .await;
+                    }
+                    changed = true;
+                }
+                // #267 审查 🟡9：baseline / advisory 一律以**来料（HEAD）**裁决——不得用本地脏工作树
+                // 裁决钉住 legacy baseline（脏改动可能给出非 HEAD 的名字）。
+                return Ok(MarketplaceWorkingCopy {
+                    dir: clone_dir,
+                    changed,
+                    applied_baseline: incoming_decision.applied_baseline,
+                    advisory: incoming_decision.advisory,
+                    committed: None,
+                });
+            }
+            Err(_) => {
+                return match local {
+                    // fetch 失败 + 本地合法 → 既有 staged clone 回退（仍不动旧内容）。
+                    Ok(_) => {
+                        refresh_working_copy_via_staged_clone(
+                            name, source, home, baseline, timeout, env,
+                        )
+                        .await
+                    }
+                    // fetch 失败 + 本地不合法 → 无上游可自愈，fail-closed 本地身份拒绝。
+                    Err(local_failure) => Err(local_failure),
+                };
+            }
+        }
+    }
+
+    refresh_working_copy_via_staged_clone(name, source, home, baseline, timeout, env).await
+}
+
+/// staged clone 回退路径：clone → 校验 → swap（未物化）/ Fallback refresh via a staged clone.
+async fn refresh_working_copy_via_staged_clone(
+    name: &str,
+    source: &Value,
+    home: &Path,
+    baseline: Option<&str>,
+    timeout: Duration,
+    env: Option<&EnvMap>,
+) -> Result<MarketplaceWorkingCopy, MarketplaceStageError> {
+    // 旧内容若无 clone 则视为「有变化」（自愈）；有 clone 则按 HEAD 比较，避免同 commit 重 clone 误报 Updated。
+    let clone_dir = marketplace_skill_dir(home, name, &[]);
+    let before_sha = if clone_dir.exists() {
+        git_head_sha(&clone_dir, timeout, env).await
+    } else {
+        None
+    };
+    let staged = clone_marketplace_to_staging(source, home, Some(timeout), env).await?;
+    let decision = apply_manifest_policy(
+        name,
+        baseline,
+        staged.manifest.as_ref(),
+        staged.manifest_present,
+    )?;
+    let committed = swap_staged_into_place(staged, home, name)?;
+    let after_sha = git_head_sha(&committed.dir, timeout, env).await;
+    let changed = before_sha != after_sha;
+    Ok(MarketplaceWorkingCopy {
+        dir: committed.dir.clone(),
+        changed,
+        applied_baseline: decision.applied_baseline,
+        advisory: decision.advisory,
+        committed: Some(committed),
+    })
+}
+
+/// refresh 单个 marketplace：先取来料清单校验，再提交并物化（#272 / runtime-contract §5.14）。
 ///
 /// `baseline = Some(b)` → 来料清单名必须等于 `b`，否则结构化失败且不碰工作树；`None` → legacy，
 /// 接受改名并记录基线 + advisory。成功返回 `registered/changed/advisory`。
+///
+/// `plugin_filter`：仅物化这些 plugin（`None` = 全量；reconcile/install 传 enabled/单 plugin）。
+/// `refresh_plugins`：外部 Git plugin 源是否重 clone（reconcile 首次克隆传 `false`，显式 refresh 传 `true`）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn refresh_marketplace_clone(
     name: &str,
@@ -1816,166 +2052,43 @@ pub(crate) async fn refresh_marketplace_clone(
     timeout: Duration,
     env: Option<&EnvMap>,
     recorder: Option<&dyn KnownMarketplaceRecorder>,
+    plugin_filter: Option<&HashSet<String>>,
+    refresh_plugins: bool,
 ) -> MarketplaceStageOutcome {
-    let mut outcome = MarketplaceStageOutcome::default();
-    if !is_valid_marketplace_name(name) {
-        outcome.failure = Some(MarketplaceStageError::InvalidRegisteredName);
-        return outcome;
-    }
-    if marketplace_clone_url(source).is_err() {
-        outcome.failure = Some(MarketplaceStageError::SourceInvalid);
-        return outcome;
-    }
-    let clone_dir = marketplace_skill_dir(home, name, &[]);
-
-    if clone_dir.exists() {
-        let head = git_head_sha(&clone_dir, timeout, env).await;
-        if let Ok((incoming, incoming_present, incoming_sha)) =
-            fetch_incoming_manifest(&clone_dir, timeout, env).await
-        {
-            let decision =
-                match apply_manifest_policy(name, baseline, incoming.as_ref(), incoming_present) {
-                    Ok(d) => d,
-                    Err(failure) => {
-                        outcome.failure = Some(failure);
-                        return outcome;
-                    }
+    let copy =
+        match refresh_marketplace_working_copy(name, source, home, baseline, timeout, env).await {
+            Ok(c) => c,
+            Err(failure) => {
+                return MarketplaceStageOutcome {
+                    failure: Some(failure),
+                    ..MarketplaceStageOutcome::default()
                 };
-            let same_commit = incoming_sha.is_some() && incoming_sha == head;
-            let mut changed = false;
-            if !same_commit {
-                if fast_forward_to_fetched(&clone_dir, timeout, env)
-                    .await
-                    .is_err()
-                {
-                    // 非 ff / 本地修改 / shallow 历史不可判定 → staged clone 重新校验后 swap。
-                    return refresh_via_staged_clone(
-                        name,
-                        source,
-                        registry,
-                        home,
-                        baseline,
-                        auto_update,
-                        timeout,
-                        env,
-                        recorder,
-                    )
-                    .await;
-                }
-                changed = true;
             }
-            let applied_baseline = decision.applied_baseline.clone();
-            let advisory = decision.advisory.clone();
-            let registered = materialize_marketplace_clone(
-                name,
-                source,
-                &clone_dir,
-                registry,
-                home,
-                MarketplaceMaterializeOptions {
-                    auto_update,
-                    changed,
-                    refresh: true,
-                    env,
-                    recorder,
-                    manifest_name_baseline: applied_baseline.as_deref(),
-                },
-            )
-            .await;
-            outcome.registered = registered;
-            outcome.changed = changed;
-            outcome.advisory = advisory;
-            return outcome;
-        }
-        // fetch 失败 → 回退 staged clone（仍不动旧内容）。
-    }
-
-    refresh_via_staged_clone(
-        name,
-        source,
-        registry,
-        home,
-        baseline,
-        auto_update,
-        timeout,
-        env,
-        recorder,
-    )
-    .await
-}
-
-/// staged clone 回退路径：clone → 校验 → swap → 物化 / Fallback refresh via a staged clone.
-#[allow(clippy::too_many_arguments)]
-async fn refresh_via_staged_clone(
-    name: &str,
-    source: &Value,
-    registry: &mut SkillRegistry,
-    home: &Path,
-    baseline: Option<&str>,
-    auto_update: bool,
-    timeout: Duration,
-    env: Option<&EnvMap>,
-    recorder: Option<&dyn KnownMarketplaceRecorder>,
-) -> MarketplaceStageOutcome {
-    let mut outcome = MarketplaceStageOutcome::default();
-    // 旧内容若无 clone 则视为「有变化」（自愈）；有 clone 则按 HEAD 比较，避免同 commit 重 clone 误报 Updated。
-    let clone_dir = marketplace_skill_dir(home, name, &[]);
-    let before_sha = if clone_dir.exists() {
-        git_head_sha(&clone_dir, timeout, env).await
-    } else {
-        None
-    };
-    let staged = match clone_marketplace_to_staging(source, home, Some(timeout), env).await {
-        Ok(s) => s,
-        Err(failure) => {
-            outcome.failure = Some(failure);
-            return outcome;
-        }
-    };
-    let decision = match apply_manifest_policy(
-        name,
-        baseline,
-        staged.manifest.as_ref(),
-        staged.manifest_present,
-    ) {
-        Ok(d) => d,
-        Err(failure) => {
-            outcome.failure = Some(failure);
-            return outcome;
-        }
-    };
-    let committed = match swap_staged_into_place(staged, home, name) {
-        Ok(c) => c,
-        Err(failure) => {
-            outcome.failure = Some(failure);
-            return outcome;
-        }
-    };
-    let after_sha = git_head_sha(&committed.dir, timeout, env).await;
-    let changed = before_sha != after_sha;
-    let applied_baseline = decision.applied_baseline.clone();
-    let advisory = decision.advisory.clone();
+        };
     let registered = materialize_marketplace_clone(
         name,
         source,
-        &committed.dir,
+        &copy.dir,
         registry,
         home,
         MarketplaceMaterializeOptions {
             auto_update,
-            changed,
-            refresh: true,
+            changed: copy.changed,
+            refresh: refresh_plugins,
             env,
             recorder,
-            manifest_name_baseline: applied_baseline.as_deref(),
+            manifest_name_baseline: copy.applied_baseline.as_deref(),
+            plugin_filter,
         },
     )
     .await;
-    committed.discard_trash();
-    outcome.registered = registered;
-    outcome.changed = changed;
-    outcome.advisory = advisory;
-    outcome
+    copy.discard_trash();
+    MarketplaceStageOutcome {
+        registered,
+        changed: copy.changed,
+        failure: None,
+        advisory: copy.advisory,
+    }
 }
 
 // ===========================================================================
@@ -3495,5 +3608,208 @@ mod tests {
             .await
             .resolve("mcp:tfrobot-tools:pkg")
             .is_some());
+    }
+
+    // ── #267 审查 🔴/🟡：清单读取绑定 sha / 工作树自愈 / legacy baseline ─────────
+
+    fn build_named_repo(repo: &Path, name: &str) {
+        fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            serde_json::json!({
+                "name": name,
+                "plugins": [{"name": "audit", "source": "./plugins/audit"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let skill = repo.join("plugins/audit/skills/code-review");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+    }
+
+    fn set_repo_name(repo: &Path, name: &str) {
+        let path = repo.join(".tfrobot-plugin/marketplace.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["name"] = serde_json::json!(name);
+        fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "rename"], repo);
+    }
+
+    fn rev_parse(dir: &Path, reference: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "rev-parse", reference])
+            .output()
+            .expect("git available");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    async fn clone_with_stage(repo: &Path, home: &Path) -> serde_json::Value {
+        let source =
+            serde_json::json!({"type": "git", "url": format!("file://{}", repo.display())});
+        let mut reg = SkillRegistry::new();
+        stage_marketplace_skills(
+            "acme",
+            &source,
+            &mut reg,
+            home,
+            MarketplaceStageOptions::default(),
+        )
+        .await;
+        source
+    }
+
+    /// #267 审查 🔴：清单读取必须绑定 `rev-parse` 得到的 sha——`FETCH_HEAD` 被并发 fetch 改写后，
+    /// 按旧 sha 读取仍应得到**校验时**的清单。
+    #[tokio::test]
+    async fn read_manifest_at_commit_binds_validated_sha_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        build_named_repo(&repo, "acme");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _source = clone_with_stage(&repo, &home).await;
+        let clone = marketplace_skill_dir(&home, "acme", &[]);
+
+        // 上游改名 v2 → fetch，锁定 sha X 与 FETCH_HEAD。
+        set_repo_name(&repo, "acme-v2");
+        git(&["fetch", "origin", "HEAD"], &clone);
+        let sha_x = rev_parse(&clone, "FETCH_HEAD");
+        let (m, present) =
+            read_manifest_at_commit(&clone, Some(&sha_x), Duration::from_secs(30), None)
+                .await
+                .unwrap();
+        assert!(present);
+        assert_eq!(m.unwrap()["name"], "acme-v2");
+
+        // 再次 fetch 把 FETCH_HEAD 移到 v3；按旧 sha X 读取仍应是 v2（绑定生效）。
+        set_repo_name(&repo, "acme-v3");
+        git(&["fetch", "origin", "HEAD"], &clone);
+        let (m_bound, _) =
+            read_manifest_at_commit(&clone, Some(&sha_x), Duration::from_secs(30), None)
+                .await
+                .unwrap();
+        assert_eq!(
+            m_bound.unwrap()["name"],
+            "acme-v2",
+            "按校验 sha 读取不得跟随被改写的 FETCH_HEAD"
+        );
+        // `None` 回退 FETCH_HEAD（现为 v3）——仅 sha 无法解析时使用。
+        let (m_head, _) = read_manifest_at_commit(&clone, None, Duration::from_secs(30), None)
+            .await
+            .unwrap();
+        assert_eq!(m_head.unwrap()["name"], "acme-v3");
+    }
+
+    /// #267 审查 🟡3：本地工作树清单损坏、上游来料合法 → staged swap 自愈（不永久 failed）。
+    #[tokio::test]
+    async fn working_copy_heals_corrupt_local_manifest_from_healthy_upstream_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        build_named_repo(&repo, "acme");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let source = clone_with_stage(&repo, &home).await;
+        let clone = marketplace_skill_dir(&home, "acme", &[]);
+        fs::write(
+            clone.join(".tfrobot-plugin/marketplace.json"),
+            "{corrupt-local",
+        )
+        .unwrap();
+
+        let copy = refresh_marketplace_working_copy(
+            "acme",
+            &source,
+            &home,
+            Some("acme"),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .expect("上游来料合法时应自愈，而不是永久失败");
+        copy.discard_trash();
+        let text = fs::read_to_string(clone.join(".tfrobot-plugin/marketplace.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).expect("工作树已替换为健康清单");
+        assert_eq!(value["name"], "acme");
+    }
+
+    /// #267 审查 🟡3：fetch 失败 + 本地工作树不合法 → fail-closed 身份拒绝（不得让脏工作树进入物化）。
+    #[tokio::test]
+    async fn working_copy_rejects_corrupt_local_manifest_when_upstream_unreachable_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        build_named_repo(&repo, "acme");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let source = clone_with_stage(&repo, &home).await;
+        let clone = marketplace_skill_dir(&home, "acme", &[]);
+        fs::write(
+            clone.join(".tfrobot-plugin/marketplace.json"),
+            "{corrupt-local",
+        )
+        .unwrap();
+        fs::remove_dir_all(&repo).unwrap();
+
+        let err = refresh_marketplace_working_copy(
+            "acme",
+            &source,
+            &home,
+            Some("acme"),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .expect_err("本地损坏 + 上游不可达必须 fail-closed");
+        assert!(
+            matches!(err, MarketplaceStageError::ManifestUnreadable),
+            "{err:?}"
+        );
+    }
+
+    /// #267 审查 🟡9：legacy（baseline None）same-commit 复用路径的 baseline 以 **HEAD** 裁决，
+    /// 不得用本地脏工作树的名字钉基线。
+    #[tokio::test]
+    async fn working_copy_legacy_same_commit_pins_baseline_from_head_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        build_named_repo(&repo, "acme");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let source = clone_with_stage(&repo, &home).await;
+        let clone = marketplace_skill_dir(&home, "acme", &[]);
+
+        // 本地工作树改成合法但不同的名字（HEAD 未变 → same-commit 路径）。
+        let path = clone.join(".tfrobot-plugin/marketplace.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["name"] = serde_json::json!("acme-dirty");
+        fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let copy = refresh_marketplace_working_copy(
+            "acme",
+            &source,
+            &home,
+            None, // legacy
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .expect("legacy 接受改名（保留旧注册名）");
+        assert_eq!(
+            copy.applied_baseline.as_deref(),
+            Some("acme"),
+            "legacy same-commit 的 baseline 必须来自 HEAD，而不是本地脏工作树"
+        );
+        copy.discard_trash();
     }
 }
