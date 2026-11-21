@@ -360,6 +360,7 @@ fn apply_migrates_authority_and_derived_surfaces() {
     .unwrap();
 
     assert_eq!(report.status(), MigrationStatus::Partial); // project will-be-inactive
+    assert!(report.written);
     assert!(report.backup.is_some());
 
     // 派生：clone 改名。
@@ -1412,4 +1413,31 @@ fn secret_count_excludes_absent_values() {
         .find(|i| i.old_name == "old-name")
         .unwrap();
     assert_eq!(item.secrets, 0, "absent old values are not planned rekeys");
+}
+
+#[test]
+fn structurally_corrupt_known_is_blocked_zero_write() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    let known_path = known_marketplaces_path(Some(&home), Some(&env));
+    fs::write(
+        &known_path,
+        serde_json::to_string(&json!({"marketplaces": {"a": 1}})).unwrap(),
+    )
+    .unwrap();
+    let before = read_bytes(&known_path);
+    let (_, secrets) = FakeKeyring::available();
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    assert_eq!(report.status(), MigrationStatus::Partial);
+    assert!(report.corrupt.is_some());
+    assert!(!report.written);
+    assert_eq!(before, read_bytes(&known_path));
 }
