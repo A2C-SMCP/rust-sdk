@@ -37,7 +37,7 @@
 | `old -> new` | 旧注册名 → 清单名 |
 | `source` | 脱敏后的来源 URL |
 | `plugins` / `secrets` | 受影响 plugin 数与计划重键的 secret 数 |
-| `reason` | unresolved/blocked 的原因（如 `catalog_missing` / `baseline_mismatch` / `keyring_unavailable`） |
+| `reason` | unresolved/blocked 的原因（如 `catalog_missing` / `baseline_mismatch` / `keyring_unavailable` / `unsafe_old_name`——旧注册名不是 strict kebab，无法安全迁移） |
 | `manual` | project/local/policy 等**不会自动改写**的引用，含文件、JSON 路径与建议值 |
 
 **冲突**（如两个旧名指向同一新名、新名已被其他来源占用、裸 plugin 名冲突）会让整次 `--apply`

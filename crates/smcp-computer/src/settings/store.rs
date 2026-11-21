@@ -553,6 +553,17 @@ fn coerce_installed_plugins_intent(
 // ===========================================================================
 // 严格只读规整（迁移预检用；结构损坏 → Err，不静默降级）/ Strict coercion
 // ===========================================================================
+/// 存储层接受的 plugin id：no-`@` 视为 local-only 透传；含 `@` 必须是合法 `<plugin>@<marketplace>`。
+fn is_acceptable_stored_plugin_id(pid: &str) -> bool {
+    if pid.is_empty() {
+        false
+    } else if pid.contains('@') {
+        is_valid_enabled_plugin_key(pid)
+    } else {
+        true
+    }
+}
+
 fn strict_coerce_err(path: &Path, reason: impl Into<String>) -> SettingsStoreError {
     SettingsStoreError::io(
         path,
@@ -596,16 +607,18 @@ fn coerce_installed_plugins_strict(
         Some(Value::Object(map)) => {
             let mut plugins = indexmap::IndexMap::new();
             for (pid, value) in map {
-                if !is_valid_enabled_plugin_key(pid) {
+                if !is_acceptable_stored_plugin_id(pid) {
                     let display = crate::settings::redaction::untrusted_name_for_display(pid);
                     return Err(strict_coerce_err(
                         path,
                         format!("plugins key {display:?} is not a valid plugin id"),
                     ));
                 }
+                let display = crate::settings::redaction::untrusted_name_for_display(pid);
                 let records: Vec<crate::settings::reconciler::InstalledPluginRecord> =
-                    serde_json::from_value(value.clone())
-                        .map_err(|e| strict_coerce_err(path, format!("plugins.{pid}: {e}")))?;
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        strict_coerce_err(path, format!("plugins entry {display:?} is invalid"))
+                    })?;
                 plugins.insert(pid.clone(), records);
             }
             InstalledPlugins { plugins }
@@ -633,7 +646,7 @@ fn coerce_installed_plugins_intent_strict(
                         "installedPlugins contains a non-string entry",
                     ));
                 };
-                if !is_valid_enabled_plugin_key(pid) {
+                if !is_acceptable_stored_plugin_id(pid) {
                     let display = crate::settings::redaction::untrusted_name_for_display(pid);
                     return Err(strict_coerce_err(
                         path,

@@ -120,12 +120,13 @@ smcp-computer marketplace migrate [--apply] [--update-declarations] [--json]
 - 默认 dry-run（零写入）；`--apply` 写入（显式 flag 即确认，不额外 `--yes`）。
 - 输出表：old name / new name / source（脱敏）/ action / plugins / secrets / reason；冲突与手动引用
   逐条列出（文件 + JSON pointer + 建议值）。
-- `--json`：`{ dryRun, items[], conflicts[], manualReferences[], backup? }`；apply 报告另含
-  `warnings` / `corrupt`。
+- `--json`：`{ dryRun, written, status, items[], conflicts[], manualReferences[], backup, corrupt }`；
+  apply 报告另含 `warnings`。
 - 退出码：`0` 成功 / 无操作；`1` 冲突或命令级错误（沿用 `EXIT_USER_ERROR`；提案原写 2 与既有
   `EXIT_NETWORK_ERROR` 语义冲突，本实现改为 1）；`3` 部分完成（unresolved / blocked /
   keyring-abort / project-local `enabledPlugins` 失活诊断，新增 `EXIT_PARTIAL`）。
-- 名称展示一律经 `untrusted_name_for_display`，source 经脱敏助手；journal/备份不落凭据。
+- 名称展示一律经 `untrusted_name_for_display`，source 经脱敏助手；journal/备份保存权威文件
+  **原字节**（可能含 source URL / settings 内容），权限 0700/0600，**不含 keyring secret 值**。
 
 ## 7. 安全前提与限制
 
@@ -146,12 +147,12 @@ smcp-computer marketplace migrate [--apply] [--update-declarations] [--json]
 
 ## 9. 测试覆盖
 
-- 库级：`crates/smcp-computer/tests/marketplace_name_migration.rs`（30 用例）——dry-run 零写、
+- 库级：`crates/smcp-computer/tests/marketplace_name_migration.rs`（33 用例）——dry-run 零写、
   全量 apply、幂等、冲突四类、离线 grandfather、baseline mismatch、secret 重键 / keyring 不可用 /
   目标键冲突、installPath 越界、损坏状态零写、多 scope + 未知字段保真、外部树改名、同源合并、
   大小写冲突、rollback。
-- 模块单测（8）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
+- 模块单测（13）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
   resume、rollback drift。
-- CLI 级（9）：`crates/smcp-computer/tests/marketplace_name_migration_cli_test.rs`——默认 dry-run、
+- CLI 级（10）：`crates/smcp-computer/tests/marketplace_name_migration_cli_test.rs`——默认 dry-run、
   apply + backup、冲突 exit 1、unresolved exit 3、resume 无 journal exit 1、rollback、help flags、
   user settings 隔离、cwd project 诊断（exit 3）。

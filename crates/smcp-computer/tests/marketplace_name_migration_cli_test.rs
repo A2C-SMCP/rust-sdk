@@ -291,3 +291,48 @@ fn cli_scans_current_project_settings_and_exits_3() {
             .as_str()
             .is_some_and(|f| f.ends_with(".tfrobot/settings.json"))));
 }
+
+#[test]
+fn cli_interrupted_rollback_exits_0_with_note() {
+    let td = TempDir::new().unwrap();
+    let (home, skill_home, env) = setup(&td);
+    seed_legacy(&skill_home, &env, "old-name", "team-tools");
+    let out = cli_binary::run_binary(
+        &home,
+        &skill_home,
+        &["marketplace", "migrate", "--apply", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let v = cli_binary::json_stdout(&out);
+    let ts = v["backup"]["timestamp"].as_str().unwrap().to_string();
+    // 模拟「apply 后硬崩、journal 仍是 applying」。
+    let backup = skill_home.join(format!("marketplace-migration-backup-{ts}/backup.json"));
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&backup).unwrap()).unwrap();
+    meta["phase"] = json!("applying");
+    fs::write(
+        skill_home.join("marketplace-migration-journal.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let out = cli_binary::run_binary(
+        &home,
+        &skill_home,
+        &["marketplace", "migrate", "--rollback", &ts, "--json"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = cli_binary::json_stdout(&out);
+    assert!(v["warnings"].as_array().unwrap().is_empty());
+    assert!(v["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n.as_str().is_some_and(|s| s.contains("interrupted"))));
+    assert!(skill_home.join("marketplace/old-name").is_dir());
+}

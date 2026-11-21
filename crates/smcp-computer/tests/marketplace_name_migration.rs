@@ -1441,3 +1441,66 @@ fn structurally_corrupt_known_is_blocked_zero_write() {
     assert!(!report.written);
     assert_eq!(before, read_bytes(&known_path));
 }
+
+#[test]
+fn local_only_intent_ids_are_preserved() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old-name", "team-tools", &[]);
+    let intent_path = installed_plugins_intent_path(Some(&home), Some(&env));
+    fs::write(
+        &intent_path,
+        serde_json::to_string(&json!({
+            "installedPlugins": ["local-only", "alpha@old-name"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (_, secrets) = FakeKeyring::available();
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    assert_eq!(report.status(), MigrationStatus::Ok, "{report:?}");
+    let intent = read_json(&intent_path);
+    let ids = intent["installedPlugins"].as_array().unwrap();
+    assert!(
+        ids.iter().any(|v| v == "local-only"),
+        "local-only id lost: {ids:?}"
+    );
+    assert!(ids.iter().any(|v| v == "alpha@team-tools"));
+    assert!(!ids.iter().any(|v| v == "alpha@old-name"));
+}
+
+#[test]
+fn pre_v03_seed_backfills_user_enabled_plugins() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old-name", "team-tools", &[("alpha", None)]);
+    let path = home
+        .join("marketplace/old-name/plugins/alpha")
+        .to_string_lossy()
+        .into_owned();
+    seed_ledger(&home, "alpha@old-name", &path, "user", None);
+    // pre-v0.3.0：无 intent、无 enabledPlugins。
+    assert!(!installed_plugins_intent_path(Some(&home), Some(&env)).exists());
+    let (_, secrets) = FakeKeyring::available();
+    apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    let user = read_json(&user_settings_path(Some(&env)));
+    // seed 回填 user-scope true（否则 boot 因 intent 已存在而跳过回填 → 静默熄灯）。
+    assert_eq!(user["enabledPlugins"]["alpha@team-tools"], true);
+    assert!(user["enabledPlugins"].get("alpha@old-name").is_none());
+}

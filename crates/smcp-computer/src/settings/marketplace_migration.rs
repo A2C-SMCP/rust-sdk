@@ -331,7 +331,9 @@ pub struct MarketplaceRollbackReport {
     pub timestamp: String,
     /// 已还原 marketplace 旧名 / restored old names。
     pub restored: Vec<String>,
-    /// 告警（keyring 不可用等）/ warnings。
+    /// 信息性说明（不计入部分完成）/ informational notes。
+    pub notes: Vec<String>,
+    /// 告警（keyring 不可用等 → exit 3）/ warnings。
     pub warnings: Vec<String>,
 }
 
@@ -470,6 +472,8 @@ struct PlanContext {
     seed_intent_pids: Vec<String>,
     /// 预检完成时的权威文件哈希（apply 前复核，检测预检后的并发写）。
     pre_hashes: BTreeMap<String, String>,
+    /// intent 中的 local-only id（no-`@`），写回 intent 时保留（tolerant coerce 会丢弃）。
+    preserved_intent_ids: Vec<String>,
 }
 
 fn load_context(
@@ -545,6 +549,7 @@ fn load_context(
             intent_missing: false,
             seed_intent_pids: Vec::new(),
             pre_hashes: BTreeMap::new(),
+            preserved_intent_ids: Vec::new(),
         });
     }
 
@@ -723,6 +728,13 @@ fn load_context(
     seed_intent_pids.sort();
     seed_intent_pids.dedup();
     let pre_hashes = current_hashes(home, env, &user_path)?;
+    let preserved_intent_ids: Vec<String> = intent
+        .account
+        .installed_plugins
+        .iter()
+        .filter(|pid| !pid.contains('@'))
+        .cloned()
+        .collect();
     Ok(PlanContext {
         home: home.to_path_buf(),
         plan,
@@ -731,6 +743,7 @@ fn load_context(
         intent_missing,
         seed_intent_pids,
         pre_hashes,
+        preserved_intent_ids,
     })
 }
 
@@ -1345,12 +1358,32 @@ pub fn rollback_marketplace_name_migration(
         }
         let journal_path = home.join(MIGRATION_JOURNAL_FILENAME);
         // prepared/applying 也可回滚：恢复预迁移备份并反向 rename（中断态可能只有部分文件被写）。
-        let in_progress = if journal_path.exists() {
+        let journal = if journal_path.exists() {
             let journal = read_journal(&journal_path)?;
-            matches!(journal.phase.as_str(), "prepared" | "applying")
+            if Path::new(&journal.home) != home {
+                return Err(MarketplaceMigrationError::HomeMismatch {
+                    backup_home: PathBuf::from(&journal.home),
+                    current_home: home.clone(),
+                });
+            }
+            if journal.version != MIGRATION_SCHEMA_VERSION
+                || journal.kind != "marketplace-name-migration"
+            {
+                return Err(MarketplaceMigrationError::JournalCorrupt {
+                    reason: "unsupported journal schema".to_string(),
+                });
+            }
+            Some(journal)
         } else {
-            false
+            None
         };
+        let in_progress = journal
+            .as_ref()
+            .is_some_and(|j| matches!(j.phase.as_str(), "prepared" | "applying"));
+        // 中断 journal 必须属于本次请求的 backup；否则可能拿旧备份覆盖在途迁移。
+        if in_progress && journal.as_ref().is_some_and(|j| j.timestamp != timestamp) {
+            return Err(MarketplaceMigrationError::JournalInProgress { path: journal_path });
+        }
         rollback_from_meta(
             &home,
             env,
@@ -1389,6 +1422,7 @@ fn apply_fresh(
         timestamp: timestamp.clone(),
         backup_dir: backup_dir.display().to_string(),
         update_declarations: ctx.update_declarations,
+        seed_intent: ctx.intent_missing,
         phase: "prepared".to_string(),
         files,
         items: ctx
@@ -1408,6 +1442,19 @@ fn apply_fresh(
     };
     write_meta(&backup_dir.join("backup.json"), &meta)?;
     write_journal(home, &meta)?;
+    if fail_after == Some("mutate-after-backup") {
+        // 测试用：模拟备份后、执行前的外部写入（应被 pre-hash 复核拦截并清理 journal）。
+        let path = known_marketplaces_path(Some(home), env);
+        std::fs::write(&path, "{}").map_err(|e| io_err(&path, e))?;
+    }
+    if fail_after == Some("create-settings-after-backup") {
+        // 测试用：模拟备份后新出现的 authority 文件（存在性变化也应拦截）。
+        let path = user_settings_path(env);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        }
+        std::fs::write(&path, "{}").map_err(|e| io_err(&path, e))?;
+    }
 
     // 执行前哈希复核（与 journal 的 pre-hash 一致；不一致 → 并发写，abort 并清掉毒 journal）。
     if let Err(e) = verify_pre_hashes(home, env, &meta) {
@@ -1417,6 +1464,12 @@ fn apply_fresh(
     // pre-v0.3.0 home：事务内（备份 + journal 之后）按账本 seed intent **一次**；
     // 不调用 migrate_ledger_to_intent_once（它会写 project/local enabledPlugins，越界）。
     seed_intent_if_missing(home, env, ctx)?;
+    if fail_after == Some("after-seed") {
+        // 测试用：模拟 seed 已落盘但 journal 尚未更新 post-hash 的硬崩窗口。
+        return Err(MarketplaceMigrationError::ConcurrentChange {
+            detail: "simulated crash after seed".to_string(),
+        });
+    }
     meta.post_hashes = current_hashes(home, env, &ctx.user_path)?;
     meta.phase = "applying".to_string();
     write_journal(home, &meta)?;
@@ -1626,7 +1679,7 @@ fn apply_one_item_inner(
 
     if item.action == MigrationAction::Rename {
         // 4) intent RMW（seed 已在事务开头一次性完成）。
-        write_intent_item(home, env, item)?;
+        write_intent_item(home, env, item, &ctx.preserved_intent_ids)?;
         // 5) ledger RMW。
         write_ledger_item(home, env, item)?;
         if fail_after == Some("after-ledger") {
@@ -1738,6 +1791,7 @@ fn write_intent_item(
     home: &Path,
     env: Option<&EnvMap>,
     item: &MigrationItem,
+    preserved_ids: &[String],
 ) -> Result<(), MigrationReason> {
     let old = item.old_name.clone();
     let new = item.new_name.clone().unwrap_or_else(|| old.clone());
@@ -1753,6 +1807,10 @@ fn write_intent_item(
     let mut err: Option<MigrationReason> = None;
     let res = try_update_installed_plugins_intent(
         |file| {
+            // tolerant coerce 会丢弃 no-`@` local-only id；写回时显式保留。
+            for pid in preserved_ids {
+                file.account.installed_plugins.insert(pid.clone());
+            }
             let suffix = format!("@{new}");
             for pid in &file.account.installed_plugins {
                 if pid.ends_with(&suffix) && !source_pids.contains(pid) && !owned_new.contains(pid)
@@ -2145,6 +2203,9 @@ struct MigrationMeta {
     timestamp: String,
     backup_dir: String,
     update_declarations: bool,
+    /// 该事务是否需要在 items 循环前 seed intent（pre-v0.3.0 home）。
+    #[serde(default)]
+    seed_intent: bool,
     phase: String,
     files: Vec<BackupFile>,
     items: Vec<MetaItem>,
@@ -2312,6 +2373,23 @@ fn seed_intent_if_missing(
         Some(home),
         env,
     )?;
+    // 对齐 boot 迁移的 user-scope enabledPlugins=true（仅 absent；不写 project/local）。
+    // 若缺失，会把 pre-v0.3.0 存量 plugin 静默熄灯。
+    let user_path = user_settings_path(env);
+    let marketplace_pids: Vec<String> = seed.iter().filter(|p| p.contains('@')).cloned().collect();
+    if !marketplace_pids.is_empty() {
+        raw_write::update_raw_settings(&user_path, false, |map| {
+            let enabled = raw_write::object_field_mut(map, FIELD_ENABLED_PLUGINS, &user_path)?;
+            for pid in &marketplace_pids {
+                enabled.entry(pid.clone()).or_insert(Value::Bool(true));
+            }
+            Ok(())
+        })
+        .map_err(|_| MarketplaceMigrationError::StateCorrupt {
+            path: user_path.clone(),
+            reason: "failed to backfill enabledPlugins during intent seed".to_string(),
+        })?;
+    }
     Ok(())
 }
 
@@ -2343,15 +2421,16 @@ fn verify_pre_hashes(
 ) -> Result<(), MarketplaceMigrationError> {
     for file in &meta.files {
         let path = PathBuf::from(&file.path);
+        let exists = path.is_file();
+        if exists != file.existed {
+            return Err(MarketplaceMigrationError::ConcurrentChange {
+                detail: format!(
+                    "{} existence changed after preflight; rerun `marketplace migrate`",
+                    path.display()
+                ),
+            });
+        }
         if file.existed {
-            if !path.is_file() {
-                return Err(MarketplaceMigrationError::ConcurrentChange {
-                    detail: format!(
-                        "{path}: file disappeared before apply",
-                        path = path.display()
-                    ),
-                });
-            }
             let bytes = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
             if Some(hex(&bytes)) != file.sha256 {
                 return Err(MarketplaceMigrationError::ConcurrentChange {
@@ -2643,7 +2722,16 @@ fn verify_resume_hashes(
         };
         let pre = file.sha256.clone();
         let post = meta.post_hashes.get(&file.key).cloned();
-        if current != pre && current != post {
+        // seed 窗口：phase=prepared 且本事务声明 seed；intent/settings 由 seed 写入但 journal
+        // 尚未记录 post-hash（进程被 kill）。允许 resume 继续（seed 幂等）。
+        let seed_window = meta.seed_intent
+            && meta.phase == "prepared"
+            && matches!(
+                file.key.as_str(),
+                "installed_plugins_intent.json" | "settings.json"
+            )
+            && current.is_some();
+        if current != pre && current != post && !seed_window {
             return Err(MarketplaceMigrationError::ConcurrentChange {
                 detail: format!(
                     "{} changed after the interrupted migration; roll back or retry manually",
@@ -2681,8 +2769,8 @@ fn rollback_from_meta(
     };
     let paths: BTreeMap<&str, PathBuf> = authority_paths(home, env).into_iter().collect();
     if in_progress {
-        report.warnings.push(
-            "rolling back an interrupted migration: restoring the pre-migration backup              (partial migration state will be discarded)"
+        report.notes.push(
+            "rolling back an interrupted migration: restoring the pre-migration backup (partial migration state will be discarded)"
                 .to_string(),
         );
     }
@@ -3106,13 +3194,188 @@ mod tests {
         // 中断态 rollback 不应再被 journal 相位门控拒绝。
         let rb =
             rollback_marketplace_name_migration(&home, Some(&env), &timestamp, &secrets).unwrap();
-        assert!(rb.warnings.iter().any(|w| w.contains("interrupted")));
+        assert!(rb.notes.iter().any(|w| w.contains("interrupted")));
+        assert!(
+            rb.warnings.is_empty(),
+            "informational note must not be a warning"
+        );
         assert!(marketplace_skill_dir(&home, "old-name", &[]).is_dir());
         assert!(!marketplace_skill_dir(&home, "team-tools", &[]).exists());
         let known = load_known_marketplaces_strict(Some(&home), Some(&env)).unwrap();
         assert!(known.account.marketplaces.contains_key("old-name"));
         assert!(!known.account.marketplaces.contains_key("team-tools"));
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn seed_crash_window_can_resume() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-name", "team-tools");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let ctx = load_context(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        // seed 已写、journal 仍是 prepared（模拟 kill 在 post-hash 记录前）。
+        let err = apply_fresh(&ctx, Some(&env), &secrets, Some("after-seed")).unwrap_err();
+        assert!(matches!(
+            err,
+            MarketplaceMigrationError::ConcurrentChange { .. }
+        ));
+        assert!(home.join(MIGRATION_JOURNAL_FILENAME).exists());
+        let resumed = resume_marketplace_name_migration(&home, Some(&env), None, &secrets).unwrap();
+        assert_eq!(resumed.status(), MigrationStatus::Ok);
+        assert!(!home.join(MIGRATION_JOURNAL_FILENAME).exists());
+        assert!(marketplace_skill_dir(&home, "team-tools", &[]).is_dir());
+    }
+
+    #[test]
+    fn poison_journal_is_cleaned_when_pre_hash_mismatch() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-name", "team-tools");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let ctx = load_context(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let err = apply_fresh(&ctx, Some(&env), &secrets, Some("mutate-after-backup")).unwrap_err();
+        assert!(matches!(
+            err,
+            MarketplaceMigrationError::ConcurrentChange { .. }
+        ));
+        // 毒 journal 被清掉，后续可重新 apply（备份保留）。
+        assert!(!home.join(MIGRATION_JOURNAL_FILENAME).exists());
+    }
+
+    #[test]
+    fn rollback_of_old_backup_is_rejected_while_another_journal_is_in_progress() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-a", "team-a");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let first = apply_fresh(
+            &load_context(
+                &home,
+                Some(&env),
+                None,
+                MarketplaceMigrationOptions::default(),
+                &secrets,
+            )
+            .unwrap(),
+            Some(&env),
+            &secrets,
+            None,
+        )
+        .unwrap();
+        let first_ts = first.backup.unwrap().timestamp;
+        // 第二个迁移中途失败，留下 applying journal + 自己的 backup。
+        seed_unit(&home, "old-b", "team-b");
+        let ctx2 = load_context(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let second = apply_fresh(&ctx2, Some(&env), &secrets, Some("after-known")).unwrap();
+        let second_ts = second.backup.unwrap().timestamp;
+        assert_ne!(first_ts, second_ts);
+        let journal_path = home.join(MIGRATION_JOURNAL_FILENAME);
+        let mut meta = read_journal(&journal_path).unwrap();
+        meta.phase = "applying".to_string();
+        write_journal(&home, &meta).unwrap();
+        // 用旧 backup 回滚必须被拒绝（否则会覆盖在途迁移并删 journal）。
+        let err = rollback_marketplace_name_migration(&home, Some(&env), &first_ts, &secrets)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MarketplaceMigrationError::JournalInProgress { .. }
+        ));
+        assert!(journal_path.exists());
+    }
+
+    #[test]
+    fn poison_journal_is_cleaned_when_authority_file_appears() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-name", "team-tools");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let ctx = load_context(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let err = apply_fresh(
+            &ctx,
+            Some(&env),
+            &secrets,
+            Some("create-settings-after-backup"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MarketplaceMigrationError::ConcurrentChange { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(!home.join(MIGRATION_JOURNAL_FILENAME).exists());
+    }
+
+    #[test]
+    fn resume_rejects_tampered_done_item() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-name", "team-tools");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let report = apply_marketplace_name_migration(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let backup_dir = PathBuf::from(&report.backup.unwrap().path);
+        // 篡改 done 项（删除新 catalog 目录）后重建 journal；post-hash 同步，确保 hash 门放行，
+        // 只剩「最终 verify done 项」能拦截。
+        std::fs::remove_dir_all(marketplace_skill_dir(&home, "team-tools", &[])).unwrap();
+        let mut meta: MigrationMeta =
+            serde_json::from_str(&std::fs::read_to_string(backup_dir.join("backup.json")).unwrap())
+                .unwrap();
+        meta.phase = "aborted".to_string();
+        meta.items[0].status = "done".to_string();
+        meta.post_hashes =
+            current_hashes(&home, Some(&env), &user_settings_path(Some(&env))).unwrap();
+        write_journal(&home, &meta).unwrap();
+        let resumed = resume_marketplace_name_migration(&home, Some(&env), None, &secrets).unwrap();
+        assert_eq!(resumed.status(), MigrationStatus::Partial);
+        assert!(resumed
+            .items
+            .iter()
+            .any(|i| i.action == MigrationAction::Blocked));
+        assert!(home.join(MIGRATION_JOURNAL_FILENAME).exists());
     }
 
     #[test]

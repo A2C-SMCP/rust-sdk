@@ -740,6 +740,9 @@ pub fn marketplace_migrate(
                             untrusted_name_for_display(name)
                         ));
                     }
+                    for note in &report.notes {
+                        eprintln!("note: {}", untrusted_name_for_display(note));
+                    }
                     for warning in &report.warnings {
                         eprintln!("warning: {}", untrusted_name_for_display(warning));
                     }
@@ -814,10 +817,12 @@ fn emit_migration_plan(
     if json_output {
         let mut value = json!({
             "dryRun": true,
+            "written": false,
             "status": status,
             "items": plan.items,
             "conflicts": plan.conflicts,
             "manualReferences": plan.manual,
+            "backup": null,
             "corrupt": plan.corrupt,
         });
         print_json(redact_migration_json(&mut value));
@@ -870,7 +875,7 @@ fn emit_migration_plan(
             }
         }
         if let Some(corrupt) = &plan.corrupt {
-            eprintln!("error: {corrupt}");
+            eprintln!("error: {}", untrusted_name_for_display(corrupt));
         }
         if plan.items.is_empty() && plan.conflicts.is_empty() && plan.corrupt.is_none() {
             msg_dim("nothing to migrate");
@@ -952,7 +957,7 @@ fn emit_migration_report(
             ));
         }
         if let Some(corrupt) = &report.corrupt {
-            eprintln!("error: {corrupt}");
+            eprintln!("error: {}", untrusted_name_for_display(corrupt));
         }
         if report.items.is_empty() && report.conflicts.is_empty() && report.corrupt.is_none() {
             msg_dim("nothing to migrate");
@@ -988,7 +993,7 @@ fn redact_migration_json(value: &mut Value) -> &mut Value {
             for (key, child) in map.iter_mut() {
                 if matches!(
                     key.as_str(),
-                    "oldName" | "newName" | "suggested" | "pointer" | "detail"
+                    "oldName" | "newName" | "suggested" | "pointer" | "detail" | "corrupt"
                 ) {
                     if let Some(text) = child.as_str() {
                         *child = Value::String(untrusted_name_for_display(text));
@@ -1035,7 +1040,8 @@ mod tests {
             "manualReferences": [{"pointer": "/enabledPlugins/alpha@user:pass@host",
                                   "suggested": "alpha@user:pass@host"}],
             "restored": ["user:pass@host"],
-            "warnings": ["failed to restore user:pass@host/token"]
+            "warnings": ["failed to restore user:pass@host/token"],
+            "corrupt": "marketplaces entry \"https://user:pass@host/repo.git\" is invalid"
         });
         let redacted = redact_migration_json(&mut value).to_string();
         assert!(!redacted.contains("pass"), "credentials leaked: {redacted}");
