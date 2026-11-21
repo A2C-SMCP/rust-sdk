@@ -1673,6 +1673,8 @@ pub(crate) struct MarketplaceMaterializeOptions<'a> {
     pub recorder: Option<&'a dyn KnownMarketplaceRecorder>,
     /// 本次应写入的 `manifestNameBaseline`（`None` = 保留既有）。
     pub manifest_name_baseline: Option<&'a str>,
+    /// 仅物化这些 plugin（`None` = 全量；#267 reconcile/install 传 enabled/单 plugin）。
+    pub plugin_filter: Option<&'a HashSet<String>>,
 }
 
 /// 从**已就位**的 clone 记录账本并 stage plugins（无 git clone/pull）/ Record + stage from a committed clone.
@@ -1714,7 +1716,7 @@ pub(crate) async fn materialize_marketplace_clone(
         clone_dir,
         registry,
         home,
-        None,
+        options.plugin_filter,
         commit_sha.as_deref(),
         options.refresh,
         timeout,
@@ -1801,10 +1803,135 @@ async fn fast_forward_to_fetched(
     .map(|_| ())
 }
 
-/// refresh 单个 marketplace：先取来料清单校验，再提交（#272 / runtime-contract §5.14）。
+/// catalog 工作副本刷新结果（**未物化**——SKILL 注册由调用方决定）/ A refreshed catalog working copy.
+///
+/// `committed.is_some()` = 本次经 staged clone swap（携带待清理的旧树 `.trash`）；`None` = 既有 clone
+/// fast-forward（或同 commit 无变化）。调用方在物化/使用完毕后调 [`discard_trash`](Self::discard_trash)。
+pub(crate) struct MarketplaceWorkingCopy {
+    /// 就位目录 `<home>/marketplace/<name>`。
+    pub dir: PathBuf,
+    /// 本次是否实际提交了新内容（clone / ff / swap）。
+    pub changed: bool,
+    /// 本次应写入/保留的 `manifestNameBaseline`（`None` = 不写，保留既有）。
+    pub applied_baseline: Option<String>,
+    /// 成功路径的 legacy advisory（类别 + 已可安全展示的文案）。
+    pub advisory: Option<(ManifestAdvisory, String)>,
+    /// swap 路径的被替换旧树（需在锁外/物化后清理）。
+    committed: Option<CommittedMarketplace>,
+}
+
+impl MarketplaceWorkingCopy {
+    /// 删除 swap 路径遗留的旧 clone 备份（fast-forward 路径 no-op）。
+    pub(crate) fn discard_trash(&self) {
+        if let Some(c) = &self.committed {
+            c.discard_trash();
+        }
+    }
+}
+
+/// refresh 单个 marketplace 的 **catalog 工作副本**：fetch → 校验来料清单 → ff / staged swap
+/// （#272 / runtime-contract §5.14）。**不**注册 SKILL、**不**写账本。
+///
+/// `baseline = Some(b)` → 来料清单名必须等于 `b`，否则结构化失败且不碰工作树；`None` → legacy，
+/// 接受改名并返回 `applied_baseline` + advisory。
+///
+/// 该半部供两条路径复用：① [`refresh_marketplace_clone`]（refresh/reconcile：刷新后物化）；
+/// ② `install_plugin{refresh:true}` 的**物化前改名校验**（拒绝时任何外部 plugin clone / registry 都未触碰）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refresh_marketplace_working_copy(
+    name: &str,
+    source: &Value,
+    home: &Path,
+    baseline: Option<&str>,
+    timeout: Duration,
+    env: Option<&EnvMap>,
+) -> Result<MarketplaceWorkingCopy, MarketplaceStageError> {
+    if !is_valid_marketplace_name(name) {
+        return Err(MarketplaceStageError::InvalidRegisteredName);
+    }
+    if marketplace_clone_url(source).is_err() {
+        return Err(MarketplaceStageError::SourceInvalid);
+    }
+    let clone_dir = marketplace_skill_dir(home, name, &[]);
+
+    if clone_dir.exists() {
+        let head = git_head_sha(&clone_dir, timeout, env).await;
+        if let Ok((incoming, incoming_present, incoming_sha)) =
+            fetch_incoming_manifest(&clone_dir, timeout, env).await
+        {
+            let decision =
+                apply_manifest_policy(name, baseline, incoming.as_ref(), incoming_present)?;
+            let same_commit = incoming_sha.is_some() && incoming_sha == head;
+            let mut changed = false;
+            if !same_commit {
+                if fast_forward_to_fetched(&clone_dir, timeout, env)
+                    .await
+                    .is_err()
+                {
+                    // 非 ff / 本地修改 / shallow 历史不可判定 → staged clone 重新校验后 swap。
+                    return refresh_working_copy_via_staged_clone(
+                        name, source, home, baseline, timeout, env,
+                    )
+                    .await;
+                }
+                changed = true;
+            }
+            return Ok(MarketplaceWorkingCopy {
+                dir: clone_dir,
+                changed,
+                applied_baseline: decision.applied_baseline,
+                advisory: decision.advisory,
+                committed: None,
+            });
+        }
+        // fetch 失败 → 回退 staged clone（仍不动旧内容）。
+    }
+
+    refresh_working_copy_via_staged_clone(name, source, home, baseline, timeout, env).await
+}
+
+/// staged clone 回退路径：clone → 校验 → swap（未物化）/ Fallback refresh via a staged clone.
+async fn refresh_working_copy_via_staged_clone(
+    name: &str,
+    source: &Value,
+    home: &Path,
+    baseline: Option<&str>,
+    timeout: Duration,
+    env: Option<&EnvMap>,
+) -> Result<MarketplaceWorkingCopy, MarketplaceStageError> {
+    // 旧内容若无 clone 则视为「有变化」（自愈）；有 clone 则按 HEAD 比较，避免同 commit 重 clone 误报 Updated。
+    let clone_dir = marketplace_skill_dir(home, name, &[]);
+    let before_sha = if clone_dir.exists() {
+        git_head_sha(&clone_dir, timeout, env).await
+    } else {
+        None
+    };
+    let staged = clone_marketplace_to_staging(source, home, Some(timeout), env).await?;
+    let decision = apply_manifest_policy(
+        name,
+        baseline,
+        staged.manifest.as_ref(),
+        staged.manifest_present,
+    )?;
+    let committed = swap_staged_into_place(staged, home, name)?;
+    let after_sha = git_head_sha(&committed.dir, timeout, env).await;
+    let changed = before_sha != after_sha;
+    Ok(MarketplaceWorkingCopy {
+        dir: committed.dir.clone(),
+        changed,
+        applied_baseline: decision.applied_baseline,
+        advisory: decision.advisory,
+        committed: Some(committed),
+    })
+}
+
+/// refresh 单个 marketplace：先取来料清单校验，再提交并物化（#272 / runtime-contract §5.14）。
 ///
 /// `baseline = Some(b)` → 来料清单名必须等于 `b`，否则结构化失败且不碰工作树；`None` → legacy，
 /// 接受改名并记录基线 + advisory。成功返回 `registered/changed/advisory`。
+///
+/// `plugin_filter`：仅物化这些 plugin（`None` = 全量；reconcile/install 传 enabled/单 plugin）。
+/// `refresh_plugins`：外部 Git plugin 源是否重 clone（reconcile 首次克隆传 `false`，显式 refresh 传 `true`）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn refresh_marketplace_clone(
     name: &str,
@@ -1816,166 +1943,43 @@ pub(crate) async fn refresh_marketplace_clone(
     timeout: Duration,
     env: Option<&EnvMap>,
     recorder: Option<&dyn KnownMarketplaceRecorder>,
+    plugin_filter: Option<&HashSet<String>>,
+    refresh_plugins: bool,
 ) -> MarketplaceStageOutcome {
-    let mut outcome = MarketplaceStageOutcome::default();
-    if !is_valid_marketplace_name(name) {
-        outcome.failure = Some(MarketplaceStageError::InvalidRegisteredName);
-        return outcome;
-    }
-    if marketplace_clone_url(source).is_err() {
-        outcome.failure = Some(MarketplaceStageError::SourceInvalid);
-        return outcome;
-    }
-    let clone_dir = marketplace_skill_dir(home, name, &[]);
-
-    if clone_dir.exists() {
-        let head = git_head_sha(&clone_dir, timeout, env).await;
-        if let Ok((incoming, incoming_present, incoming_sha)) =
-            fetch_incoming_manifest(&clone_dir, timeout, env).await
-        {
-            let decision =
-                match apply_manifest_policy(name, baseline, incoming.as_ref(), incoming_present) {
-                    Ok(d) => d,
-                    Err(failure) => {
-                        outcome.failure = Some(failure);
-                        return outcome;
-                    }
+    let copy =
+        match refresh_marketplace_working_copy(name, source, home, baseline, timeout, env).await {
+            Ok(c) => c,
+            Err(failure) => {
+                return MarketplaceStageOutcome {
+                    failure: Some(failure),
+                    ..MarketplaceStageOutcome::default()
                 };
-            let same_commit = incoming_sha.is_some() && incoming_sha == head;
-            let mut changed = false;
-            if !same_commit {
-                if fast_forward_to_fetched(&clone_dir, timeout, env)
-                    .await
-                    .is_err()
-                {
-                    // 非 ff / 本地修改 / shallow 历史不可判定 → staged clone 重新校验后 swap。
-                    return refresh_via_staged_clone(
-                        name,
-                        source,
-                        registry,
-                        home,
-                        baseline,
-                        auto_update,
-                        timeout,
-                        env,
-                        recorder,
-                    )
-                    .await;
-                }
-                changed = true;
             }
-            let applied_baseline = decision.applied_baseline.clone();
-            let advisory = decision.advisory.clone();
-            let registered = materialize_marketplace_clone(
-                name,
-                source,
-                &clone_dir,
-                registry,
-                home,
-                MarketplaceMaterializeOptions {
-                    auto_update,
-                    changed,
-                    refresh: true,
-                    env,
-                    recorder,
-                    manifest_name_baseline: applied_baseline.as_deref(),
-                },
-            )
-            .await;
-            outcome.registered = registered;
-            outcome.changed = changed;
-            outcome.advisory = advisory;
-            return outcome;
-        }
-        // fetch 失败 → 回退 staged clone（仍不动旧内容）。
-    }
-
-    refresh_via_staged_clone(
-        name,
-        source,
-        registry,
-        home,
-        baseline,
-        auto_update,
-        timeout,
-        env,
-        recorder,
-    )
-    .await
-}
-
-/// staged clone 回退路径：clone → 校验 → swap → 物化 / Fallback refresh via a staged clone.
-#[allow(clippy::too_many_arguments)]
-async fn refresh_via_staged_clone(
-    name: &str,
-    source: &Value,
-    registry: &mut SkillRegistry,
-    home: &Path,
-    baseline: Option<&str>,
-    auto_update: bool,
-    timeout: Duration,
-    env: Option<&EnvMap>,
-    recorder: Option<&dyn KnownMarketplaceRecorder>,
-) -> MarketplaceStageOutcome {
-    let mut outcome = MarketplaceStageOutcome::default();
-    // 旧内容若无 clone 则视为「有变化」（自愈）；有 clone 则按 HEAD 比较，避免同 commit 重 clone 误报 Updated。
-    let clone_dir = marketplace_skill_dir(home, name, &[]);
-    let before_sha = if clone_dir.exists() {
-        git_head_sha(&clone_dir, timeout, env).await
-    } else {
-        None
-    };
-    let staged = match clone_marketplace_to_staging(source, home, Some(timeout), env).await {
-        Ok(s) => s,
-        Err(failure) => {
-            outcome.failure = Some(failure);
-            return outcome;
-        }
-    };
-    let decision = match apply_manifest_policy(
-        name,
-        baseline,
-        staged.manifest.as_ref(),
-        staged.manifest_present,
-    ) {
-        Ok(d) => d,
-        Err(failure) => {
-            outcome.failure = Some(failure);
-            return outcome;
-        }
-    };
-    let committed = match swap_staged_into_place(staged, home, name) {
-        Ok(c) => c,
-        Err(failure) => {
-            outcome.failure = Some(failure);
-            return outcome;
-        }
-    };
-    let after_sha = git_head_sha(&committed.dir, timeout, env).await;
-    let changed = before_sha != after_sha;
-    let applied_baseline = decision.applied_baseline.clone();
-    let advisory = decision.advisory.clone();
+        };
     let registered = materialize_marketplace_clone(
         name,
         source,
-        &committed.dir,
+        &copy.dir,
         registry,
         home,
         MarketplaceMaterializeOptions {
             auto_update,
-            changed,
-            refresh: true,
+            changed: copy.changed,
+            refresh: refresh_plugins,
             env,
             recorder,
-            manifest_name_baseline: applied_baseline.as_deref(),
+            manifest_name_baseline: copy.applied_baseline.as_deref(),
+            plugin_filter,
         },
     )
     .await;
-    committed.discard_trash();
-    outcome.registered = registered;
-    outcome.changed = changed;
-    outcome.advisory = advisory;
-    outcome
+    copy.discard_trash();
+    MarketplaceStageOutcome {
+        registered,
+        changed: copy.changed,
+        failure: None,
+        advisory: copy.advisory,
+    }
 }
 
 // ===========================================================================

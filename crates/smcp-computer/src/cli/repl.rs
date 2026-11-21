@@ -131,6 +131,8 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
                     auto_update: has_flag(&args, "--auto-update"),
                     no_clone,
                     confirm: Some(&confirm),
+                    // #267：REPL 的 `--settings`（构造期已归一）参与引用守卫 flag 层。
+                    flag_settings_path: comp.normalized_flag_settings_path(),
                     json_output: json,
                 },
             )

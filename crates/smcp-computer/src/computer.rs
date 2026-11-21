@@ -1490,6 +1490,8 @@ impl<S: Session> Computer<S> {
         let instance_dir = self.config_dir();
         let params = AddMarketplaceParams {
             config_cwd: Some(instance_dir.as_path()),
+            // #267：flag 层（`--settings`）的同源路径必须是**构造期归一后**的路径（#248 口径）。
+            flag_settings_path: self.normalized_flag_settings_path(),
             ..params
         };
         let (res, conflicts) = {
@@ -7091,6 +7093,72 @@ mod tests {
                 .await,
             Err(GovernanceError::UnknownMarketplace(n)) if n == "ghost"
         ));
+    }
+
+    /// #267：Computer 级 `--settings`（flag 层）接线——flag settings 的 `enabledPlugins` 引用参与
+    /// remove/re-add 守卫；同一操作无 flag 层则放行。
+    #[tokio::test]
+    async fn computer_add_marketplace_flag_layer_reference_guard_267() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("xdg").to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let url_a = build_marketplace_repo95(&tmp.path().join("repo-a"));
+        let url_b = build_marketplace_repo95(&tmp.path().join("repo-b"));
+
+        let comp_a = Computer::new("c267a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env.clone())
+            .with_blob_cache_root(tmp.path().join("blob-a"));
+        comp_a
+            .add_marketplace(&url_a, AddMarketplaceParams::default())
+            .await
+            .unwrap();
+        comp_a
+            .remove_marketplace(
+                "acme",
+                RemoveMarketplaceParams {
+                    keep_plugins: false,
+                    hooks: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // flag 层只剩 `<plugin>@acme` 引用 → 同名 re-add 必须拒绝（实例构造期归一后的 flag 路径）。
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+        let comp_flag = Computer::new("c267b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let err = comp_flag
+            .add_marketplace(&url_b, AddMarketplaceParams::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                GovernanceError::MarketplaceNameReferenced { name, plugin_ids }
+                    if name == "acme" && plugin_ids.iter().any(|p| p == "audit@acme")
+            ),
+            "{err:?}"
+        );
+
+        // 无 flag 层 → 正常注册（证明拒绝来自 flag 层）。
+        let comp_plain = Computer::new("c267c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-c"));
+        comp_plain
+            .add_marketplace(&url_b, AddMarketplaceParams::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

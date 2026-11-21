@@ -75,7 +75,8 @@ use crate::skills::manifest::{
 use crate::skills::registry::{SkillRegistry, SkillSourceConflict};
 use crate::skills::staging::{
     has_projectable_skill, locate_plugin_root, plugin_skill_container_dirs,
-    stage_marketplace_skills, MarketplaceStageOptions, SkillStagingError, DEFAULT_GIT_TIMEOUT,
+    refresh_marketplace_working_copy, stage_marketplace_skills, MarketplaceStageError,
+    MarketplaceStageOptions, SkillStagingError, DEFAULT_GIT_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
@@ -303,7 +304,8 @@ pub struct InstallOptions<'a> {
     pub project_path: Option<&'a str>,
     /// 记录版本覆盖（`--version`）；缺省按 entry > plugin.json > commitSha 解析 / version override。
     pub version: Option<&'a str>,
-    /// `true` → 已存在 catalog 走 pull、独立 plugin 重 clone（sha-pin 例外）/ refresh mode。
+    /// `true` → catalog 先经守卫 refresh（fetch → 来料清单名预校验 → ff / staged swap，#267），再解析
+    /// plugin 根；独立 Git plugin 源重 clone（sha-pin 例外）。清单改名 → `Staging` 错误且零变更。
     pub refresh: bool,
     /// 单次 git 操作超时（`None` → [`DEFAULT_GIT_TIMEOUT`]）/ per-op git timeout。
     pub timeout: Option<Duration>,
@@ -985,12 +987,22 @@ fn bundled_servers_of(home: &Path, plugin_id: &str, env: Option<&EnvMap>) -> Has
     out
 }
 
-/// 从 `known_marketplaces.json` 取 marketplace 的 git source + commitSha；未添加 → 拒 / Resolve mp source。
+/// 从 `known_marketplaces.json` 解析的 marketplace 身份 / resolved marketplace identity。
+struct ResolvedMarketplaceSource {
+    /// marketplace git source。
+    source: Value,
+    /// 账本 `commitSha`（version fallback）。
+    commit_sha: Option<String>,
+    /// 账本 `manifestNameBaseline`（#267 refresh 改名守卫；legacy = `None`）。
+    manifest_name_baseline: Option<String>,
+}
+
+/// 从 `known_marketplaces.json` 取 marketplace 的 git source + commitSha + baseline；未添加 → 拒。
 fn resolve_marketplace_source(
     marketplace: &str,
     home: &Path,
     env: Option<&EnvMap>,
-) -> Result<(Value, Option<String>), PluginInstallError> {
+) -> Result<ResolvedMarketplaceSource, PluginInstallError> {
     let known = load_known_marketplaces(Some(home), env);
     let record = known.account.marketplaces.get(marketplace).ok_or_else(|| {
         PluginInstallError::Precondition(format!(
@@ -1007,7 +1019,11 @@ fn resolve_marketplace_source(
         .get("commitSha")
         .and_then(Value::as_str)
         .map(String::from);
-    Ok((record.source.clone(), commit_sha))
+    Ok(ResolvedMarketplaceSource {
+        source: record.source.clone(),
+        commit_sha,
+        manifest_name_baseline: record.manifest_name_baseline.clone(),
+    })
 }
 
 /// bundled server 依赖模型预检（#139/D3，§7.2/§10.6）/ Bundled-server dependency-model precheck。
@@ -1091,7 +1107,8 @@ async fn materialize_plugin(
     strict_check: bool,
 ) -> Result<MaterializedPlugin, PluginInstallError> {
     let (plugin, marketplace) = split_plugin_id(plugin_id)?;
-    let (source, commit_sha) = resolve_marketplace_source(&marketplace, home, env)?;
+    let resolved = resolve_marketplace_source(&marketplace, home, env)?;
+    let (source, commit_sha) = (resolved.source, resolved.commit_sha);
 
     let catalog_dir = marketplace_skill_dir(home, &marketplace, &[]);
     if !catalog_dir.is_dir() {
@@ -1257,7 +1274,9 @@ pub async fn materialize_plugin_record(
 /// （absent = 未启用 → `installed_disabled`）。激活全部交给 [`enable_plugin`]。
 ///
 /// 顺序：⓪ **★安装层唯一性闸门**（#275：`installedPlugins` 意图内同裸名 `<plugin>` 跨 marketplace 唯一；
-/// 命中即拒绝、零变更，且先于 materialize）→ ① 解析 id + mp source；② 要求 catalog 已 clone、读
+/// 命中即拒绝、零变更，且先于 materialize）→ ⓪' `refresh` 时**先刷新/校验 catalog 工作副本**
+/// （`refresh_marketplace_working_copy`：来料清单改名/缺失/非法/损坏在**任何物化之前**以 `Staging` 拒绝；
+/// 网络失败降级为保留旧 catalog，见 #267）→ ① 解析 id + mp source；② 要求 catalog 已 clone、读
 /// marketplace.json 定位 entry；③ `locate_plugin_root` 定位 plugin 根（必要时 clone）；④ strict 冲突检测 +
 /// [`load_bundled_servers`]（注册前畸形即抛）；⑤ **★冲突闸门**（外来 MCP 同名硬抛、零变更——满足
 /// 「install 拒绝 foreign name conflict」，虽本步不挂载）；⑥ stage skills → 立即 `mark_orphan`（不投影；
@@ -1279,8 +1298,44 @@ pub async fn install_plugin(
 
     // ⓪ #275 安装层唯一性前置（协议 skill.md §1.5 / conformance-tests.md:365）：已装集合内同一裸名
     //    `<plugin>` 只能来自一个 marketplace。必须在 [`materialize_plugin`] 之前，保证拒绝时零变更。
-    let (plugin, _marketplace) = split_plugin_id(plugin_id)?;
+    let (plugin, marketplace) = split_plugin_id(plugin_id)?;
     ensure_bare_plugin_not_installed(&plugin, plugin_id, home, env)?;
+
+    // ⓪' #267 / §5.14：`refresh=true` 时先刷新/校验 catalog 工作副本（来料清单名），失败在**任何**物化
+    //    （含外部 plugin clone）与 registry 变更之前返回。catalog 未 clone 时跳过，保留 materialize_plugin
+    //    既有的 Precondition 文案。
+    if options.refresh && marketplace_skill_dir(home, &marketplace, &[]).is_dir() {
+        let resolved = resolve_marketplace_source(&marketplace, home, env)?;
+        match refresh_marketplace_working_copy(
+            &marketplace,
+            &resolved.source,
+            home,
+            resolved.manifest_name_baseline.as_deref(),
+            timeout,
+            env,
+        )
+        .await
+        {
+            Ok(copy) => copy.discard_trash(),
+            Err(failure) => match &failure {
+                // §5.14 refresh 改名 / 清单坏：validation 拒绝，旧注册/内容/能力保持 active。
+                MarketplaceStageError::ManifestNameChanged { .. }
+                | MarketplaceStageError::ManifestNameMissing
+                | MarketplaceStageError::ManifestNameInvalid
+                | MarketplaceStageError::ManifestUnreadable => {
+                    return Err(PluginInstallError::Staging(SkillStagingError(
+                        failure.to_string(),
+                    )));
+                }
+                // 网络 / I-O：失败降级铁律——保留旧 catalog 继续（不应用未校验内容）。
+                _ => tracing::error!(
+                    marketplace = %marketplace,
+                    error = %failure,
+                    "install: marketplace refresh failed; continuing with the existing catalog (degraded)"
+                ),
+            },
+        }
+    }
 
     // ①-④：解析 mp source + 定位 plugin 根（必要时 clone）+ strict 冲突检测 + 载入 bundled servers（注册前
     // 畸形即抛 → 原子前置）。install 与账本重建 [`materialize_plugin_record`] 共享此原语，杜绝物化路径漂移。
@@ -1312,7 +1367,8 @@ pub async fn install_plugin(
     let snapshot = registry.clone();
     clear_uninstalled_marketplace_skill_names(registry, home, env, &want_source, &skill_prefix);
     let _ = take_own_source_conflicts(registry, &want_source, &skill_prefix);
-    // skills 注册：复用既有 clone（refresh 透传）；失败降级（返回 Vec、不抛，见 #49）。计数供成功日志。
+    // skills 注册：catalog（预校验路径）与外部 plugin clone（materialize_plugin）均已刷新 → 此处只登记，
+    // 不再重复 pull；失败降级（返回 Vec、不抛，见 #49）。计数供成功日志。
     let staged_skills = stage_marketplace_skills(
         &m.marketplace,
         &m.source,
@@ -1320,7 +1376,7 @@ pub async fn install_plugin(
         home,
         MarketplaceStageOptions {
             plugin_filter: Some(&filter),
-            refresh: options.refresh,
+            refresh: false,
             timeout: Some(timeout),
             env,
             ..Default::default()
@@ -1820,8 +1876,8 @@ pub(crate) async fn enable_plugin_with_reclaim(
 
     // ③ 复活 skills（re-stage：register_or_update 翻活孤儿；复用既有 clone）。resolve/staging 失败均回滚，
     //    避免「标记已启用但零投影」。staging 的返回值＝本次实际注册的 SKILL 数——用于捕获被吞的 per-plugin 失败。
-    let (source, _commit_sha) = match resolve_marketplace_source(&marketplace, home, env) {
-        Ok(v) => v,
+    let source = match resolve_marketplace_source(&marketplace, home, env) {
+        Ok(v) => v.source,
         Err(e) => {
             restore_enabled_plugin(plugin_id, scope, options.project_path, env, prior_enabled);
             reclaim_failed_enable_servers(
@@ -7284,5 +7340,140 @@ mod tests {
             .unwrap();
         assert_eq!(kept.source, "marketplace:mp-b");
         assert!(orphaned, "install 后仍为 installed_disabled（orphan）");
+    }
+
+    // ── #267 marketplace 改名守卫（install refresh）/ rename guard on install refresh ──
+
+    /// 把 setup 的 baseline None 升级为 #272 注册形态（新 add 恒写 baseline = 注册名）。
+    fn pin_baseline(home: &Path, env: &EnvMap, name: &str) {
+        let name = name.to_string();
+        update_known_marketplaces(
+            move |file| {
+                file.account
+                    .marketplaces
+                    .get_mut(&name)
+                    .unwrap()
+                    .manifest_name_baseline = Some(name.clone());
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
+    }
+
+    /// #267 item 1：`install_plugin{refresh:true}` 拉到来料改名清单 → 在**任何**物化之前拒绝；
+    /// 旧 catalog / 旧能力 / 意图均不变。
+    #[tokio::test]
+    async fn install_refresh_rejects_renamed_manifest_before_materialize_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let source = build_source_repo_with_servers(&repo, &[]);
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        pin_baseline(&home, &env, "acme");
+        let clone = home.join("marketplace").join("acme");
+        let head = git_head(&clone);
+
+        // 上游改名（内容与 plugin 条目不变）。
+        let manifest = repo.join(".tfrobot-plugin/marketplace.json");
+        let text = fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("\"acme\"", "\"acme-v2\"");
+        fs::write(&manifest, text).unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "rename"], &repo);
+
+        let mut reg = SkillRegistry::new();
+        let err = install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("manifest name changed"), "{msg}");
+        assert!(reg.is_empty(), "拒绝必须发生在 skill 注册之前");
+        assert_eq!(git_head(&clone), head, "拒绝不得提交新内容");
+        assert!(
+            load_installed_plugins_intent(Some(&home), Some(&env))
+                .account
+                .installed_plugins
+                .is_empty(),
+            "拒绝不得写安装意图"
+        );
+        assert!(
+            load_installed_plugins(Some(&home), Some(&env))
+                .account
+                .plugins
+                .is_empty(),
+            "拒绝不得写账本"
+        );
+    }
+
+    /// #267 item 1 正向：同源上游更新 → `install_plugin{refresh:true}` 正常收敛。
+    #[tokio::test]
+    async fn install_refresh_same_source_updates_content_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let source = build_source_repo_with_servers(&repo, &[]);
+        let (home, env) = setup_home_with_catalog(&tmp, source).await;
+        pin_baseline(&home, &env, "acme");
+
+        let mut reg = SkillRegistry::new();
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // install 后 skill 为 installed_disabled（orphan，不投影）→ 经 all_refs 读取描述。
+        let desc = |reg: &SkillRegistry| {
+            reg.all_refs()
+                .into_iter()
+                .find(|(r, _)| r.name == "audit:code-review")
+                .map(|(r, orphaned)| {
+                    assert!(orphaned, "install 后应为 installed_disabled");
+                    r.description
+                })
+                .expect("install 必须注册 audit:code-review")
+        };
+        assert_eq!(desc(&reg), "review code");
+
+        // 上游同源更新内容。
+        let skill = repo.join("plugins/audit/skills/code-review/SKILL.md");
+        fs::write(
+            &skill,
+            "---\nname: code-review\ndescription: review code v2\n---\nbody",
+        )
+        .unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "update"], &repo);
+
+        install_plugin(
+            "audit@acme",
+            &mut reg,
+            &home,
+            InstallOptions {
+                refresh: true,
+                env: Some(&env),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(desc(&reg), "review code v2");
     }
 }

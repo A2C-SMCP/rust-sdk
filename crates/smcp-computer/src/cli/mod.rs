@@ -321,7 +321,7 @@ async fn dispatch(mut args: Args) -> i32 {
     // 取出 subcommand（避免部分移动后再借 `&args` 给 run_repl）/ take command out so `&args` stays valid。
     let command = args.command.take();
     match command {
-        Some(Commands::Marketplace { action }) => dispatch_marketplace(action).await,
+        Some(Commands::Marketplace { action }) => dispatch_marketplace(action, &root).await,
         Some(Commands::Plugin { action }) => dispatch_plugin(action, &root).await,
         Some(Commands::Settings { action }) => dispatch_settings(action, &root),
         Some(Commands::Skill { action }) => dispatch_skill(action).await,
@@ -394,7 +394,7 @@ fn migrate_governance_once(home: &Path) {
 }
 
 // ── 非交互子命令分发（不 boot Computer；离线 registry）/ non-interactive dispatch ──
-async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
+async fn dispatch_marketplace(action: MarketplaceCmd, root: &RootState) -> i32 {
     let home = skill_home();
     migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
@@ -407,6 +407,8 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
             no_clone,
             json,
         } => {
+            // #267：一次性 marketplace add 的引用守卫同样消费 `--settings` flag 层（归一失败 → 无 flag 层）。
+            let flag_settings_path = normalize_root_flag_path(root);
             let _spinner = clone_spinner("Cloning marketplace...", !json && !no_clone);
             marketplace_add(
                 &mut registry,
@@ -419,6 +421,7 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
                     auto_update,
                     no_clone,
                     confirm: None, // 非交互无 confirm → add 须 --trust。
+                    flag_settings_path: flag_settings_path.as_deref(),
                     json_output: json,
                 },
             )
@@ -552,13 +555,12 @@ async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
     }
 }
 
-fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
-    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
-    let cwd = std::env::current_dir().ok();
-    let cwd = cwd.as_deref();
-    // #248 复审：一次性 settings 子命令与运行期同口径——flag 路径先归一；失败 = 无 flag 层
-    // （fail-closed + stderr 诊断），不得回读原始 `~...` 串（仓库可植入 `<cwd>/~alice/...`）。
-    let flag_normalized = root.flag_path.as_deref().and_then(|raw| {
+/// 一次性子命令的 flag settings 路径归一（#248 口径，settings / marketplace 共用）。
+///
+/// 归一失败 → `None`（无 flag 层）+ stderr 诊断；**不得**回读原始 `~...` 串（仓库可植入
+/// `<cwd>/~alice/...` 冒充受信 flag）。
+fn normalize_root_flag_path(root: &RootState) -> Option<std::path::PathBuf> {
+    root.flag_path.as_deref().and_then(|raw| {
         match crate::computer::normalize_flag_path(raw, None) {
             Ok(path) => Some(path),
             Err(reason) => {
@@ -569,7 +571,16 @@ fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
                 None
             }
         }
-    });
+    })
+}
+
+fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
+    // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
+    let cwd = std::env::current_dir().ok();
+    let cwd = cwd.as_deref();
+    // #248 复审：一次性 settings 子命令与运行期同口径——flag 路径先归一；失败 = 无 flag 层
+    // （fail-closed + stderr 诊断），不得回读原始 `~...` 串（仓库可植入 `<cwd>/~alice/...`）。
+    let flag_normalized = normalize_root_flag_path(root);
     let flag = flag_normalized.as_deref();
     match action {
         SettingsCmd::Show { scope, json } => {
@@ -1190,5 +1201,28 @@ mod tests {
         );
         assert_eq!(stored, std::path::absolute("flag-mcp.json").unwrap());
         assert!(computer.mcp_flag_config_error().is_none());
+    }
+
+    /// #267：一次性 marketplace add 与 settings 子命令共用同一 flag 归一纪律——
+    /// 绝对路径 / `~/...` 归一成功，`~user` 形态 fail-closed（None，无 flag 层）。
+    #[test]
+    fn normalize_root_flag_path_shares_settings_discipline_267() {
+        let abs = std::env::temp_dir().join("flag267-settings.json");
+        let root = RootState {
+            flag_path: Some(abs.clone()),
+            approve_all_mcp: false,
+        };
+        assert_eq!(normalize_root_flag_path(&root), Some(abs));
+
+        let root = RootState {
+            flag_path: Some(std::path::PathBuf::from("~alice/settings.json")),
+            approve_all_mcp: false,
+        };
+        assert!(
+            normalize_root_flag_path(&root).is_none(),
+            "`~user` 形态必须 fail-closed（不回退原始串）"
+        );
+
+        assert!(normalize_root_flag_path(&RootState::default()).is_none());
     }
 }
