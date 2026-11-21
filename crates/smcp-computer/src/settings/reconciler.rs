@@ -38,9 +38,9 @@
 //!   `<plugin>@<name>` → 拒绝（`reason="marketplace_dangling_references"`），不 clone/不注册/不写账本。
 //!   仅 `enabledPlugins` 残留不阻断——那是首次声明式安装的合法期望态；显式 add 路径的完整引用守卫由
 //!   `claim_marketplace_registration` 承担（含 flag/policy 层）。
-//! - **失败降级铁律**（§7.2）：git clone/pull 失败 → 记 ERROR、不阻断其余、对 Agent 不可见（不入 Registry）；
-//!   本模块**不**向调用方抛 git/IO 异常（沿用 [`stage_marketplace_skills`] 的吞错降级）。§5.14 拒绝**不是**
-//!   clone/pull 失败：旧能力保持 active、不降级。
+//! - **失败降级铁律**（§7.2）：git clone/pull / staged 回退失败 → 记 ERROR、归 `failed`（可重试、已降级）、
+//!   不阻断其余；本模块**不**向调用方抛 git/IO 异常。clone 树仍在也不归 `updated`（刷新失败 ≠ 已更新）。
+//!   §5.14 拒绝**不是** clone/pull 失败：旧能力保持 active、不降级。
 //!
 //! 存储接缝 / Store seam（#67 / #68 边界）：本模块经 [`SkillGovernanceStore`] 读/改
 //! `known_marketplaces.json` 与 `installed_plugins.json`，**不**自持久化逻辑——原子写 + 恢复归 **#67 SET-04**，
@@ -195,10 +195,10 @@ pub trait SkillGovernanceStore: KnownMarketplaceRecorder {
     fn update_installed_plugins(&self, mutate: &mut dyn FnMut(&mut InstalledPlugins));
     /// 读取 `installed_plugins_intent.json`（全局安装意图，v0.3.0）快照 / Load the install-intent snapshot。
     ///
-    /// 默认返回空（供 test 替身无痛适配）；真实 store（[`FileSkillGovernanceStore`](crate::settings::store::FileSkillGovernanceStore)）覆盖之。
-    fn load_installed_plugins_intent(&self) -> InstalledPluginsIntent {
-        InstalledPluginsIntent::default()
-    }
+    /// **必需方法（#267 审查 🟡10）**：reconcile 的声明式 re-add 引用门依赖它 fail-closed；早期版本提供
+    /// 「默认返回空」的实现，未覆写的外部 store 会让该守卫静默 fail-open。v0.5.1 起移除默认实现（公开
+    /// trait 破坏面，见 release notes）——实现方必须给出真实安装意图快照。
+    fn load_installed_plugins_intent(&self) -> InstalledPluginsIntent;
     /// RMW 修改 `installed_plugins_intent.json` / Read-modify-write the install intent。默认 no-op（见上）。
     fn update_installed_plugins_intent(
         &self,
@@ -540,9 +540,9 @@ pub(crate) fn source_for_log(source: &Value) -> String {
 /// - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 [`prune_marketplaces`] 显式清）。
 ///
 /// 每个 declared marketplace 物化其 `enabledPlugins` 中**启用**的 plugin 的 SKILL；禁用 / 未声明 plugin 不注册。
-/// 失败降级：clone/pull 失败且 clone 树缺失 → 归 `failed`（降级）；clone 树仍在 → 沿用既有行为归
-/// `up_to_date` / `updated`。§5.14 拒绝（source 冲突 / refresh 改名 / re-add 悬挂引用）同样归 `failed`，但它
-/// **不是** clone/pull 失败——旧能力保持 active、不降级，见 [`ReconcileReport::failed`]。
+/// 失败降级：clone/pull / staged 回退失败 → 一律归 `failed`（可重试、已降级；clone 树仍在也不归 `updated`
+/// ——刷新失败不是「已更新」）。§5.14 拒绝（source 冲突 / refresh 改名 / re-add 悬挂引用）同样归 `failed`，
+/// 但它**不是** clone/pull 失败——旧能力保持 active、不降级，见 [`ReconcileReport::failed`]。
 ///
 /// **声明式 re-add 引用门**（#267）：账本 + clone 均缺失且 `installedPlugins` 安装意图仍指向该名 → 拒绝；
 /// 仅 `enabledPlugins` 残留不阻断（首次声明式安装的合法期望态）。
@@ -698,14 +698,18 @@ pub async fn reconcile(
                 report.failed.push(name.clone());
                 continue;
             }
-            // 非身份失败：保持既有降级语义（clone 树缺失 → failed；clone 在 + do_refresh → updated）。
+            // 非身份失败（fetch + staged 双失败 / I-O）：归 `failed`（可重试、已降级），与日志口径一致；
+            // 不得归 `updated`——刷新失败不是「已更新」。
             tracing::error!(
                 marketplace = %name,
                 error = %failure,
-                "reconcile: marketplace refresh/clone failed (degraded)"
+                "reconcile: marketplace refresh/clone failed (degraded; retryable)"
             );
+            report.failed.push(name.clone());
+            continue;
         }
 
+        // 成功路径分类（失败已在上面 continue）。
         if !clone_dir.exists() {
             report.failed.push(name.clone());
         } else if !present_before {
@@ -2984,10 +2988,10 @@ mod tests {
         );
     }
 
-    /// #267 审查 🟡：same-commit 复用路径不得被**工作树脏改动**绕过——本地把 clone 的清单改成
-    /// 改名版（上游 HEAD 未变）也必须拒绝，旧能力保留。
+    /// #267 审查 🟡3/🟡9：本地工作树被改成改名清单（上游 HEAD 未变）→ 不按脏内容注册；
+    /// 上游来料合法 → staged swap 自愈回 HEAD 内容（same-commit 替换，HEAD 不推进），baseline 保持 HEAD。
     #[tokio::test]
-    async fn reconcile_rejects_dirty_worktree_manifest_rename_267() {
+    async fn reconcile_heals_dirty_worktree_manifest_rename_267() {
         let tmp = TempDir::new().unwrap();
         let repo = make_marketplace_repo(tmp.path(), "from A");
         let home = tmp.path().join("home");
@@ -3005,7 +3009,7 @@ mod tests {
         let r1 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
         assert_eq!(r1.installed, vec!["acme".to_string()]);
 
-        // 本地脏改动 clone 的工作树清单（上游 HEAD 不变 → incoming_sha == head 的 same-commit 路径）。
+        // 本地脏改动 clone 的工作树清单（上游 HEAD 不变 → same-commit 路径）。
         let clone = marketplace_skill_dir(&home, "acme", &[]);
         let manifest = clone.join(".tfrobot-plugin/marketplace.json");
         let text = std::fs::read_to_string(&manifest)
@@ -3014,21 +3018,63 @@ mod tests {
         std::fs::write(&manifest, text).unwrap();
         let head = git_head(&clone);
 
-        let (logs, subscriber) = capture_subscriber();
-        let r2 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default())
-            .with_subscriber(subscriber)
-            .await;
-        assert_eq!(r2.failed, vec!["acme".to_string()]);
+        let r2 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r2.updated, vec!["acme".to_string()], "{r2:?}");
+        assert!(r2.failed.is_empty(), "{r2:?}");
+        // 工作树已自愈为 HEAD 清单（脏改名未被注册）。
+        let healed = std::fs::read_to_string(&manifest).unwrap();
         assert!(
-            logs.contents()
-                .contains("marketplace_manifest_name_changed"),
-            "{}",
-            logs.contents()
+            healed.contains("\"acme\"") && !healed.contains("acme-v2"),
+            "{healed}"
         );
         assert_eq!(
             reg.resolve("audit:code-review").unwrap().description,
             "from A"
         );
-        assert_eq!(git_head(&clone), head, "拒绝不得提交 / 推进");
+        assert_eq!(git_head(&clone), head, "同 commit 自愈不推进 HEAD");
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("acme"),
+            "baseline 以 HEAD 裁决"
+        );
+    }
+
+    /// #267 审查 🟡4：网络 / staged 双失败（clone 仍在）→ 归 `failed`（可重试、已降级），
+    /// 不得与日志矛盾地归 `updated`；旧内容/能力保留。
+    #[tokio::test]
+    async fn reconcile_refresh_network_failure_with_existing_clone_is_failed_267() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_marketplace_repo(tmp.path(), "from A");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url = format!("file://{}", repo.display());
+        let d = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {
+                "source": {"type": "git", "url": url},
+                "autoUpdate": true
+            }},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+        let r1 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r1.installed, vec!["acme".to_string()]);
+
+        // 上游不可达：fetch + staged clone 均失败，但本地 clone 仍在。
+        std::fs::remove_dir_all(&repo).unwrap();
+        let clone = marketplace_skill_dir(&home, "acme", &[]);
+        let head = git_head(&clone);
+        let r2 = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
+        assert_eq!(r2.failed, vec!["acme".to_string()], "{r2:?}");
+        assert!(r2.updated.is_empty(), "刷新失败不得归 updated: {r2:?}");
+        assert!(r2.installed.is_empty() && r2.up_to_date.is_empty());
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A",
+            "旧能力保持 active（降级）"
+        );
+        assert_eq!(git_head(&clone), head);
     }
 }

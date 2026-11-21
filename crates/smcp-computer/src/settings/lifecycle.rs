@@ -252,8 +252,14 @@ pub struct AddMarketplaceParams<'a> {
     /// 引用守卫的 cwd 锚（project/local `enabledPlugins`；`None` → 进程 cwd）。
     pub config_cwd: Option<&'a Path>,
     /// 引用守卫的 flag 层 settings 文件（`--settings`；`None` = 无 flag 层，#267）。
+    ///
+    /// `Computer::add_marketplace` 包装时由实例的 `normalized_flag_settings_path()` **覆盖**；本字段
+    /// 供自由函数调用方 / CLI / 测试注入。
     pub flag_settings_path: Option<&'a Path>,
     /// 引用守卫的 policy 层视图（`None` → 由 `env` 经 `resolve_policy_settings` 现解析，#267）。
+    ///
+    /// `Computer::add_marketplace` 包装时由实例 policy 视图**覆盖**（宿主不得注入空/过期视图绕过守卫）；
+    /// 本字段供自由函数调用方 / 测试注入（注入即视为 hermetic 测试来源）。
     pub policy_settings: Option<&'a Map<String, Value>>,
 }
 

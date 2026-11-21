@@ -479,3 +479,100 @@ pub async fn dispatch_skill<S: Session>(comp: &Computer<S>, parts: &[&str]) {
         other => msg_warn(&format!("unknown skill subcommand: {other}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::computer::SilentSession;
+    use crate::settings::store::load_known_marketplaces;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(args: &[&str], cwd: &Path) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn build_repo(repo: &Path, name: &str) -> String {
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            serde_json::json!({
+                "name": name,
+                "plugins": [{"name": "alpha", "source": "./plugins/alpha"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let skill = repo.join("plugins/alpha/skills/code-review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: repl flag guard\n---\nbody",
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        format!("file://{}", repo.display())
+    }
+
+    /// #267 审查 🟡7：REPL `marketplace add` 的 `--settings`（flag 层）引用守卫接线。
+    #[tokio::test]
+    async fn repl_marketplace_add_rejects_flag_layer_reference_267() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mp = format!("repl-flag-guard-267-{}", std::process::id());
+        let url = build_repo(&tmp.path().join("repo"), &mp);
+        let flag = tmp.path().join("flag-settings.json");
+        let mut enabled = serde_json::Map::new();
+        enabled.insert(format!("alpha@{mp}"), serde_json::Value::Bool(true));
+        let mut flag_settings = serde_json::Map::new();
+        flag_settings.insert(
+            "enabledPlugins".to_string(),
+            serde_json::Value::Object(enabled),
+        );
+        std::fs::write(&flag, serde_json::Value::Object(flag_settings).to_string()).unwrap();
+        let comp = Computer::new(
+            "c267repl",
+            SilentSession::new("s"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .with_skill_home(home.clone())
+        .with_flag_settings_path(&flag)
+        .with_blob_cache_root(tmp.path().join("blob"));
+
+        dispatch_marketplace(&comp, &["marketplace", "add", &url, "--trust"]).await;
+
+        assert!(
+            load_known_marketplaces(Some(&home), None)
+                .account
+                .marketplaces
+                .is_empty(),
+            "REPL add 必须消费 --settings 的引用（flag 层）"
+        );
+        assert!(
+            !home.join("marketplace").join(&mp).exists(),
+            "拒绝不得留下 clone"
+        );
+    }
+}

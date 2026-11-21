@@ -48,14 +48,19 @@ marketplace add <git-url> [--name <expected>] [--trust] [--auto-update] [--no-cl
 规则（#272 / #267）：
 
 - 清单名与基线一致 → 正常更新（CLI `updated` / `unchanged`；reconcile 归 `updated`；install 继续）。
-- **清单名变化 / 缺失 / 非法 / 损坏** → 提交前拒绝：旧注册、旧内容与旧能力保持不变，**不进入 degraded**，
+- **清单名变化 / 缺失 / 非法** → 提交前拒绝：旧注册、旧内容与旧能力保持不变，**不进入 degraded**，
   既有 `<plugin>@<old-name>` 引用不被静默重写。CLI 报 `rejected` + 诊断；reconcile 归 `failed` 并输出
-  `reason=marketplace_manifest_name_changed` / `_name_missing` / `_name_invalid` / `_manifest_unreadable`；
-  install 返回 `PluginInstallError::Staging` 并输出同一 `reason` 日志（发生在任何物化之前）。
+  `reason=marketplace_manifest_name_changed` / `_name_missing` / `_name_invalid`；install 返回
+  `PluginInstallError::Staging` 并输出同一 `reason` 日志（发生在任何物化之前）。
+- **清单存在但不可读 / 损坏** → 同样在提交前拒绝、旧内容保留；CLI 的行状态为 `unchanged` + 诊断
+  （`manifest_unreadable`，不是 `rejected`）；reconcile 归 `failed`（`_manifest_unreadable`）；install 返回
+  `Staging`。
 - legacy（无 `manifestNameBaseline`）首次成功 refresh → 记录基线（来料清单名）并保留旧名，给 advisory；
   之后再次改名才拒绝。**三个入口都会钉基线**（CLI/reconcile 经 recorder，install 预校验路径显式回写）。
-- 工作树清单同样受校验：本地脏改动 / 崩溃残留的改名清单不会被 same-commit 复用路径绕过。
-- 网络 / I-O 失败：CLI 维持逐行降级；reconcile 归 `failed`（clone 缺失）或 `updated`（clone 仍在）；
+- 工作树清单同样受校验，但**本地不合法不等于永久失败**：上游来料合法时经 staged swap 强制替换工作树
+  （自愈）；来料也不合法才拒绝；fetch 失败 + 本地不合法则 fail-closed 拒绝（不得让脏工作树进入物化）。
+  same-commit 复用的 baseline 以**来料/HEAD** 裁决，不用本地脏工作树裁决。
+- 网络 / I-O 失败：CLI 维持逐行降级；reconcile 归 `failed`（可重试、已降级，clone 仍在也不归 `updated`）；
   install 保留旧 catalog 继续安装（不应用未校验内容）。
 
 ## 4. 常见冲突示例
