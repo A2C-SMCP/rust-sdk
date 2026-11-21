@@ -1015,8 +1015,8 @@ pub(crate) async fn locate_plugin_root(
              (WARNING: cascades uninstall of ALL plugins from that marketplace and revokes its \
              trust; do NOT pass --keep-plugins), then 'marketplace add <git-url> --trust' (the \
              registered name comes from the manifest top-level name; if it differs from the old \
-             name, migrate references first -- see docs/computer/marketplace-identity.md; add \
-             --auto-update if it was set), reinstall each \
+             name, migrate references first with 'marketplace migrate' -- see \
+             docs/computer/marketplace-name-migration.md; add --auto-update if it was set), reinstall each \
              plugin per original scope (project/local: run inside the original project directory; \
              '--version' only restores the ledger version field, it does not pin content), and \
              'plugin enable <plugin>@<name>' for plugins previously enabled. See \

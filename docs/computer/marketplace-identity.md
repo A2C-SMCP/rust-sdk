@@ -85,5 +85,17 @@ marketplace add <git-url> [--name <expected>] [--trust] [--auto-update] [--no-cl
 
 升级后建议对 legacy 源执行一次 **`marketplace refresh`** 建立基线（辅助后续检测；`reconcile` 与
 `install{refresh:true}` 的首次成功 refresh 也会钉基线，但显式 refresh 最直观）。**真正的改名迁移**
-（把旧 URL 派生名统一为清单名、重写引用）见 #289；不要把 `remove` + `add` 当作无损迁移——旧
-`<plugin>@<old-name>` 引用会失效。
+（把旧 URL 派生名统一为清单名、重写引用）用 `marketplace migrate`（默认 dry-run，`--apply` 写入；
+#289）：
+
+```text
+marketplace migrate                  # dry-run：列出旧名 -> 清单名、冲突与手动项
+marketplace migrate --apply          # 迁移（离线；先停所有 Computer / python 实例）
+marketplace migrate --apply --update-declarations   # 同时改 user 的 extraKnownMarketplaces
+marketplace migrate --resume          # 中断后幂等续做
+marketplace migrate --rollback <ts>   # 按备份回滚
+```
+
+它会改写安装/启用意图、trust / blocked、secret 键与派生账本/catalog 目录；project/local 只报告。
+不要把 `remove` + `add` 当作无损迁移——旧 `<plugin>@<old-name>` 引用会失效。详见
+[存量 Marketplace 注册名迁移](marketplace-name-migration.md)。

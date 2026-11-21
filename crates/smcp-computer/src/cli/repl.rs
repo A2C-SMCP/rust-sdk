@@ -23,8 +23,8 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use super::commands::marketplace::{
-    marketplace_add, marketplace_info, marketplace_list, marketplace_refresh, marketplace_remove,
-    marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
+    marketplace_add, marketplace_info, marketplace_list, marketplace_migrate, marketplace_refresh,
+    marketplace_remove, marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
 };
 use super::commands::plugin::{
     plugin_disable, plugin_enable_with_paths, plugin_gc, plugin_info, plugin_install, plugin_list,
@@ -34,7 +34,7 @@ use super::commands::settings::{
     is_emit_key, settings_edit, settings_get, settings_set, settings_show,
 };
 use super::commands::skill::{skill_info, skill_list};
-use super::commands::{flag_value, msg_warn, CliMcpHooks, Confirm, EXIT_OK};
+use super::commands::{flag_value, msg_warn, CliMcpHooks, Confirm, EXIT_OK, EXIT_PARTIAL};
 use super::progress::clone_spinner;
 use crate::computer::{Computer, Session};
 use crate::settings::reconciler::McpTeardown;
@@ -199,6 +199,22 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
             }
             let (key, value) = pos[1].split_once('=').unwrap_or((pos[1].as_str(), ""));
             marketplace_set(&home, None, &pos[0], key, value, json);
+        }
+        "migrate" => {
+            // 离线迁移：REPL 里也提醒先停止其它实例；--rollback 取 flag 值。
+            let rollback = flag_value(&args, "--rollback");
+            let code = marketplace_migrate(
+                &home,
+                None,
+                has_flag(&args, "--apply"),
+                has_flag(&args, "--update-declarations"),
+                has_flag(&args, "--resume"),
+                rollback.as_deref(),
+                json,
+            );
+            if code == EXIT_OK || code == EXIT_PARTIAL {
+                comp.mark_skills_dirty();
+            }
         }
         other => msg_warn(&format!("unknown marketplace subcommand: {other}")),
     }

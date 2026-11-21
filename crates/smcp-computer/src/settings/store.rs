@@ -241,7 +241,7 @@ fn lock_sidecar_path(data_path: &Path) -> PathBuf {
 ///
 /// 被占时按**指数退避**重试 `retries` 次（每次 WARN，延迟封顶 `backoff_max`）；仍拿不到 → 返回
 /// [`SettingsStoreError::Lock`]（fail-fast，绝不无锁写）。`work` 在持锁期间执行，返回后锁释放。
-fn with_file_lock<T>(
+pub(crate) fn with_file_lock<T>(
     data_path: &Path,
     retries: u32,
     backoff_base: Duration,
@@ -347,6 +347,29 @@ fn backup_corrupt(path: &Path) -> Option<PathBuf> {
             );
             None
         }
+    }
+}
+
+/// 读取 JSONC 物化文件（容错前导 `//` 头）**严格只读**：损坏 → Err，不改名/不备份。
+///
+/// 供迁移预检使用：现有 [`read_jsonc_with_recovery`] 会在损坏时 `backup_corrupt`（写入），
+/// 破坏「冲突/损坏时零写入」的保证。
+fn read_jsonc_strict(path: &Path) -> Result<Option<Map<String, Value>>, SettingsStoreError> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SettingsStoreError::io(path, e)),
+    };
+    match serde_json::from_str::<Value>(&strip_jsonc_header(&raw)) {
+        Ok(Value::Object(map)) => Ok(Some(map)),
+        Ok(_) => Err(SettingsStoreError::io(
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, "root is not an object"),
+        )),
+        Err(e) => Err(SettingsStoreError::io(
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, format!("corrupt JSON: {e}")),
+        )),
     }
 }
 
@@ -564,6 +587,44 @@ pub fn load_installed_plugins_intent(
     }
 }
 
+/// 严格只读加载 `known_marketplaces.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+///
+/// 迁移预检专用（零写入保证）；日常读取仍用 [`load_known_marketplaces`]（容错 + 损坏降级）。
+pub(crate) fn load_known_marketplaces_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    let path = known_marketplaces_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => Ok(coerce_known_marketplaces(&data, &path)),
+        None => Ok(empty_known_marketplaces()),
+    }
+}
+
+/// 严格只读加载 `installed_plugins.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+pub(crate) fn load_installed_plugins_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginsFile, SettingsStoreError> {
+    let path = installed_plugins_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => Ok(coerce_installed_plugins(&data, &path)),
+        None => Ok(empty_installed_plugins()),
+    }
+}
+
+/// 严格只读加载 `installed_plugins_intent.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+pub(crate) fn load_installed_plugins_intent_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    let path = installed_plugins_intent_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => Ok(coerce_installed_plugins_intent(&data, &path)),
+        None => Ok(empty_installed_plugins_intent()),
+    }
+}
+
 /// 加锁 + 原子写 `known_marketplaces.json`（带写保护头 + `version`）/ Locked atomic write。
 ///
 /// ⚠️ **不可**在已持有 `with_file_lock` 的上下文内调用；读-改-写请改用 [`update_known_marketplaces`]。
@@ -681,6 +742,37 @@ pub fn update_installed_plugins(
             current.version = MATERIALIZED_VERSION;
             atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
             Ok(current)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 持锁 read-check-write `installed_plugins.json`（仿 [`update_known_marketplaces_checked`]）。
+///
+/// `work` 在文件锁内执行并返回 `(值, 是否持久化)`；供迁移在锁内复核目标 pid 后决定写入，
+/// 避免「无变化也重写」与跨进程 TOCTOU。
+pub(crate) fn update_installed_plugins_checked<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut InstalledPluginsFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
+    let path = installed_plugins_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<T> {
+            let mut current = match read_jsonc_with_recovery(&path) {
+                Some(data) => coerce_installed_plugins(&data, &path),
+                None => empty_installed_plugins(),
+            };
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
         },
     )?
     .map_err(|e| SettingsStoreError::io(&path, e))
