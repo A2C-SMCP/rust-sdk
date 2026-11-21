@@ -31,8 +31,8 @@ pub mod repl;
 mod utils;
 
 use commands::marketplace::{
-    marketplace_add, marketplace_info, marketplace_list, marketplace_refresh, marketplace_remove,
-    marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
+    marketplace_add, marketplace_info, marketplace_list, marketplace_migrate, marketplace_refresh,
+    marketplace_remove, marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
 };
 use commands::plugin::{
     plugin_disable, plugin_enable, plugin_gc, plugin_info, plugin_install, plugin_list,
@@ -194,6 +194,25 @@ pub enum MarketplaceCmd {
     Set {
         name: String,
         assignment: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Migrate legacy marketplace registration names to the manifest top-level name.
+    ///
+    /// Dry-run by default; `--apply` writes. Offline: stop all Computer/python instances first.
+    Migrate {
+        /// Write changes (default is a zero-write dry-run).
+        #[arg(long)]
+        apply: bool,
+        /// Also rewrite user-scope `extraKnownMarketplaces` (project/local stay report-only).
+        #[arg(long, conflicts_with_all = ["resume", "rollback"])]
+        update_declarations: bool,
+        /// Resume an interrupted migration journal.
+        #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+        resume: bool,
+        /// Roll back a previous migration by backup timestamp.
+        #[arg(long, value_name = "TIMESTAMP", conflicts_with_all = ["apply", "resume"])]
+        rollback: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -396,6 +415,27 @@ fn migrate_governance_once(home: &Path) {
 // ── 非交互子命令分发（不 boot Computer；离线 registry）/ non-interactive dispatch ──
 async fn dispatch_marketplace(action: MarketplaceCmd, root: &RootState) -> i32 {
     let home = skill_home();
+    // #289：migrate 是离线事务，不跑 v0.3.0 账本迁移、不重建 registry（事务边界外零写入）。
+    let action = match action {
+        MarketplaceCmd::Migrate {
+            apply,
+            update_declarations,
+            resume,
+            rollback,
+            json,
+        } => {
+            return marketplace_migrate(
+                &home,
+                None,
+                apply,
+                update_declarations,
+                resume,
+                rollback.as_deref(),
+                json,
+            );
+        }
+        other => other,
+    };
     migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
     match action {
@@ -471,6 +511,8 @@ async fn dispatch_marketplace(action: MarketplaceCmd, root: &RootState) -> i32 {
                 .unwrap_or((assignment.as_str(), ""));
             marketplace_set(&home, None, &name, key, value, json)
         }
+        // 已在函数开头提前返回（离线事务，不跑治理迁移/registry 重建）。
+        MarketplaceCmd::Migrate { .. } => unreachable!("handled before dispatch prelude"),
     }
 }
 

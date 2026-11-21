@@ -27,6 +27,7 @@
 pub mod config;
 pub mod installer;
 pub mod lifecycle;
+pub mod marketplace_migration;
 pub mod mcp_config;
 pub mod policy;
 pub(crate) mod raw_write;
@@ -51,6 +52,14 @@ pub use lifecycle::{
     AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceAddRequest,
     MarketplaceRefreshDiagnostic, MarketplaceRefreshRow, MarketplaceRemoveOutcome,
     RefreshDiagnosticCode, RefreshStatus, RemoveMarketplaceParams,
+};
+
+pub use marketplace_migration::{
+    apply_marketplace_name_migration, plan_marketplace_name_migration,
+    resume_marketplace_name_migration, rollback_marketplace_name_migration, BackupRef, EnvRename,
+    ManualReference, MarketplaceMigrationError, MarketplaceMigrationOptions,
+    MarketplaceMigrationPlan, MarketplaceMigrationReport, MarketplaceRollbackReport,
+    MigrationAction, MigrationConflict, MigrationItem, MigrationReason, MigrationStatus,
 };
 
 pub use mcp_config::{

@@ -481,3 +481,24 @@ a2c> notify update
 2. `marketplace remove <name>`（默认级联卸载该 marketplace 下**所有**已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
 3. `marketplace add <git-url> --trust`（重新 clone 并重新授予 trust；**注册名取清单顶层 `name`，`--name` 仅作期望名校验、不再改名**，清单名与旧名不同会导致旧 `<plugin>@<old-name>` 引用失效——见 [Marketplace 身份模型](./marketplace-identity.md)；原来开过 auto-update 的加 `--auto-update`）
 4. 逐一按原 scope `plugin install <plugin>@<name> --scope <scope>`——缺省 user；多 scope 每个 scope 各装一次；project/local 须在原项目目录执行（cwd 即 projectPath）；`--version` 仅恢复账本字段、不锁定内容。此前启用过的再 `plugin enable <plugin>@<name>`
+
+## 11. Marketplace 注册名迁移（#289）
+
+0.5.1 之前注册的 marketplace 可能保留了旧注册名（URL 派生名 / `--name` 别名）。用
+`marketplace migrate` 迁移到清单顶层 `name`（默认 dry-run）：
+
+```text
+marketplace migrate                                   # 只列出计划，零写入
+marketplace migrate --apply                           # 执行（离线；先停所有 Computer）
+marketplace migrate --apply --update-declarations     # 同时改 user 的 extraKnownMarketplaces
+marketplace migrate --resume                          # 中断后幂等续做
+marketplace migrate --rollback <timestamp>            # 按备份回滚
+```
+
+- 退出码：`0` 成功/无操作；`1` 冲突或命令级错误；`3` 部分完成（unresolved/blocked/keyring 不可用/
+  project-local 启用项将失活或 trust/blocked 旧名失效）。
+- `--json` 输出 `dryRun` / `written` / `status` / `items` / `conflicts` / `manualReferences` /
+  `backup` / `corrupt`；apply 报告另含 `warnings`，rollback 报告含 `restored` / `notes` / `warnings`。
+- project/local/policy/flag 的引用只报告；`extraKnownMarketplaces` 仅 `--update-declarations` 改
+  **user** scope。REPL 内只允许 dry-run（`--apply` / `--resume` / `--rollback` 请在 shell 执行）。
+- 完整说明见 [存量 Marketplace 注册名迁移](marketplace-name-migration.md)。

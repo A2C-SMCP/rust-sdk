@@ -699,9 +699,358 @@ pub fn marketplace_set(
     ok_msg(&format!("{display_name:?} auto-update set to {val}"))
 }
 
+/// `marketplace migrate`：存量注册名迁移（#289）。
+///
+/// 默认 dry-run（零写入）；`--apply` 写入；`--resume` 续做未完成 journal；`--rollback <ts>` 还原。
+/// **离线迁移**：不 clone、不触网；执行前请停止所有 Computer / python 实例。
+pub fn marketplace_migrate(
+    home: &Path,
+    env: Option<&EnvMap>,
+    apply: bool,
+    update_declarations: bool,
+    resume: bool,
+    rollback: Option<&str>,
+    json_output: bool,
+) -> i32 {
+    use crate::inputs::secret_store::SecretStore;
+    use crate::settings::marketplace_migration::{
+        apply_marketplace_name_migration, plan_marketplace_name_migration,
+        resume_marketplace_name_migration, rollback_marketplace_name_migration,
+        MarketplaceMigrationOptions,
+    };
+
+    let secrets = SecretStore::new();
+    let cwd = std::env::current_dir().ok();
+    let write_operation = apply || resume || rollback.is_some();
+    if write_operation {
+        eprintln!(
+            "warning: marketplace migrate is offline; stop all Computer/python instances before applying"
+        );
+    }
+    if let Some(timestamp) = rollback {
+        return match rollback_marketplace_name_migration(home, env, timestamp, &secrets) {
+            Ok(report) => {
+                if json_output {
+                    let mut value = serde_json::to_value(&report).unwrap_or(Value::Null);
+                    print_json(redact_migration_json(&mut value));
+                } else {
+                    for name in &report.restored {
+                        ok_msg(&format!(
+                            "restored marketplace {:?}",
+                            untrusted_name_for_display(name)
+                        ));
+                    }
+                    for note in &report.notes {
+                        eprintln!("note: {}", untrusted_name_for_display(note));
+                    }
+                    for warning in &report.warnings {
+                        eprintln!("warning: {}", untrusted_name_for_display(warning));
+                    }
+                }
+                if report.warnings.is_empty() {
+                    EXIT_OK
+                } else {
+                    super::EXIT_PARTIAL
+                }
+            }
+            Err(e) => err(
+                &format!("marketplace migrate --rollback failed: {e}"),
+                json_output,
+                EXIT_USER_ERROR,
+            ),
+        };
+    }
+    if resume {
+        return match resume_marketplace_name_migration(home, env, cwd.as_deref(), &secrets) {
+            Ok(report) => emit_migration_report(&report, json_output),
+            Err(e) => err(
+                &format!("marketplace migrate --resume failed: {e}"),
+                json_output,
+                EXIT_USER_ERROR,
+            ),
+        };
+    }
+    let options = MarketplaceMigrationOptions {
+        update_declarations,
+    };
+    if apply {
+        return match apply_marketplace_name_migration(home, env, cwd.as_deref(), options, &secrets)
+        {
+            Ok(report) => emit_migration_report(&report, json_output),
+            Err(e) => err(
+                &format!("marketplace migrate --apply failed: {e}"),
+                json_output,
+                EXIT_USER_ERROR,
+            ),
+        };
+    }
+    match plan_marketplace_name_migration(home, env, cwd.as_deref(), options, &secrets) {
+        Ok(plan) => emit_migration_plan(&plan, json_output),
+        Err(e) => err(
+            &format!("marketplace migrate failed: {e}"),
+            json_output,
+            EXIT_USER_ERROR,
+        ),
+    }
+}
+
+fn emit_migration_plan(
+    plan: &crate::settings::marketplace_migration::MarketplaceMigrationPlan,
+    json_output: bool,
+) -> i32 {
+    use crate::settings::marketplace_migration::{MigrationAction, MigrationStatus};
+    let status = if !plan.conflicts.is_empty() {
+        MigrationStatus::Conflicts
+    } else if plan.corrupt.is_some()
+        || plan.items.iter().any(|i| {
+            !matches!(
+                i.action,
+                MigrationAction::Rename | MigrationAction::BaselineOnly | MigrationAction::NoOp
+            )
+        })
+        || plan
+            .manual
+            .iter()
+            .any(|m| matches!(m.effect.as_str(), "will-be-inactive" | "stale-trust"))
+    {
+        MigrationStatus::Partial
+    } else {
+        MigrationStatus::Ok
+    };
+    if json_output {
+        let mut value = json!({
+            "dryRun": true,
+            "written": false,
+            "status": status,
+            "items": plan.items,
+            "conflicts": plan.conflicts,
+            "manualReferences": plan.manual,
+            "backup": null,
+            "corrupt": plan.corrupt,
+        });
+        print_json(redact_migration_json(&mut value));
+    } else {
+        println!("Marketplace registration migration (dry-run):");
+        for item in &plan.items {
+            let old = untrusted_name_for_display(&item.old_name);
+            let new = item
+                .new_name
+                .as_deref()
+                .map(untrusted_name_for_display)
+                .unwrap_or_else(|| "—".to_string());
+            println!(
+                "  {:<9} {} -> {}  source={}  plugins={}  secrets={}",
+                action_label(item.action),
+                old,
+                new,
+                item.source,
+                item.plugins.len(),
+                item.secrets
+            );
+            if let Some(reason) = item.reason {
+                println!("            reason: {}", reason_label(reason));
+            }
+        }
+        for conflict in &plan.conflicts {
+            msg_dim(&format!(
+                "  conflict  {} ({} -> {})",
+                conflict.kind,
+                untrusted_name_for_display(&conflict.old_name),
+                conflict
+                    .new_name
+                    .as_deref()
+                    .map(untrusted_name_for_display)
+                    .unwrap_or_else(|| "—".to_string())
+            ));
+        }
+        for manual in &plan.manual {
+            let line = format!(
+                "  manual    {} {} ({}) -> {}",
+                manual.file,
+                untrusted_name_for_display(&manual.pointer),
+                manual.effect,
+                untrusted_name_for_display(&manual.suggested)
+            );
+            // 迁移后必须人工处理的引用（失活 / 失效 trust）走 stderr 告警，不能只藏在 dim 输出里。
+            if matches!(manual.effect.as_str(), "will-be-inactive" | "stale-trust") {
+                eprintln!("warning:{line}");
+            } else {
+                msg_dim(&line);
+            }
+        }
+        if let Some(corrupt) = &plan.corrupt {
+            eprintln!("error: {}", untrusted_name_for_display(corrupt));
+        }
+        if plan.items.is_empty() && plan.conflicts.is_empty() && plan.corrupt.is_none() {
+            msg_dim("nothing to migrate");
+        } else if plan.conflicts.is_empty()
+            && plan.corrupt.is_none()
+            && plan.items.iter().any(|i| {
+                matches!(
+                    i.action,
+                    MigrationAction::Rename | MigrationAction::BaselineOnly
+                )
+            })
+        {
+            msg_dim("dry-run: no changes written; rerun with --apply to migrate");
+        }
+    }
+    status_exit(status)
+}
+
+fn emit_migration_report(
+    report: &crate::settings::marketplace_migration::MarketplaceMigrationReport,
+    json_output: bool,
+) -> i32 {
+    if json_output {
+        let mut value = serde_json::to_value(report).unwrap_or(Value::Null);
+        print_json(redact_migration_json(&mut value));
+    } else {
+        println!("Marketplace registration migration:");
+        if !report.conflicts.is_empty() {
+            eprintln!("error: conflicts detected; no changes were written");
+        }
+        for item in &report.items {
+            let old = untrusted_name_for_display(&item.old_name);
+            let new = item
+                .new_name
+                .as_deref()
+                .map(untrusted_name_for_display)
+                .unwrap_or_else(|| "—".to_string());
+            println!(
+                "  {:<9} {} -> {}  source={}  plugins={}  secrets={}",
+                action_label(item.action),
+                old,
+                new,
+                item.source,
+                item.plugins.len(),
+                item.secrets
+            );
+            if let Some(reason) = item.reason {
+                println!("            reason: {}", reason_label(reason));
+            }
+        }
+        for conflict in &report.conflicts {
+            msg_dim(&format!(
+                "  conflict  {} ({} -> {})",
+                conflict.kind,
+                untrusted_name_for_display(&conflict.old_name),
+                conflict
+                    .new_name
+                    .as_deref()
+                    .map(untrusted_name_for_display)
+                    .unwrap_or_else(|| "—".to_string())
+            ));
+        }
+        for manual in &report.manual {
+            eprintln!(
+                "warning: {} {} ({}) -> {}",
+                manual.file,
+                untrusted_name_for_display(&manual.pointer),
+                manual.effect,
+                untrusted_name_for_display(&manual.suggested)
+            );
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {}", untrusted_name_for_display(warning));
+        }
+        if let Some(backup) = &report.backup {
+            msg_dim(&format!(
+                "backup: {} (keep it for manual rollback: --rollback {})",
+                backup.path, backup.timestamp
+            ));
+        }
+        if let Some(corrupt) = &report.corrupt {
+            eprintln!("error: {}", untrusted_name_for_display(corrupt));
+        }
+        if report.items.is_empty() && report.conflicts.is_empty() && report.corrupt.is_none() {
+            msg_dim("nothing to migrate");
+        }
+    }
+    status_exit(report.status())
+}
+
+fn status_exit(status: crate::settings::marketplace_migration::MigrationStatus) -> i32 {
+    use crate::settings::marketplace_migration::MigrationStatus;
+    match status {
+        MigrationStatus::Ok => EXIT_OK,
+        MigrationStatus::Conflicts => EXIT_USER_ERROR,
+        MigrationStatus::Partial => super::EXIT_PARTIAL,
+    }
+}
+
+fn action_label(action: crate::settings::marketplace_migration::MigrationAction) -> &'static str {
+    use crate::settings::marketplace_migration::MigrationAction;
+    match action {
+        MigrationAction::Rename => "rename",
+        MigrationAction::BaselineOnly => "baseline",
+        MigrationAction::NoOp => "no-op",
+        MigrationAction::Unresolved => "unresolved",
+        MigrationAction::Blocked => "blocked",
+    }
+}
+
+/// 迁移 JSON 展示脱敏：legacy 旧名可能内嵌凭据（#285），所有名称/指针/详情走公开脱敏边界。
+fn redact_migration_json(value: &mut Value) -> &mut Value {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "oldName" | "newName" | "suggested" | "pointer" | "detail" | "corrupt"
+                ) {
+                    if let Some(text) = child.as_str() {
+                        *child = Value::String(untrusted_name_for_display(text));
+                    }
+                } else if matches!(key.as_str(), "restored" | "warnings") {
+                    if let Value::Array(items) = child {
+                        for item in items {
+                            if let Some(text) = item.as_str() {
+                                *item = Value::String(untrusted_name_for_display(text));
+                            }
+                        }
+                    } else if let Some(text) = child.as_str() {
+                        *child = Value::String(untrusted_name_for_display(text));
+                    }
+                } else {
+                    redact_migration_json(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_migration_json(child);
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+fn reason_label(reason: crate::settings::marketplace_migration::MigrationReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migration_json_redacts_names_restored_and_warnings() {
+        let mut value = json!({
+            "items": [{"oldName": "user:pass@host", "newName": "team-tools", "detail": "x user:pass@host"}],
+            "manualReferences": [{"pointer": "/enabledPlugins/alpha@user:pass@host",
+                                  "suggested": "alpha@user:pass@host"}],
+            "restored": ["user:pass@host"],
+            "warnings": ["failed to restore user:pass@host/token"],
+            "corrupt": "marketplaces entry \"https://user:pass@host/repo.git\" is invalid"
+        });
+        let redacted = redact_migration_json(&mut value).to_string();
+        assert!(!redacted.contains("pass"), "credentials leaked: {redacted}");
+    }
+
     use crate::cli::commands::test_env;
     use async_trait::async_trait;
     use tempfile::tempdir;

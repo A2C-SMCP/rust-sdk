@@ -241,7 +241,7 @@ fn lock_sidecar_path(data_path: &Path) -> PathBuf {
 ///
 /// 被占时按**指数退避**重试 `retries` 次（每次 WARN，延迟封顶 `backoff_max`）；仍拿不到 → 返回
 /// [`SettingsStoreError::Lock`]（fail-fast，绝不无锁写）。`work` 在持锁期间执行，返回后锁释放。
-fn with_file_lock<T>(
+pub(crate) fn with_file_lock<T>(
     data_path: &Path,
     retries: u32,
     backoff_base: Duration,
@@ -347,6 +347,29 @@ fn backup_corrupt(path: &Path) -> Option<PathBuf> {
             );
             None
         }
+    }
+}
+
+/// 读取 JSONC 物化文件（容错前导 `//` 头）**严格只读**：损坏 → Err，不改名/不备份。
+///
+/// 供迁移预检使用：现有 [`read_jsonc_with_recovery`] 会在损坏时 `backup_corrupt`（写入），
+/// 破坏「冲突/损坏时零写入」的保证。
+fn read_jsonc_strict(path: &Path) -> Result<Option<Map<String, Value>>, SettingsStoreError> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SettingsStoreError::io(path, e)),
+    };
+    match serde_json::from_str::<Value>(&strip_jsonc_header(&raw)) {
+        Ok(Value::Object(map)) => Ok(Some(map)),
+        Ok(_) => Err(SettingsStoreError::io(
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, "root is not an object"),
+        )),
+        Err(e) => Err(SettingsStoreError::io(
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, format!("corrupt JSON: {e}")),
+        )),
     }
 }
 
@@ -528,6 +551,134 @@ fn coerce_installed_plugins_intent(
 }
 
 // ===========================================================================
+// 严格只读规整（迁移预检用；结构损坏 → Err，不静默降级）/ Strict coercion
+// ===========================================================================
+/// 存储层接受的 plugin id：no-`@` 视为 local-only 透传；含 `@` 必须是合法 `<plugin>@<marketplace>`。
+fn is_acceptable_stored_plugin_id(pid: &str) -> bool {
+    if pid.is_empty() {
+        false
+    } else if pid.contains('@') {
+        is_valid_enabled_plugin_key(pid)
+    } else {
+        true
+    }
+}
+
+fn strict_coerce_err(path: &Path, reason: impl Into<String>) -> SettingsStoreError {
+    SettingsStoreError::io(
+        path,
+        io::Error::new(io::ErrorKind::InvalidData, reason.into()),
+    )
+}
+
+fn coerce_known_marketplaces_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    let account = match data.get("marketplaces") {
+        Some(Value::Object(map)) => {
+            let mut marketplaces = indexmap::IndexMap::new();
+            for (name, value) in map {
+                let display = crate::settings::redaction::untrusted_name_for_display(name);
+                let entry: KnownMarketplaceEntry =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        strict_coerce_err(
+                            path,
+                            format!("marketplaces entry {display:?} is invalid"),
+                        )
+                    })?;
+                marketplaces.insert(name.clone(), entry);
+            }
+            KnownMarketplaces { marketplaces }
+        }
+        Some(Value::Null) | None => KnownMarketplaces::default(),
+        Some(_) => {
+            return Err(strict_coerce_err(
+                path,
+                "field 'marketplaces' is not an object",
+            ))
+        }
+    };
+    Ok(KnownMarketplacesFile {
+        version: MATERIALIZED_VERSION,
+        account,
+    })
+}
+
+fn coerce_installed_plugins_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<InstalledPluginsFile, SettingsStoreError> {
+    let account = match data.get("plugins") {
+        Some(Value::Object(map)) => {
+            let mut plugins = indexmap::IndexMap::new();
+            for (pid, value) in map {
+                if !is_acceptable_stored_plugin_id(pid) {
+                    let display = crate::settings::redaction::untrusted_name_for_display(pid);
+                    return Err(strict_coerce_err(
+                        path,
+                        format!("plugins key {display:?} is not a valid plugin id"),
+                    ));
+                }
+                let display = crate::settings::redaction::untrusted_name_for_display(pid);
+                let records: Vec<crate::settings::reconciler::InstalledPluginRecord> =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        strict_coerce_err(path, format!("plugins entry {display:?} is invalid"))
+                    })?;
+                plugins.insert(pid.clone(), records);
+            }
+            InstalledPlugins { plugins }
+        }
+        Some(Value::Null) | None => InstalledPlugins::default(),
+        Some(_) => return Err(strict_coerce_err(path, "field 'plugins' is not an object")),
+    };
+    Ok(InstalledPluginsFile {
+        version: MATERIALIZED_VERSION,
+        account,
+    })
+}
+
+fn coerce_installed_plugins_intent_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    let mut set: IndexSet<String> = IndexSet::new();
+    match data.get("installedPlugins") {
+        Some(Value::Array(arr)) => {
+            for value in arr {
+                let Some(pid) = value.as_str() else {
+                    return Err(strict_coerce_err(
+                        path,
+                        "installedPlugins contains a non-string entry",
+                    ));
+                };
+                if !is_acceptable_stored_plugin_id(pid) {
+                    let display = crate::settings::redaction::untrusted_name_for_display(pid);
+                    return Err(strict_coerce_err(
+                        path,
+                        format!("installedPlugins contains an invalid plugin id {display:?} (expect '<plugin>@<marketplace>')"),
+                    ));
+                }
+                set.insert(pid.to_string());
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => {
+            return Err(strict_coerce_err(
+                path,
+                "field 'installedPlugins' is not an array",
+            ))
+        }
+    }
+    Ok(InstalledPluginsIntentFile {
+        version: MATERIALIZED_VERSION,
+        account: InstalledPluginsIntent {
+            installed_plugins: set,
+        },
+    })
+}
+
+// ===========================================================================
 // 高层读写 / High-level load & save
 // ===========================================================================
 /// 加载 `known_marketplaces.json`（缺失 / 损坏 → 空配置）/ Load known_marketplaces.json。
@@ -561,6 +712,44 @@ pub fn load_installed_plugins_intent(
     match read_jsonc_with_recovery(&path) {
         Some(data) => coerce_installed_plugins_intent(&data, &path),
         None => empty_installed_plugins_intent(),
+    }
+}
+
+/// 严格只读加载 `known_marketplaces.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+///
+/// 迁移预检专用（零写入保证）；日常读取仍用 [`load_known_marketplaces`]（容错 + 损坏降级）。
+pub(crate) fn load_known_marketplaces_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    let path = known_marketplaces_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => coerce_known_marketplaces_strict(&data, &path),
+        None => Ok(empty_known_marketplaces()),
+    }
+}
+
+/// 严格只读加载 `installed_plugins.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+pub(crate) fn load_installed_plugins_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginsFile, SettingsStoreError> {
+    let path = installed_plugins_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => coerce_installed_plugins_strict(&data, &path),
+        None => Ok(empty_installed_plugins()),
+    }
+}
+
+/// 严格只读加载 `installed_plugins_intent.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+pub(crate) fn load_installed_plugins_intent_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    let path = installed_plugins_intent_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => coerce_installed_plugins_intent_strict(&data, &path),
+        None => Ok(empty_installed_plugins_intent()),
     }
 }
 
@@ -681,6 +870,99 @@ pub fn update_installed_plugins(
             current.version = MATERIALIZED_VERSION;
             atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
             Ok(current)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+fn store_error_to_io(error: SettingsStoreError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// 严格版 `installed_plugins` checked RMW：损坏状态 fail-closed（不触发 `.corrupt` 改名）。
+pub(crate) fn update_installed_plugins_checked_strict<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut InstalledPluginsFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
+    let path = installed_plugins_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<T> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => {
+                    coerce_installed_plugins_strict(&data, &path).map_err(store_error_to_io)?
+                }
+                None => empty_installed_plugins(),
+            };
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 严格版 `known_marketplaces` checked RMW：损坏状态 fail-closed。
+pub(crate) fn update_known_marketplaces_checked_strict<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut KnownMarketplacesFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
+    let path = known_marketplaces_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<T> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => {
+                    coerce_known_marketplaces_strict(&data, &path).map_err(store_error_to_io)?
+                }
+                None => empty_known_marketplaces(),
+            };
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 严格版 intent 可中止 RMW：损坏状态 fail-closed。
+pub(crate) fn try_update_installed_plugins_intent_strict(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile) -> bool,
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<Option<InstalledPluginsIntentFile>, SettingsStoreError> {
+    let path = installed_plugins_intent_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<Option<InstalledPluginsIntentFile>> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => coerce_installed_plugins_intent_strict(&data, &path)
+                    .map_err(store_error_to_io)?,
+                None => empty_installed_plugins_intent(),
+            };
+            if !mutator(&mut current) {
+                return Ok(None);
+            }
+            current.version = MATERIALIZED_VERSION;
+            atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            Ok(Some(current))
         },
     )?
     .map_err(|e| SettingsStoreError::io(&path, e))

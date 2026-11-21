@@ -56,6 +56,8 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_USER_ERROR: i32 = 1;
 /// 网络错（clone/stage 失败）/ network error。
 pub const EXIT_NETWORK_ERROR: i32 = 2;
+/// 部分完成（marketplace migrate 有 unresolved/blocked/失活诊断）/ partial migration。
+pub const EXIT_PARTIAL: i32 = 3;
 
 // ── 输出辅助 / output helpers ────────────────────────────────────────────────
 /// 结构化 JSON 输出（`--json`）/ pretty-print a JSON value。
