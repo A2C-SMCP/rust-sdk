@@ -103,12 +103,12 @@ D1 已退役明文存储，无迁移面；env 注入值（`A2C_SMCP_<ENV_SEGMENT
 - `--apply` 遇残留 journal → 报错并提示 `--resume` / `--rollback`；`--resume` 以 **journal 的
   old/new 映射**驱动（崩溃后旧目录可能已不在，不重新按旧名检测），每步先复查磁盘成员关系；
   续做前校验当前文件 hash == pre-hash 或最近 post-hash，否则拒绝（并发修改）。
-- `--rollback <timestamp>`：journal 处于 prepared/running 时拒绝（先 resume）；校验当前文件 hash ==
-  迁移后 post-hash（未被迁移写过的文件 == pre-hash），不符 → `RollbackDrift` 不覆盖用户改动；
-  反向 rename（外部树先、clone 后）+ 还原四份权威文件 + secret 反写（new→old，keyring 不可用则告警
-  exit 3）。`--rollback` 对 prepared/applying 的中断态也可执行：跳过漂移校验、恢复预迁移备份并
+- `--rollback <timestamp>`：done/aborted 状态校验当前文件 hash == 迁移后 post-hash（未被迁移写过的
+  文件 == pre-hash），不符 → `RollbackDrift` 不覆盖用户改动；prepared/applying 中断态也可执行：
+  要求 journal.timestamp == 请求的 backup（防旧备份覆盖在途迁移），跳过漂移校验、恢复预迁移备份 +
   反向 rename（会丢弃迁移自身的半写；用户需在 resume/rollback 之间二选一，勿先行编辑）。
-  备份永久保留，文档说明手动清理。
+  反向 rename（外部树先、clone 后）+ 还原四份权威文件 + secret 反写（new→old，keyring 不可用则告警
+  exit 3）。备份永久保留，文档说明手动清理。
 
 ## 6. CLI / UX
 
@@ -151,8 +151,8 @@ smcp-computer marketplace migrate [--apply] [--update-declarations] [--json]
   全量 apply、幂等、冲突四类、离线 grandfather、baseline mismatch、secret 重键 / keyring 不可用 /
   目标键冲突、installPath 越界、损坏状态零写、多 scope + 未知字段保真、外部树改名、同源合并、
   大小写冲突、rollback。
-- 模块单测（13）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
-  resume、rollback drift。
+- 模块单测（15）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
+  resume、rollback drift、半 seed 恢复、seed 窗口外来 intent 拒绝。
 - CLI 级（10）：`crates/smcp-computer/tests/marketplace_name_migration_cli_test.rs`——默认 dry-run、
   apply + backup、冲突 exit 1、unresolved exit 3、resume 无 journal exit 1、rollback、help flags、
   user settings 隔离、cwd project 诊断（exit 3）。

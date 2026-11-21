@@ -1448,6 +1448,8 @@ fn local_only_intent_ids_are_preserved() {
     let home = home_of(&td);
     let env = env_of(&td);
     seed_marketplace(&home, "old-name", "team-tools", &[]);
+    // local-only 可能只存在于 ledger（boot 迁移产物）。
+    seed_ledger(&home, "local-only", "/tmp/local-only", "user", None);
     let intent_path = installed_plugins_intent_path(Some(&home), Some(&env));
     fs::write(
         &intent_path,

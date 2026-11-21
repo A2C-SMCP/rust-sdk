@@ -579,8 +579,14 @@ fn coerce_known_marketplaces_strict(
         Some(Value::Object(map)) => {
             let mut marketplaces = indexmap::IndexMap::new();
             for (name, value) in map {
-                let entry: KnownMarketplaceEntry = serde_json::from_value(value.clone())
-                    .map_err(|e| strict_coerce_err(path, format!("marketplaces.{name}: {e}")))?;
+                let display = crate::settings::redaction::untrusted_name_for_display(name);
+                let entry: KnownMarketplaceEntry =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        strict_coerce_err(
+                            path,
+                            format!("marketplaces entry {display:?} is invalid"),
+                        )
+                    })?;
                 marketplaces.insert(name.clone(), entry);
             }
             KnownMarketplaces { marketplaces }

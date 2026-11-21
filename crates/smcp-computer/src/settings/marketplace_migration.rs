@@ -728,13 +728,27 @@ fn load_context(
     seed_intent_pids.sort();
     seed_intent_pids.dedup();
     let pre_hashes = current_hashes(home, env, &user_path)?;
-    let preserved_intent_ids: Vec<String> = intent
+    // local-only id（no-`@`）在 intent 与 ledger 中都可能合法；写回 intent 时全部保留。
+    let mut preserved_intent_ids: Vec<String> = intent
         .account
         .installed_plugins
         .iter()
         .filter(|pid| !pid.contains('@'))
         .cloned()
         .collect();
+    if intent_missing {
+        // pre-v0.3.0：账本是唯一来源，local-only id 也要随 seed 进 intent 并保留。
+        preserved_intent_ids.extend(
+            ledger
+                .account
+                .plugins
+                .keys()
+                .filter(|pid| !pid.contains('@'))
+                .cloned(),
+        );
+    }
+    preserved_intent_ids.sort();
+    preserved_intent_ids.dedup();
     Ok(PlanContext {
         home: home.to_path_buf(),
         plan,
@@ -1423,6 +1437,7 @@ fn apply_fresh(
         backup_dir: backup_dir.display().to_string(),
         update_declarations: ctx.update_declarations,
         seed_intent: ctx.intent_missing,
+        seed_pids: ctx.seed_intent_pids.clone(),
         phase: "prepared".to_string(),
         files,
         items: ctx
@@ -1463,7 +1478,7 @@ fn apply_fresh(
     }
     // pre-v0.3.0 home：事务内（备份 + journal 之后）按账本 seed intent **一次**；
     // 不调用 migrate_ledger_to_intent_once（它会写 project/local enabledPlugins，越界）。
-    seed_intent_if_missing(home, env, ctx)?;
+    seed_intent_if_missing(home, env, ctx, fail_after)?;
     if fail_after == Some("after-seed") {
         // 测试用：模拟 seed 已落盘但 journal 尚未更新 post-hash 的硬崩窗口。
         return Err(MarketplaceMigrationError::ConcurrentChange {
@@ -2206,6 +2221,9 @@ struct MigrationMeta {
     /// 该事务是否需要在 items 循环前 seed intent（pre-v0.3.0 home）。
     #[serde(default)]
     seed_intent: bool,
+    /// seed 使用的账本 pid 全集（用于 resume 时校验 seed 窗口内容）。
+    #[serde(default)]
+    seed_pids: Vec<String>,
     phase: String,
     files: Vec<BackupFile>,
     items: Vec<MetaItem>,
@@ -2354,16 +2372,79 @@ fn current_hashes(
     Ok(out)
 }
 
+/// 把 user-scope `enabledPlugins[pid] = true`（仅 absent；不写 project/local）。
+fn backfill_enabled_plugins(
+    home: &Path,
+    env: Option<&EnvMap>,
+    pids: &[String],
+) -> Result<(), MarketplaceMigrationError> {
+    let _ = home;
+    let user_path = user_settings_path(env);
+    let marketplace_pids: Vec<&String> = pids.iter().filter(|p| p.contains('@')).collect();
+    if marketplace_pids.is_empty() {
+        return Ok(());
+    }
+    raw_write::update_raw_settings(&user_path, false, |map| {
+        let enabled = raw_write::object_field_mut(map, FIELD_ENABLED_PLUGINS, &user_path)?;
+        for pid in &marketplace_pids {
+            enabled.entry((*pid).clone()).or_insert(Value::Bool(true));
+        }
+        Ok(())
+    })
+    .map_err(raw_write_error_to_migration)?;
+    Ok(())
+}
+
+fn raw_write_error_to_migration(error: raw_write::RawWriteError) -> MarketplaceMigrationError {
+    match error {
+        raw_write::RawWriteError::Store(e) => e.into(),
+        raw_write::RawWriteError::Io { path, source } => {
+            MarketplaceMigrationError::Io { path, source }
+        }
+        raw_write::RawWriteError::Corrupt { path, reason } => {
+            MarketplaceMigrationError::StateCorrupt { path, reason }
+        }
+        raw_write::RawWriteError::MalformedTarget {
+            path,
+            key,
+            expected,
+        } => MarketplaceMigrationError::StateCorrupt {
+            path,
+            reason: format!("field {key:?} has unexpected type (expected {expected})"),
+        },
+    }
+}
+
+/// 从当前 intent 回填 user-scope enabledPlugins（resume 半 seed 窗口幂等修复）。
+fn backfill_enabled_from_intent(
+    home: &Path,
+    env: Option<&EnvMap>,
+) -> Result<(), MarketplaceMigrationError> {
+    let intent = crate::settings::store::load_installed_plugins_intent_strict(Some(home), env)?;
+    let pids: Vec<String> = intent.account.installed_plugins.iter().cloned().collect();
+    backfill_enabled_plugins(home, env, &pids)
+}
+
 /// pre-v0.3.0：intent 缺失时在事务内按账本 pid 一次性 seed（不写 project/local）。
+///
+/// 写序：先 settings 回填、后 intent——若在两次写之间崩溃，intent 仍缺失，resume 会重跑整个 seed，
+/// 不会出现「intent 已在、enabled 回填丢失」的熄灯窗口。
 fn seed_intent_if_missing(
     home: &Path,
     env: Option<&EnvMap>,
     ctx: &PlanContext,
+    fail_after: Option<&str>,
 ) -> Result<(), MarketplaceMigrationError> {
     if !ctx.intent_missing {
         return Ok(());
     }
     let seed = ctx.seed_intent_pids.clone();
+    backfill_enabled_plugins(home, env, &seed)?;
+    if fail_after == Some("after-seed-settings") {
+        return Err(MarketplaceMigrationError::ConcurrentChange {
+            detail: "simulated crash between seed writes".to_string(),
+        });
+    }
     crate::settings::store::update_installed_plugins_intent(
         |file| {
             for pid in &seed {
@@ -2373,23 +2454,6 @@ fn seed_intent_if_missing(
         Some(home),
         env,
     )?;
-    // 对齐 boot 迁移的 user-scope enabledPlugins=true（仅 absent；不写 project/local）。
-    // 若缺失，会把 pre-v0.3.0 存量 plugin 静默熄灯。
-    let user_path = user_settings_path(env);
-    let marketplace_pids: Vec<String> = seed.iter().filter(|p| p.contains('@')).cloned().collect();
-    if !marketplace_pids.is_empty() {
-        raw_write::update_raw_settings(&user_path, false, |map| {
-            let enabled = raw_write::object_field_mut(map, FIELD_ENABLED_PLUGINS, &user_path)?;
-            for pid in &marketplace_pids {
-                enabled.entry(pid.clone()).or_insert(Value::Bool(true));
-            }
-            Ok(())
-        })
-        .map_err(|_| MarketplaceMigrationError::StateCorrupt {
-            path: user_path.clone(),
-            reason: "failed to backfill enabledPlugins during intent seed".to_string(),
-        })?;
-    }
     Ok(())
 }
 
@@ -2497,9 +2561,10 @@ fn resume_from_journal(
         secrets,
     )?;
     verify_resume_hashes(home, env, &meta)?;
-    // pre-v0.3.0 且崩溃发生在 seed 前：resume 事务内补 seed 一次。
-    if ctx.intent_missing {
-        seed_intent_if_missing(home, env, &ctx)?;
+    // pre-v0.3.0：无论 intent 是否已存在，都幂等重跑 seed + enabled 回填（修复半 seed 崩溃窗口）。
+    if meta.seed_intent {
+        seed_intent_if_missing(home, env, &ctx, None)?;
+        backfill_enabled_from_intent(home, env)?;
         meta.post_hashes = current_hashes(home, env, &ctx.user_path)?;
         let _ = write_journal(home, &meta);
     }
@@ -2724,13 +2789,21 @@ fn verify_resume_hashes(
         let post = meta.post_hashes.get(&file.key).cloned();
         // seed 窗口：phase=prepared 且本事务声明 seed；intent/settings 由 seed 写入但 journal
         // 尚未记录 post-hash（进程被 kill）。允许 resume 继续（seed 幂等）。
-        let seed_window = meta.seed_intent
+        let mut seed_window = meta.seed_intent
             && meta.phase == "prepared"
             && matches!(
                 file.key.as_str(),
                 "installed_plugins_intent.json" | "settings.json"
             )
             && current.is_some();
+        if seed_window && file.key == "installed_plugins_intent.json" {
+            // seed 窗口只接受「恰好等于 seed 集合」的 intent；外部写入的 dangling pid 必须拒绝。
+            let intent =
+                crate::settings::store::load_installed_plugins_intent_strict(Some(home), env)?;
+            let current_set: HashSet<&String> = intent.account.installed_plugins.iter().collect();
+            let expected: HashSet<&String> = meta.seed_pids.iter().collect();
+            seed_window = current_set == expected;
+        }
         if current != pre && current != post && !seed_window {
             return Err(MarketplaceMigrationError::ConcurrentChange {
                 detail: format!(
@@ -2740,7 +2813,6 @@ fn verify_resume_hashes(
             });
         }
     }
-    let _ = home;
     Ok(())
 }
 
@@ -3035,8 +3107,9 @@ pub(crate) fn rewrite_install_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::reconciler::InstalledPluginRecord;
     use crate::settings::reconciler::KnownMarketplaceEntry;
-    use crate::settings::store::update_known_marketplaces;
+    use crate::settings::store::{update_installed_plugins, update_known_marketplaces};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -3375,6 +3448,100 @@ mod tests {
             .items
             .iter()
             .any(|i| i.action == MigrationAction::Blocked));
+        assert!(home.join(MIGRATION_JOURNAL_FILENAME).exists());
+    }
+
+    fn seed_unit_with_ledger(home: &Path, old: &str, manifest: &str, plugin: &str) {
+        seed_unit(home, old, manifest);
+        let pid = format!("{plugin}@{old}");
+        let install = marketplace_skill_dir(home, old, &[])
+            .join("plugins")
+            .join(plugin);
+        update_installed_plugins(
+            |file| {
+                let mut extra = Map::new();
+                extra.insert("scope".to_string(), Value::String("user".to_string()));
+                file.account.plugins.insert(
+                    pid,
+                    vec![InstalledPluginRecord {
+                        install_path: Some(install.to_string_lossy().into_owned()),
+                        mcp_servers: Vec::new(),
+                        extra,
+                    }],
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn half_seed_crash_resumes_and_backfills_enabled() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit_with_ledger(&home, "old-name", "team-tools", "alpha");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let ctx = load_context(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        // settings 已回填、intent 尚未写（模拟两次 seed 写之间被 kill）。
+        let err = apply_fresh(&ctx, Some(&env), &secrets, Some("after-seed-settings")).unwrap_err();
+        assert!(matches!(
+            err,
+            MarketplaceMigrationError::ConcurrentChange { .. }
+        ));
+        assert!(home.join(MIGRATION_JOURNAL_FILENAME).exists());
+        assert!(!installed_plugins_intent_path(Some(&home), Some(&env)).exists());
+        let resumed = resume_marketplace_name_migration(&home, Some(&env), None, &secrets).unwrap();
+        assert_eq!(resumed.status(), MigrationStatus::Ok, "{resumed:?}");
+        let user = raw_write::read_strict_map(&user_settings_path(Some(&env))).unwrap();
+        assert_eq!(user["enabledPlugins"]["alpha@team-tools"], true);
+    }
+
+    #[test]
+    fn seed_window_rejects_foreign_intent() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit_with_ledger(&home, "old-name", "team-tools", "alpha");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let ctx = load_context(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let _ = apply_fresh(&ctx, Some(&env), &secrets, Some("after-seed-settings")).unwrap_err();
+        // 外部把 dangling pid 写进 intent，不应被 seed 窗口放行。
+        crate::settings::store::update_installed_plugins_intent(
+            |file| {
+                file.account
+                    .installed_plugins
+                    .insert("alpha@old-name".to_string());
+                file.account
+                    .installed_plugins
+                    .insert("beta@old-name".to_string());
+            },
+            Some(&home),
+            Some(&env),
+        )
+        .unwrap();
+        let err = resume_marketplace_name_migration(&home, Some(&env), None, &secrets).unwrap_err();
+        assert!(matches!(
+            err,
+            MarketplaceMigrationError::ConcurrentChange { .. }
+        ));
         assert!(home.join(MIGRATION_JOURNAL_FILENAME).exists());
     }
 
