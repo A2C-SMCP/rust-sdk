@@ -720,6 +720,13 @@ pub fn marketplace_migrate(
     };
 
     let secrets = SecretStore::new();
+    let cwd = std::env::current_dir().ok();
+    let write_operation = apply || resume || rollback.is_some();
+    if write_operation {
+        eprintln!(
+            "warning: marketplace migrate is offline; stop all Computer/python instances before applying"
+        );
+    }
     if let Some(timestamp) = rollback {
         return match rollback_marketplace_name_migration(home, env, timestamp, &secrets) {
             Ok(report) => {
@@ -734,7 +741,7 @@ pub fn marketplace_migrate(
                         ));
                     }
                     for warning in &report.warnings {
-                        eprintln!("warning: {warning}");
+                        eprintln!("warning: {}", untrusted_name_for_display(warning));
                     }
                 }
                 if report.warnings.is_empty() {
@@ -751,7 +758,7 @@ pub fn marketplace_migrate(
         };
     }
     if resume {
-        return match resume_marketplace_name_migration(home, env, None, &secrets) {
+        return match resume_marketplace_name_migration(home, env, cwd.as_deref(), &secrets) {
             Ok(report) => emit_migration_report(&report, json_output),
             Err(e) => err(
                 &format!("marketplace migrate --resume failed: {e}"),
@@ -764,10 +771,8 @@ pub fn marketplace_migrate(
         update_declarations,
     };
     if apply {
-        eprintln!(
-            "warning: marketplace migrate is offline; stop all Computer/python instances before applying"
-        );
-        return match apply_marketplace_name_migration(home, env, None, options, &secrets) {
+        return match apply_marketplace_name_migration(home, env, cwd.as_deref(), options, &secrets)
+        {
             Ok(report) => emit_migration_report(&report, json_output),
             Err(e) => err(
                 &format!("marketplace migrate --apply failed: {e}"),
@@ -776,7 +781,7 @@ pub fn marketplace_migrate(
             ),
         };
     }
-    match plan_marketplace_name_migration(home, env, None, options, &secrets) {
+    match plan_marketplace_name_migration(home, env, cwd.as_deref(), options, &secrets) {
         Ok(plan) => emit_migration_plan(&plan, json_output),
         Err(e) => err(
             &format!("marketplace migrate failed: {e}"),
@@ -853,7 +858,10 @@ fn emit_migration_plan(
         for manual in &plan.manual {
             let line = format!(
                 "  manual    {} {} ({}) -> {}",
-                manual.file, manual.pointer, manual.effect, manual.suggested
+                manual.file,
+                untrusted_name_for_display(&manual.pointer),
+                manual.effect,
+                untrusted_name_for_display(&manual.suggested)
             );
             if manual.effect == "will-be-inactive" {
                 eprintln!("warning:{line}");
@@ -928,11 +936,14 @@ fn emit_migration_report(
         for manual in &report.manual {
             eprintln!(
                 "warning: {} {} ({}) -> {}",
-                manual.file, manual.pointer, manual.effect, manual.suggested
+                manual.file,
+                untrusted_name_for_display(&manual.pointer),
+                manual.effect,
+                untrusted_name_for_display(&manual.suggested)
             );
         }
         for warning in &report.warnings {
-            eprintln!("warning: {warning}");
+            eprintln!("warning: {}", untrusted_name_for_display(warning));
         }
         if let Some(backup) = &report.backup {
             msg_dim(&format!(
@@ -982,6 +993,16 @@ fn redact_migration_json(value: &mut Value) -> &mut Value {
                     if let Some(text) = child.as_str() {
                         *child = Value::String(untrusted_name_for_display(text));
                     }
+                } else if matches!(key.as_str(), "restored" | "warnings") {
+                    if let Value::Array(items) = child {
+                        for item in items {
+                            if let Some(text) = item.as_str() {
+                                *item = Value::String(untrusted_name_for_display(text));
+                            }
+                        }
+                    } else if let Some(text) = child.as_str() {
+                        *child = Value::String(untrusted_name_for_display(text));
+                    }
                 } else {
                     redact_migration_json(child);
                 }
@@ -1007,6 +1028,19 @@ fn reason_label(reason: crate::settings::marketplace_migration::MigrationReason)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migration_json_redacts_names_restored_and_warnings() {
+        let mut value = json!({
+            "items": [{"oldName": "user:pass@host", "newName": "team-tools", "detail": "x user:pass@host"}],
+            "manualReferences": [{"pointer": "/enabledPlugins/alpha@user:pass@host",
+                                  "suggested": "alpha@user:pass@host"}],
+            "restored": ["user:pass@host"],
+            "warnings": ["failed to restore user:pass@host/token"]
+        });
+        let redacted = redact_migration_json(&mut value).to_string();
+        assert!(!redacted.contains("pass"), "credentials leaked: {redacted}");
+    }
+
     use crate::cli::commands::test_env;
     use async_trait::async_trait;
     use tempfile::tempdir;

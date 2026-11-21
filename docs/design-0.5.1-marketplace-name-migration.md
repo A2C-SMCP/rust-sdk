@@ -72,8 +72,9 @@ D1 已退役明文存储，无迁移面；env 注入值（`A2C_SMCP_<ENV_SEGMENT
 
 0. 持 `<home>/marketplace-migration.lock`（只互斥 migrate 进程）；`apply` 在锁内**重新检测 + 全量
    预检**（不接受调用方传入的 plan，消除 plan/apply 漂移）。
-1. 备份到 `<home>/marketplace-migration-backup-<ts>/`（目录 0700、文件 0600；**不存 secret 值 /
-   原始 URL**），记录四份权威文件的 **pre-hash**，写 journal（phase=prepared）。执行前复核当前
+1. 备份到 `<home>/marketplace-migration-backup-<ts>/`（目录 0700、文件 0600）。备份保存四份权威
+   文件的**原始字节**（`known_marketplaces.json` 的 source URL / user settings 内容会原样落盘，回滚
+   依赖这些字节；**keyring secret 值不备份**），记录 **pre-hash**，写 journal（phase=prepared）。执行前复核当前
    hash == journal pre-hash，不一致 → `ConcurrentChange` abort。
 2. **secret 重键（先于目录/文件改写）**：枚举清单内 plugin 的 `mcp-servers/inputs.json`（严格解析；
    畸形 / 已装 plugin 根不可读 → 保守 abort）。`password:true` inputs：
@@ -105,7 +106,9 @@ D1 已退役明文存储，无迁移面；env 注入值（`A2C_SMCP_<ENV_SEGMENT
 - `--rollback <timestamp>`：journal 处于 prepared/running 时拒绝（先 resume）；校验当前文件 hash ==
   迁移后 post-hash（未被迁移写过的文件 == pre-hash），不符 → `RollbackDrift` 不覆盖用户改动；
   反向 rename（外部树先、clone 后）+ 还原四份权威文件 + secret 反写（new→old，keyring 不可用则告警
-  exit 3）。备份永久保留，文档说明手动清理。
+  exit 3）。`--rollback` 对 prepared/applying 的中断态也可执行：跳过漂移校验、恢复预迁移备份并
+  反向 rename（会丢弃迁移自身的半写；用户需在 resume/rollback 之间二选一，勿先行编辑）。
+  备份永久保留，文档说明手动清理。
 
 ## 6. CLI / UX
 
@@ -143,12 +146,12 @@ smcp-computer marketplace migrate [--apply] [--update-declarations] [--json]
 
 ## 9. 测试覆盖
 
-- 库级：`crates/smcp-computer/tests/marketplace_name_migration.rs`（22 用例）——dry-run 零写、
+- 库级：`crates/smcp-computer/tests/marketplace_name_migration.rs`（30 用例）——dry-run 零写、
   全量 apply、幂等、冲突四类、离线 grandfather、baseline mismatch、secret 重键 / keyring 不可用 /
   目标键冲突、installPath 越界、损坏状态零写、多 scope + 未知字段保真、外部树改名、同源合并、
   大小写冲突、rollback。
-- 模块单测（7）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
+- 模块单测（8）：安全名 / 时间戳、installPath 组件边界、baseline-only、journal 阻断、aborted
   resume、rollback drift。
-- CLI 级（8）：`crates/smcp-computer/tests/marketplace_name_migration_cli_test.rs`——默认 dry-run、
+- CLI 级（9）：`crates/smcp-computer/tests/marketplace_name_migration_cli_test.rs`——默认 dry-run、
   apply + backup、冲突 exit 1、unresolved exit 3、resume 无 journal exit 1、rollback、help flags、
-  user settings 隔离。
+  user settings 隔离、cwd project 诊断（exit 3）。

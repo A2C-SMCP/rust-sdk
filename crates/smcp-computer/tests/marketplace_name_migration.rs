@@ -186,6 +186,8 @@ fn known_entry(home: &Path, name: &str) -> Option<KnownMarketplaceEntry> {
 #[derive(Clone, Default)]
 struct FakeKeyring {
     inner: Arc<Mutex<HashMap<String, String>>>,
+    ops: Arc<Mutex<Vec<String>>>,
+    fail_set: Arc<Mutex<Option<String>>>,
     available: bool,
 }
 
@@ -193,6 +195,8 @@ impl FakeKeyring {
     fn available() -> (Self, SecretStore) {
         let fake = Self {
             inner: Arc::default(),
+            ops: Arc::default(),
+            fail_set: Arc::default(),
             available: true,
         };
         let store = SecretStore::with_backend(SERVICE_NAME, Box::new(fake.clone()));
@@ -202,6 +206,8 @@ impl FakeKeyring {
     fn unavailable() -> (Self, SecretStore) {
         let fake = Self {
             inner: Arc::default(),
+            ops: Arc::default(),
+            fail_set: Arc::default(),
             available: false,
         };
         let store = SecretStore::with_backend(SERVICE_NAME, Box::new(fake.clone()));
@@ -218,6 +224,14 @@ impl FakeKeyring {
             .unwrap()
             .insert(key.to_string(), value.to_string());
     }
+
+    fn fail_set_for(&self, key: &str) {
+        *self.fail_set.lock().unwrap() = Some(key.to_string());
+    }
+
+    fn ops(&self) -> Vec<String> {
+        self.ops.lock().unwrap().clone()
+    }
 }
 
 impl KeyringBackend for FakeKeyring {
@@ -233,6 +247,10 @@ impl KeyringBackend for FakeKeyring {
         if !self.available {
             return false;
         }
+        if self.fail_set.lock().unwrap().as_deref() == Some(id) {
+            return false;
+        }
+        self.ops.lock().unwrap().push(format!("set:{id}"));
         self.inner
             .lock()
             .unwrap()
@@ -241,6 +259,7 @@ impl KeyringBackend for FakeKeyring {
     }
 
     fn delete(&self, _service: &str, id: &str) -> bool {
+        self.ops.lock().unwrap().push(format!("delete:{id}"));
         self.inner.lock().unwrap().remove(id).is_some()
     }
 }
@@ -939,28 +958,6 @@ fn multi_scope_and_unknown_ledger_fields_preserved() {
 }
 
 #[test]
-fn case_only_rename_is_conflict() {
-    let td = TempDir::new().unwrap();
-    let home = home_of(&td);
-    let env = env_of(&td);
-    seed_marketplace(&home, "Team-Tools", "team-tools", &[]);
-    let (_, secrets) = FakeKeyring::available();
-    let report = apply_marketplace_name_migration(
-        &home,
-        Some(&env),
-        None,
-        MarketplaceMigrationOptions::default(),
-        &secrets,
-    )
-    .unwrap();
-    assert_eq!(report.status(), MigrationStatus::Conflicts);
-    assert!(report
-        .conflicts
-        .iter()
-        .any(|c| c.kind == "case_only_rename"));
-}
-
-#[test]
 fn same_source_target_merge_is_not_conflict() {
     let td = TempDir::new().unwrap();
     let home = home_of(&td);
@@ -1087,4 +1084,332 @@ fn missing_intent_is_seeded_from_ledger_instead_of_becoming_empty() {
     .unwrap();
     let intent = read_json(&intent_path);
     assert_eq!(intent["installedPlugins"], json!(["alpha@team-tools"]));
+}
+
+#[test]
+fn pre_v03_multi_marketplace_seed_migrates_all_without_resurrecting_old_pids() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old-a", "team-a", &[("alpha", None)]);
+    seed_marketplace(&home, "old-b", "team-b", &[("beta", None)]);
+    let path_a = home
+        .join("marketplace/old-a/plugins/alpha")
+        .to_string_lossy()
+        .into_owned();
+    let path_b = home
+        .join("marketplace/old-b/plugins/beta")
+        .to_string_lossy()
+        .into_owned();
+    // pre-v0.3.0：只有 ledger，没有 intent。
+    seed_ledger(&home, "alpha@old-a", &path_a, "user", None);
+    seed_ledger(&home, "beta@old-b", &path_b, "user", None);
+    let intent_path = installed_plugins_intent_path(Some(&home), Some(&env));
+    assert!(!intent_path.exists());
+
+    let (_, secrets) = FakeKeyring::available();
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    assert_eq!(report.status(), MigrationStatus::Ok, "{report:?}");
+    let intent = read_json(&intent_path);
+    let ids = intent["installedPlugins"].as_array().unwrap();
+    assert!(ids.iter().any(|v| v == "alpha@team-a"));
+    assert!(ids.iter().any(|v| v == "beta@team-b"));
+    assert!(!ids.iter().any(|v| v == "alpha@old-a"));
+    assert!(!ids.iter().any(|v| v == "beta@old-b"));
+}
+
+#[test]
+fn project_scope_ledger_does_not_write_project_settings() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    let project = td.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    seed_marketplace(&home, "old-name", "team-tools", &[("alpha", None)]);
+    let path = home
+        .join("marketplace/old-name/plugins/alpha")
+        .to_string_lossy()
+        .into_owned();
+    seed_ledger(
+        &home,
+        "alpha@old-name",
+        &path,
+        "project",
+        Some(project.to_str().unwrap()),
+    );
+    let project_settings = workdir_project_settings_path(&project);
+    let (_, secrets) = FakeKeyring::available();
+    apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        Some(&project),
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    // 官方 v0.3.0 迁移会顺手写 project enabledPlugins；本迁移必须不写 project/local。
+    assert!(
+        !project_settings.exists(),
+        "project settings must not be created by migration: {}",
+        project_settings.display()
+    );
+}
+
+#[test]
+fn user_only_references_migrate_cleanly_exit_ok() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old-name", "team-tools", &[]);
+    write_user_settings(
+        &env,
+        &json!({
+            "enabledPlugins": {"alpha@old-name": true},
+            "trustedMarketplaces": ["old-name"],
+            "blockedMarketplaces": ["old-name"]
+        }),
+    );
+    let (_, secrets) = FakeKeyring::available();
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    assert_eq!(report.status(), MigrationStatus::Ok, "{report:?}");
+    assert!(
+        report.manual.is_empty(),
+        "user-scope refs are rewritten, not manual"
+    );
+}
+
+#[test]
+fn cwd_project_reference_reports_will_be_inactive() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    let project = td.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    seed_marketplace(&home, "old-name", "team-tools", &[]);
+    let settings = workdir_project_settings_path(&project);
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(
+        &settings,
+        serde_json::to_string(&json!({"enabledPlugins": {"alpha@old-name": true}})).unwrap(),
+    )
+    .unwrap();
+    let before = read_bytes(&settings);
+    let (_, secrets) = FakeKeyring::available();
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        Some(&project),
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    assert_eq!(report.status(), MigrationStatus::Partial);
+    assert!(report
+        .manual
+        .iter()
+        .any(|m| m.effect == "will-be-inactive" && m.file == settings.to_string_lossy()));
+    assert_eq!(before, read_bytes(&settings));
+}
+
+#[test]
+fn non_kebab_old_name_is_blocked_zero_write() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old_name", "team-tools", &[]);
+    let before = read_bytes(&known_marketplaces_path(Some(&home), Some(&env)));
+    let (_, secrets) = FakeKeyring::available();
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|i| i.old_name == "old_name")
+        .unwrap();
+    assert_eq!(item.action, MigrationAction::Unresolved);
+    assert_eq!(item.reason, Some(MigrationReason::UnsafeOldName));
+    assert!(report.backup.is_none());
+    assert_eq!(
+        before,
+        read_bytes(&known_marketplaces_path(Some(&home), Some(&env)))
+    );
+}
+
+#[test]
+fn invalid_intent_pid_is_blocked_without_rename_backup() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old-name", "team-tools", &[]);
+    let intent_path = installed_plugins_intent_path(Some(&home), Some(&env));
+    fs::write(
+        &intent_path,
+        serde_json::to_string(&json!({"installedPlugins": ["alpha@old_name"]})).unwrap(),
+    )
+    .unwrap();
+    let before = read_bytes(&intent_path);
+    let (_, secrets) = FakeKeyring::available();
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    assert_eq!(report.status(), MigrationStatus::Partial);
+    assert!(report.corrupt.is_some());
+    assert!(report.backup.is_none());
+    assert_eq!(before, read_bytes(&intent_path));
+    assert!(home.join("marketplace/old-name").is_dir());
+}
+
+#[test]
+fn secret_ops_set_before_delete() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old-name", "team-tools", &[("alpha", Some("token"))]);
+    seed_intent(&home, &["alpha@old-name"]);
+    let (fake, secrets) = FakeKeyring::available();
+    fake.set_value("alpha@old-name/token", "s3cret");
+    apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    let ops = fake.ops();
+    let last_set = ops.iter().rposition(|op| op.starts_with("set:")).unwrap();
+    let first_delete = ops.iter().position(|op| op.starts_with("delete:")).unwrap();
+    assert!(
+        last_set < first_delete,
+        "all new secrets must be set before any old delete: {ops:?}"
+    );
+}
+
+#[test]
+fn secret_midway_failure_cleans_new_keys_and_keeps_old() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    // 两个 password input，第二个 set 失败。
+    let catalog = home.join("marketplace/old-name");
+    fs::create_dir_all(catalog.join(".tfrobot-plugin")).unwrap();
+    fs::write(
+        catalog.join(".tfrobot-plugin/marketplace.json"),
+        serde_json::to_string(&json!({
+            "name": "team-tools",
+            "plugins": [{"name": "alpha", "source": "./plugins/alpha"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let inputs = catalog.join("plugins/alpha/mcp-servers");
+    fs::create_dir_all(&inputs).unwrap();
+    fs::write(
+        inputs.join("inputs.json"),
+        serde_json::to_string(&json!({
+            "inputs": [
+                {"type": "PromptString", "id": "token_a", "description": "a", "password": true},
+                {"type": "PromptString", "id": "token_b", "description": "b", "password": true}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    update_known_marketplaces(
+        |file| {
+            file.account.marketplaces.insert(
+                "old-name".to_string(),
+                KnownMarketplaceEntry {
+                    source: source("https://example.com/org/repo.git"),
+                    manifest_name_baseline: None,
+                    extra: Map::new(),
+                },
+            );
+        },
+        Some(&home),
+        None,
+    )
+    .unwrap();
+    seed_intent(&home, &["alpha@old-name"]);
+    let (fake, secrets) = FakeKeyring::available();
+    fake.set_value("alpha@old-name/token_a", "value-a");
+    fake.set_value("alpha@old-name/token_b", "value-b");
+    fake.fail_set_for("alpha@team-tools/token_b");
+
+    let report = apply_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|i| i.old_name == "old-name")
+        .unwrap();
+    assert_eq!(item.action, MigrationAction::Blocked);
+    assert_eq!(item.reason, Some(MigrationReason::KeyringUnavailable));
+    // 旧键保留；本次已 set 的新键被清理；目录/账本未迁移。
+    assert_eq!(
+        fake.get_value("alpha@old-name/token_a").as_deref(),
+        Some("value-a")
+    );
+    assert_eq!(
+        fake.get_value("alpha@old-name/token_b").as_deref(),
+        Some("value-b")
+    );
+    assert!(fake.get_value("alpha@team-tools/token_a").is_none());
+    assert!(fake.get_value("alpha@team-tools/token_b").is_none());
+    assert!(home.join("marketplace/old-name").is_dir());
+    assert!(!home.join("marketplace/team-tools").exists());
+}
+
+#[test]
+fn secret_count_excludes_absent_values() {
+    let td = TempDir::new().unwrap();
+    let home = home_of(&td);
+    let env = env_of(&td);
+    seed_marketplace(&home, "old-name", "team-tools", &[("alpha", Some("token"))]);
+    let (_, secrets) = FakeKeyring::available(); // 无旧 secret
+    let plan = plan_marketplace_name_migration(
+        &home,
+        Some(&env),
+        None,
+        MarketplaceMigrationOptions::default(),
+        &secrets,
+    )
+    .unwrap();
+    let item = plan
+        .items
+        .iter()
+        .find(|i| i.old_name == "old-name")
+        .unwrap();
+    assert_eq!(item.secrets, 0, "absent old values are not planned rekeys");
 }

@@ -267,6 +267,8 @@ pub struct MarketplaceMigrationReport {
     pub command: String,
     /// 是否 dry-run / dry run。
     pub dry_run: bool,
+    /// 本次是否实际执行了写入（冲突/损坏/无可写项时即使 `--apply` 也为 false）。
+    pub written: bool,
     /// 条目 / items。
     pub items: Vec<MigrationItem>,
     /// 冲突 / conflicts。
@@ -575,7 +577,9 @@ fn load_context(
             install_paths: Vec::new(),
         };
 
-        if !is_safe_name_segment(&old) {
+        if !is_safe_name_segment(&old) || !crate::settings::schema::is_valid_marketplace_name(&old)
+        {
+            // 非严格 kebab 旧名无法在 intent/known 键空间中安全迁移（coerce 会丢弃非法 pid）。
             item.reason = Some(MigrationReason::UnsafeOldName);
             plan.items.push(item);
             continue;
@@ -716,9 +720,6 @@ fn load_context(
     );
     let intent_missing = !installed_plugins_intent_path(Some(home), env).exists();
     let mut seed_intent_pids: Vec<String> = ledger.account.plugins.keys().cloned().collect();
-    if let Some(Value::Object(enabled)) = user_map.get(FIELD_ENABLED_PLUGINS) {
-        seed_intent_pids.extend(enabled.keys().cloned());
-    }
     seed_intent_pids.sort();
     seed_intent_pids.dedup();
     let pre_hashes = current_hashes(home, env, &user_path)?;
@@ -902,9 +903,9 @@ fn plan_secrets(
             }
         }
     }
-    let count = plans.len();
-    // 只为确有旧值的条目计划 set（无旧值 = 无迁移面）。
+    // 只为确有旧值的条目计划 set（无旧值 = 无迁移面），计数与计划保持一致。
     plans.retain(|p| secrets.get(&p.old_key).is_some());
+    let count = plans.len();
     envs.sort_by(|a, b| a.old.cmp(&b.old));
     envs.dedup_by(|a, b| a.old == b.old && a.new == b.new);
     Ok((plans, envs, count))
@@ -976,15 +977,8 @@ fn detect_conflicts(
             continue;
         };
         let old = item.old_name.as_str();
-        // 大小写不敏感 FS 上的「仅大小写不同」改名：不猜原地改名。
-        if old.eq_ignore_ascii_case(new) && old != new {
-            conflicts.push(MigrationConflict {
-                kind: "case_only_rename".to_string(),
-                old_name: old.to_string(),
-                new_name: Some(new.to_string()),
-                detail: "old and new names differ only by case; rename manually".to_string(),
-            });
-        }
+        // 旧名必须是 strict kebab（plan 已拦截），manifest 名也是 strict kebab；两者的
+        // 大小写差异不可达，故不单列 case-only 冲突。
         // 目标名已注册。
         if let Some(target) = known.account.marketplaces.get(new) {
             let same_source = compare_marketplace_sources(&item.source_value, &target.source)
@@ -1135,11 +1129,12 @@ fn collect_manual_references(
     let mut refs: Vec<ManualReference> = Vec::new();
     // user scope：enabled/trusted/blocked 会被改写；extraKnown 默认只报告。
     if !update_declarations {
+        // user_scope=true：只报 user `extraKnownMarketplaces`（enabled/trusted/blocked 会被自动改写）。
         scan_settings_map(
             &user_settings_path(env),
             user_map,
             &renames,
-            false,
+            true,
             &mut refs,
         );
     }
@@ -1327,9 +1322,14 @@ pub fn rollback_marketplace_name_migration(
     with_migration_lock(&home, || {
         let backup_dir = home.join(format!("{MIGRATION_BACKUP_PREFIX}{timestamp}"));
         let manifest_path = backup_dir.join("backup.json");
-        let meta = read_meta_file(&manifest_path).map_err(|_| {
-            MarketplaceMigrationError::BackupNotFound {
+        if !manifest_path.is_file() {
+            return Err(MarketplaceMigrationError::BackupNotFound {
                 timestamp: timestamp.to_string(),
+            });
+        }
+        let meta = read_meta_file(&manifest_path).map_err(|e| {
+            MarketplaceMigrationError::BackupManifestInvalid {
+                reason: e.to_string(),
             }
         })?;
         if Path::new(&meta.home) != home {
@@ -1344,12 +1344,13 @@ pub fn rollback_marketplace_name_migration(
             });
         }
         let journal_path = home.join(MIGRATION_JOURNAL_FILENAME);
-        if journal_path.exists() {
+        // prepared/applying 也可回滚：恢复预迁移备份并反向 rename（中断态可能只有部分文件被写）。
+        let in_progress = if journal_path.exists() {
             let journal = read_journal(&journal_path)?;
-            if journal.phase != "done" && journal.phase != "aborted" {
-                return Err(MarketplaceMigrationError::JournalInProgress { path: journal_path });
-            }
-        }
+            matches!(journal.phase.as_str(), "prepared" | "applying")
+        } else {
+            false
+        };
         rollback_from_meta(
             &home,
             env,
@@ -1358,6 +1359,7 @@ pub fn rollback_marketplace_name_migration(
             &backup_dir,
             &journal_path,
             secrets,
+            in_progress,
         )
     })
 }
@@ -1407,16 +1409,15 @@ fn apply_fresh(
     write_meta(&backup_dir.join("backup.json"), &meta)?;
     write_journal(home, &meta)?;
 
-    // 执行前哈希复核（与 journal 的 pre-hash 一致；不一致 → 并发写，abort）。
-    verify_pre_hashes(home, env, &meta)?;
-    // pre-v0.3.0 home：在事务内（备份 + journal 之后）补一次账本→intent 迁移，避免创建空 intent。
-    if ctx.intent_missing {
-        if let Err(e) = crate::settings::installer::migrate_ledger_to_intent_once(home, env) {
-            tracing::warn!(error = %e, "pre-v0.3.0 intent migration failed (non-blocking)");
-        }
-        // seed 本身也是事务内写入：记录 post-hash，供崩溃后 --resume 校验通过。
-        meta.post_hashes = current_hashes(home, env, &ctx.user_path)?;
+    // 执行前哈希复核（与 journal 的 pre-hash 一致；不一致 → 并发写，abort 并清掉毒 journal）。
+    if let Err(e) = verify_pre_hashes(home, env, &meta) {
+        let _ = std::fs::remove_file(home.join(MIGRATION_JOURNAL_FILENAME));
+        return Err(e);
     }
+    // pre-v0.3.0 home：事务内（备份 + journal 之后）按账本 seed intent **一次**；
+    // 不调用 migrate_ledger_to_intent_once（它会写 project/local enabledPlugins，越界）。
+    seed_intent_if_missing(home, env, ctx)?;
+    meta.post_hashes = current_hashes(home, env, &ctx.user_path)?;
     meta.phase = "applying".to_string();
     write_journal(home, &meta)?;
 
@@ -1502,6 +1503,7 @@ fn apply_fresh(
     let mut report = MarketplaceMigrationReport {
         command: "marketplace migrate".to_string(),
         dry_run: false,
+        written: true,
         items: report_items,
         conflicts: Vec::new(),
         manual: ctx.plan.manual.clone(),
@@ -1623,8 +1625,8 @@ fn apply_one_item_inner(
     }
 
     if item.action == MigrationAction::Rename {
-        // 4) intent RMW（pre-v0.3.0：intent 缺失时以账本/启用集 seed，避免空 intent 让 boot 迁移跳过回填）。
-        write_intent_item(home, env, item, ctx.intent_missing, &ctx.seed_intent_pids)?;
+        // 4) intent RMW（seed 已在事务开头一次性完成）。
+        write_intent_item(home, env, item)?;
         // 5) ledger RMW。
         write_ledger_item(home, env, item)?;
         if fail_after == Some("after-ledger") {
@@ -1736,8 +1738,6 @@ fn write_intent_item(
     home: &Path,
     env: Option<&EnvMap>,
     item: &MigrationItem,
-    seed_if_missing: bool,
-    seed_pids: &[String],
 ) -> Result<(), MigrationReason> {
     let old = item.old_name.clone();
     let new = item.new_name.clone().unwrap_or_else(|| old.clone());
@@ -1753,11 +1753,6 @@ fn write_intent_item(
     let mut err: Option<MigrationReason> = None;
     let res = try_update_installed_plugins_intent(
         |file| {
-            if seed_if_missing {
-                for pid in seed_pids {
-                    file.account.installed_plugins.insert(pid.clone());
-                }
-            }
             let suffix = format!("@{new}");
             for pid in &file.account.installed_plugins {
                 if pid.ends_with(&suffix) && !source_pids.contains(pid) && !owned_new.contains(pid)
@@ -2298,6 +2293,28 @@ fn current_hashes(
     Ok(out)
 }
 
+/// pre-v0.3.0：intent 缺失时在事务内按账本 pid 一次性 seed（不写 project/local）。
+fn seed_intent_if_missing(
+    home: &Path,
+    env: Option<&EnvMap>,
+    ctx: &PlanContext,
+) -> Result<(), MarketplaceMigrationError> {
+    if !ctx.intent_missing {
+        return Ok(());
+    }
+    let seed = ctx.seed_intent_pids.clone();
+    crate::settings::store::update_installed_plugins_intent(
+        |file| {
+            for pid in &seed {
+                file.account.installed_plugins.insert(pid.clone());
+            }
+        },
+        Some(home),
+        env,
+    )?;
+    Ok(())
+}
+
 fn verify_ctx_hashes(
     home: &Path,
     env: Option<&EnvMap>,
@@ -2401,6 +2418,12 @@ fn resume_from_journal(
         secrets,
     )?;
     verify_resume_hashes(home, env, &meta)?;
+    // pre-v0.3.0 且崩溃发生在 seed 前：resume 事务内补 seed 一次。
+    if ctx.intent_missing {
+        seed_intent_if_missing(home, env, &ctx)?;
+        meta.post_hashes = current_hashes(home, env, &ctx.user_path)?;
+        let _ = write_journal(home, &meta);
+    }
     let manual = if ctx.plan.manual.is_empty() {
         manual_for_journal(home, env, cwd, &meta)
     } else {
@@ -2409,6 +2432,20 @@ fn resume_from_journal(
     let mut report_items: Vec<MigrationItem> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut failed = false;
+    let done_items: Vec<MetaItem> = meta
+        .items
+        .iter()
+        .filter(|i| i.status == "done")
+        .cloned()
+        .collect();
+    for m in &done_items {
+        let mut item = synthesized_item(m, &ctx);
+        if m.action == "baselineonly" {
+            item.action = MigrationAction::BaselineOnly;
+            item.new_name = Some(m.old.clone());
+        }
+        report_items.push(item);
+    }
     let pending: Vec<MetaItem> = meta
         .items
         .iter()
@@ -2456,6 +2493,25 @@ fn resume_from_journal(
         }
     }
     if !failed {
+        // 续做完成前对全部 done 项复跑后置条件（含本轮与历史项），防止「静默洗白」不一致状态。
+        for m in &done_items {
+            let mut item = synthesized_item(m, &ctx);
+            if m.action == "baselineonly" {
+                item.action = MigrationAction::BaselineOnly;
+                item.new_name = Some(m.old.clone());
+            }
+            if let Err(reason) = verify_item(home, env, &item) {
+                failed = true;
+                meta.phase = "aborted".to_string();
+                let mut aborted = item;
+                aborted.action = MigrationAction::Blocked;
+                aborted.reason = Some(reason);
+                report_items.push(aborted);
+                break;
+            }
+        }
+    }
+    if !failed {
         meta.phase = "done".to_string();
         meta.post_hashes = current_hashes(home, env, &ctx.user_path)?;
     }
@@ -2468,6 +2524,7 @@ fn resume_from_journal(
     Ok(MarketplaceMigrationReport {
         command: "marketplace migrate --resume".to_string(),
         dry_run: false,
+        written: true,
         items: report_items,
         conflicts: Vec::new(),
         manual,
@@ -2599,6 +2656,7 @@ fn verify_resume_hashes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rollback_from_meta(
     home: &Path,
     env: Option<&EnvMap>,
@@ -2607,16 +2665,30 @@ fn rollback_from_meta(
     backup_dir: &Path,
     journal_path: &Path,
     secrets: &SecretStore,
+    in_progress: bool,
 ) -> Result<MarketplaceRollbackReport, MarketplaceMigrationError> {
+    if meta.rolled_back {
+        // 幂等：已回滚过 → 直接成功返回（不再次改动状态）。
+        return Ok(MarketplaceRollbackReport {
+            timestamp: timestamp.to_string(),
+            ..Default::default()
+        });
+    }
     #[allow(unused_mut)]
     let mut report = MarketplaceRollbackReport {
         timestamp: timestamp.to_string(),
         ..Default::default()
     };
     let paths: BTreeMap<&str, PathBuf> = authority_paths(home, env).into_iter().collect();
-    // 漂移检测：当前文件必须等于迁移后的 post-hash；未被迁移写过的文件必须保持 pre-hash
-    // （含「原本不存在、现在被创建」）。任一不符 → 拒绝覆盖用户新改动。
-    for file in &meta.files {
+    if in_progress {
+        report.warnings.push(
+            "rolling back an interrupted migration: restoring the pre-migration backup              (partial migration state will be discarded)"
+                .to_string(),
+        );
+    }
+    // 漂移检测（仅 done/aborted）：当前文件必须等于迁移后的 post-hash；未被迁移写过的文件必须保持
+    // pre-hash（含「原本不存在、现在被创建」）。中断态跳过（可能是迁移自身的半写）。
+    for file in meta.files.iter().filter(|_| !in_progress) {
         let path = paths
             .get(file.key.as_str())
             .cloned()
@@ -2639,8 +2711,8 @@ fn rollback_from_meta(
             });
         }
     }
-    // 反向 rename（外部树先、clone 后）。
-    for item in meta.items.iter().filter(|i| i.status == "done") {
+    // 反向 rename（外部树先、clone 后）。不依赖 journal status：硬崩溃可能留下 pending 但目录已改名。
+    for item in &meta.items {
         if item.action == "baselineonly" {
             continue;
         }
@@ -2658,12 +2730,16 @@ fn rollback_from_meta(
                 marketplace_skill_dir(home, &item.old, &[]),
             ),
         ];
+        let mut renamed = false;
         for (from, to) in pairs {
             if from.exists() && !to.exists() {
                 std::fs::rename(&from, &to).map_err(|e| io_err(&from, e))?;
+                renamed = true;
             }
         }
-        report.restored.push(item.old.clone());
+        if renamed {
+            report.restored.push(item.old.clone());
+        }
     }
     // 还原四份权威文件（按 key 映射到当前 env 解析出的路径，避免恢复到他处）。
     for file in &meta.files {
@@ -2718,6 +2794,7 @@ fn report_from_plan(
     MarketplaceMigrationReport {
         command: "marketplace migrate".to_string(),
         dry_run,
+        written: false,
         items: plan.items.clone(),
         conflicts: plan.conflicts.clone(),
         manual: plan.manual.clone(),
@@ -2992,6 +3069,50 @@ mod tests {
         let known = load_known_marketplaces_strict(Some(&home), Some(&env)).unwrap();
         assert!(known.account.marketplaces.contains_key("team-tools"));
         assert!(!known.account.marketplaces.contains_key("old-name"));
+    }
+
+    #[test]
+    fn interrupted_apply_can_roll_back() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-name", "team-tools");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let ctx = load_context(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let item = ctx.plan.items[0].clone();
+        // 先走一次可回滚的失败，拿到备份时间戳；再把状态改造成「硬崩溃中途」。
+        let report = apply_fresh(&ctx, Some(&env), &secrets, Some("after-known")).unwrap();
+        let timestamp = report.backup.as_ref().unwrap().timestamp.clone();
+        // 模拟崩溃窗口：catalog 已改名、known 已写，journal 仍是 applying。
+        std::fs::rename(
+            marketplace_skill_dir(&home, "old-name", &[]),
+            marketplace_skill_dir(&home, "team-tools", &[]),
+        )
+        .unwrap();
+        write_known_item(&home, Some(&env), &item).unwrap();
+        let journal_path = home.join(MIGRATION_JOURNAL_FILENAME);
+        let mut meta = read_journal(&journal_path).unwrap();
+        meta.phase = "applying".to_string();
+        write_journal(&home, &meta).unwrap();
+
+        // 中断态 rollback 不应再被 journal 相位门控拒绝。
+        let rb =
+            rollback_marketplace_name_migration(&home, Some(&env), &timestamp, &secrets).unwrap();
+        assert!(rb.warnings.iter().any(|w| w.contains("interrupted")));
+        assert!(marketplace_skill_dir(&home, "old-name", &[]).is_dir());
+        assert!(!marketplace_skill_dir(&home, "team-tools", &[]).exists());
+        let known = load_known_marketplaces_strict(Some(&home), Some(&env)).unwrap();
+        assert!(known.account.marketplaces.contains_key("old-name"));
+        assert!(!known.account.marketplaces.contains_key("team-tools"));
+        assert!(!journal_path.exists());
     }
 
     #[test]

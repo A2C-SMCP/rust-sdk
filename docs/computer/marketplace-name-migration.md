@@ -25,8 +25,9 @@
    marketplace migrate --json     # 脚本可读
    ```
 
-3. 迁移会自动把权威文件备份到 `<A2C_SKILL_HOME>/marketplace-migration-backup-<timestamp>/`
-   （权限 0700/0600，不含 secret 值），成功后备份保留，便于回滚或人工核对。
+3. 迁移会自动把权威文件**原字节**备份到 `<A2C_SKILL_HOME>/marketplace-migration-backup-<timestamp>/`
+   （权限 0700/0600；可能含 settings 内容与 source URL，**不含 keyring secret 值**），成功后备份保留，
+   便于回滚或人工核对。
 
 ## 3. 输出怎么看
 
@@ -102,7 +103,9 @@ clone 缺失、清单缺失或不可读、清单名缺失/非法 → 该 marketp
   ```
 
   `<timestamp>` 见成功输出或备份目录名。回滚会校验当前文件仍是迁移后的状态；若你迁移后又改过
-  settings / 账本，会拒绝覆盖（`RollbackDrift`）。备份目录不会自动删除，确认无误后可手动清理。
+  settings / 账本，会拒绝覆盖（`RollbackDrift`）。**中断（中断 journal 仍在）时也可直接回滚**：会
+  恢复预迁移备份并反向改名（迁移自身的半写被丢弃）；但请先在 `--resume` 与 `--rollback` 间选定，
+  不要先手动编辑。备份目录不会自动删除，确认无误后可手动清理。
 
 ## 7. 常见问题
 

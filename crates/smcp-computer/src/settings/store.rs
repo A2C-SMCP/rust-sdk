@@ -551,6 +551,107 @@ fn coerce_installed_plugins_intent(
 }
 
 // ===========================================================================
+// 严格只读规整（迁移预检用；结构损坏 → Err，不静默降级）/ Strict coercion
+// ===========================================================================
+fn strict_coerce_err(path: &Path, reason: impl Into<String>) -> SettingsStoreError {
+    SettingsStoreError::io(
+        path,
+        io::Error::new(io::ErrorKind::InvalidData, reason.into()),
+    )
+}
+
+fn coerce_known_marketplaces_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    let account = match data.get("marketplaces") {
+        Some(Value::Object(map)) => {
+            let mut marketplaces = indexmap::IndexMap::new();
+            for (name, value) in map {
+                let entry: KnownMarketplaceEntry = serde_json::from_value(value.clone())
+                    .map_err(|e| strict_coerce_err(path, format!("marketplaces.{name}: {e}")))?;
+                marketplaces.insert(name.clone(), entry);
+            }
+            KnownMarketplaces { marketplaces }
+        }
+        Some(Value::Null) | None => KnownMarketplaces::default(),
+        Some(_) => {
+            return Err(strict_coerce_err(
+                path,
+                "field 'marketplaces' is not an object",
+            ))
+        }
+    };
+    Ok(KnownMarketplacesFile {
+        version: MATERIALIZED_VERSION,
+        account,
+    })
+}
+
+fn coerce_installed_plugins_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<InstalledPluginsFile, SettingsStoreError> {
+    let account = match data.get("plugins") {
+        Some(Value::Object(map)) => {
+            let mut plugins = indexmap::IndexMap::new();
+            for (pid, value) in map {
+                let records: Vec<crate::settings::reconciler::InstalledPluginRecord> =
+                    serde_json::from_value(value.clone())
+                        .map_err(|e| strict_coerce_err(path, format!("plugins.{pid}: {e}")))?;
+                plugins.insert(pid.clone(), records);
+            }
+            InstalledPlugins { plugins }
+        }
+        Some(Value::Null) | None => InstalledPlugins::default(),
+        Some(_) => return Err(strict_coerce_err(path, "field 'plugins' is not an object")),
+    };
+    Ok(InstalledPluginsFile {
+        version: MATERIALIZED_VERSION,
+        account,
+    })
+}
+
+fn coerce_installed_plugins_intent_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    let mut set: IndexSet<String> = IndexSet::new();
+    match data.get("installedPlugins") {
+        Some(Value::Array(arr)) => {
+            for value in arr {
+                let Some(pid) = value.as_str() else {
+                    return Err(strict_coerce_err(
+                        path,
+                        "installedPlugins contains a non-string entry",
+                    ));
+                };
+                if !is_valid_enabled_plugin_key(pid) {
+                    return Err(strict_coerce_err(
+                        path,
+                        format!("installedPlugins contains an invalid plugin id {pid:?} (expect '<plugin>@<marketplace>')"),
+                    ));
+                }
+                set.insert(pid.to_string());
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => {
+            return Err(strict_coerce_err(
+                path,
+                "field 'installedPlugins' is not an array",
+            ))
+        }
+    }
+    Ok(InstalledPluginsIntentFile {
+        version: MATERIALIZED_VERSION,
+        account: InstalledPluginsIntent {
+            installed_plugins: set,
+        },
+    })
+}
+
+// ===========================================================================
 // 高层读写 / High-level load & save
 // ===========================================================================
 /// 加载 `known_marketplaces.json`（缺失 / 损坏 → 空配置）/ Load known_marketplaces.json。
@@ -596,7 +697,7 @@ pub(crate) fn load_known_marketplaces_strict(
 ) -> Result<KnownMarketplacesFile, SettingsStoreError> {
     let path = known_marketplaces_path(home, env);
     match read_jsonc_strict(&path)? {
-        Some(data) => Ok(coerce_known_marketplaces(&data, &path)),
+        Some(data) => coerce_known_marketplaces_strict(&data, &path),
         None => Ok(empty_known_marketplaces()),
     }
 }
@@ -608,7 +709,7 @@ pub(crate) fn load_installed_plugins_strict(
 ) -> Result<InstalledPluginsFile, SettingsStoreError> {
     let path = installed_plugins_path(home, env);
     match read_jsonc_strict(&path)? {
-        Some(data) => Ok(coerce_installed_plugins(&data, &path)),
+        Some(data) => coerce_installed_plugins_strict(&data, &path),
         None => Ok(empty_installed_plugins()),
     }
 }
@@ -620,7 +721,7 @@ pub(crate) fn load_installed_plugins_intent_strict(
 ) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
     let path = installed_plugins_intent_path(home, env);
     match read_jsonc_strict(&path)? {
-        Some(data) => Ok(coerce_installed_plugins_intent(&data, &path)),
+        Some(data) => coerce_installed_plugins_intent_strict(&data, &path),
         None => Ok(empty_installed_plugins_intent()),
     }
 }

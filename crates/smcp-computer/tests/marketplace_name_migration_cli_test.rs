@@ -263,3 +263,31 @@ fn cli_user_settings_path_is_isolated() {
     assert_eq!(out.status.code(), Some(0));
     assert!(!user_path.exists(), "dry-run must not create user settings");
 }
+
+#[test]
+fn cli_scans_current_project_settings_and_exits_3() {
+    let td = TempDir::new().unwrap();
+    let (home, skill_home, env) = setup(&td);
+    seed_legacy(&skill_home, &env, "old-name", "team-tools");
+    // run_binary 的 current_dir 是 home，故项目 settings 放在 home/.tfrobot/。
+    let project_settings = home.join(".tfrobot/settings.json");
+    fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
+    fs::write(
+        &project_settings,
+        serde_json::to_string(&json!({"enabledPlugins": {"alpha@old-name": true}})).unwrap(),
+    )
+    .unwrap();
+    let out = cli_binary::run_binary(&home, &skill_home, &["marketplace", "migrate", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = cli_binary::json_stdout(&out);
+    let manual = v["manualReferences"].as_array().unwrap();
+    assert!(manual.iter().any(|m| m["effect"] == "will-be-inactive"
+        && m["file"]
+            .as_str()
+            .is_some_and(|f| f.ends_with(".tfrobot/settings.json"))));
+}
