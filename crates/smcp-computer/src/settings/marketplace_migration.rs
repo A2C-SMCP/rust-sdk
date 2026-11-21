@@ -3546,6 +3546,78 @@ mod tests {
     }
 
     #[test]
+    fn resume_backfills_enabled_when_settings_write_was_lost() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit_with_ledger(&home, "old-name", "team-tools", "alpha");
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        let report = apply_marketplace_name_migration(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let backup_dir = PathBuf::from(&report.backup.unwrap().path);
+        // 模拟「intent 已写、settings 回填丢失」：删掉 enabled 键后重建 journal。
+        let user_path = user_settings_path(Some(&env));
+        raw_write::update_raw_settings(&user_path, false, |map| {
+            let enabled = raw_write::object_field_mut(map, FIELD_ENABLED_PLUGINS, &user_path)?;
+            enabled.remove("alpha@team-tools");
+            Ok(())
+        })
+        .unwrap();
+        let mut meta: MigrationMeta =
+            serde_json::from_str(&std::fs::read_to_string(backup_dir.join("backup.json")).unwrap())
+                .unwrap();
+        meta.phase = "aborted".to_string();
+        meta.post_hashes = current_hashes(&home, Some(&env), &user_path).unwrap();
+        write_journal(&home, &meta).unwrap();
+        let resumed = resume_marketplace_name_migration(&home, Some(&env), None, &secrets).unwrap();
+        assert_eq!(resumed.status(), MigrationStatus::Ok, "{resumed:?}");
+        let user = raw_write::read_strict_map(&user_path).unwrap();
+        assert_eq!(user["enabledPlugins"]["alpha@team-tools"], true);
+    }
+
+    #[test]
+    fn pre_v03_ledger_local_only_id_survives_first_intent_write() {
+        let td = TempDir::new().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        seed_unit(&home, "old-name", "team-tools");
+        update_installed_plugins(
+            |file| {
+                file.account.plugins.insert(
+                    "local-only".to_string(),
+                    vec![InstalledPluginRecord::default()],
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+        let env = unit_env(&td);
+        let secrets = SecretStore::new();
+        apply_marketplace_name_migration(
+            &home,
+            Some(&env),
+            None,
+            MarketplaceMigrationOptions::default(),
+            &secrets,
+        )
+        .unwrap();
+        let intent = load_installed_plugins_intent_strict(Some(&home), Some(&env)).unwrap();
+        assert!(
+            intent.account.installed_plugins.contains("local-only"),
+            "pre-v0.3 ledger local-only id lost: {:?}",
+            intent.account.installed_plugins
+        );
+    }
+
+    #[test]
     fn rollback_rejects_drifted_state() {
         let td = TempDir::new().unwrap();
         let home = td.path().join("home");
