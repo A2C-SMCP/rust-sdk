@@ -497,7 +497,7 @@ marketplace migrate --rollback <timestamp>            # 按备份回滚
 
 - 退出码：`0` 成功/无操作；`1` 冲突或命令级错误；`3` 部分完成（unresolved/blocked/keyring 不可用/
   project-local 启用项将失活）。
-- `--json` 输出 `dryRun` / `items` / `conflicts` / `manualReferences` / `backup`。
+- `--json` 输出 `dryRun` / `written` / `status` / `items` / `conflicts` / `manualReferences` / `backup`。
 - project/local/policy/flag 的引用只报告；`extraKnownMarketplaces` 仅 `--update-declarations` 改
   **user** scope。
 - 完整说明见 [存量 Marketplace 注册名迁移](marketplace-name-migration.md)。

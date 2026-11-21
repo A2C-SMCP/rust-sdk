@@ -596,6 +596,14 @@ fn coerce_installed_plugins_strict(
         Some(Value::Object(map)) => {
             let mut plugins = indexmap::IndexMap::new();
             for (pid, value) in map {
+                if !is_valid_enabled_plugin_key(pid) {
+                    let display =
+                        crate::settings::redaction::untrusted_name_for_display(pid);
+                    return Err(strict_coerce_err(
+                        path,
+                        format!("plugins key {display:?} is not a valid plugin id"),
+                    ));
+                }
                 let records: Vec<crate::settings::reconciler::InstalledPluginRecord> =
                     serde_json::from_value(value.clone())
                         .map_err(|e| strict_coerce_err(path, format!("plugins.{pid}: {e}")))?;
@@ -627,9 +635,11 @@ fn coerce_installed_plugins_intent_strict(
                     ));
                 };
                 if !is_valid_enabled_plugin_key(pid) {
+                    let display =
+                        crate::settings::redaction::untrusted_name_for_display(pid);
                     return Err(strict_coerce_err(
                         path,
-                        format!("installedPlugins contains an invalid plugin id {pid:?} (expect '<plugin>@<marketplace>')"),
+                        format!("installedPlugins contains an invalid plugin id {display:?} (expect '<plugin>@<marketplace>')"),
                     ));
                 }
                 set.insert(pid.to_string());
