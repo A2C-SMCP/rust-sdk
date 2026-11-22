@@ -185,12 +185,14 @@ pub fn format_settings_errors(errors: &[crate::settings::SettingsValidationError
     errors
         .iter()
         .map(|e| {
-            format!(
-                "⚠ settings.json[{}]: {} — {}",
-                e.scope.as_str(),
-                e.field,
-                e.reason
-            )
+            // #267：marketplace 声明错误在**所有呈现面**统一脱敏（settings show/get、boot 批准流程、
+            // 治理重挂 flag 错误）——与恢复报告的 `marketplace_declaration_errors` 同一口径。
+            let sanitized = crate::settings::recovery::sanitize_marketplace_declaration_error(e);
+            let (field, reason) = match &sanitized {
+                Some(dto) => (dto.field.as_str(), dto.reason.as_str()),
+                None => (e.field.as_str(), e.reason.as_str()),
+            };
+            format!("⚠ settings.json[{}]: {field} — {reason}", e.scope.as_str())
         })
         .collect()
 }
@@ -429,6 +431,10 @@ pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: O
     for conflict in &report.marketplace_source_conflicts {
         msg_warn(&marketplace_source_conflict_line(conflict));
     }
+    // #267：settings 校验阶段被丢弃的非法 marketplace 声明——让「有声明但不可用」可见。
+    for error in &report.marketplace_declaration_errors {
+        msg_warn(&marketplace_declaration_error_line(error));
+    }
 }
 
 /// #295 声明面换源被拒（§5.14）的 CLI 提示行（纯格式化，供单测——呈现半程的可断言守护同 #143）/
@@ -445,6 +451,21 @@ fn marketplace_source_conflict_line(
          registered source; declaration rejected (keeping the registered source; remove + re-add the \
          marketplace to switch sources)",
         conflict.marketplace
+    )
+}
+
+/// #267 非法 marketplace 声明被 settings 校验丢弃的 CLI 提示行（纯格式化，供单测）/
+/// invalid marketplace declaration warning line.
+///
+/// `field` / `reason` 已在 `MarketplaceDeclarationError` 构造点脱敏并清洗控制字符；本函数只拼装。
+fn marketplace_declaration_error_line(
+    error: &crate::settings::MarketplaceDeclarationError,
+) -> String {
+    format!(
+        "⚠ settings.json[{}]: {} — {} (declaration ignored; existing registration unchanged)",
+        error.scope.as_str(),
+        error.field,
+        error.reason
     )
 }
 
@@ -485,6 +506,52 @@ mod tests {
             !line.contains("skills restored"),
             "提示不得承诺恢复：{line}"
         );
+    }
+
+    /// #267：非法声明提示行含 scope/field/reason 与「旧注册不变」承诺；DTO 已在构造点脱敏。
+    #[test]
+    fn marketplace_declaration_error_line_pins_fields_and_scope() {
+        let error = crate::settings::MarketplaceDeclarationError {
+            scope: SettingsScope::User,
+            marketplace: Some("acme".to_string()),
+            field: "extraKnownMarketplaces.acme.source.url".to_string(),
+            reason: "malformed git url".to_string(),
+            source_path: Some("/tmp/settings.json".to_string()),
+        };
+        let line = marketplace_declaration_error_line(&error);
+        assert!(line.contains("[user]"), "{line}");
+        assert!(
+            line.contains("extraKnownMarketplaces.acme.source.url"),
+            "{line}"
+        );
+        assert!(line.contains("malformed git url"), "{line}");
+        assert!(line.contains("existing registration unchanged"), "{line}");
+    }
+
+    /// #267：所有 settings 错误呈现面对 marketplace 声明错误共用同一脱敏口径。
+    #[test]
+    fn format_settings_errors_sanitizes_marketplace_declaration_fields() {
+        let secret = "https://user:PW_SECRET@example.com/repo.git";
+        let errors = vec![SettingsValidationError {
+            scope: SettingsScope::User,
+            field: format!("extraKnownMarketplaces.{secret}.source.url\u{202E}"),
+            reason: format!("malformed git url: {secret}\nFAKE\u{1b}"),
+            source_path: None,
+        }];
+        let lines = format_settings_errors(&errors);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("extraKnownMarketplaces."),
+            "前缀必须保留：{}",
+            lines[0]
+        );
+        for needle in ["PW_SECRET", "\n", "\u{1b}", "\u{202E}"] {
+            assert!(
+                !lines[0].contains(needle),
+                "未清洗 {needle:?}：{}",
+                lines[0]
+            );
+        }
     }
 
     /// #143：`format_settings_errors` 的文案与 scope/field 拼装（呈现半程的可断言守护——`run_mcp_approval`

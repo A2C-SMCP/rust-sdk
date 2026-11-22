@@ -607,8 +607,13 @@ fn normalize_root_flag_path(root: &RootState) -> Option<std::path::PathBuf> {
             Ok(path) => Some(path),
             Err(reason) => {
                 eprintln!(
-                    "⚠ settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
-                    raw.display()
+                    "{}",
+                    crate::computer::flag_path_diagnostic(
+                        "flag settings",
+                        raw,
+                        reason,
+                        "flag scope disabled"
+                    )
                 );
                 None
             }
@@ -768,7 +773,7 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) ->
         .computer
         .normalized_mcp_flag_config()
         .map(Path::to_path_buf);
-    approval::run_mcp_approval(
+    approval::run_mcp_approval_for_repl(
         &handler.computer,
         root.approve_all_mcp,
         flag_settings_path.as_deref(),
@@ -1148,10 +1153,17 @@ mod tests {
             Some(&resolve_env),
             Some(planted.as_path()),
         );
+        // policy 无 env 接缝：宿主 policy 可覆盖 merged 视图，只看 Flag 层（与本用例下方生效组同口径）。
+        let control_flag = control
+            .scope_layers
+            .iter()
+            .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
+            .map(|(_, layer)| layer)
+            .expect("five-layer view always contains Flag");
         assert_eq!(
-            control.settings.get("enableAllProjectMcpServers"),
+            control_flag.get("enableAllProjectMcpServers"),
             Some(&serde_json::json!(true)),
-            "控制组：植入 settings 必须是有效信任载荷"
+            "控制组：植入 settings 必须是有效信任载荷（只看 Flag 层）"
         );
         use crate::settings::mcp_config::{resolve_mcp_config, ResolveMcpConfigArgs};
         // policy / managed-mcp 无 env 接缝：managed 指向 tempdir 内路径（不读宿主），断言只看 Flag 层。

@@ -1533,7 +1533,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tokio::net::TcpListener;
 
-    type TestSseSender = mpsc::UnboundedSender<Result<Frame<Bytes>, Infallible>>;
+    /// 有界 SSE body 通道（#263 复审）：高频供流测试不得无界积压 → 内存上界固定。
+    const TEST_SSE_CHANNEL_CAPACITY: usize = 32;
+    type TestSseSender = mpsc::Sender<Result<Frame<Bytes>, Infallible>>;
     type TestSseBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
     struct TestSseMock {
@@ -1639,7 +1641,8 @@ mod tests {
                     "event: message\ndata: {}\n\n",
                     serde_json::to_string(value).unwrap()
                 );
-                let _ = tx.send(Ok(Frame::data(Bytes::from(frame))));
+                // 有界通道：队列满即丢本条通知（测试按需推进消费，不阻塞同步 helper）。
+                let _ = tx.try_send(Ok(Frame::data(Bytes::from(frame))));
             }
         }
     }
@@ -1667,12 +1670,15 @@ mod tests {
 
         if method == Method::GET && path == "/sse" {
             active.fetch_add(1, Ordering::SeqCst);
-            let (tx, rx) = mpsc::unbounded_channel::<Result<Frame<Bytes>, Infallible>>();
+            let (tx, rx) =
+                mpsc::channel::<Result<Frame<Bytes>, Infallible>>(TEST_SSE_CHANNEL_CAPACITY);
             connections.lock().unwrap().push(tx.clone());
             if send_endpoint {
-                let _ = tx.send(Ok(Frame::data(Bytes::from(
-                    "event: endpoint\ndata: /messages\n\n",
-                ))));
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from(
+                        "event: endpoint\ndata: /messages\n\n",
+                    ))))
+                    .await;
             }
             let guard = ActiveConnectionGuard(active);
             let stream = unfold((rx, guard), |(mut rx, guard)| async move {
@@ -1934,25 +1940,41 @@ mod tests {
             "expected exactly one production `tokio::select!` in sse_client.rs"
         );
         let select_at = select_offsets[0];
-        // 按 chars 截取，避免多字节 UTF-8 边界 panic（注释含中文）。
-        let head: String = production
-            .get(select_at..)
-            .expect("select offset must be a char boundary")
-            .chars()
-            .take(160)
-            .collect();
+        // 扫描**整个 `tokio::select!` 块**（而非固定 160 chars）——`biased;` 若被插到块内更靠后
+        // 的合法位置（宏首行之后）也必须被抓到。
+        let block = select_block(production, select_at);
         assert!(
-            !head.contains("biased"),
+            !block.contains("biased"),
             "SSE stream select! must not use `biased`: it can starve request_rx"
         );
     }
 
+    /// 从 `tokio::select!` 起始偏移按花括号配对截取完整块（字符串中的 `{}` 亦成对，不影响配对）。
+    fn select_block(text: &str, start: usize) -> &str {
+        let mut depth = 0i32;
+        for (offset, ch) in text[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[start..start + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated `tokio::select!` block");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn continuous_stream_traffic_does_not_starve_tool_requests() {
-        // #254 复审测试缺口：SSE 流持续就绪时 request_rx 不得被饿死。
-        // 多线程运行时 + 独立泵任务持续灌 `notifications/resources/updated`（处理含 await），
-        // 复现生产下「stream 分支始终就绪」；若 `select!` 加回 `biased`（cancel→stream→request），
-        // list_tools 会排到 30s 响应超时。预灌一段突发确保 request 入队瞬间流非空。
+        // #254 复审测试缺口 / #263 复审：SSE 流持续就绪时 request_rx 不得被饿死。
+        // 供流**有界**：mock 的 SSE body 使用有界 mpsc（`TEST_SSE_CHANNEL_CAPACITY`），泵任务
+        // `send().await` 受背压限制——高频流下积压有确定上界，不会 OOM/SIGKILL。
+        // 本用例是**公平调度下的行为 smoke**：fair select 下 `list_tools` 必须在 3s 内完成。
+        // `biased` 回归的**确定性判据**是源码锚 `sse_stream_select_must_not_use_biased_polling`
+        // （已实测加回 `biased` 即红）；2 线程调度下行为级可能因队列短暂排空而通过，故不单靠它。
         let mock = TestSseMock::spawn(StatusCode::OK).await;
         let client = SseMCPClient::new(sse_test_params(&mock));
         tokio::time::timeout(Duration::from_secs(5), client.connect())
@@ -1981,20 +2003,16 @@ mod tests {
                 None,
             )
             .await;
-        for _ in 0..64 {
-            let _ = pump_tx.send(Ok(Frame::data(Bytes::from(big_frame.clone()))));
-        }
+        // 有界背压：通道满时 `send().await` 阻塞，队列至多 `TEST_SSE_CHANNEL_CAPACITY` 帧。
         let pump = tokio::spawn(async move {
             loop {
                 if pump_tx
                     .send(Ok(Frame::data(Bytes::from(big_frame.clone()))))
+                    .await
                     .is_err()
                 {
                     break;
                 }
-                // 节流：`yield_now` 紧循环会让生产端比消费端快两个数量级，biased 回归时 3s 窗口
-                // 可积压数百 MB 触发 OOM/SIGKILL；1ms/帧约 75MB/s，足以让 stream 分支持续就绪。
-                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
 
@@ -2011,7 +2029,7 @@ mod tests {
             }
         })
         .await
-        .expect("the stream pump did not feed the client");
+        .expect("the bounded stream pump did not feed the client");
 
         let tools = tokio::time::timeout(Duration::from_secs(3), client.list_tools())
             .await
@@ -2064,10 +2082,32 @@ mod tests {
             .expect("connect timed out")
             .expect("connect failed");
 
-        tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), client.disconnect())
             .await
             .expect("disconnect must be bounded when lifecycle POSTs hang")
             .expect("disconnect failed");
+        // #263 复审：耗时上界与**实际投递**断言。理论上限 = 2×1s lifecycle POST + 1s stream shutdown
+        // = 3s；断言留 3s CI 余量（<6s），仍能抓住旧 30s×2 回归（外层 10s 先触发）。
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "disconnect 不得被挂起的 lifecycle POST 拖长：{elapsed:?}"
+        );
+        let lifecycle: Vec<String> = mock
+            .post_methods()
+            .into_iter()
+            .filter(|method| !method.starts_with("notifications/"))
+            .collect();
+        assert_eq!(
+            lifecycle,
+            vec![
+                "initialize".to_string(),
+                "shutdown".to_string(),
+                "exit".to_string()
+            ],
+            "挂起 server 也必须实际收到 shutdown → exit 投递"
+        );
     }
 
     #[tokio::test]
