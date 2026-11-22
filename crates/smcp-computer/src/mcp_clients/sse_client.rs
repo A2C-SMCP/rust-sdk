@@ -83,8 +83,12 @@ pub struct SseMCPClient {
     /// 每连接代际：shutdown 递增使旧任务的写入失效 / per-connection generation for stale-write fencing.
     stream_generation: Arc<AtomicU64>,
     /// 连接代际（#267 S4 审查 🟡2）：**仅新连接**递增；lifecycle supervisor 捕获它并在每条
-    /// POST 前校验——重连后旧 supervisor 不得把迟到的 exit 打到新会话。
+    /// POST 前校验。作用域限定：只覆盖**同一 client 实例**的 disconnect→connect；已发出的
+    /// in-flight POST 不可收回，manager stop→start 新建 client 的跨实例迟到 POST 是既有已声明
+    /// 边界（见 `spawn_lifecycle_notifications`），不构成普遍保证。
     connection_epoch: Arc<AtomicU64>,
+    /// lifecycle POST 单条上限（生产 `SSE_LIFECYCLE_POST_TIMEOUT`；单测可注入长值以消除时序假设）。
+    lifecycle_post_timeout: Duration,
     /// start 与 shutdown 互斥（防 shutdown 落在 spawn 与 store 之间）/ serializes start vs shutdown.
     stream_lifecycle: Mutex<()>,
     /// endpoint 就绪等待上限（生产 10s；单测可缩短）/ endpoint readiness timeout (tests may shorten).
@@ -163,6 +167,7 @@ impl SseMCPClient {
             lifecycle_task: StdMutex::new(None),
             stream_generation: Arc::new(AtomicU64::new(0)),
             connection_epoch: Arc::new(AtomicU64::new(0)),
+            lifecycle_post_timeout: SSE_LIFECYCLE_POST_TIMEOUT,
             stream_lifecycle: Mutex::new(()),
             endpoint_ready_timeout: Duration::from_secs(10),
         }
@@ -265,6 +270,7 @@ impl SseMCPClient {
         };
         let http_client = self.http_client.clone();
         let headers = self.base.params.headers.clone();
+        let post_timeout = self.lifecycle_post_timeout;
         let epoch = self.connection_epoch.load(Ordering::SeqCst);
         let connection_epoch = Arc::clone(&self.connection_epoch);
         let mut guard = self
@@ -282,7 +288,8 @@ impl SseMCPClient {
                     );
                     break;
                 }
-                post_lifecycle_message(&http_client, &endpoint, &headers, method).await;
+                post_lifecycle_message(&http_client, &endpoint, &headers, method, post_timeout)
+                    .await;
             }
             let _ = done_tx.send(());
         });
@@ -702,13 +709,14 @@ impl SseMCPClient {
 
 /// 尽力投递一条 SSE lifecycle 消息（shutdown/exit）——直接 POST，不经流任务队列。
 ///
-/// 由 [`SseMCPClient::spawn_lifecycle_notifications`] 的后台任务调用（#267 S4）：每条带
-/// [`SSE_LIFECYCLE_POST_TIMEOUT`] 上限，失败只 warn 不向上传播；返回是否投递成功（单测用）。
+/// 由 [`SseMCPClient::spawn_lifecycle_notifications`] 的后台任务调用（#267 S4）：每条带调用方
+/// 传入的下发上限（生产 `SSE_LIFECYCLE_POST_TIMEOUT`），失败只 warn 不向上传播；返回是否投递成功。
 async fn post_lifecycle_message(
     http_client: &reqwest::Client,
     endpoint: &str,
     headers: &std::collections::HashMap<String, String>,
     method: &str,
+    timeout: Duration,
 ) -> bool {
     let request_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -725,7 +733,7 @@ async fn post_lifecycle_message(
     for (key, value) in headers {
         request = request.header(key, value);
     }
-    match tokio::time::timeout(SSE_LIFECYCLE_POST_TIMEOUT, request.json(&body).send()).await {
+    match tokio::time::timeout(timeout, request.json(&body).send()).await {
         Ok(Ok(response)) if response.status().is_success() => {
             debug!("SSE {method} posted");
             true
@@ -849,8 +857,9 @@ impl MCPClientProtocol for SseMCPClient {
         }
 
         // 尽力通知 server 侧关闭 / Best-effort lifecycle messages.
-        // #267 S4：后台投递（fire-and-forget，shutdown→exit 顺序、每条 1s 上限）——teardown
-        // 不再等待对端；投递失败只 warn。详见 `spawn_lifecycle_notifications` 的边界说明。
+        // #267 S4：后台投递（shutdown→exit 顺序、每条 1s 上限）。SSE disconnect 的硬上界
+        // ≈1.5s = ≤500ms 下发窗口 + ≤1s 流关闭；慢服务器超窗后由后台继续投递（best-effort），
+        // 不再等待响应。投递失败只 warn。详见 `spawn_lifecycle_notifications` 的边界说明。
         let dispatch_done = self.spawn_lifecycle_notifications().await;
         // #267 S4 审查 🟡1：关闭 GET 流前给 lifecycle 一个**有界下发窗口**——服务端可能在流关闭后
         // 失效 POST endpoint（→ shutdown/exit 404）。健康服务器毫秒级完成；慢服务器超窗后仍由后台
@@ -1636,6 +1645,8 @@ mod tests {
         post_methods: Arc<StdMutex<Vec<String>>>,
         /// #267 S4 审查 🟡1：GET 流已关闭（active==0）后才到达的 shutdown/exit。
         late_lifecycle: Arc<StdMutex<Vec<String>>>,
+        /// 当前挂起中的 shutdown/exit POST 数量（#267 S4 审查 🟡3：并发 supervisor 判据）。
+        lifecycle_active: Arc<AtomicUsize>,
     }
 
     impl TestSseMock {
@@ -1671,11 +1682,13 @@ mod tests {
                 Arc::new(StdMutex::new(Vec::new()));
             let post_methods: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
             let late_lifecycle: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+            let lifecycle_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
             let active_for_server = active.clone();
             let connections_for_server = connections.clone();
             let post_methods_for_server = post_methods.clone();
             let late_lifecycle_for_server = late_lifecycle.clone();
+            let lifecycle_active_for_server = lifecycle_active.clone();
             tokio::spawn(async move {
                 loop {
                     let (stream, _) = match listener.accept().await {
@@ -1687,12 +1700,14 @@ mod tests {
                     let connections = connections_for_server.clone();
                     let post_methods = post_methods_for_server.clone();
                     let late_lifecycle = late_lifecycle_for_server.clone();
+                    let lifecycle_active = lifecycle_active_for_server.clone();
                     tokio::spawn(async move {
                         let service = service_fn(move |req| {
                             let active = active.clone();
                             let connections = connections.clone();
                             let post_methods = post_methods.clone();
                             let late_lifecycle = late_lifecycle.clone();
+                            let lifecycle_active = lifecycle_active.clone();
                             async move {
                                 sse_test_handler(
                                     req,
@@ -1700,6 +1715,7 @@ mod tests {
                                     connections,
                                     post_methods,
                                     late_lifecycle,
+                                    lifecycle_active,
                                     initialize_status,
                                     send_endpoint,
                                     hang_lifecycle,
@@ -1721,6 +1737,7 @@ mod tests {
                 connections,
                 post_methods,
                 late_lifecycle,
+                lifecycle_active,
             }
         }
 
@@ -1736,6 +1753,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
+        }
+
+        fn lifecycle_active(&self) -> usize {
+            self.lifecycle_active.load(Ordering::SeqCst)
         }
 
         fn sse_url(&self) -> String {
@@ -1759,6 +1780,15 @@ mod tests {
         }
     }
 
+    /// 挂起中 lifecycle POST 计数守卫：请求 future 被取消/连接关闭时递减。
+    struct ActiveLifecycleGuard(Arc<AtomicUsize>);
+
+    impl Drop for ActiveLifecycleGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     /// 活跃连接计数守卫：响应体被 drop（客户端断开 / 任务取消）时递减。
     struct ActiveConnectionGuard(Arc<AtomicUsize>);
 
@@ -1776,6 +1806,7 @@ mod tests {
         connections: Arc<StdMutex<Vec<TestSseSender>>>,
         post_methods: Arc<StdMutex<Vec<String>>>,
         late_lifecycle: Arc<StdMutex<Vec<String>>>,
+        lifecycle_active: Arc<AtomicUsize>,
         initialize_status: StatusCode,
         send_endpoint: bool,
         hang_lifecycle: bool,
@@ -1835,6 +1866,8 @@ mod tests {
 
             if hang_lifecycle && matches!(rpc_method, "shutdown" | "exit") {
                 // 永不响应：覆盖 disconnect 直接 POST 的 1s 上限（旧 30s send_request 会超 5s 外层断言）。
+                lifecycle_active.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveLifecycleGuard(lifecycle_active.clone());
                 std::future::pending::<()>().await;
             }
 
@@ -2220,8 +2253,8 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_is_bounded_when_lifecycle_posts_hang() {
-        // #267 S4：shutdown/exit 改为后台投递（每条仍带 1s 上限）——挂起的 server 不得让
-        // disconnect 等待（E4 实测修复前 2.0s）。
+        // #267 S4：shutdown/exit 改为后台投递（每条仍带 1s 上限）。挂起的 server 不得把 disconnect
+        // 拖到逐条等待（E4 修复前 2.0s）；现硬上界 ≈1.5s（500ms 下发窗口 + ≤1s 流关闭）。
         let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
         let client = SseMCPClient::new(sse_test_params(&mock));
         tokio::time::timeout(Duration::from_secs(5), client.connect())
@@ -2265,6 +2298,7 @@ mod tests {
             &endpoint,
             &std::collections::HashMap::new(),
             "shutdown",
+            SSE_LIFECYCLE_POST_TIMEOUT,
         )
         .await;
         let elapsed = started.elapsed();
@@ -2320,7 +2354,10 @@ mod tests {
         // #267 S4 审查 🟡3：两个并发 disconnect 不得各自 spawn 出长期存活的任务——take/abort/spawn/store
         // 必须在同一临界区。命中判据：只有一个 supervisor 能走到 exit。
         let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
-        let client = Arc::new(SseMCPClient::new(sse_test_params(&mock)));
+        let mut client = SseMCPClient::new(sse_test_params(&mock));
+        // 注入长下发上限：两个 supervisor 都不会在断言前超时推进到 exit（消除 1s 调度假设）。
+        client.lifecycle_post_timeout = Duration::from_secs(10);
+        let client = Arc::new(client);
         *client.endpoint_url.lock().await =
             Some(format!("http://127.0.0.1:{}/messages", mock.port));
         let first = {
@@ -2337,11 +2374,17 @@ mod tests {
         };
         let _ = tokio::join!(first, second);
 
-        let lifecycle = wait_for_lifecycle_methods(&mock, &["shutdown", "exit"]).await;
-        let exits = lifecycle.iter().filter(|method| *method == "exit").count();
+        // 判据：被顶替者的 in-flight POST 必须被取消——挂起中的 lifecycle POST 只剩存活者这一条。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while mock.lifecycle_active() != 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // 稳定窗口：确认没有第二条在途 POST 在稍后才出现。
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
-            exits, 1,
-            "concurrent spawns must leave exactly one supervisor; got {lifecycle:?}"
+            mock.lifecycle_active(),
+            1,
+            "concurrent spawns must leave exactly one in-flight supervisor POST"
         );
     }
 
@@ -2387,17 +2430,23 @@ mod tests {
         client.disconnect().await.expect("disconnect failed");
         wait_for_lifecycle_methods(&mock, &["shutdown"]).await;
 
-        tokio::time::timeout(Duration::from_secs(5), client.connect())
-            .await
-            .expect("reconnect timed out")
-            .expect("reconnect failed");
-        // 旧 supervisor 的 shutdown 会在 1s 后超时并在 exit 前撞上 epoch 闸门——等待超过该窗口，
-        // 断言没有新的 exit 到达（负向观察，deadline 而非 sleep 竞态）。
+        // 快照必须在 connect **之前**：若旧 exit 在快照前落达，会在前后两次计数里同时出现而假绿。
         let exits_before = mock
             .post_methods()
             .iter()
             .filter(|method| *method == "exit")
             .count();
+        assert_eq!(
+            exits_before, 0,
+            "no exit may be delivered before the new connection"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("reconnect timed out")
+            .expect("reconnect failed");
+        // 旧 supervisor 的 shutdown 会在 1s 后超时并在 exit 前撞上 epoch 闸门——等待超过该窗口，
+        // 断言没有任何 exit 到达（负向观察，deadline 而非 sleep 竞态）。
         tokio::time::sleep(Duration::from_millis(1300)).await;
         let exits_after = mock
             .post_methods()
@@ -2405,7 +2454,7 @@ mod tests {
             .filter(|method| *method == "exit")
             .count();
         assert_eq!(
-            exits_after, exits_before,
+            exits_after, 0,
             "a superseded supervisor must not deliver exit after a new connection"
         );
 
