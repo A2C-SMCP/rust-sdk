@@ -1736,9 +1736,10 @@ impl<S: Session> Computer<S> {
     ///
     /// 治理恢复（[`reconcile_governance`](Self::reconcile_governance)）、待批准列表
     /// （[`list_pending_bundled_approvals`](Self::list_pending_bundled_approvals)）、归属视图
-    /// （[`enabled_bundled_ownership`](Self::enabled_bundled_ownership)）、enable 回滚 provider
-    /// （[`resolved_runtime_settings`](Self::resolved_runtime_settings)）与 config 快照
-    /// （`instance_config_context`）必须**同源**；新增解析参数只改此处，防口径漂移。
+    /// （[`enabled_bundled_ownership`](Self::enabled_bundled_ownership)）与 enable 回滚 provider
+    /// （[`resolved_runtime_settings`](Self::resolved_runtime_settings)）的**唯一收口**；新增解析参数只改
+    /// 此处，防口径漂移。**不含** `instance_config_context`（config 快照）——它经 `ConfigContext` 仅共享
+    /// 实例 `env` / flag / `config_dir`，`policy_settings` 刻意不接（借用字段限制，见其 doc）。
     fn resolve_instance_settings(
         &self,
         env: Option<&EnvMap>,
@@ -7954,6 +7955,42 @@ mod tests {
         assert!(
             all.iter().any(|error| error.scope == SettingsScope::Flag),
             "非 CLI 取路（resolve_settings）MUST 保留 Flag 校验错误：{all:?}"
+        );
+    }
+
+    /// rust-sdk#267 复审 🟡2：锁定 `reconcile_governance` public doc 的契约——`declared` 是调用方
+    /// **显式受信覆盖**：实例 flag 显式 false 而 `declared=true` 时，`plugin_enabled_origin` 为 `None`，
+    /// 不落 PENDING、按调用方覆盖直挂（宿主与 flag/embed 同属受信层）。
+    #[tokio::test]
+    async fn reconcile_governance_declared_override_beats_instance_flag_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let comp = Computer::new("c248m", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248m"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+        assert!(
+            report.pending_bundled_servers.is_empty(),
+            "origin=None（调用方覆盖）MUST NOT 落 PENDING"
+        );
+        assert_eq!(
+            report.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "调用方显式 declared=true 属受信覆盖，MUST 直挂"
+        );
+    }
         );
     }
 
