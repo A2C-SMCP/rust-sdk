@@ -10,7 +10,7 @@ use smcp_computer::mcp_clients::model::{
 };
 use smcp_computer::mcp_clients::stdio_client::StdioMCPClient;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Path to the echo MCP server relative to workspace root
 fn echo_server_path() -> String {
@@ -271,6 +271,69 @@ async fn test_stdio_custom_connect_timeout_reports_effective_value() {
         }
         other => panic!("expected a custom STDIO timeout, got {other:?}"),
     }
+}
+
+/// #267 S4：子进程回答 initialize 后**忽略 stdin**（EOF 不退出）时，disconnect 必须有界返回，
+/// 且子进程已被回收（不能只测耗时）。
+///
+/// E4 实测修复前 disconnect 已 6.3ms（`service.cancel()` 快速返回 + SIGKILL 回收）⇒ 本用例是
+/// **回归栅栏**而非红灯：任何把 teardown 改成等待子进程自然退出的回归都会撞上 1.5s 上界。
+///
+/// 确定性：假 server 用 `exec sleep 300` 保证 `$$` 即被 kill 的目标进程，且无 sleep 竞态——
+/// pid 文件在 initialize 应答前写入，connect 成功即保证其存在。
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_disconnect_is_bounded_when_child_ignores_stdin() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let pid_path = temp.path().join("child.pid");
+    let script = r#"
+echo $$ > "$PID_FILE"
+read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"stdin-ignoring","version":"0.0.1"}}}\n' "$id"
+exec sleep 300
+"#;
+    let mut params = shell_params(script);
+    params
+        .env
+        .insert("PID_FILE".to_string(), pid_path.display().to_string());
+
+    let client = StdioMCPClient::new(params);
+    tokio::time::timeout(Duration::from_secs(10), client.connect())
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+    assert_eq!(client.state(), ClientState::Connected);
+
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(10), client.disconnect())
+        .await
+        .expect("disconnect must not wait for a child that ignores stdin")
+        .expect("disconnect failed");
+    let elapsed = started.elapsed();
+
+    assert_eq!(client.state(), ClientState::Disconnected);
+    // 500ms 上界：远高于实测 6.3ms（负载裕量），又低于 1s close 超时——能把「快速 Ok(Some)」
+    // 与「掉进 close_with_timeout 超时分支再靠 SIGKILL 收敛」区分开（审查 🟡）。
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "stdio disconnect must take the fast close path (E4 6.3ms), took {elapsed:?}"
+    );
+
+    let pid: i32 = std::fs::read_to_string(&pid_path)
+        .expect("fake server must record its pid")
+        .trim()
+        .parse()
+        .expect("pid file must contain a pid");
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    assert!(
+        !alive,
+        "child process {pid} must be reaped before disconnect returns"
+    );
 }
 
 /// Regression test for https://github.com/A2C-SMCP/rust-sdk/issues/10

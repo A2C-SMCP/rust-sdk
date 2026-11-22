@@ -28,6 +28,10 @@ use tracing::{debug, error, info, warn};
 /// Bounded join for the SSE stream task; on timeout it is aborted and awaited to completion.
 const SSE_STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// 单条 SSE lifecycle POST（shutdown/exit）的上限（#267 S4）。投递在后台任务中进行，
+/// 不阻塞 disconnect；失败只 warn。
+const SSE_LIFECYCLE_POST_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// 单次 SSE 连接的任务所有权 / Ownership of one SSE stream-task generation.
 struct SseStreamOwner {
     cancel: CancellationToken,
@@ -63,6 +67,9 @@ pub struct SseMCPClient {
     /// SSE 常驻流任务所有权（std Mutex：`Drop` 需同步 take；take 后立即释放，不跨 await）/
     /// ownership of the SSE stream task（std Mutex so Drop can take it synchronously）.
     stream_owner: StdMutex<Option<SseStreamOwner>>,
+    /// lifecycle 投递 supervisor（#267 S4）：单任务、去重——新 disconnect 先 abort 旧任务，
+    /// 避免快速 stop/start 循环无界累积后台任务。std Mutex 供 `Drop` 同步 abort。
+    lifecycle_task: StdMutex<Option<JoinHandle<()>>>,
     /// 每连接代际：shutdown 递增使旧任务的写入失效 / per-connection generation for stale-write fencing.
     stream_generation: Arc<AtomicU64>,
     /// start 与 shutdown 互斥（防 shutdown 落在 spawn 与 store 之间）/ serializes start vs shutdown.
@@ -140,6 +147,7 @@ impl SseMCPClient {
             update_tx: Arc::new(Mutex::new(None)),
             notify: None,
             stream_owner: StdMutex::new(None),
+            lifecycle_task: StdMutex::new(None),
             stream_generation: Arc::new(AtomicU64::new(0)),
             stream_lifecycle: Mutex::new(()),
             endpoint_ready_timeout: Duration::from_secs(10),
@@ -223,36 +231,37 @@ impl SseMCPClient {
         }
     }
 
-    /// 尽力投递一条 SSE lifecycle 消息（shutdown/exit）——直接 POST，不经流任务队列。
+    /// 后台投递 shutdown→exit（#267 S4，fire-and-forget）。
     ///
-    /// #254 复审：原先入队后立刻 cancel，公平轮询下任务也未必先消费队列（响应通道还可能被上一条
-    /// 响应“插队”）；改为直接 POST 保证投递，并加 1s 上限避免 teardown 被慢服务器拖住。
-    async fn post_lifecycle_message(&self, method: &str) {
+    /// teardown 不等待对端：任务内按固定顺序各投递一条、每条 1s 上限，失败只 warn。
+    /// 单 supervisor 去重——新 disconnect 先 abort 上一个仍在跑的任务，避免无界累积。
+    ///
+    /// 边界（best-effort）：进程在 disconnect 后立即退出可能丢消息；对端极慢时迟到的 POST
+    /// 可能跨过快速 stop→start 的重连窗口。
+    async fn spawn_lifecycle_notifications(&self) {
         let Some(endpoint) = self.endpoint_url.lock().await.clone() else {
-            debug!("Skip SSE {method}: endpoint not established");
+            debug!("Skip SSE lifecycle messages: endpoint not established");
             return;
         };
-        let request_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or_default();
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "id": request_id,
+        let http_client = self.http_client.clone();
+        let headers = self.base.params.headers.clone();
+        let previous = self
+            .lifecycle_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+        let task = tokio::spawn(async move {
+            for method in ["shutdown", "exit"] {
+                post_lifecycle_message(&http_client, &endpoint, &headers, method).await;
+            }
         });
-        let mut request = self
-            .http_client
-            .post(&endpoint)
-            .header("Content-Type", "application/json");
-        for (key, value) in &self.base.params.headers {
-            request = request.header(key, value);
-        }
-        match tokio::time::timeout(SSE_STREAM_SHUTDOWN_TIMEOUT, request.json(&body).send()).await {
-            Ok(Ok(_)) => debug!("SSE {method} posted"),
-            Ok(Err(error)) => warn!("Failed to send {method} request: {}", error),
-            Err(_) => warn!("Timed out posting {method} request"),
-        }
+        *self
+            .lifecycle_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(task);
     }
 
     /// 结束当前 SSE 流任务并清空全部连接态（#254 S2）。
@@ -663,6 +672,47 @@ impl SseMCPClient {
     }
 }
 
+/// 尽力投递一条 SSE lifecycle 消息（shutdown/exit）——直接 POST，不经流任务队列。
+///
+/// 由 [`SseMCPClient::spawn_lifecycle_notifications`] 的后台任务调用（#267 S4）：每条带
+/// [`SSE_LIFECYCLE_POST_TIMEOUT`] 上限，失败只 warn 不向上传播；返回是否投递成功（单测用）。
+async fn post_lifecycle_message(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    headers: &std::collections::HashMap<String, String>,
+    method: &str,
+) -> bool {
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "id": request_id,
+    });
+    let mut request = http_client
+        .post(endpoint)
+        .header("Content-Type", "application/json");
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    match tokio::time::timeout(SSE_LIFECYCLE_POST_TIMEOUT, request.json(&body).send()).await {
+        Ok(Ok(_)) => {
+            debug!("SSE {method} posted");
+            true
+        }
+        Ok(Err(error)) => {
+            warn!("Failed to send {method} request: {}", error);
+            false
+        }
+        Err(_) => {
+            warn!("Timed out posting {method} request");
+            false
+        }
+    }
+}
+
 /// 解析 endpoint URL，支持相对路径
 fn resolve_endpoint_url(base_url: &str, endpoint: &str) -> String {
     // 如果是绝对 URL 直接返回
@@ -692,6 +742,11 @@ impl Drop for SseMCPClient {
             owner.cancel.cancel();
             owner.task.abort();
         }
+        // #267 S4（审查 🔴）：**不要** abort `lifecycle_task`。manager 的 stop 路径在调用
+        // `disconnect` 前已把 client 从 `active_clients` 移除、disconnect 返回后立即 drop 最后一个
+        // Arc——若在此 abort，fire-and-forget 的 shutdown/exit 投递会在几十 ms 内被静默掐断
+        //（exit 通常尚未发出）。该任务自持有界（≤2×1s）且只持 http_client/endpoint/headers 克隆，
+        // 允许短暂超过 client 生命周期；放弃投递必须走 disconnect 内的显式 abort-previous 语义。
     }
 }
 
@@ -762,10 +817,9 @@ impl MCPClientProtocol for SseMCPClient {
         }
 
         // 尽力通知 server 侧关闭 / Best-effort lifecycle messages.
-        // #254 复审：直接 POST 而非入队——入队后立刻 cancel 会丢消息（且不依赖队列消费时序）；
-        // POST 本身带 1s 上限，保证 teardown 不被慢服务器拖住。更完整的 bounded/fire-and-forget 归 S4。
-        self.post_lifecycle_message("shutdown").await;
-        self.post_lifecycle_message("exit").await;
+        // #267 S4：后台投递（fire-and-forget，shutdown→exit 顺序、每条 1s 上限）——teardown
+        // 不再等待对端；投递失败只 warn。详见 `spawn_lifecycle_notifications` 的边界说明。
+        self.spawn_lifecycle_notifications().await;
 
         // 关闭SSE连接：取消并等待流任务、清 response_rx / 连接态（#254 S2）。
         self.shutdown_stream().await;
@@ -1774,6 +1828,28 @@ mod tests {
         }
     }
 
+    /// #267 S4：lifecycle 投递改为后台任务后，投递观测必须轮询（无同步等待点）。
+    async fn wait_for_lifecycle_methods(mock: &TestSseMock, expected: &[&str]) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let lifecycle: Vec<String> = mock
+                .post_methods()
+                .into_iter()
+                .filter(|method| !method.starts_with("notifications/"))
+                .collect();
+            if expected
+                .iter()
+                .all(|method| lifecycle.iter().any(|seen| seen == method))
+            {
+                return lifecycle;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return lifecycle;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// #254 复审：connect 失败 / disconnect 后五处连接态必须全部清空。
     async fn assert_stream_state_cleared(client: &SseMCPClient) {
         assert!(
@@ -2044,7 +2120,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_posts_shutdown_then_exit() {
         // #254 复审测试缺口：disconnect 必须**实际发出** shutdown、exit 两个 POST（直接投递）。
-        // 若回退为「入队后立即 cancel」，队列消息可能未消费即被取消，该序列断言会失败。
+        // #267 S4 起改为后台投递（fire-and-forget），因此用轮询观察投递结果。
         let mock = TestSseMock::spawn(StatusCode::OK).await;
         let client = SseMCPClient::new(sse_test_params(&mock));
         tokio::time::timeout(Duration::from_secs(5), client.connect())
@@ -2054,12 +2130,8 @@ mod tests {
 
         client.disconnect().await.expect("disconnect failed");
         // `notifications/initialized` 是 connect 期间发出的通知 POST，可能晚于 disconnect 落达；
-        // 这里只核对**请求**序列（initialize 之后的 lifecycle 消息必须实际投递）。
-        let lifecycle: Vec<String> = mock
-            .post_methods()
-            .into_iter()
-            .filter(|method| !method.starts_with("notifications/"))
-            .collect();
+        // 这里只核对**请求**序列（initialize 之后的 lifecycle 消息必须实际投递，且顺序固定）。
+        let lifecycle = wait_for_lifecycle_methods(&mock, &["shutdown", "exit"]).await;
         assert_eq!(
             lifecycle,
             vec![
@@ -2073,8 +2145,8 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_is_bounded_when_lifecycle_posts_hang() {
-        // #254 复审：shutdown/exit 直接 POST 各带 1s 上限——挂起的 server 不得把 disconnect 拖成
-        // 30s×2（旧 `send_request(...).await` 会超过下面的 5s 外层断言）。
+        // #267 S4：shutdown/exit 改为后台投递（每条仍带 1s 上限）——挂起的 server 不得让
+        // disconnect 等待（E4 实测修复前 2.0s）。
         let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
         let client = SseMCPClient::new(sse_test_params(&mock));
         tokio::time::timeout(Duration::from_secs(5), client.connect())
@@ -2082,31 +2154,115 @@ mod tests {
             .expect("connect timed out")
             .expect("connect failed");
 
-        let started = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(10), client.disconnect())
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), client.disconnect())
             .await
             .expect("disconnect must be bounded when lifecycle POSTs hang")
             .expect("disconnect failed");
-        // #263 复审：耗时上界与**实际投递**断言。理论上限 = 2×1s lifecycle POST + 1s stream shutdown
-        // = 3s；断言留 3s CI 余量（<6s），仍能抓住旧 30s×2 回归（外层 10s 先触发）。
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(6),
-            "disconnect 不得被挂起的 lifecycle POST 拖长：{elapsed:?}"
+            elapsed < Duration::from_millis(1500),
+            "disconnect must not await lifecycle POSTs; took {elapsed:?}"
         );
-        let lifecycle: Vec<String> = mock
-            .post_methods()
-            .into_iter()
-            .filter(|method| !method.starts_with("notifications/"))
-            .collect();
+
+        // 失败只 warn、不阻塞：两条 POST 仍被尝试投递（后台任务各自 1s 上限）。
+        let lifecycle = wait_for_lifecycle_methods(&mock, &["shutdown", "exit"]).await;
+        assert!(
+            lifecycle.iter().any(|method| method == "shutdown"),
+            "shutdown must still be attempted in the background"
+        );
+        assert!(
+            lifecycle.iter().any(|method| method == "exit"),
+            "exit must still be attempted in the background"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_post_timeout_is_bounded_and_reported() {
+        // #267 S4：单条 lifecycle POST 的有界性由返回的失败信号承载（后台任务据此只 warn，
+        // 不向 disconnect 传播）。
+        let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
+        let http = reqwest::Client::new();
+        let endpoint = format!("http://127.0.0.1:{}/messages", mock.port);
+        let started = std::time::Instant::now();
+        let delivered = post_lifecycle_message(
+            &http,
+            &endpoint,
+            &std::collections::HashMap::new(),
+            "shutdown",
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            !delivered,
+            "a hanging server must be reported as a failed delivery"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "lifecycle POST must be bounded (1s cap), took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_disconnect_aborts_previous_lifecycle_supervisor() {
+        // #267 S4：快速 stop→start→stop 不得无界累积后台投递任务——新 supervisor 必须 abort 旧的。
+        // 命中判据：被顶替的 supervisor 在 shutdown（mock 挂起 1s）期间被取消，因此绝不会发出 exit；
+        // 新 supervisor 正常走完 shutdown→exit。
+        //
+        // 这里直接调用 `spawn_lifecycle_notifications` 两次（同一连接、无重连握手），避免把
+        // 「SSE 重连在 1s 内完成」当测试窗口（审查 🟡：并行负载下会 flaky）。
+        let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
+        let client = SseMCPClient::new(sse_test_params(&mock));
+        // 直接给 endpoint，跳过 connect：本用例只测 supervisor 去重。
+        *client.endpoint_url.lock().await =
+            Some(format!("http://127.0.0.1:{}/messages", mock.port));
+
+        // supervisor#1 发出 shutdown（mock 记录后挂起）。
+        client.spawn_lifecycle_notifications().await;
+        wait_for_lifecycle_methods(&mock, &["shutdown"]).await;
+
+        // 立即顶替：supervisor#1 被 abort（远早于其 1s 超时），supervisor#2 接管。
+        client.spawn_lifecycle_notifications().await;
+
+        let lifecycle = wait_for_lifecycle_methods(&mock, &["shutdown", "exit"]).await;
+        let shutdowns = lifecycle
+            .iter()
+            .filter(|method| *method == "shutdown")
+            .count();
+        let exits = lifecycle.iter().filter(|method| *method == "exit").count();
         assert_eq!(
-            lifecycle,
-            vec![
-                "initialize".to_string(),
-                "shutdown".to_string(),
-                "exit".to_string()
-            ],
-            "挂起 server 也必须实际收到 shutdown → exit 投递"
+            shutdowns, 2,
+            "each supervisor must issue shutdown; got {lifecycle:?}"
+        );
+        assert_eq!(
+            exits, 1,
+            "the superseded supervisor must be aborted before exit; got {lifecycle:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_delivery_survives_client_drop_after_disconnect() {
+        // #267 S4（审查 🔴）：manager 的 stop 路径在 disconnect 前移除 client、返回后立即 drop 最后
+        // 一个 Arc。fire-and-forget 投递不得因此被静默掐断——shutdown 与 exit 都必须仍被尝试发出。
+        let mock = TestSseMock::spawn_with_hanging_lifecycle().await;
+        let client = Arc::new(SseMCPClient::new(sse_test_params(&mock)));
+        tokio::time::timeout(Duration::from_secs(5), client.connect())
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        client.disconnect().await.expect("disconnect failed");
+        // 复现生产 stop 路径：disconnect 返回后 client 立即被 drop（supervisor 仍在 shutdown 挂起中）。
+        drop(client);
+
+        let lifecycle = wait_for_lifecycle_methods(&mock, &["shutdown", "exit"]).await;
+        assert!(
+            lifecycle.iter().any(|method| method == "shutdown"),
+            "shutdown must still be delivered after client drop; got {lifecycle:?}"
+        );
+        assert!(
+            lifecycle.iter().any(|method| method == "exit"),
+            "exit must still be delivered after client drop; got {lifecycle:?}"
         );
     }
 

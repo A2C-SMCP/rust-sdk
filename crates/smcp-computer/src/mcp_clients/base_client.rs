@@ -17,6 +17,29 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
+/// stdio/HTTP MCP 服务关闭（`RunningService::close_with_timeout`）的外层等待上限（#267 S4）：
+/// 对端停 POST 时 rmcp 的会话清理 DELETE 自带 5s 上限，外层 1s 切断等待、由分离任务兜底。
+pub(crate) const MCP_SERVICE_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 有界关闭一个 rmcp 运行服务（stdio/HTTP 共用，#267 S4）。
+///
+/// 超时后 rmcp 已取消 cancellation token 并分离服务任务（`JoinHandle` drop = detach，非 abort），
+/// 会话清理/子进程回收按 rmcp 自身 5s 上限在后台完成；调用方随后照常推进自己的 teardown。
+pub(crate) async fn close_service_bounded<R, S>(service: &mut rmcp::service::RunningService<R, S>)
+where
+    R: rmcp::service::ServiceRole,
+    S: rmcp::Service<R>,
+{
+    match service.close_with_timeout(MCP_SERVICE_CLOSE_TIMEOUT).await {
+        Ok(Some(reason)) => debug!("Service stopped with reason: {:?}", reason),
+        Ok(None) => warn!(
+            "Service teardown exceeded {:?}; continuing with detached cleanup",
+            MCP_SERVICE_CLOSE_TIMEOUT
+        ),
+        Err(e) => error!("Error stopping service: {}", e),
+    }
+}
+
 /// 状态变化回调类型（#186 逐 MCP 状态事件接线；别名拆分以压低字段类型复杂度）/ state-change callback type.
 type StateChangeCallback = Box<dyn Fn(ClientState, ClientState) + Send + Sync>;
 
