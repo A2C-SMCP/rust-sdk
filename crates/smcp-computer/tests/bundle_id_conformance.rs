@@ -91,7 +91,8 @@ fn bundle_id_conformance_vectors_pass() {
 
     // ---- 夹具完整性门禁（#142）-------------------------------------------------------------
     // 本文件的 `VECTORS` 是协议仓 `docs/specification/fixtures/bundle_id_conformance_vectors.json` 的
-    // **vendored 逐字节副本**（`include_str!` 编译期嵌入），同步靠人手 `git show` —— 没有任何构建期校验。
+    // **vendored 逐字节副本**（协议 develop `e811757`，PR#85 / protocol#78 版本；`include_str!` 编译期嵌入），
+    // 同步靠人手 `git show` —— 没有任何构建期校验。
     // 原先只有一句宽松的 `>= 16`、且从不读 `algorithm` 块 ⇒ **副本被截断或漂移在 rust 侧无人察觉**
     // （少几条向量照样绿）。姊妹文件 `env_segment_conformance.rs` 早已有这层门禁，此处照其形态补齐。
     let algo = &doc["algorithm"];
@@ -112,8 +113,8 @@ fn bundle_id_conformance_vectors_pass() {
     // 精确条数（非 `>=`）：协议仓新增向量时此处 MUST 同步失败，逼出一次显式的重新同步。
     assert_eq!(
         vectors.len(),
-        16,
-        "16 条向量（PR #16 首 14 条 + #17 raw 决策 2 条 `${{input:*}}`）；条数变化即副本与协议仓漂移"
+        25,
+        "25 条向量（PR #16 首 14 条 + #17 raw 决策 2 条 `${{input:*}}` + PR#85 protocol#78 补 9 条）；条数变化即副本与协议仓漂移"
     );
 
     let mut checked = 0usize;

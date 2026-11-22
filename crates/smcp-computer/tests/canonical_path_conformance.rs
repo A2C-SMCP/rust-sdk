@@ -13,8 +13,8 @@ use smcp::utils::path_norm::{normalize_path, PathPlatform};
 
 const VECTORS: &str = include_str!("fixtures/canonical_path_conformance_vectors.json");
 
-/// vendored 副本的 sha256（协议 develop `ce39f63`，PR#72 版本）。协议更新 vendored 文件时**有意**改此常量。
-const FIXTURE_SHA256: &str = "176582498b4b09b6603a418f352eecd552e23efc44fea4b552d3576fa02d4cb7";
+/// vendored 副本的 sha256（协议 develop `e811757`，PR#85 / protocol#78 版本）。协议更新 vendored 文件时**有意**改此常量。
+const FIXTURE_SHA256: &str = "0f1ebbd83a31c310203f9b670b3565de8f039953745c51f6e3392429c57f6fdd";
 
 #[test]
 fn fixture_bytes_are_pinned() {
@@ -36,18 +36,18 @@ fn canonical_path_conformance_vectors() {
     }
 
     let vectors = doc["vectors"].as_array().expect("vectors array");
-    assert_eq!(vectors.len(), 49, "49 条向量");
+    assert_eq!(vectors.len(), 56, "56 条向量");
     let posix = vectors.iter().filter(|v| v["platform"] == "posix").count();
     let windows = vectors
         .iter()
         .filter(|v| v["platform"] == "windows")
         .count();
-    assert_eq!((posix, windows), (18, 31), "POSIX 18 + Windows 31");
+    assert_eq!((posix, windows), (19, 37), "POSIX 19 + Windows 37");
     let invalid = vectors
         .iter()
         .filter(|v| v["error"] == "invalid_path")
         .count();
-    assert_eq!(invalid, 21, "21 条 invalid_path");
+    assert_eq!(invalid, 27, "27 条 invalid_path");
 
     for vector in vectors {
         let id = vector["id"].as_str().expect("id");
