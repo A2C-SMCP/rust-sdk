@@ -124,8 +124,9 @@ pub(crate) fn sanitized_marketplace_error(
         scope: error.scope,
         field: sanitize_marketplace_field(&error.field),
         reason: sanitize_marketplace_text(&error.reason),
-        // 路径可能由攻击者控制（project-local 文件路径），同样做凭据剥离 + 控制字符清洗。
-        source_path: error.source_path.as_deref().map(sanitize_marketplace_text),
+        // 路径按路径对待：只清洗控制/格式字符，**不**走 URL 脱敏（避免 Windows `...\alice@corp\...`
+        // 被 scp-like redactor 整段替换）。回填时机见 `validate_settings` 末尾的二次脱敏。
+        source_path: error.source_path.as_deref().map(scrub_diagnostic_chars),
     })
 }
 
@@ -746,6 +747,13 @@ pub fn validate_settings(
         }
     }
 
+    // #302 D3：source_path 在**校验器返回后**才回填；marketplace 错误需在此再脱敏一次
+    // （field/reason 幂等；source_path 仅控制字符清洗）。
+    let errors = errors
+        .into_iter()
+        .map(|error| sanitized_marketplace_error(&error).unwrap_or(error))
+        .collect();
+
     (cleaned, errors)
 }
 
@@ -1331,6 +1339,33 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    /// #302 D3：`source_path` 只做控制字符清洗（路径按路径对待，不触发 scp/URL 脱敏）；
+    /// 且在 `validate_settings` 末尾回填后仍被脱敏一次。
+    #[test]
+    fn test_extra_marketplaces_error_source_path_scrubbed_not_url_redacted() {
+        let raw = json!({"extraKnownMarketplaces": {
+            "acme": {"source": {"type": "git", "url": "not-a-url"}}
+        }});
+        let windows_path = r"C:\Users\alice@corp\settings.json";
+        let (_, errors) = validate_settings(&raw, SettingsScope::User, Some(windows_path));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].source_path.as_deref(),
+            Some(windows_path),
+            "合法路径（含 @/盘符）不得被 URL 脱敏器改写"
+        );
+
+        let dirty_path = "C:\\Users\\alice@corp\\settings.json\nFAKE\u{202E}";
+        let (_, errors) = validate_settings(&raw, SettingsScope::User, Some(dirty_path));
+        let scrubbed = errors[0].source_path.as_deref().expect("source_path");
+        assert!(!scrubbed.contains('\n'), "{scrubbed:?}");
+        assert!(!scrubbed.contains('\u{202E}'), "{scrubbed:?}");
+        assert!(
+            scrubbed.starts_with(r"C:\Users\alice@corp\settings.json"),
+            "{scrubbed:?}"
+        );
     }
 
     // ---- 标量 / 数组类型校验 ----

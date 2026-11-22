@@ -2189,6 +2189,63 @@ mod tests {
         );
     }
 
+    /// #302 D5：autoUpdate / 显式 refresh 路径同样必须把账本 source 归一为 `{type,url}`。
+    #[tokio::test]
+    async fn reconcile_refresh_paths_normalize_source_with_extra_keys_302() {
+        for (auto_update, explicit_refresh) in [(true, false), (false, true)] {
+            let tmp = TempDir::new().unwrap();
+            let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let url_a = format!("file://{}", repo_a.display());
+            let store = MemStore::default();
+            let mut reg = SkillRegistry::new();
+
+            let d_a = declared(serde_json::json!({
+                "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+                "enabledPlugins": {"audit@acme": true}
+            }));
+            assert_eq!(
+                reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                    .await
+                    .installed,
+                vec!["acme".to_string()]
+            );
+
+            let mut entry = serde_json::json!({
+                "source": {"type": "git", "url": url_a, "ref": "main"}
+            });
+            if auto_update {
+                entry["autoUpdate"] = serde_json::json!(true);
+            }
+            let d = declared(serde_json::json!({
+                "extraKnownMarketplaces": {"acme": entry},
+                "enabledPlugins": {"audit@acme": true}
+            }));
+            let r = reconcile(
+                &mut reg,
+                &home,
+                &d,
+                &store,
+                ReconcileOptions {
+                    refresh: explicit_refresh,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(
+                r.failed.is_empty(),
+                "auto={auto_update} refresh={explicit_refresh}: {r:?}"
+            );
+            assert_eq!(r.updated, vec!["acme".to_string()]);
+            assert_eq!(
+                store.load_known_marketplaces().marketplaces["acme"].source,
+                serde_json::json!({"type": "git", "url": url_a}),
+                "refresh 路径也必须剥离额外键（auto={auto_update} refresh={explicit_refresh}）"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reconcile_accepts_canonically_equivalent_registered_source() {
         let tmp = TempDir::new().unwrap();

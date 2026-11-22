@@ -211,7 +211,7 @@ pub(crate) fn sanitize_marketplace_declaration_error(
     let sanitized = sanitized_marketplace_error(error)?;
     Some(MarketplaceDeclarationError {
         scope: sanitized.scope,
-        marketplace: declaration_marketplace(&sanitized.field),
+        marketplace: declaration_marketplace(&sanitized.field, &sanitized.reason),
         field: sanitized.field,
         reason: sanitized.reason,
         source_path: sanitized.source_path,
@@ -220,12 +220,16 @@ pub(crate) fn sanitize_marketplace_declaration_error(
 
 /// 从脱敏后的字段路径解析 marketplace 名（`extraKnownMarketplaces.<name>[.source*|.autoUpdate]`）。
 ///
-/// 只剥离**已知的完整后缀**（顺序：最长优先）——非法名称本身可能含 `.source` 子串，按前缀切分会误判。
+/// 名称非法时校验器只记 `<name>`（无后缀），此时**整个剩余段**就是名称——不能按后缀启发式切分
+/// （非法名本身可能是 `acme.source.url`）。合法名的字段才剥离已知完整后缀（最长优先）。
 /// 无法解析（顶层字段类型错误）返回 `None`。
-fn declaration_marketplace(field: &str) -> Option<String> {
+fn declaration_marketplace(field: &str, reason: &str) -> Option<String> {
     let rest = field
         .strip_prefix(FIELD_EXTRA_KNOWN_MARKETPLACES)?
         .strip_prefix('.')?;
+    if reason.starts_with("marketplace name must be strict kebab") {
+        return (!rest.is_empty()).then(|| rest.to_string());
+    }
     let name = [".source.url", ".source.type", ".source", ".autoUpdate"]
         .iter()
         .find_map(|suffix| rest.strip_suffix(suffix))
@@ -1265,6 +1269,34 @@ mod tests {
                 .expect("top-level declaration error")
                 .marketplace,
             None
+        );
+        // 非法名恰好形如 `acme.source.url`：名称错误 reason 分支 → 整个剩余段是名称（不按后缀切分）。
+        let dotted_invalid = SettingsValidationError {
+            scope: SettingsScope::User,
+            field: "extraKnownMarketplaces.acme.source.url".to_string(),
+            reason: "marketplace name must be strict kebab (1-64)".to_string(),
+            source_path: None,
+        };
+        assert_eq!(
+            sanitize_marketplace_declaration_error(&dotted_invalid)
+                .expect("invalid-name declaration error")
+                .marketplace
+                .as_deref(),
+            Some("acme.source.url")
+        );
+        // 合法名的 source.url 错误仍剥离已知后缀。
+        let valid_source = SettingsValidationError {
+            scope: SettingsScope::User,
+            field: "extraKnownMarketplaces.acme.source.url".to_string(),
+            reason: "malformed git url".to_string(),
+            source_path: None,
+        };
+        assert_eq!(
+            sanitize_marketplace_declaration_error(&valid_source)
+                .expect("valid-name declaration error")
+                .marketplace
+                .as_deref(),
+            Some("acme")
         );
     }
 

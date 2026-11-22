@@ -275,12 +275,19 @@ fn cli_run_prints_invalid_marketplace_declaration_once_with_mcp_json() {
     let output = run_args(dir.path(), &["run"]);
     let stdout = stdout_of(&output);
     assert_eq!(output.status.code(), Some(0), "stdout={stdout}");
-    let count = stdout
+    // 关键：approval 的重复行走 `format_settings_errors`，**没有** report 的独有后缀；必须按字段路径
+    // `extraKnownMarketplaces.` 计数（期望 1）。若把 `run_mcp_approval_for_repl` 换回全部呈现，这里变 2。
+    let field_mentions = stdout.matches("extraKnownMarketplaces.").count();
+    assert_eq!(
+        field_mentions, 1,
+        "同一非法声明只应呈现一次（remount 负责，approval 抑制）：stdout={stdout}"
+    );
+    let report_lines = stdout
         .matches("declaration ignored; existing registration unchanged")
         .count();
     assert_eq!(
-        count, 1,
-        "同一非法声明只应打印一次（remount 负责，approval 抑制）：stdout={stdout}"
+        report_lines, 1,
+        "report 警示行也须恰好一次：stdout={stdout}"
     );
     assert!(!stdout.contains("PW_SECRET"), "stdout={stdout}");
 }
