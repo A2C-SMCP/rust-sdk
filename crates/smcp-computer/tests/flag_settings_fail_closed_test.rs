@@ -215,3 +215,38 @@ fn repl_settings_show_fails_closed_on_tilde_path() {
         "REPL settings 不得回读植入文件：stdout={stdout}"
     );
 }
+
+/// #267：非法用户 scope marketplace 声明必须在 CLI 恢复输出可见（且凭据/控制字符已脱敏）。
+#[test]
+fn cli_run_reports_invalid_marketplace_declaration() {
+    let dir = tempdir().unwrap();
+    // `isolated_env` 将 XDG_CONFIG_HOME 指向 `<dir>/xdg-config`；user settings 落在 `<xdg>/a2c/`。
+    let settings_dir = dir.path().join("xdg-config").join("a2c");
+    fs::create_dir_all(&settings_dir).unwrap();
+    fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"extraKnownMarketplaces":{"https://user:PW_SECRET@example.com/repo.git":{"source":{"type":"git","url":"not-a-url"}}}}"#,
+    )
+    .unwrap();
+
+    let output = run_args(dir.path(), &["run"]);
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("declaration ignored; existing registration unchanged"),
+        "CLI 恢复输出必须显示非法声明警示：stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("extraKnownMarketplaces."),
+        "警示须保留字段前缀：stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("PW_SECRET") && !stderr.contains("PW_SECRET"),
+        "不得回显凭据：stdout={stdout}; stderr={stderr}"
+    );
+}

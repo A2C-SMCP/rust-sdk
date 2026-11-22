@@ -70,6 +70,7 @@ use crate::settings::reconciler::{declared_marketplaces, source_for_log, REASON_
 use crate::settings::redaction::untrusted_name_for_display;
 use crate::settings::schema::{
     is_marketplace_declaration_field, SettingsScope, SettingsValidationError,
+    FIELD_EXTRA_KNOWN_MARKETPLACES,
 };
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
@@ -161,6 +162,10 @@ pub struct GovernanceRecoveryReport {
     /// 不改变校验丢弃语义、不进入 degraded。由编排方（`Computer::reconcile_governance`）从
     /// `ResolvedSettings.errors` 填充；直接调用 [`recover_marketplace_skills`] 时恒空（该入口拿到的
     /// `declared` 已过校验）。
+    ///
+    /// ⚠️ 语义为**实例解析视图**（user/project/local/policy；当前不含 flag 层——CLI 单独打印 flag 校验
+    /// 错误）。`reconcile_governance(declared=Some(...))` 的 overlay 可能已过滤，本字段不据此重算；
+    /// settings-flag-runtime-cleanup 将接解析块对 `SettingsScope::Flag` 做去重/过滤。
     pub marketplace_declaration_errors: Vec<MarketplaceDeclarationError>,
     /// 账本缺记录、从 `installedPlugins` 意图**重物化派生缓存成功**的 enabled plugin id（§63）/ rebuilt from intent。
     pub rematerialized_plugins: Vec<String>,
@@ -190,42 +195,66 @@ pub(crate) fn marketplace_declaration_errors(
 ) -> Vec<MarketplaceDeclarationError> {
     errors
         .iter()
-        .filter(|error| is_marketplace_declaration_field(&error.field))
-        .map(|error| MarketplaceDeclarationError {
-            scope: error.scope,
-            field: sanitize_declaration_field(&error.field),
-            reason: sanitize_declaration_text(&error.reason),
-            source_path: error.source_path.as_deref().map(scrub_control_chars),
-        })
+        .filter_map(sanitize_marketplace_declaration_error)
         .collect()
 }
 
-/// 保留 `extraKnownMarketplaces` 前缀，只对前缀之后的子串脱敏（前缀本身含 `.`，整体喂给 URL 脱敏器会
-/// 被误判为 scheme 的一部分）。
-fn sanitize_declaration_field(field: &str) -> String {
-    const PREFIX: &str = "extraKnownMarketplaces";
-    if field == PREFIX {
-        return field.to_string();
+/// 单条 settings 校验错误 → 脱敏 DTO；非 `extraKnownMarketplaces` 字段返回 `None`。
+///
+/// CLI 的所有校验错误呈现面（`format_settings_errors`）也复用它，保证 `settings show/get`、
+/// boot 批准流程、治理重挂 flag 错误打印与新恢复报告使用**同一脱敏口径**。
+pub(crate) fn sanitize_marketplace_declaration_error(
+    error: &SettingsValidationError,
+) -> Option<MarketplaceDeclarationError> {
+    if !is_marketplace_declaration_field(&error.field) {
+        return None;
     }
+    Some(MarketplaceDeclarationError {
+        scope: error.scope,
+        field: sanitize_declaration_field(&error.field),
+        reason: sanitize_declaration_text(&error.reason),
+        source_path: error.source_path.as_deref().map(scrub_control_chars),
+    })
+}
+
+/// 保留 `extraKnownMarketplaces` 前缀，只对前缀之后的子串脱敏（前缀本身含 `.`，整体喂给 URL 脱敏器会
+/// 被误判为 scheme 的一部分）。前缀用 schema 常量，避免与字段名漂移；无法剥离时整段脱敏（fail-safe）。
+fn sanitize_declaration_field(field: &str) -> String {
     match field
-        .strip_prefix(PREFIX)
+        .strip_prefix(FIELD_EXTRA_KNOWN_MARKETPLACES)
         .and_then(|rest| rest.strip_prefix('.'))
     {
-        Some(rest) => format!("{PREFIX}.{}", sanitize_declaration_text(rest)),
-        None => field.to_string(),
+        Some(rest) => format!(
+            "{FIELD_EXTRA_KNOWN_MARKETPLACES}.{}",
+            sanitize_declaration_text(rest)
+        ),
+        None => sanitize_declaration_text(field),
     }
 }
 
-/// 不可信文本 → 诊断展示值：Git URL 凭据剥离 + 控制字符替换为空格。
+/// 不可信文本 → 诊断展示值：Git URL 凭据剥离 + 控制/格式字符替换为空格。
 fn sanitize_declaration_text(text: &str) -> String {
     scrub_control_chars(&untrusted_name_for_display(text))
 }
 
-/// 控制字符（换行 / ESC / C1 等）替换为空格，防 CLI/日志注入。
+/// 控制字符 + Unicode 格式/行分隔符（bidi 覆写 / 零宽 / 行分隔）替换为空格，防 CLI/日志注入。
 fn scrub_control_chars(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_unsafe_display_char(c) { ' ' } else { c })
         .collect()
+}
+
+/// 终端展示不安全的字符：C0/C1 控制符（`char::is_control`）+ 常见 Unicode 格式/行分隔符。
+fn is_unsafe_display_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
 }
 
 // ===========================================================================
@@ -1202,8 +1231,8 @@ mod tests {
             },
             SettingsValidationError {
                 scope: SettingsScope::User,
-                field: "extraKnownMarketplaces".to_string(),
-                reason: "expected object, got array\nFAKE_LINE\u{1b}[31m".to_string(),
+                field: "extraKnownMarketplaces.evil\u{202E}gnp.exe\u{2028}FAKE".to_string(),
+                reason: "expected object, got array\nFAKE_LINE\u{1b}[31m\u{202E}REV".to_string(),
                 source_path: None,
             },
         ];
@@ -1218,9 +1247,27 @@ mod tests {
         assert!(!got[0].field.contains("PW_SECRET"), "{:?}", got[0].field);
         assert!(!got[0].reason.contains("PW_SECRET"), "{:?}", got[0].reason);
         assert_eq!(got[0].source_path.as_deref(), Some("/tmp/settings.json"));
-        assert_eq!(got[1].field, "extraKnownMarketplaces");
-        assert!(!got[1].reason.contains('\n'), "{:?}", got[1].reason);
-        assert!(!got[1].reason.contains('\u{1b}'), "{:?}", got[1].reason);
+        // 字段侧同样清洗：bidi 覆写 / 行分隔 / 换行 / ESC 全部替换为空格。
+        assert!(
+            got[1].field.starts_with("extraKnownMarketplaces."),
+            "{:?}",
+            got[1].field
+        );
+        for needle in ['\u{202E}', '\u{2028}', '\n', '\u{1b}'] {
+            assert!(
+                !got[1].field.contains(needle),
+                "field 未清洗 {needle:?}：{:?}",
+                got[1].field
+            );
+            assert!(
+                !got[1].reason.contains(needle),
+                "reason 未清洗 {needle:?}：{:?}",
+                got[1].reason
+            );
+        }
+        // 单条入口与非 marketplace 返回 None 亦钉死（CLI 共享口径）。
+        assert!(sanitize_marketplace_declaration_error(&errors[0]).is_none());
+        assert!(sanitize_marketplace_declaration_error(&errors[2]).is_some());
     }
 
     #[tokio::test]

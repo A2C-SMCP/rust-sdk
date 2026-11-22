@@ -2258,6 +2258,23 @@ mod tests {
             marketplace_source_rejection(&empty, &empty),
             Some(REASON_SOURCE_UNUSABLE)
         );
+        // `compare == Same` 但声明侧不可克隆（canonicalize 会 trim / 展开简写）→ 必须 fail-closed
+        // （钉死 `|| unusable` 守卫；删掉它本组用例即红）。
+        for declared in [
+            serde_json::json!({"type": "git", "url": " file:///tmp/a "}),
+            serde_json::json!({"type": "git", "url": "owner/repo"}),
+        ] {
+            let registered = if declared["url"] == "owner/repo" {
+                serde_json::json!({"type": "git", "url": "https://github.com/owner/repo.git"})
+            } else {
+                serde_json::json!({"type": "git", "url": "file:///tmp/a"})
+            };
+            assert_eq!(
+                marketplace_source_rejection(&registered, &declared),
+                Some(REASON_SOURCE_CONFLICT),
+                "Same-but-uncloneable declared source must fail closed: {declared}"
+            );
+        }
     }
 
     #[tokio::test]

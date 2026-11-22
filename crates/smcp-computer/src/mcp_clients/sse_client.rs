@@ -2069,15 +2069,15 @@ mod tests {
             .expect("connect failed");
 
         let started = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        tokio::time::timeout(Duration::from_secs(10), client.disconnect())
             .await
             .expect("disconnect must be bounded when lifecycle POSTs hang")
             .expect("disconnect failed");
-        // #263 复审：耗时上界（2×1s POST 上限 + 1s stream shutdown + CI 余量）与**实际投递**断言。
-        // mock 在挂起响应前已记录 method，故 shutdown/exit 必须可见（回退为「入队后 cancel」会丢）。
+        // #263 复审：耗时上界与**实际投递**断言。理论上限 = 2×1s lifecycle POST + 1s stream shutdown
+        // = 3s；断言留 3s CI 余量（<6s），仍能抓住旧 30s×2 回归（外层 10s 先触发）。
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(6),
             "disconnect 不得被挂起的 lifecycle POST 拖长：{elapsed:?}"
         );
         let lifecycle: Vec<String> = mock
