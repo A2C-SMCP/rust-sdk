@@ -1021,6 +1021,25 @@ async fn boot_rejoin_computer(name: &str, temp: &tempfile::TempDir) -> Computer<
     computer
 }
 
+/// CLI 路径的 `CommandHandler` 装配（#259 复审：两个 CLI 回房用例共用同一 `CliConfig`）。
+#[cfg(feature = "cli")]
+fn cli_handler_with_budget(
+    computer: Computer<SilentSession>,
+    budget_secs: u64,
+) -> smcp_computer::cli::commands::CommandHandler {
+    use smcp_computer::cli::commands::{CliConfig, CommandHandler};
+    CommandHandler::new(
+        computer,
+        CliConfig {
+            url: None,
+            namespace: "/smcp".to_string(),
+            auth: None,
+            headers: None,
+            office_rejoin_budget_secs: Some(budget_secs),
+        },
+    )
+}
+
 /// #234：回房 ACK 在途时传输层再次失效——连接级中断不得清空 `desired`；
 /// 下一次会话必须继续回放并恢复成员关系。
 #[tokio::test]
@@ -1083,8 +1102,6 @@ async fn interrupted_rejoin_keeps_intent_for_next_session() {
 #[cfg(feature = "cli")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_reset_in_rejoin_backoff_rejoins_retained_desired_office() {
-    use smcp_computer::cli::commands::{CliConfig, CommandHandler};
-
     let _ = tracing_subscriber::fmt::try_init();
     let temp = tempfile::TempDir::new().unwrap();
     let env = isolated_config_env(temp.path());
@@ -1123,16 +1140,7 @@ async fn identity_reset_in_rejoin_backoff_rejoins_retained_desired_office() {
     .with_skill_home(temp.path().join("skills"))
     .with_blob_cache_root(temp.path().join("blob"))
     .with_config_env(env.clone());
-    let mut handler = CommandHandler::new(
-        computer,
-        CliConfig {
-            url: None,
-            namespace: "/smcp".to_string(),
-            auth: None,
-            headers: None,
-            office_rejoin_budget_secs: Some(30),
-        },
-    );
+    let mut handler = cli_handler_with_budget(computer, 30);
     handler.computer.boot_up().await.expect("boot computer");
     handler
         .connect_socketio(&server.url, "/smcp", &None, &None)
@@ -1279,9 +1287,7 @@ async fn failed_explicit_join_during_rejoin_backoff_cancels_pending_intent() {
 #[cfg(feature = "cli")]
 #[tokio::test]
 async fn cli_join_outcome_reports_cancelled_rejoin_intent() {
-    use smcp_computer::cli::commands::{
-        rejoin_intent_cancelled_notice, CliConfig, CommandError, CommandHandler,
-    };
+    use smcp_computer::cli::commands::{rejoin_intent_cancelled_notice, CommandError};
 
     let _ = tracing_subscriber::fmt::try_init();
     let mut server = start_reconnect_capture_server_with_policy(
@@ -1292,16 +1298,7 @@ async fn cli_join_outcome_reports_cancelled_rejoin_intent() {
     .await;
     let temp = tempfile::TempDir::new().unwrap();
     let computer = boot_rejoin_computer("office-cancel-cli", &temp).await;
-    let mut handler = CommandHandler::new(
-        computer,
-        CliConfig {
-            url: None,
-            namespace: "/smcp".to_string(),
-            auth: None,
-            headers: None,
-            office_rejoin_budget_secs: Some(30),
-        },
-    );
+    let mut handler = cli_handler_with_budget(computer, 30);
     // 走 CLI 连接路径，让 `CliConfig::office_rejoin_budget_secs` 真正进入 ConnectOptions。
     handler
         .connect_socketio(&server.url, "/smcp", &None, &None)
@@ -1353,6 +1350,48 @@ async fn cli_join_outcome_reports_cancelled_rejoin_intent() {
         "the CLI notice is a pure format string and must not drift"
     );
 
+    handler
+        .computer
+        .shutdown()
+        .await
+        .expect("shutdown computer");
+    server.shutdown();
+}
+
+/// #259 复审：CLI `CliConfig::office_rejoin_budget_secs` 必须真正到达 `ConnectOptions`（调用点突变
+/// 防护）。预算 0 → 自动回房单次尝试；若 call site 丢参回落 60s，2s 窗口内会出现退避重试 → 用例红。
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_zero_rejoin_budget_makes_automatic_rejoin_single_attempt() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut server = start_reconnect_capture_server(Some(2), None).await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let computer = boot_rejoin_computer("office-cli-zero", &temp).await;
+    let mut handler = cli_handler_with_budget(computer, 0);
+    handler
+        .connect_socketio(&server.url, "/smcp", &None, &None)
+        .await
+        .expect("connect through CLI handler");
+    let _ = server.next_auth().await;
+    handler
+        .join_socket_room("office-cli-zero", "office-cli-zero")
+        .await
+        .expect("initial join");
+    let _ = server.next_join().await;
+
+    server.force_network_disconnect();
+    let _ = server.next_auth().await;
+    let _ = server.next_join().await; // 第 2 次 join 被 4101 拒绝
+
+    server.assert_no_join_for(Duration::from_secs(2)).await;
+    let socketio = handler.computer.get_socketio_client();
+    let socketio = socketio.read().await;
+    assert_eq!(
+        socketio.as_ref().unwrap().get_office_id().await,
+        None,
+        "预算 0 的 CLI 路径不得继续退避重试"
+    );
+    drop(socketio);
     handler
         .computer
         .shutdown()

@@ -653,8 +653,16 @@ async fn delay_oauth_discovery(state: &OAuthMockState) {
 }
 
 // `Atomic::fetch_update` 在 rustc 1.99 起被 renamed 为 `try_update` 并标记 deprecated，但后者要求
-// 更新的工具链；本项目 MSRV 1.86，故本测试局部 `allow` 保持兼容（升 MSRV 时再改 `try_update`）。
+// 更新的工具链；本项目 MSRV 1.86，故只在所需 helper 上局部 `allow` 保持兼容（升 MSRV 时再改 `try_update`）。
 #[allow(deprecated)]
+fn try_consume_one(atomic: &AtomicUsize) -> bool {
+    atomic
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+}
+
 async fn oauth_http_mock_handler(
     req: Request<hyper::body::Incoming>,
     state: Arc<OAuthMockState>,
@@ -880,13 +888,7 @@ async fn oauth_http_mock_handler(
         }
         let request_index = state.token_requests.fetch_add(1, Ordering::SeqCst);
         state.token_started.notify_one();
-        if state
-            .reject_token_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if try_consume_one(&state.reject_token_remaining) {
             return Ok(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(empty_body())
@@ -917,14 +919,8 @@ async fn oauth_http_mock_handler(
             ))
             .unwrap());
     }
-    let reject_authorized = path == "/mcp"
-        && authorized
-        && state
-            .reject_authorized_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok();
+    let reject_authorized =
+        path == "/mcp" && authorized && try_consume_one(&state.reject_authorized_remaining);
     if path == "/mcp" && (!authorized || reject_authorized) {
         let challenge = if state.bare_bearer_challenge.load(Ordering::SeqCst) {
             r#"Bearer realm="mcp""#.to_string()
@@ -962,13 +958,8 @@ async fn oauth_http_mock_handler(
         .get("method")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    let challenge_tools_write = rpc_method == "tools/call"
-        && state
-            .challenge_tools_write_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok();
+    let challenge_tools_write =
+        rpc_method == "tools/call" && try_consume_one(&state.challenge_tools_write_remaining);
     if challenge_tools_write {
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)

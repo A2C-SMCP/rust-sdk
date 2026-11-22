@@ -1245,10 +1245,8 @@ impl<S: Session> Computer<S> {
                 self.mcp_flag_config_error = None;
             }
             Err(reason) => {
-                let message = format!(
-                    "⚠ mcp config path {} is unusable ({reason}); flag MCP layer disabled (fail-closed)",
-                    raw.display()
-                );
+                let message =
+                    flag_path_diagnostic("mcp config", &raw, reason, "flag MCP layer disabled");
                 error!("{message}");
                 self.mcp_flag_config = None;
                 self.mcp_flag_config_error = Some(message);
@@ -1274,8 +1272,10 @@ impl<S: Session> Computer<S> {
     ///
     /// 与 [`with_mcp_flag_config`](Self::with_mcp_flag_config) 同属 flag scope 文件对（协议 §2.5-3）。
     /// **构造期归一为绝对路径**（对齐 python `Computer._absolute_path`）：拒绝集 / 文件读取 / settings
-    /// 合并三处必须看到同一路径。`~` 优先用注入 env 的 `HOME`（空白视同未设置），其次退回进程 `HOME`；
-    /// 两者皆无、`~user` 形态（rust 无 NSS expanduser）或无法绝对化时 **fail-closed**：flag 层置空，
+    /// 合并三处必须看到同一路径。`~` 优先用**注入 env**、其次**进程 env**；每套 env 内 Windows
+    /// `USERPROFILE` 优先、`HOME` 次之（对齐 python `ntpath.expanduser`），POSIX 只读 `HOME`
+    /// （不读 `USERPROFILE`）。两者皆无、`~user` 形态（rust 无 NSS expanduser）或无法绝对化时
+    /// **fail-closed**：flag 层置空，
     /// 失败原因经 [`flag_settings_path_error`](Self::flag_settings_path_error) 呈现（CLI 启动时
     /// `eprintln!`），**不**退回相对串或 `<cwd>/~/...` 的错误文件。需要 `~` 锚定**注入** HOME 时，
     /// 请先 [`with_config_env`](Self::with_config_env) 再调用本方法。缺省 `None` = 无 flag 层。
@@ -1288,10 +1288,8 @@ impl<S: Session> Computer<S> {
                 self.flag_settings_path_error = None;
             }
             Err(reason) => {
-                let message = format!(
-                    "⚠ flag settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
-                    raw.display()
-                );
+                let message =
+                    flag_path_diagnostic("flag settings", &raw, reason, "flag scope disabled");
                 error!("{message}");
                 self.flag_settings_path = None;
                 self.flag_settings_path_error = Some(message);
@@ -2039,30 +2037,35 @@ impl<S: Session> Computer<S> {
         // 路径 per_scope_layers=None ⇒ 门不触发，本实现显式收紧）。flag 层受信（免批准）不参与 origin 判定，其缺席
         // 仅影响罕见 flag+project 重叠（过度提示，安全）。
         let config_dir = self.config_dir();
+        let policy = resolve_policy_settings(None, None, None);
+        let resolved = resolve_settings(ResolveSettingsArgs {
+            cwd: Some(&config_dir),
+            env,
+            flag_settings_path: None,
+            policy_settings: Some(&policy),
+        });
+        // #267 / #295 残余：settings 校验期整条丢弃的非法 `extraKnownMarketplaces` 声明进入恢复报告
+        // （校验/丢弃语义不变；此处只做可观测）。当前内部解析不含 flag 层（CLI 已单独打印 flag 校验
+        // 错误）；settings-flag-runtime-cleanup 合入后将接本解析块，对 `SettingsScope::Flag` 做去重/过滤。
+        let declaration_errors =
+            crate::settings::recovery::marketplace_declaration_errors(&resolved.errors);
+        for error in &declaration_errors {
+            tracing::warn!(
+                scope = error.scope.as_str(),
+                field = %error.field,
+                reason = %error.reason,
+                source_path = error.source_path.as_deref().unwrap_or(""),
+                "governance: invalid marketplace declaration dropped by settings validation \
+                 (ignored; existing registration unchanged)"
+            );
+        }
+        let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)> =
+            resolved.scope_layers;
         let resolved_declared;
-        let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)>;
         let declared: &serde_json::Map<String, serde_json::Value> = match declared {
-            Some(d) => {
-                let policy = resolve_policy_settings(None, None, None);
-                scope_layers = resolve_settings(ResolveSettingsArgs {
-                    cwd: Some(&config_dir),
-                    env,
-                    flag_settings_path: None,
-                    policy_settings: Some(&policy),
-                })
-                .scope_layers;
-                d
-            }
+            Some(d) => d,
             None => {
-                let policy = resolve_policy_settings(None, None, None);
-                let resolved = resolve_settings(ResolveSettingsArgs {
-                    cwd: Some(&config_dir),
-                    env,
-                    flag_settings_path: None,
-                    policy_settings: Some(&policy),
-                });
                 resolved_declared = resolved.settings;
-                scope_layers = resolved.scope_layers;
                 &resolved_declared
             }
         };
@@ -2093,6 +2096,7 @@ impl<S: Session> Computer<S> {
             reg.record_source_conflicts(conflicts.iter().cloned());
             (report, conflicts)
         };
+        report.marketplace_declaration_errors = declaration_errors;
 
         // 阶段一·五：账本派生缓存补全（§63 账本删除无损，#104）。**已释放 skill 写锁**、无锁纯 FS/git，故置于
         // phase 1 与 phase 2 之间：意图有 enabled pid 但账本缺记录 → 从意图重物化账本 `installPath`，使随后 phase 2
@@ -2955,12 +2959,14 @@ impl<S: Session> Computer<S> {
         if !recovery.restored_plugins.is_empty()
             || !recovery.failed_marketplaces.is_empty()
             || !recovery.marketplace_source_conflicts.is_empty()
+            || !recovery.marketplace_declaration_errors.is_empty()
         {
             info!(
                 restored_plugins = recovery.restored_plugins.len(),
                 restored_skills = recovery.restored_skills.len(),
                 failed_marketplaces = recovery.failed_marketplaces.len(),
                 marketplace_source_conflicts = recovery.marketplace_source_conflicts.len(),
+                marketplace_declaration_errors = recovery.marketplace_declaration_errors.len(),
                 "governance boot recovery complete"
             );
         }
@@ -5656,15 +5662,31 @@ fn resolve_landing_root_settings(
     Some(crate::skills::home::expand_home(raw.trim(), env))
 }
 
+/// flag 层路径归一失败的诊断文案（构造期 builder / 一次性 CLI 共用）。
+///
+/// `kind`：`"flag settings"` / `"mcp config"`；`disabled_note`：`"flag scope disabled"` /
+/// `"flag MCP layer disabled"`。保持 `… is unusable (…); … (fail-closed)` 形状，防多处文案/名词漂移。
+pub(crate) fn flag_path_diagnostic(
+    kind: &str,
+    raw: &Path,
+    reason: &str,
+    disabled_note: &str,
+) -> String {
+    format!(
+        "⚠ {kind} path {} is unusable ({reason}); {disabled_note} (fail-closed)",
+        raw.display()
+    )
+}
+
 /// 构造期归一 **flag 层文件路径**（`--settings` / `--mcp-config`）：成功 → 绝对路径；失败 → 原因
 /// （调用方 fail-closed 置 `None`）。
 ///
 /// 规则：
 /// - 空路径 → 失败；非 UTF-8 → 无 `~` 语义，直接绝对化（失败则报错）。
-/// - 前导 `~` / `~/...` / `~\...`（Windows 写法，对齐 python `expanduser`）：用注入 env 的 `HOME`
-///   （空白视同未设置），其次进程 `HOME`；**仅 Windows** 再退 `USERPROFILE`（POSIX 不读，对齐
-///   python）；全部为空 → 失败（**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的
-///   路径会被当成受信 flag 层）。
+/// - 前导 `~` / `~/...` / `~\...`（Windows 写法，对齐 python `expanduser`）：**注入 env 优先、进程
+///   env 次之**；每套 env 内 Windows `USERPROFILE` 优先、`HOME` 次之（对齐 python
+///   `ntpath.expanduser`），POSIX 只读 `HOME`（不读 `USERPROFILE`；空白视同未设置）。全部为空 →
+///   失败（**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的路径会被当成受信 flag 层）。
 /// - `~user`（前导 `~` 但不是 `~` / `~/` / `~\`）：rust 无 NSS expanduser → 显式失败，不静默锚到
 ///   `<cwd>/~user`。
 /// - 其它（含中段 `~` 的合法相对路径，如 `conf/~/flag.json`）：中段 `~` 只是普通字符，按构造期 cwd
@@ -5728,6 +5750,9 @@ fn home_lookup(env: Option<&EnvMap>) -> Option<String> {
 ///
 /// Windows：**`USERPROFILE` 优先**，`HOME` 次之（对齐 python `ntpath.expanduser`）；POSIX：只读
 /// `HOME`（不读 `USERPROFILE`，对齐 python posixpath）。
+///
+/// 有意**不**消费 `HOMEDRIVE`+`HOMEPATH`（python `ntpath.expanduser` 在 `USERPROFILE` 缺失时的
+/// 兜底更宽）；本 SDK 的 flag 层路径契约只认上表两键，缺失即 fail-closed，不猜驱动器组合。
 fn home_lookup_with(env: Option<&EnvMap>, windows: bool) -> Option<String> {
     let lookup = |name: &str| match env {
         Some(map) => map.get(name).cloned(),
@@ -7617,6 +7642,71 @@ mod tests {
                 .all(|d| d.code != DiagnosticCode::MarketplaceSyncFailed),
             "声明冲突不得映射为 degraded 诊断：{:?}",
             status.diagnostics
+        );
+    }
+
+    /// #267 / #295 残余：非法 `extraKnownMarketplaces` 声明被 settings 校验整条丢弃时，boot 恢复报告
+    /// 必须可见（不改变丢弃语义、不计入 source_conflicts），旧注册源能力照常恢复。
+    #[tokio::test]
+    async fn reconcile_governance_reports_invalid_declaration_without_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let xdg = tmp.path().join("xdg");
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        // user settings：合法 enabledPlugins + 非法 marketplace 声明（typo URL → 校验期整条丢弃）。
+        let settings_dir = xdg.join("a2c");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let settings_path = settings_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "enabledPlugins": { "audit@acme": true },
+                "extraKnownMarketplaces": {
+                    "acme": { "source": { "type": "git", "url": "not-a-git-url" } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"))
+            .with_config_dir(tmp.path().join("config"))
+            .with_config_env(env);
+        let report = comp_b.reconcile_governance(None, None).await;
+
+        assert_eq!(
+            report.marketplace_declaration_errors.len(),
+            1,
+            "非法声明必须在恢复报告可见：{report:?}"
+        );
+        let error = &report.marketplace_declaration_errors[0];
+        assert_eq!(error.scope, SettingsScope::User);
+        assert_eq!(error.field, "extraKnownMarketplaces.acme.source.url");
+        assert!(error.reason.contains("malformed git url"), "{error:?}");
+        assert_eq!(
+            error.source_path,
+            Some(settings_path.to_string_lossy().into_owned())
+        );
+        // 非法声明是「声明本身不可用」，不得混入合法换源冲突；校验丢弃语义不变（旧源照常恢复、不降级）。
+        assert!(
+            report.marketplace_source_conflicts.is_empty(),
+            "非法声明不得计入换源冲突：{report:?}"
+        );
+        assert!(report.failed_marketplaces.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        assert!(
+            !comp_b.status.has_degraded(),
+            "非法声明可观测不得产生 Degraded 诊断：{:?}",
+            comp_b.status().await.diagnostics
         );
     }
 
@@ -12779,6 +12869,12 @@ mod tests {
         assert_eq!(
             home_lookup_with(Some(&env), false).as_deref(),
             Some("/home/alice")
+        );
+        // USERPROFILE 缺失、仅 HOME 存在：Windows 也回落到 HOME（不是直接 fail-closed）。
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some("/home/alice"),
+            "Windows 下 USERPROFILE 缺失须回落 HOME"
         );
     }
 

@@ -88,14 +88,14 @@ pub use reconciler::{
 pub use recovery::{
     collect_enabled_bundled_servers, recover_marketplace_skills,
     rematerialize_missing_ledger_records, BundledServerRecord, GovernanceRecoveryReport,
-    MarketplaceSourceConflict,
+    MarketplaceDeclarationError, MarketplaceSourceConflict,
 };
 
 pub use schema::{
-    is_valid_enabled_plugin_key, is_valid_git_url, is_valid_marketplace_name, validate_settings,
-    ComputerSettings, GitSource, MarketplaceEntry, PermissionsBlock, SettingsScope,
-    SettingsValidationError, BOOL_FIELDS, FIELD_READ_ROOTS, POLICY_ONLY_FIELDS,
-    STRING_ARRAY_FIELDS, TRUSTED_SCOPE_ONLY_FIELDS,
+    is_marketplace_declaration_field, is_valid_enabled_plugin_key, is_valid_git_url,
+    is_valid_marketplace_name, validate_settings, ComputerSettings, GitSource, MarketplaceEntry,
+    PermissionsBlock, SettingsScope, SettingsValidationError, BOOL_FIELDS, FIELD_READ_ROOTS,
+    POLICY_ONLY_FIELDS, STRING_ARRAY_FIELDS, TRUSTED_SCOPE_ONLY_FIELDS,
 };
 pub use scope::{
     apply_write, load_settings_file, merge_layers, merge_read, resolve_settings,

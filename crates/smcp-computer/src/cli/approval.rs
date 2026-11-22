@@ -153,7 +153,15 @@ pub async fn run_mcp_approval<S: Session>(
     // #143：settings 的校验错误必须**呈现**——scope 越权（policy-only / 审批门 enable 方向判据）会**静默
     // 丢弃字段**，若连错误也吞掉，用户只会看到「我的 settings 莫名不生效」。协议指南 §2.1/§3：响亮失败。
     let resolved_st = resolved_settings_with_errors(cwd.as_deref(), None, flag_settings);
-    for line in format_settings_errors(&resolved_st.errors) {
+    // #267：非法 marketplace 声明的可观测由 `run_governance_remount` 统一负责（含 flag 层），
+    // 此处过滤避免同批错误在一个启动流程里重复打印。
+    let other_errors: Vec<_> = resolved_st
+        .errors
+        .iter()
+        .filter(|e| !crate::settings::is_marketplace_declaration_field(&e.field))
+        .cloned()
+        .collect();
+    for line in format_settings_errors(&other_errors) {
         msg_warn(&line);
     }
     let settings = resolved_st.settings;

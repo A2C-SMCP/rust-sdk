@@ -25,8 +25,12 @@
 //!   **拒绝**——不注销 SKILL、不删 clone 树、不 stage/pull；旧注册、旧物化内容与旧运行时能力保持 active。
 //!   拒绝归 `failed` 并记 `reason="marketplace_source_conflict"` 的结构化 ERROR；换源必须显式
 //!   [`prune_marketplaces`] / lifecycle remove 后 re-add，且既有 `<plugin>@<name>` 意图引用须先移除
-//!   （§5.14 ④，由 #272 的 remove/add 语义执行）。同源判定为精确 JSON `Value` 相等（canonical 归一化归
-//!   #272）；已注册名的新声明 source 不可克隆时同样拒绝（`reason="marketplace_source_unusable"`，fail-closed）。
+//!   （§5.14 ④，由 #272 的 remove/add 语义执行）。同源判定经
+//!   [`compare_marketplace_sources`]——仅
+//!   [`MarketplaceSourceRelation::Same`] 才算同源；写法不同 / 形态非法 = `Unverifiable` → fail-closed。
+//!   已注册名的新声明 source 不可克隆时同样拒绝；`reason="marketplace_source_unusable"` **仅**用于「两侧
+//!   完全同形（精确 `Value` 相等）且不可克隆」的情形，其余拒绝（含不同 URL / 不同写法）一律记
+//!   `marketplace_source_conflict`（换源语义优先，保持 #294 口径）。
 //!   **前置契约**：拒绝分支不 stage——本函数只保留调用方传入的 `SkillRegistry` 现状。用空 Registry 做启动
 //!   对账的调用方须先跑 [`recover_marketplace_skills`](super::recovery::recover_marketplace_skills) 或传入
 //!   既有 Registry，否则被拒 marketplace 的旧 SKILL 不会出现在该 Registry（账本与 clone 树不受影响）。
@@ -70,7 +74,9 @@ use crate::settings::schema::{is_valid_enabled_plugin_key, is_valid_marketplace_
 use crate::settings::scope::EnvMap;
 use crate::skills::home::{marketplace_skill_dir, SOURCE_MARKETPLACE};
 use crate::skills::registry::SkillRegistry;
-use crate::skills::sources::marketplace_clone_url;
+use crate::skills::sources::{
+    compare_marketplace_sources, marketplace_clone_url, MarketplaceSourceRelation,
+};
 use crate::skills::staging::{
     external_plugin_dir, refresh_marketplace_clone, stage_marketplace_skills,
     KnownMarketplaceRecorder, MarketplaceStageOptions, MarketplaceStageOutcome,
@@ -500,9 +506,11 @@ fn unregister_marketplace_skills(
 /// 旧能力仍按注册源恢复、不降级）。
 pub(crate) const REASON_SOURCE_CONFLICT: &str = "marketplace_source_conflict";
 
-/// 已注册名对应的声明 source 不可用（与账本同形但非合法 git source）时的 fail-closed reason。
+/// 已注册名对应的声明 source 不可用时的 fail-closed reason。
 ///
-/// 两侧「同样不可用」无法证明同源（§5.14「无法确定时 MUST fail-closed」）→ 视为注册被拒。
+/// **仅**用于「注册与声明的 source 精确同形（`Value` 相等）且不可克隆」——此时不是换源尝试，而是无法
+/// 证明同源（§5.14「无法确定时 MUST fail-closed」）。不同 URL（即使声明侧不可用）仍归
+/// [`REASON_SOURCE_CONFLICT`]（换源语义优先）。
 const REASON_SOURCE_UNUSABLE: &str = "marketplace_source_unusable";
 
 /// 账本+clone 均缺失时仍存在 `installedPlugins` 意图引用（§5.14 remove/re-add 守卫）/ dangling refs。
@@ -523,18 +531,44 @@ pub(crate) fn source_for_log(source: &Value) -> String {
         .unwrap_or_else(|| REDACTED_GIT_SOURCE.to_string())
 }
 
+/// 声明 source 相对已注册 source 的 §5.14 拒绝判定：`Some(reason)` = 拒绝，`None` = 可继续。
+///
+/// 同源判定与 #272 注册面统一为 [`compare_marketplace_sources`]（仅 `Same` 才算同源；写法不同 /
+/// 形态非法 = `Unverifiable` → fail-closed）。reason 保持 #294 安全语义：
+/// - 两侧**精确同形**（`Value` 相等）且声明不可克隆 → [`REASON_SOURCE_UNUSABLE`]（非换源，无法证明同源）；
+/// - 其余拒绝（不同 URL / 不同写法 / 单侧不可用）→ [`REASON_SOURCE_CONFLICT`]（换源尝试优先）。
+pub(crate) fn marketplace_source_rejection(
+    registered: &Value,
+    declared: &Value,
+) -> Option<&'static str> {
+    let unusable = marketplace_clone_url(declared).is_err();
+    let same_shaped_unusable = unusable && registered == declared;
+    let conflict =
+        compare_marketplace_sources(registered, declared) != MarketplaceSourceRelation::Same;
+    if same_shaped_unusable {
+        Some(REASON_SOURCE_UNUSABLE)
+    } else if conflict || unusable {
+        Some(REASON_SOURCE_CONFLICT)
+    } else {
+        None
+    }
+}
+
 /// 对账声明的 marketplace 与物化 clone 树（additive-only）/ Reconcile declared vs materialized。
 ///
 /// 四分支（§7.1 step 3）/ Four branches:
 /// - **missing**（declared∖materialized）→ clone。**产生新内容**（missing 或 refresh）一律经
 ///   `refresh_marketplace_clone`：fetch → 来料清单名预校验（已注册 baseline）→ ff / staged swap；
 ///   改名 / 缺失 / 非法 / 损坏清单在提交前拒绝，旧内容/能力保留（#267）。
-/// - **sourceChanged**（`record.source != decl.source`）→ **拒绝**（runtime-contract §5.14）：不注销 SKILL、不
-///   `rmtree`、不 stage/pull，归 `failed` 并记 `reason="marketplace_source_conflict"` 的 ERROR；旧注册、旧物化
-///   内容与旧运行时能力保持 active。换源必须显式 [`prune_marketplaces`] / lifecycle remove 后 re-add，且既有
-///   `<plugin>@<name>` 意图引用须先移除（§5.14 ④，由 #272 的 remove/add 语义执行）。
-///   同源判定为精确 JSON `Value` 相等（canonical 归一化归 #272）；已注册名的新声明 source 不可克隆时同样
-///   拒绝（`reason="marketplace_source_unusable"`，fail-closed——无法证明同源）。
+/// - **sourceChanged**（`compare_marketplace_sources(record.source, decl.source) != Same`）→ **拒绝**
+///   （runtime-contract §5.14）：不注销 SKILL、不 `rmtree`、不 stage/pull，归 `failed` 并记
+///   `reason="marketplace_source_conflict"` 的 ERROR；旧注册、旧物化内容与旧运行时能力保持 active。换源必须
+///   显式 [`prune_marketplaces`] / lifecycle remove 后 re-add，且既有 `<plugin>@<name>` 意图引用须先移除
+///   （§5.14 ④，由 #272 的 remove/add 语义执行）。同源判定与 #272 注册面一致：仅
+///   [`MarketplaceSourceRelation::Same`]（trim + `owner/repo` 简写展开后的逐字相等）才算同源；写法不同 /
+///   形态非法 = `Unverifiable` → fail-closed。已注册名的新声明 source 不可克隆时同样拒绝；reason 仅在
+///   「两侧精确同形且不可克隆」时记 `marketplace_source_unusable`，其余（含不同 URL）记
+///   `marketplace_source_conflict`（fail-closed——无法证明同源）。
 /// - **autoUpdate**（`decl.autoUpdate == true` 或显式 `refresh`）→ 守卫 refresh（同上；source 冲突项不 pull，
 ///   拒绝优先）。
 /// - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 [`prune_marketplaces`] 显式清）。
@@ -569,19 +603,12 @@ pub async fn reconcile(
 
         // §5.14 / #294：一名一源；声明面换源 MUST 拒绝（validation），MUST NOT 静默覆盖/替换。
         // 守卫在任何 unregister / rmtree / stage / pull 之前；旧注册、旧物化内容与旧能力保持 active。
-        // 精确 `Value` 不等即拒绝（fail-closed）：归一化（同一仓库不同写法）归 #272 的身份语义。
-        // 已注册名 + 声明 source 不可用（两侧同为 null / `{}` 等）同样无法证明同源 → fail-closed 拒绝，
-        // 否则 stage 空转后会被误报为 up_to_date / updated（看似成功但什么都没应用）。
+        // 同源判定与 #272 注册面统一为 `compare_marketplace_sources`；reason 保持 #294 安全语义
+        // （见 [`marketplace_source_rejection`]）。
         let record = materialized.get(name);
-        let source_conflict = record.is_some_and(|r| r.source != source);
-        let source_unusable = record.is_some() && marketplace_clone_url(&source).is_err();
-        if source_conflict || source_unusable {
+        if let Some(reason) = record.and_then(|r| marketplace_source_rejection(&r.source, &source))
+        {
             let registered = record.map_or(Value::Null, |r| r.source.clone());
-            let reason = if source_conflict {
-                REASON_SOURCE_CONFLICT
-            } else {
-                REASON_SOURCE_UNUSABLE
-            };
             tracing::error!(
                 marketplace = %name,
                 reason = reason,
@@ -1956,7 +1983,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_source_conflict_fail_closed_on_equal_unusable_sources() {
-        // 账本与声明「同形但都不可用」：无法证明同源 → fail-closed 拒绝，不得因 `==` 放行后把空转
+        // 账本与声明「精确同形但都不可用」：无法证明同源 → fail-closed 拒绝，不得因同形放行后把空转
         // stage 误报成 up_to_date / updated。含对象形态（非 git / 非法 url）以钉死 marketplace_clone_url
         // 谓词——防实现被弱化为 `!source.is_object()` 后本用例仍绿。
         for unusable in [
@@ -2108,7 +2135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_source_conflict_compares_whole_source_shape() {
+    async fn reconcile_source_identity_ignores_extra_source_keys() {
         let tmp = TempDir::new().unwrap();
         let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
         let home = tmp.path().join("home");
@@ -2128,7 +2155,8 @@ mod tests {
             vec!["acme".to_string()]
         );
 
-        // 同 url 但形状不同（多余 ref 键）：无法判定同源 → fail-closed 拒绝（归一化归 #272）。
+        // #272 身份 = `{type,url}`；额外 `ref` / 未知键不参与同源判定（真实 settings 经
+        // `validate_settings` 本就会剥掉额外键）。旧精确 `Value` 比较会误拒——本用例钉死 canonical 谓词。
         let d = declared(serde_json::json!({
             "extraKnownMarketplaces": {"acme": {"source": {
                 "type": "git", "url": url_a, "ref": "main"
@@ -2136,11 +2164,99 @@ mod tests {
             "enabledPlugins": {"audit@acme": true}
         }));
         let r = reconcile(&mut reg, &home, &d, &store, ReconcileOptions::default()).await;
-        assert_eq!(r.failed, vec!["acme".to_string()]);
-        assert!(r.updated.is_empty() && r.up_to_date.is_empty());
+        assert!(r.failed.is_empty(), "额外 source 键不得触发换源拒绝：{r:?}");
+        assert_eq!(r.up_to_date, vec!["acme".to_string()]);
+        assert!(r.installed.is_empty() && r.updated.is_empty());
         assert_eq!(
-            store.load_known_marketplaces().marketplaces["acme"].source,
-            serde_json::json!({"type": "git", "url": url_a})
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_accepts_canonically_equivalent_registered_source() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = make_marketplace_repo(&tmp.path().join("a"), "from A");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let url_a = format!("file://{}", repo_a.display());
+        let store = MemStore::default();
+        let mut reg = SkillRegistry::new();
+
+        let d_a = declared(serde_json::json!({
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": url_a}}},
+            "enabledPlugins": {"audit@acme": true}
+        }));
+        assert_eq!(
+            reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default())
+                .await
+                .installed,
+            vec!["acme".to_string()]
+        );
+
+        // 账本（不可信输入）source 带首尾空白：canonicalize 会 trim → Same。旧精确 `Value` 比较会误判换源。
+        store.record(KnownMarketplaceRecord {
+            name: "acme",
+            source: &serde_json::json!({"type": "git", "url": format!("  {url_a}  ")}),
+            install_location: &marketplace_skill_dir(&home, "acme", &[]),
+            commit_sha: Some("deadbeef"),
+            auto_update: false,
+            changed: true,
+        });
+
+        let r = reconcile(&mut reg, &home, &d_a, &store, ReconcileOptions::default()).await;
+        assert!(r.failed.is_empty(), "可证明等价不得拒绝：{r:?}");
+        assert_eq!(r.up_to_date, vec!["acme".to_string()]);
+        assert_eq!(
+            reg.resolve("audit:code-review").unwrap().description,
+            "from A"
+        );
+    }
+
+    /// #294 安全语义：`marketplace_source_unusable` 只留给「精确同形且不可克隆」；不同 URL 一律 conflict。
+    #[test]
+    fn marketplace_source_rejection_reason_priority_294() {
+        let url_a = serde_json::json!({"type": "git", "url": "file:///tmp/a"});
+        let url_b = serde_json::json!({"type": "git", "url": "file:///tmp/b"});
+        assert_eq!(marketplace_source_rejection(&url_a, &url_a), None);
+        // 额外 ref 键：身份只看 type+url → 不冲突。
+        assert_eq!(
+            marketplace_source_rejection(
+                &url_a,
+                &serde_json::json!({"type": "git", "url": "file:///tmp/a", "ref": "main"})
+            ),
+            None
+        );
+        // 不同 URL：即使声明侧不可克隆，仍是换源尝试 → conflict。
+        assert_eq!(
+            marketplace_source_rejection(&url_a, &url_b),
+            Some(REASON_SOURCE_CONFLICT)
+        );
+        assert_eq!(
+            marketplace_source_rejection(
+                &url_a,
+                &serde_json::json!({"type": "git", "url": "bogus"})
+            ),
+            Some(REASON_SOURCE_CONFLICT)
+        );
+        // Unverifiable（等价仓库不同写法）→ conflict（fail-closed）。
+        assert_eq!(
+            marketplace_source_rejection(
+                &serde_json::json!({"type": "git", "url": "https://example.com/org/repo.git"}),
+                &serde_json::json!({"type": "git", "url": "git@example.com:org/repo.git"})
+            ),
+            Some(REASON_SOURCE_CONFLICT)
+        );
+        // 精确同形且不可克隆 → unusable。
+        let bogus = serde_json::json!({"type": "git", "url": "bogus"});
+        assert_eq!(
+            marketplace_source_rejection(&bogus, &bogus),
+            Some(REASON_SOURCE_UNUSABLE)
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(
+            marketplace_source_rejection(&empty, &empty),
+            Some(REASON_SOURCE_UNUSABLE)
         );
     }
 

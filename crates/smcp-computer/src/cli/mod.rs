@@ -607,8 +607,13 @@ fn normalize_root_flag_path(root: &RootState) -> Option<std::path::PathBuf> {
             Ok(path) => Some(path),
             Err(reason) => {
                 eprintln!(
-                    "⚠ settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
-                    raw.display()
+                    "{}",
+                    crate::computer::flag_path_diagnostic(
+                        "flag settings",
+                        raw,
+                        reason,
+                        "flag scope disabled"
+                    )
                 );
                 None
             }
@@ -1048,6 +1053,30 @@ mod tests {
         assert_eq!(code, EXIT_USER_ERROR);
     }
 
+    /// #248/#264 R3：一次性 settings 子命令的 flag 路径归一——`~user` 形态 fail-closed 为 None
+    /// （不回退原始串），合法绝对路径正常返回。
+    #[test]
+    fn normalize_root_flag_path_fails_closed_on_tilde_user() {
+        let tilde = RootState {
+            flag_path: Some(std::path::PathBuf::from("~alice/settings.json")),
+            ..Default::default()
+        };
+        assert!(
+            normalize_root_flag_path(&tilde).is_none(),
+            "`~user` 必须 fail-closed 为无 flag 层"
+        );
+
+        let tmp = tempdir().unwrap();
+        let valid = tmp.path().join("flag.json");
+        std::fs::write(&valid, "{}").unwrap();
+        let root = RootState {
+            flag_path: Some(valid.clone()),
+            ..Default::default()
+        };
+        assert_eq!(normalize_root_flag_path(&root), Some(valid));
+        assert!(normalize_root_flag_path(&RootState::default()).is_none());
+    }
+
     /// #248：`run_repl` 的 Computer 装配必须把 `--settings` 接线到 `with_flag_settings_path`——
     /// 否则 CLI 传了 flag 文件、运行期仍 flag-blind（settings show 可见但 readRoots / landingRoot 不生效）。
     #[tokio::test]
@@ -1148,10 +1177,17 @@ mod tests {
             Some(&resolve_env),
             Some(planted.as_path()),
         );
+        // policy 无 env 接缝：宿主 policy 可覆盖 merged 视图，只看 Flag 层（与本用例下方生效组同口径）。
+        let control_flag = control
+            .scope_layers
+            .iter()
+            .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
+            .map(|(_, layer)| layer)
+            .expect("five-layer view always contains Flag");
         assert_eq!(
-            control.settings.get("enableAllProjectMcpServers"),
+            control_flag.get("enableAllProjectMcpServers"),
             Some(&serde_json::json!(true)),
-            "控制组：植入 settings 必须是有效信任载荷"
+            "控制组：植入 settings 必须是有效信任载荷（只看 Flag 层）"
         );
         use crate::settings::mcp_config::{resolve_mcp_config, ResolveMcpConfigArgs};
         // policy / managed-mcp 无 env 接缝：managed 指向 tempdir 内路径（不读宿主），断言只看 Flag 层。

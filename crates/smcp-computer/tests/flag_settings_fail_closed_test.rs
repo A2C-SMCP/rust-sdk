@@ -117,3 +117,101 @@ fn repo_planted_tilde_settings_cannot_grant_project_mcp_trust() {
         "植入的 flag 不得提供信任判据（否则 server 会被判 Enabled）：stdout={stdout}"
     );
 }
+
+/// #264 R3：一次性 `settings` 子命令也走同一 fail-closed 归一——植入的 `<cwd>/~alice/settings.json`
+/// 不得作为 flag 层被读取；stderr 明确诊断。
+#[test]
+fn cli_settings_show_fails_closed_on_tilde_path() {
+    let dir = tempdir().unwrap();
+    let planted_dir = dir.path().join("~alice");
+    fs::create_dir_all(&planted_dir).unwrap();
+    fs::write(
+        planted_dir.join("settings.json"),
+        r#"{"trustedMarketplaces":["PLANTED"]}"#,
+    )
+    .unwrap();
+
+    let output = run_args(
+        dir.path(),
+        &[
+            "--settings",
+            "~alice/settings.json",
+            "settings",
+            "show",
+            "--scope",
+            "flag",
+            "--json",
+        ],
+    );
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("flag settings path") && stderr.contains("fail-closed"),
+        "一次性 settings 子命令必须 fail-closed 诊断：stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("PLANTED"),
+        "植入的 `~alice/settings.json` 不得作为 flag 层被读取：stdout={stdout}"
+    );
+}
+
+/// 以 piped stdin 跑 REPL（写入脚本后关闭 stdin → EOF 退出）。
+fn run_repl_with_stdin(dir: &Path, args: &[&str], script: &str) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_smcp-computer"))
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .envs(isolated_env(dir))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("smcp-computer binary runs");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(script.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+    child.wait_with_output().expect("smcp-computer exits")
+}
+
+/// #264 R3：REPL 内 `settings show` 只认 `run_repl` 传入的归一后路径（失败 = 无 flag 层），
+/// 不得回读仓库植入的 `<cwd>/~alice/settings.json`。
+#[test]
+fn repl_settings_show_fails_closed_on_tilde_path() {
+    let dir = tempdir().unwrap();
+    let planted_dir = dir.path().join("~alice");
+    fs::create_dir_all(&planted_dir).unwrap();
+    fs::write(
+        planted_dir.join("settings.json"),
+        r#"{"trustedMarketplaces":["PLANTED"]}"#,
+    )
+    .unwrap();
+
+    let output = run_repl_with_stdin(
+        dir.path(),
+        &["--settings", "~alice/settings.json", "run"],
+        "settings show --scope flag --json\n",
+    );
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("flag settings path") && stderr.contains("fail-closed"),
+        "REPL 启动边界必须 fail-closed 诊断：stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("PLANTED"),
+        "REPL settings 不得回读植入文件：stdout={stdout}"
+    );
+}

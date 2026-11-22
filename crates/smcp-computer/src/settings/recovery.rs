@@ -67,7 +67,10 @@ use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig};
 use crate::settings::installer::materialize_plugin_record;
 use crate::settings::reconciler::{declared_marketplaces, source_for_log, REASON_SOURCE_CONFLICT};
-use crate::settings::schema::SettingsScope;
+use crate::settings::redaction::untrusted_name_for_display;
+use crate::settings::schema::{
+    is_marketplace_declaration_field, SettingsScope, SettingsValidationError,
+};
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
     load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
@@ -105,6 +108,27 @@ pub struct MarketplaceSourceConflict {
     pub declared_source_display: String,
 }
 
+/// 被 settings 校验整条丢弃的非法 `extraKnownMarketplaces` 声明（#295 残余 / python#293 语义）。
+///
+/// 校验语义不变（非法条目照旧丢弃、不阻断启动）；本结构只让「有声明但非法」在恢复报告中可见。
+/// 与 [`MarketplaceSourceConflict`] 正交：后者是**合法声明**给已注册名换源被拒；本结构是声明自身不可用
+/// （typo / 缺 `source` / 非 git URL），恢复仍按注册源，二者不重复计数。
+///
+/// ⚠️ `field` / `reason` 已经过脱敏（Git URL 凭据剥离）与控制字符清洗；`field` 保留
+/// `extraKnownMarketplaces.` 前缀，便于用户定位配置。`source_path` 为产生该错误的 settings 文件（可空）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MarketplaceDeclarationError {
+    /// 来源 scope（user / project / local / flag / policy）/ owning settings scope.
+    pub scope: SettingsScope,
+    /// 点路径（如 `extraKnownMarketplaces.my-mp.source.url`）；marketplace 名段已脱敏。
+    pub field: String,
+    /// 校验失败原因（已脱敏 + 控制字符清洗）/ sanitized validation reason.
+    pub reason: String,
+    /// 产生该错误的 settings 文件路径（可空）/ originating settings file, if known.
+    pub source_path: Option<String>,
+}
+
 /// 一次 [`recover_marketplace_skills`] + MCP 重挂的结果（观测 + 测试信号）/ Boot recovery report。
 ///
 /// `remounted_servers` 由编排方（[`Computer`](crate::computer::Computer)）在第二阶段填充——本模块的
@@ -131,6 +155,13 @@ pub struct GovernanceRecoveryReport {
     /// 与 [`failed_marketplaces`](Self::failed_marketplaces) 正交，勿混用：`failed_marketplaces` 是「源不可达、
     /// skills 未恢复」的降级；本字段是「声明被拒、旧注册仍按注册源恢复（旧能力 active）」——**不进入 degraded**。
     pub marketplace_source_conflicts: Vec<MarketplaceSourceConflict>,
+    /// settings 校验阶段被整条丢弃的非法 `extraKnownMarketplaces` 声明（#295 残余 / python#293 语义）。
+    ///
+    /// 与 [`marketplace_source_conflicts`](Self::marketplace_source_conflicts) 正交、不重复计数；
+    /// 不改变校验丢弃语义、不进入 degraded。由编排方（`Computer::reconcile_governance`）从
+    /// `ResolvedSettings.errors` 填充；直接调用 [`recover_marketplace_skills`] 时恒空（该入口拿到的
+    /// `declared` 已过校验）。
+    pub marketplace_declaration_errors: Vec<MarketplaceDeclarationError>,
     /// 账本缺记录、从 `installedPlugins` 意图**重物化派生缓存成功**的 enabled plugin id（§63）/ rebuilt from intent。
     pub rematerialized_plugins: Vec<String>,
     /// 账本缺记录但**重物化失败**（源不可达等）的 enabled plugin id（降级、未阻断其余）/ degraded rematerialize。
@@ -147,6 +178,54 @@ pub struct GovernanceRecoveryReport {
     /// [`Computer::list_pending_bundled_approvals`](crate::computer::Computer::list_pending_bundled_approvals)
     /// （独立现算）。
     pub pending_bundled_servers: Vec<BundledServerRecord>,
+}
+
+/// 从 settings 校验错误中筛出 `extraKnownMarketplaces` 声明错误并脱敏 / collect declaration errors.
+///
+/// 只读纯函数：不改变校验语义（非法条目仍在校验期被丢弃）。`field` 保留
+/// `extraKnownMarketplaces` 前缀，前缀之后的整段与 `reason` 都经
+/// [`untrusted_name_for_display`] 脱敏并清洗控制字符（防恶意名称把 URL 凭据或换行/ANSI 注入诊断输出）。
+pub(crate) fn marketplace_declaration_errors(
+    errors: &[SettingsValidationError],
+) -> Vec<MarketplaceDeclarationError> {
+    errors
+        .iter()
+        .filter(|error| is_marketplace_declaration_field(&error.field))
+        .map(|error| MarketplaceDeclarationError {
+            scope: error.scope,
+            field: sanitize_declaration_field(&error.field),
+            reason: sanitize_declaration_text(&error.reason),
+            source_path: error.source_path.as_deref().map(scrub_control_chars),
+        })
+        .collect()
+}
+
+/// 保留 `extraKnownMarketplaces` 前缀，只对前缀之后的子串脱敏（前缀本身含 `.`，整体喂给 URL 脱敏器会
+/// 被误判为 scheme 的一部分）。
+fn sanitize_declaration_field(field: &str) -> String {
+    const PREFIX: &str = "extraKnownMarketplaces";
+    if field == PREFIX {
+        return field.to_string();
+    }
+    match field
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
+        Some(rest) => format!("{PREFIX}.{}", sanitize_declaration_text(rest)),
+        None => field.to_string(),
+    }
+}
+
+/// 不可信文本 → 诊断展示值：Git URL 凭据剥离 + 控制字符替换为空格。
+fn sanitize_declaration_text(text: &str) -> String {
+    scrub_control_chars(&untrusted_name_for_display(text))
+}
+
+/// 控制字符（换行 / ESC / C1 等）替换为空格，防 CLI/日志注入。
+fn scrub_control_chars(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 // ===========================================================================
@@ -256,9 +335,8 @@ pub async fn recover_marketplace_skills(
     // 注册」→ **拒绝声明变更**并结构化报告（不静默沿用旧源），恢复动作保持不变。
     // 检测范围 = declared ∩ known **全量**（不只 enabled 分组——reconcile() 当前无生产调用点，
     // disabled-only 的声明冲突否则无人报告）。同源判定与 #272 注册面一致：`Same` 才算同源，
-    // `Unverifiable`（含写法不同 / 形态非法）一律 fail-closed 视为冲突。
-    // ⚠️ 已知不一致（隔离审查 🟡）：`reconcile()` 仍按精确 `Value` 相等（#294 已钉其形状测试），
-    // 两种入口对「可证明等价写法」的裁决可能不同；谓词统一另行跟进，本单不改 reconcile 行为。
+    // `Unverifiable`（含写法不同 / 形态非法）一律 fail-closed 视为冲突。`reconcile()` 已统一到
+    // 同一谓词（#267），两条入口对「可证明等价写法」的裁决一致。
     for (name, decl) in &declared_marketplaces(declared) {
         let Some(record) = known.marketplaces.get(name) else {
             // 未注册的声明 → 非「同名不同源」，归 reconcile 的 missing 分支（boot 不 clone 新源）。
@@ -1103,6 +1181,46 @@ mod tests {
     /// 期望的脱敏展示值 / expected redacted display for a source url。
     fn display_of(source: &Value) -> String {
         crate::settings::redaction::git_url_for_display(source["url"].as_str().unwrap())
+    }
+
+    /// #267：只筛 `extraKnownMarketplaces` 声明错误；前缀保留、子串脱敏、控制字符清洗。
+    #[test]
+    fn marketplace_declaration_errors_filter_redact_and_scrub() {
+        let secret = "https://user:PW_SECRET@example.com/repo.git";
+        let errors = vec![
+            SettingsValidationError {
+                scope: SettingsScope::User,
+                field: "enabledPlugins.good@mp".to_string(),
+                reason: "unrelated".to_string(),
+                source_path: None,
+            },
+            SettingsValidationError {
+                scope: SettingsScope::Project,
+                field: format!("extraKnownMarketplaces.{secret}.source.url"),
+                reason: format!("malformed git url: {secret}"),
+                source_path: Some("/tmp/settings.json".to_string()),
+            },
+            SettingsValidationError {
+                scope: SettingsScope::User,
+                field: "extraKnownMarketplaces".to_string(),
+                reason: "expected object, got array\nFAKE_LINE\u{1b}[31m".to_string(),
+                source_path: None,
+            },
+        ];
+        let got = marketplace_declaration_errors(&errors);
+        assert_eq!(got.len(), 2, "非 marketplace 字段必须被过滤：{got:?}");
+        assert_eq!(got[0].scope, SettingsScope::Project);
+        assert!(
+            got[0].field.starts_with("extraKnownMarketplaces."),
+            "前缀必须保留：{:?}",
+            got[0].field
+        );
+        assert!(!got[0].field.contains("PW_SECRET"), "{:?}", got[0].field);
+        assert!(!got[0].reason.contains("PW_SECRET"), "{:?}", got[0].reason);
+        assert_eq!(got[0].source_path.as_deref(), Some("/tmp/settings.json"));
+        assert_eq!(got[1].field, "extraKnownMarketplaces");
+        assert!(!got[1].reason.contains('\n'), "{:?}", got[1].reason);
+        assert!(!got[1].reason.contains('\u{1b}'), "{:?}", got[1].reason);
     }
 
     #[tokio::test]

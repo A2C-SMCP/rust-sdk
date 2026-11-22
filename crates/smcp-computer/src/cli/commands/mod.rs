@@ -429,6 +429,10 @@ pub async fn run_governance_remount<S: Session>(comp: &Computer<S>, flag_path: O
     for conflict in &report.marketplace_source_conflicts {
         msg_warn(&marketplace_source_conflict_line(conflict));
     }
+    // #267：settings 校验阶段被丢弃的非法 marketplace 声明——让「有声明但不可用」可见。
+    for error in &report.marketplace_declaration_errors {
+        msg_warn(&marketplace_declaration_error_line(error));
+    }
 }
 
 /// #295 声明面换源被拒（§5.14）的 CLI 提示行（纯格式化，供单测——呈现半程的可断言守护同 #143）/
@@ -445,6 +449,21 @@ fn marketplace_source_conflict_line(
          registered source; declaration rejected (keeping the registered source; remove + re-add the \
          marketplace to switch sources)",
         conflict.marketplace
+    )
+}
+
+/// #267 非法 marketplace 声明被 settings 校验丢弃的 CLI 提示行（纯格式化，供单测）/
+/// invalid marketplace declaration warning line.
+///
+/// `field` / `reason` 已在 `MarketplaceDeclarationError` 构造点脱敏并清洗控制字符；本函数只拼装。
+fn marketplace_declaration_error_line(
+    error: &crate::settings::MarketplaceDeclarationError,
+) -> String {
+    format!(
+        "⚠ settings.json[{}]: {} — {} (declaration ignored; existing registration unchanged)",
+        error.scope.as_str(),
+        error.field,
+        error.reason
     )
 }
 
@@ -485,6 +504,25 @@ mod tests {
             !line.contains("skills restored"),
             "提示不得承诺恢复：{line}"
         );
+    }
+
+    /// #267：非法声明提示行含 scope/field/reason 与「旧注册不变」承诺；DTO 已在构造点脱敏。
+    #[test]
+    fn marketplace_declaration_error_line_pins_fields_and_scope() {
+        let error = crate::settings::MarketplaceDeclarationError {
+            scope: SettingsScope::User,
+            field: "extraKnownMarketplaces.acme.source.url".to_string(),
+            reason: "malformed git url".to_string(),
+            source_path: Some("/tmp/settings.json".to_string()),
+        };
+        let line = marketplace_declaration_error_line(&error);
+        assert!(line.contains("[user]"), "{line}");
+        assert!(
+            line.contains("extraKnownMarketplaces.acme.source.url"),
+            "{line}"
+        );
+        assert!(line.contains("malformed git url"), "{line}");
+        assert!(line.contains("existing registration unchanged"), "{line}");
     }
 
     /// #143：`format_settings_errors` 的文案与 scope/field 拼装（呈现半程的可断言守护——`run_mcp_approval`

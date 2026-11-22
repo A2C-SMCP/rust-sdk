@@ -98,6 +98,16 @@ pub const FIELD_LANDING_ROOT: &str = "landingRoot";
 /// authorized read roots for `client:resolve_path`.
 pub const FIELD_READ_ROOTS: &str = "readRoots";
 
+/// 错误字段路径是否属于 `extraKnownMarketplaces` 声明（含顶层字段本身）。
+///
+/// 供治理恢复报告筛选与 CLI 呈现共用，避免 `starts_with` 字面量在多处漂移。
+#[must_use]
+pub fn is_marketplace_declaration_field(field: &str) -> bool {
+    field == FIELD_EXTRA_KNOWN_MARKETPLACES
+        || (field.starts_with(FIELD_EXTRA_KNOWN_MARKETPLACES)
+            && field[FIELD_EXTRA_KNOWN_MARKETPLACES.len()..].starts_with('.'))
+}
+
 /// policy-only 字段：出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
 /// Policy-only fields: filtered + recorded if seen outside the policy scope.
 pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS];
