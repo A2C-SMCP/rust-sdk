@@ -358,6 +358,8 @@ pub(crate) struct GovernanceArgs<'a> {
     pub env: Option<&'a EnvMap>,
     /// SKILL Home（marketplace/plugin 意图 + 账本根）；`None` → env 解析 / home。
     pub home: Option<&'a Path>,
+    /// `--settings <file>` flag 层（#248 v0.5.1：治理快照与运行期/归属视图同源）/ flag settings path。
+    pub flag_settings_path: Option<&'a Path>,
     /// policy `managed-mcp.json` 覆盖路径（测试隔离用）/ managed mcp path override。
     pub managed_mcp_path: Option<&'a Path>,
     /// 平台标识 / platform override。
@@ -383,6 +385,7 @@ pub(crate) fn resolve_governance_snapshot(
         cwd,
         env,
         home,
+        flag_settings_path,
         managed_mcp_path,
         platform,
         policy_settings,
@@ -393,6 +396,7 @@ pub(crate) fn resolve_governance_snapshot(
         cwd,
         env,
         home,
+        flag_settings_path,
         managed_mcp_path,
         platform,
         policy_settings,

@@ -59,7 +59,8 @@ pub struct PlannedServer {
 /// 问题。`diagnostics` 非空 ⇒ [`import_mcp_servers`] 拒绝写盘（全有或全无）。
 #[derive(Debug, Clone, Default)]
 pub struct PreflightReport {
-    /// 确定性诊断（schema / 只读来源 / 损坏目标 / `${input:}` 不可达；非阻断式收集）/ deterministic diagnostics.
+    /// 确定性诊断（schema / 只读来源 / 损坏目标 / 目标容器畸形 / `${input:}` 不可达；非阻断式收集）/
+    /// deterministic diagnostics.
     pub diagnostics: Vec<SettingsValidationError>,
     /// 零写预测的落盘清单 / zero-write predicted persist list.
     pub planned: Vec<PlannedServer>,
@@ -608,7 +609,7 @@ mod tests {
 
     /// rust-sdk#267（#292 残余）：目标容器畸形（`servers` 非对象）是**确定性**失败——preflight MUST
     /// 预测为诊断（复用 executor 的容器校验），使 `import_mcp_servers` 返回 `ImportError::Preflight`
-    /// 而非 `Persist`；零写（目标文件逐字节不变、不创建 local 文件）。
+    /// 而非 `Persist`；零写（目标文件逐字节不变）。
     #[test]
     fn preflight_flags_malformed_target_container_267() {
         let tmp = TempDir::new().unwrap();
@@ -616,7 +617,6 @@ mod tests {
         let env = xdg_env(&tmp);
         let managed = tmp.path().join("no-managed.json");
         let project_mcp = crate::settings::mcp_config::workdir_mcp_config_path(&wd);
-        let local_mcp = crate::settings::mcp_config::workdir_mcp_local_config_path(&wd);
         write(&project_mcp, r#"{"servers": []}"#);
         let before = std::fs::read(&project_mcp).unwrap();
         let c = ctx(&wd, &env, &managed);
@@ -649,6 +649,41 @@ mod tests {
             before,
             "零写：目标文件 MUST 逐字节不变"
         );
-        assert!(!local_mcp.exists(), "零写：不得创建 local 文件");
+    }
+
+    /// rust-sdk#267 审查 🟢7：`upsert_new_scope=Local`（`Computer::preflight_mcp_servers` 的默认落点）
+    /// 的容器畸形同样归 `Preflight`，且 local 目标文件零写。
+    #[test]
+    fn preflight_flags_malformed_local_container_267() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = xdg_env(&tmp);
+        let managed = tmp.path().join("no-managed.json");
+        let local_mcp = crate::settings::mcp_config::workdir_mcp_local_config_path(&wd);
+        let project_mcp = crate::settings::mcp_config::workdir_mcp_config_path(&wd);
+        write(&local_mcp, r#"{"servers": []}"#);
+        let before = std::fs::read(&local_mcp).unwrap();
+        let mut c = ctx(&wd, &env, &managed);
+        c.opts.upsert_new_scope = WriteScope::Local;
+
+        let report = preflight_mcp_import(&c, &[stdio("new-srv", "cmd")]);
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|d| d.field == "<file>")
+            .expect("Local 目标容器畸形 MUST 由 preflight 预测");
+        assert_eq!(
+            diagnostic.source_path.as_deref(),
+            Some(local_mcp.to_string_lossy().as_ref())
+        );
+
+        let res = import_mcp_servers(&c, &[stdio("new-srv", "cmd")]);
+        assert!(matches!(res, Err(ImportError::Preflight(_))));
+        assert_eq!(
+            std::fs::read(&local_mcp).unwrap(),
+            before,
+            "零写：local 不变"
+        );
+        assert!(!project_mcp.exists(), "零写：不得创建 project 文件");
     }
 }
