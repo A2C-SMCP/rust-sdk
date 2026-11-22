@@ -18,13 +18,16 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 /// stdio/HTTP MCP 服务关闭（`RunningService::close_with_timeout`）的外层等待上限（#267 S4）：
-/// 对端停 POST 时 rmcp 的会话清理 DELETE 自带 5s 上限，外层 1s 切断等待、由分离任务兜底。
+/// HTTP 对端停 POST 时 rmcp 的会话清理 DELETE 自带 5s 上限，外层 1s 切断等待；stdio 由调用方的
+/// `terminate_child`（SIGKILL+wait）保证子进程回收。两者都不阻塞 `disconnect`。
 pub(crate) const MCP_SERVICE_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 有界关闭一个 rmcp 运行服务（stdio/HTTP 共用，#267 S4）。
 ///
 /// 超时后 rmcp 已取消 cancellation token 并分离服务任务（`JoinHandle` drop = detach，非 abort），
-/// 会话清理/子进程回收按 rmcp 自身 5s 上限在后台完成；调用方随后照常推进自己的 teardown。
+/// 调用方随后照常推进自己的 teardown。之后的分工：
+/// - HTTP：rmcp worker 的会话清理（DELETE）按自身 5s 上限在后台完成；
+/// - stdio：调用方 `terminate_child` 同步 SIGKILL+wait 子进程，分离的服务任务随 stdout 关闭收敛。
 pub(crate) async fn close_service_bounded<R, S>(service: &mut rmcp::service::RunningService<R, S>)
 where
     R: rmcp::service::ServiceRole,

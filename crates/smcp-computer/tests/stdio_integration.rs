@@ -277,7 +277,7 @@ async fn test_stdio_custom_connect_timeout_reports_effective_value() {
 /// 且子进程已被回收（不能只测耗时）。
 ///
 /// E4 实测修复前 disconnect 已 6.3ms（`service.cancel()` 快速返回 + SIGKILL 回收）⇒ 本用例是
-/// **回归栅栏**而非红灯：任何把 teardown 改成等待子进程自然退出的回归都会撞上 1.5s 上界。
+/// **回归栅栏**而非红灯：任何把 teardown 改成等待子进程自然退出的回归都会撞上 500ms 上界。
 ///
 /// 确定性：假 server 用 `exec sleep 300` 保证 `$$` 即被 kill 的目标进程，且无 sleep 竞态——
 /// pid 文件在 initialize 应答前写入，connect 成功即保证其存在。

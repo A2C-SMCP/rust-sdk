@@ -1372,6 +1372,22 @@ async fn test_streamable_http_static_authorization_header_reaches_every_http_met
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.disconnect().await.unwrap();
 
+    // #267 S4：close_with_timeout 超时后会话清理由分离任务继续完成——DELETE 可能晚于 disconnect
+    // 返回才落达（审查 🟡），轮询等待而不是瞬时断言。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let saw_delete = {
+            let requests = state.recorded_authorization.lock().await;
+            requests
+                .iter()
+                .any(|(observed, _)| *observed == Method::DELETE)
+        };
+        if saw_delete || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     let requests = state.recorded_authorization.lock().await;
     assert!(
         requests.iter().all(|(_, authorized)| *authorized),

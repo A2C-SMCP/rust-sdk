@@ -18,8 +18,9 @@ use smcp_computer::mcp_clients::http_client::HttpMCPClient;
 use smcp_computer::mcp_clients::model::{ClientState, HttpServerParameters, MCPClientProtocol};
 use streamable_mock::{spawn_streamable_mock_with_handle, MockOpts};
 
-/// 生产上限 1s（`MCP_SERVICE_CLOSE_TIMEOUT`）；并行 CI 下断言留 500ms 裕量。
-const DISCONNECT_BOUND: Duration = Duration::from_millis(1500);
+/// 生产上限 1s（`MCP_SERVICE_CLOSE_TIMEOUT`）；并行 CI 下断言留 1.5s 裕量（审查 🟡：1.5s 总界对
+/// 1s 生产等待太紧）。仍远低于 E4 修复前的 5s 基线。
+const DISCONNECT_BOUND: Duration = Duration::from_millis(2500);
 
 /// HTTP：会话清理 DELETE 永不响应时，disconnect 必须在上限内返回，且**清理不丢**——
 /// 由分离任务继续完成（#267 S4 复审要求：不能只测耗时）。
@@ -64,18 +65,9 @@ async fn http_disconnect_is_bounded_when_session_cleanup_hangs() {
         1,
         "detached session cleanup must still be in flight after the bounded disconnect"
     );
-    mock.release_cleanup();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while mock.cleanup_active() != 0 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        mock.cleanup_active(),
-        0,
-        "detached session cleanup must complete after the server releases the DELETE"
-    );
 
-    // 服务已不可再用：状态机拒绝请求；且 client 未被旧 service 卡死——可重新 connect。
+    // 生产语义：disconnect 返回后立即重连、旧 DELETE 仍在途（审查 🟡：必须在释放 cleanup 之前）。
+    // 服务已不可再用：状态机拒绝请求；client 未被旧 service 卡死——可重新 connect。
     assert!(
         client.list_tools().await.is_err(),
         "disconnected client must reject requests"
@@ -85,4 +77,15 @@ async fn http_disconnect_is_bounded_when_session_cleanup_hangs() {
         .expect("reconnect timed out")
         .expect("client must remain usable after bounded teardown");
     client.disconnect().await.expect("second disconnect failed");
+
+    mock.release_cleanup();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while mock.cleanup_active() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        mock.cleanup_active(),
+        0,
+        "detached session cleanups must complete after the server releases the DELETE"
+    );
 }
