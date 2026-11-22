@@ -1267,8 +1267,10 @@ impl<S: Session> Computer<S> {
         self.mcp_flag_config.as_deref()
     }
 
-    /// #248：注入 `--settings <file>` 的 flag 层 settings.json 路径（运行期 `readRoots` / `landingRoot`
-    /// 的 flag 作用域来源）/ inject the `--settings` flag-layer settings path。
+    /// #248：注入 `--settings <file>` 的 flag 层 settings.json 路径（运行期 `readRoots` / `landingRoot`、
+    /// 治理恢复重挂（[`reconcile_governance`](Self::reconcile_governance)）、待批准列表
+    /// （[`list_pending_bundled_approvals`](Self::list_pending_bundled_approvals)）、归属视图与 config CRUD
+    /// 快照（`instance_config_context`）的 flag 作用域统一来源）/ inject the `--settings` flag-layer settings path。
     ///
     /// 与 [`with_mcp_flag_config`](Self::with_mcp_flag_config) 同属 flag scope 文件对（协议 §2.5-3）。
     /// **构造期归一为绝对路径**（对齐 python `Computer._absolute_path`）：拒绝集 / 文件读取 / settings
@@ -1338,6 +1340,21 @@ impl<S: Session> Computer<S> {
         &self.embed_servers
     }
 
+    /// 以实例上下文组装 [`ConfigContext`]（runtime config CRUD 的单一收口）。
+    ///
+    /// #248（v0.5.1）：接实例 `--settings` flag 层（构造期归一后的
+    /// [`normalized_flag_settings_path`](Self::normalized_flag_settings_path)），使 config 快照的治理视图
+    /// （`plugins.enabled` / revision）与其余运行期解析点同源。
+    ///
+    /// **刻意不接**（有据决策，勿「顺手补齐」）：
+    /// - `flag_mcp_config_path`：与 Python `upsert_mcp_server` 的「origin 快照不含 flag/embed、写后遮蔽 WARN」
+    ///   口径一致（python `computer.py` 已知代价）；接入会让 rust 把 flag 声明直接判 `ReadOnlyOrigin`，
+    ///   比对称 SDK 更严。flag/embed 声明面另经 [`non_plugin_declared_bundle_ids`](Self::non_plugin_declared_bundle_ids)
+    ///   / `declared_mcp_servers` 消费。
+    /// - `policy_settings`：该字段是借用 `Option<&Map>`（`ConfigContext` 可 `Copy`），实例侧无 owned map；
+    ///   `None` 在 snapshot 语义为「空 policy 层」而非 ambient policy。需要 policy 的治理解析点各自以实例
+    ///   env 解析（见 [`reconcile_governance`](Self::reconcile_governance) / [`list_pending_bundled_approvals`](Self::list_pending_bundled_approvals)
+    ///   / [`enabled_bundled_ownership`](Self::enabled_bundled_ownership)）。
     fn instance_config_context<'a>(
         &'a self,
         config_dir: &'a std::path::Path,
@@ -1347,6 +1364,8 @@ impl<S: Session> Computer<S> {
         ConfigContext {
             env: self.config_env(),
             home: Some(home),
+            // #248：实例 flag settings 参与快照合并（settings 读面生效；写目标仍只认可写 scope）。
+            flag_settings_path: self.normalized_flag_settings_path(),
             // #147：remove 守卫按 origin 判定须能看见 embed 声明（否则宿主构造 server 被判「无声明的纯运行期
             // 投影」误拒/误判）。frozen 快照，与 mcp.json/durable 同入声明面。
             embed_servers: &self.embed_servers,
@@ -2014,8 +2033,8 @@ impl<S: Session> Computer<S> {
     /// - `declared`：合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。恢复阶段读
     ///   `enabledPlugins`（启用门控）**与 `extraKnownMarketplaces`（#295 §5.14 声明面换源检测）**——只传
     ///   `enabledPlugins` 的调用方不会得到换源冲突诊断（声明变更仍被忽略、不报错）。`None` → 内部解析
-    ///   （进程 cwd 的 user/project/local/policy，**无** `--settings` flag scope）；CLI 参考接线传
-    ///   **flag-aware** 视图使 `--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效。
+    ///   （本实例 `config_dir` 的 project/local + 实例 env 的 user/project/local + 实例 `--settings` flag +
+    ///   实例 env 解析的 policy；#248 v0.5.1 起 flag 层不再缺席）。
     ///
     /// 返回 [`GovernanceRecoveryReport`]（恢复 / 跳过 / 降级明细，供观测与测试）。
     pub async fn reconcile_governance(
@@ -2027,29 +2046,32 @@ impl<S: Session> Computer<S> {
         // #121 A：以**本实例** User env 解析 settings / 账本，绝不混入宿主 ambient（守 boot 重启的归属一致）。
         let env = self.config_env();
         // `declared` 覆盖：CLI 参考接线传 **flag-aware** 合并视图（`--settings` scope 生效，对齐 Python
-        // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（user + 进程 cwd 的 project/local +
-        // policy，**无** `--settings` flag scope；跨重启可靠 disable 请写 user scope）。cwd=None（进程态）。
+        // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（实例 env 的 user +
+        // 实例 `config_dir` 的 project/local + **实例 `--settings` flag** + 实例 env 的 policy）。
         //
         // #165 Option B：`scope_layers`（per-scope 原始层）用于 project-origin 检测——与 `declared` **解耦**。
         // `declared==None` 时与 declared 同源解析；`declared==Some(flag-aware)` 时单独解析。二者均锚定**本实例
         // `config_dir`**（#113：override > 进程 cwd；与 governance_snapshot 等同源，且令测试 hermetic）——project scope
         // 必在此解析内，故门在所有挂载路径（含 CLI `run_governance_remount`）生效（Python #182 在 declared=Some
-        // 路径 per_scope_layers=None ⇒ 门不触发，本实现显式收紧）。flag 层受信（免批准）不参与 origin 判定，其缺席
-        // 仅影响罕见 flag+project 重叠（过度提示，安全）。
+        // 路径 per_scope_layers=None ⇒ 门不触发，本实现显式收紧）。#248 v0.5.1：flag 层同样纳入 `scope_layers`——
+        // `plugin_enabled_origin` 由 flag 供给时返回 `Flag`（受信、免批准），不再把「flag=true + project=true」
+        // 误判为 project-origin 而落 PENDING（安全方向不变：project 单独供给仍走审批门）。
         let config_dir = self.config_dir();
-        let policy = resolve_policy_settings(None, None, None);
+        let flag_settings_path = self.normalized_flag_settings_path();
+        let policy = resolve_policy_settings(env, None, None);
         let resolved = resolve_settings(ResolveSettingsArgs {
             cwd: Some(&config_dir),
             env,
-            flag_settings_path: None,
+            flag_settings_path,
             policy_settings: Some(&policy),
         });
         // #267 / #295 残余：settings 校验期整条丢弃的非法 `extraKnownMarketplaces` 声明进入恢复报告
-        // （校验/丢弃语义不变；此处只做可观测）。当前内部解析不含 flag 层（CLI 已单独打印 flag 校验
-        // 错误）；settings-flag-runtime-cleanup 合入后将接本解析块，对 `SettingsScope::Flag` 做去重/过滤。
-        let declaration_errors =
+        // （校验/丢弃语义不变；此处只做可观测）。#248 合入后本解析含实例 flag 层：**Flag 校验错误不进
+        // report 字段**（CLI 启动边界已单独打印、避免重复）；WARN 仍记录全量（含 Flag），嵌入方可直接
+        // `resolve_settings` 取全量校验错误。
+        let all_declaration_errors =
             crate::settings::recovery::marketplace_declaration_errors(&resolved.errors);
-        for error in &declaration_errors {
+        for error in &all_declaration_errors {
             tracing::warn!(
                 scope = error.scope.as_str(),
                 field = %error.field,
@@ -2059,6 +2081,10 @@ impl<S: Session> Computer<S> {
                  (ignored; existing registration unchanged)"
             );
         }
+        let declaration_errors: Vec<_> = all_declaration_errors
+            .into_iter()
+            .filter(|error| error.scope != SettingsScope::Flag)
+            .collect();
         let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)> =
             resolved.scope_layers;
         let resolved_declared;
@@ -4343,17 +4369,20 @@ impl<S: Session> Computer<S> {
     ///
     /// 现算（lock-free 纯读）：resolve settings →
     /// [`collect_enabled_bundled_servers`](crate::settings::recovery::collect_enabled_bundled_servers) → 过滤
-    /// project-origin ∧ PENDING。与 reconcile 阶段二**同源同判据**（origin + `mcp_server_status`）。
+    /// project-origin ∧ PENDING。与 reconcile 阶段二**同源同判据**（origin + `mcp_server_status`）——#248
+    /// v0.5.1 起同源含**实例 `--settings` flag 层**与实例 env 解析的 policy（flag=true 受信免批准；
+    /// flag=false 可压过 project=true）。
     #[must_use]
     pub fn list_pending_bundled_approvals(&self) -> Vec<BundledServerRecord> {
         let home = self.skill_home();
         let env = self.config_env();
         let config_dir = self.config_dir();
+        let policy = resolve_policy_settings(env, None, None);
         let resolved = resolve_settings(ResolveSettingsArgs {
             cwd: Some(&config_dir),
             env,
-            flag_settings_path: None,
-            policy_settings: Some(&resolve_policy_settings(None, None, None)),
+            flag_settings_path: self.normalized_flag_settings_path(),
+            policy_settings: Some(&policy),
         });
         let declared = &resolved.settings;
         let scope_layers = &resolved.scope_layers;
@@ -4378,6 +4407,9 @@ impl<S: Session> Computer<S> {
     /// [`remove_server`](Self::remove_server)）的**唯一同源**——保证「查询归属」与「增删可否」一致（#126 验收#3）。
     /// #121 A：以**本实例** env（`config_env`）解析账本 + `enabledPlugins`，绝不混入宿主 ambient settings。**停用的
     /// plugin 不在结果内**（#126 D3：停用插件后同名 server 可自由增删——issue 记录的规避路径）。
+    /// #248 v0.5.1：与 reconcile / pending / config 快照**同源**——project/local 锚**实例 `config_dir`**（非进程
+    /// cwd）、纳入**实例 `--settings` flag 层**与实例 env 解析的 policy；嵌入宿主 `with_config_dir` 下
+    /// project-scope 启用态不再漏判。
     ///
     /// **join key = `bundle_id`（#127 起对称）**：`add_or_update_server` / `remove_server` /
     /// `list_mcp_servers_with_metadata` 三者**一律**按软件唯一身份 `bundle_id` 判占用。此前 add 按 name、
@@ -4395,11 +4427,14 @@ impl<S: Session> Computer<S> {
     fn enabled_bundled_ownership(&self) -> Vec<BundledServerRecord> {
         let home = self.skill_home();
         let env = self.config_env();
-        let policy = resolve_policy_settings(None, None, None);
+        // #248 v0.5.1：project/local 锚**实例 `config_dir`**（与 reconcile/pending/config 快照同源；此前
+        // `cwd: None` 退回进程 cwd，嵌入宿主漏判）、实例 flag settings 与实例 env 解析的 policy。
+        let config_dir = self.config_dir();
+        let policy = resolve_policy_settings(env, None, None);
         let declared = resolve_settings(ResolveSettingsArgs {
-            cwd: None,
+            cwd: Some(&config_dir),
             env,
-            flag_settings_path: None,
+            flag_settings_path: self.normalized_flag_settings_path(),
             policy_settings: Some(&policy),
         })
         .settings;
@@ -7780,6 +7815,239 @@ mod tests {
             *hooks.registered.lock().unwrap(),
             vec!["audit-mcp".to_string()],
             "声明面命中但未挂载 → reconcile MUST 重挂（不得复现零投影半态）"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：`reconcile_governance(declared=None)` 的内部解析 MUST 纳入实例
+    /// `--settings` flag 层——flag-only `enabledPlugins=true` 也要恢复技能并重挂 bundled server。
+    #[tokio::test]
+    async fn reconcile_governance_none_path_consumes_flag_settings_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let comp = Computer::new("c248a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(&wd)
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248a"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp.reconcile_governance(Some(&hooks), None).await;
+        assert_eq!(
+            report.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "flag 层 enabledPlugins MUST 驱动 declared=None 的恢复重挂"
+        );
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()]
+        );
+
+        // 对照：同上下文无 flag 层 → 不激活（证明重挂来自 flag 层）。
+        let blind = Computer::new("c248b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-248b"));
+        let blind_hooks = RecordingRemountHooks::new();
+        let blind_report = blind.reconcile_governance(Some(&blind_hooks), None).await;
+        assert!(
+            blind_report.remounted_servers.is_empty(),
+            "无 flag 层时 MUST 不重挂（对照）"
+        );
+        assert!(blind_hooks.registered.lock().unwrap().is_empty());
+    }
+
+    /// rust-sdk#267（#248 残余）：`declared=Some` 分支的 `scope_layers` 也必须纳入 flag 层——
+    /// flag=true + project=true 时 origin=Flag（受信），MUST NOT 误落 project-origin 的 PENDING 审批门。
+    #[tokio::test]
+    async fn reconcile_governance_declared_some_treats_flag_origin_as_trusted_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(wd.join(".tfrobot")).unwrap();
+        std::fs::write(
+            wd.join(".tfrobot").join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let comp = Computer::new("c248c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248c"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+        assert!(
+            report.pending_bundled_servers.is_empty(),
+            "flag 受信 scope MUST 压过 project-origin（不落 PENDING）"
+        );
+        assert_eq!(
+            report.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "flag+project 重叠时 MUST 直挂"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：`list_pending_bundled_approvals` 必须消费 flag 层——
+    /// flag 的 `false` 能压过 project 的 `true`（修复前 flag 缺席，pending 仍非空）。
+    #[tokio::test]
+    async fn list_pending_bundled_approvals_consumes_flag_layer_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(wd.join(".tfrobot")).unwrap();
+        std::fs::write(
+            wd.join(".tfrobot").join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let project_only =
+            Computer::new("c248d", SilentSession::new("s"), None, None, false, false)
+                .with_skill_home(home.clone())
+                .with_config_dir(&wd)
+                .with_config_env(env.clone())
+                .with_blob_cache_root(tmp.path().join("blob-248d"));
+        assert_eq!(
+            project_only.list_pending_bundled_approvals().len(),
+            1,
+            "project-only 启用 MUST 落 PENDING（正对照）"
+        );
+
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+        let with_flag = Computer::new("c248e", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248e"));
+        assert!(
+            with_flag.list_pending_bundled_approvals().is_empty(),
+            "flag=false MUST 压过 project=true（flag 层必须被消费）"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：归属视图（`enabled_bundled_ownership` → `list_mcp_servers_with_metadata`）
+    /// 必须消费 flag 层——flag-only 启用的 bundled server 以 `managedBy=plugin` 出现。
+    #[tokio::test]
+    async fn list_mcp_servers_with_metadata_consumes_flag_layer_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let env = instance_xdg_env_126(&tmp);
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+
+        let comp = Computer::new("c248f", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248f"));
+        let meta = comp.list_mcp_servers_with_metadata().await;
+        let audit = meta
+            .iter()
+            .find(|m| m.name == "audit-mcp")
+            .expect("flag-only 启用的 bundled server MUST 出现在归属视图");
+        assert!(
+            matches!(audit.managed_by, McpOwnership::Plugin { .. }),
+            "flag 启用的 bundled server MUST 标 managedBy=plugin"
+        );
+
+        // 对照：无 flag 层 → 未启用，不在归属视图。
+        let blind = Computer::new("c248g", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-248g"));
+        assert!(
+            blind
+                .list_mcp_servers_with_metadata()
+                .await
+                .iter()
+                .all(|m| m.name != "audit-mcp"),
+            "无 flag 层时 MUST 不出现（对照）"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：`enabled_bundled_ownership` 的 project/local 锚点 MUST 是**实例**
+    /// `config_dir`（而非进程 cwd）——嵌入宿主 `with_config_dir` 下 project-scope 启用态要被看见。
+    #[tokio::test]
+    async fn enabled_bundled_ownership_anchors_project_at_config_dir_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(wd.join(".tfrobot")).unwrap();
+        std::fs::write(
+            wd.join(".tfrobot").join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let comp = Computer::new("c248h", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-248h"));
+        let meta = comp.list_mcp_servers_with_metadata().await;
+        let audit = meta
+            .iter()
+            .find(|m| m.name == "audit-mcp")
+            .expect("实例 config_dir 的 project 启用态 MUST 进入归属视图");
+        assert!(matches!(audit.managed_by, McpOwnership::Plugin { .. }));
+    }
+
+    /// rust-sdk#267（#248 残余）：`instance_config_context` 组装快照时 MUST 接实例 flag settings
+    /// （`plugins.enabled` 出现 flag-origin 条目）；对照无 flag 层不出现。
+    #[tokio::test]
+    async fn instance_config_context_consumes_flag_settings_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&wd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+
+        let comp = Computer::new("c248i", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag);
+        let ctx = comp.instance_config_context(&wd, &home, WriteScope::Local);
+        let snap = load_config(&ctx);
+        let entry = snap
+            .plugins
+            .enabled
+            .iter()
+            .find(|e| e.id == "audit@acme")
+            .expect("flag 层 enabledPlugins MUST 进入 instance_config_context 快照");
+        assert!(entry.enabled);
+        assert_eq!(entry.origin, ProvenanceScope::Flag);
+
+        // 对照：无 flag 层 → 不出现。
+        let blind = Computer::new("c248j", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env);
+        let blind_ctx = blind.instance_config_context(&wd, &home, WriteScope::Local);
+        assert!(
+            load_config(&blind_ctx)
+                .plugins
+                .enabled
+                .iter()
+                .all(|e| e.id != "audit@acme"),
+            "无 flag 层时 MUST 不出现（对照）"
         );
     }
 

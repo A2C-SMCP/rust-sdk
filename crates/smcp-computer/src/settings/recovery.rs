@@ -166,9 +166,10 @@ pub struct GovernanceRecoveryReport {
     /// `ResolvedSettings.errors` 填充；直接调用 [`recover_marketplace_skills`] 时恒空（该入口拿到的
     /// `declared` 已过校验）。
     ///
-    /// ⚠️ 语义为**实例解析视图**（user/project/local/policy；当前不含 flag 层——CLI 单独打印 flag 校验
-    /// 错误）。`reconcile_governance(declared=Some(...))` 的 overlay 可能已过滤，本字段不据此重算；
-    /// settings-flag-runtime-cleanup 将接解析块对 `SettingsScope::Flag` 做去重/过滤。
+    /// ⚠️ 语义为**实例解析视图**（user/project/local/flag/policy），但 **`SettingsScope::Flag` 的校验
+    /// 错误不进本字段**（v0.5.1 #248 合入后）：CLI 启动边界已单独打印 flag 校验错误，此处过滤防重复；
+    /// WARN 日志仍记录全量（含 Flag），非 CLI 嵌入方可直接调用 `resolve_settings` 取全量校验错误。
+    /// `reconcile_governance(declared=Some(...))` 的 overlay 可能已过滤，本字段不据此重算。
     pub marketplace_declaration_errors: Vec<MarketplaceDeclarationError>,
     /// 账本缺记录、从 `installedPlugins` 意图**重物化派生缓存成功**的 enabled plugin id（§63）/ rebuilt from intent。
     pub rematerialized_plugins: Vec<String>,
