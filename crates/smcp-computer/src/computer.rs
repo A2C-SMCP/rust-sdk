@@ -2040,6 +2040,8 @@ impl<S: Session> Computer<S> {
     /// - **跨重启 enable 语义以 user scope 为准（v0.3.0）**：enabled 门控读合并 `declared`，其 project/local 层来自
     ///   **本实例 `config_dir`**（#248 v0.5.1 起；此前为进程 cwd，#98）。写在**其他目录**的 project/local scope
     ///   的 `enabledPlugins=true` 在恢复时不可见 → 该 plugin **不**激活。**跨重启可靠启用应写 user scope**；
+    ///   若每次 boot 都注入同一 `--settings` flag 文件（CLI 参考接线），flag 层启用同样可靠（v0.5.1 起
+    ///   boot 的内部解析已消费实例 flag）；
     ///   project/local-scoped plugin 的 enable 天然锚定实例 config_dir（含存量 v0.2.x 迁移到 project scope
     ///   的记录，属 v0.3.0 per-scope 语义，非疏漏——迁移「不熄灯」保证对 user scope 成立、对 project/local 以
     ///   实例 config_dir 为准）。
@@ -2051,11 +2053,11 @@ impl<S: Session> Computer<S> {
     ///   `enabledPlugins` 的调用方不会得到换源冲突诊断（声明变更仍被忽略、不报错）。`None` → 内部解析
     ///   （本实例 `config_dir` 的 project/local + 实例 env 的 user/project/local + 实例 `--settings` flag +
     ///   实例 env 解析的 policy；#248 v0.5.1 起 flag 层不再缺席）。
-    ///   **调用方权威覆盖**：实例注入 `--settings` flag 路径时，调用方 SHOULD 传 **flag-aware** 合并视图
-    ///   （CLI 参考接线如此）。启用门控按 `declared`、project-origin 审批门按实例 `scope_layers`；若两者不一致
-    ///   （如 flag 显式 false 而 `declared` 为 true），`plugin_enabled_origin` 为 `None` 时不落 PENDING、按调用方
-    ///   显式覆盖直挂——宿主显式 `declared` 与 flag/embed 同属受信层，此为有意语义（非绕过：调用方本可直接
-    ///   `register_server`）。
+    ///   **受信层覆盖**：调用方 SHOULD 传 **flag-aware** 合并视图（CLI 参考接线如此）。实例 flag/policy
+    ///   两层的显式 `enabledPlugins` 值会**覆盖** `declared.enabledPlugins`（#267 审查 🟡1）——flag-blind
+    ///   caller 的旧视图不能把受信层的显式 disable 压成 enable（反之亦然）；其余键与其他 scope 仍以调用方为准。
+    ///   当 flag/policy 无意见且无实例 scope 供给启用（`plugin_enabled_origin == None`）时，调用方
+    ///   `declared=true` 仍直挂（宿主显式覆盖与 flag/embed 同属受信层；本可直接 `register_server`）。
     ///
     /// 返回 [`GovernanceRecoveryReport`]（恢复 / 跳过 / 降级明细，供观测与测试）。
     pub async fn reconcile_governance(
@@ -2102,8 +2104,14 @@ impl<S: Session> Computer<S> {
         let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)> =
             resolved.scope_layers;
         let resolved_declared;
+        let overlaid_declared;
         let declared: &serde_json::Map<String, serde_json::Value> = match declared {
-            Some(d) => d,
+            Some(d) => {
+                // #267 审查 🟡1：flag/policy 是**受信层**，其显式 `enabledPlugins` 覆盖调用方
+                // `declared`（flag-blind caller 的旧习惯不得把受信层显式 disable 压成 enable，反之亦然）。
+                overlaid_declared = overlay_instance_enablement_overrides(d, &scope_layers);
+                &overlaid_declared
+            }
             None => {
                 resolved_declared = resolved.settings;
                 &resolved_declared
@@ -4415,9 +4423,10 @@ impl<S: Session> Computer<S> {
     /// [`remove_server`](Self::remove_server)）的**唯一同源**——保证「查询归属」与「增删可否」一致（#126 验收#3）。
     /// #121 A：以**本实例** env（`config_env`）解析账本 + `enabledPlugins`，绝不混入宿主 ambient settings。**停用的
     /// plugin 不在结果内**（#126 D3：停用插件后同名 server 可自由增删——issue 记录的规避路径）。
-    /// #248 v0.5.1：与 reconcile / pending / config 快照**同源**——project/local 锚**实例 `config_dir`**（非进程
-    /// cwd）、纳入**实例 `--settings` flag 层**与实例 env 解析的 policy；嵌入宿主 `with_config_dir` 下
-    /// project-scope 启用态不再漏判。
+    /// #248 v0.5.1：与 reconcile / pending **同源**——project/local 锚**实例 `config_dir`**（非进程 cwd）、
+    /// 纳入**实例 `--settings` flag 层**与实例 env 解析的 policy；嵌入宿主 `with_config_dir` 下 project-scope
+    /// 启用态不再漏判。⚠️ 例外（#267 审查 🟡3）：config 快照（`instance_config_context`）仅共享 env/flag/
+    /// config_dir，**policy 刻意不接**（借用字段限制，见其 doc）——「与 config 快照同源」仅限这三点。
     ///
     /// **join key = `bundle_id`（#127 起对称）**：`add_or_update_server` / `remove_server` /
     /// `list_mcp_servers_with_metadata` 三者**一律**按软件唯一身份 `bundle_id` 判占用。此前 add 按 name、
@@ -5685,6 +5694,51 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
 /// `flag_settings_path`（`--settings <file>`）非 `None` 时 flag 层一并参与合并——flag 是
 /// `landingRoot` 的受信 scope（protocol#65，rust-sdk#248）。**缓存语义保持**：`Computer::landing_root`
 /// 仍是「已解析且已配置 → 进程内缓存；未配置 → 每次重查」，运行期改 settings 的生效时机不变。
+/// #267 审查 🟡1：用实例 **flag/policy** 两层的 `enabledPlugins` 覆盖调用方传入的 `declared`
+/// （其他键与其他 scope 不动；层序低→高，policy 胜 flag）。
+///
+/// 背景：`declared=Some` 的调用方可能仍按 0.5.0 习惯传 **flag-blind** 合并视图——若受信层显式
+/// `enabledPlugins=false` 而调用方视图是 true，旧行为会因 `plugin_enabled_origin == None` 跳过
+/// project-origin 审批门并直挂（受信层 disable 被静默压过）。覆盖后启用门控与 origin 判定同源，
+/// 显式 disable 生效；无 flag/policy 意见时调用方视图仍保持权威。
+fn overlay_instance_enablement_overrides(
+    declared: &serde_json::Map<String, serde_json::Value>,
+    scope_layers: &[(SettingsScope, serde_json::Map<String, serde_json::Value>)],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut overrides: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    for (scope, layer) in scope_layers {
+        if !matches!(scope, SettingsScope::Flag | SettingsScope::Policy) {
+            continue;
+        }
+        if let Some(enabled) = layer
+            .get("enabledPlugins")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (pid, value) in enabled {
+                if let Some(flag) = value.as_bool() {
+                    overrides.insert(pid.clone(), flag);
+                }
+            }
+        }
+    }
+    if overrides.is_empty() {
+        return declared.clone();
+    }
+    let mut out = declared.clone();
+    let entry = out
+        .entry("enabledPlugins".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(map) = entry.as_object_mut() {
+        for (pid, enabled) in overrides {
+            map.insert(pid, serde_json::Value::Bool(enabled));
+        }
+    }
+    out
+}
+
 fn resolve_landing_root_settings(
     config_dir: &std::path::Path,
     env: Option<&EnvMap>,
@@ -7958,39 +8012,60 @@ mod tests {
         );
     }
 
-    /// rust-sdk#267 复审 🟡2：锁定 `reconcile_governance` public doc 的契约——`declared` 是调用方
-    /// **显式受信覆盖**：实例 flag 显式 false 而 `declared=true` 时，`plugin_enabled_origin` 为 `None`，
-    /// 不落 PENDING、按调用方覆盖直挂（宿主与 flag/embed 同属受信层）。
+    /// rust-sdk#267 独立审查 🟡1：实例 flag/policy 的显式 `enabledPlugins` MUST 覆盖调用方
+    /// `declared`（flag-blind caller 的旧视图不得把受信层 disable 压成 enable）。
+    /// 双向锁定：flag=false + declared=true → 不挂载；flag=true + declared=false → 挂载。
     #[tokio::test]
-    async fn reconcile_governance_declared_override_beats_instance_flag_248() {
+    async fn reconcile_governance_instance_flag_overrides_caller_declared_248() {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = cold_start_setup95(&tmp).await;
         let wd = tmp.path().join("wd");
         std::fs::create_dir_all(&wd).unwrap();
+        let env = instance_xdg_env_126(&tmp);
         let flag = tmp.path().join("flag-settings.json");
         std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
-        let env = instance_xdg_env_126(&tmp);
 
-        let comp = Computer::new("c248m", SilentSession::new("s"), None, None, false, false)
-            .with_skill_home(home)
-            .with_config_dir(&wd)
-            .with_config_env(env)
-            .with_flag_settings_path(&flag)
-            .with_blob_cache_root(tmp.path().join("blob-248m"));
-        let hooks = RecordingRemountHooks::new();
-        let report = comp
-            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+        // 受信层显式 disable + 调用方（flag-blind）declared=true → MUST NOT 挂载。
+        let comp_disabled =
+            Computer::new("c248m", SilentSession::new("s"), None, None, false, false)
+                .with_skill_home(home.clone())
+                .with_config_dir(&wd)
+                .with_config_env(env.clone())
+                .with_flag_settings_path(&flag)
+                .with_blob_cache_root(tmp.path().join("blob-248m"));
+        let hooks_disabled = RecordingRemountHooks::new();
+        let report_disabled = comp_disabled
+            .reconcile_governance(Some(&hooks_disabled), Some(&declared_audit_enabled()))
             .await;
         assert!(
-            report.pending_bundled_servers.is_empty(),
-            "origin=None（调用方覆盖）MUST NOT 落 PENDING"
+            report_disabled.remounted_servers.is_empty(),
+            "实例 flag=false MUST 覆盖 caller declared=true（受信层 disable 不得被压过）"
         );
+        assert!(report_disabled.pending_bundled_servers.is_empty());
+        assert!(hooks_disabled.registered.lock().unwrap().is_empty());
+
+        // 对称：受信层显式 enable + 调用方 declared=false → MUST 挂载。
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let caller_disabled: serde_json::Map<String, serde_json::Value> =
+            serde_json::json!({ "enabledPlugins": { "audit@acme": false } })
+                .as_object()
+                .unwrap()
+                .clone();
+        let comp_enabled =
+            Computer::new("c248n", SilentSession::new("s"), None, None, false, false)
+                .with_skill_home(home)
+                .with_config_dir(&wd)
+                .with_config_env(env)
+                .with_flag_settings_path(&flag)
+                .with_blob_cache_root(tmp.path().join("blob-248n"));
+        let hooks_enabled = RecordingRemountHooks::new();
+        let report_enabled = comp_enabled
+            .reconcile_governance(Some(&hooks_enabled), Some(&caller_disabled))
+            .await;
         assert_eq!(
-            report.remounted_servers,
+            report_enabled.remounted_servers,
             vec!["audit-mcp".to_string()],
-            "调用方显式 declared=true 属受信覆盖，MUST 直挂"
-        );
-    }
+            "实例 flag=true MUST 覆盖 caller declared=false（受信层 enable 生效）"
         );
     }
 
@@ -8184,6 +8259,15 @@ mod tests {
             plugin.status,
             crate::governance::PluginStatus::InstalledEnabled
         );
+        let rev_flag = snap.revision.clone();
+
+        // 同实例改写 flag → revision MUST 变（GUI 以 revision 作缓存键；release note 承诺）。
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+        let snap_switched = comp.governance_snapshot().await.unwrap();
+        assert_ne!(
+            rev_flag, snap_switched.revision,
+            "flag 内容切换 MUST 改变 GovernanceSnapshot.revision"
+        );
 
         // 对照：无 flag 层 → InstalledDisabled（证明启用态来自 flag 层）。
         let blind = Computer::new("c248l", SilentSession::new("s"), None, None, false, false)
@@ -8201,6 +8285,10 @@ mod tests {
         assert_eq!(
             blind_plugin.status,
             crate::governance::PluginStatus::InstalledDisabled
+        );
+        assert_ne!(
+            snap_switched.revision, blind_snap.revision,
+            "flag=false 与无 flag 的 revision 也应不同（快照内容含 flag 层）"
         );
     }
 

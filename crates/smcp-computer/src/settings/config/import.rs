@@ -174,6 +174,12 @@ pub fn preflight_mcp_import(ctx: &ConfigContext, servers: &[MCPServerConfig]) ->
     }
 
     // (3) 目标可读性：executor 同款只读探针（零写）——既有目标损坏 / IO 确定性暴露。
+    // #267 审查 🟡7：混合 origin 批次下，文件级诊断的 scope MUST 取该文件对应 plan 的 scope，而非
+    // batch default（否则 Local 目标文件会被误标为 Project）。同一文件的 plan scope 恒相同。
+    let mut file_scopes: HashMap<PathBuf, SettingsScope> = HashMap::new();
+    for plan in &all_plans {
+        file_scopes.entry(plan.file.clone()).or_insert(plan.scope);
+    }
     let mut existing_by_file: HashMap<PathBuf, Map<String, Value>> = HashMap::new();
     for file in unique(target_files) {
         match read_raw_object(&file) {
@@ -181,7 +187,10 @@ pub fn preflight_mcp_import(ctx: &ConfigContext, servers: &[MCPServerConfig]) ->
                 existing_by_file.insert(file, existing);
             }
             Err(e) => diagnostics.push(SettingsValidationError {
-                scope: ctx.opts.upsert_new_scope.into(),
+                scope: file_scopes
+                    .get(&file)
+                    .copied()
+                    .unwrap_or_else(|| ctx.opts.upsert_new_scope.into()),
                 field: "<file>".to_string(),
                 reason: format!("import target unreadable/corrupt: {e}"),
                 source_path: Some(file.to_string_lossy().into_owned()),
@@ -685,5 +694,37 @@ mod tests {
             "零写：local 不变"
         );
         assert!(!project_mcp.exists(), "零写：不得创建 project 文件");
+    }
+
+    /// rust-sdk#267 审查 🟡7：混合 origin 批次下，文件级「不可读」诊断的 scope MUST 取该文件对应
+    /// plan 的 scope（Local 文件不得被标成 batch default / Project）。
+    #[test]
+    fn preflight_unreadable_diagnostic_uses_plan_scope_267() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = xdg_env(&tmp);
+        let managed = tmp.path().join("no-managed.json");
+        let project_mcp = crate::settings::mcp_config::workdir_mcp_config_path(&wd);
+        let local_mcp = crate::settings::mcp_config::workdir_mcp_local_config_path(&wd);
+        // 既有 project 声明（可读）+ 新 server 落 Local；local 文件损坏 → 文件级诊断。
+        write(
+            &project_mcp,
+            r#"{"servers": {"proj": {"type":"stdio","server_parameters":{"command":"p"}}}}"#,
+        );
+        write(&local_mcp, r#"{"servers": ["#);
+        let mut c = ctx(&wd, &env, &managed);
+        c.opts.upsert_new_scope = WriteScope::Local;
+
+        let report = preflight_mcp_import(&c, &[stdio("proj", "p2"), stdio("fresh", "f")]);
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|d| d.source_path.as_deref() == Some(local_mcp.to_string_lossy().as_ref()))
+            .expect("损坏的 local 目标文件 MUST 产出文件级诊断");
+        assert_eq!(
+            diagnostic.scope,
+            crate::settings::schema::SettingsScope::Local,
+            "诊断 scope MUST 来自该文件的 plan（Local），而非 batch default"
+        );
     }
 }
