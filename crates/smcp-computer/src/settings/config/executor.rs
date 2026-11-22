@@ -110,9 +110,10 @@ pub fn execute_write_plans(plans: &[WritePlan]) -> Result<(), ExecutorError> {
     // 把可预检故障（损坏的既有目标、畸形容器）挡在**首次写之前**，显著收窄「顺序多文件写、后序失败不回滚
     // 前序」的半落盘窗口。逐 plan 对**盘上现状**校验，不模拟同批前序 plan 的执行结果。
     // 非真原子性（best-effort 早探测）：探测与实际写之间文件仍可能被外部改动，故 `execute_one` 内持锁重读为准。
+    // #292：校验经 [`validate_write_plan`] 单一入口，与 `config::import` 零写 preflight 共用。
     for plan in plans {
         let existing = read_raw_object(plan.file.as_path())?;
-        prepare_write_plan(plan, &existing)?;
+        validate_write_plan(plan, &existing)?;
     }
     for plan in plans {
         execute_one(plan)?;
@@ -264,6 +265,18 @@ fn prepare_write_plan(
             })
         }
     }
+}
+
+/// #292：目标容器预检的只读投影——`execute_write_plans` 批前探测与
+/// `config::import::preflight_mcp_import` 零写预测**共用**同一校验（`prepare_write_plan` 含 project
+/// `readRoots` 策略剥离 + 逐层 object/string-set 容器 guard）。
+///
+/// 丢弃私有 `Prepared`，不把执行计划细节暴露给调用方（避免 `private_interfaces` 告警）。
+pub(crate) fn validate_write_plan(
+    plan: &WritePlan,
+    existing: &Map<String, Value>,
+) -> Result<(), ExecutorError> {
+    prepare_write_plan(plan, existing).map(|_| ())
 }
 
 /// 逐层校验 object 型更新树：每个 `WriteValue::Object` 容器键在盘上必须缺失或已是 object。

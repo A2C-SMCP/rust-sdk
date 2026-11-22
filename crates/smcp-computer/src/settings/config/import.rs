@@ -20,15 +20,18 @@
 //!
 //! 纯 config 层：**不 mount / 不 render 取值**（运行期物化归 `Computer::mount_server`，本 API 守 config 边界）。
 
-use std::collections::HashSet;
+//! #292 / rust-sdk#267：零写 preflight 复用 executor 的 `validate_write_plan`（project `readRoots` 剥离 +
+//! 逐层 object/string-set 容器 guard）——目标容器畸形归 `ImportError::Preflight`，不再落 `Persist`。
+
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::crud::{load_config, update_config, ConfigContext, ConfigCrudError, ConfigEdit};
-use super::executor::read_raw_object;
+use super::executor::{read_raw_object, validate_write_plan, ExecutorError};
 use super::write_target::{
-    resolve_write_target, ConfigEntity, EditIntent, WriteScope, WriteTargetError,
+    resolve_write_target, ConfigEntity, EditIntent, WritePlan, WriteScope, WriteTargetError,
 };
 use crate::mcp_clients::bundle_id::{resolve_bundle_id, BundleId};
 use crate::mcp_clients::model::MCPServerConfig;
@@ -100,14 +103,14 @@ impl std::error::Error for ImportError {}
 
 /// **零写 preflight**：对一批 typed MCP server 做确定性 + 引用语法可达校验，预测落盘清单 / zero-write preflight.
 ///
-/// 检查四类确定性错误（守 #107：**不取真实值**、不探测 secret 可解性 / 文件存在 / MCP 可启动——那是运行期）：
+/// 检查五类确定性错误（守 #107：**不取真实值**、不探测 secret 可解性 / 文件存在 / MCP 可启动——那是运行期）：
 /// 1. **schema**：`validate_server`（按 planned scope，与读侧同一道门）。
 /// 2. **write-target**：[`resolve_write_target`]（纯函数）的只读 origin / synthesized / unsupported。
-/// 3. **目标可读性**：executor 同款**文件级**只读探针读既有目标文件（损坏 / IO）。注意：executor 自
-///    #292 起还会批前校验目标**容器畸形**（非对象/非数组），本 preflight **不**预测该类错误——import
-///    仍会零写失败（executor preflight 兜底），但分类可能落在 `Persist` 而非 `Preflight`
-///    （#267 跟进，issuecomment-6974980142）。
-/// 4. **`${input:<id>}` 可达**：引用的 input id 须在已声明 input 集（`snapshot.inputs`）内；`${env:}` 仅语法。
+/// 3. **目标可读性**：executor 同款**文件级**只读探针读既有目标文件（损坏 / IO）。
+/// 4. **目标容器兼容**（#292/rust-sdk#267）：逐 plan 复用 executor 的
+///    `validate_write_plan`（project `readRoots` 剥离 + 逐层 object/string-set 容器 guard）——容器畸形
+///    由此归入 `PreflightReport` 诊断（`ImportError::Preflight`），不再留给 executor 误分类为 `Persist`。
+/// 5. **`${input:<id>}` 可达**：引用的 input id 须在已声明 input 集（`snapshot.inputs`）内；`${env:}` 仅语法。
 ///
 /// 全程零写。返回预测的 `planned` + 汇总的 `diagnostics`。`ConfigContext.opts.upsert_new_scope` 决定新声明落点。
 #[must_use]
@@ -124,6 +127,8 @@ pub fn preflight_mcp_import(ctx: &ConfigContext, servers: &[MCPServerConfig]) ->
     let mut diagnostics: Vec<SettingsValidationError> = Vec::new();
     let mut planned: Vec<PlannedServer> = Vec::new();
     let mut target_files: Vec<PathBuf> = Vec::new();
+    // #292：保留每 server 的写计划，供目标容器兼容校验复用 executor 的唯一校验入口。
+    let mut all_plans: Vec<WritePlan> = Vec::new();
 
     for server in servers {
         let name = server.name().to_string();
@@ -149,12 +154,13 @@ pub fn preflight_mcp_import(ctx: &ConfigContext, servers: &[MCPServerConfig]) ->
             .unwrap_or_else(|| ctx.opts.upsert_new_scope.into());
         let write_scope = to_write_scope(scope_ss, ctx.opts.upsert_new_scope);
         target_files.extend(plans.iter().map(|p| p.file.clone()));
+        all_plans.extend(plans);
 
         // (1) schema：按 planned scope 校验（与读侧同一道门）。
         let (resolved, errs) = validate_server(&name, &body, scope_ss, None);
         diagnostics.extend(errs);
 
-        // (4) `${input:}` 引用可达（纯语法扫描，不取真实值）。
+        // (5) `${input:}` 引用可达（纯语法扫描，不取真实值）。
         diagnostics.extend(input_ref_diags(&name, &body, &declared_inputs, scope_ss));
 
         if let Some(r) = resolved {
@@ -167,14 +173,46 @@ pub fn preflight_mcp_import(ctx: &ConfigContext, servers: &[MCPServerConfig]) ->
     }
 
     // (3) 目标可读性：executor 同款只读探针（零写）——既有目标损坏 / IO 确定性暴露。
+    let mut existing_by_file: HashMap<PathBuf, Map<String, Value>> = HashMap::new();
     for file in unique(target_files) {
-        if let Err(e) = read_raw_object(&file) {
-            diagnostics.push(SettingsValidationError {
+        match read_raw_object(&file) {
+            Ok(existing) => {
+                existing_by_file.insert(file, existing);
+            }
+            Err(e) => diagnostics.push(SettingsValidationError {
                 scope: ctx.opts.upsert_new_scope.into(),
                 field: "<file>".to_string(),
                 reason: format!("import target unreadable/corrupt: {e}"),
                 source_path: Some(file.to_string_lossy().into_owned()),
-            });
+            }),
+        }
+    }
+
+    // (4) 目标容器兼容（#292 / rust-sdk#267）：与 executor 批前探测**同一校验入口**
+    // （`validate_write_plan`，含 project `readRoots` 剥离 + 逐层容器 guard）。容器畸形由此成为
+    // Preflight 诊断——import 返回 `ImportError::Preflight` 而非 executor 的 `Persist`；零写不变。
+    for plan in &all_plans {
+        let Some(existing) = existing_by_file.get(plan.file.as_path()) else {
+            continue; // 文件级读取失败已在上方报过。
+        };
+        if let Err(e) = validate_write_plan(plan, existing) {
+            let reason = match &e {
+                ExecutorError::CorruptTarget { reason, .. } => {
+                    format!("import target container malformed: {reason}")
+                }
+                other => format!("import target validation failed: {other}"),
+            };
+            let diagnostic = SettingsValidationError {
+                // plan-level scope 比 batch default 更准确（同批可含不同 origin 的更新）。
+                scope: plan.scope,
+                field: "<file>".to_string(),
+                reason,
+                source_path: Some(plan.file.to_string_lossy().into_owned()),
+            };
+            // 同一畸形容器可被多个 plan 命中——按精确相等去重，保持报告顺序稳定。
+            if !diagnostics.contains(&diagnostic) {
+                diagnostics.push(diagnostic);
+            }
         }
     }
 
@@ -195,7 +233,7 @@ pub fn preflight_mcp_import(ctx: &ConfigContext, servers: &[MCPServerConfig]) ->
 /// SDK 决定序列化（`canonicalize_persist_body`）、provenance 与 write-target（`opts.upsert_new_scope`）。
 ///
 /// **原子性边界**：上述「全有或全无」对**确定性**失败成立（preflight 已挡 schema / write-target / 目标可读 /
-/// 引用可达，`update_config` phase 1 挡消解期错）；**非确定性执行期 I/O 失败**（磁盘满 / 权限 / 与外部写者竞态）
+/// 目标容器畸形 / 引用可达，`update_config` phase 1 挡消解期错）；**非确定性执行期 I/O 失败**（磁盘满 / 权限 / 与外部写者竞态）
 /// 发生时，executor 顺序写**不回滚**前序已落盘条目（FS 固有限制、非事务性），此时可能留下部分写 + `Err(Persist)`。
 ///
 /// **不 mount / 不 render 取值**（运行期物化归 `Computer::mount_server`，本 API 守 #107 config 边界）。
@@ -566,5 +604,51 @@ mod tests {
             "preflight MUST 不取真实值/不探测 env 存在（实得 {:?}）",
             report.diagnostics
         );
+    }
+
+    /// rust-sdk#267（#292 残余）：目标容器畸形（`servers` 非对象）是**确定性**失败——preflight MUST
+    /// 预测为诊断（复用 executor 的容器校验），使 `import_mcp_servers` 返回 `ImportError::Preflight`
+    /// 而非 `Persist`；零写（目标文件逐字节不变、不创建 local 文件）。
+    #[test]
+    fn preflight_flags_malformed_target_container_267() {
+        let tmp = TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let env = xdg_env(&tmp);
+        let managed = tmp.path().join("no-managed.json");
+        let project_mcp = crate::settings::mcp_config::workdir_mcp_config_path(&wd);
+        let local_mcp = crate::settings::mcp_config::workdir_mcp_local_config_path(&wd);
+        write(&project_mcp, r#"{"servers": []}"#);
+        let before = std::fs::read(&project_mcp).unwrap();
+        let c = ctx(&wd, &env, &managed);
+
+        let report = preflight_mcp_import(&c, &[stdio("new-srv", "cmd")]);
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|d| d.field == "<file>")
+            .expect("preflight MUST 预测目标容器畸形（不得留给 executor 的 Persist）");
+        assert!(
+            diagnostic
+                .reason
+                .contains("import target container malformed"),
+            "容器畸形诊断文案（实得 {:?}）",
+            diagnostic
+        );
+        assert_eq!(
+            diagnostic.source_path.as_deref(),
+            Some(project_mcp.to_string_lossy().as_ref())
+        );
+
+        let res = import_mcp_servers(&c, &[stdio("new-srv", "cmd")]);
+        assert!(
+            matches!(res, Err(ImportError::Preflight(_))),
+            "确定性容器畸形 MUST 归 Preflight（实得 {res:?}）"
+        );
+        assert_eq!(
+            std::fs::read(&project_mcp).unwrap(),
+            before,
+            "零写：目标文件 MUST 逐字节不变"
+        );
+        assert!(!local_mcp.exists(), "零写：不得创建 local 文件");
     }
 }
