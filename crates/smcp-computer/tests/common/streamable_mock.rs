@@ -38,12 +38,15 @@ pub fn empty_body() -> BoxBody {
 /// - `expose_resources`：是否声明 resources capability 并响应 `resources/list`（寻址对拍需；AUTH-01 不需）。
 /// - `tool_meta`：`tools/list` 产出的 `protected` 工具携带的 `_meta`（#200 ToolMeta 三层合并对拍用）。
 ///   `None`（默认）= 不带 `_meta` —— 与既有测试逐字一致。
+/// - `hang_session_cleanup`：非-POST 的 rmcp 会话清理 DELETE 在响应前阻塞，直到测试显式释放
+///   （#267 S4：断言 disconnect 有界返回后清理仍由分离任务完成）。默认 `false` → 逐字保持 405 快速降级。
 #[derive(Debug, Clone)]
 pub struct MockOpts {
     pub reject_status: StatusCode,
     pub with_www_authenticate: bool,
     pub expose_resources: bool,
     pub tool_meta: Option<serde_json::Value>,
+    pub hang_session_cleanup: bool,
 }
 
 impl Default for MockOpts {
@@ -53,7 +56,38 @@ impl Default for MockOpts {
             with_www_authenticate: false,
             expose_resources: true,
             tool_meta: None,
+            hang_session_cleanup: false,
         }
+    }
+}
+
+/// 运行中的 mock 句柄：提供端口与「阻塞中的会话清理 DELETE」观测/释放闸门（#267 S4）。
+pub struct StreamableMockHandle {
+    pub port: u16,
+    cleanup_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    cleanup_release: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl StreamableMockHandle {
+    /// 当前阻塞中的会话清理 DELETE 数量。
+    pub fn cleanup_active(&self) -> usize {
+        self.cleanup_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 释放所有阻塞中的 DELETE（返回 405，rmcp 映射为"服务器不支持删除会话"后 worker 收敛）。
+    /// 用 Semaphore 而非 Notify：许可会留存，消除「先放行后挂起」的丢失唤醒窗口。
+    pub fn release_cleanup(&self) {
+        self.cleanup_release.add_permits(1024);
+    }
+}
+
+/// 统计一次阻塞 DELETE 的生命周期：进入 +1，返回/被取消时 -1。
+struct CleanupGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -61,10 +95,21 @@ impl Default for MockOpts {
 async fn streamable_handler(
     req: Request<hyper::body::Incoming>,
     opts: MockOpts,
+    cleanup_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    cleanup_release: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<Response<BoxBody>, Infallible> {
     if req.method() != Method::POST {
         // 非-POST（rmcp 打开的 GET SSE 通知流）→ 405。rmcp 据此立即降级为
         // `ServerDoesNotSupportSse`（`streamable_http_client.rs:429`），不耗超时——见 #149 第 3 项结论。
+        if opts.hang_session_cleanup && req.method() == Method::DELETE {
+            cleanup_active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _guard = CleanupGuard(cleanup_active);
+            // Semaphore 许可留存：即使 release 早于等待也生效。
+            let _permit = cleanup_release
+                .acquire()
+                .await
+                .expect("cleanup release semaphore must stay open");
+        }
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(empty_body())
@@ -146,8 +191,20 @@ async fn streamable_handler(
 
 /// 起一台 Streamable HTTP mock，返回监听端口（`127.0.0.1:0` 随机端口）。
 pub async fn spawn_streamable_mock(opts: MockOpts) -> u16 {
+    spawn_streamable_mock_with_handle(opts).await.port
+}
+
+/// 起一台 Streamable HTTP mock，返回可观测/可释放会话清理阻塞的句柄（#267 S4）。
+pub async fn spawn_streamable_mock_with_handle(opts: MockOpts) -> StreamableMockHandle {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let cleanup_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cleanup_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let handle = StreamableMockHandle {
+        port,
+        cleanup_active: cleanup_active.clone(),
+        cleanup_release: cleanup_release.clone(),
+    };
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -156,11 +213,15 @@ pub async fn spawn_streamable_mock(opts: MockOpts) -> u16 {
             let io = TokioIo::new(stream);
             // MockOpts 非 Copy（#200 加 tool_meta 后 Clone 化）：循环内每连接 clone 一份，供服务闭包按值持有。
             let opts = opts.clone();
+            let cleanup_active = cleanup_active.clone();
+            let cleanup_release = cleanup_release.clone();
             tokio::spawn(async move {
                 // service_fn 要求 Fn：每请求再 clone 供 handler 按值消费。
                 let service = service_fn(move |req| {
                     let opts = opts.clone();
-                    async move { streamable_handler(req, opts).await }
+                    let cleanup_active = cleanup_active.clone();
+                    let cleanup_release = cleanup_release.clone();
+                    async move { streamable_handler(req, opts, cleanup_active, cleanup_release).await }
                 });
                 // reqwest 0.13 may optimistically reuse a just-closed test connection under
                 // parallel load; advertise close explicitly so auth status assertions observe
@@ -171,5 +232,5 @@ pub async fn spawn_streamable_mock(opts: MockOpts) -> u16 {
             });
         }
     });
-    port
+    handle
 }

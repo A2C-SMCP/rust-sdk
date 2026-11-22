@@ -2926,8 +2926,10 @@ impl<S: Session> Computer<S> {
         //
         // **停止契约**：`shutdown()` 显式 abort 本任务（`stop_mcp_notify_consumer`），是**确定性**的停止路径。
         // rx 关闭需所有 sender 克隆 drop：stdio/http 客户端的 sender 随 rmcp `RunningService`（客户端 drop）一并
-        // 释放；**SSE 客户端的常驻流任务是 detached spawn、持 sender 克隆**，仅在其 SSE 连接结束或 `disconnect`
-        // 时才释放。故「drop 而不 shutdown」时本任务可能滞留到 SSE 流结束——推荐经 `shutdown()` 收尾。
+        // 释放——但 #267 S4 起 `disconnect` 的有界关闭超时后，RunningService 会分离其服务任务，sender 可再多活
+        // 至 rmcp 自身的 drain(≤2s)+会话清理(≤5s)；**SSE 客户端的常驻流任务是 detached spawn、持 sender 克隆**，
+        // 仅在其 SSE 连接结束或 `disconnect` 时才释放。故「drop 而不 shutdown」时本任务可能滞留到 SSE 流结束
+        //（或上述分离清理结束）——推荐经 `shutdown()` 收尾。
         {
             let reactor = self.mcp_change_reactor();
             let mut change_rx = change_rx;

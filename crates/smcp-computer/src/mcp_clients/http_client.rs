@@ -7,7 +7,7 @@
 * 依赖: tokio, reqwest, serde_json
 * 描述: HTTP类型的MCP客户端实现
 */
-use super::base_client::BaseMCPClient;
+use super::base_client::{close_service_bounded, BaseMCPClient};
 use super::bundle_id::BundleId;
 use super::model::*;
 use super::stdio_client::A2cClientHandler;
@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 /// HTTP 客户端连接超时时间（秒）/ Connect timeout for HTTP client (seconds)
 const CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -860,12 +860,11 @@ impl MCPClientProtocol for HttpMCPClient {
         }
 
         // rmcp 传输 cancel 负责优雅关闭（含 DELETE session）/ transport cancel handles graceful shutdown.
+        // #267 S4：关闭有界——服务器停 POST 时 rmcp 的会话清理 DELETE 自带 5s 上限，外层 1s 切断等待；
+        // 超时后 rmcp 已取消 cancellation token 并分离任务，清理继续在后台按 rmcp 自身上限完成。
         let service = self.running_service.lock().await.take();
-        if let Some(service) = service {
-            match service.cancel().await {
-                Ok(reason) => debug!("Service stopped with reason: {:?}", reason),
-                Err(e) => error!("Error stopping service: {}", e),
-            }
+        if let Some(mut service) = service {
+            close_service_bounded(&mut service).await;
         }
 
         self.base.update_state(ClientState::Disconnected).await;
