@@ -652,13 +652,23 @@ pub async fn reconcile(
             }
         }
 
-        // Python: source if isinstance(source, Mapping) else {} —— 非对象 source 传空对象（仅离线复用的
-        // stage 用；guarded refresh 直接用原值，由 marketplace_clone_url 校验）。
-        let source_for_stage = if source.is_object() {
-            source.clone()
-        } else {
-            empty_source.clone()
-        };
+        // #302 🟡5：跨 SDK 账本一致性——身份只看 `{type,url}`；写入账本 / 传给 stage 前剥离额外键
+        // （python `same_source` 比较全部非 url 键，raw 额外键会造成假冲突）。声明源不可用时保留原值，
+        // 让下游按既有失败路径报错（守卫/ stage 负责）。
+        let source_for_stage = marketplace_clone_url(&source)
+            .map(|url| {
+                let mut normalized = Map::new();
+                normalized.insert("type".to_string(), Value::String("git".to_string()));
+                normalized.insert("url".to_string(), Value::String(url));
+                Value::Object(normalized)
+            })
+            .unwrap_or_else(|_| {
+                if source.is_object() {
+                    source.clone()
+                } else {
+                    empty_source.clone()
+                }
+            });
         // #267：产生新内容的路径（refresh 或 clone 缺失）一律走 #272 守卫原语（fetch → 预校验来料清单名 →
         // ff / staged swap），改名/缺失/非法/损坏清单在**提交前**拒绝；既有 clone + 非 refresh 保持离线
         // 复用（stage，不触网）。
@@ -666,7 +676,7 @@ pub async fn reconcile(
             let baseline = record.and_then(|r| r.manifest_name_baseline.clone());
             refresh_marketplace_clone(
                 name,
-                &source,
+                &source_for_stage,
                 registry,
                 home,
                 baseline.as_deref(),
@@ -2170,6 +2180,12 @@ mod tests {
         assert_eq!(
             reg.resolve("audit:code-review").unwrap().description,
             "from A"
+        );
+        // #302 🟡5：接受额外键后，账本仍须归一为 `{type,url}`（python `same_source` 比较全部非 url 键）。
+        assert_eq!(
+            store.load_known_marketplaces().marketplaces["acme"].source,
+            serde_json::json!({"type": "git", "url": url_a}),
+            "账本 source 必须剥离额外键"
         );
     }
 

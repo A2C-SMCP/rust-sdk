@@ -102,10 +102,71 @@ pub const FIELD_READ_ROOTS: &str = "readRoots";
 ///
 /// 供治理恢复报告筛选与 CLI 呈现共用，避免 `starts_with` 字面量在多处漂移。
 #[must_use]
-pub fn is_marketplace_declaration_field(field: &str) -> bool {
+pub(crate) fn is_marketplace_declaration_field(field: &str) -> bool {
     field == FIELD_EXTRA_KNOWN_MARKETPLACES
         || (field.starts_with(FIELD_EXTRA_KNOWN_MARKETPLACES)
             && field[FIELD_EXTRA_KNOWN_MARKETPLACES.len()..].starts_with('.'))
+}
+
+/// 对 marketplace 声明错误做统一脱敏；非 marketplace 字段返回 `None`（保持原错误）。
+///
+/// 在 **`validate_settings` 出口**调用一次，使 `SettingsValidationError` 的所有消费者（CLI 文本、
+/// `ConfigSnapshot` / `ImportReport` / `ValidationReport` 的 diagnostics、恢复报告）都拿到同一安全值。
+/// `field` 保留 `extraKnownMarketplaces` 前缀，前缀之后的整段与 `reason` 经
+/// [`untrusted_name_for_display`] 脱敏并清洗控制/格式字符。
+pub(crate) fn sanitized_marketplace_error(
+    error: &SettingsValidationError,
+) -> Option<SettingsValidationError> {
+    if !is_marketplace_declaration_field(&error.field) {
+        return None;
+    }
+    Some(SettingsValidationError {
+        scope: error.scope,
+        field: sanitize_marketplace_field(&error.field),
+        reason: sanitize_marketplace_text(&error.reason),
+        // 路径可能由攻击者控制（project-local 文件路径），同样做凭据剥离 + 控制字符清洗。
+        source_path: error.source_path.as_deref().map(sanitize_marketplace_text),
+    })
+}
+
+/// 保留 `extraKnownMarketplaces` 前缀，只对前缀之后的子串脱敏（前缀本身含 `.`，整体喂给 URL 脱敏器会
+/// 被误判为 scheme 的一部分）。前缀用常量，无法剥离时整段脱敏（fail-safe）。
+fn sanitize_marketplace_field(field: &str) -> String {
+    match field
+        .strip_prefix(FIELD_EXTRA_KNOWN_MARKETPLACES)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
+        Some(rest) => format!(
+            "{FIELD_EXTRA_KNOWN_MARKETPLACES}.{}",
+            sanitize_marketplace_text(rest)
+        ),
+        None => sanitize_marketplace_text(field),
+    }
+}
+
+/// 不可信文本 → 诊断展示值：Git URL 凭据剥离 + 控制/格式字符替换为空格。
+pub(crate) fn sanitize_marketplace_text(text: &str) -> String {
+    scrub_diagnostic_chars(&super::redaction::untrusted_name_for_display(text))
+}
+
+/// 控制字符 + Unicode 格式/行分隔符（bidi 覆写 / 零宽 / 行分隔）替换为空格，防 CLI/日志注入。
+pub(crate) fn scrub_diagnostic_chars(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_unsafe_display_char(c) { ' ' } else { c })
+        .collect()
+}
+
+/// 终端展示不安全的字符：C0/C1 控制符（`char::is_control`）+ 常见 Unicode 格式/行分隔符。
+fn is_unsafe_display_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
 }
 
 /// policy-only 字段：出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
@@ -524,6 +585,12 @@ fn validate_extra_marketplaces(key: &str, value: &Value, scope: SettingsScope) -
         }
         cleaned.insert(name.clone(), Value::Object(normalized));
     }
+    // #302 🔴：非法 marketplace 名称/来源可能是恶意文本——在**校验出口**统一脱敏一次，保证所有
+    // 消费者（CLI 文本、snapshot/import/validation diagnostics、恢复报告）不会拿到带凭据的原始字段。
+    let errors = errors
+        .into_iter()
+        .map(|error| sanitized_marketplace_error(&error).unwrap_or(error))
+        .collect();
     (Some(Value::Object(cleaned)), errors)
 }
 
@@ -1235,6 +1302,33 @@ mod tests {
             assert!(
                 errors.iter().any(|e| e.field == bad_field),
                 "missing error {bad_field}"
+            );
+        }
+    }
+
+    /// #302 🔴：校验出口即脱敏——恶意 marketplace 名称（URL / 编码凭据 / 控制字符）不得进入
+    /// 任何 `SettingsValidationError` 消费者（CLI 文本、snapshot/import/validation diagnostics）。
+    #[test]
+    fn test_extra_marketplaces_error_field_redacts_credentials_and_controls() {
+        for name in [
+            "https://example.com/team/alice%3APW_SECRET%40example.com/repo.git",
+            "ev\u{202E}il\u{2028}NAME",
+        ] {
+            let raw = json!({"extraKnownMarketplaces": {
+                name: {"source": {"type": "git", "url": "git@h:p"}}
+            }});
+            let (_, errors) = validate_settings(&raw, SettingsScope::User, None);
+            assert_eq!(errors.len(), 1, "{name}");
+            let field = &errors[0].field;
+            assert!(
+                field.starts_with("extraKnownMarketplaces."),
+                "前缀必须保留：{field}"
+            );
+            assert!(!field.contains("PW_SECRET"), "{field}");
+            assert!(!field.contains('%'), "{field}");
+            assert!(
+                !field.contains('\u{202E}') && !field.contains('\u{2028}'),
+                "{field}"
             );
         }
     }

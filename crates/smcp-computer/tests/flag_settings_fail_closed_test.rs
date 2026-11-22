@@ -250,3 +250,37 @@ fn cli_run_reports_invalid_marketplace_declaration() {
         "不得回显凭据：stdout={stdout}; stderr={stderr}"
     );
 }
+
+/// #302 🟡：存在 `mcp.json` 时，批准流程会再次遍历 settings 错误——非法声明必须只打印一次
+/// （治理重挂负责；REPL 批准入口抑制同类）。
+#[test]
+fn cli_run_prints_invalid_marketplace_declaration_once_with_mcp_json() {
+    let dir = tempdir().unwrap();
+    let settings_dir = dir.path().join("xdg-config").join("a2c");
+    fs::create_dir_all(&settings_dir).unwrap();
+    fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"extraKnownMarketplaces":{"https://user:PW_SECRET@example.com/repo.git":{}}}"#,
+    )
+    .unwrap();
+    // project mcp.json 使 `run_mcp_approval` 越过 `servers.is_empty()` early-return。
+    let tfrobot = dir.path().join(".tfrobot");
+    fs::create_dir_all(&tfrobot).unwrap();
+    fs::write(
+        tfrobot.join("mcp.json"),
+        r#"{"servers":{"proj":{"type":"stdio","server_parameters":{"command":"/bin/true"}}}}"#,
+    )
+    .unwrap();
+
+    let output = run_args(dir.path(), &["run"]);
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "stdout={stdout}");
+    let count = stdout
+        .matches("declaration ignored; existing registration unchanged")
+        .count();
+    assert_eq!(
+        count, 1,
+        "同一非法声明只应打印一次（remount 负责，approval 抑制）：stdout={stdout}"
+    );
+    assert!(!stdout.contains("PW_SECRET"), "stdout={stdout}");
+}

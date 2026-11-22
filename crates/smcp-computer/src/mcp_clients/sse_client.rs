@@ -1940,17 +1940,31 @@ mod tests {
             "expected exactly one production `tokio::select!` in sse_client.rs"
         );
         let select_at = select_offsets[0];
-        // 按 chars 截取，避免多字节 UTF-8 边界 panic（注释含中文）。
-        let head: String = production
-            .get(select_at..)
-            .expect("select offset must be a char boundary")
-            .chars()
-            .take(160)
-            .collect();
+        // 扫描**整个 `tokio::select!` 块**（而非固定 160 chars）——`biased;` 若被插到块内更靠后
+        // 的合法位置（宏首行之后）也必须被抓到。
+        let block = select_block(production, select_at);
         assert!(
-            !head.contains("biased"),
+            !block.contains("biased"),
             "SSE stream select! must not use `biased`: it can starve request_rx"
         );
+    }
+
+    /// 从 `tokio::select!` 起始偏移按花括号配对截取完整块（字符串中的 `{}` 亦成对，不影响配对）。
+    fn select_block(text: &str, start: usize) -> &str {
+        let mut depth = 0i32;
+        for (offset, ch) in text[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[start..start + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated `tokio::select!` block");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

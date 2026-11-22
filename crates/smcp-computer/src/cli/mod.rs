@@ -773,7 +773,7 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) ->
         .computer
         .normalized_mcp_flag_config()
         .map(Path::to_path_buf);
-    approval::run_mcp_approval(
+    approval::run_mcp_approval_for_repl(
         &handler.computer,
         root.approve_all_mcp,
         flag_settings_path.as_deref(),

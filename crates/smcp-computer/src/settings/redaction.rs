@@ -14,6 +14,7 @@
 //! URL 的 userinfo、query、fragment 都可能承载凭据。公开错误不得保存这些原始片段，因为派生
 //! `Debug` / `Display` 会把枚举字段直接带入日志；配置导出则只替换已确认的 userinfo 面，保留其余 URL。
 
+use percent_encoding::percent_decode_str;
 use url::Url;
 
 /// 无法安全呈现的 Git 来源占位符 / placeholder for a Git source that cannot be shown safely.
@@ -66,6 +67,12 @@ pub(crate) fn git_url_for_display(raw: &str) -> String {
         return REDACTED_GIT_SOURCE.to_string();
     }
 
+    // #302 🔴：凭据也可能被百分号编码进 **path**（`/team/alice%3APW%40example.com/repo.git`），
+    // authority 剥离不会碰到它。path 任一段解码后呈 `user:pass@host` 形态 → fail-closed 整段占位。
+    if path_has_credential_like_text(&parsed) {
+        return REDACTED_GIT_SOURCE.to_string();
+    }
+
     if !parsed.username().is_empty() && parsed.set_username("").is_err() {
         return REDACTED_GIT_SOURCE.to_string();
     }
@@ -80,6 +87,16 @@ pub(crate) fn git_url_for_display(raw: &str) -> String {
 /// 非法 Git 来源的公开错误载荷与 CLI 展示共用同一严格安全边界。
 pub(crate) fn git_source_for_error(raw: &str) -> String {
     git_url_for_display(raw)
+}
+
+/// URL path 任一段是否呈凭据样文本（percent-decode 后同时含 `:` 与 `@`，如 `alice:PW@host`）。
+fn path_has_credential_like_text(parsed: &Url) -> bool {
+    parsed.path_segments().is_some_and(|mut segments| {
+        segments.any(|segment| {
+            let decoded = percent_decode_str(segment).decode_utf8_lossy();
+            decoded.contains(':') && decoded.contains('@')
+        })
+    })
 }
 
 /// 展示面的 Git 来源归一值 / display-normalized Git source for presentation surfaces.
@@ -281,6 +298,25 @@ mod tests {
         for secret in ["cnb", "FAKE_TOKEN", "QUERY", "FRAGMENT"] {
             assert!(!got.contains(secret));
         }
+    }
+
+    /// #302 🔴：path 中百分号编码/字面凭据也必须 fail-closed（authority 剥离不覆盖 path）。
+    #[test]
+    fn path_embedded_credentials_are_fully_redacted() {
+        for raw in [
+            "https://example.com/team/alice%3APW_SECRET%40example.com/repo.git",
+            "https://example.com/team/alice:PW_SECRET@example.com/repo.git",
+            "file:///team/alice%3APW_SECRET%40example.com/repo.git",
+        ] {
+            let got = git_url_for_display(raw);
+            assert_eq!(got, REDACTED_GIT_SOURCE, "{raw}");
+            assert!(!got.contains("PW_SECRET"), "{raw}");
+        }
+        // 正常 path（无 `user:pass@host` 形态）不受影响。
+        assert_eq!(
+            git_url_for_display("https://example.com/team/repo.git"),
+            "https://example.com/team/repo.git"
+        );
     }
 
     #[test]

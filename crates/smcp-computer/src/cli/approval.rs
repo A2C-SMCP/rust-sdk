@@ -130,6 +130,28 @@ pub async fn run_mcp_approval<S: Session>(
     flag_settings: Option<&Path>,
     flag_mcp_config: Option<&Path>,
 ) {
+    run_mcp_approval_inner(comp, approve_all, flag_settings, flag_mcp_config, true).await;
+}
+
+/// REPL 启动流内部入口：`run_governance_remount` 已打印 marketplace 声明错误，这里抑制同类，
+/// 避免同一非法声明在 stdout 出现两次。公共 [`run_mcp_approval`] 保持「全部呈现」语义，供独立调用方
+/// （不经治理重挂）使用。
+pub(crate) async fn run_mcp_approval_for_repl<S: Session>(
+    comp: &Computer<S>,
+    approve_all: bool,
+    flag_settings: Option<&Path>,
+    flag_mcp_config: Option<&Path>,
+) {
+    run_mcp_approval_inner(comp, approve_all, flag_settings, flag_mcp_config, false).await;
+}
+
+async fn run_mcp_approval_inner<S: Session>(
+    comp: &Computer<S>,
+    approve_all: bool,
+    flag_settings: Option<&Path>,
+    flag_mcp_config: Option<&Path>,
+    include_marketplace_declaration_errors: bool,
+) {
     // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
     let cwd = std::env::current_dir().ok();
     let resolved = resolve_mcp_config(ResolveMcpConfigArgs {
@@ -153,10 +175,19 @@ pub async fn run_mcp_approval<S: Session>(
     // #143：settings 的校验错误必须**呈现**——scope 越权（policy-only / 审批门 enable 方向判据）会**静默
     // 丢弃字段**，若连错误也吞掉，用户只会看到「我的 settings 莫名不生效」。协议指南 §2.1/§3：响亮失败。
     let resolved_st = resolved_settings_with_errors(cwd.as_deref(), None, flag_settings);
-    // #267：marketplace 声明错误的 field/reason 由 `format_settings_errors` 统一脱敏；此处保持
-    // 「全部校验错误都呈现」的既有语义（不做过滤，避免独立调用方丢失诊断；重复打印的收敛留给
-    // settings-flag-runtime-cleanup 的 flag 去重）。
-    for line in format_settings_errors(&resolved_st.errors) {
+    // #267：marketplace 声明错误的 field/reason 由 `format_settings_errors` 统一脱敏。REPL 路径由
+    // `run_governance_remount` 负责打印同类（`include=false` 时抑制），独立调用方保持全部呈现。
+    let settings_errors: Vec<_> = if include_marketplace_declaration_errors {
+        resolved_st.errors.clone()
+    } else {
+        resolved_st
+            .errors
+            .iter()
+            .filter(|e| !crate::settings::schema::is_marketplace_declaration_field(&e.field))
+            .cloned()
+            .collect()
+    };
+    for line in format_settings_errors(&settings_errors) {
         msg_warn(&line);
     }
     let settings = resolved_st.settings;

@@ -75,6 +75,9 @@ fn marketplace_add_no_clone_json_stdout_contract_267() {
     fs::write(repo.join("UPSTREAM_UPDATE"), b"new").unwrap();
     git(&["add", "-A"], &repo);
     git(&["commit", "-qm", "update"], &repo);
+    // 再把源仓库移走：任何触网/重新 clone 都会失败；`--no-clone` 仍必须成功（只读本地 catalog）。
+    let repo_moved = dir.path().join("repo-moved");
+    fs::rename(&repo, &repo_moved).unwrap();
 
     let second = run_binary(
         &home,

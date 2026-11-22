@@ -513,6 +513,7 @@ mod tests {
     fn marketplace_declaration_error_line_pins_fields_and_scope() {
         let error = crate::settings::MarketplaceDeclarationError {
             scope: SettingsScope::User,
+            marketplace: Some("acme".to_string()),
             field: "extraKnownMarketplaces.acme.source.url".to_string(),
             reason: "malformed git url".to_string(),
             source_path: Some("/tmp/settings.json".to_string()),

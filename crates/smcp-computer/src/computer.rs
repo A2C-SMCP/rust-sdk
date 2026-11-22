@@ -7680,15 +7680,29 @@ mod tests {
             .with_config_env(env);
         let report = comp_b.reconcile_governance(None, None).await;
 
-        assert_eq!(
-            report.marketplace_declaration_errors.len(),
-            1,
-            "非法声明必须在恢复报告可见：{report:?}"
-        );
-        let error = &report.marketplace_declaration_errors[0];
-        assert_eq!(error.scope, SettingsScope::User);
-        assert_eq!(error.field, "extraKnownMarketplaces.acme.source.url");
+        // 按 scope/field 过滤断言（ambient policy 也可能产生诊断，不能假设总数恰好 1）。
+        let error = report
+            .marketplace_declaration_errors
+            .iter()
+            .find(|e| {
+                e.scope == SettingsScope::User
+                    && e.field == "extraKnownMarketplaces.acme.source.url"
+            })
+            .unwrap_or_else(|| panic!("非法声明必须在恢复报告可见：{report:?}"));
+        assert_eq!(error.marketplace.as_deref(), Some("acme"), "{error:?}");
         assert!(error.reason.contains("malformed git url"), "{error:?}");
+        assert_eq!(
+            report
+                .marketplace_declaration_errors
+                .iter()
+                .filter(|e| {
+                    e.scope == SettingsScope::User
+                        && e.field == "extraKnownMarketplaces.acme.source.url"
+                })
+                .count(),
+            1,
+            "同一非法声明不得重复计入：{report:?}"
+        );
         assert_eq!(
             error.source_path,
             Some(settings_path.to_string_lossy().into_owned())

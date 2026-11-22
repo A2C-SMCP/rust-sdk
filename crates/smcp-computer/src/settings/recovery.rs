@@ -67,9 +67,8 @@ use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig};
 use crate::settings::installer::materialize_plugin_record;
 use crate::settings::reconciler::{declared_marketplaces, source_for_log, REASON_SOURCE_CONFLICT};
-use crate::settings::redaction::untrusted_name_for_display;
 use crate::settings::schema::{
-    is_marketplace_declaration_field, SettingsScope, SettingsValidationError,
+    sanitized_marketplace_error, SettingsScope, SettingsValidationError,
     FIELD_EXTRA_KNOWN_MARKETPLACES,
 };
 use crate::settings::scope::EnvMap;
@@ -122,6 +121,10 @@ pub struct MarketplaceSourceConflict {
 pub struct MarketplaceDeclarationError {
     /// 来源 scope（user / project / local / flag / policy）/ owning settings scope.
     pub scope: SettingsScope,
+    /// 被丢弃声明的 marketplace 名（已脱敏）；顶层字段类型错误等无法定位单条时为 `None`。
+    ///
+    /// 与 python#293 的 `marketplace / scope / reason` 契约对齐，消费方无需解析 `field`。
+    pub marketplace: Option<String>,
     /// 点路径（如 `extraKnownMarketplaces.my-mp.source.url`）；marketplace 名段已脱敏。
     pub field: String,
     /// 校验失败原因（已脱敏 + 控制字符清洗）/ sanitized validation reason.
@@ -187,9 +190,8 @@ pub struct GovernanceRecoveryReport {
 
 /// 从 settings 校验错误中筛出 `extraKnownMarketplaces` 声明错误并脱敏 / collect declaration errors.
 ///
-/// 只读纯函数：不改变校验语义（非法条目仍在校验期被丢弃）。`field` 保留
-/// `extraKnownMarketplaces` 前缀，前缀之后的整段与 `reason` 都经
-/// [`untrusted_name_for_display`] 脱敏并清洗控制字符（防恶意名称把 URL 凭据或换行/ANSI 注入诊断输出）。
+/// 只读纯函数：不改变校验语义（非法条目仍在校验期被丢弃）。`validate_settings` 出口已对同类错误
+/// 统一脱敏；本函数再经 [`sanitized_marketplace_error`] 处理一次（幂等），覆盖手工构造的错误。
 pub(crate) fn marketplace_declaration_errors(
     errors: &[SettingsValidationError],
 ) -> Vec<MarketplaceDeclarationError> {
@@ -206,55 +208,29 @@ pub(crate) fn marketplace_declaration_errors(
 pub(crate) fn sanitize_marketplace_declaration_error(
     error: &SettingsValidationError,
 ) -> Option<MarketplaceDeclarationError> {
-    if !is_marketplace_declaration_field(&error.field) {
-        return None;
-    }
+    let sanitized = sanitized_marketplace_error(error)?;
     Some(MarketplaceDeclarationError {
-        scope: error.scope,
-        field: sanitize_declaration_field(&error.field),
-        reason: sanitize_declaration_text(&error.reason),
-        source_path: error.source_path.as_deref().map(scrub_control_chars),
+        scope: sanitized.scope,
+        marketplace: declaration_marketplace(&sanitized.field),
+        field: sanitized.field,
+        reason: sanitized.reason,
+        source_path: sanitized.source_path,
     })
 }
 
-/// 保留 `extraKnownMarketplaces` 前缀，只对前缀之后的子串脱敏（前缀本身含 `.`，整体喂给 URL 脱敏器会
-/// 被误判为 scheme 的一部分）。前缀用 schema 常量，避免与字段名漂移；无法剥离时整段脱敏（fail-safe）。
-fn sanitize_declaration_field(field: &str) -> String {
-    match field
-        .strip_prefix(FIELD_EXTRA_KNOWN_MARKETPLACES)
-        .and_then(|rest| rest.strip_prefix('.'))
-    {
-        Some(rest) => format!(
-            "{FIELD_EXTRA_KNOWN_MARKETPLACES}.{}",
-            sanitize_declaration_text(rest)
-        ),
-        None => sanitize_declaration_text(field),
-    }
-}
-
-/// 不可信文本 → 诊断展示值：Git URL 凭据剥离 + 控制/格式字符替换为空格。
-fn sanitize_declaration_text(text: &str) -> String {
-    scrub_control_chars(&untrusted_name_for_display(text))
-}
-
-/// 控制字符 + Unicode 格式/行分隔符（bidi 覆写 / 零宽 / 行分隔）替换为空格，防 CLI/日志注入。
-fn scrub_control_chars(text: &str) -> String {
-    text.chars()
-        .map(|c| if is_unsafe_display_char(c) { ' ' } else { c })
-        .collect()
-}
-
-/// 终端展示不安全的字符：C0/C1 控制符（`char::is_control`）+ 常见 Unicode 格式/行分隔符。
-fn is_unsafe_display_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{061C}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-                | '\u{FEFF}'
-        )
+/// 从脱敏后的字段路径解析 marketplace 名（`extraKnownMarketplaces.<name>[.source*|.autoUpdate]`）。
+///
+/// 只剥离**已知的完整后缀**（顺序：最长优先）——非法名称本身可能含 `.source` 子串，按前缀切分会误判。
+/// 无法解析（顶层字段类型错误）返回 `None`。
+fn declaration_marketplace(field: &str) -> Option<String> {
+    let rest = field
+        .strip_prefix(FIELD_EXTRA_KNOWN_MARKETPLACES)?
+        .strip_prefix('.')?;
+    let name = [".source.url", ".source.type", ".source", ".autoUpdate"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))
+        .unwrap_or(rest);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 // ===========================================================================
@@ -1247,12 +1223,17 @@ mod tests {
         assert!(!got[0].field.contains("PW_SECRET"), "{:?}", got[0].field);
         assert!(!got[0].reason.contains("PW_SECRET"), "{:?}", got[0].reason);
         assert_eq!(got[0].source_path.as_deref(), Some("/tmp/settings.json"));
+        // 结构化 marketplace 名（python#293 契约）：已脱敏、无需消费方解析 field。
+        let name = got[0].marketplace.as_deref().expect("marketplace name");
+        assert!(name.contains("example.com"), "{name:?}");
+        assert!(!name.contains("PW_SECRET"), "{name:?}");
         // 字段侧同样清洗：bidi 覆写 / 行分隔 / 换行 / ESC 全部替换为空格。
         assert!(
             got[1].field.starts_with("extraKnownMarketplaces."),
             "{:?}",
             got[1].field
         );
+        let evil_name = got[1].marketplace.as_deref().expect("marketplace name");
         for needle in ['\u{202E}', '\u{2028}', '\n', '\u{1b}'] {
             assert!(
                 !got[1].field.contains(needle),
@@ -1264,10 +1245,27 @@ mod tests {
                 "reason 未清洗 {needle:?}：{:?}",
                 got[1].reason
             );
+            assert!(
+                !evil_name.contains(needle),
+                "marketplace 未清洗 {needle:?}：{evil_name:?}"
+            );
         }
         // 单条入口与非 marketplace 返回 None 亦钉死（CLI 共享口径）。
         assert!(sanitize_marketplace_declaration_error(&errors[0]).is_none());
         assert!(sanitize_marketplace_declaration_error(&errors[2]).is_some());
+        // 顶层字段类型错误无法定位单条 marketplace → None。
+        let top_level = SettingsValidationError {
+            scope: SettingsScope::User,
+            field: "extraKnownMarketplaces".to_string(),
+            reason: "expected object, got array".to_string(),
+            source_path: None,
+        };
+        assert_eq!(
+            sanitize_marketplace_declaration_error(&top_level)
+                .expect("top-level declaration error")
+                .marketplace,
+            None
+        );
     }
 
     #[tokio::test]
