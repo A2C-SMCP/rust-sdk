@@ -43,7 +43,7 @@ pub use installer::{
     disable_plugin, enable_plugin, install_plugin, materialize_plugin_record, uninstall_plugin,
     DisableOptions, EnableOptions, InstallOptions, McpHookError, McpInstallHooks,
     McpServerNameConflictError, PluginInstallError, PluginNameConflictError,
-    PluginNameConflictKind, UninstallOptions,
+    PluginNameConflictKind, ResolvedSettingsProvider, UninstallOptions,
 };
 
 pub use lifecycle::{

@@ -1654,10 +1654,11 @@ impl<S: Session> Computer<S> {
     /// bump **config** revision + `emit_update_config`（#115 R1：installer 据实际写盘返回 `changed`，幂等 re-enable
     /// 不虚假 bump / 不惊动 robot）；bundled server 若翻活经 hooks 走 [`Self::mount_server`] 另 bump capability（§12 R2 正交）。
     ///
-    /// **失败回滚（#286）**：经内部 seam 供给运行期权威——`non_plugin_declared_bundle_ids` 全集（§4.9.1-2
-    /// 回收判据）、manager 活跃（已挂载）集（existing-wins 权威）、五层 settings 解析（门控含 flag/policy）、
-    /// gate 锚点（`options.project_path` → 本实例 `config_dir`）。enable 失败且该 pid 在任何 scope 都不再启用时，
-    /// 回收其 bundled server；remount 对已挂载实例 existing-wins 不覆盖。
+    /// **失败回滚（#286 follow-up；Discussion #82 裁决 C / §2.4）**：经内部 seam 供给运行期权威——
+    /// `non_plugin_declared_bundle_ids` 全集（写后失败时对**本次新挂**做 §4.9.1-2 三档判定）、manager 活跃
+    /// （已挂载）集（existing-wins 权威）、五层 settings 解析 + gate 锚点（失败回滚后合并视图诊断）。写后失败
+    /// 只清理本次尝试新挂（含失败者），registry 回填 staging 前快照，raw 精确恢复 pre-state；有效 prior-true
+    /// 失败返回 [`PluginInstallError::EnableFailedRetained`]。remount 对已挂载实例 existing-wins 不覆盖。
     ///
     /// # Errors
     /// 见 [`PluginInstallError`]（未安装 / 冲突 / manifest / settings 写 / 注入）。
@@ -1685,13 +1686,16 @@ impl<S: Session> Computer<S> {
             env,
         };
         // #286 复审 🔴1/🟡3/🟡4：MUST 在取 `skill_registry` 写锁**之前**备齐运行期权威（同 disable/uninstall）：
-        // ① 回收判据「非用户声明」全集；② manager 活跃（已挂载）集——existing-wins 唯一权威，避免声明面
-        //    （disabled/待审批）被误当已挂载；③ 五层 settings 解析——门控覆盖 flag/policy 的 enabledPlugins；
-        // ④ gate 锚点：调用方 project_path（写盘锚）回退本实例 config_dir。
+        // ① 「非用户声明」全集——写后失败对**本次新挂**做 §4.9.1-2 三档判定；② manager 活跃（已挂载）集
+        //    ——existing-wins 唯一权威，避免声明面（disabled/待审批）被误当已挂载；③ 五层 settings 解析
+        //    ——失败诊断的 pre/post 合并视图（含 flag/policy）；④ gate 锚点：调用方 project_path
+        //    （写盘锚）回退本实例 config_dir。
         let non_plugin = self.non_plugin_declared_bundle_ids(&home, env);
-        // 🔴1：provider 在失败回滚后求值（不得在此快照——回滚写 false 须被读到）；🟡2：env 与本次
-        // enable 的读写同源（effective env，而非 config_env）。
-        let resolved_settings = || self.resolved_runtime_settings(env);
+        // 诊断 provider MUST 现算：写前取 pre-state、回滚写盘后取 post-state（不得在此缓存快照）；🟡2：env
+        // 与本次 enable 的读写同源（effective env，而非 config_env）。锚点由 installer 传入
+        // （`options.project_path` → 本实例 config_dir），不得固定读 config_dir。
+        let resolved_settings =
+            |anchor: Option<&str>| self.resolved_runtime_settings_at(env, anchor);
         let config_dir = self.config_dir();
         let gate_project_path = options.project_path.or_else(|| config_dir.to_str());
         let mounted = self.mounted_bundle_ids().await;
@@ -1737,7 +1741,7 @@ impl<S: Session> Computer<S> {
     /// 治理恢复（[`reconcile_governance`](Self::reconcile_governance)）、待批准列表
     /// （[`list_pending_bundled_approvals`](Self::list_pending_bundled_approvals)）、归属视图
     /// （[`enabled_bundled_ownership`](Self::enabled_bundled_ownership)）与 enable 回滚 provider
-    /// （[`resolved_runtime_settings`](Self::resolved_runtime_settings)）的**唯一收口**；新增解析参数只改
+    /// （[`resolved_runtime_settings_at`](Self::resolved_runtime_settings_at)）的**唯一收口**；新增解析参数只改
     /// 此处，防口径漂移。**不含** `instance_config_context`（config 快照）——它经 `ConfigContext` 仅共享
     /// 实例 `env` / flag / `config_dir`，`policy_settings` 刻意不接（借用字段限制，见其 doc）。
     fn resolve_instance_settings(
@@ -1745,25 +1749,35 @@ impl<S: Session> Computer<S> {
         env: Option<&EnvMap>,
     ) -> crate::settings::scope::ResolvedSettings {
         let config_dir = self.config_dir();
+        self.resolve_instance_settings_at(env, &config_dir)
+    }
+
+    /// 指定 project/local 解析锚的实例 settings（诊断锚点场景；不改变本实例默认 `config_dir`）。
+    fn resolve_instance_settings_at(
+        &self,
+        env: Option<&EnvMap>,
+        cwd: &std::path::Path,
+    ) -> crate::settings::scope::ResolvedSettings {
         let policy = resolve_policy_settings(env, None, None);
         resolve_settings(ResolveSettingsArgs {
-            cwd: Some(&config_dir),
+            cwd: Some(cwd),
             env,
             flag_settings_path: self.normalized_flag_settings_path(),
             policy_settings: Some(&policy),
         })
     }
 
-    /// 运行期五层 settings 合并视图（user<project<local<flag<policy，锚定本实例 `config_dir`）。
-    ///
-    /// #286 复审 🟡4：enable 失败回滚的 any-scope 门控凭此覆盖 **flag（`--settings`）/policy** 的
-    /// `enabledPlugins`（只读文件三层会漏掉高层显式 true）。每次现算、零持久态（与
-    /// [`resolve_settings`](crate::settings::scope::resolve_settings) 同源）。
-    pub(crate) fn resolved_runtime_settings(
+    /// 指定**诊断锚点**的五层合并视图：`anchor` = 操作 scope 的 project/local 目录
+    /// （`options.project_path`）；`None` 回退本实例 `config_dir`。enable 失败诊断 MUST 用操作锚点，
+    /// 否则「projectPath != config_dir」时会误报/漏报 retained。
+    pub(crate) fn resolved_runtime_settings_at(
         &self,
         env: Option<&EnvMap>,
+        anchor: Option<&str>,
     ) -> serde_json::Map<String, serde_json::Value> {
-        self.resolve_instance_settings(env).settings
+        let config_dir = self.config_dir();
+        let cwd = anchor.map(std::path::Path::new).unwrap_or(&config_dir);
+        self.resolve_instance_settings_at(env, cwd).settings
     }
 
     /// 运行期**已挂载**的 bundle_id 集（manager 活跃集；existing-wins 权威，#286 复审 🔴1）。
@@ -8329,7 +8343,7 @@ mod tests {
     }
 
     /// #286 复审 🔴1/🟡4：Computer 注入五层解析 **provider**（含 flag）——flag-only enabled=true 时
-    /// 失败回滚 MUST 保留已挂 server（provider 在回滚后求值，且不得被回滚写 false 掩盖）。
+    /// 预检失败 MUST 保留已挂 server，并包装 retained 诊断（provider 覆盖 flag 层）。
     #[tokio::test]
     async fn enable_plugin_failure_keeps_server_for_flag_only_enabled_286() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8373,6 +8387,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
+            crate::settings::installer::PluginInstallError::EnableFailedRetained { .. }
+        ));
+        assert!(matches!(
+            err.retained_source_deep(),
             crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
         ));
         assert!(
@@ -8384,10 +8402,10 @@ mod tests {
         );
     }
 
-    /// #286 最终复审 1：生产入口（Computer）的 provider MUST 在**失败回滚后**求值——prior=true 时删除
-    /// 安装根再 enable：回滚写 false 后 must 回收已挂 server（enable 前快照会保留 → 半态）。
+    /// Discussion#82 裁决 C（生产入口）：prior-true 时删除安装根再 enable → 预检零写保持 true，
+    /// 已挂 server / SKILL MUST 保留；诊断包装 `EnableFailedRetained`。
     #[tokio::test]
-    async fn enable_plugin_failure_reclaims_after_rollback_via_computer_286() {
+    async fn enable_plugin_failure_keeps_state_via_computer_82() {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = cold_start_setup95(&tmp).await;
         let cfg_root = tmp.path().join("cfg");
@@ -8415,7 +8433,7 @@ mod tests {
             "首次 enable 应挂上 audit-mcp"
         );
 
-        // 删除安装根 → 再次 enable 预检失败（prior=true → 回滚写 false）。
+        // 删除安装根 → 再次 enable 预检失败（prior=true → 零写保持 true）。
         let records = crate::settings::store::load_installed_plugins(Some(&home), None)
             .account
             .plugins
@@ -8430,20 +8448,19 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
+            crate::settings::installer::PluginInstallError::EnableFailedRetained { .. }
         ));
         assert!(
-            !comp
-                .list_mcp_servers()
+            comp.list_mcp_servers()
                 .await
                 .iter()
                 .any(|c| c.name() == "audit-mcp"),
-            "回滚后 provider=false → MUST 回收（快照语义会保留 → 磁盘 disabled 投影仍在）"
+            "prior-true 预检失败 MUST 保留已挂 server（Discussion#82 裁决 C）"
         );
     }
 
     /// #286 最终复审 2：resolved provider MUST 用 **effective env**（`options.env`），而非 `config_env()`——
-    /// env_b 下 user=true、config_env=env_a 时，失败回滚 MUST 保留 server（用 config_env 解析会误回收）。
+    /// env_b 下 user=true、config_env=env_a 时，失败诊断 MUST 用 effective env（用 config_env 会漏报 retained）。
     #[tokio::test]
     async fn enable_plugin_failure_uses_effective_env_for_gate_286() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8507,6 +8524,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
+            crate::settings::installer::PluginInstallError::EnableFailedRetained { .. }
+        ));
+        assert!(matches!(
+            err.retained_source_deep(),
             crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
         ));
         assert!(
@@ -8514,7 +8535,7 @@ mod tests {
                 .await
                 .iter()
                 .any(|c| c.name() == "audit-mcp"),
-            "effective env（env_b）的 user=true 必须被门控看见；用 config_env 会误回收"
+            "effective env（env_b）的 user=true 必须被诊断看见；用 config_env 会误报未保留"
         );
     }
 

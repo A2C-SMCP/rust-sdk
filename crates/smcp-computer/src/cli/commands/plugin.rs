@@ -55,6 +55,16 @@ fn plugin_err(msg: &str, json_output: bool, code: i32, error_code: Option<&str>)
     code
 }
 
+/// enable 失败的稳定 error_code：先经 [`PluginInstallError::retained_source_deep`] 剥掉
+/// `EnableFailedRetained` 诊断包装再分类——包装只补充「既有启用状态已保留」，不改变 error_code。
+fn enable_failure_error_code(err: &PluginInstallError) -> Option<&'static str> {
+    match err.retained_source_deep() {
+        PluginInstallError::Conflict(_) => Some("mcp_server_name_conflict"),
+        PluginInstallError::NameConflict(_) => Some("plugin_name_conflict"),
+        _ => None,
+    }
+}
+
 // ── 内部辅助 / internal helpers ──────────────────────────────────────────────
 /// `<plugin>@<marketplace>` → `(plugin, marketplace)`；格式非法 → `None`。
 fn split_plugin_id(plugin_id: &str) -> Option<(&str, &str)> {
@@ -258,8 +268,8 @@ pub async fn plugin_uninstall(
 }
 
 /// 该记录的 enable 写盘锚点：记录自带 `projectPath` 优先；缺失（如 rematerialize 后记录恒为
-/// `scope=user`、无 projectPath）→ 回退调用方 `project_path_hint`（REPL 传进程 cwd）。#286/D：后者同时作为
-/// 失败回滚 any-scope 门控对 project/local scope 的锚点，避免「local 仍 enabled 却被误回收/误 orphan」。
+/// `scope=user`、无 projectPath）→ 回退调用方 `project_path_hint`（REPL 传进程 cwd）。该锚点同时用于
+/// 失败诊断的合并视图（`user<project<local`），避免因读不到 local/project 层而误报未保留。
 fn record_enable_project_path<'a>(
     rec: &'a InstalledPluginRecord,
     project_path_hint: Option<&'a str>,
@@ -271,9 +281,9 @@ fn record_enable_project_path<'a>(
         .or(project_path_hint)
 }
 
-/// 启用单个 plugin（旧签名 wrapper，下游兼容）：无运行期权威——不回滚回收、existing-wins 退回
-/// `hooks.mounted_servers()`、门控只看文件三层。SDK 内带 `Computer` 的调用方请用
-/// [`plugin_enable_with_paths`]。
+/// 启用单个 plugin（旧签名 wrapper，下游兼容）：无运行期权威——existing-wins 退回
+/// `hooks.mounted_servers()`、诊断只看文件三层（写后失败仍按 attempt-only 清理 hook 侧实例）。
+/// SDK 内带 `Computer` 的调用方请用 [`plugin_enable_with_paths`]。
 pub async fn plugin_enable(
     registry: &mut SkillRegistry,
     home: &Path,
@@ -290,6 +300,7 @@ pub async fn plugin_enable(
         None,
         None,
         None,
+        None,
         hooks,
         json_output,
     )
@@ -299,12 +310,15 @@ pub async fn plugin_enable(
 /// 启用单个 plugin（带运行期权威的完整路径；#286）/ enable a plugin with runtime authority.
 ///
 /// scope 契约：从 ledger 逐 scope 读；每条记录 register 之前先 `inject_inputs(installPath)`。
-/// `project_path_hint`：记录缺 `projectPath` 时的写盘/门控锚点（REPL 传 cwd；一次性子命令传 `None`）。
-/// `resolved_settings`：运行期五层 settings 合并视图的 **provider**（`Computer::resolved_runtime_settings`）——
-/// 门控覆盖 flag/policy 的 `enabledPlugins`（🟡4）；**MUST 在失败回滚后求值**（🔴1，见
+/// `project_path_hint`：记录缺 `projectPath` 时的**写盘/回滚**锚点（REPL 传 cwd）；
+/// **一次性子命令 MUST 传 `None`**（保持 project/local 记录缺 `projectPath` 时 fail-closed）。
+/// `diagnostic_path`：失败诊断的合并视图锚点（记录 `projectPath` 优先，其次本参数，再次写锚）；
+/// cwd 只能作为诊断锚，**不得**经本参数兜底写盘。
+/// `resolved_settings`：运行期五层 settings 合并视图的 **provider**（`Computer::resolved_runtime_settings_at`）——
+/// 接收逐记录诊断锚点、覆盖 flag/policy 的 `enabledPlugins`；**MUST 现算**（pre/post 两时点，见
 /// `EnableReclaimContext`）。
-/// `non_plugin_bundle_ids`：失败回滚的 §4.9.1-2 回收判据「非用户声明」数据源，MUST 由持有 `Computer`
-/// 的调用方供给（REPL）；一次性子命令无活跃 server（hooks=None）→ `None`（不摘）。
+/// `non_plugin_bundle_ids`：写后失败对本次新挂做 §4.9.1-2 三档判定的「非用户声明」数据源，MUST 由持有
+/// `Computer` 的调用方供给（REPL）；一次性子命令无活跃 server（hooks=None）→ `None`。
 #[allow(clippy::too_many_arguments)] // CLI handler：显式资源 + flags（同 plugin_disable 风格）
 pub async fn plugin_enable_with_paths(
     registry: &mut SkillRegistry,
@@ -312,7 +326,8 @@ pub async fn plugin_enable_with_paths(
     env: Option<&EnvMap>,
     plugin_id: &str,
     project_path_hint: Option<&str>,
-    resolved_settings: Option<&dyn Fn() -> Map<String, Value>>,
+    diagnostic_path: Option<&str>,
+    resolved_settings: Option<&crate::settings::installer::ResolvedSettingsProvider<'_>>,
     non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
     hooks: Option<&dyn McpInstallHooks>,
     json_output: bool,
@@ -336,18 +351,23 @@ pub async fn plugin_enable_with_paths(
                 return plugin_err(&e.to_string(), json_output, EXIT_USER_ERROR, None);
             }
         }
+        // 写盘锚：记录 `projectPath` 优先；缺省回退显式写 hint（一次性 CLI 传 None → fail-closed）。
+        let write_path = record_enable_project_path(rec, project_path_hint);
+        // 诊断锚：记录 `projectPath` 优先；其次 diagnostic_path（可含 cwd），再次写锚。
+        // cwd 只能经此进入诊断，**不得**兜底写盘。
+        let diag_path = record_enable_project_path(rec, diagnostic_path.or(project_path_hint));
         let res = enable_plugin_with_reclaim(
             plugin_id,
             registry,
             home,
             EnableOptions {
                 scope: Some(scope_of(rec)),
-                project_path: record_enable_project_path(rec, project_path_hint),
+                project_path: write_path,
                 timeout: None,
                 env,
             },
             EnableReclaimContext {
-                gate_project_path: project_path_hint,
+                gate_project_path: diag_path,
                 resolved_settings,
                 // CLI 无 manager 快照注入 → 回退 CliMcpHooks::mounted_servers（其既有集为运行期已挂载）。
                 mounted_bundle_ids: None,
@@ -358,24 +378,16 @@ pub async fn plugin_enable_with_paths(
         .await;
         match res {
             Ok(_changed) => {}
-            Err(PluginInstallError::Conflict(e)) => {
+            // Discussion#82：prior-true 失败会被 `EnableFailedRetained` 包装；打印外层文本以携带
+            // 「既有启用状态已保留」提示，但 error_code 按剥壳后的内层变体分类（与未包装时一致）。
+            Err(e) => {
                 return plugin_err(
                     &e.to_string(),
                     json_output,
                     EXIT_USER_ERROR,
-                    Some("mcp_server_name_conflict"),
+                    enable_failure_error_code(&e),
                 )
             }
-            // #275：跨 marketplace 同名 plugin（enable 防御 / stage 后 fail-closed）。
-            Err(PluginInstallError::NameConflict(e)) => {
-                return plugin_err(
-                    &e.to_string(),
-                    json_output,
-                    EXIT_USER_ERROR,
-                    Some("plugin_name_conflict"),
-                )
-            }
-            Err(e) => return plugin_err(&e.to_string(), json_output, EXIT_USER_ERROR, None),
         }
         scopes.push(json!(scope_of(rec)));
     }
@@ -644,6 +656,7 @@ mod tests {
     use crate::settings::scope::user_settings_path;
     use crate::settings::store::update_installed_plugins;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn seed_plugin(home: &Path, env: &HashMap<String, String>, pid: &str, scope: &str) {
@@ -717,23 +730,27 @@ mod tests {
         assert_eq!(record_enable_project_path(&make(None), None), None);
     }
 
-    /// 🟡5 CLI 接线：`plugin_enable_with_paths` MUST 把 `non_plugin`（回收）与 `project_path_hint`（门控
-    /// 锚点）传给 seam——删任一接线该测试变红。
+    /// Discussion#82：CLI enable 预检失败零写零回收；写后失败按逐记录写锚（`projectPath` 优先，
+    /// 缺省 hint）恢复，并清理本次新挂 server。`resolved_settings` 诊断接线在 B 段断言。
     #[tokio::test]
-    async fn plugin_enable_with_paths_wires_reclaim_and_hint_286() {
+    async fn plugin_enable_with_paths_preflight_and_write_after_82() {
         use crate::mcp_clients::model::{BundleId as TestBundleId, MCPServerConfig, ServerName};
         use crate::settings::installer::McpHookError;
-        use std::sync::Mutex;
+        use std::sync::{Arc, Mutex};
 
         struct RecordingHooks {
             removed: Mutex<Vec<String>>,
+            fail_register: bool,
         }
         #[async_trait::async_trait]
         impl McpInstallHooks for RecordingHooks {
             fn existing_servers(&self) -> HashMap<TestBundleId, ServerName> {
                 HashMap::new()
             }
-            async fn register_server(&self, _cfg: MCPServerConfig) -> Result<(), McpHookError> {
+            async fn register_server(&self, cfg: MCPServerConfig) -> Result<(), McpHookError> {
+                if self.fail_register {
+                    return Err(McpHookError(format!("boom on {}", cfg.name())));
+                }
                 Ok(())
             }
             async fn remove_server(&self, id: &TestBundleId) -> Result<(), McpHookError> {
@@ -742,12 +759,13 @@ mod tests {
             }
         }
 
-        // A) non_plugin 接线：预检失败（installPath 缺失）且无 scope 启用 → 回收 figma-mcp。
+        // A) 预检失败（installPath 缺失）：零写零回收——即使提供了 non_plugin 判据也不得摘。
         let dir_a = tempdir().unwrap();
         let env_a = test_env(dir_a.path());
         seed_plugin(dir_a.path(), &env_a, "figma@acme", "user");
         let hooks_a = RecordingHooks {
             removed: Mutex::new(Vec::new()),
+            fail_register: false,
         };
         let code = plugin_enable_with_paths(
             &mut SkillRegistry::new(),
@@ -756,31 +774,43 @@ mod tests {
             "figma@acme",
             None,
             None,
+            None,
             Some(&HashSet::new()),
             Some(&hooks_a),
             true,
         )
         .await;
         assert_eq!(code, EXIT_USER_ERROR);
-        assert_eq!(
-            *hooks_a.removed.lock().unwrap(),
-            vec!["figma-mcp".to_string()],
-            "non_plugin 未接线 → 失败回滚不会回收 server"
+        assert!(
+            hooks_a.removed.lock().unwrap().is_empty(),
+            "预检失败零写零回收（Discussion#82）"
         );
 
-        // B) hint 接线：运行期锚点 project enabled=true → 门控保留（不回收）。
+        // B) 写后失败（register 失败）+ project scope 无 projectPath：hint 决定写盘/恢复锚点；
+        //    失败后 project key 精确删键、本次新挂 server 撤除。hint 未接线时写盘前置失败，
+        //    project settings 不会存在 → 下面的读取会 panic（测试对接线敏感）。
         let dir_b = tempdir().unwrap();
         let env_b = test_env(dir_b.path());
-        seed_plugin(dir_b.path(), &env_b, "figma@acme", "user");
         let proj = dir_b.path().join("proj");
-        std::fs::create_dir_all(proj.join(".tfrobot")).unwrap();
-        std::fs::write(
-            proj.join(".tfrobot/settings.json"),
-            r#"{"enabledPlugins":{"figma@acme":true}}"#,
-        )
-        .unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_real_enable_fixture(dir_b.path(), &env_b, "project");
         let hooks_b = RecordingHooks {
             removed: Mutex::new(Vec::new()),
+            fail_register: true,
+        };
+        // provider 接线守护：记录收到的诊断锚点，证明 CLI 未把 resolved_settings 置 None、
+        // 且锚点 = 操作 project_path（而非宿主默认）。
+        let seen_anchors: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = {
+            let seen = Arc::clone(&seen_anchors);
+            move |anchor: Option<&str>| {
+                seen.lock().unwrap().push(anchor.map(str::to_string));
+                let mut ep = Map::new();
+                ep.insert("figma@acme".to_string(), Value::Bool(false));
+                let mut m = Map::new();
+                m.insert("enabledPlugins".to_string(), Value::Object(ep));
+                m
+            }
         };
         let code = plugin_enable_with_paths(
             &mut SkillRegistry::new(),
@@ -788,48 +818,227 @@ mod tests {
             Some(&env_b),
             "figma@acme",
             proj.to_str(),
-            None,
+            proj.to_str(),
+            Some(&provider),
             Some(&HashSet::new()),
             Some(&hooks_b),
             true,
         )
         .await;
         assert_eq!(code, EXIT_USER_ERROR);
+        let want_anchor = proj.to_string_lossy().into_owned();
+        let anchors = seen_anchors.lock().unwrap().clone();
         assert!(
-            hooks_b.removed.lock().unwrap().is_empty(),
-            "hint 未接线 → 门控看不到 project enabled=true，会误回收"
+            !anchors.is_empty(),
+            "CLI 必须把 resolved_settings provider 传给 installer（接线守护）"
         );
+        assert!(
+            anchors
+                .iter()
+                .all(|a| a.as_deref() == Some(want_anchor.as_str())),
+            "provider 诊断锚点必须是操作 project_path：{anchors:?}"
+        );
+        let settings = crate::settings::scope::workdir_project_settings_path(&proj);
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings)
+                .unwrap_or_else(|e| panic!("hint 未接线：project settings 未写 ({e})")),
+        )
+        .unwrap();
+        assert!(
+            v.get("enabledPlugins")
+                .and_then(|m| m.get("figma@acme"))
+                .is_none(),
+            "写后失败 MUST 恢复 project pre-state（原 absent → 删键）"
+        );
+        assert_eq!(
+            *hooks_b.removed.lock().unwrap(),
+            vec!["figma-mcp".to_string()],
+            "本次新挂 server 必须清理"
+        );
+    }
 
-        // C) resolved provider 接线：flag/policy-only true（文件三层无值）→ 门控保留（不回收）。
-        let dir_c = tempdir().unwrap();
-        let env_c = test_env(dir_c.path());
-        seed_plugin(dir_c.path(), &env_c, "figma@acme", "user");
-        let provider = || {
-            let mut ep = Map::new();
-            ep.insert("figma@acme".to_string(), Value::Bool(true));
-            let mut m = Map::new();
-            m.insert("enabledPlugins".to_string(), Value::Object(ep));
-            m
-        };
-        let hooks_c = RecordingHooks {
-            removed: Mutex::new(Vec::new()),
-        };
+    /// 写锚 fail-closed：project 记录缺 `projectPath` 时，cwd 只能作诊断锚，MUST NOT 兜底写盘。
+    #[tokio::test]
+    async fn plugin_enable_with_paths_rejects_project_record_without_project_path_82() {
+        use crate::mcp_clients::model::{BundleId as TestBundleId, MCPServerConfig, ServerName};
+        use crate::settings::installer::McpHookError;
+
+        struct OkHooks;
+        #[async_trait::async_trait]
+        impl McpInstallHooks for OkHooks {
+            fn existing_servers(&self) -> HashMap<TestBundleId, ServerName> {
+                HashMap::new()
+            }
+            async fn register_server(&self, _cfg: MCPServerConfig) -> Result<(), McpHookError> {
+                Ok(())
+            }
+            async fn remove_server(&self, _id: &TestBundleId) -> Result<(), McpHookError> {
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_real_enable_fixture(dir.path(), &env, "project");
         let code = plugin_enable_with_paths(
             &mut SkillRegistry::new(),
-            dir_c.path(),
-            Some(&env_c),
+            dir.path(),
+            Some(&env),
             "figma@acme",
+            None,          // 写锚：缺 projectPath → fail-closed
+            proj.to_str(), // 仅诊断锚（cwd）
             None,
-            Some(&provider),
             Some(&HashSet::new()),
-            Some(&hooks_c),
+            Some(&OkHooks),
             true,
         )
         .await;
         assert_eq!(code, EXIT_USER_ERROR);
         assert!(
-            hooks_c.removed.lock().unwrap().is_empty(),
-            "resolved provider 未接线 → flag/policy-only true 被忽略，会误回收"
+            !crate::settings::scope::workdir_project_settings_path(&proj).exists(),
+            "cwd 诊断锚不得兜底写盘（project 记录缺 projectPath 必须拒绝）"
+        );
+    }
+
+    /// 真实 enable 夹具：install 树（skill + bundled server）+ 本地 git marketplace（acme/figma）
+    /// + 账本记录（installPath = `<home>/x`，声明 `figma-mcp`）。
+    fn seed_real_enable_fixture(
+        home: &Path,
+        env: &HashMap<String, String>,
+        scope: &str,
+    ) -> PathBuf {
+        let root = home.join("x");
+        let skill = root.join("skills/code-review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        let sd = root.join("mcp-servers");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(
+            sd.join("figma-mcp.json"),
+            r#"{"type":"stdio","name":"figma-mcp","server_parameters":{"command":"node"}}"#,
+        )
+        .unwrap();
+
+        let repo = home.join("repo-acme");
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            r#"{"name":"acme","plugins":[{"name":"figma","source":"./plugins/figma"}]}"#,
+        )
+        .unwrap();
+        let rskill = repo.join("plugins/figma/skills/code-review");
+        std::fs::create_dir_all(&rskill).unwrap();
+        std::fs::write(
+            rskill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"][..],
+            &["commit", "-qm", "init"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", &repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git available");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let url = format!("file://{}", repo.display());
+        crate::settings::store::update_known_marketplaces(
+            |f| {
+                f.account.marketplaces.insert(
+                    "acme".to_string(),
+                    crate::settings::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
+                        source: json!({"type": "git", "url": url}),
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(home),
+            Some(env),
+        )
+        .unwrap();
+        seed_plugin(home, env, "figma@acme", scope);
+        root
+    }
+
+    /// CLI 剥壳（Discussion#82 / 架构师确认）：`EnableFailedRetained` 包装不得改变内层 error_code；
+    /// prior-false 原变体直接分类。覆盖 ContentUnavailable / NameConflict / Mcp 冲突三类。
+    #[test]
+    fn enable_failure_error_code_unwraps_retained_variant_82() {
+        use crate::settings::installer::{
+            McpServerNameConflictError, PluginInstallError, PluginNameConflictError,
+            PluginNameConflictKind,
+        };
+
+        let unavailable = PluginInstallError::ContentUnavailable {
+            plugin_id: "figma@acme".to_string(),
+            detail: "install_path_missing: root".to_string(),
+        };
+        // 未包装：直接原变体，无 error_code。
+        assert_eq!(enable_failure_error_code(&unavailable), None);
+        // 包装：剥壳后仍是 ContentUnavailable，无 error_code；Display 携带 retained 提示。
+        let wrapped_unavailable = PluginInstallError::EnableFailedRetained {
+            source: Box::new(unavailable),
+        };
+        assert_eq!(enable_failure_error_code(&wrapped_unavailable), None);
+        assert!(wrapped_unavailable
+            .to_string()
+            .contains("existing enabled state retained"));
+
+        // NameConflict（#275 跨 marketplace 同名）：剥壳后保留 plugin_name_conflict。
+        let name_conflict = PluginInstallError::NameConflict(PluginNameConflictError {
+            requested_pid: "figma@acme".to_string(),
+            plugin: "figma".to_string(),
+            kind: PluginNameConflictKind::Installed {
+                installed_pid: "figma@other".to_string(),
+            },
+        });
+        assert_eq!(
+            enable_failure_error_code(&name_conflict),
+            Some("plugin_name_conflict")
+        );
+        let wrapped_name = PluginInstallError::EnableFailedRetained {
+            source: Box::new(name_conflict),
+        };
+        assert_eq!(
+            enable_failure_error_code(&wrapped_name),
+            Some("plugin_name_conflict")
+        );
+
+        // Mcp 同名冲突（§10.6）：剥壳后保留 mcp_server_name_conflict。
+        let conflict =
+            PluginInstallError::Conflict(McpServerNameConflictError("figma-mcp".to_string()));
+        assert_eq!(
+            enable_failure_error_code(&conflict),
+            Some("mcp_server_name_conflict")
+        );
+        let wrapped_conflict = PluginInstallError::EnableFailedRetained {
+            source: Box::new(conflict),
+        };
+        assert_eq!(
+            enable_failure_error_code(&wrapped_conflict),
+            Some("mcp_server_name_conflict")
         );
     }
 

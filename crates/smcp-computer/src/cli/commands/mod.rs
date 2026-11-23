@@ -488,6 +488,32 @@ mod tests {
     use crate::computer::{Computer, SilentSession};
     use crate::settings::{SettingsScope, SettingsValidationError};
 
+    /// Discussion#82 / 架构师条件 3：生产 CLI hook 的 `remove_server` 是**运行期 unmount**——
+    /// 用户 mcp.json 声明逐字节不变（durable 条目不被 plugin 回滚删除）。
+    #[tokio::test]
+    async fn cli_mcp_hooks_remove_server_is_runtime_only_82() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = test_env(dir.path());
+        let comp = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(dir.path().join("home"))
+            .with_blob_cache_root(dir.path().join("blob"))
+            .with_config_dir(dir.path().join("config"))
+            .with_config_env(env.clone());
+        let mcp_path = crate::settings::user_mcp_config_path(Some(&env));
+        std::fs::create_dir_all(mcp_path.parent().unwrap()).unwrap();
+        let before = br#"{"servers":{"figma-mcp":{"type":"stdio","server_parameters":{"command":"user-cmd"}}}}"#;
+        std::fs::write(&mcp_path, before).unwrap();
+
+        let hooks = CliMcpHooks::new(&comp, None, None).await;
+        let bid = BundleId::try_from("figma-mcp".to_string()).unwrap();
+        hooks.remove_server(&bid).await.unwrap();
+        assert_eq!(
+            std::fs::read(&mcp_path).unwrap(),
+            before,
+            "生产 hook remove_server 不得改 durable mcp.json"
+        );
+    }
+
     /// #295：冲突提示文案需覆盖「无法证明等价」的 fail-closed 情形（scp vs https 等写法差异），
     /// 不得断言「源不同」；且只展示注册名、不带 URL。
     #[test]

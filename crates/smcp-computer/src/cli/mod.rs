@@ -35,7 +35,7 @@ use commands::marketplace::{
     marketplace_remove, marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
 };
 use commands::plugin::{
-    plugin_disable, plugin_enable, plugin_gc, plugin_info, plugin_install, plugin_list,
+    plugin_disable, plugin_enable_with_paths, plugin_gc, plugin_info, plugin_install, plugin_list,
     plugin_uninstall, PluginInstallOptions,
 };
 use commands::settings::{settings_edit, settings_get, settings_set, settings_show};
@@ -516,7 +516,7 @@ async fn dispatch_marketplace(action: MarketplaceCmd, root: &RootState) -> i32 {
     }
 }
 
-async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
+async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
     let home = skill_home();
     migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
@@ -571,8 +571,33 @@ async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
             .await
         }
         PluginCmd::Enable { id, json } => {
-            // 无活跃 Computer（hooks=None）→ 无 server 可摘；走旧签名 wrapper（无运行期权威）。
-            plugin_enable(&mut registry, &home, None, &id, None, json).await
+            // 无活跃 Computer（hooks=None）→ 无运行期挂载可摘；写盘/诊断锚用逐记录 projectPath，
+            // 缺省回退进程 cwd（installer 内同源）。诊断 provider 复用 CLI 的 flag-aware 五层解析，
+            // 覆盖 `--settings` flag 层（一次性子命令没有 Computer 实例，policy 走 ambient 解析）。
+            let cwd = cwd.as_deref().and_then(std::path::Path::to_str);
+            let flag_settings_path = normalize_root_flag_path(root);
+            let provider = |anchor: Option<&str>| {
+                commands::resolved_settings(
+                    anchor.map(std::path::Path::new),
+                    None,
+                    flag_settings_path.as_deref(),
+                )
+            };
+            plugin_enable_with_paths(
+                &mut registry,
+                &home,
+                None,
+                &id,
+                // 写锚 MUST 保持 fail-closed：project/local 记录缺 projectPath 时拒绝；
+                // cwd 仅作诊断锚（diag 参数），不得兜底写盘。
+                None,
+                cwd,
+                Some(&provider),
+                None,
+                None,
+                json,
+            )
+            .await
         }
         PluginCmd::Disable { id, json } => {
             plugin_disable(&mut registry, &home, None, &id, &HashSet::new(), None, json).await
