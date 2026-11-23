@@ -8460,7 +8460,7 @@ mod tests {
     }
 
     /// #286 最终复审 2：resolved provider MUST 用 **effective env**（`options.env`），而非 `config_env()`——
-    /// env_b 下 user=true、config_env=env_a 时，失败回滚 MUST 保留 server（用 config_env 解析会误回收）。
+    /// env_b 下 user=true、config_env=env_a 时，失败诊断 MUST 用 effective env（用 config_env 会漏报 retained）。
     #[tokio::test]
     async fn enable_plugin_failure_uses_effective_env_for_gate_286() {
         let tmp = tempfile::TempDir::new().unwrap();

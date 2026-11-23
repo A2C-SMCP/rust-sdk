@@ -300,6 +300,7 @@ pub async fn plugin_enable(
         None,
         None,
         None,
+        None,
         hooks,
         json_output,
     )
@@ -309,8 +310,10 @@ pub async fn plugin_enable(
 /// 启用单个 plugin（带运行期权威的完整路径；#286）/ enable a plugin with runtime authority.
 ///
 /// scope 契约：从 ledger 逐 scope 读；每条记录 register 之前先 `inject_inputs(installPath)`。
-/// `project_path_hint`：记录缺 `projectPath` 时的**写盘/诊断**锚点（REPL/一次性子命令传 cwd）；
-/// 记录自带 `projectPath` 时以其为准（两者必须同源——诊断不得随 cwd 漂移）。
+/// `project_path_hint`：记录缺 `projectPath` 时的**写盘/回滚**锚点（REPL 传 cwd）；
+/// **一次性子命令 MUST 传 `None`**（保持 project/local 记录缺 `projectPath` 时 fail-closed）。
+/// `diagnostic_path`：失败诊断的合并视图锚点（记录 `projectPath` 优先，其次本参数，再次写锚）；
+/// cwd 只能作为诊断锚，**不得**经本参数兜底写盘。
 /// `resolved_settings`：运行期五层 settings 合并视图的 **provider**（`Computer::resolved_runtime_settings_at`）——
 /// 接收逐记录诊断锚点、覆盖 flag/policy 的 `enabledPlugins`；**MUST 现算**（pre/post 两时点，见
 /// `EnableReclaimContext`）。
@@ -323,6 +326,7 @@ pub async fn plugin_enable_with_paths(
     env: Option<&EnvMap>,
     plugin_id: &str,
     project_path_hint: Option<&str>,
+    diagnostic_path: Option<&str>,
     resolved_settings: Option<&crate::settings::installer::ResolvedSettingsProvider<'_>>,
     non_plugin_bundle_ids: Option<&HashSet<BundleId>>,
     hooks: Option<&dyn McpInstallHooks>,
@@ -347,20 +351,23 @@ pub async fn plugin_enable_with_paths(
                 return plugin_err(&e.to_string(), json_output, EXIT_USER_ERROR, None);
             }
         }
-        // 写盘与诊断 MUST 用同一个逐记录锚点（记录 `projectPath` 优先，缺省回退 hint）。
-        let rec_project_path = record_enable_project_path(rec, project_path_hint);
+        // 写盘锚：记录 `projectPath` 优先；缺省回退显式写 hint（一次性 CLI 传 None → fail-closed）。
+        let write_path = record_enable_project_path(rec, project_path_hint);
+        // 诊断锚：记录 `projectPath` 优先；其次 diagnostic_path（可含 cwd），再次写锚。
+        // cwd 只能经此进入诊断，**不得**兜底写盘。
+        let diag_path = record_enable_project_path(rec, diagnostic_path.or(project_path_hint));
         let res = enable_plugin_with_reclaim(
             plugin_id,
             registry,
             home,
             EnableOptions {
                 scope: Some(scope_of(rec)),
-                project_path: rec_project_path,
+                project_path: write_path,
                 timeout: None,
                 env,
             },
             EnableReclaimContext {
-                gate_project_path: rec_project_path,
+                gate_project_path: diag_path,
                 resolved_settings,
                 // CLI 无 manager 快照注入 → 回退 CliMcpHooks::mounted_servers（其既有集为运行期已挂载）。
                 mounted_bundle_ids: None,
@@ -723,8 +730,8 @@ mod tests {
         assert_eq!(record_enable_project_path(&make(None), None), None);
     }
 
-    /// Discussion#82：CLI enable 预检失败零写零回收；写后失败按 `project_path_hint` 写盘/恢复锚点，
-    /// 并清理本次新挂 server。`resolved_settings` 的诊断接线由 installer 单测覆盖。
+    /// Discussion#82：CLI enable 预检失败零写零回收；写后失败按逐记录写锚（`projectPath` 优先，
+    /// 缺省 hint）恢复，并清理本次新挂 server。`resolved_settings` 诊断接线在 B 段断言。
     #[tokio::test]
     async fn plugin_enable_with_paths_preflight_and_write_after_82() {
         use crate::mcp_clients::model::{BundleId as TestBundleId, MCPServerConfig, ServerName};
@@ -765,6 +772,7 @@ mod tests {
             dir_a.path(),
             Some(&env_a),
             "figma@acme",
+            None,
             None,
             None,
             Some(&HashSet::new()),
@@ -810,6 +818,7 @@ mod tests {
             Some(&env_b),
             "figma@acme",
             proj.to_str(),
+            proj.to_str(),
             Some(&provider),
             Some(&HashSet::new()),
             Some(&hooks_b),
@@ -845,6 +854,51 @@ mod tests {
             *hooks_b.removed.lock().unwrap(),
             vec!["figma-mcp".to_string()],
             "本次新挂 server 必须清理"
+        );
+    }
+
+    /// 写锚 fail-closed：project 记录缺 `projectPath` 时，cwd 只能作诊断锚，MUST NOT 兜底写盘。
+    #[tokio::test]
+    async fn plugin_enable_with_paths_rejects_project_record_without_project_path_82() {
+        use crate::mcp_clients::model::{BundleId as TestBundleId, MCPServerConfig, ServerName};
+        use crate::settings::installer::McpHookError;
+
+        struct OkHooks;
+        #[async_trait::async_trait]
+        impl McpInstallHooks for OkHooks {
+            fn existing_servers(&self) -> HashMap<TestBundleId, ServerName> {
+                HashMap::new()
+            }
+            async fn register_server(&self, _cfg: MCPServerConfig) -> Result<(), McpHookError> {
+                Ok(())
+            }
+            async fn remove_server(&self, _id: &TestBundleId) -> Result<(), McpHookError> {
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let env = test_env(dir.path());
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_real_enable_fixture(dir.path(), &env, "project");
+        let code = plugin_enable_with_paths(
+            &mut SkillRegistry::new(),
+            dir.path(),
+            Some(&env),
+            "figma@acme",
+            None,          // 写锚：缺 projectPath → fail-closed
+            proj.to_str(), // 仅诊断锚（cwd）
+            None,
+            Some(&HashSet::new()),
+            Some(&OkHooks),
+            true,
+        )
+        .await;
+        assert_eq!(code, EXIT_USER_ERROR);
+        assert!(
+            !crate::settings::scope::workdir_project_settings_path(&proj).exists(),
+            "cwd 诊断锚不得兜底写盘（project 记录缺 projectPath 必须拒绝）"
         );
     }
 

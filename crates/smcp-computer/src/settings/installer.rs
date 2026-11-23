@@ -832,15 +832,18 @@ fn restore_enabled_plugin(
     }
 }
 
+/// enable 失败诊断的五层合并视图 provider：参数 = 诊断锚点（operation 的 project/local 目录；
+/// `None` 用宿主默认锚），返回合并后的 settings。
+///
+/// 公开别名（`settings::ResolvedSettingsProvider`）：下游实现 `plugin_enable_with_paths` 的
+/// provider 参数时可直接命名，无需展开 `dyn Fn` 类型。
+pub type ResolvedSettingsProvider<'a> = dyn Fn(Option<&str>) -> Map<String, Value> + 'a;
+
 /// enable 回滚的上下文（内部 seam，`#286`）：承载 existing-wins 与诊断所需的**运行期权威**。
 ///
 /// 全部字段缺省 = 不可用（公开 `enable_plugin` 路径）——existing-wins 退回 hook 的
 /// [`mounted_servers`](McpInstallHooks::mounted_servers)、诊断只看文件三层（不读 flag/policy 层，见
-/// [`plugin_effectively_enabled`]）。
-/// enable 失败诊断的五层合并视图 provider：参数 = 诊断锚点（operation 的 project/local 目录；
-/// `None` 用宿主默认锚），返回合并后的 settings。
-pub(crate) type ResolvedSettingsProvider<'a> = dyn Fn(Option<&str>) -> Map<String, Value> + 'a;
-
+/// `plugin_effectively_enabled`）。
 #[derive(Default)]
 pub(crate) struct EnableReclaimContext<'a> {
     /// 运行期锚点（CLI cwd / `Computer::config_dir`）：无五层解析结果时的 project/local 文件合并锚点。
@@ -959,13 +962,15 @@ async fn cleanup_attempt_servers(
     }
     let mut ids: Vec<BundleId> = attempt_ids.iter().cloned().collect();
     ids.sort();
-    let installed = load_installed_plugins(Some(home), env);
-    let other = crate::settings::reconciler::other_plugin_mcp_deps(&installed.account, plugin_id);
+    // 仅当提供「非用户声明」判据时才需要账本/他 plugin 依赖做三档分类；否则按
+    // 「只移除本 plugin 贡献」处理（mode 仅日志），避免无谓读账本。
     let reclaimable = match non_plugin_bundle_ids {
         Some(non_plugin) => {
+            let installed = load_installed_plugins(Some(home), env);
+            let other =
+                crate::settings::reconciler::other_plugin_mcp_deps(&installed.account, plugin_id);
             crate::settings::reconciler::reclaimable_mcp_deps(&ids, &other, non_plugin)
         }
-        // 无「非用户声明」判据 ⇒ 无法分类；按「只移除本 plugin 贡献」语义处理（mode 仅日志）。
         None => Vec::new(),
     };
     for id in &ids {
@@ -2516,7 +2521,7 @@ mod tests {
         }
     }
 
-    /// #286：测试用回滚上下文（仅回收判据；gate/mounted/resolved 缺省）。
+    /// 测试用回滚上下文（`non_plugin` = 写后失败三档分类集；gate/mounted/resolved 缺省）。
     fn reclaim_ctx(non_plugin: Option<&HashSet<BundleId>>) -> EnableReclaimContext<'_> {
         EnableReclaimContext {
             non_plugin_bundle_ids: non_plugin,
@@ -5195,8 +5200,8 @@ mod tests {
         assert_ne!(enabled_flag(&env, "audit@acme"), Some(true));
     }
 
-    // ---- #286：enable 失败回滚 server 回收 / remount existing-wins -------------
-    /// A：预检失败且无任何 scope 启用 → 摘除本 plugin 可回收的已挂 bundled server。
+    // ---- #286 follow-up：enable 失败回滚（pre-state / attempt-only / existing-wins）----
+    /// 预检零写：prior-true 失败保持 true；既有 bundled server 不摘除（不做任何回收动作）。
     #[tokio::test]
     async fn enable_prior_true_preflight_failure_keeps_servers_82() {
         let tmp = TempDir::new().unwrap();
@@ -5270,9 +5275,10 @@ mod tests {
         );
     }
 
-    /// A 的反向：未提供 non_plugin 判据（None）→ MUST NOT 摘除（防连坐用户/宿主 server）。
+    /// 预检零写不读 `non_plugin`：prior-true 预检失败保持 true；即使 non_plugin=None 也不存在
+    /// 「摘除」动作（三档判定只在写后失败路径生效）。
     #[tokio::test]
-    async fn enable_preflight_failure_without_non_plugin_keeps_servers_286() {
+    async fn enable_prior_true_preflight_failure_ignores_non_plugin_82() {
         let tmp = TempDir::new().unwrap();
         let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
         let env = cfg_env(&tmp, env);
@@ -5334,14 +5340,14 @@ mod tests {
         ));
         assert!(
             h2.removed.lock().unwrap().is_empty(),
-            "prior-true 预检失败 MUST NOT 摘除既有 server（与 non_plugin 是否提供无关）"
+            "预检零写无摘除动作（non_plugin 不参与预检路径）"
         );
     }
 
     /// 另一 project 锚点仍启用时，失败 scope（user，本锚点无值）的预检零写仍 MUST NOT 摘 server；
     /// 诊断只看本次操作锚点，故不包装 retained（行为与诊断分离）。
     #[tokio::test]
-    async fn enable_preflight_failure_keeps_servers_when_other_scope_enabled_286() {
+    async fn enable_preflight_failure_keeps_servers_when_other_scope_enabled_82() {
         let tmp = TempDir::new().unwrap();
         let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
         let env = cfg_env(&tmp, env);
@@ -5627,14 +5633,14 @@ mod tests {
         assert!(reg.resolve("audit:code-review").is_none());
     }
 
-    /// 用户声明的同 bundle_id server 永不连坐（§4.9.1-2「非用户声明」）。
+    /// 写后失败三档：用户声明（origin != plugin）的**本次新挂** server 只移除本 plugin 贡献
+    /// （运行期 unmount），durable mcp.json 字节不变。
     #[tokio::test]
-    async fn enable_preflight_failure_keeps_user_declared_server_286() {
+    async fn enable_write_after_failure_user_declared_contribution_removed_82() {
         let tmp = TempDir::new().unwrap();
         let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
         let env = cfg_env(&tmp, env);
         let mut reg = SkillRegistry::new();
-        let hooks = RecordingHooks::new();
         install_plugin(
             "audit@acme",
             &mut reg,
@@ -5643,34 +5649,20 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&hooks),
+            None,
         )
         .await
         .unwrap();
-        enable_plugin(
-            "audit@acme",
-            &mut reg,
-            &home,
-            EnableOptions {
-                env: Some(&env),
-                ..Default::default()
-            },
-            Some(&hooks),
-        )
-        .await
-        .unwrap();
-        let root = PathBuf::from(
-            ledger_records(&home, &env, "audit@acme")[0]
-                .install_path
-                .clone()
-                .unwrap(),
-        );
-        fs::remove_dir_all(&root).unwrap();
+        // 用户 durable 声明（真实 user mcp.json 路径）；installer 永不写它。
+        let user_mcp = crate::settings::mcp_config::user_mcp_config_path(Some(&env));
+        fs::create_dir_all(user_mcp.parent().unwrap()).unwrap();
+        let before = br#"{"servers":{"audit-mcp":{"type":"stdio","server_parameters":{"command":"user-cmd"}}}}"#;
+        fs::write(&user_mcp, before).unwrap();
 
         let non_plugin: HashSet<BundleId> =
             std::iter::once(BundleId::try_from("audit-mcp".to_string()).unwrap()).collect();
-        let h2 = RecordingHooks::new().with_existing(&["audit-mcp"]);
-        enable_plugin_with_reclaim(
+        let h2 = RecordingHooks::new().failing_register("audit-mcp");
+        let err = enable_plugin_with_reclaim(
             "audit@acme",
             &mut reg,
             &home,
@@ -5683,20 +5675,27 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            h2.removed.lock().unwrap().is_empty(),
-            "用户声明（origin != plugin）的同 bundle_id server MUST NOT 被回收"
+        assert!(matches!(err, PluginInstallError::Hook(_)));
+        assert_eq!(
+            *h2.removed.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "用户声明的本次新挂 server 只移除本 plugin 贡献（运行期 unmount）"
+        );
+        assert_eq!(
+            fs::read(&user_mcp).unwrap(),
+            before,
+            "durable mcp.json 不得被回滚删除/改写"
         );
     }
 
-    /// 其他 plugin 仍依赖 → 不回收（§4.9.1-2 第一条）。
+    /// 写后失败三档：其他 plugin 仍声明依赖的**本次新挂** server 只移除本 plugin 贡献
+    /// （运行期 unmount），他 plugin 账本依赖记录不变。
     #[tokio::test]
-    async fn enable_preflight_failure_keeps_other_plugin_dependency_286() {
+    async fn enable_write_after_failure_other_plugin_dependency_kept_82() {
         let tmp = TempDir::new().unwrap();
         let (home, env, _src) = setup_installed_catalog(&tmp, true).await;
         let env = cfg_env(&tmp, env);
         let mut reg = SkillRegistry::new();
-        let hooks = RecordingHooks::new();
         install_plugin(
             "audit@acme",
             &mut reg,
@@ -5705,19 +5704,7 @@ mod tests {
                 env: Some(&env),
                 ..Default::default()
             },
-            Some(&hooks),
-        )
-        .await
-        .unwrap();
-        enable_plugin(
-            "audit@acme",
-            &mut reg,
-            &home,
-            EnableOptions {
-                env: Some(&env),
-                ..Default::default()
-            },
-            Some(&hooks),
+            None,
         )
         .await
         .unwrap();
@@ -5737,16 +5724,9 @@ mod tests {
             Some(&env),
         )
         .unwrap();
-        let root = PathBuf::from(
-            ledger_records(&home, &env, "audit@acme")[0]
-                .install_path
-                .clone()
-                .unwrap(),
-        );
-        fs::remove_dir_all(&root).unwrap();
 
-        let h2 = RecordingHooks::new().with_existing(&["audit-mcp"]);
-        enable_plugin_with_reclaim(
+        let h2 = RecordingHooks::new().failing_register("audit-mcp");
+        let err = enable_plugin_with_reclaim(
             "audit@acme",
             &mut reg,
             &home,
@@ -5759,9 +5739,16 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            h2.removed.lock().unwrap().is_empty(),
-            "其他 plugin 仍声明依赖 → MUST NOT 回收"
+        assert!(matches!(err, PluginInstallError::Hook(_)));
+        assert_eq!(
+            *h2.removed.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "他 plugin 依赖的本次新挂 server 只移除本 plugin 贡献（运行期 unmount）"
+        );
+        assert_eq!(
+            ledger_records(&home, &env, "other@acme")[0].mcp_servers,
+            vec![BundleId::try_from("audit-mcp".to_string()).unwrap()],
+            "他 plugin 账本依赖记录不得被回滚删除/改写"
         );
     }
 
@@ -6989,7 +6976,7 @@ mod tests {
         ));
         assert!(
             h2.removed.lock().unwrap().is_empty(),
-            "回滚后 provider=true（prior-true 保留）→ MUST NOT 回收"
+            "预检零写（prior-true 保留）→ MUST NOT 回收"
         );
         assert_eq!(enabled_flag(&env, "audit@acme"), Some(true));
     }

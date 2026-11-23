@@ -588,6 +588,9 @@ async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
                 &home,
                 None,
                 &id,
+                // 写锚 MUST 保持 fail-closed：project/local 记录缺 projectPath 时拒绝；
+                // cwd 仅作诊断锚（diag 参数），不得兜底写盘。
+                None,
                 cwd,
                 Some(&provider),
                 None,

@@ -341,6 +341,7 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 None,
                 id,
                 project_path_hint,
+                project_path_hint,
                 Some(&resolved_settings),
                 Some(&non_plugin),
                 Some(&hooks),

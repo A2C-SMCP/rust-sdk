@@ -474,6 +474,46 @@ async fn conformance_preflight_diagnostic_anchor_uses_operation_path_82() {
     assert_eq!(skill_names(&comp.get_skills().await), before);
 }
 
+/// 合并视图（架构师复审 🟡5）：user=false、project=true → 有效 **enabled**；失败 MUST 包装 retained。
+#[tokio::test]
+async fn conformance_preflight_user_false_project_true_wraps_82() {
+    let td = TempDir::new().unwrap();
+    let env = xdg_env(&td);
+    let proj = td.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let comp = base_computer_with_config(&td, &env, &proj);
+    let record = add_and_install(&comp, &env, &td).await;
+    // add 之后写（引用守卫把任何 scope 的 enabledPlugins 键视为意图引用）。
+    write(
+        &user_settings_path(Some(&env)),
+        r#"{"enabledPlugins":{"audit@audit-mp":false}}"#,
+    );
+    write(
+        &workdir_project_settings_path(&proj),
+        r#"{"enabledPlugins":{"audit@audit-mp":true}}"#,
+    );
+    break_skills_only(&installed_root(&record));
+
+    let err = comp
+        .enable_plugin("audit@audit-mp", EnableOptions::default(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PluginInstallError::EnableFailedRetained { .. }),
+        "有效合并视图 user=false/project=true 为 enabled → 必须包装 retained：{err}"
+    );
+    assert_eq!(
+        raw_enabled(&user_settings_path(Some(&env)), "audit@audit-mp"),
+        Some(json!(false)),
+        "user=false 不得被更高 scope 的失败触碰"
+    );
+    assert_eq!(
+        project_enabled(&proj, "audit@audit-mp"),
+        Some(json!(true)),
+        "project=true 不得被回滚"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ④ 写后失败：prior-absent
 // ═══════════════════════════════════════════════════════════════════════════════
