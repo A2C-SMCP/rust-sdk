@@ -326,11 +326,13 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, Some(plugin), Some(marketplace)).await;
-            // #286：失败回滚的 §4.9.1-2 回收判据（同 disable）——MUST 在取 registry 写锁前由 Computer 供给。
+            // #286：写后失败对本次新挂做 §4.9.1-2 三档判定的「非用户声明」集（同 disable）——
+            // MUST 在取 registry 写锁前由 Computer 供给。
             let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
-            // #286 🟡4：运行期五层 settings（含 flag/policy）provider 供门控——失败回滚后才求值（🔴1）；
-            // 🟡D：记录缺 projectPath（rematerialize 后恒 scope=user）时以进程 cwd 作门控锚点（同 install 分支）。
-            let resolved_settings = || comp.resolved_runtime_settings(None);
+            // #286 🟡4：运行期五层 settings（含 flag/policy）provider 供失败诊断（pre∧post 合并视图），
+            // 并以**操作锚点**（cwd / 记录 projectPath）解析 project/local 层。
+            let resolved_settings =
+                |anchor: Option<&str>| comp.resolved_runtime_settings_at(None, anchor);
             let project_path_hint = cwd.as_deref().and_then(Path::to_str);
             let mut registry = reg_arc.write().await;
             let code = plugin_enable_with_paths(

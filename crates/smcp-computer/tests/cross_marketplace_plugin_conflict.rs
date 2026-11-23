@@ -159,7 +159,13 @@ async fn legacy_double_install_reconcile_reports_and_enable_fails_closed() {
         .enable_plugin("alpha@mp-b", EnableOptions::default(), None)
         .await
         .unwrap_err();
-    match err {
+    // 有效 prior-true（settings 已含 true）→ 失败 MUST 经 `EnableFailedRetained` 包装；剥壳后仍是
+    // NameConflict。先断言包装存在（防「删掉 ⓪ 分支 wrap」的变异逃逸）。
+    assert!(matches!(
+        err,
+        PluginInstallError::EnableFailedRetained { .. }
+    ));
+    match err.retained_source_deep() {
         PluginInstallError::NameConflict(e) => {
             assert!(matches!(e.kind, PluginNameConflictKind::Installed { .. }))
         }
@@ -170,9 +176,13 @@ async fn legacy_double_install_reconcile_reports_and_enable_fails_closed() {
         .enable_plugin("alpha@mp-a", EnableOptions::default(), None)
         .await
         .unwrap_err();
-    match err {
+    assert!(matches!(
+        err,
+        PluginInstallError::EnableFailedRetained { .. }
+    ));
+    match err.retained_source_deep() {
         PluginInstallError::NameConflict(e) => assert!(matches!(
-            e.kind,
+            &e.kind,
             PluginNameConflictKind::Installed { installed_pid } if installed_pid == "alpha@mp-b"
         )),
         other => panic!("expected NameConflict for winner, got {other:?}"),
