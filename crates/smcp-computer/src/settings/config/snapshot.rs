@@ -868,6 +868,7 @@ mod tests {
         mk.account.marketplaces.insert(
             "local".to_string(),
             KnownMarketplaceEntry {
+                manifest_name_baseline: None,
                 source: json!({"type": "git", "url": "https://example.com/mp.git"}),
                 extra: Map::new(),
             },

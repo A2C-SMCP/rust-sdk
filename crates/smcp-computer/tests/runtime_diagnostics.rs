@@ -88,6 +88,7 @@ fn seed_unreachable_marketplace(td: &TempDir) {
             file.account.marketplaces.insert(
                 "acme".to_string(),
                 smcp_computer::settings::KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": bad}),
                     extra: Map::new(),
                 },

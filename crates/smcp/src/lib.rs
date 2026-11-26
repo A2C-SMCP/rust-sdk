@@ -33,7 +33,7 @@ pub const SMCP_NAMESPACE: &str = "/smcp";
 ///
 /// 协议依据 / Protocol: `a2c-smcp-protocol` versioning.md。
 /// Python 参考 / Python reference: `a2c_smcp/smcp.py`。
-pub const PROTOCOL_VERSION: &str = "0.5.0";
+pub const PROTOCOL_VERSION: &str = "0.5.1";
 
 /// 标准错误码模块 / Standard error codes module
 ///

@@ -13,14 +13,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-a2c-smcp = { version = "0.1.0", features = ["agent", "computer"] }
+a2c-smcp = { version = "0.5.1", features = ["agent", "computer"] }
 ```
 
 Or use all features:
 
 ```toml
 [dependencies]
-a2c-smcp = { version = "0.1.0", features = ["full"] }
+a2c-smcp = { version = "0.5.1", features = ["full"] }
 ```
 
 ## 📦 Features
@@ -35,7 +35,7 @@ a2c-smcp = { version = "0.1.0", features = ["full"] }
 A2C-SMCP 协议规范已拆分为独立仓库，支持多语言 SDK 开发。
 
 - **协议仓库**: [a2c-smcp-protocol](https://github.com/A2C-SMCP/a2c-smcp-protocol)
-- **当前协议版本**: 0.1.2-rc1
+- **当前协议版本**: 0.5.1
 
 开发时参考路径：
 - 协议规范：`a2c-smcp-protocol/specification/`

@@ -66,7 +66,11 @@ use serde_json::{Map, Value};
 use crate::mcp_clients::bundle_id::resolve_bundle_id;
 use crate::mcp_clients::model::{BundleId, MCPServerConfig};
 use crate::settings::installer::materialize_plugin_record;
-use crate::settings::schema::SettingsScope;
+use crate::settings::reconciler::{declared_marketplaces, source_for_log, REASON_SOURCE_CONFLICT};
+use crate::settings::schema::{
+    sanitized_marketplace_error, SettingsScope, SettingsValidationError,
+    FIELD_EXTRA_KNOWN_MARKETPLACES,
+};
 use crate::settings::scope::EnvMap;
 use crate::settings::store::{
     load_installed_plugins, load_installed_plugins_intent, load_known_marketplaces,
@@ -77,10 +81,58 @@ use crate::skills::registry::SkillRegistry;
 use crate::skills::staging::{
     stage_marketplace_skills, MarketplaceStageOptions, DEFAULT_GIT_TIMEOUT,
 };
+use crate::skills::{compare_marketplace_sources, MarketplaceSourceRelation};
 
 // ===========================================================================
 // 恢复报告 / Recovery report
 // ===========================================================================
+/// 声明面 source 与已注册 source 冲突（§5.14「同名不同源」validation 拒绝）/ declared-vs-registered conflict。
+///
+/// boot 恢复检测到声明面给**已注册名**换源时产生：**声明变更被拒**（不静默沿用）、但恢复仍按**注册 source**
+/// 重建（旧能力保留）。**已存在 clone 树不 wipe、不按声明源重 clone**；clone 缺失时仍从注册 source
+/// clone。换源须显式 remove + re-add（§5.14 ④）。
+///
+/// ⚠️ 字段只存**脱敏展示值**（git URL 的 userinfo / query / fragment 已剥离；账本是不可信输入），
+/// **不可**用于身份比较——同源判定以原始 `source` 值为准。无法安全展示的形态（scp-like / 畸形 URL）
+/// 显示为 `<redacted-git-source>` 占位符。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MarketplaceSourceConflict {
+    /// 冲突的 marketplace 注册名 / marketplace registration name.
+    pub marketplace: String,
+    /// 已注册（保留生效）source 的脱敏展示值；scp-like / 畸形 URL → `<redacted-git-source>` /
+    /// redacted display of the registered (kept) source.
+    pub registered_source_display: String,
+    /// 声明面声明但被拒绝的 source 的脱敏展示值；scp-like / 畸形 URL → `<redacted-git-source>` /
+    /// redacted display of the declared (rejected) source.
+    pub declared_source_display: String,
+}
+
+/// 被 settings 校验整条丢弃的非法 `extraKnownMarketplaces` 声明（#295 残余 / python#293 语义）。
+///
+/// 校验语义不变（非法条目照旧丢弃、不阻断启动）；本结构只让「有声明但非法」在恢复报告中可见。
+/// 与 [`MarketplaceSourceConflict`] 正交：后者是**合法声明**给已注册名换源被拒；本结构是声明自身不可用
+/// （typo / 缺 `source` / 非 git URL），恢复仍按注册源，二者不重复计数。
+///
+/// ⚠️ `field` / `reason` 已经过脱敏（Git URL 凭据剥离）与控制字符清洗；`field` 保留
+/// `extraKnownMarketplaces.` 前缀，便于用户定位配置。`source_path` 为产生该错误的 settings 文件（可空）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MarketplaceDeclarationError {
+    /// 来源 scope（user / project / local / flag / policy）/ owning settings scope.
+    pub scope: SettingsScope,
+    /// 被丢弃声明的 marketplace 名（已脱敏）；顶层字段类型错误等无法定位单条时为 `None`。
+    ///
+    /// 与 python#293 的 `marketplace / scope / reason` 契约对齐，消费方无需解析 `field`。
+    pub marketplace: Option<String>,
+    /// 点路径（如 `extraKnownMarketplaces.my-mp.source.url`）；marketplace 名段已脱敏。
+    pub field: String,
+    /// 校验失败原因（已脱敏 + 控制字符清洗）/ sanitized validation reason.
+    pub reason: String,
+    /// 产生该错误的 settings 文件路径（可空）/ originating settings file, if known.
+    pub source_path: Option<String>,
+}
+
 /// 一次 [`recover_marketplace_skills`] + MCP 重挂的结果（观测 + 测试信号）/ Boot recovery report。
 ///
 /// `remounted_servers` 由编排方（[`Computer`](crate::computer::Computer)）在第二阶段填充——本模块的
@@ -102,6 +154,23 @@ pub struct GovernanceRecoveryReport {
     pub failed_marketplaces: Vec<String>,
     /// 显式 `enabledPlugins=false` 故**刻意跳过**的已装 plugin id（不复活）/ deliberately-skipped disabled。
     pub skipped_disabled: Vec<String>,
+    /// 声明面给已注册 marketplace 换源、**声明变更被拒**的冲突项（§5.14；#295）/ rejected declared source changes。
+    ///
+    /// 与 [`failed_marketplaces`](Self::failed_marketplaces) 正交，勿混用：`failed_marketplaces` 是「源不可达、
+    /// skills 未恢复」的降级；本字段是「声明被拒、旧注册仍按注册源恢复（旧能力 active）」——**不进入 degraded**。
+    pub marketplace_source_conflicts: Vec<MarketplaceSourceConflict>,
+    /// settings 校验阶段被整条丢弃的非法 `extraKnownMarketplaces` 声明（#295 残余 / python#293 语义）。
+    ///
+    /// 与 [`marketplace_source_conflicts`](Self::marketplace_source_conflicts) 正交、不重复计数；
+    /// 不改变校验丢弃语义、不进入 degraded。由编排方（`Computer::reconcile_governance`）从
+    /// `ResolvedSettings.errors` 填充；直接调用 [`recover_marketplace_skills`] 时恒空（该入口拿到的
+    /// `declared` 已过校验）。
+    ///
+    /// ⚠️ 语义为**实例解析视图**（user/project/local/flag/policy），但 **`SettingsScope::Flag` 的校验
+    /// 错误不进本字段**（v0.5.1 #248 合入后）：CLI 启动边界已单独打印 flag 校验错误，此处过滤防重复；
+    /// WARN 日志仍记录全量（含 Flag），非 CLI 嵌入方可直接调用 `resolve_settings` 取全量校验错误。
+    /// `reconcile_governance(declared=Some(...))` 的 overlay 可能已过滤，本字段不据此重算。
+    pub marketplace_declaration_errors: Vec<MarketplaceDeclarationError>,
     /// 账本缺记录、从 `installedPlugins` 意图**重物化派生缓存成功**的 enabled plugin id（§63）/ rebuilt from intent。
     pub rematerialized_plugins: Vec<String>,
     /// 账本缺记录但**重物化失败**（源不可达等）的 enabled plugin id（降级、未阻断其余）/ degraded rematerialize。
@@ -118,6 +187,55 @@ pub struct GovernanceRecoveryReport {
     /// [`Computer::list_pending_bundled_approvals`](crate::computer::Computer::list_pending_bundled_approvals)
     /// （独立现算）。
     pub pending_bundled_servers: Vec<BundledServerRecord>,
+}
+
+/// 从 settings 校验错误中筛出 `extraKnownMarketplaces` 声明错误并脱敏 / collect declaration errors.
+///
+/// 只读纯函数：不改变校验语义（非法条目仍在校验期被丢弃）。`validate_settings` 出口已对同类错误
+/// 统一脱敏；本函数再经 [`sanitized_marketplace_error`] 处理一次（幂等），覆盖手工构造的错误。
+pub(crate) fn marketplace_declaration_errors(
+    errors: &[SettingsValidationError],
+) -> Vec<MarketplaceDeclarationError> {
+    errors
+        .iter()
+        .filter_map(sanitize_marketplace_declaration_error)
+        .collect()
+}
+
+/// 单条 settings 校验错误 → 脱敏 DTO；非 `extraKnownMarketplaces` 字段返回 `None`。
+///
+/// CLI 的所有校验错误呈现面（`format_settings_errors`）也复用它，保证 `settings show/get`、
+/// boot 批准流程、治理重挂 flag 错误打印与新恢复报告使用**同一脱敏口径**。
+pub(crate) fn sanitize_marketplace_declaration_error(
+    error: &SettingsValidationError,
+) -> Option<MarketplaceDeclarationError> {
+    let sanitized = sanitized_marketplace_error(error)?;
+    Some(MarketplaceDeclarationError {
+        scope: sanitized.scope,
+        marketplace: declaration_marketplace(&sanitized.field, &sanitized.reason),
+        field: sanitized.field,
+        reason: sanitized.reason,
+        source_path: sanitized.source_path,
+    })
+}
+
+/// 从脱敏后的字段路径解析 marketplace 名（`extraKnownMarketplaces.<name>[.source*|.autoUpdate]`）。
+///
+/// 名称非法时校验器只记 `<name>`（无后缀），此时**整个剩余段**就是名称——不能按后缀启发式切分
+/// （非法名本身可能是 `acme.source.url`）。合法名的字段才剥离已知完整后缀（最长优先）。
+/// 无法解析（顶层字段类型错误）返回 `None`。
+fn declaration_marketplace(field: &str, reason: &str) -> Option<String> {
+    let rest = field
+        .strip_prefix(FIELD_EXTRA_KNOWN_MARKETPLACES)?
+        .strip_prefix('.')?;
+    if reason.starts_with("marketplace name must be strict kebab") {
+        return (!rest.is_empty()).then(|| rest.to_string());
+    }
+    let name = [".source.url", ".source.type", ".source", ".autoUpdate"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))
+        .unwrap_or(rest);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 // ===========================================================================
@@ -183,6 +301,12 @@ pub fn plugin_enabled_origin(
 /// marketplace 分组启用 plugin，逐 marketplace 经 [`stage_marketplace_skills`]（`refresh = false`、
 /// `plugin_filter = 启用 plugin 名`、`recorder = None` 不改账本）重挂。enabled 门控见模块文档。
 ///
+/// **声明面换源检测（#295，§5.14）**：`declared` 中的 `extraKnownMarketplaces` 与 `known_marketplaces`
+/// 的注册 source 比对；给已注册名换源者**拒绝声明变更**、记入
+/// [`GovernanceRecoveryReport::marketplace_source_conflicts`]，恢复仍按注册 source（旧能力保留）。
+/// ⚠️ 调用方传入的 `declared` 需含 `extraKnownMarketplaces` 才会产生该诊断；只传 `enabledPlugins`
+/// 时换源声明仍被忽略且不报告。
+///
 /// **持锁契约**：调用方持 `skill_registry` 写锁传入 `&mut SkillRegistry`；本函数内 stage 含 git await，写锁
 /// 跨 await（与 install/enable/refresh 同构，boot 期无并发故安全）。MCP server 重挂**不**在此（见
 /// [`collect_enabled_bundled_servers`]），以便调用方释放写锁后再经 hooks 重挂、断开 ABBA。
@@ -214,6 +338,43 @@ pub async fn recover_marketplace_skills(
         let bucket = by_marketplace.entry(marketplace.to_string()).or_default();
         bucket.0.insert(plugin.to_string());
         bucket.1.push(pid.clone());
+    }
+
+    // ==== §5.14 / #295：声明面换源检测 ==================================================
+    // boot 恢复按**注册 source** 重建旧运行态（= 保留旧能力）；声明面给已注册名换源属 §5.14「同名不同源
+    // 注册」→ **拒绝声明变更**并结构化报告（不静默沿用旧源），恢复动作保持不变。
+    // 检测范围 = declared ∩ known **全量**（不只 enabled 分组——reconcile() 当前无生产调用点，
+    // disabled-only 的声明冲突否则无人报告）。同源判定与 #272 注册面一致：`Same` 才算同源，
+    // `Unverifiable`（含写法不同 / 形态非法）一律 fail-closed 视为冲突。`reconcile()` 已统一到
+    // 同一谓词（#267），两条入口对「可证明等价写法」的裁决一致。
+    for (name, decl) in &declared_marketplaces(declared) {
+        let Some(record) = known.marketplaces.get(name) else {
+            // 未注册的声明 → 非「同名不同源」，归 reconcile 的 missing 分支（boot 不 clone 新源）。
+            continue;
+        };
+        let declared_source = decl.get("source").cloned().unwrap_or(Value::Null);
+        if compare_marketplace_sources(&record.source, &declared_source)
+            == MarketplaceSourceRelation::Same
+        {
+            continue;
+        }
+        let registered_display = source_for_log(&record.source);
+        let declared_display = source_for_log(&declared_source);
+        tracing::warn!(
+            marketplace = %name,
+            reason = REASON_SOURCE_CONFLICT,
+            registered_source = %registered_display,
+            declared_source = %declared_display,
+            "recover: declared marketplace source rejected (§5.14, keeping registered source; \
+             remove + re-add the marketplace to switch sources)"
+        );
+        report
+            .marketplace_source_conflicts
+            .push(MarketplaceSourceConflict {
+                marketplace: name.clone(),
+                registered_source_display: registered_display,
+                declared_source_display: declared_display,
+            });
     }
 
     for (marketplace, (plugin_names, pids)) in &by_marketplace {
@@ -436,7 +597,52 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber;
+
+    // ---- 日志捕获（结构化 WARN 断言）/ captured logs ---------------------------
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `(捕获器, subscriber)`：`fut.with_subscriber(sub).await` 后读 [`CapturedLogs::contents`]。
+    fn capture_subscriber() -> (
+        CapturedLogs,
+        impl tracing::Subscriber + Send + Sync + 'static,
+    ) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        (logs, subscriber)
+    }
 
     fn git(args: &[&str], cwd: &Path) {
         let out = Command::new("git")
@@ -460,17 +666,22 @@ mod tests {
 
     /// 构造 marketplace 源 git 仓库（audit plugin：1 skill + 1 bundled server）→ 返回 git source。
     fn build_source_repo(repo: &Path) -> Value {
+        build_source_repo_with_desc(repo, "review code")
+    }
+
+    /// 指定 SKILL 描述的 marketplace 源仓库（多源用例区分内容归属）/ marketplace repo with custom desc。
+    fn build_source_repo_with_desc(repo: &Path, desc: &str) -> Value {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+            r#"{"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
         )
         .unwrap();
         let skill = repo.join("plugins/audit/skills/code-review");
         fs::create_dir_all(&skill).unwrap();
         fs::write(
             skill.join("SKILL.md"),
-            "---\nname: code-review\ndescription: review code\n---\nbody",
+            format!("---\nname: code-review\ndescription: {desc}\n---\nbody"),
         )
         .unwrap();
         let sd = repo.join("plugins/audit/mcp-servers");
@@ -513,6 +724,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: src_clone,
                         extra: Map::new(),
                     },
@@ -753,6 +965,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": bad}),
                         extra: Map::new(),
                     },
@@ -886,6 +1099,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": bad}),
                         extra: Map::new(),
                     },
@@ -956,6 +1170,466 @@ mod tests {
         let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
         assert_eq!(report, GovernanceRecoveryReport::default());
         assert!(collect_enabled_bundled_servers(&home, None, &declared).is_empty());
+    }
+
+    // ==== #295：声明面换源 → 拒绝声明变更、仍按注册源恢复旧能力、结构化报告 ==========
+
+    /// declared 视图附加 `extraKnownMarketplaces` 声明 / attach a marketplace declaration。
+    fn declared_with_marketplace(
+        mut declared: Map<String, Value>,
+        name: &str,
+        source: Value,
+    ) -> Map<String, Value> {
+        let mut entry = Map::new();
+        entry.insert("source".to_string(), source);
+        let mut mps = Map::new();
+        mps.insert(name.to_string(), Value::Object(entry));
+        declared.insert("extraKnownMarketplaces".to_string(), Value::Object(mps));
+        declared
+    }
+
+    /// 期望的脱敏展示值 / expected redacted display for a source url。
+    fn display_of(source: &Value) -> String {
+        crate::settings::redaction::git_url_for_display(source["url"].as_str().unwrap())
+    }
+
+    /// #267：只筛 `extraKnownMarketplaces` 声明错误；前缀保留、子串脱敏、控制字符清洗。
+    #[test]
+    fn marketplace_declaration_errors_filter_redact_and_scrub() {
+        let secret = "https://user:PW_SECRET@example.com/repo.git";
+        let errors = vec![
+            SettingsValidationError {
+                scope: SettingsScope::User,
+                field: "enabledPlugins.good@mp".to_string(),
+                reason: "unrelated".to_string(),
+                source_path: None,
+            },
+            SettingsValidationError {
+                scope: SettingsScope::Project,
+                field: format!("extraKnownMarketplaces.{secret}.source.url"),
+                reason: format!("malformed git url: {secret}"),
+                source_path: Some("/tmp/settings.json".to_string()),
+            },
+            SettingsValidationError {
+                scope: SettingsScope::User,
+                field: "extraKnownMarketplaces.evil\u{202E}gnp.exe\u{2028}FAKE".to_string(),
+                reason: "expected object, got array\nFAKE_LINE\u{1b}[31m\u{202E}REV".to_string(),
+                source_path: None,
+            },
+        ];
+        let got = marketplace_declaration_errors(&errors);
+        assert_eq!(got.len(), 2, "非 marketplace 字段必须被过滤：{got:?}");
+        assert_eq!(got[0].scope, SettingsScope::Project);
+        assert!(
+            got[0].field.starts_with("extraKnownMarketplaces."),
+            "前缀必须保留：{:?}",
+            got[0].field
+        );
+        assert!(!got[0].field.contains("PW_SECRET"), "{:?}", got[0].field);
+        assert!(!got[0].reason.contains("PW_SECRET"), "{:?}", got[0].reason);
+        assert_eq!(got[0].source_path.as_deref(), Some("/tmp/settings.json"));
+        // 结构化 marketplace 名（python#293 契约）：已脱敏、无需消费方解析 field。
+        let name = got[0].marketplace.as_deref().expect("marketplace name");
+        assert!(name.contains("example.com"), "{name:?}");
+        assert!(!name.contains("PW_SECRET"), "{name:?}");
+        // 字段侧同样清洗：bidi 覆写 / 行分隔 / 换行 / ESC 全部替换为空格。
+        assert!(
+            got[1].field.starts_with("extraKnownMarketplaces."),
+            "{:?}",
+            got[1].field
+        );
+        let evil_name = got[1].marketplace.as_deref().expect("marketplace name");
+        for needle in ['\u{202E}', '\u{2028}', '\n', '\u{1b}'] {
+            assert!(
+                !got[1].field.contains(needle),
+                "field 未清洗 {needle:?}：{:?}",
+                got[1].field
+            );
+            assert!(
+                !got[1].reason.contains(needle),
+                "reason 未清洗 {needle:?}：{:?}",
+                got[1].reason
+            );
+            assert!(
+                !evil_name.contains(needle),
+                "marketplace 未清洗 {needle:?}：{evil_name:?}"
+            );
+        }
+        // 单条入口与非 marketplace 返回 None 亦钉死（CLI 共享口径）。
+        assert!(sanitize_marketplace_declaration_error(&errors[0]).is_none());
+        assert!(sanitize_marketplace_declaration_error(&errors[2]).is_some());
+        // 顶层字段类型错误无法定位单条 marketplace → None。
+        let top_level = SettingsValidationError {
+            scope: SettingsScope::User,
+            field: "extraKnownMarketplaces".to_string(),
+            reason: "expected object, got array".to_string(),
+            source_path: None,
+        };
+        assert_eq!(
+            sanitize_marketplace_declaration_error(&top_level)
+                .expect("top-level declaration error")
+                .marketplace,
+            None
+        );
+        // 非法名恰好形如 `acme.source.url`：名称错误 reason 分支 → 整个剩余段是名称（不按后缀切分）。
+        let dotted_invalid = SettingsValidationError {
+            scope: SettingsScope::User,
+            field: "extraKnownMarketplaces.acme.source.url".to_string(),
+            reason: "marketplace name must be strict kebab (1-64)".to_string(),
+            source_path: None,
+        };
+        assert_eq!(
+            sanitize_marketplace_declaration_error(&dotted_invalid)
+                .expect("invalid-name declaration error")
+                .marketplace
+                .as_deref(),
+            Some("acme.source.url")
+        );
+        // 合法名的 source.url 错误仍剥离已知后缀。
+        let valid_source = SettingsValidationError {
+            scope: SettingsScope::User,
+            field: "extraKnownMarketplaces.acme.source.url".to_string(),
+            reason: "malformed git url".to_string(),
+            source_path: None,
+        };
+        assert_eq!(
+            sanitize_marketplace_declaration_error(&valid_source)
+                .expect("valid-name declaration error")
+                .marketplace
+                .as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_declared_source_change_keeps_registered_source() {
+        let tmp = TempDir::new().unwrap();
+        let (home, source_a) = setup_installed(&tmp).await;
+        // 另一个可 clone 的仓库（不同 URL / 不同内容）：若被误用，clone 与描述都会变。
+        let source_b = build_source_repo_with_desc(&tmp.path().join("repo-b"), "from B");
+
+        // 哨兵：冲突不得 wipe 旧 clone 树（只读不删）。
+        let clone_dir = marketplace_skill_dir(&home, "acme", &[]);
+        fs::write(clone_dir.join("SENTINEL"), b"keep").unwrap();
+
+        let mut fresh = SkillRegistry::new();
+        let declared =
+            declared_with_marketplace(declared_enabled(&["audit@acme"]), "acme", source_b.clone());
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        // 声明变更被拒 → 结构化冲突（脱敏展示值），不混入 failed（旧能力已恢复，非降级）。
+        assert_eq!(
+            report.marketplace_source_conflicts,
+            vec![MarketplaceSourceConflict {
+                marketplace: "acme".to_string(),
+                registered_source_display: display_of(&source_a),
+                declared_source_display: display_of(&source_b),
+            }]
+        );
+        assert!(report.failed_marketplaces.is_empty());
+        assert_eq!(report.restored_plugins, vec!["audit@acme".to_string()]);
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        // 旧能力：内容仍是注册源 A。
+        assert_eq!(
+            fresh.resolve("audit:code-review").unwrap().description,
+            "review code"
+        );
+        // 旧物化：clone 树未被 wipe / 未换源（仍是 A 的内容；哨兵仍在）。
+        assert!(
+            clone_dir.join("SENTINEL").exists(),
+            "声明冲突不得 wipe 旧 clone 树"
+        );
+        let skill_md = clone_dir.join("plugins/audit/skills/code-review/SKILL.md");
+        assert!(fs::read_to_string(skill_md)
+            .unwrap()
+            .contains("review code"));
+    }
+
+    /// 关键变异杀：clone 丢失时恢复必须从**注册源**重 clone（而非声明源）。
+    ///
+    /// clone 存在时 `stage_marketplace_skills`（refresh=false）只复用旧树、不校验 source，
+    /// 「stage 误用声明源」的变异在 clone 存在用例下不可见，故必须删树复跑。
+    #[tokio::test]
+    async fn recover_conflict_reclones_from_registered_source_when_clone_missing() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _source_a) = setup_installed(&tmp).await;
+        let source_b = build_source_repo_with_desc(&tmp.path().join("repo-b"), "from B");
+        // 模拟旧物化丢失（clone 树被删）：恢复应从账本注册源重 clone。
+        fs::remove_dir_all(marketplace_skill_dir(&home, "acme", &[])).unwrap();
+
+        let mut fresh = SkillRegistry::new();
+        let declared =
+            declared_with_marketplace(declared_enabled(&["audit@acme"]), "acme", source_b);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        // 来自注册源 A（不是被拒绝的声明源 B）。
+        assert_eq!(
+            fresh.resolve("audit:code-review").unwrap().description,
+            "review code"
+        );
+        let skill_md = marketplace_skill_dir(&home, "acme", &[])
+            .join("plugins/audit/skills/code-review/SKILL.md");
+        let content = fs::read_to_string(skill_md).unwrap();
+        assert!(content.contains("review code"));
+        assert!(!content.contains("from B"), "不得从被拒声明源 clone");
+    }
+
+    #[tokio::test]
+    async fn recover_same_declared_source_reports_no_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let (home, source_a) = setup_installed(&tmp).await;
+
+        let mut fresh = SkillRegistry::new();
+        let declared =
+            declared_with_marketplace(declared_enabled(&["audit@acme"]), "acme", source_a);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert!(report.marketplace_source_conflicts.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+    }
+
+    /// 检测范围含「已注册但从未安装」：intent 无任何 pid 也须报告声明冲突、且零恢复。
+    #[tokio::test]
+    async fn recover_known_but_uninstalled_marketplace_reports_source_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let source_a = build_source_repo(&tmp.path().join("repo"));
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        // catalog 物化 + 写 known（**不** install：installedPlugins 意图为空）。
+        let mut throwaway = SkillRegistry::new();
+        stage(
+            "acme",
+            &source_a,
+            &mut throwaway,
+            &home,
+            MarketplaceStageOptions {
+                refresh: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let src_clone = source_a.clone();
+        update_known_marketplaces(
+            move |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
+                        source: src_clone,
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+        let source_b = build_source_repo_with_desc(&tmp.path().join("repo-b"), "from B");
+
+        let mut fresh = SkillRegistry::new();
+        let declared = declared_with_marketplace(Map::new(), "acme", source_b);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert!(report.failed_marketplaces.is_empty());
+        assert!(report.restored_plugins.is_empty());
+        assert!(report.restored_skills.is_empty());
+        assert!(fresh.is_empty());
+    }
+
+    /// 同源判定经 canonicalize（trim）：等价写法不报冲突——钉 #272 谓词（杀「严格 JSON 相等」变异）。
+    #[tokio::test]
+    async fn recover_equivalent_declared_source_reports_no_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let (home, source_a) = setup_installed(&tmp).await;
+        let padded = json!({
+            "type": "git",
+            "url": format!("  {}  ", source_a["url"].as_str().unwrap()),
+        });
+
+        let mut fresh = SkillRegistry::new();
+        let declared = declared_with_marketplace(declared_enabled(&["audit@acme"]), "acme", padded);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert!(report.marketplace_source_conflicts.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_undeclared_marketplace_reports_no_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _source_a) = setup_installed(&tmp).await;
+
+        let mut fresh = SkillRegistry::new();
+        // 无 `extraKnownMarketplaces` 键（纯命令式 add 的常态）→ 无从冲突。
+        let declared = declared_enabled(&["audit@acme"]);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert!(report.marketplace_source_conflicts.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+    }
+
+    /// 检测范围为 declared ∩ known 全量：plugin 全 disabled（不 stage）也须报告声明冲突。
+    #[tokio::test]
+    async fn recover_disabled_only_marketplace_still_reports_source_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _source_a) = setup_installed(&tmp).await;
+        let source_b = build_source_repo_with_desc(&tmp.path().join("repo-b"), "from B");
+
+        let mut fresh = SkillRegistry::new();
+        // 无 enabledPlugins → pid 落 skipped_disabled，不 stage；但声明冲突仍须可见。
+        let declared = declared_with_marketplace(Map::new(), "acme", source_b);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert_eq!(
+            report.marketplace_source_conflicts[0].marketplace,
+            "acme".to_string()
+        );
+        assert_eq!(report.skipped_disabled, vec!["audit@acme".to_string()]);
+        assert!(report.restored_skills.is_empty());
+        assert!(fresh.is_empty());
+    }
+
+    /// 声明条目缺 `source` 键 → 声明 = Null，无法证明同源 → fail-closed 记冲突（对齐 #294）。
+    #[tokio::test]
+    async fn recover_conflict_fail_closed_when_declared_source_missing() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _source_a) = setup_installed(&tmp).await;
+
+        let mut fresh = SkillRegistry::new();
+        let mut declared = declared_enabled(&["audit@acme"]);
+        declared.insert("extraKnownMarketplaces".to_string(), json!({ "acme": {} }));
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+    }
+
+    /// 报告字段只存脱敏展示值：URL 内嵌 userinfo 不得经字段 / Debug 泄露。
+    #[tokio::test]
+    async fn recover_conflict_display_is_redacted() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _source_a) = setup_installed(&tmp).await;
+
+        let mut fresh = SkillRegistry::new();
+        let secret = json!({"type": "git", "url": "https://user:sekret@example.com/acme.git"});
+        let declared = declared_with_marketplace(declared_enabled(&["audit@acme"]), "acme", secret);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        let conflict = &report.marketplace_source_conflicts[0];
+        for shown in [
+            &conflict.declared_source_display,
+            &conflict.registered_source_display,
+        ] {
+            assert!(!shown.contains("sekret"), "凭据泄露：{shown}");
+            assert!(!shown.contains('@'), "userinfo 未剥离：{shown}");
+        }
+        assert!(
+            !format!("{report:?}").contains("sekret"),
+            "Debug 输出不得含凭据"
+        );
+    }
+
+    /// 双侧脱敏 + 结构化 WARN：注册侧（账本，不可信输入）与声明侧带凭据 URL 都必须脱敏；
+    /// WARN 必须携 `reason=marketplace_source_conflict` 供统一检索。
+    #[tokio::test]
+    async fn recover_conflict_redacts_both_sides_and_warn_is_structured() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _source_a) = setup_installed(&tmp).await;
+        // 覆盖账本：注册侧（不可信输入）与声明侧都带 userinfo 凭据。
+        update_known_marketplaces(
+            move |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
+                        source: json!({
+                            "type": "git",
+                            "url": "https://reg-user:reg-sekret@example.com/acme.git"
+                        }),
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(&home),
+            None,
+        )
+        .unwrap();
+
+        let mut fresh = SkillRegistry::new();
+        let declared = declared_with_marketplace(
+            declared_enabled(&["audit@acme"]),
+            "acme",
+            json!({"type": "git", "url": "https://dec-user:dec-sekret@example.com/other.git"}),
+        );
+        let (logs, subscriber) = capture_subscriber();
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared)
+            .with_subscriber(subscriber)
+            .await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        let conflict = &report.marketplace_source_conflicts[0];
+        for shown in [
+            &conflict.registered_source_display,
+            &conflict.declared_source_display,
+        ] {
+            assert!(!shown.contains("sekret"), "凭据泄露：{shown}");
+            assert!(!shown.contains('@'), "userinfo 未剥离：{shown}");
+        }
+        assert!(!format!("{report:?}").contains("sekret"), "Debug 泄露");
+
+        let text = logs.contents();
+        assert!(
+            text.contains("marketplace_source_conflict"),
+            "WARN 缺结构化 reason：{text}"
+        );
+        assert!(text.contains("recover:"), "WARN 消息前缀缺失：{text}");
+        assert!(!text.contains("sekret"), "tracing 日志不得含凭据：{text}");
+    }
+
+    /// 冲突 + 注册源不可达（clone 丢失且源仓库已删）→ conflict 与 failed 并存、不 panic。
+    #[tokio::test]
+    async fn recover_conflict_when_registered_source_unreachable() {
+        let tmp = TempDir::new().unwrap();
+        let (home, source_a) = setup_installed(&tmp).await;
+        let source_b = build_source_repo_with_desc(&tmp.path().join("repo-b"), "from B");
+        // 删旧物化 + 删源仓库 → 注册源不可达。
+        fs::remove_dir_all(marketplace_skill_dir(&home, "acme", &[])).unwrap();
+        let repo_path = PathBuf::from(
+            source_a["url"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("file://"),
+        );
+        fs::remove_dir_all(repo_path).unwrap();
+
+        let mut fresh = SkillRegistry::new();
+        let declared =
+            declared_with_marketplace(declared_enabled(&["audit@acme"]), "acme", source_b);
+        let report = recover_marketplace_skills(&mut fresh, &home, None, &declared).await;
+
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert_eq!(report.failed_marketplaces, vec!["acme".to_string()]);
+        assert!(report.restored_plugins.is_empty());
+        assert!(fresh.is_empty());
     }
 
     /// 建启用意图 declared map：`{"enabledPlugins": {pid: true, ...}}`（v0.3.0：absent 不再默认启用）/ enabled declared。
@@ -1227,7 +1901,7 @@ mod tests {
         fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins":[{"name":"audit","source":"./plugins/audit"},{"name":"lint","source":"./plugins/lint"}]}"#,
+            r#"{"name":"acme","plugins":[{"name":"audit","source":"./plugins/audit"},{"name":"lint","source":"./plugins/lint"}]}"#,
         )
         .unwrap();
         for p in ["audit", "lint"] {
@@ -1261,6 +1935,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "acme".to_string(),
                     crate::settings::reconciler::KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: src_clone,
                         extra: Map::new(),
                     },

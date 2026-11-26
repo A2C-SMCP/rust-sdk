@@ -16,14 +16,14 @@
 //!
 //! ```toml
 //! [dependencies]
-//! a2c-smcp = { version = "0.1.0", features = ["agent", "computer"] }
+//! a2c-smcp = { version = "0.5.1", features = ["agent", "computer"] }
 //! ```
 //!
 //! ## Example
 //!
 //! ```rust,no_run,ignore
 //! // Add features to your Cargo.toml:
-//! // a2c-smcp = { version = "0.1.0", features = ["agent", "computer"] }
+//! // a2c-smcp = { version = "0.5.0", features = ["agent", "computer"] }
 //!
 //! #[cfg(feature = "agent")]
 //! use a2c_smcp::agent::SmcpAgent;

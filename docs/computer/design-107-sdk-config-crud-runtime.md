@@ -281,7 +281,7 @@ S6 ──> S8 连接态 → robot capability 同步(revision 驱动 server:updat
 
 ## 12. 风险 / 待议
 
-- **R1 多 scope remove 策略**：✅ **已拍板（#109）**=删**所有可写 scope**（真删干净）；origin=policy/flag → `ReadOnlyOrigin` 硬错（非 partial）。✅ **执行器已落地（#110，`config/executor.rs`）**：no-change 判定用**精确语义比对**（`is_no_change`/`strip_fresh_scaffold`——只剥「本次写新物化、且在 existing 缺失/非对象」的空对象脚手架，**不**对称剥两侧，故既不凭空建 `{"servers":{}}`、也不误跳磁盘上空对象值 server 的真实删除）。多文件 fan-out 落盘前加 pre-flight 只读探测（corrupt/IO），收窄半落盘窗口。
+- **R1 多 scope remove 策略**：✅ **已拍板（#109）**=删**所有可写 scope**（真删干净）；origin=policy/flag → `ReadOnlyOrigin` 硬错（非 partial）。✅ **执行器已落地（#110，`config/executor.rs`）**：no-change 判定用**精确语义比对**（`is_no_change`/`strip_fresh_scaffold`——只剥「本次写新物化、且在 existing 缺失/非对象」的空对象脚手架，**不**对称剥两侧，故既不凭空建 `{"servers":{}}`、也不误跳磁盘上空对象值 server 的真实删除）。多文件 fan-out 落盘前加 pre-flight 只读探测（corrupt/IO），收窄半落盘窗口。**#292（v0.5.1）**：pre-flight 扩展为目标容器畸形校验（逐层 object 容器 + string-set 非数组，复用 `settings/raw_write` guard，映射既有 `CorruptTarget`）；project `readRoots` A+ 对齐（保留 + WARN，显式 Set/Delete 忽略、旧键保留）；`crud::save_config`/export/migrate 保持文档化例外。
 - **R2 revision 语义**：✅ **已拍板并落地（#114 S7）**=**分离**两个独立单调计数（`config_revision` ⊥ `capability_revision`），因 config 改不一定改 capability（如 disable 一个本未激活的 server）。`status.rs` 的 `RuntimeStatus` 各持一个 `AtomicU64`；capability 于 boot / MCP start·stop bump，config 于 S6 mutate 落盘 bump。
 - **R3 value_store 退役的兼容**：✅ **已拍板（#112，用户决策=硬退役）**=删 `inputs/value_store.rs` 读写，旧 `input-values.json` 残留**孤儿化**（不再读取）。「无损迁移」验收项**显式豁免**（换取代码零残留 + 立即停止明文依赖）；升级迁移路径=用户经 `RuntimeOptions.input_resolver` 或 env `A2C_SMCP_<ENV_SEGMENT(id)>` 重新提供该值。`secret_store.rs`（keyring，加密非明文）**保留**为 `KeyringSecretResolver`（opt-in secret resolver），非退役目标。
 - **R4 duplicate/import 跨机**：协议 §5.8「install path 非权威、boot 重校验」——duplicate 到新 `config_dir` 后物化账本须重建，不可照搬 installPath。

@@ -84,7 +84,7 @@ pub fn subcommands(ns: &str) -> &'static [&'static str] {
         "inputs" => &[
             "load", "add", "update", "rm", "remove", "get", "list", "value",
         ],
-        "marketplace" => &["add", "list", "info", "remove", "refresh", "set"],
+        "marketplace" => &["add", "list", "info", "remove", "refresh", "set", "migrate"],
         "plugin" => &[
             "install",
             "uninstall",
@@ -109,6 +109,13 @@ pub fn flags_for(ns: &str, sub: &str) -> &'static [&'static str] {
         ("marketplace", "add") => &["--name", "--trust", "--auto-update", "--no-clone", "--json"],
         ("marketplace", "list" | "info" | "refresh" | "set") => &["--json"],
         ("marketplace", "remove") => &["--keep-plugins", "--json"],
+        ("marketplace", "migrate") => &[
+            "--apply",
+            "--update-declarations",
+            "--resume",
+            "--rollback",
+            "--json",
+        ],
         ("skill", "list") => &["--source", "--json"],
         ("skill", "info") => &["--json"],
         ("plugin", "install") => &["--version", "--scope", "--json"],
@@ -160,7 +167,7 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
         "marketplace" => &[
             (
                 "marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]",
-                "添加 marketplace（首次 y/N trust）/ add",
+                "添加 marketplace（注册名取清单 name；--name 仅作期望名校验；首次 y/N trust）/ add",
             ),
             ("marketplace list [--json]", "列出已知 marketplace / list"),
             (
@@ -178,6 +185,10 @@ fn namespace_commands(ns: &str) -> &'static [(&'static str, &'static str)] {
             (
                 "marketplace set <name> auto-update=<bool>",
                 "设置 per-source auto-update / set flag",
+            ),
+            (
+                "marketplace migrate [--apply] [--update-declarations] [--resume] [--rollback <ts>]",
+                "存量注册名迁移（默认 dry-run；离线：先停 Computer）/ migrate legacy names",
             ),
         ],
         "plugin" => &[

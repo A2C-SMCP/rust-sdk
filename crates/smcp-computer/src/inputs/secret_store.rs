@@ -19,7 +19,9 @@
 //! 平台编译为 always-unavailable stub。运行期再经 [`keyring_available`] 探测后端（容器 / CI / 无 Secret
 //! Service → 不可用），不可用时 [`SecretStore`] `get→None` / `set→false`（**绝不**降级落明文，§9.3）。
 //!
-//! 键空间：service=`a2c-computer`、key=**全局 `<id>`**（与「Input id 全局唯一」一致）。
+//! 键空间：service=`a2c-computer`、key 由调用方传入——plugin-scoped input 的解析后 id 为
+//! `<plugin>@<marketplace>/<id>`（见 `inputs::plugin_pool::prefix_input_id` 与 `inputs::resolver`），
+//! 全局裸 id `<id>` 仅用于无 plugin 上下文；本模块不自行拼键。
 //!
 //! 可测试性：[`SecretStore`] 持可注入的 [`KeyringBackend`]（真实 [`OsKeyring`] / 测试用内存 fake /
 //! always-unavailable），令降级与命中两条路径均可确定性单测、不碰真实钥匙串。

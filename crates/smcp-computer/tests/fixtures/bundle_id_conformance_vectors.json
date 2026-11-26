@@ -23,6 +23,15 @@
     {"desc": "空名 → fallback（streamable http，headers 纳入）", "name": "", "config": {"type": "streamable", "url": "https://api.example.com/mcp", "headers": {"Authorization": "Bearer z"}}, "expected_bundle_id": "bundle_0706e7b45613df7a"},
     {"desc": "空名 → fallback（sse，与同 url 的 http 因 type 判别符不同而不同）", "name": "", "config": {"type": "sse", "url": "https://api.example.com/sse", "headers": {}}, "expected_bundle_id": "bundle_e1d7b1216a270815"},
     {"desc": "无名 + stdio env 含 ${input:*} 占位 → fallback 取 raw（占位字面，MUST NOT 渲染；渲染实现会得不同值）", "name": "", "config": {"type": "stdio", "command": "node", "args": ["server.js"], "env": {"API_KEY": "${input:api_key}"}}, "expected_bundle_id": "bundle_68ae00fea9122c01"},
-    {"desc": "无名 + http header 含 ${input:*} 占位 → fallback 取 raw（占位字面）", "name": "", "config": {"type": "streamable", "url": "https://api.example.com/mcp", "headers": {"Authorization": "Bearer ${input:token}"}}, "expected_bundle_id": "bundle_6366b4fd89f56f6a"}
+    {"desc": "无名 + http header 含 ${input:*} 占位 → fallback 取 raw（占位字面）", "name": "", "config": {"type": "streamable", "url": "https://api.example.com/mcp", "headers": {"Authorization": "Bearer ${input:token}"}}, "expected_bundle_id": "bundle_6366b4fd89f56f6a"},
+    {"desc": "裁首部 '-'（trim [_-] 不只 '_'）", "name": "-lead", "config": {"type": "stdio", "command": "x", "args": [], "env": {}}, "expected_bundle_id": "lead"},
+    {"desc": "裁尾部 '-'", "name": "trail-", "config": {"type": "stdio", "command": "x", "args": [], "env": {}}, "expected_bundle_id": "trail"},
+    {"desc": "首尾 '-_' 混合裁剪", "name": "-_x_-", "config": {"type": "stdio", "command": "x", "args": [], "env": {}}, "expected_bundle_id": "x"},
+    {"desc": "显式 bundle_id 原样采用（不裁剪首尾 '_'）", "name": "whatever", "config": {"type": "stdio", "command": "x", "args": [], "env": {}, "bundle_id": "_custom"}, "expected_bundle_id": "_custom"},
+    {"desc": "无名 + args 保序（['b','a'] 不得排序）", "name": "", "config": {"type": "stdio", "command": "x", "args": ["b", "a"], "env": {}}, "expected_bundle_id": "bundle_3ee6b893b908ffac"},
+    {"desc": "无名 + args 对照（已排序 ['a','b']，与上条哈希不同）", "name": "", "config": {"type": "stdio", "command": "x", "args": ["a", "b"], "env": {}}, "expected_bundle_id": "bundle_b7fa4ce988ca0e0b"},
+    {"desc": "replace 后折叠：连续非法字符 → 单个 '_'（顺序不可反）", "name": "a!!b", "config": {"type": "stdio", "command": "x", "args": [], "env": {}}, "expected_bundle_id": "a_b"},
+    {"desc": "显式 bundle_id 原样采用（不裁剪首尾 '-'）", "name": "whatever", "config": {"type": "stdio", "command": "x", "args": [], "env": {}, "bundle_id": "-custom"}, "expected_bundle_id": "-custom"},
+    {"desc": "无名 + 非 ASCII 连接身份（TLV 长度按 UTF-8 字节，非字符数）", "name": "", "config": {"type": "stdio", "command": "x", "args": ["你好"], "env": {}}, "expected_bundle_id": "bundle_8897335851935828"}
   ]
 }

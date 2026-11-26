@@ -67,7 +67,7 @@ use crate::settings::scope::{resolve_settings, EnvMap, ResolveSettingsArgs};
 use crate::skills::{
     resolve_skill_home, resolve_skill_view, stage_mcp_skills, stage_user_skills, user_dropin_root,
     AsyncCallback, CallbackResult, OnChange, SkillEventDebouncer, SkillFileWatcher, SkillRegistry,
-    SkillResourceView, SkillSandboxError, SOURCE_USER,
+    SkillResourceView, SkillSandboxError, SkillSourceConflict, SOURCE_USER,
 };
 use smcp::utils::env_truthy;
 use smcp::A2CSkillRef;
@@ -712,6 +712,34 @@ fn reconcile_orphans_in(
     }
 }
 
+/// #275：SKILL 源冲突 → 被拒 pid（`<plugin>@<marketplace>`）/ Rejected pid from a source conflict。
+fn skill_source_conflict_pid(conflict: &SkillSourceConflict) -> Option<String> {
+    let plugin = conflict.name.split_once(':')?.0;
+    let marketplace = conflict.rejected_source.strip_prefix("marketplace:")?;
+    Some(format!("{plugin}@{marketplace}"))
+}
+
+/// #275：过滤仍成立的 SKILL 源冲突（kept source 仍是 owner ∧ rejected marketplace 仍 known）。
+///
+/// add/refresh 即时诊断与 reconcile 的 prior 复核共用，避免把 uninstall/remove 后的 stale 记录
+/// 重新发成诊断。
+fn live_skill_source_conflicts(
+    registry: &SkillRegistry,
+    known: &crate::settings::reconciler::KnownMarketplaces,
+    conflicts: &[SkillSourceConflict],
+) -> Vec<SkillSourceConflict> {
+    conflicts
+        .iter()
+        .filter(|c| {
+            registry.source_of(&c.name) == Some(c.kept_source.as_str())
+                && c.rejected_source
+                    .strip_prefix("marketplace:")
+                    .is_some_and(|mp| known.marketplaces.contains_key(mp))
+        })
+        .cloned()
+        .collect()
+}
+
 /// 递归扫描配置 JSON，收集所有 `${input:<id>}` 引用的 input id（#112 S5）/ collect referenced input ids。
 ///
 /// 与 [`ConfigRender`](crate::mcp_clients::ConfigRender) 同一占位符文法（`\$\{input:<id>}`）。供
@@ -1217,10 +1245,8 @@ impl<S: Session> Computer<S> {
                 self.mcp_flag_config_error = None;
             }
             Err(reason) => {
-                let message = format!(
-                    "⚠ mcp config path {} is unusable ({reason}); flag MCP layer disabled (fail-closed)",
-                    raw.display()
-                );
+                let message =
+                    flag_path_diagnostic("mcp config", &raw, reason, "flag MCP layer disabled");
                 error!("{message}");
                 self.mcp_flag_config = None;
                 self.mcp_flag_config_error = Some(message);
@@ -1241,13 +1267,17 @@ impl<S: Session> Computer<S> {
         self.mcp_flag_config.as_deref()
     }
 
-    /// #248：注入 `--settings <file>` 的 flag 层 settings.json 路径（运行期 `readRoots` / `landingRoot`
-    /// 的 flag 作用域来源）/ inject the `--settings` flag-layer settings path。
+    /// #248：注入 `--settings <file>` 的 flag 层 settings.json 路径（运行期 `readRoots` / `landingRoot`、
+    /// 治理恢复重挂（[`reconcile_governance`](Self::reconcile_governance)）、待批准列表
+    /// （[`list_pending_bundled_approvals`](Self::list_pending_bundled_approvals)）、归属视图与 config CRUD
+    /// 快照（`instance_config_context`）的 flag 作用域统一来源）/ inject the `--settings` flag-layer settings path。
     ///
     /// 与 [`with_mcp_flag_config`](Self::with_mcp_flag_config) 同属 flag scope 文件对（协议 §2.5-3）。
     /// **构造期归一为绝对路径**（对齐 python `Computer._absolute_path`）：拒绝集 / 文件读取 / settings
-    /// 合并三处必须看到同一路径。`~` 优先用注入 env 的 `HOME`（空白视同未设置），其次退回进程 `HOME`；
-    /// 两者皆无、`~user` 形态（rust 无 NSS expanduser）或无法绝对化时 **fail-closed**：flag 层置空，
+    /// 合并三处必须看到同一路径。`~` 优先用**注入 env**、其次**进程 env**；每套 env 内 Windows
+    /// `USERPROFILE` 优先、`HOME` 次之（对齐 python `ntpath.expanduser`），POSIX 只读 `HOME`
+    /// （不读 `USERPROFILE`）。两者皆无、`~user` 形态（rust 无 NSS expanduser）或无法绝对化时
+    /// **fail-closed**：flag 层置空，
     /// 失败原因经 [`flag_settings_path_error`](Self::flag_settings_path_error) 呈现（CLI 启动时
     /// `eprintln!`），**不**退回相对串或 `<cwd>/~/...` 的错误文件。需要 `~` 锚定**注入** HOME 时，
     /// 请先 [`with_config_env`](Self::with_config_env) 再调用本方法。缺省 `None` = 无 flag 层。
@@ -1260,10 +1290,8 @@ impl<S: Session> Computer<S> {
                 self.flag_settings_path_error = None;
             }
             Err(reason) => {
-                let message = format!(
-                    "⚠ flag settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
-                    raw.display()
-                );
+                let message =
+                    flag_path_diagnostic("flag settings", &raw, reason, "flag scope disabled");
                 error!("{message}");
                 self.flag_settings_path = None;
                 self.flag_settings_path_error = Some(message);
@@ -1312,6 +1340,21 @@ impl<S: Session> Computer<S> {
         &self.embed_servers
     }
 
+    /// 以实例上下文组装 [`ConfigContext`]（runtime config CRUD 的单一收口）。
+    ///
+    /// #248（v0.5.1）：接实例 `--settings` flag 层（构造期归一后的
+    /// [`normalized_flag_settings_path`](Self::normalized_flag_settings_path)），使 config 快照的治理视图
+    /// （`plugins.enabled` / revision）与其余运行期解析点同源。
+    ///
+    /// **刻意不接**（有据决策，勿「顺手补齐」）：
+    /// - `flag_mcp_config_path`：与 Python `upsert_mcp_server` 的「origin 快照不含 flag/embed、写后遮蔽 WARN」
+    ///   口径一致（python `computer.py` 已知代价）；接入会让 rust 把 flag 声明直接判 `ReadOnlyOrigin`，
+    ///   比对称 SDK 更严。flag/embed 声明面另经 [`non_plugin_declared_bundle_ids`](Self::non_plugin_declared_bundle_ids)
+    ///   / `declared_mcp_servers` 消费。
+    /// - `policy_settings`：该字段是借用 `Option<&Map>`（`ConfigContext` 可 `Copy`），实例侧无 owned map；
+    ///   `None` 在 snapshot 语义为「空 policy 层」而非 ambient policy。需要 policy 的治理解析点各自以实例
+    ///   env 解析（见 [`reconcile_governance`](Self::reconcile_governance) / [`list_pending_bundled_approvals`](Self::list_pending_bundled_approvals)
+    ///   / [`enabled_bundled_ownership`](Self::enabled_bundled_ownership)）。
     fn instance_config_context<'a>(
         &'a self,
         config_dir: &'a std::path::Path,
@@ -1321,6 +1364,8 @@ impl<S: Session> Computer<S> {
         ConfigContext {
             env: self.config_env(),
             home: Some(home),
+            // #248：实例 flag settings 参与快照合并（settings 读面生效；写目标仍只认可写 scope）。
+            flag_settings_path: self.normalized_flag_settings_path(),
             // #147：remove 守卫按 origin 判定须能看见 embed 声明（否则宿主构造 server 被判「无声明的纯运行期
             // 投影」误拒/误判）。frozen 快照，与 mcp.json/durable 同入声明面。
             embed_servers: &self.embed_servers,
@@ -1431,9 +1476,10 @@ impl<S: Session> Computer<S> {
     /// 发 [`ComputerEvent::ConfigRevisionBumped`]，使 GUI 无需轮询内部文件即可观察治理生命周期变更）+ fire-and-forget
     /// socketio `update_config` 通知（未连接 → `InvalidState` 静默，绝不 panic）。
     ///
-    /// **调用契约（无虚假 bump）**：仅在 mutator **成功且确有内容变更**的路径调用——`add_marketplace` / `remove_marketplace`
-    /// 对重复/未知目标返 `Err`（[`GovernanceError::DuplicateMarketplace`] / `UnknownMarketplace`）、`install_plugin`
-    /// 成功即真实（重）物化账本、`uninstall_plugin` 仅在 `Ok(true)`（确有移除）调用，故成功即真变，无需再门控。
+    /// **调用契约（无虚假 bump）**：仅在 mutator **成功且确有内容变更**的路径调用——`add_marketplace` 对
+    /// 同名异源 / 未知等目标返 `Err`、**同源重复 add 幂等返回 `changed=false`**（调用方据此跳过本函数）、
+    /// `remove_marketplace` 对未知目标返 `Err`、`install_plugin` 成功即真实（重）物化账本、
+    /// `uninstall_plugin` 仅在 `Ok(true)`（确有移除）调用，故成功即真变，无需再门控。
     /// 这与 `enable/disable_plugin` **刻意**用 `changed` 门控（#115 R1：re-enable 已启用者是返 `Ok` 的**真 no-op**、
     /// 须避免虚假 bump）的差异**是有意的**——install/uninstall/add/remove 的成功语义本身已排除 no-op。§12 R2：
     /// config ⊥ capability——bundled server 重挂的能力变化由 MCP start/stop 各自 bump capability，与此正交。
@@ -1442,24 +1488,57 @@ impl<S: Session> Computer<S> {
         let _ = self.emit_update_config().await;
     }
 
-    /// 添加 marketplace（归一 URL + 派生名 + clone/stage 或仅注册意图）/ add a marketplace。
+    /// 添加 marketplace（clone → 读清单顶层 `name` 定名 → 账本锁内唯一性/引用认领 → 原子 swap/注册）。
     ///
-    /// 信任门（user-scope `trustedMarketplaces`）由产品 client 在调用前自理——**不**属 `skill_home` 治理边界。
+    /// #272：注册名取清单 `name`；`AddMarketplaceParams.name` 仅作**期望名校验**（不覆盖）。同源重复
+    /// add 幂等（`changed=false`）；同名异源 / 同源旧名 / 残留引用 fail-closed；`no_clone` 仅在已有
+    /// catalog + 期望名匹配 + 同源可证时成功。信任门（user-scope `trustedMarketplaces`）由产品 client
+    /// 在调用前自理——**不**属 `skill_home` 治理边界。
     ///
     /// # Errors
-    /// 见 [`GovernanceError`]（非法 URL/名、重名、clone 失败、账本写失败）。
+    /// 见 [`GovernanceError`]（非法 URL/名、清单名校验失败、同名冲突、clone/账本失败）。
     pub async fn add_marketplace(
         &self,
         git_url: &str,
         params: AddMarketplaceParams<'_>,
     ) -> Result<MarketplaceAddOutcome, GovernanceError> {
         let home = self.skill_home();
-        let res = {
-            let mut reg = self.skill_registry.write().await;
-            crate::settings::lifecycle::add_marketplace(&mut reg, &home, None, git_url, params)
-                .await
+        // #121/#272：引用守卫的 settings 解析必须锚定**本实例**（不是宿主 ambient env/cwd）。
+        let instance_dir = self.config_dir();
+        // #267 审查 🟡5：policy 层同样以**本实例**视图覆盖——宿主不得通过 `policy_settings`
+        // 注入空/过期视图绕过引用守卫（与 flag 层同一口径）。
+        let policy_settings =
+            crate::settings::policy::resolve_policy_settings(self.config_env(), None, None);
+        let params = AddMarketplaceParams {
+            config_cwd: Some(instance_dir.as_path()),
+            // #267：flag 层（`--settings`）的同源路径必须是**构造期归一后**的路径（#248 口径）。
+            flag_settings_path: self.normalized_flag_settings_path(),
+            policy_settings: Some(&policy_settings),
+            ..params
         };
-        if res.is_ok() {
+        let (res, conflicts) = {
+            let mut reg = self.skill_registry.write().await;
+            let res = crate::settings::lifecycle::add_marketplace(
+                &mut reg,
+                &home,
+                self.config_env(),
+                git_url,
+                params,
+            )
+            .await;
+            // #275：add 阶段被跨源守卫拒绝的 SKILL 不静默——即时写结构化诊断（仅发仍成立的冲突；
+            // 保留记录供 reconcile 复核，不在此 drain）。
+            let known = crate::settings::store::load_known_marketplaces(Some(&home), None).account;
+            let conflicts = live_skill_source_conflicts(&reg, &known, reg.source_conflicts());
+            (res, conflicts)
+        };
+        // #272：同源重复 add 幂等（`changed=false`）不得虚假 bump / 标脏 / 重发冲突诊断；
+        // 但幂等 add 顺带更新旗标（如 `--auto-update`）属于真实状态变更，仍需通知。
+        if res
+            .as_ref()
+            .is_ok_and(|outcome| outcome.changed || outcome.flags_updated)
+        {
+            self.record_skill_source_conflicts(&conflicts);
             self.mark_skills_dirty();
             self.emit_governance_config_change().await;
         }
@@ -1471,10 +1550,17 @@ impl<S: Session> Computer<S> {
     /// `target == "all"` → 全部已知 marketplace；否则单个目标。未知目标 → `missing` 行（不整体报错）。
     pub async fn refresh_marketplace(&self, target: &str) -> Vec<MarketplaceRefreshRow> {
         let home = self.skill_home();
-        let rows = {
+        let (rows, conflicts) = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::lifecycle::refresh_marketplaces(&mut reg, &home, None, target).await
+            let rows =
+                crate::settings::lifecycle::refresh_marketplaces(&mut reg, &home, None, target)
+                    .await;
+            let known = crate::settings::store::load_known_marketplaces(Some(&home), None).account;
+            let conflicts = live_skill_source_conflicts(&reg, &known, reg.source_conflicts());
+            (rows, conflicts)
         };
+        // #275：refresh 阶段被跨源守卫拒绝的 SKILL 即时写结构化诊断（记录保留给 reconcile 复核）。
+        self.record_skill_source_conflicts(&conflicts);
         // refresh 即便全 unchanged 也可能翻活孤儿 / 重挂；统一标脏交去抖器判定。
         self.mark_skills_dirty();
         rows
@@ -1568,6 +1654,12 @@ impl<S: Session> Computer<S> {
     /// bump **config** revision + `emit_update_config`（#115 R1：installer 据实际写盘返回 `changed`，幂等 re-enable
     /// 不虚假 bump / 不惊动 robot）；bundled server 若翻活经 hooks 走 [`Self::mount_server`] 另 bump capability（§12 R2 正交）。
     ///
+    /// **失败回滚（#286 follow-up；Discussion #82 裁决 C / §2.4）**：经内部 seam 供给运行期权威——
+    /// `non_plugin_declared_bundle_ids` 全集（写后失败时对**本次新挂**做 §4.9.1-2 三档判定）、manager 活跃
+    /// （已挂载）集（existing-wins 权威）、五层 settings 解析 + gate 锚点（失败回滚后合并视图诊断）。写后失败
+    /// 只清理本次尝试新挂（含失败者），registry 回填 staging 前快照，raw 精确恢复 pre-state；有效 prior-true
+    /// 失败返回 [`PluginInstallError::EnableFailedRetained`]。remount 对已挂载实例 existing-wins 不覆盖。
+    ///
     /// # Errors
     /// 见 [`PluginInstallError`]（未安装 / 冲突 / manifest / settings 写 / 注入）。
     pub async fn enable_plugin(
@@ -1593,10 +1685,37 @@ impl<S: Session> Computer<S> {
             timeout: options.timeout,
             env,
         };
+        // #286 复审 🔴1/🟡3/🟡4：MUST 在取 `skill_registry` 写锁**之前**备齐运行期权威（同 disable/uninstall）：
+        // ① 「非用户声明」全集——写后失败对**本次新挂**做 §4.9.1-2 三档判定；② manager 活跃（已挂载）集
+        //    ——existing-wins 唯一权威，避免声明面（disabled/待审批）被误当已挂载；③ 五层 settings 解析
+        //    ——失败诊断的 pre/post 合并视图（含 flag/policy）；④ gate 锚点：调用方 project_path
+        //    （写盘锚）回退本实例 config_dir。
+        let non_plugin = self.non_plugin_declared_bundle_ids(&home, env);
+        // 诊断 provider MUST 现算：写前取 pre-state、回滚写盘后取 post-state（不得在此缓存快照）；🟡2：env
+        // 与本次 enable 的读写同源（effective env，而非 config_env）。锚点由 installer 传入
+        // （`options.project_path` → 本实例 config_dir），不得固定读 config_dir。
+        let resolved_settings =
+            |anchor: Option<&str>| self.resolved_runtime_settings_at(env, anchor);
+        let config_dir = self.config_dir();
+        let gate_project_path = options.project_path.or_else(|| config_dir.to_str());
+        let mounted = self.mounted_bundle_ids().await;
+        let reclaim_ctx = crate::settings::installer::EnableReclaimContext {
+            gate_project_path,
+            resolved_settings: Some(&resolved_settings),
+            mounted_bundle_ids: Some(&mounted),
+            non_plugin_bundle_ids: Some(&non_plugin),
+        };
         let res = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::installer::enable_plugin(plugin_id, &mut reg, &home, effective, hooks)
-                .await
+            crate::settings::installer::enable_plugin_with_reclaim(
+                plugin_id,
+                &mut reg,
+                &home,
+                effective,
+                reclaim_ctx,
+                hooks,
+            )
+            .await
         };
         match res {
             Ok(changed) => {
@@ -1614,6 +1733,60 @@ impl<S: Session> Computer<S> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// 实例 settings 解析的**唯一收口**（实例 `config_dir` + 实例 env + 实例 `--settings` flag +
+    /// 实例 env 解析的 policy；#248 v0.5.1）。
+    ///
+    /// 治理恢复（[`reconcile_governance`](Self::reconcile_governance)）、待批准列表
+    /// （[`list_pending_bundled_approvals`](Self::list_pending_bundled_approvals)）、归属视图
+    /// （[`enabled_bundled_ownership`](Self::enabled_bundled_ownership)）与 enable 回滚 provider
+    /// （[`resolved_runtime_settings_at`](Self::resolved_runtime_settings_at)）的**唯一收口**；新增解析参数只改
+    /// 此处，防口径漂移。**不含** `instance_config_context`（config 快照）——它经 `ConfigContext` 仅共享
+    /// 实例 `env` / flag / `config_dir`，`policy_settings` 刻意不接（借用字段限制，见其 doc）。
+    fn resolve_instance_settings(
+        &self,
+        env: Option<&EnvMap>,
+    ) -> crate::settings::scope::ResolvedSettings {
+        let config_dir = self.config_dir();
+        self.resolve_instance_settings_at(env, &config_dir)
+    }
+
+    /// 指定 project/local 解析锚的实例 settings（诊断锚点场景；不改变本实例默认 `config_dir`）。
+    fn resolve_instance_settings_at(
+        &self,
+        env: Option<&EnvMap>,
+        cwd: &std::path::Path,
+    ) -> crate::settings::scope::ResolvedSettings {
+        let policy = resolve_policy_settings(env, None, None);
+        resolve_settings(ResolveSettingsArgs {
+            cwd: Some(cwd),
+            env,
+            flag_settings_path: self.normalized_flag_settings_path(),
+            policy_settings: Some(&policy),
+        })
+    }
+
+    /// 指定**诊断锚点**的五层合并视图：`anchor` = 操作 scope 的 project/local 目录
+    /// （`options.project_path`）；`None` 回退本实例 `config_dir`。enable 失败诊断 MUST 用操作锚点，
+    /// 否则「projectPath != config_dir」时会误报/漏报 retained。
+    pub(crate) fn resolved_runtime_settings_at(
+        &self,
+        env: Option<&EnvMap>,
+        anchor: Option<&str>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let config_dir = self.config_dir();
+        let cwd = anchor.map(std::path::Path::new).unwrap_or(&config_dir);
+        self.resolve_instance_settings_at(env, cwd).settings
+    }
+
+    /// 运行期**已挂载**的 bundle_id 集（manager 活跃集；existing-wins 权威，#286 复审 🔴1）。
+    pub(crate) async fn mounted_bundle_ids(&self) -> HashSet<BundleId> {
+        self.list_mcp_servers()
+            .await
+            .iter()
+            .map(crate::mcp_clients::bundle_id::resolve_bundle_id)
+            .collect()
     }
 
     /// #139/§4.9.1-2 回收判据「X 非用户声明」项的数据源：**带 origin 的运行期权威配置集中 `origin != plugin`
@@ -1731,7 +1904,8 @@ impl<S: Session> Computer<S> {
         }
     }
 
-    /// 卸载单个 plugin（删 installPath 树 + 注销 skills + 级联停摘 bundled server + 删账本）/ uninstall。
+    /// 卸载单个 plugin（删 plugin 独占外部 clone，共享 catalog 不删 + 注销 skills（**仅该 pid 账本记录全部
+    /// 移除时**）+ 按 retained 判据停摘 bundled server + 删账本）/ uninstall。
     ///
     /// 未安装 / 无匹配 scope → `Ok(false)`（no-op）。
     ///
@@ -1763,6 +1937,86 @@ impl<S: Session> Computer<S> {
             self.emit_governance_config_change().await;
         }
         res
+    }
+
+    /// #275：把「同裸名 plugin 多 marketplace 已装」与「SKILL 源冲突」写入 Governance 诊断。
+    ///
+    /// 只读 intent + 本轮 registry 冲突记录；不迁移、不改写 `installedPlugins` / `enabledPlugins`。
+    /// 同一被拒 pid 的多条 SKILL 冲突按 `(code, target)` 键聚合为一条。诊断只声明「重复对」，
+    /// 不臆测哪一侧可用（被拒侧可能恰是唯一可达源），由宿主/用户自行决定 uninstall 哪一个。
+    fn record_cross_marketplace_conflicts(
+        &self,
+        home: &Path,
+        env: Option<&EnvMap>,
+        conflicts: &[SkillSourceConflict],
+    ) {
+        // 1) installedPlugins 意图：同裸名第二个及之后的 pid → PluginNameConflict。
+        let intent = crate::settings::store::load_installed_plugins_intent(Some(home), env);
+        let mut first_by_plugin: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for pid in &intent.account.installed_plugins {
+            let Some((plugin, _)) = pid.split_once('@') else {
+                continue;
+            };
+            match first_by_plugin.get(plugin) {
+                Some(first) => {
+                    if first == pid {
+                        continue;
+                    }
+                    self.status.record_diagnostic(RuntimeDiagnostic::new(
+                        DiagnosticCode::PluginNameConflict,
+                        DiagnosticSeverity::Degraded,
+                        DiagnosticSource::Governance,
+                        DiagnosticOperation::CheckPluginNameUniqueness,
+                        DiagnosticTarget::Plugin(pid.clone()),
+                        format!(
+                            "plugin name conflict: {plugin:?} is installed from multiple marketplaces \
+                             ({first} and {pid}); keep exactly one and uninstall the rest before \
+                             switching sources"
+                        ),
+                    ));
+                }
+                None => {
+                    first_by_plugin.insert(plugin.to_string(), pid.clone());
+                }
+            }
+        }
+
+        self.record_skill_source_conflicts(conflicts);
+    }
+
+    /// #275：SKILL 源冲突 → 按被拒 pid 聚合的 Governance 诊断（reconcile / add / refresh 共用）。
+    fn record_skill_source_conflicts(&self, conflicts: &[SkillSourceConflict]) {
+        let mut by_pid: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for conflict in conflicts {
+            if let Some(pid) = skill_source_conflict_pid(conflict) {
+                by_pid.entry(pid).or_default().push(conflict.name.clone());
+            }
+        }
+        for (pid, mut names) in by_pid {
+            names.sort_unstable();
+            names.dedup();
+            let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            let more = names.len().saturating_sub(3);
+            self.status.record_diagnostic(RuntimeDiagnostic::new(
+                DiagnosticCode::SkillSourceConflict,
+                DiagnosticSeverity::Degraded,
+                DiagnosticSource::Governance,
+                DiagnosticOperation::RegisterSkill,
+                DiagnosticTarget::Plugin(pid.clone()),
+                format!(
+                    "skill source conflict for {pid}: skill(s) {} already owned by another \
+                     marketplace source (first registrant wins); resolve the conflicting source \
+                     (uninstall its plugin or remove its marketplace)",
+                    if more > 0 {
+                        format!("{shown} (+{more} more)")
+                    } else {
+                        shown
+                    }
+                ),
+            ));
+        }
     }
 
     /// 治理状态启动恢复（从 `skill_home` 持久化 ledger 重建边界内派生态）/ governance boot recovery（#95）。
@@ -1798,16 +2052,26 @@ impl<S: Session> Computer<S> {
     ///   （clone 树已存在、`refresh = false`）仅本地 FS、无网络，开销小；但 clone 树缺失需 clone 时单源最坏
     ///   `DEFAULT_GIT_TIMEOUT`，期间 `get_skills` 等 skill 读阻塞。宜**低频 / 受控**触发（恢复语义本就一次性）。
     /// - **跨重启 enable 语义以 user scope 为准（v0.3.0）**：enabled 门控读合并 `declared`，其 project/local 层来自
-    ///   **进程 cwd**（#98：`Computer` 不再持有 workspace）。写在**非进程-cwd 的 project/local scope**
-    ///   的 `enabledPlugins=true` 在恢复时可能不可见 → 该 plugin **不**激活。**跨重启可靠启用应写 user scope**；
-    ///   project/local-scoped plugin 的 enable 天然 cwd 相关（含存量 v0.2.x 迁移到 project scope 的记录，属 v0.3.0
-    ///   per-scope 语义，非疏漏——迁移「不熄灯」保证对 user scope 成立、对 project/local 以进程 cwd 为准）。
+    ///   **本实例 `config_dir`**（#248 v0.5.1 起；此前为进程 cwd，#98）。写在**其他目录**的 project/local scope
+    ///   的 `enabledPlugins=true` 在恢复时不可见 → 该 plugin **不**激活。**跨重启可靠启用应写 user scope**；
+    ///   若每次 boot 都注入同一 `--settings` flag 文件（CLI 参考接线），flag 层启用同样可靠（v0.5.1 起
+    ///   boot 的内部解析已消费实例 flag）；
+    ///   project/local-scoped plugin 的 enable 天然锚定实例 config_dir（含存量 v0.2.x 迁移到 project scope
+    ///   的记录，属 v0.3.0 per-scope 语义，非疏漏——迁移「不熄灯」保证对 user scope 成立、对 project/local 以
+    ///   实例 config_dir 为准）。
     ///
     /// ## 参数 / Params
     /// - `hooks`：`None` = skills-only（boot 默认）；`Some` = client 经 hooks 重挂 bundled MCP server。
-    /// - `declared`：`enabledPlugins` 合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。
-    ///   `None` → 内部解析（进程 cwd 的 user/project/local/policy，**无** `--settings` flag scope）；CLI 参考
-    ///   接线传 **flag-aware** 视图使 `--settings`-scope 的 `enabledPlugins=false` 在重挂阶段生效。
+    /// - `declared`：合并声明视图覆盖（对齐 Python `reconcile_governance(declared=...)`）。恢复阶段读
+    ///   `enabledPlugins`（启用门控）**与 `extraKnownMarketplaces`（#295 §5.14 声明面换源检测）**——只传
+    ///   `enabledPlugins` 的调用方不会得到换源冲突诊断（声明变更仍被忽略、不报错）。`None` → 内部解析
+    ///   （本实例 `config_dir` 的 project/local + 实例 env 的 user/project/local + 实例 `--settings` flag +
+    ///   实例 env 解析的 policy；#248 v0.5.1 起 flag 层不再缺席）。
+    ///   **受信层覆盖**：调用方 SHOULD 传 **flag-aware** 合并视图（CLI 参考接线如此）。实例 flag/policy
+    ///   两层的显式 `enabledPlugins` 值会**覆盖** `declared.enabledPlugins`（#267 审查 🟡1）——flag-blind
+    ///   caller 的旧视图不能把受信层的显式 disable 压成 enable（反之亦然）；其余键与其他 scope 仍以调用方为准。
+    ///   当 flag/policy 无意见且无实例 scope 供给启用（`plugin_enabled_origin == None`）时，调用方
+    ///   `declared=true` 仍直挂（宿主显式覆盖与 flag/embed 同属受信层；本可直接 `register_server`）。
     ///
     /// 返回 [`GovernanceRecoveryReport`]（恢复 / 跳过 / 降级明细，供观测与测试）。
     pub async fn reconcile_governance(
@@ -1819,40 +2083,51 @@ impl<S: Session> Computer<S> {
         // #121 A：以**本实例** User env 解析 settings / 账本，绝不混入宿主 ambient（守 boot 重启的归属一致）。
         let env = self.config_env();
         // `declared` 覆盖：CLI 参考接线传 **flag-aware** 合并视图（`--settings` scope 生效，对齐 Python
-        // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（user + 进程 cwd 的 project/local +
-        // policy，**无** `--settings` flag scope；跨重启可靠 disable 请写 user scope）。cwd=None（进程态）。
+        // `reconcile_governance(declared=...)` kwarg）；`None` → 内部解析（实例 env 的 user +
+        // 实例 `config_dir` 的 project/local + **实例 `--settings` flag** + 实例 env 的 policy）。
         //
         // #165 Option B：`scope_layers`（per-scope 原始层）用于 project-origin 检测——与 `declared` **解耦**。
         // `declared==None` 时与 declared 同源解析；`declared==Some(flag-aware)` 时单独解析。二者均锚定**本实例
         // `config_dir`**（#113：override > 进程 cwd；与 governance_snapshot 等同源，且令测试 hermetic）——project scope
         // 必在此解析内，故门在所有挂载路径（含 CLI `run_governance_remount`）生效（Python #182 在 declared=Some
-        // 路径 per_scope_layers=None ⇒ 门不触发，本实现显式收紧）。flag 层受信（免批准）不参与 origin 判定，其缺席
-        // 仅影响罕见 flag+project 重叠（过度提示，安全）。
-        let config_dir = self.config_dir();
+        // 路径 per_scope_layers=None ⇒ 门不触发，本实现显式收紧）。#248 v0.5.1：flag 层同样纳入 `scope_layers`——
+        // `plugin_enabled_origin` 由 flag 供给时返回 `Flag`（受信、免批准），不再把「flag=true + project=true」
+        // 误判为 project-origin 而落 PENDING（安全方向不变：project 单独供给仍走审批门）。
+        // 实例 settings 解析走唯一收口（实例 config_dir/env/flag/policy，与 pending/ownership/快照同源）。
+        let resolved = self.resolve_instance_settings(env);
+        // #267 / #295 残余：settings 校验期整条丢弃的非法 `extraKnownMarketplaces` 声明进入恢复报告
+        // （校验/丢弃语义不变；此处只做可观测）。#248 合入后本解析含实例 flag 层：**Flag 校验错误不进
+        // report 字段**（CLI 启动边界已单独打印、避免重复）；WARN 仍记录全量（含 Flag），嵌入方可直接
+        // `resolve_settings` 取全量校验错误。
+        let all_declaration_errors =
+            crate::settings::recovery::marketplace_declaration_errors(&resolved.errors);
+        for error in &all_declaration_errors {
+            tracing::warn!(
+                scope = error.scope.as_str(),
+                field = %error.field,
+                reason = %error.reason,
+                source_path = error.source_path.as_deref().unwrap_or(""),
+                "governance: invalid marketplace declaration dropped by settings validation \
+                 (ignored; existing registration unchanged)"
+            );
+        }
+        let declaration_errors: Vec<_> = all_declaration_errors
+            .into_iter()
+            .filter(|error| error.scope != SettingsScope::Flag)
+            .collect();
+        let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)> =
+            resolved.scope_layers;
         let resolved_declared;
-        let scope_layers: Vec<(SettingsScope, serde_json::Map<String, serde_json::Value>)>;
+        let overlaid_declared;
         let declared: &serde_json::Map<String, serde_json::Value> = match declared {
             Some(d) => {
-                let policy = resolve_policy_settings(None, None, None);
-                scope_layers = resolve_settings(ResolveSettingsArgs {
-                    cwd: Some(&config_dir),
-                    env,
-                    flag_settings_path: None,
-                    policy_settings: Some(&policy),
-                })
-                .scope_layers;
-                d
+                // #267 审查 🟡1：flag/policy 是**受信层**，其显式 `enabledPlugins` 覆盖调用方
+                // `declared`（flag-blind caller 的旧习惯不得把受信层显式 disable 压成 enable，反之亦然）。
+                overlaid_declared = overlay_instance_enablement_overrides(d, &scope_layers);
+                &overlaid_declared
             }
             None => {
-                let policy = resolve_policy_settings(None, None, None);
-                let resolved = resolve_settings(ResolveSettingsArgs {
-                    cwd: Some(&config_dir),
-                    env,
-                    flag_settings_path: None,
-                    policy_settings: Some(&policy),
-                });
                 resolved_declared = resolved.settings;
-                scope_layers = resolved.scope_layers;
                 &resolved_declared
             }
         };
@@ -1862,11 +2137,28 @@ impl<S: Session> Computer<S> {
         // 恢复即自然清除（运行期恢复路径，boot 与运行期统一语义）。
         self.status
             .clear_diagnostics_where(|d| d.source == DiagnosticSource::Governance);
-        let mut report = {
+        let (mut report, source_conflicts) = {
             let mut reg = self.skill_registry.write().await;
-            crate::settings::recovery::recover_marketplace_skills(&mut reg, &home, env, declared)
-                .await
+            // #275：上一轮 add/refresh 的冲突记录先取出，本轮 recovery 后逐条复核——仅当 kept source 仍是
+            // 该 name 的 owner 且被拒 marketplace 仍 known 才保留（只丢弃可证明已不存在的记录）。
+            let prior = reg.drain_source_conflicts();
+            let report = crate::settings::recovery::recover_marketplace_skills(
+                &mut reg, &home, env, declared,
+            )
+            .await;
+            let known = crate::settings::store::load_known_marketplaces(Some(&home), env).account;
+            let retained = live_skill_source_conflicts(&reg, &known, &prior);
+            let mut conflicts = reg.drain_source_conflicts();
+            for conflict in retained {
+                if !conflicts.contains(&conflict) {
+                    conflicts.push(conflict);
+                }
+            }
+            // 回写 registry：下一轮 reconcile 的 prior drain 才能继续复核（否则二次 reconcile 静默清除）。
+            reg.record_source_conflicts(conflicts.iter().cloned());
+            (report, conflicts)
         };
+        report.marketplace_declaration_errors = declaration_errors;
 
         // 阶段一·五：账本派生缓存补全（§63 账本删除无损，#104）。**已释放 skill 写锁**、无锁纯 FS/git，故置于
         // phase 1 与 phase 2 之间：意图有 enabled pid 但账本缺记录 → 从意图重物化账本 `installPath`，使随后 phase 2
@@ -1901,6 +2193,8 @@ impl<S: Session> Computer<S> {
                 format!("ledger rematerialize failed for enabled plugin: {pid}"),
             ));
         }
+        // #275：存量双装（同裸名多 marketplace）与 SKILL 源冲突 → 结构化诊断（Degraded / Governance）。
+        self.record_cross_marketplace_conflicts(&home, env, &source_conflicts);
 
         // 阶段二：重挂 bundled MCP server（**已释放 skill 写锁**）。best-effort、逐个降级。
         // 严格镜像 Python `computer.py::reconcile_governance` remount 臂（PR #119 / #100 设计 Y）：
@@ -1911,7 +2205,9 @@ impl<S: Session> Computer<S> {
         if let Some(h) = hooks {
             // #139：去重按 **bundle_id**（身份键）——name 允许碰撞、非身份。同名不同 bundle_id 的合法 server
             // 不再互相隐身；同 bundle_id 已存在 → 既有/用户配置胜（首见胜，additive-only）。
-            let mut existing: HashSet<BundleId> = h.existing_servers().into_keys().collect();
+            // #286 复审 🟡3：挂载权威 = **运行期已挂载集**（声明面 hook 的 `existing_servers` 含
+            // disabled/待审批，用它跳过会复现「enabled 但零 server 投影」半态）。
+            let mut existing: HashSet<BundleId> = h.mounted_servers();
             let mut injected_roots: HashSet<PathBuf> = HashSet::new();
             // #214：重挂成功的 bundled server 收齐后经**统一批量启动器**一次启动（共享 Computer 级
             // 并发控件，避免恢复路径绕过上限；best-effort 降级语义见循环后 WARN）。
@@ -2644,8 +2940,10 @@ impl<S: Session> Computer<S> {
         //
         // **停止契约**：`shutdown()` 显式 abort 本任务（`stop_mcp_notify_consumer`），是**确定性**的停止路径。
         // rx 关闭需所有 sender 克隆 drop：stdio/http 客户端的 sender 随 rmcp `RunningService`（客户端 drop）一并
-        // 释放；**SSE 客户端的常驻流任务是 detached spawn、持 sender 克隆**，仅在其 SSE 连接结束或 `disconnect`
-        // 时才释放。故「drop 而不 shutdown」时本任务可能滞留到 SSE 流结束——推荐经 `shutdown()` 收尾。
+        // 释放——但 #267 S4 起 `disconnect` 的有界关闭超时后，RunningService 会分离其服务任务，sender 可再多活
+        // 至 rmcp 自身的 drain(≤2s)+会话清理(≤5s)；**SSE 客户端的常驻流任务是 detached spawn、持 sender 克隆**，
+        // 仅在其 SSE 连接结束或 `disconnect` 时才释放。故「drop 而不 shutdown」时本任务可能滞留到 SSE 流结束
+        //（或上述分离清理结束）——推荐经 `shutdown()` 收尾。
         {
             let reactor = self.mcp_change_reactor();
             let mut change_rx = change_rx;
@@ -2722,11 +3020,17 @@ impl<S: Session> Computer<S> {
             );
         }
         let recovery = self.reconcile_governance(None, None).await;
-        if !recovery.restored_plugins.is_empty() || !recovery.failed_marketplaces.is_empty() {
+        if !recovery.restored_plugins.is_empty()
+            || !recovery.failed_marketplaces.is_empty()
+            || !recovery.marketplace_source_conflicts.is_empty()
+            || !recovery.marketplace_declaration_errors.is_empty()
+        {
             info!(
                 restored_plugins = recovery.restored_plugins.len(),
                 restored_skills = recovery.restored_skills.len(),
                 failed_marketplaces = recovery.failed_marketplaces.len(),
+                marketplace_source_conflicts = recovery.marketplace_source_conflicts.len(),
+                marketplace_declaration_errors = recovery.marketplace_declaration_errors.len(),
                 "governance boot recovery complete"
             );
         }
@@ -4103,18 +4407,15 @@ impl<S: Session> Computer<S> {
     ///
     /// 现算（lock-free 纯读）：resolve settings →
     /// [`collect_enabled_bundled_servers`](crate::settings::recovery::collect_enabled_bundled_servers) → 过滤
-    /// project-origin ∧ PENDING。与 reconcile 阶段二**同源同判据**（origin + `mcp_server_status`）。
+    /// project-origin ∧ PENDING。与 reconcile 阶段二**同源同判据**（origin + `mcp_server_status`）——#248
+    /// v0.5.1 起同源含**实例 `--settings` flag 层**与实例 env 解析的 policy（flag=true 受信免批准；
+    /// flag=false 可压过 project=true）。
     #[must_use]
     pub fn list_pending_bundled_approvals(&self) -> Vec<BundledServerRecord> {
         let home = self.skill_home();
         let env = self.config_env();
-        let config_dir = self.config_dir();
-        let resolved = resolve_settings(ResolveSettingsArgs {
-            cwd: Some(&config_dir),
-            env,
-            flag_settings_path: None,
-            policy_settings: Some(&resolve_policy_settings(None, None, None)),
-        });
+        // 与 reconcile 阶段二 / 归属视图 / config 快照同源（实例 config_dir/env/flag/policy 唯一收口）。
+        let resolved = self.resolve_instance_settings(env);
         let declared = &resolved.settings;
         let scope_layers = &resolved.scope_layers;
         crate::settings::recovery::collect_enabled_bundled_servers(&home, env, declared)
@@ -4138,6 +4439,10 @@ impl<S: Session> Computer<S> {
     /// [`remove_server`](Self::remove_server)）的**唯一同源**——保证「查询归属」与「增删可否」一致（#126 验收#3）。
     /// #121 A：以**本实例** env（`config_env`）解析账本 + `enabledPlugins`，绝不混入宿主 ambient settings。**停用的
     /// plugin 不在结果内**（#126 D3：停用插件后同名 server 可自由增删——issue 记录的规避路径）。
+    /// #248 v0.5.1：与 reconcile / pending **同源**——project/local 锚**实例 `config_dir`**（非进程 cwd）、
+    /// 纳入**实例 `--settings` flag 层**与实例 env 解析的 policy；嵌入宿主 `with_config_dir` 下 project-scope
+    /// 启用态不再漏判。⚠️ 例外（#267 审查 🟡3）：config 快照（`instance_config_context`）仅共享 env/flag/
+    /// config_dir，**policy 刻意不接**（借用字段限制，见其 doc）——「与 config 快照同源」仅限这三点。
     ///
     /// **join key = `bundle_id`（#127 起对称）**：`add_or_update_server` / `remove_server` /
     /// `list_mcp_servers_with_metadata` 三者**一律**按软件唯一身份 `bundle_id` 判占用。此前 add 按 name、
@@ -4155,14 +4460,9 @@ impl<S: Session> Computer<S> {
     fn enabled_bundled_ownership(&self) -> Vec<BundledServerRecord> {
         let home = self.skill_home();
         let env = self.config_env();
-        let policy = resolve_policy_settings(None, None, None);
-        let declared = resolve_settings(ResolveSettingsArgs {
-            cwd: None,
-            env,
-            flag_settings_path: None,
-            policy_settings: Some(&policy),
-        })
-        .settings;
+        // #248 v0.5.1：project/local 锚**实例 `config_dir`**（与 reconcile/pending/config 快照同源；此前
+        // `cwd: None` 退回进程 cwd，嵌入宿主漏判）、实例 flag settings 与实例 env 解析的 policy。
+        let declared = self.resolve_instance_settings(env).settings;
         crate::settings::recovery::collect_enabled_bundled_servers(&home, env, &declared)
     }
 
@@ -4307,12 +4607,19 @@ impl<S: Session> Computer<S> {
     pub async fn governance_snapshot(&self) -> Result<GovernanceSnapshot, GovernanceQueryError> {
         let home = self.skill_home();
         let config_dir = self.config_dir();
+        let env = self.config_env();
+        // #248 v0.5.1：治理快照（GUI 的 `list_plugins` / `get_plugin` / `revision` 来源）与运行期/归属视图
+        // **同源**——实例 flag settings 层 + 实例 env 解析的 policy；否则 flag-only 启用的插件会在同一快照内
+        // 出现「enabled=false 但 materialized_mcp_servers 非空」的自相矛盾，且 flag 切换不 bump revision。
+        let policy = resolve_policy_settings(env, None, None);
         let overlay = self.governance_overlay().await;
         Ok(resolve_governance_snapshot(
             GovernanceArgs {
                 cwd: Some(&config_dir),
-                env: self.config_env(),
+                env,
                 home: Some(&home),
+                flag_settings_path: self.normalized_flag_settings_path(),
+                policy_settings: Some(&policy),
                 ..Default::default()
             },
             &overlay,
@@ -5403,12 +5710,59 @@ impl<S: Session + 'static> ComputerHandlerOps for Computer<S> {
 /// `flag_settings_path`（`--settings <file>`）非 `None` 时 flag 层一并参与合并——flag 是
 /// `landingRoot` 的受信 scope（protocol#65，rust-sdk#248）。**缓存语义保持**：`Computer::landing_root`
 /// 仍是「已解析且已配置 → 进程内缓存；未配置 → 每次重查」，运行期改 settings 的生效时机不变。
+/// #267 审查 🟡1：用实例 **flag/policy** 两层的 `enabledPlugins` 覆盖调用方传入的 `declared`
+/// （其他键与其他 scope 不动；层序低→高，policy 胜 flag）。
+///
+/// 背景：`declared=Some` 的调用方可能仍按 0.5.0 习惯传 **flag-blind** 合并视图——若受信层显式
+/// `enabledPlugins=false` 而调用方视图是 true，旧行为会因 `plugin_enabled_origin == None` 跳过
+/// project-origin 审批门并直挂（受信层 disable 被静默压过）。覆盖后启用门控与 origin 判定同源，
+/// 显式 disable 生效；无 flag/policy 意见时调用方视图仍保持权威。
+fn overlay_instance_enablement_overrides(
+    declared: &serde_json::Map<String, serde_json::Value>,
+    scope_layers: &[(SettingsScope, serde_json::Map<String, serde_json::Value>)],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut overrides: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    for (scope, layer) in scope_layers {
+        if !matches!(scope, SettingsScope::Flag | SettingsScope::Policy) {
+            continue;
+        }
+        if let Some(enabled) = layer
+            .get("enabledPlugins")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (pid, value) in enabled {
+                if let Some(flag) = value.as_bool() {
+                    overrides.insert(pid.clone(), flag);
+                }
+            }
+        }
+    }
+    if overrides.is_empty() {
+        return declared.clone();
+    }
+    let mut out = declared.clone();
+    let entry = out
+        .entry("enabledPlugins".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(map) = entry.as_object_mut() {
+        for (pid, enabled) in overrides {
+            map.insert(pid, serde_json::Value::Bool(enabled));
+        }
+    }
+    out
+}
+
 fn resolve_landing_root_settings(
     config_dir: &std::path::Path,
     env: Option<&EnvMap>,
     flag_settings_path: Option<&Path>,
 ) -> Option<PathBuf> {
-    let policy = resolve_policy_settings(None, None, None);
+    // #248 v0.5.1 审查：policy 以**实例 env** 解析（与 reconcile/pending/ownership/config 快照同源；
+    // 此前传 None 会退回宿主进程 env，remote policy 落地后同一实例出现两套 policy 层）。
+    let policy = resolve_policy_settings(env, None, None);
     let resolved = resolve_settings(ResolveSettingsArgs {
         cwd: Some(config_dir),
         env,
@@ -5422,15 +5776,31 @@ fn resolve_landing_root_settings(
     Some(crate::skills::home::expand_home(raw.trim(), env))
 }
 
+/// flag 层路径归一失败的诊断文案（构造期 builder / 一次性 CLI 共用）。
+///
+/// `kind`：`"flag settings"` / `"mcp config"`；`disabled_note`：`"flag scope disabled"` /
+/// `"flag MCP layer disabled"`。保持 `… is unusable (…); … (fail-closed)` 形状，防多处文案/名词漂移。
+pub(crate) fn flag_path_diagnostic(
+    kind: &str,
+    raw: &Path,
+    reason: &str,
+    disabled_note: &str,
+) -> String {
+    format!(
+        "⚠ {kind} path {} is unusable ({reason}); {disabled_note} (fail-closed)",
+        raw.display()
+    )
+}
+
 /// 构造期归一 **flag 层文件路径**（`--settings` / `--mcp-config`）：成功 → 绝对路径；失败 → 原因
 /// （调用方 fail-closed 置 `None`）。
 ///
 /// 规则：
 /// - 空路径 → 失败；非 UTF-8 → 无 `~` 语义，直接绝对化（失败则报错）。
-/// - 前导 `~` / `~/...` / `~\...`（Windows 写法，对齐 python `expanduser`）：用注入 env 的 `HOME`
-///   （空白视同未设置），其次进程 `HOME`；**仅 Windows** 再退 `USERPROFILE`（POSIX 不读，对齐
-///   python）；全部为空 → 失败（**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的
-///   路径会被当成受信 flag 层）。
+/// - 前导 `~` / `~/...` / `~\...`（Windows 写法，对齐 python `expanduser`）：**注入 env 优先、进程
+///   env 次之**；每套 env 内 Windows `USERPROFILE` 优先、`HOME` 次之（对齐 python
+///   `ntpath.expanduser`），POSIX 只读 `HOME`（不读 `USERPROFILE`；空白视同未设置）。全部为空 →
+///   失败（**不得**退回相对串或 `<cwd>/~/...`——否则 cwd 下可由仓库植入的路径会被当成受信 flag 层）。
 /// - `~user`（前导 `~` 但不是 `~` / `~/` / `~\`）：rust 无 NSS expanduser → 显式失败，不静默锚到
 ///   `<cwd>/~user`。
 /// - 其它（含中段 `~` 的合法相对路径，如 `conf/~/flag.json`）：中段 `~` 只是普通字符，按构造期 cwd
@@ -5494,6 +5864,9 @@ fn home_lookup(env: Option<&EnvMap>) -> Option<String> {
 ///
 /// Windows：**`USERPROFILE` 优先**，`HOME` 次之（对齐 python `ntpath.expanduser`）；POSIX：只读
 /// `HOME`（不读 `USERPROFILE`，对齐 python posixpath）。
+///
+/// 有意**不**消费 `HOMEDRIVE`+`HOMEPATH`（python `ntpath.expanduser` 在 `USERPROFILE` 缺失时的
+/// 兜底更宽）；本 SDK 的 flag 层路径契约只认上表两键，缺失即 fail-closed，不猜驱动器组合。
 fn home_lookup_with(env: Option<&EnvMap>, windows: bool) -> Option<String> {
     let lookup = |name: &str| match env {
         Some(map) => map.get(name).cloned(),
@@ -6706,40 +7079,142 @@ mod tests {
 
     // ── #94：Computer 级 marketplace / plugin 生命周期 API ───────────────────────
     #[tokio::test]
-    async fn computer_marketplace_add_and_remove_no_clone() {
+    async fn computer_add_marketplace_opaque_scheme_error_does_not_echo_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        for raw in [
+            "ssh:alice:PW_LEAK@example.com",
+            "ssh:/alice:PW_LEAK@example.com",
+            "ssh:///alice:PW_LEAK@example.com",
+            "git:///alice:PW_LEAK@example.com",
+            "file:alice:PW_LEAK@example.com",
+        ] {
+            let err = computer
+                .add_marketplace(
+                    raw,
+                    AddMarketplaceParams {
+                        no_clone: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &err,
+                GovernanceError::InvalidUrl(source) if source == "<redacted-git-source>"
+            ));
+            let public_forms = format!("{err}\n{err:?}");
+            for secret in ["alice", "PW_LEAK", "example.com"] {
+                assert!(!public_forms.contains(secret), "{raw}: {public_forms}");
+            }
+            // 拒绝发生在账本写入之前。
+            let known = crate::settings::store::load_known_marketplaces(
+                Some(computer.skill_home().as_path()),
+                None,
+            )
+            .account;
+            assert!(
+                known.marketplaces.is_empty(),
+                "{raw}: {:?}",
+                known.marketplaces
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_add_marketplace_credential_path_name_rejected_without_ledger_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob"));
+
+        for raw in [
+            "file:///alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK@example.com",
+            "git@host:alice:PW_LEAK",
+            "git@host:alice%3APW_LEAK%40example.com",
+            "file:///alice:PW_LEAK",
+            "file:///alice%3APW_LEAK%40example.com",
+        ] {
+            // #272：注册名只来自清单 name；这些 URL 形态在不可定名时一律 validation 拒绝（不派生）。
+            let err = computer
+                .add_marketplace(
+                    raw,
+                    AddMarketplaceParams {
+                        no_clone: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    GovernanceError::Validation(
+                        crate::skills::MarketplaceStageError::ManifestNameMissing
+                    )
+                ),
+                "{raw}: {err:?}"
+            );
+            let public_forms = format!("{err}\n{err:?}");
+            for secret in ["alice", "PW_LEAK", "alice-pw-leak", "pw-leak"] {
+                assert!(!public_forms.contains(secret), "{raw}: {public_forms}");
+            }
+            let known = crate::settings::store::load_known_marketplaces(
+                Some(computer.skill_home().as_path()),
+                None,
+            )
+            .account;
+            assert!(
+                known.marketplaces.is_empty(),
+                "{raw}: {:?}",
+                known.marketplaces
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_marketplace_add_and_remove() {
         use crate::settings::lifecycle::marketplace_name_taken;
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         // 不 boot_up：add/remove 只需 skill_registry 写锁 + skill_home（运行期只读、override 即足）。
+        // #272：引用守卫读实例 settings，注入隔离 XDG 避免宿主 ~/.config。
         let computer = Computer::new("c", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home.clone())
-            .with_blob_cache_root(tmp.path().join("blob"));
+            .with_blob_cache_root(tmp.path().join("blob"))
+            .with_config_env({
+                let env: EnvMap = std::iter::once((
+                    "XDG_CONFIG_HOME".to_string(),
+                    tmp.path().join("xdg").to_string_lossy().into_owned(),
+                ))
+                .collect();
+                env
+            });
 
         // 产品 client 经 Computer 方法添加 marketplace——**不**直接触碰 SkillRegistry，得结构化结果。
+        let url = build_marketplace_repo95(&tmp.path().join("repo"));
         let outcome = computer
-            .add_marketplace(
-                "acme/skills",
-                AddMarketplaceParams {
-                    no_clone: true,
-                    ..Default::default()
-                },
-            )
+            .add_marketplace(&url, AddMarketplaceParams::default())
             .await
             .unwrap();
-        assert_eq!(outcome.name, "skills");
-        assert!(outcome.no_clone);
+        assert_eq!(outcome.name, "acme");
+        assert!(outcome.changed);
         // 账本落在构造期固定的 skill_home 边界内。
-        assert!(marketplace_name_taken(
-            &computer.skill_home(),
-            None,
-            "skills"
-        ));
+        assert!(marketplace_name_taken(&computer.skill_home(), None, "acme"));
 
         // 移除（保留 plugin 记录）→ prune 账本条目。
         let removed = computer
             .remove_marketplace(
-                "skills",
+                "acme",
                 RemoveMarketplaceParams {
                     keep_plugins: true,
                     hooks: None,
@@ -6747,12 +7222,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(removed.name, "skills");
+        assert_eq!(removed.name, "acme");
         assert!(removed.kept_plugins);
         assert!(!marketplace_name_taken(
             &computer.skill_home(),
             None,
-            "skills"
+            "acme"
         ));
 
         // 未知 marketplace → 结构化错误。
@@ -6762,6 +7237,141 @@ mod tests {
                 .await,
             Err(GovernanceError::UnknownMarketplace(n)) if n == "ghost"
         ));
+    }
+
+    /// #267：Computer 级 `--settings`（flag 层）接线——flag settings 的 `enabledPlugins` 引用参与
+    /// remove/re-add 守卫；同一操作无 flag 层则放行。
+    #[tokio::test]
+    async fn computer_add_marketplace_flag_layer_reference_guard_267() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("xdg").to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let url_a = build_marketplace_repo95(&tmp.path().join("repo-a"));
+        let url_b = build_marketplace_repo95(&tmp.path().join("repo-b"));
+
+        let comp_a = Computer::new("c267a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env.clone())
+            .with_blob_cache_root(tmp.path().join("blob-a"));
+        comp_a
+            .add_marketplace(&url_a, AddMarketplaceParams::default())
+            .await
+            .unwrap();
+        comp_a
+            .remove_marketplace(
+                "acme",
+                RemoveMarketplaceParams {
+                    keep_plugins: false,
+                    hooks: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // flag 层只剩 `<plugin>@acme` 引用 → 同名 re-add 必须拒绝（实例构造期归一后的 flag 路径）。
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+        let comp_flag = Computer::new("c267b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let err = comp_flag
+            .add_marketplace(&url_b, AddMarketplaceParams::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                GovernanceError::MarketplaceNameReferenced { name, plugin_ids }
+                    if name == "acme" && plugin_ids.iter().any(|p| p == "audit@acme")
+            ),
+            "{err:?}"
+        );
+
+        // 无 flag 层 → 正常注册（证明拒绝来自 flag 层）。
+        let comp_plain = Computer::new("c267c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-c"));
+        comp_plain
+            .add_marketplace(&url_b, AddMarketplaceParams::default())
+            .await
+            .unwrap();
+    }
+
+    /// #267 审查 🟡5：`Computer::add_marketplace` 以**实例** policy 视图覆盖调用方的 `policy_settings`
+    /// ——宿主注入的空/伪造 policy 不得绕过引用守卫。用本进程 pid 构造唯一 marketplace 名，避免宿主
+    /// managed policy 偶然命中（hermetic）。
+    #[tokio::test]
+    async fn computer_add_marketplace_overrides_caller_policy_settings_267() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            tmp.path().join("xdg").to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let mp = format!("policy-guard-267-{}", std::process::id());
+
+        // 内联 marketplace 仓库（清单名 = 唯一名）。
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            serde_json::json!({
+                "name": mp,
+                "plugins": [{"name": "audit", "source": "./plugins/audit"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let skill = repo.join("plugins/audit/skills/code-review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: policy guard\n---\nbody",
+        )
+        .unwrap();
+        git95(&["init", "-q"], &repo);
+        git95(&["add", "-A"], &repo);
+        git95(&["commit", "-qm", "init"], &repo);
+        let url = format!("file://{}", repo.display());
+
+        // 伪造 policy **含**指向该名的引用：若 Computer 不覆盖，add 会被拒。
+        let mut enabled = serde_json::Map::new();
+        enabled.insert(format!("audit@{mp}"), serde_json::Value::Bool(true));
+        let mut fake_policy = serde_json::Map::new();
+        fake_policy.insert(
+            "enabledPlugins".to_string(),
+            serde_json::Value::Object(enabled),
+        );
+        let comp = Computer::new("c267p", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob"));
+        comp.add_marketplace(
+            &url,
+            AddMarketplaceParams {
+                policy_settings: Some(&fake_policy),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Computer 必须以实例 policy 覆盖宿主注入的伪造 policy");
+        assert!(
+            crate::settings::store::load_known_marketplaces(Some(&home), None)
+                .account
+                .marketplaces
+                .contains_key(&mp),
+            "覆盖后引用守卫按实例 policy（空）放行，注册成立"
+        );
     }
 
     #[tokio::test]
@@ -6814,7 +7424,7 @@ mod tests {
         std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
         std::fs::write(
             repo.join(".tfrobot-plugin/marketplace.json"),
-            r#"{"plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
+            r#"{"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}"#,
         )
         .unwrap();
         let skill = repo.join("plugins/audit/skills/code-review");
@@ -6845,6 +7455,8 @@ mod tests {
         injected_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
         existing: std::collections::HashSet<String>,
         fail_register: Option<String>,
+        /// `true` ⇒ `mounted_servers` 为空（模拟「声明面 hook」：existing 含未挂载声明）。
+        declaration_only: bool,
     }
     impl RecordingRemountHooks {
         fn new() -> Self {
@@ -6853,6 +7465,7 @@ mod tests {
                 injected_roots: std::sync::Mutex::new(Vec::new()),
                 existing: std::collections::HashSet::new(),
                 fail_register: None,
+                declaration_only: false,
             }
         }
         fn failing(name: &str) -> Self {
@@ -6868,6 +7481,11 @@ mod tests {
                 ..Self::new()
             }
         }
+        /// 声明面 hook：existing 只是声明（未挂载）→ mounted 权威为空（#286 复审 🟡3）。
+        fn declaration_only(mut self) -> Self {
+            self.declaration_only = true;
+            self
+        }
     }
     #[async_trait::async_trait]
     impl McpInstallHooks for RecordingRemountHooks {
@@ -6876,6 +7494,13 @@ mod tests {
                 .iter()
                 .filter_map(|n| BundleId::try_from(n.clone()).ok().map(|b| (b, n.clone())))
                 .collect()
+        }
+        fn mounted_servers(&self) -> std::collections::HashSet<BundleId> {
+            if self.declaration_only {
+                std::collections::HashSet::new()
+            } else {
+                self.existing_servers().into_keys().collect()
+            }
         }
         async fn register_server(
             &self,
@@ -6963,7 +7588,15 @@ mod tests {
         let url = build_marketplace_repo95(&tmp.path().join("repo"));
         let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home.clone())
-            .with_blob_cache_root(tmp.path().join("blob-a"));
+            .with_blob_cache_root(tmp.path().join("blob-a"))
+            .with_config_env({
+                let env: EnvMap = std::iter::once((
+                    "XDG_CONFIG_HOME".to_string(),
+                    tmp.path().join("xdg").to_string_lossy().into_owned(),
+                ))
+                .collect();
+                env
+            });
         comp_a
             .add_marketplace(
                 &url,
@@ -7002,7 +7635,15 @@ mod tests {
         // ── 重启前：Computer A 添加 marketplace（真实 clone）+ 安装 plugin（写 installed_plugins.json）。
         let comp_a = Computer::new("a", SilentSession::new("s"), None, None, false, false)
             .with_skill_home(home.clone())
-            .with_blob_cache_root(tmp.path().join("blob-a"));
+            .with_blob_cache_root(tmp.path().join("blob-a"))
+            .with_config_env({
+                let env: EnvMap = std::iter::once((
+                    "XDG_CONFIG_HOME".to_string(),
+                    tmp.path().join("xdg").to_string_lossy().into_owned(),
+                ))
+                .collect();
+                env
+            });
         comp_a
             .add_marketplace(
                 &url,
@@ -7072,6 +7713,131 @@ mod tests {
             .is_some());
     }
 
+    /// #295：声明面换源 → boot recovery 报结构化冲突；旧能力按注册源恢复；**不降级**。
+    #[tokio::test]
+    async fn reconcile_governance_source_conflict_reports_without_degrading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        // 另一个可 clone 的源（不得被使用）。
+        let other_url = build_marketplace_repo95(&tmp.path().join("repo-b"));
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"));
+        let declared = serde_json::json!({
+            "enabledPlugins": { "audit@acme": true },
+            "extraKnownMarketplaces": { "acme": { "source": { "type": "git", "url": other_url } } }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let report = comp_b.reconcile_governance(None, Some(&declared)).await;
+        assert_eq!(report.marketplace_source_conflicts.len(), 1);
+        assert_eq!(report.marketplace_source_conflicts[0].marketplace, "acme");
+        assert!(report.failed_marketplaces.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+
+        // §5.14：validation 拒绝不得降级——直接断言 boot 降级判定所用的谓词（`has_degraded`），
+        // 而非 lifecycle（本用例未 boot，初态 Created 下 `!= Degraded` 恒真、无覆盖力）。
+        assert!(
+            !comp_b.status.has_degraded(),
+            "声明冲突不得产生 Degraded 诊断：{:?}",
+            comp_b.status().await.diagnostics
+        );
+        let status = comp_b.status().await;
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .all(|d| d.code != DiagnosticCode::MarketplaceSyncFailed),
+            "声明冲突不得映射为 degraded 诊断：{:?}",
+            status.diagnostics
+        );
+    }
+
+    /// #267 / #295 残余：非法 `extraKnownMarketplaces` 声明被 settings 校验整条丢弃时，boot 恢复报告
+    /// 必须可见（不改变丢弃语义、不计入 source_conflicts），旧注册源能力照常恢复。
+    #[tokio::test]
+    async fn reconcile_governance_reports_invalid_declaration_without_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let xdg = tmp.path().join("xdg");
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        // user settings：合法 enabledPlugins + 非法 marketplace 声明（typo URL → 校验期整条丢弃）。
+        let settings_dir = xdg.join("a2c");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let settings_path = settings_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "enabledPlugins": { "audit@acme": true },
+                "extraKnownMarketplaces": {
+                    "acme": { "source": { "type": "git", "url": "not-a-git-url" } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let comp_b = Computer::new("b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-b"))
+            .with_config_dir(tmp.path().join("config"))
+            .with_config_env(env);
+        let report = comp_b.reconcile_governance(None, None).await;
+
+        // 按 scope/field 过滤断言（ambient policy 也可能产生诊断，不能假设总数恰好 1）。
+        let error = report
+            .marketplace_declaration_errors
+            .iter()
+            .find(|e| {
+                e.scope == SettingsScope::User
+                    && e.field == "extraKnownMarketplaces.acme.source.url"
+            })
+            .unwrap_or_else(|| panic!("非法声明必须在恢复报告可见：{report:?}"));
+        assert_eq!(error.marketplace.as_deref(), Some("acme"), "{error:?}");
+        assert!(error.reason.contains("malformed git url"), "{error:?}");
+        assert_eq!(
+            report
+                .marketplace_declaration_errors
+                .iter()
+                .filter(|e| {
+                    e.scope == SettingsScope::User
+                        && e.field == "extraKnownMarketplaces.acme.source.url"
+                })
+                .count(),
+            1,
+            "同一非法声明不得重复计入：{report:?}"
+        );
+        assert_eq!(
+            error.source_path,
+            Some(settings_path.to_string_lossy().into_owned())
+        );
+        // 非法声明是「声明本身不可用」，不得混入合法换源冲突；校验丢弃语义不变（旧源照常恢复、不降级）。
+        assert!(
+            report.marketplace_source_conflicts.is_empty(),
+            "非法声明不得计入换源冲突：{report:?}"
+        );
+        assert!(report.failed_marketplaces.is_empty());
+        assert_eq!(
+            report.restored_skills,
+            vec!["audit:code-review".to_string()]
+        );
+        assert!(
+            !comp_b.status.has_degraded(),
+            "非法声明可观测不得产生 Degraded 诊断：{:?}",
+            comp_b.status().await.diagnostics
+        );
+    }
+
     /// 阶段二：给定 hooks → 重挂 bundled MCP server；report.remounted_servers 命中 + hook 收到注册 + 幂等。
     #[tokio::test]
     async fn reconcile_governance_remounts_bundled_servers_via_hooks() {
@@ -7108,6 +7874,669 @@ mod tests {
             .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
             .await;
         assert_eq!(report2.remounted_servers, vec!["audit-mcp".to_string()]);
+    }
+
+    /// #286 复审 🟡3：reconcile 的 existing-wins 用**运行期挂载集**——声明面命中但未挂载仍应重挂。
+    #[tokio::test]
+    async fn reconcile_remount_ignores_declaration_only_existing_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+
+        let comp_b = Computer::new("b286", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_blob_cache_root(tmp.path().join("blob-286r"));
+        let hooks = RecordingRemountHooks::with_existing(&["audit-mcp"]).declaration_only();
+        let report = comp_b
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+        assert_eq!(report.remounted_servers, vec!["audit-mcp".to_string()]);
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()],
+            "声明面命中但未挂载 → reconcile MUST 重挂（不得复现零投影半态）"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：`reconcile_governance(declared=None)` 的内部解析 MUST 纳入实例
+    /// `--settings` flag 层——flag-only `enabledPlugins=true` 也要恢复技能并重挂 bundled server。
+    #[tokio::test]
+    async fn reconcile_governance_none_path_consumes_flag_settings_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let comp = Computer::new("c248a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(&wd)
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248a"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp.reconcile_governance(Some(&hooks), None).await;
+        assert_eq!(
+            report.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "flag 层 enabledPlugins MUST 驱动 declared=None 的恢复重挂"
+        );
+        assert_eq!(
+            *hooks.registered.lock().unwrap(),
+            vec!["audit-mcp".to_string()]
+        );
+
+        // 对照：同上下文无 flag 层 → 不激活（证明重挂来自 flag 层）。
+        let blind = Computer::new("c248b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-248b"));
+        let blind_hooks = RecordingRemountHooks::new();
+        let blind_report = blind.reconcile_governance(Some(&blind_hooks), None).await;
+        assert!(
+            blind_report.remounted_servers.is_empty(),
+            "无 flag 层时 MUST 不重挂（对照）"
+        );
+        assert!(blind_hooks.registered.lock().unwrap().is_empty());
+    }
+
+    /// rust-sdk#267（#248 残余）：`declared=Some` 分支的 `scope_layers` 也必须纳入 flag 层——
+    /// flag=true + project=true 时 origin=Flag（受信），MUST NOT 误落 project-origin 的 PENDING 审批门。
+    #[tokio::test]
+    async fn reconcile_governance_declared_some_treats_flag_origin_as_trusted_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(wd.join(".tfrobot")).unwrap();
+        std::fs::write(
+            wd.join(".tfrobot").join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let comp = Computer::new("c248c", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248c"));
+        let hooks = RecordingRemountHooks::new();
+        let report = comp
+            .reconcile_governance(Some(&hooks), Some(&declared_audit_enabled()))
+            .await;
+        assert!(
+            report.pending_bundled_servers.is_empty(),
+            "flag 受信 scope MUST 压过 project-origin（不落 PENDING）"
+        );
+        assert_eq!(
+            report.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "flag+project 重叠时 MUST 直挂"
+        );
+    }
+
+    /// rust-sdk#267 合入 #302 契约：非法 marketplace 声明的 **Flag** 校验错误不进恢复报告字段
+    /// （CLI 启动边界已单独打印、避免重复）；非 CLI 取路（直接 `resolve_settings`）仍保留全量（含 Flag）。
+    #[tokio::test]
+    async fn reconcile_governance_declaration_errors_flag_dedupe_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(
+            &flag,
+            r#"{"extraKnownMarketplaces":{"acme":{"source":{"type":"git","url":"garbage"}}}}"#,
+        )
+        .unwrap();
+
+        let comp = Computer::new("c248o", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248o"));
+        let report = comp
+            .reconcile_governance(Some(&RecordingRemountHooks::new()), None)
+            .await;
+        assert!(
+            report
+                .marketplace_declaration_errors
+                .iter()
+                .all(|error| error.scope != SettingsScope::Flag),
+            "Flag 校验错误 MUST NOT 进报告字段（CLI 已单独打印）：{:?}",
+            report.marketplace_declaration_errors
+        );
+
+        // 非 CLI 取路：直接解析仍保留 Flag 校验错误（含 WARN 全量日志之外的结构化入口）。
+        let resolved = resolve_settings(ResolveSettingsArgs {
+            cwd: Some(&wd),
+            env: Some(&env),
+            flag_settings_path: Some(&flag),
+            policy_settings: None,
+        });
+        let all = crate::settings::recovery::marketplace_declaration_errors(&resolved.errors);
+        assert!(
+            all.iter().any(|error| error.scope == SettingsScope::Flag),
+            "非 CLI 取路（resolve_settings）MUST 保留 Flag 校验错误：{all:?}"
+        );
+    }
+
+    /// rust-sdk#267 独立审查 🟡1：实例 flag/policy 的显式 `enabledPlugins` MUST 覆盖调用方
+    /// `declared`（flag-blind caller 的旧视图不得把受信层 disable 压成 enable）。
+    /// 双向锁定：flag=false + declared=true → 不挂载；flag=true + declared=false → 挂载。
+    #[tokio::test]
+    async fn reconcile_governance_instance_flag_overrides_caller_declared_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+
+        // 受信层显式 disable + 调用方（flag-blind）declared=true → MUST NOT 挂载。
+        let comp_disabled =
+            Computer::new("c248m", SilentSession::new("s"), None, None, false, false)
+                .with_skill_home(home.clone())
+                .with_config_dir(&wd)
+                .with_config_env(env.clone())
+                .with_flag_settings_path(&flag)
+                .with_blob_cache_root(tmp.path().join("blob-248m"));
+        let hooks_disabled = RecordingRemountHooks::new();
+        let report_disabled = comp_disabled
+            .reconcile_governance(Some(&hooks_disabled), Some(&declared_audit_enabled()))
+            .await;
+        assert!(
+            report_disabled.remounted_servers.is_empty(),
+            "实例 flag=false MUST 覆盖 caller declared=true（受信层 disable 不得被压过）"
+        );
+        assert!(report_disabled.pending_bundled_servers.is_empty());
+        assert!(hooks_disabled.registered.lock().unwrap().is_empty());
+
+        // 对称：受信层显式 enable + 调用方 declared=false → MUST 挂载。
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let caller_disabled: serde_json::Map<String, serde_json::Value> =
+            serde_json::json!({ "enabledPlugins": { "audit@acme": false } })
+                .as_object()
+                .unwrap()
+                .clone();
+        let comp_enabled =
+            Computer::new("c248n", SilentSession::new("s"), None, None, false, false)
+                .with_skill_home(home)
+                .with_config_dir(&wd)
+                .with_config_env(env)
+                .with_flag_settings_path(&flag)
+                .with_blob_cache_root(tmp.path().join("blob-248n"));
+        let hooks_enabled = RecordingRemountHooks::new();
+        let report_enabled = comp_enabled
+            .reconcile_governance(Some(&hooks_enabled), Some(&caller_disabled))
+            .await;
+        assert_eq!(
+            report_enabled.remounted_servers,
+            vec!["audit-mcp".to_string()],
+            "实例 flag=true MUST 覆盖 caller declared=false（受信层 enable 生效）"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：`list_pending_bundled_approvals` 必须消费 flag 层——
+    /// flag 的 `false` 能压过 project 的 `true`（修复前 flag 缺席，pending 仍非空）。
+    #[tokio::test]
+    async fn list_pending_bundled_approvals_consumes_flag_layer_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(wd.join(".tfrobot")).unwrap();
+        std::fs::write(
+            wd.join(".tfrobot").join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let project_only =
+            Computer::new("c248d", SilentSession::new("s"), None, None, false, false)
+                .with_skill_home(home.clone())
+                .with_config_dir(&wd)
+                .with_config_env(env.clone())
+                .with_blob_cache_root(tmp.path().join("blob-248d"));
+        assert_eq!(
+            project_only.list_pending_bundled_approvals().len(),
+            1,
+            "project-only 启用 MUST 落 PENDING（正对照）"
+        );
+
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+        let with_flag = Computer::new("c248e", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248e"));
+        assert!(
+            with_flag.list_pending_bundled_approvals().is_empty(),
+            "flag=false MUST 压过 project=true（flag 层必须被消费）"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：归属视图（`enabled_bundled_ownership` → `list_mcp_servers_with_metadata`）
+    /// 必须消费 flag 层——flag-only 启用的 bundled server 以 `managedBy=plugin` 出现。
+    #[tokio::test]
+    async fn list_mcp_servers_with_metadata_consumes_flag_layer_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+
+        let comp = Computer::new("c248f", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(&wd)
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248f"));
+        let meta = comp.list_mcp_servers_with_metadata().await;
+        let audit = meta
+            .iter()
+            .find(|m| m.name == "audit-mcp")
+            .expect("flag-only 启用的 bundled server MUST 出现在归属视图");
+        assert!(
+            matches!(audit.managed_by, McpOwnership::Plugin { .. }),
+            "flag 启用的 bundled server MUST 标 managedBy=plugin"
+        );
+
+        // 对照：无 flag 层 → 未启用，不在归属视图。`with_config_dir` 令 project/local 锚定空 wd，
+        // 避免宿主进程 cwd 的 `.tfrobot/settings.json` 污染（审查 🟡2：hermetic）。
+        let blind = Computer::new("c248g", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-248g"));
+        assert!(
+            blind
+                .list_mcp_servers_with_metadata()
+                .await
+                .iter()
+                .all(|m| m.name != "audit-mcp"),
+            "无 flag 层时 MUST 不出现（对照）"
+        );
+    }
+
+    /// rust-sdk#267（#248 残余）：`enabled_bundled_ownership` 的 project/local 锚点 MUST 是**实例**
+    /// `config_dir`（而非进程 cwd）——嵌入宿主 `with_config_dir` 下 project-scope 启用态要被看见。
+    #[tokio::test]
+    async fn enabled_bundled_ownership_anchors_project_at_config_dir_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(wd.join(".tfrobot")).unwrap();
+        std::fs::write(
+            wd.join(".tfrobot").join("settings.json"),
+            r#"{"enabledPlugins":{"audit@acme":true}}"#,
+        )
+        .unwrap();
+        let env = instance_xdg_env_126(&tmp);
+
+        let comp = Computer::new("c248h", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-248h"));
+        let meta = comp.list_mcp_servers_with_metadata().await;
+        let audit = meta
+            .iter()
+            .find(|m| m.name == "audit-mcp")
+            .expect("实例 config_dir 的 project 启用态 MUST 进入归属视图");
+        assert!(matches!(audit.managed_by, McpOwnership::Plugin { .. }));
+    }
+
+    /// rust-sdk#267（#248 残余）：`instance_config_context` 组装快照时 MUST 接实例 flag settings
+    /// （`plugins.enabled` 出现 flag-origin 条目）；对照无 flag 层不出现。
+    #[tokio::test]
+    async fn instance_config_context_consumes_flag_settings_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wd = tmp.path().join("wd");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&wd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+
+        let comp = Computer::new("c248i", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag);
+        let ctx = comp.instance_config_context(&wd, &home, WriteScope::Local);
+        let snap = load_config(&ctx);
+        let entry = snap
+            .plugins
+            .enabled
+            .iter()
+            .find(|e| e.id == "audit@acme")
+            .expect("flag 层 enabledPlugins MUST 进入 instance_config_context 快照");
+        assert!(entry.enabled);
+        assert_eq!(entry.origin, ProvenanceScope::Flag);
+
+        // 对照：无 flag 层 → 不出现。
+        let blind = Computer::new("c248j", SilentSession::new("s"), None, None, false, false)
+            .with_config_env(env);
+        let blind_ctx = blind.instance_config_context(&wd, &home, WriteScope::Local);
+        assert!(
+            load_config(&blind_ctx)
+                .plugins
+                .enabled
+                .iter()
+                .all(|e| e.id != "audit@acme"),
+            "无 flag 层时 MUST 不出现（对照）"
+        );
+    }
+
+    /// rust-sdk#267 审查 🔴1：`governance_snapshot`（GUI 的 `list_plugins` / `get_plugin` / `revision` 来源）
+    /// MUST 与运行期/归属视图**同源**消费实例 flag settings——否则 flag-only 启用的插件在同一 PluginSnapshot
+    /// 内出现「enabled=false 但 materialized 非空」的自相矛盾。
+    #[tokio::test]
+    async fn governance_snapshot_consumes_flag_settings_248() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let wd = tmp.path().join("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        let env = instance_xdg_env_126(&tmp);
+        let flag = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+
+        let comp = Computer::new("c248k", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(&wd)
+            .with_config_env(env.clone())
+            .with_flag_settings_path(&flag)
+            .with_blob_cache_root(tmp.path().join("blob-248k"));
+        let snap = comp.governance_snapshot().await.unwrap();
+        let plugin = snap
+            .plugins
+            .iter()
+            .find(|p| p.id == "audit@acme")
+            .expect("已安装 plugin MUST 出现在治理快照");
+        assert!(plugin.enabled, "flag 层启用 MUST 在治理快照生效");
+        assert_eq!(
+            plugin.enablement_scope,
+            Some(ProvenanceScope::Flag),
+            "胜出 scope MUST 为 Flag"
+        );
+        assert_eq!(
+            plugin.status,
+            crate::governance::PluginStatus::InstalledEnabled
+        );
+        let rev_flag = snap.revision.clone();
+
+        // 同实例改写 flag → revision MUST 变（GUI 以 revision 作缓存键；release note 承诺）。
+        std::fs::write(&flag, r#"{"enabledPlugins":{"audit@acme":false}}"#).unwrap();
+        let snap_switched = comp.governance_snapshot().await.unwrap();
+        assert_ne!(
+            rev_flag, snap_switched.revision,
+            "flag 内容切换 MUST 改变 GovernanceSnapshot.revision"
+        );
+
+        // 对照：无 flag 层 → InstalledDisabled（证明启用态来自 flag 层）。
+        let blind = Computer::new("c248l", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(&wd)
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-248l"));
+        let blind_snap = blind.governance_snapshot().await.unwrap();
+        let blind_plugin = blind_snap
+            .plugins
+            .iter()
+            .find(|p| p.id == "audit@acme")
+            .expect("已安装 plugin MUST 出现在治理快照");
+        assert!(!blind_plugin.enabled);
+        assert_eq!(
+            blind_plugin.status,
+            crate::governance::PluginStatus::InstalledDisabled
+        );
+        assert_ne!(
+            snap_switched.revision, blind_snap.revision,
+            "flag=false 与无 flag 的 revision 也应不同（快照内容含 flag 层）"
+        );
+    }
+
+    /// #286 复审 🟡4：Computer 注入 manager 已挂载集为 existing-wins 权威——hooks 声明面为空也不重挂已挂载实例。
+    #[tokio::test]
+    async fn enable_plugin_skips_remount_for_runtime_mounted_server_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_root = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg_root).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_root.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let comp = Computer::new("c286a", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home)
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-286a"));
+        comp.boot_up().await.unwrap();
+        let server_cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "audit-mcp",
+            "server_parameters": {"command": "node"}
+        }))
+        .unwrap();
+        comp.mount_server(server_cfg).await.unwrap();
+        let hooks = RecordingRemountHooks::new();
+        comp.enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap();
+        assert!(
+            hooks.registered.lock().unwrap().is_empty(),
+            "运行期已挂载 → MUST existing-wins 跳过（Computer 注入 mounted_bundle_ids）"
+        );
+    }
+
+    /// #286 复审 🔴1/🟡4：Computer 注入五层解析 **provider**（含 flag）——flag-only enabled=true 时
+    /// 预检失败 MUST 保留已挂 server，并包装 retained 诊断（provider 覆盖 flag 层）。
+    #[tokio::test]
+    async fn enable_plugin_failure_keeps_server_for_flag_only_enabled_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_root = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg_root).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_root.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let flag_file = tmp.path().join("flag-settings.json");
+        std::fs::write(&flag_file, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+        let comp = Computer::new("c286b", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env)
+            .with_flag_settings_path(&flag_file)
+            .with_blob_cache_root(tmp.path().join("blob-286b"));
+        comp.boot_up().await.unwrap();
+        let server_cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "audit-mcp",
+            "server_parameters": {"command": "node"}
+        }))
+        .unwrap();
+        comp.mount_server(server_cfg).await.unwrap();
+        // 破坏安装根 → enable 预检失败。
+        let records = crate::settings::store::load_installed_plugins(Some(&home), None)
+            .account
+            .plugins
+            .get("audit@acme")
+            .cloned()
+            .unwrap();
+        let root = std::path::PathBuf::from(records[0].install_path.clone().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let hooks = MountingRemountHooks::new(&comp);
+        let err = comp
+            .enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::settings::installer::PluginInstallError::EnableFailedRetained { .. }
+        ));
+        assert!(matches!(
+            err.retained_source_deep(),
+            crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
+        ));
+        assert!(
+            comp.list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "flag-only enabled=true → 失败回滚 MUST 保留 server（resolved provider 注入）"
+        );
+    }
+
+    /// Discussion#82 裁决 C（生产入口）：prior-true 时删除安装根再 enable → 预检零写保持 true，
+    /// 已挂 server / SKILL MUST 保留；诊断包装 `EnableFailedRetained`。
+    #[tokio::test]
+    async fn enable_plugin_failure_keeps_state_via_computer_82() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_root = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg_root).unwrap();
+        let env: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_root.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let comp = Computer::new("c286d", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env)
+            .with_blob_cache_root(tmp.path().join("blob-286d"));
+        comp.boot_up().await.unwrap();
+        let hooks = MountingRemountHooks::new(&comp);
+        comp.enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap();
+        assert!(
+            comp.list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "首次 enable 应挂上 audit-mcp"
+        );
+
+        // 删除安装根 → 再次 enable 预检失败（prior=true → 零写保持 true）。
+        let records = crate::settings::store::load_installed_plugins(Some(&home), None)
+            .account
+            .plugins
+            .get("audit@acme")
+            .cloned()
+            .unwrap();
+        let root = std::path::PathBuf::from(records[0].install_path.clone().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+        let err = comp
+            .enable_plugin("audit@acme", EnableOptions::default(), Some(&hooks))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::settings::installer::PluginInstallError::EnableFailedRetained { .. }
+        ));
+        assert!(
+            comp.list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "prior-true 预检失败 MUST 保留已挂 server（Discussion#82 裁决 C）"
+        );
+    }
+
+    /// #286 最终复审 2：resolved provider MUST 用 **effective env**（`options.env`），而非 `config_env()`——
+    /// env_b 下 user=true、config_env=env_a 时，失败诊断 MUST 用 effective env（用 config_env 会漏报 retained）。
+    #[tokio::test]
+    async fn enable_plugin_failure_uses_effective_env_for_gate_286() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = cold_start_setup95(&tmp).await;
+        let cfg_a = tmp.path().join("cfg-a");
+        let cfg_b = tmp.path().join("cfg-b");
+        std::fs::create_dir_all(&cfg_a).unwrap();
+        std::fs::create_dir_all(&cfg_b).unwrap();
+        let env_a: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_a.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        let env_b: EnvMap = std::iter::once((
+            "XDG_CONFIG_HOME".to_string(),
+            cfg_b.to_string_lossy().into_owned(),
+        ))
+        .collect();
+        // env_b 的 user settings：plugin 仍启用（另一 scope 不会被本次回滚触碰）。
+        let user_path = crate::settings::scope::user_settings_path(Some(&env_b));
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        std::fs::write(&user_path, r#"{"enabledPlugins":{"audit@acme":true}}"#).unwrap();
+
+        let comp = Computer::new("c286e", SilentSession::new("s"), None, None, false, false)
+            .with_skill_home(home.clone())
+            .with_config_dir(tmp.path().join("wd"))
+            .with_config_env(env_a) // config_env 无任何 enabled 设置
+            .with_blob_cache_root(tmp.path().join("blob-286e"));
+        comp.boot_up().await.unwrap();
+        let server_cfg: MCPServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "stdio", "name": "audit-mcp",
+            "server_parameters": {"command": "node"}
+        }))
+        .unwrap();
+        comp.mount_server(server_cfg).await.unwrap();
+        let records = crate::settings::store::load_installed_plugins(Some(&home), None)
+            .account
+            .plugins
+            .get("audit@acme")
+            .cloned()
+            .unwrap();
+        let root = std::path::PathBuf::from(records[0].install_path.clone().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // 失败 scope=project（写盘/回滚锚 wd2，无值）；门控以 effective env=env_b 解析 → user=true 保留。
+        let wd2 = tmp.path().join("wd2");
+        std::fs::create_dir_all(&wd2).unwrap();
+        let hooks = MountingRemountHooks::new(&comp);
+        let err = comp
+            .enable_plugin(
+                "audit@acme",
+                EnableOptions {
+                    scope: Some("project"),
+                    project_path: wd2.to_str(),
+                    env: Some(&env_b),
+                    ..Default::default()
+                },
+                Some(&hooks),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::settings::installer::PluginInstallError::EnableFailedRetained { .. }
+        ));
+        assert!(matches!(
+            err.retained_source_deep(),
+            crate::settings::installer::PluginInstallError::ContentUnavailable { .. }
+        ));
+        assert!(
+            comp.list_mcp_servers()
+                .await
+                .iter()
+                .any(|c| c.name() == "audit-mcp"),
+            "effective env（env_b）的 user=true 必须被诊断看见；用 config_env 会误报未保留"
+        );
     }
 
     /// #165 Option B（变异验证判据）：project-scope `enabledPlugins=true`（入 git、随仓库分发）激活的 plugin
@@ -11986,6 +13415,12 @@ mod tests {
         assert_eq!(
             home_lookup_with(Some(&env), false).as_deref(),
             Some("/home/alice")
+        );
+        // USERPROFILE 缺失、仅 HOME 存在：Windows 也回落到 HOME（不是直接 fail-closed）。
+        assert_eq!(
+            home_lookup_with(Some(&env), true).as_deref(),
+            Some("/home/alice"),
+            "Windows 下 USERPROFILE 缺失须回落 HOME"
         );
     }
 

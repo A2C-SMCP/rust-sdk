@@ -298,8 +298,9 @@ pub fn load_project_config_doc(config_dir: &Path) -> Result<ProjectConfigDoc, Co
 /// **整体替换**语义（与 `update_config` 的实体级 fan-out 不同）：`Some(map)` 覆盖该文件、`None` 跳过（不建不删）。
 ///
 /// #245 / protocol#65：project settings 层的 `readRoots`（仅受信 scope 可设）在落盘前剔除——本函数是
-/// import / duplicate / SDK 调用等**整体写**路径的单一收口。诊断：import 经 `validate_config` 产出
-/// `ValidationReport`；duplicate 等无报告的路径只记 tracing warn。
+/// import / duplicate / SDK 调用等**整体写**路径的单一收口。**#292 起明确为 A+ 的显式例外**：实体级
+/// `config::executor` 路径保留 + WARN，整文档覆盖写无法保留未携带的键，故仍剔除。诊断：import 经
+/// `validate_config` 产出 `ValidationReport`；duplicate 等无报告的路径只记 tracing warn。
 pub fn save_config(config_dir: &Path, doc: &ProjectConfigDoc) -> Result<(), ConfigCrudError> {
     let mut sanitized = doc.clone();
     drop_project_read_roots(&mut sanitized);
@@ -314,7 +315,9 @@ pub fn save_config(config_dir: &Path, doc: &ProjectConfigDoc) -> Result<(), Conf
 
 /// #245 / protocol#65：project scope 不得持久化 `readRoots`（仅受信 scope 可设）。
 ///
-/// 供整体写（[`save_config`]）与面向分享的导出（[`export_config`](super::portability::export_config)）复用。
+/// 供**整体写**（[`save_config`]）与面向分享的导出（[`export_config`](super::portability::export_config)）
+/// 复用。**#292**：这是 A+（保留 + WARN）的显式例外——实体级 executor 写入不再剔除；整文档覆盖写与
+/// 分享物边界仍按本函数剔除。
 pub(crate) fn drop_project_read_roots(doc: &mut ProjectConfigDoc) {
     if let Some(settings) = doc.settings.as_mut() {
         if settings.remove(FIELD_READ_ROOTS).is_some() {
@@ -466,6 +469,29 @@ mod tests {
             read_json(&mcp),
             json!({"servers": {"srv": {"type": "stdio"}}})
         );
+    }
+
+    #[test]
+    fn save_config_still_drops_project_read_roots_exception() {
+        // #292 文档化例外：整文档 `save_config`（import/duplicate/整体写）仍剔除 project `readRoots`；
+        // 实体级 executor 写入才保留 + WARN。本测试锁定该例外不被误改。
+        let fx = Fixture::new();
+        let mut settings = JsonMap::new();
+        settings.insert("readRoots".to_string(), json!(["/data"]));
+        settings.insert("keep".to_string(), json!(1));
+        let doc = ProjectConfigDoc {
+            settings: Some(settings),
+            settings_local: None,
+            mcp: None,
+            mcp_local: None,
+        };
+        save_config(&fx.wd, &doc).unwrap();
+        let saved = read_json(&workdir_project_settings_path(&fx.wd));
+        assert!(
+            saved.get("readRoots").is_none(),
+            "save_config 的整体写例外仍须剔除 project readRoots：{saved}"
+        );
+        assert_eq!(saved["keep"], json!(1));
     }
 
     #[test]

@@ -241,7 +241,7 @@ fn lock_sidecar_path(data_path: &Path) -> PathBuf {
 ///
 /// 被占时按**指数退避**重试 `retries` 次（每次 WARN，延迟封顶 `backoff_max`）；仍拿不到 → 返回
 /// [`SettingsStoreError::Lock`]（fail-fast，绝不无锁写）。`work` 在持锁期间执行，返回后锁释放。
-fn with_file_lock<T>(
+pub(crate) fn with_file_lock<T>(
     data_path: &Path,
     retries: u32,
     backoff_base: Duration,
@@ -347,6 +347,29 @@ fn backup_corrupt(path: &Path) -> Option<PathBuf> {
             );
             None
         }
+    }
+}
+
+/// 读取 JSONC 物化文件（容错前导 `//` 头）**严格只读**：损坏 → Err，不改名/不备份。
+///
+/// 供迁移预检使用：现有 [`read_jsonc_with_recovery`] 会在损坏时 `backup_corrupt`（写入），
+/// 破坏「冲突/损坏时零写入」的保证。
+fn read_jsonc_strict(path: &Path) -> Result<Option<Map<String, Value>>, SettingsStoreError> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SettingsStoreError::io(path, e)),
+    };
+    match serde_json::from_str::<Value>(&strip_jsonc_header(&raw)) {
+        Ok(Value::Object(map)) => Ok(Some(map)),
+        Ok(_) => Err(SettingsStoreError::io(
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, "root is not an object"),
+        )),
+        Err(e) => Err(SettingsStoreError::io(
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, format!("corrupt JSON: {e}")),
+        )),
     }
 }
 
@@ -528,6 +551,134 @@ fn coerce_installed_plugins_intent(
 }
 
 // ===========================================================================
+// 严格只读规整（迁移预检用；结构损坏 → Err，不静默降级）/ Strict coercion
+// ===========================================================================
+/// 存储层接受的 plugin id：no-`@` 视为 local-only 透传；含 `@` 必须是合法 `<plugin>@<marketplace>`。
+fn is_acceptable_stored_plugin_id(pid: &str) -> bool {
+    if pid.is_empty() {
+        false
+    } else if pid.contains('@') {
+        is_valid_enabled_plugin_key(pid)
+    } else {
+        true
+    }
+}
+
+fn strict_coerce_err(path: &Path, reason: impl Into<String>) -> SettingsStoreError {
+    SettingsStoreError::io(
+        path,
+        io::Error::new(io::ErrorKind::InvalidData, reason.into()),
+    )
+}
+
+fn coerce_known_marketplaces_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    let account = match data.get("marketplaces") {
+        Some(Value::Object(map)) => {
+            let mut marketplaces = indexmap::IndexMap::new();
+            for (name, value) in map {
+                let display = crate::settings::redaction::untrusted_name_for_display(name);
+                let entry: KnownMarketplaceEntry =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        strict_coerce_err(
+                            path,
+                            format!("marketplaces entry {display:?} is invalid"),
+                        )
+                    })?;
+                marketplaces.insert(name.clone(), entry);
+            }
+            KnownMarketplaces { marketplaces }
+        }
+        Some(Value::Null) | None => KnownMarketplaces::default(),
+        Some(_) => {
+            return Err(strict_coerce_err(
+                path,
+                "field 'marketplaces' is not an object",
+            ))
+        }
+    };
+    Ok(KnownMarketplacesFile {
+        version: MATERIALIZED_VERSION,
+        account,
+    })
+}
+
+fn coerce_installed_plugins_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<InstalledPluginsFile, SettingsStoreError> {
+    let account = match data.get("plugins") {
+        Some(Value::Object(map)) => {
+            let mut plugins = indexmap::IndexMap::new();
+            for (pid, value) in map {
+                if !is_acceptable_stored_plugin_id(pid) {
+                    let display = crate::settings::redaction::untrusted_name_for_display(pid);
+                    return Err(strict_coerce_err(
+                        path,
+                        format!("plugins key {display:?} is not a valid plugin id"),
+                    ));
+                }
+                let display = crate::settings::redaction::untrusted_name_for_display(pid);
+                let records: Vec<crate::settings::reconciler::InstalledPluginRecord> =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        strict_coerce_err(path, format!("plugins entry {display:?} is invalid"))
+                    })?;
+                plugins.insert(pid.clone(), records);
+            }
+            InstalledPlugins { plugins }
+        }
+        Some(Value::Null) | None => InstalledPlugins::default(),
+        Some(_) => return Err(strict_coerce_err(path, "field 'plugins' is not an object")),
+    };
+    Ok(InstalledPluginsFile {
+        version: MATERIALIZED_VERSION,
+        account,
+    })
+}
+
+fn coerce_installed_plugins_intent_strict(
+    data: &Map<String, Value>,
+    path: &Path,
+) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    let mut set: IndexSet<String> = IndexSet::new();
+    match data.get("installedPlugins") {
+        Some(Value::Array(arr)) => {
+            for value in arr {
+                let Some(pid) = value.as_str() else {
+                    return Err(strict_coerce_err(
+                        path,
+                        "installedPlugins contains a non-string entry",
+                    ));
+                };
+                if !is_acceptable_stored_plugin_id(pid) {
+                    let display = crate::settings::redaction::untrusted_name_for_display(pid);
+                    return Err(strict_coerce_err(
+                        path,
+                        format!("installedPlugins contains an invalid plugin id {display:?} (expect '<plugin>@<marketplace>')"),
+                    ));
+                }
+                set.insert(pid.to_string());
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => {
+            return Err(strict_coerce_err(
+                path,
+                "field 'installedPlugins' is not an array",
+            ))
+        }
+    }
+    Ok(InstalledPluginsIntentFile {
+        version: MATERIALIZED_VERSION,
+        account: InstalledPluginsIntent {
+            installed_plugins: set,
+        },
+    })
+}
+
+// ===========================================================================
 // 高层读写 / High-level load & save
 // ===========================================================================
 /// 加载 `known_marketplaces.json`（缺失 / 损坏 → 空配置）/ Load known_marketplaces.json。
@@ -561,6 +712,44 @@ pub fn load_installed_plugins_intent(
     match read_jsonc_with_recovery(&path) {
         Some(data) => coerce_installed_plugins_intent(&data, &path),
         None => empty_installed_plugins_intent(),
+    }
+}
+
+/// 严格只读加载 `known_marketplaces.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+///
+/// 迁移预检专用（零写入保证）；日常读取仍用 [`load_known_marketplaces`]（容错 + 损坏降级）。
+pub(crate) fn load_known_marketplaces_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    let path = known_marketplaces_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => coerce_known_marketplaces_strict(&data, &path),
+        None => Ok(empty_known_marketplaces()),
+    }
+}
+
+/// 严格只读加载 `installed_plugins.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+pub(crate) fn load_installed_plugins_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginsFile, SettingsStoreError> {
+    let path = installed_plugins_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => coerce_installed_plugins_strict(&data, &path),
+        None => Ok(empty_installed_plugins()),
+    }
+}
+
+/// 严格只读加载 `installed_plugins_intent.json`：缺失 → 空；损坏 → Err（**不**改名备份）。
+pub(crate) fn load_installed_plugins_intent_strict(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    let path = installed_plugins_intent_path(home, env);
+    match read_jsonc_strict(&path)? {
+        Some(data) => coerce_installed_plugins_intent_strict(&data, &path),
+        None => Ok(empty_installed_plugins_intent()),
     }
 }
 
@@ -619,21 +808,42 @@ pub fn update_known_marketplaces(
     home: Option<&Path>,
     env: Option<&EnvMap>,
 ) -> Result<KnownMarketplacesFile, SettingsStoreError> {
+    // 单一 RMW 真相：委托 checked 变体（persist=true），避免两段加锁体漂移。
+    update_known_marketplaces_checked(home, env, |current| {
+        mutator(current);
+        (current.clone(), true)
+    })
+}
+
+/// 持锁 read-check-write `known_marketplaces.json`（#272 注册提交点）/ Locked checked RMW.
+///
+/// `work` 在**文件锁内**执行并返回 `(值, 是否持久化)`——唯一性/引用判定与插入在同一把锁内完成，
+/// 跨进程并发 add 不会双注册。`work` 内只做同步短操作（禁止 async / 嵌套 store 写）。
+///
+/// # Errors
+/// 锁 / I/O 失败 → [`SettingsStoreError`]。
+pub(crate) fn update_known_marketplaces_checked<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut KnownMarketplacesFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
     let path = known_marketplaces_path(home, env);
     with_file_lock(
         &path,
         DEFAULT_LOCK_RETRIES,
         DEFAULT_LOCK_BACKOFF_BASE,
         DEFAULT_LOCK_BACKOFF_MAX,
-        || -> io::Result<KnownMarketplacesFile> {
+        || -> io::Result<T> {
             let mut current = match read_jsonc_with_recovery(&path) {
                 Some(data) => coerce_known_marketplaces(&data, &path),
                 None => empty_known_marketplaces(),
             };
-            mutator(&mut current);
-            current.version = MATERIALIZED_VERSION;
-            atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
-            Ok(current)
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
         },
     )?
     .map_err(|e| SettingsStoreError::io(&path, e))
@@ -665,6 +875,99 @@ pub fn update_installed_plugins(
     .map_err(|e| SettingsStoreError::io(&path, e))
 }
 
+fn store_error_to_io(error: SettingsStoreError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// 严格版 `installed_plugins` checked RMW：损坏状态 fail-closed（不触发 `.corrupt` 改名）。
+pub(crate) fn update_installed_plugins_checked_strict<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut InstalledPluginsFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
+    let path = installed_plugins_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<T> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => {
+                    coerce_installed_plugins_strict(&data, &path).map_err(store_error_to_io)?
+                }
+                None => empty_installed_plugins(),
+            };
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 严格版 `known_marketplaces` checked RMW：损坏状态 fail-closed。
+pub(crate) fn update_known_marketplaces_checked_strict<T>(
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+    work: impl FnOnce(&mut KnownMarketplacesFile) -> (T, bool),
+) -> Result<T, SettingsStoreError> {
+    let path = known_marketplaces_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<T> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => {
+                    coerce_known_marketplaces_strict(&data, &path).map_err(store_error_to_io)?
+                }
+                None => empty_known_marketplaces(),
+            };
+            let (out, persist) = work(&mut current);
+            if persist {
+                current.version = MATERIALIZED_VERSION;
+                atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            }
+            Ok(out)
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 严格版 intent 可中止 RMW：损坏状态 fail-closed。
+pub(crate) fn try_update_installed_plugins_intent_strict(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile) -> bool,
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<Option<InstalledPluginsIntentFile>, SettingsStoreError> {
+    let path = installed_plugins_intent_path(home, env);
+    with_file_lock(
+        &path,
+        DEFAULT_LOCK_RETRIES,
+        DEFAULT_LOCK_BACKOFF_BASE,
+        DEFAULT_LOCK_BACKOFF_MAX,
+        || -> io::Result<Option<InstalledPluginsIntentFile>> {
+            let mut current = match read_jsonc_strict(&path).map_err(store_error_to_io)? {
+                Some(data) => coerce_installed_plugins_intent_strict(&data, &path)
+                    .map_err(store_error_to_io)?,
+                None => empty_installed_plugins_intent(),
+            };
+            if !mutator(&mut current) {
+                return Ok(None);
+            }
+            current.version = MATERIALIZED_VERSION;
+            atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
+            Ok(Some(current))
+        },
+    )?
+    .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
 /// 持锁原子读-改-写 `installed_plugins_intent.json`（语义同 [`update_known_marketplaces`]）/ Locked atomic RMW。
 ///
 /// install/uninstall 经此写全局安装意图（config-first）。缺失文件 → 空集起步；`mutator` 就地增删 id。
@@ -674,24 +977,74 @@ pub fn update_installed_plugins_intent(
     home: Option<&Path>,
     env: Option<&EnvMap>,
 ) -> Result<InstalledPluginsIntentFile, SettingsStoreError> {
+    Ok(update_installed_plugins_intent_locked(
+        |current| {
+            mutator(current);
+            true
+        },
+        home,
+        env,
+    )?
+    .expect("update_installed_plugins_intent always commits"))
+}
+
+/// 可中止的 intent RMW：`mutator` 返回 `false` → **不落盘**（文件逐字节不变）/ Abortable intent RMW.
+///
+/// #275 TOCTOU 复核用：锁内发现同裸名抢跑时放弃插入，避免「拒绝仍重写 intent」造成抢跑路径的
+/// 非字节级变更。返回 `None` 表示放弃；`Some(file)` 表示已提交落盘。
+pub(crate) fn try_update_installed_plugins_intent(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile) -> bool,
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<Option<InstalledPluginsIntentFile>, SettingsStoreError> {
+    update_installed_plugins_intent_locked(mutator, home, env)
+}
+
+fn update_installed_plugins_intent_locked(
+    mutator: impl FnOnce(&mut InstalledPluginsIntentFile) -> bool,
+    home: Option<&Path>,
+    env: Option<&EnvMap>,
+) -> Result<Option<InstalledPluginsIntentFile>, SettingsStoreError> {
     let path = installed_plugins_intent_path(home, env);
     with_file_lock(
         &path,
         DEFAULT_LOCK_RETRIES,
         DEFAULT_LOCK_BACKOFF_BASE,
         DEFAULT_LOCK_BACKOFF_MAX,
-        || -> io::Result<InstalledPluginsIntentFile> {
+        || -> io::Result<Option<InstalledPluginsIntentFile>> {
             let mut current = match read_jsonc_with_recovery(&path) {
                 Some(data) => coerce_installed_plugins_intent(&data, &path),
                 None => empty_installed_plugins_intent(),
             };
-            mutator(&mut current);
+            if !mutator(&mut current) {
+                return Ok(None);
+            }
             current.version = MATERIALIZED_VERSION;
             atomic_write_json(&path, &current, Some(WRITE_PROTECTION_HEADER))?;
-            Ok(current)
+            Ok(Some(current))
         },
     )?
     .map_err(|e| SettingsStoreError::io(&path, e))
+}
+
+/// 已装 plugin 所属 marketplace，按 `installedPlugins` 首次出现顺序（installed intent 优先）/
+/// Marketplaces owning installed plugins, in installed-intent order.
+///
+/// 用于 CLI 离线重建 / refresh-all 的 **staging 排序**：已装 plugin 的源必须先于「仅添加」的源注册，
+/// 否则跨 marketplace 同名 SKILL 的「先到者胜」会被字母序的 catalog 载入顺序错误仲裁。
+pub fn installed_marketplace_order(home: Option<&Path>, env: Option<&EnvMap>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for pid in &load_installed_plugins_intent(home, env)
+        .account
+        .installed_plugins
+    {
+        if let Some((_, marketplace)) = pid.split_once('@') {
+            if !order.iter().any(|m| m == marketplace) {
+                order.push(marketplace.to_string());
+            }
+        }
+    }
+    order
 }
 
 // ===========================================================================
@@ -744,7 +1097,7 @@ fn resolve_last_updated(prior: Option<String>, changed: bool, now: &str) -> Stri
 }
 
 /// `clone_dir.resolve()` 等价：canonicalize（解析 symlink + 绝对化），失败回退词法归一 / resolve display path。
-fn resolve_install_location(path: &Path) -> String {
+pub(crate) fn resolve_install_location(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| normalize_lexical(path))
         .display()
@@ -808,41 +1161,50 @@ impl FileSkillGovernanceStore {
 
 impl KnownMarketplaceRecorder for FileSkillGovernanceStore {
     fn record(&self, rec: KnownMarketplaceRecord<'_>) {
-        let now = now_iso8601();
-        let res = update_known_marketplaces(
-            |file| {
-                let prior = file
-                    .account
-                    .marketplaces
-                    .get(rec.name)
-                    .and_then(|e| e.extra.get("lastUpdated"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let last_updated = resolve_last_updated(prior, rec.changed, &now);
+        self.record_with_baseline(rec, None);
+    }
 
-                let mut extra = Map::new();
-                extra.insert(
-                    "installLocation".to_string(),
-                    Value::String(resolve_install_location(rec.install_location)),
-                );
-                extra.insert("lastUpdated".to_string(), Value::String(last_updated));
-                if let Some(sha) = rec.commit_sha {
-                    extra.insert("commitSha".to_string(), Value::String(sha.to_string()));
-                }
-                if rec.auto_update {
-                    extra.insert("autoUpdate".to_string(), Value::Bool(true));
-                }
-                file.account.marketplaces.insert(
-                    rec.name.to_string(),
-                    KnownMarketplaceEntry {
-                        source: rec.source.clone(),
-                        extra,
-                    },
-                );
-            },
-            Some(&self.home),
-            self.env(),
-        );
+    fn record_with_baseline(&self, rec: KnownMarketplaceRecord<'_>, baseline: Option<&str>) {
+        let now = now_iso8601();
+        let res = update_known_marketplaces_checked(Some(&self.home), self.env(), |file| {
+            let prior = file.account.marketplaces.get(rec.name).cloned();
+            let prior_last_updated = prior
+                .as_ref()
+                .and_then(|e| e.extra.get("lastUpdated"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let last_updated = resolve_last_updated(prior_last_updated, rec.changed, &now);
+
+            // 以 prior extra 为基底：保留未知扩展键（#272），并清除 recorder 管理的键后重写。
+            let mut extra = prior.as_ref().map(|e| e.extra.clone()).unwrap_or_default();
+            for key in ["installLocation", "lastUpdated", "commitSha", "autoUpdate"] {
+                extra.remove(key);
+            }
+            extra.insert(
+                "installLocation".to_string(),
+                Value::String(resolve_install_location(rec.install_location)),
+            );
+            extra.insert("lastUpdated".to_string(), Value::String(last_updated));
+            if let Some(sha) = rec.commit_sha {
+                extra.insert("commitSha".to_string(), Value::String(sha.to_string()));
+            }
+            if rec.auto_update {
+                extra.insert("autoUpdate".to_string(), Value::Bool(true));
+            }
+            // #272：新值优先；未提供时保留既有基线（legacy 首次 refresh 由调用方提供）。
+            let manifest_name_baseline = baseline
+                .map(str::to_string)
+                .or_else(|| prior.and_then(|e| e.manifest_name_baseline));
+            file.account.marketplaces.insert(
+                rec.name.to_string(),
+                KnownMarketplaceEntry {
+                    source: rec.source.clone(),
+                    manifest_name_baseline,
+                    extra,
+                },
+            );
+            ((), true)
+        });
         if let Err(e) = res {
             // 失败降级铁律：物化记录是诊断 / 对账元数据，丢失靠下次 reconcile 重建，不阻断 staging。
             tracing::error!(marketplace = %rec.name, error = %e, "failed to record known_marketplaces.json");
@@ -959,6 +1321,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn try_update_intent_aborts_without_touching_file() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let path = installed_plugins_intent_path(Some(home), None);
+        // 缺失文件 + abort → 文件仍不存在（不得因「落盘即建文件」副作用创建）。
+        let out = try_update_installed_plugins_intent(|_| false, Some(home), None).unwrap();
+        assert!(out.is_none());
+        assert!(!path.exists());
+
+        // 已有文件 + abort → 逐字节不变。
+        update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("a@mp".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let out = try_update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("b@mp".to_string());
+                false
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn installed_marketplace_order_follows_intent_sequence() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        update_installed_plugins_intent(
+            |f| {
+                f.account.installed_plugins.insert("alpha@mp-b".to_string());
+                f.account.installed_plugins.insert("beta@mp-a".to_string());
+                f.account.installed_plugins.insert("gamma@mp-b".to_string());
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_marketplace_order(Some(home), None),
+            vec!["mp-b".to_string(), "mp-a".to_string()]
+        );
+    }
+
     // ---- 纯逻辑 / pure logic ------------------------------------------------
     #[test]
     fn strip_jsonc_header_drops_leading_comment_and_blanks() {
@@ -1006,6 +1421,7 @@ mod tests {
         file.account.marketplaces.insert(
             "acme".to_string(),
             KnownMarketplaceEntry {
+                manifest_name_baseline: None,
                 source: json!({"type": "git", "url": "https://example.com/acme.git"}),
                 extra: {
                     let mut m = Map::new();
@@ -1190,6 +1606,7 @@ mod tests {
                 file.account.marketplaces.insert(
                     "beta".into(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": "b"}),
                         extra: Map::new(),
                     },
@@ -1215,6 +1632,7 @@ mod tests {
             km.marketplaces.insert(
                 "gamma".into(),
                 KnownMarketplaceEntry {
+                    manifest_name_baseline: None,
                     source: json!({"type": "git", "url": "g"}),
                     extra: Map::new(),
                 },
@@ -1275,5 +1693,128 @@ mod tests {
         // commitSha / autoUpdate 在本次（无 sha + autoUpdate=false）整条替换后不再出现
         assert!(e2.extra.get("commitSha").is_none());
         assert!(e2.extra.get("autoUpdate").is_none());
+    }
+
+    // ---- #272 manifestNameBaseline / baseline recorder ---------------
+    #[test]
+    fn manifest_name_baseline_roundtrip_and_tolerance() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let path = known_marketplaces_path(Some(home), None);
+        update_known_marketplaces(
+            |file| {
+                file.account.marketplaces.insert(
+                    "acme".to_string(),
+                    KnownMarketplaceEntry {
+                        source: json!({"type": "git", "url": "https://example.com/acme.git"}),
+                        manifest_name_baseline: Some("team-tools".to_string()),
+                        extra: Map::new(),
+                    },
+                );
+            },
+            Some(home),
+            None,
+        )
+        .unwrap();
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools")
+        );
+        // 物化文件带 JSONC 写保护头，用 store 自己的容错读取。
+        let mut raw = read_jsonc_with_recovery(&path).expect("ledger file parses");
+        assert_eq!(
+            raw["marketplaces"]["acme"]["manifestNameBaseline"],
+            json!("team-tools")
+        );
+
+        // 畸形基线 → None + 整份账本不得被清空。
+        raw["marketplaces"]["acme"]["manifestNameBaseline"] = json!("Bad_Name");
+        std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(loaded.marketplaces.len(), 1);
+        assert!(loaded.marketplaces["acme"].manifest_name_baseline.is_none());
+    }
+
+    #[test]
+    fn recorder_preserves_and_updates_baseline() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let store = FileSkillGovernanceStore::new(home);
+        let source = json!({"type": "git", "url": "https://example.com/acme.git"});
+        let clone_dir = home.join("marketplace/acme");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        let record = |changed: bool| KnownMarketplaceRecord {
+            name: "acme",
+            source: &source,
+            install_location: &clone_dir,
+            commit_sha: None,
+            auto_update: false,
+            changed,
+        };
+
+        store.record_with_baseline(record(true), Some("team-tools"));
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools")
+        );
+
+        // 不带 baseline 的后续 record → 保留既有基线。
+        store.record(record(false));
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools")
+        );
+
+        // 显式新基线 → 覆盖。
+        store.record_with_baseline(record(true), Some("team-tools-v2"));
+        let loaded = load_known_marketplaces(Some(home), None).account;
+        assert_eq!(
+            loaded.marketplaces["acme"]
+                .manifest_name_baseline
+                .as_deref(),
+            Some("team-tools-v2")
+        );
+    }
+
+    #[test]
+    fn checked_update_persists_only_when_requested() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let path = known_marketplaces_path(Some(home), None);
+        let value = update_known_marketplaces_checked(Some(home), None, |file| {
+            file.account
+                .marketplaces
+                .insert("ghost".to_string(), KnownMarketplaceEntry::default());
+            (7u32, false)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert!(!path.exists(), "persist=false must not write the ledger");
+
+        update_known_marketplaces_checked(Some(home), None, |file| {
+            file.account.marketplaces.insert(
+                "acme".to_string(),
+                KnownMarketplaceEntry {
+                    source: json!({"type": "git", "url": "https://example.com/acme.git"}),
+                    manifest_name_baseline: Some("acme".to_string()),
+                    extra: Map::new(),
+                },
+            );
+            ((), true)
+        })
+        .unwrap();
+        assert!(load_known_marketplaces(Some(home), None)
+            .account
+            .marketplaces
+            .contains_key("acme"));
     }
 }

@@ -72,6 +72,10 @@ git cliff --unreleased --prepend CHANGELOG.md  # 仅追加未发布的变更
 # 方式一：通过 gh CLI 创建 Release（推荐）
 gh release create v0.1.2 --title "v0.1.2" --generate-notes
 
+# 若存在手写发版说明（如 docs/releases/v0.5.1.md 的升级迁移段落），用 --notes-file 并入；
+# 手写正文会前置到自动生成的 changes 之前（CHANGELOG 由 git-cliff 重生成，手写内容不放那里）。
+gh release create v0.1.2 --title "v0.1.2" --generate-notes --notes-file docs/releases/v0.1.2.md
+
 # 方式二：手动触发 workflow
 gh workflow run "Publish to crates.io"
 ```

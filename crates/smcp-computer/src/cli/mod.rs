@@ -31,11 +31,11 @@ pub mod repl;
 mod utils;
 
 use commands::marketplace::{
-    marketplace_add, marketplace_info, marketplace_list, marketplace_refresh, marketplace_remove,
-    marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
+    marketplace_add, marketplace_info, marketplace_list, marketplace_migrate, marketplace_refresh,
+    marketplace_remove, marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
 };
 use commands::plugin::{
-    plugin_disable, plugin_enable, plugin_gc, plugin_info, plugin_install, plugin_list,
+    plugin_disable, plugin_enable_with_paths, plugin_gc, plugin_info, plugin_install, plugin_list,
     plugin_uninstall, PluginInstallOptions,
 };
 use commands::settings::{settings_edit, settings_get, settings_set, settings_show};
@@ -153,12 +153,14 @@ pub enum IdentityCmd {
 pub enum MarketplaceCmd {
     Add {
         git_url: String,
+        /// Expected manifest name (validation only; the registered name comes from the manifest).
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         trust: bool,
         #[arg(long)]
         auto_update: bool,
+        /// Register intent only (requires an existing catalog and --name).
         #[arg(long)]
         no_clone: bool,
         #[arg(long)]
@@ -192,6 +194,25 @@ pub enum MarketplaceCmd {
     Set {
         name: String,
         assignment: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Migrate legacy marketplace registration names to the manifest top-level name.
+    ///
+    /// Dry-run by default; `--apply` writes. Offline: stop all Computer/python instances first.
+    Migrate {
+        /// Write changes (default is a zero-write dry-run).
+        #[arg(long)]
+        apply: bool,
+        /// Also rewrite user-scope `extraKnownMarketplaces` (project/local stay report-only).
+        #[arg(long, conflicts_with_all = ["resume", "rollback"])]
+        update_declarations: bool,
+        /// Resume an interrupted migration journal.
+        #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+        resume: bool,
+        /// Roll back a previous migration by backup timestamp.
+        #[arg(long, value_name = "TIMESTAMP", conflicts_with_all = ["apply", "resume"])]
+        rollback: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -319,7 +340,7 @@ async fn dispatch(mut args: Args) -> i32 {
     // 取出 subcommand（避免部分移动后再借 `&args` 给 run_repl）/ take command out so `&args` stays valid。
     let command = args.command.take();
     match command {
-        Some(Commands::Marketplace { action }) => dispatch_marketplace(action).await,
+        Some(Commands::Marketplace { action }) => dispatch_marketplace(action, &root).await,
         Some(Commands::Plugin { action }) => dispatch_plugin(action, &root).await,
         Some(Commands::Settings { action }) => dispatch_settings(action, &root),
         Some(Commands::Skill { action }) => dispatch_skill(action).await,
@@ -392,8 +413,29 @@ fn migrate_governance_once(home: &Path) {
 }
 
 // ── 非交互子命令分发（不 boot Computer；离线 registry）/ non-interactive dispatch ──
-async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
+async fn dispatch_marketplace(action: MarketplaceCmd, root: &RootState) -> i32 {
     let home = skill_home();
+    // #289：migrate 是离线事务，不跑 v0.3.0 账本迁移、不重建 registry（事务边界外零写入）。
+    let action = match action {
+        MarketplaceCmd::Migrate {
+            apply,
+            update_declarations,
+            resume,
+            rollback,
+            json,
+        } => {
+            return marketplace_migrate(
+                &home,
+                None,
+                apply,
+                update_declarations,
+                resume,
+                rollback.as_deref(),
+                json,
+            );
+        }
+        other => other,
+    };
     migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
     match action {
@@ -405,6 +447,8 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
             no_clone,
             json,
         } => {
+            // #267：一次性 marketplace add 的引用守卫同样消费 `--settings` flag 层（归一失败 → 无 flag 层）。
+            let flag_settings_path = normalize_root_flag_path(root);
             let _spinner = clone_spinner("Cloning marketplace...", !json && !no_clone);
             marketplace_add(
                 &mut registry,
@@ -417,6 +461,7 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
                     auto_update,
                     no_clone,
                     confirm: None, // 非交互无 confirm → add 须 --trust。
+                    flag_settings_path: flag_settings_path.as_deref(),
                     json_output: json,
                 },
             )
@@ -466,10 +511,12 @@ async fn dispatch_marketplace(action: MarketplaceCmd) -> i32 {
                 .unwrap_or((assignment.as_str(), ""));
             marketplace_set(&home, None, &name, key, value, json)
         }
+        // 已在函数开头提前返回（离线事务，不跑治理迁移/registry 重建）。
+        MarketplaceCmd::Migrate { .. } => unreachable!("handled before dispatch prelude"),
     }
 }
 
-async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
+async fn dispatch_plugin(action: PluginCmd, root: &RootState) -> i32 {
     let home = skill_home();
     migrate_governance_once(&home);
     let mut registry = rebuild_registry(&home, None).await;
@@ -524,7 +571,33 @@ async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
             .await
         }
         PluginCmd::Enable { id, json } => {
-            plugin_enable(&mut registry, &home, None, &id, None, json).await
+            // 无活跃 Computer（hooks=None）→ 无运行期挂载可摘；写盘/诊断锚用逐记录 projectPath，
+            // 缺省回退进程 cwd（installer 内同源）。诊断 provider 复用 CLI 的 flag-aware 五层解析，
+            // 覆盖 `--settings` flag 层（一次性子命令没有 Computer 实例，policy 走 ambient 解析）。
+            let cwd = cwd.as_deref().and_then(std::path::Path::to_str);
+            let flag_settings_path = normalize_root_flag_path(root);
+            let provider = |anchor: Option<&str>| {
+                commands::resolved_settings(
+                    anchor.map(std::path::Path::new),
+                    None,
+                    flag_settings_path.as_deref(),
+                )
+            };
+            plugin_enable_with_paths(
+                &mut registry,
+                &home,
+                None,
+                &id,
+                // 写锚 MUST 保持 fail-closed：project/local 记录缺 projectPath 时拒绝；
+                // cwd 仅作诊断锚（diag 参数），不得兜底写盘。
+                None,
+                cwd,
+                Some(&provider),
+                None,
+                None,
+                json,
+            )
+            .await
         }
         PluginCmd::Disable { id, json } => {
             plugin_disable(&mut registry, &home, None, &id, &HashSet::new(), None, json).await
@@ -549,24 +622,37 @@ async fn dispatch_plugin(action: PluginCmd, _root: &RootState) -> i32 {
     }
 }
 
+/// 一次性子命令的 flag settings 路径归一（#248 口径，settings / marketplace 共用）。
+///
+/// 归一失败 → `None`（无 flag 层）+ stderr 诊断；**不得**回读原始 `~...` 串（仓库可植入
+/// `<cwd>/~alice/...` 冒充受信 flag）。
+fn normalize_root_flag_path(root: &RootState) -> Option<std::path::PathBuf> {
+    root.flag_path.as_deref().and_then(|raw| {
+        match crate::computer::normalize_flag_path(raw, None) {
+            Ok(path) => Some(path),
+            Err(reason) => {
+                eprintln!(
+                    "{}",
+                    crate::computer::flag_path_diagnostic(
+                        "flag settings",
+                        raw,
+                        reason,
+                        "flag scope disabled"
+                    )
+                );
+                None
+            }
+        }
+    })
+}
+
 fn dispatch_settings(action: SettingsCmd, root: &RootState) -> i32 {
     // #98：project/local scope 锚定进程 cwd（`Computer` 不再持有 workspace）。
     let cwd = std::env::current_dir().ok();
     let cwd = cwd.as_deref();
     // #248 复审：一次性 settings 子命令与运行期同口径——flag 路径先归一；失败 = 无 flag 层
     // （fail-closed + stderr 诊断），不得回读原始 `~...` 串（仓库可植入 `<cwd>/~alice/...`）。
-    let flag_normalized = root.flag_path.as_deref().and_then(|raw| {
-        match crate::computer::normalize_flag_path(raw, None) {
-            Ok(path) => Some(path),
-            Err(reason) => {
-                eprintln!(
-                    "⚠ settings path {} is unusable ({reason}); flag scope disabled (fail-closed)",
-                    raw.display()
-                );
-                None
-            }
-        }
-    });
+    let flag_normalized = normalize_root_flag_path(root);
     let flag = flag_normalized.as_deref();
     match action {
         SettingsCmd::Show { scope, json } => {
@@ -712,7 +798,7 @@ async fn run_repl(args: &Args, root: &RootState, mcp_config: Option<PathBuf>) ->
         .computer
         .normalized_mcp_flag_config()
         .map(Path::to_path_buf);
-    approval::run_mcp_approval(
+    approval::run_mcp_approval_for_repl(
         &handler.computer,
         root.approve_all_mcp,
         flag_settings_path.as_deref(),
@@ -1092,10 +1178,17 @@ mod tests {
             Some(&resolve_env),
             Some(planted.as_path()),
         );
+        // policy 无 env 接缝：宿主 policy 可覆盖 merged 视图，只看 Flag 层（与本用例下方生效组同口径）。
+        let control_flag = control
+            .scope_layers
+            .iter()
+            .find(|(scope, _)| *scope == crate::settings::SettingsScope::Flag)
+            .map(|(_, layer)| layer)
+            .expect("five-layer view always contains Flag");
         assert_eq!(
-            control.settings.get("enableAllProjectMcpServers"),
+            control_flag.get("enableAllProjectMcpServers"),
             Some(&serde_json::json!(true)),
-            "控制组：植入 settings 必须是有效信任载荷"
+            "控制组：植入 settings 必须是有效信任载荷（只看 Flag 层）"
         );
         use crate::settings::mcp_config::{resolve_mcp_config, ResolveMcpConfigArgs};
         // policy / managed-mcp 无 env 接缝：managed 指向 tempdir 内路径（不读宿主），断言只看 Flag 层。
@@ -1187,5 +1280,28 @@ mod tests {
         );
         assert_eq!(stored, std::path::absolute("flag-mcp.json").unwrap());
         assert!(computer.mcp_flag_config_error().is_none());
+    }
+
+    /// #267：一次性 marketplace add 与 settings 子命令共用同一 flag 归一纪律——
+    /// 绝对路径 / `~/...` 归一成功，`~user` 形态 fail-closed（None，无 flag 层）。
+    #[test]
+    fn normalize_root_flag_path_shares_settings_discipline_267() {
+        let abs = std::env::temp_dir().join("flag267-settings.json");
+        let root = RootState {
+            flag_path: Some(abs.clone()),
+            approve_all_mcp: false,
+        };
+        assert_eq!(normalize_root_flag_path(&root), Some(abs));
+
+        let root = RootState {
+            flag_path: Some(std::path::PathBuf::from("~alice/settings.json")),
+            approve_all_mcp: false,
+        };
+        assert!(
+            normalize_root_flag_path(&root).is_none(),
+            "`~user` 形态必须 fail-closed（不回退原始串）"
+        );
+
+        assert!(normalize_root_flag_path(&RootState::default()).is_none());
     }
 }

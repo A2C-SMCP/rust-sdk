@@ -23,18 +23,18 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use super::commands::marketplace::{
-    marketplace_add, marketplace_info, marketplace_list, marketplace_refresh, marketplace_remove,
-    marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
+    marketplace_add, marketplace_info, marketplace_list, marketplace_migrate, marketplace_refresh,
+    marketplace_remove, marketplace_set, MarketplaceAddOptions, MarketplaceRemoveOptions,
 };
 use super::commands::plugin::{
-    plugin_disable, plugin_enable, plugin_gc, plugin_info, plugin_install, plugin_list,
+    plugin_disable, plugin_enable_with_paths, plugin_gc, plugin_info, plugin_install, plugin_list,
     plugin_uninstall, PluginInstallOptions,
 };
 use super::commands::settings::{
     is_emit_key, settings_edit, settings_get, settings_set, settings_show,
 };
 use super::commands::skill::{skill_info, skill_list};
-use super::commands::{flag_value, msg_warn, CliMcpHooks, Confirm, EXIT_OK};
+use super::commands::{flag_value, msg_warn, CliMcpHooks, Confirm, EXIT_OK, EXIT_PARTIAL};
 use super::progress::clone_spinner;
 use crate::computer::{Computer, Session};
 use crate::settings::reconciler::McpTeardown;
@@ -113,7 +113,7 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
     match sub.as_str() {
         "add" => {
             let Some(url) = pos.first() else {
-                msg_warn("usage: marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]");
+                msg_warn("usage: marketplace add <git-url> [--name N (expected manifest name)] [--trust] [--auto-update] [--no-clone]");
                 return;
             };
             let no_clone = has_flag(&args, "--no-clone");
@@ -131,6 +131,8 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
                     auto_update: has_flag(&args, "--auto-update"),
                     no_clone,
                     confirm: Some(&confirm),
+                    // #267：REPL 的 `--settings`（构造期已归一）参与引用守卫 flag 层。
+                    flag_settings_path: comp.normalized_flag_settings_path(),
                     json_output: json,
                 },
             )
@@ -197,6 +199,41 @@ pub async fn dispatch_marketplace<S: Session>(comp: &Computer<S>, parts: &[&str]
             }
             let (key, value) = pos[1].split_once('=').unwrap_or((pos[1].as_str(), ""));
             marketplace_set(&home, None, &pos[0], key, value, json);
+        }
+        "migrate" => {
+            // 写入路径只在非交互 CLI 提供；REPL 仅 dry-run（或明确报 usage），避免与 clap 约束分叉。
+            if has_flag(&args, "--apply") {
+                msg_warn(
+                    "marketplace migrate --apply is only supported in the non-interactive CLI \
+                     (run: smcp-computer marketplace migrate --apply)",
+                );
+                return;
+            }
+            let has_rollback_flag = args.iter().any(|a| a == "--rollback");
+            let rollback = flag_value(&args, "--rollback");
+            if has_rollback_flag && rollback.is_none() {
+                msg_warn("usage: marketplace migrate --rollback <timestamp>");
+                return;
+            }
+            if rollback.is_some() || has_flag(&args, "--resume") {
+                msg_warn(
+                    "marketplace migrate --resume/--rollback are only supported in the \
+                     non-interactive CLI",
+                );
+                return;
+            }
+            let code = marketplace_migrate(
+                &home,
+                None,
+                false,
+                has_flag(&args, "--update-declarations"),
+                false,
+                None,
+                json,
+            );
+            if code == EXIT_OK || code == EXIT_PARTIAL {
+                comp.mark_skills_dirty();
+            }
         }
         other => msg_warn(&format!("unknown marketplace subcommand: {other}")),
     }
@@ -289,8 +326,28 @@ pub async fn dispatch_plugin<S: Session>(comp: &Computer<S>, parts: &[&str]) {
                 return;
             };
             let hooks = CliMcpHooks::new(comp, Some(plugin), Some(marketplace)).await;
+            // #286：写后失败对本次新挂做 §4.9.1-2 三档判定的「非用户声明」集（同 disable）——
+            // MUST 在取 registry 写锁前由 Computer 供给。
+            let non_plugin = comp.non_plugin_declared_bundle_ids(&home, None);
+            // #286 🟡4：运行期五层 settings（含 flag/policy）provider 供失败诊断（pre∧post 合并视图），
+            // 并以**操作锚点**（cwd / 记录 projectPath）解析 project/local 层。
+            let resolved_settings =
+                |anchor: Option<&str>| comp.resolved_runtime_settings_at(None, anchor);
+            let project_path_hint = cwd.as_deref().and_then(Path::to_str);
             let mut registry = reg_arc.write().await;
-            let code = plugin_enable(&mut registry, &home, None, id, Some(&hooks), json).await;
+            let code = plugin_enable_with_paths(
+                &mut registry,
+                &home,
+                None,
+                id,
+                project_path_hint,
+                project_path_hint,
+                Some(&resolved_settings),
+                Some(&non_plugin),
+                Some(&hooks),
+                json,
+            )
+            .await;
             drop(registry);
             if code == EXIT_OK {
                 comp.mark_skills_dirty();
@@ -458,5 +515,102 @@ pub async fn dispatch_skill<S: Session>(comp: &Computer<S>, parts: &[&str]) {
             skill_info(&registry, name, json);
         }
         other => msg_warn(&format!("unknown skill subcommand: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::computer::SilentSession;
+    use crate::settings::store::load_known_marketplaces;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(args: &[&str], cwd: &Path) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn build_repo(repo: &Path, name: &str) -> String {
+        std::fs::create_dir_all(repo.join(".tfrobot-plugin")).unwrap();
+        std::fs::write(
+            repo.join(".tfrobot-plugin/marketplace.json"),
+            serde_json::json!({
+                "name": name,
+                "plugins": [{"name": "alpha", "source": "./plugins/alpha"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let skill = repo.join("plugins/alpha/skills/code-review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: code-review\ndescription: repl flag guard\n---\nbody",
+        )
+        .unwrap();
+        git(&["init", "-q"], repo);
+        git(&["add", "-A"], repo);
+        git(&["commit", "-qm", "init"], repo);
+        format!("file://{}", repo.display())
+    }
+
+    /// #267 审查 🟡7：REPL `marketplace add` 的 `--settings`（flag 层）引用守卫接线。
+    #[tokio::test]
+    async fn repl_marketplace_add_rejects_flag_layer_reference_267() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mp = format!("repl-flag-guard-267-{}", std::process::id());
+        let url = build_repo(&tmp.path().join("repo"), &mp);
+        let flag = tmp.path().join("flag-settings.json");
+        let mut enabled = serde_json::Map::new();
+        enabled.insert(format!("alpha@{mp}"), serde_json::Value::Bool(true));
+        let mut flag_settings = serde_json::Map::new();
+        flag_settings.insert(
+            "enabledPlugins".to_string(),
+            serde_json::Value::Object(enabled),
+        );
+        std::fs::write(&flag, serde_json::Value::Object(flag_settings).to_string()).unwrap();
+        let comp = Computer::new(
+            "c267repl",
+            SilentSession::new("s"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .with_skill_home(home.clone())
+        .with_flag_settings_path(&flag)
+        .with_blob_cache_root(tmp.path().join("blob"));
+
+        dispatch_marketplace(&comp, &["marketplace", "add", &url, "--trust"]).await;
+
+        assert!(
+            load_known_marketplaces(Some(&home), None)
+                .account
+                .marketplaces
+                .is_empty(),
+            "REPL add 必须消费 --settings 的引用（flag 层）"
+        );
+        assert!(
+            !home.join("marketplace").join(&mp).exists(),
+            "拒绝不得留下 clone"
+        );
     }
 }

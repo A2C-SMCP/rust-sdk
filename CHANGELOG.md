@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-11-26
+
+### Bug Fixes
+
+- *(computer)* #271 卸载/GC 不再删除共享 catalog 树，仅删独占外部 clone (#276)
+- *(computer)* #273 scp-like 源展示恢复 host+path（#154 严格边界不变） (#277)
+- *(computer)* [**breaking**] #275 跨 marketplace 同名 plugin 安装层唯一性 (#281)
+- *(computer)* #279 严格展示函数对 opaque scheme 一律 fail-closed (#282)
+- *(computer)* #274 enable 内容缺失 fail-fast + 回滚（∀ 声明态判据） (#283)
+- *(computer)* #285 拒绝 hostless Git URL，防凭据 slug 进 marketplace 名称 (#287)
+- *(computer)* #278 旧版本升级迁移文档 + install 失败恢复提示 (#288)
+- *(computer)* #284 多 scope 卸载保留 retained 记录声明的 skills 与 servers (#291)
+- *(computer)* #286 enable 失败回滚回收 server + remount existing-wins（§2.4/§2.5-1） (#290)
+- *(computer)* #292 executor A+ 对齐：project readRoots 保留 + 目标容器畸形 fail-closed (#293)
+- *(computer)* #294 reconcile 声明式换源拒绝而非 wipe+reclone（§5.14） (#296)
+- *(computer)* #272 marketplace 注册名改用清单 name（方向 A） (#297)
+- *(computer)* #295 boot recovery 声明面换源拒绝与结构化报告（§5.14） (#298)
+- *(computer)* #267 marketplace 剩余身份守卫（refresh 改名 / 声明式 re-add / flag-policy 引用层） (#300)
+- *(computer)* #267 v0.5.1 剩余小项（谓词统一 / 非法声明可观测 / CLI 测试 / 复审销项） (#302)
+- *(computer)* #267 settings 残余：flag 层四点消费 + import 容器预检（#248/#292） (#301)
+- *(computer)* #267 S4 MCP client teardown 有界化（stdio/HTTP close + SSE lifecycle） (#303)
+- *(computer)* Protocol#78 数据向量 re-vendor（bundle 25 / canonical 56） (#304)
+- *(computer)* #286 follow-up enable 失败回滚按 scope pre-state（protocol#83 裁决 C） (#306)
+
+### Documentation
+
+- *(release)* #267 补齐 v0.5.1 release notes 覆盖（9 项 + #286 占位） (#305)
+
+### Features
+
+- *(computer)* #289 marketplace 存量注册名迁移（migrate + journal/备份/回滚） (#299)
+
+### Miscellaneous Tasks
+
+- *(ci)* 固定 Rust 工具链到 1.99.1（避免 1.100 rustfmt 基线漂移） (#280)
+
 ## [0.5.0] - 2026-11-03
 
 ### Bug Fixes
@@ -30,6 +66,7 @@ All notable changes to this project will be documented in this file.
 ### Documentation
 
 - *(test)* Diagnose macOS artifact-directory timeout failures (#229)
+- *(changelog)* V0.5.0 变更归入
 
 ### Features
 
@@ -56,6 +93,7 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #240 PR-A 注释订正与回房测试判别修正 (#242)
 - *(ci)* 发版前置——clippy all-features 门禁修复 + publish 失败不再被吞 (#258)
 - *(ci)* 清零 clippy 基线红，cargo clippy-workspace 全绿 (#265)
+- Release v0.5.0
 
 ### Testing
 
@@ -77,12 +115,10 @@ All notable changes to this project will be documented in this file.
 
 ## [0.4.1] - 2026-08-28
 
-### Breaking Changes
-
-- *(smcp-agent)* `AsyncSmcpAgent::tool_call` and `SyncSmcpAgent::tool_call` now accept an optional `tokio_util::sync::CancellationToken` and wait for the original tool-call acknowledgement after signaling cancellation; the unusable public `tool_call_cancel(req_id)` methods were removed (#217, #218).
-
 ### Bug Fixes
 
+- *(computer)* Address Socket.IO review findings (#206)
+- *(computer)* Upgrade Socket.IO dispatch for long tool calls (#208) (#209)
 - *(computer)* #211 旧 transport 迟到 Close 不再清除新会话 membership
 - *(computer)* #208 长调用期间 cancel ACK 即时可达——best-effort 剥离 MCP cancelled 通知
 - *(tests)* #213 v022 e2e 矩阵适配 BundleID 工具名（exposed_tool 单一来源）
@@ -90,37 +126,7 @@ All notable changes to this project will be documented in this file.
 ### Documentation
 
 - *(tests)* #212 target 自动清理（launchd cargo-sweep）与 [profile.test] 落地注记
-
-### Features
-
-- *(tests)* #212 本地全量测试分级提速——nextest 接入 + 测试剖面瘦身 + RA 锁隔离
-- *(tests)* #212 补交 [profile.test] debug=line-tables-only（与 #211 提交拆分后补交）
-- *(computer)* #214 Computer 级 MCP 有限并发启动——统一门控/批量 API/治理恢复/CLI flag
-
-### Refactor
-
-- *(tests)* #213 复审跟进——exposed_tool 直调生产命名函数 + 保留裸名就地注释
-
-## [0.4.0] - 2026-08-25
-
-### Breaking Changes
-
-- *(computer)* #204 changes `Computer::set_socketio_client` to return `ComputerResult<()>` and
-  adds `ConnectOptions::namespace_connect_timeout`. Exhaustive `ConnectOptions` literals must set
-  the new field or use `..Default::default()`; the default is 30 seconds.
-- *(computer)* #204 makes `SmcpComputerClient::get_office_id` and
-  `get_current_office_id` report only server-confirmed membership. During an initial join or
-  automatic rejoin they now return `None` / `InvalidState` until the join ACK succeeds.
-
-### Bug Fixes
-
-- *(computer)* #204 restores Office membership after Socket.IO transport reconnect, fences stale
-  join ACKs by connection generation, and makes client installation/replacement, disconnect, and
-  shutdown ownership atomic. Calling `disconnect_socketio` with an empty slot is now a no-op and
-  no longer forces the lifecycle back to `Started`.
-- *(computer)* #208 upgrades `tf-rust-socketio` and `tf-rust-engineio` to 0.9.0 so long-running
-  tool calls no longer block Socket.IO heartbeats or prompt cancellation. Independent events may
-  complete out of order while delivery remains exactly once and cancellation causality is retained.
+- *(changelog)* V0.4.1 变更归入（#214/#208/#211/#212/#213）
 
 ### Features
 
@@ -128,156 +134,98 @@ All notable changes to this project will be documented in this file.
 - *(skill)* A2CSkillRef.tags 加性字段透传（#198，protocol#50/PR#55，镜像 python#198）
 - *(blob)* Client:put_blob 上行写入通道（#195，protocol#12/PR#53，镜像 python#196）
 - *(blob)* #195 审查下轮 3 条收口——put_blob 真 e2e + spawn_blocking + flag 分叉注记
+- *(tests)* #212 本地全量测试分级提速——nextest 接入 + 测试剖面瘦身 + RA 锁隔离
+- *(tests)* #212 补交 [profile.test] debug=line-tables-only（与 #211 提交拆分后补交）
+- *(computer)* #214 Computer 级 MCP 有限并发启动——统一门控/批量 API/治理恢复/CLI flag
 
 ### Miscellaneous Tasks
 
 - PROTOCOL_VERSION 同步 0.4.0（对齐 protocol develop 0.4.0-dev 周期，镜像 python f8e02ab）
 - Restore CI baseline on develop (#210)
+- Release v0.4.1
 
-### Migration Notes
+### Refactor
 
-- Handle the `ComputerResult` returned by `set_socketio_client`. When constructing
-  `ConnectOptions`, prefer `..Default::default()` or set `namespace_connect_timeout` explicitly for
-  networks where namespace authentication can legitimately take longer than 30 seconds. Treat
-  Office getters as confirmed server state rather than desired join intent.
-- Do not rely on completion ordering between independent Socket.IO events. Preserve ordering only
-  where the protocol defines a causal boundary, such as a tool call and its cancellation.
+- *(tests)* #213 复审跟进——exposed_tool 直调生产命名函数 + 保留裸名就地注释
+
+## [0.4.0-dev.0] - 2026-08-24
+
+### Bug Fixes
+
+- *(ci)* Publish 依赖序修正——smcp-server-hyper 前置 + wait-for-index 补 User-Agent
+- *(ci)* Publish.yml 消除全部 annotations——checkout v5 + 清理 package 暂存区
+
+### Documentation
+
+- *(skill)* Release SKILL 补充发布验收与依赖序教训（v0.3.2 事故沉淀）
+
+### Miscellaneous Tasks
+
+- Release v0.4.0-dev.0
 
 ## [0.3.2] - 2026-08-24
 
-### Breaking Changes
+### Bug Fixes
 
-- *(computer)* #157 upgrades the public MCP model and transport surface from `rmcp 0.11`
-  to exactly `rmcp 2.2.0`. Downstream code must use the rmcp 2.2 resource/content
-  layouts; removed legacy aliases and construction shims such as `RawContent`,
-  `RawTextContent`, `RawResource`, and `Annotated` are no longer re-exported.
-- *(computer)* `OAuthError::Protocol` now carries the SDK-owned
-  `OAuthProtocolError` category instead of rmcp's `AuthError`. Provider response
-  details are intentionally discarded at this boundary.
-- *(computer)* #160 changes interactive `complete_oauth` and `cancel_oauth` to return
-  `OAuthFlowOutcome`. Expired and issuer-mismatched callbacks now use dedicated
-  `OAuthError` variants instead of a generic protocol error.
-- *(computer)* #167 adds `ComputerEvent::OAuthStatusChanged`. Exhaustive event matches need the
-  new variant, and `ComputerEvent` is no longer `Copy`.
-- *(computer)* #180 removes the public `HttpServerConfig.oauth`, `authPolicy`/`auth_policy`,
-  `OAuthOptions`, `OAuthClientMode`, and `OAuthClientRegistration` configuration surface. HTTP
-  OAuth is now automatic-only; serialized configurations containing removed fields fail
-  validation with a migration diagnostic. The configuration-only `OAuthError` variants
-  `ConflictingAuthorizationHeader`, `ExplicitPolicyRequiresOptions`, and
-  `DisabledPolicyWithOptions` are also removed.
-- *(computer)* [**breaking**] #165 project-scope enabledPlugins bundled MCP server
-  自我批准回落审批门——启用的 bundled server 在 project scope 显式声明即受
-  PENDING 门控（Option B，审批门绕过残面收口）。
-- *(computer)* [**breaking**] #169 安全层 Gate 1-3 对 plugin baseline 强制生效——
-  plugin 引入的 MCP server 在 reconcile 阶段受到与用户声明一致的 policy
-  deny/allow/disable 门控。
+- Automate Atlassian OAuth UAT consent
+- *(computer)* Address OAuth review findings
+- *(release)* Keep workspace version at 0.3.1
+- *(computer)* [**breaking**] Project-scope enabledPlugins bundled server 回落审批门 PENDING (#165, Option B)
+- *(computer)* [**breaking**] 安全层 Gate 1-3 对 plugin baseline 强制生效 (#169)
+- *(computer)* Resolve_target §5.1 步骤序死锁 — 多命中精确 bundle_id 匹配优先（Candidate B）
+- *(computer)* Start/restart 对「已声明未挂载」目标增加生命周期守卫 (#175)
+- *(computer)* 空 OAuth scope 配置采纳 PRM scopes_supported 进行初始授权 (#176)
+- *(computer)* Settings show --scope policy 经 validate_settings 做字段校验 (#166)
+- *(computer)* Complete auto OAuth startup in one call (#179)
+- *(smcp-computer)* Decouple activation from connection (#182)
+- *(smcp-computer)* Propagate OAuth capability revocation
+- *(smcp-computer)* #188 staging 根归属——URI 前缀优先于 _meta.source，被覆盖资源不再当独立根物化
+- *(smcp-computer)* #189 裸 Bearer challenge 准入放开——well-known 回退链 + RFC 8414 §3.3 issuer 一致性
+- *(smcp-computer)* #189 审查跟进——直取形态 §3.3 覆盖 + 文档契约 + reset 行为锚定
+- *(smcp-computer)* Publish dynamic tool changes
+- *(agent,computer)* 锁跨无界 await 并发缺陷——transport 重入死锁 & manager 生命周期冻结
+- *(computer)* Restore office membership after reconnect (#204)
 
 ### Features
 
-- *(computer)* #174 makes Streamable HTTP authentication anonymous-first by default and admits
-  OAuth only after a Bearer challenge plus validated RFC 9728/RFC 8414 metadata. Hosts receive
-  structured results for OAuth-required, unsupported challenge, discovery failure, ordinary
-  401/403, and rejected static credentials; automatic flows reuse the existing credential store,
-  status events, refresh, scope step-up, and cancellation lifecycle.
+- *(computer)* Add OAuth support with rmcp 2.2 (#157)
+- *(computer)* Complete OAuth host integration (#158)
+- *(computer)* Complete injectable OAuth credential store (#159)
+- *(computer)* Finalize OAuth host integration contract (#160)
+- *(computer)* Add OAuth resource and status events
+- *(computer)* Add transactional OAuth cancellation (#170)
+- *(computer)* Negotiate MCP OAuth automatically (#174)
+- *(computer)* Negotiate MCP OAuth automatically + adopt PRM scopes (#174, #176)
+- *(computer)* Make HTTP OAuth negotiation automatic-only (#180)
+- *(computer)* Materialize MCP inputs at process start
+- *(computer)* Prioritize client resolver over cache
+- *(computer)* #161 结构化窗口枚举诊断 + 三传输 list_windows 能力门
+- *(computer)* #162 结构化 Runtime diagnostics：键控可清除 + 单调 revision/事件
+- *(computer)* Support dynamic Socket.IO auth provider
+- *(computer)* #186 逐 MCP runtime 状态变更事件——投影单源、弱锚点断环、自死锁根治
 
-- *(computer)* #157 adds OAuth status, begin, callback completion, and credential
-  clearing APIs for Streamable HTTP servers. Automatic negotiation uses Authorization
-  Code + PKCE with standards-derived metadata and dynamic client registration, with refresh and bounded
-  `insufficient_scope` step-up.
-- *(computer)* #159 makes OAuth credential policy host-injectable through
-  `Computer::with_oauth_credential_store`; credentials are isolated by bundle ID, canonical protected resource,
-  issuer, client mode, client identity, and configured scopes. The SDK default is
-  process-local memory and never probes an OS credential vault; hosts that need
-  cross-process resume must inject an `OAuthCredentialStore`.
-- *(computer)* #160 defines one browser/callback host contract for local loopback and
-  headless HTTPS Gateway flow drivers, with structured completion/termination outcomes,
-  one-time opaque-state routing, deterministic expiry, and rustdoc-integrated guidance.
-- *(computer)* #167 isolates the canonical RFC 8707 OAuth resource discovered for an HTTP MCP
-  endpoint and publishes deduplicated, bundle-aware OAuth status changes through the shared
-  Computer event stream, including refresh failure and 401/403 background transitions.
-- *(computer)* #170 adds `Computer::create_oauth_flow` and the cloneable `OAuthFlow` handle, making
-  discovery, DCR, callback exchange, server replacement/removal, and shutdown cancellation
-  bounded without provider-timeout waits. Interactive reauthorization now stages candidate
-  credentials and commits them only after completion wins the terminal race.
-- *(computer)* #161 结构化窗口枚举诊断 + 三传输 list_windows 能力门——能力不支持的传输
-  显式返回 CapabilityNotSupported（聚合侧需要信号而非静默空列表）。
-- *(computer)* #162 结构化 Runtime diagnostics：键控可清除 + 单调 revision/事件——
-  stop-after-failed-start 语义收敛到协议门控。
-- *(computer)* #186 逐 MCP runtime 状态变更事件——投影单源、弱锚点断环、自死锁根治；
-  订阅滞后后按 revision 排空。
-- *(computer)* #190 启动时物化 MCP runtime inputs（进程级输入挂载）。
-- *(computer)* #192 客户端 resolver 优先于缓存——同名 server 先查客户端配置。
-- *(computer)* #201 建连与自动重连支持动态 Socket.IO auth provider（动态凭据刷新）。
+### Miscellaneous Tasks
 
-### Bug Fixes
+- Cargo fmt
+- Ignore isolated target-*/ build dirs
+- *(workspace)* Declare MSRV 1.86
+- *(lock)* Refresh Cargo.lock against workspace manifests
+- *(workspace)* MSRV resolver fallback 移至 .cargo/config.toml（RFC 3537）
+- *(ci)* 新增 resolver config 回归守卫（#203）
 
-- *(computer)* #179 makes automatic OAuth startup a bounded transaction: persisted Authorization
-  Code credentials and both Client Credentials modes connect in one `start_client_by_id` call,
-  while truly missing user authorization still returns `OAuthRequired`. Persisted automatic OAuth
-  credentials can also be cleared before the first reconnect.
-- *(computer)* Bound process-local OAuth and MCP lifecycle registries by retaining only
-  weak references and reclaiming dead slots during server/configuration churn.
-- *(computer)* Keep plain-HTTP SSE clients from initializing the platform TLS
-  certificate store. This prevents macOS Keychain contention from delaying or
-  failing concurrent local MCP connections and their prompt error handling.
-- *(computer)* #166 settings show --scope policy 经 validate_settings 做字段校验——
-  判废字段不再零警告穿出。
-- *(computer)* #171 resolve_target §5.1 步骤序死锁——多命中时精确 bundle_id 匹配优先
-  （Candidate B），捆绑名不再永远不可寻址。
-- *(computer)* #175 start 对「已声明未挂载」目标增加生命周期守卫（对标 stop_receipt）。
-- *(computer)* #176 空 OAuth scope 配置采纳 PRM scopes_supported 进行初始授权——
-  业务工具不再因空 scope 授权后不可用。
-- *(computer)* #178 锁跨无界 await 并发缺陷——transport 重入死锁 & manager 生命周期冻结。
-- *(computer)* #182 启动与 connect 状态解耦——未授权 MCP 启动后不再显示 inactive/pending。
-- *(computer)* #184 认证能力撤销后传播 capability revision 与 Office 工具通知。
-- *(computer)* #188 staging 根归属——URI 前缀优先于 _meta.source，被覆盖资源不再当独立根物化。
-- *(computer)* #189 裸 Bearer challenge 准入放开——well-known 回退链 + RFC 8414 §3.3
-  issuer 一致性门（含直取形态与 reset 行为锚定审查跟进）。
-- *(computer)* #199 publish dynamic tool changes——运行期工具变更即时发布。
+### Styling
 
-### Migration Notes
+- *(smcp-computer)* Cargo fmt（#188 测试断言换行）
 
-- Remove `oauth`, `authPolicy`, and `auth_policy` from every HTTP server configuration; they now
-  produce a validation error. Without static credentials, Streamable HTTP always connects
-  anonymously first and admits OAuth only after a standards-compliant Bearer challenge. Static
-  `Authorization` headers always remain static-only and never fall back to OAuth.
-  Automatic negotiation binds admission to the challenged protected-resource metadata and requires
-  its effective resource to match the MCP endpoint plus issuer-bearing RFC 8414/OIDC metadata;
-  derived legacy endpoints and cross-resource configuration are not admitted.
-- The embedding Desktop/CLI must open `OAuthLaunch.authorization_url`, receive the
-  loopback/HTTPS callback, and pass its `code`, `state`, and optional `issuer` to
-  `complete_oauth`. Map `access_denied` and other OAuth errors to the corresponding
-  `OAuthCancellationReason` and call `cancel_oauth`; neither method returns `()`.
-  The SDK does not open a browser or bind a callback listener.
-- Persistent OAuth is now host policy: Desktop applications may inject a Keychain-backed
-  `OAuthCredentialStore`, while multi-tenant services should bind their injected store to
-  tenant/principal runtime context. Without injection, credentials are lost on process exit.
-- OAuth status fields serialize as camelCase. Existing non-OAuth
-  HTTP servers retain normal redirect behavior; OAuth requests only follow
-  same-origin redirects.
-- Resource, scopes, authorization server, and client registration are no longer configurable;
-  they are derived from validated metadata. After `subscribe_events()` reports lag, call
-  `oauth_status(bundle_id)` to resynchronize OAuth UI state.
-- Match `OAuthError::Protocol(OAuthProtocolError::...)` for stable control flow. Raw
-  rmcp/provider errors are no longer available through the public error value.
-- New hosts should retain the `OAuthFlow` returned by `create_oauth_flow`, await `flow.launch()`,
-  and drive `flow.complete`, `flow.cancel_callback`, or `flow.cancel`. Existing
-  `begin_oauth`/`complete_oauth`/`cancel_oauth` methods remain available with their existing
-  signatures, but cannot cancel the pre-launch interval because they do not expose a handle before
-  state generation. The exhaustive public `OAuthError` enum adds lifecycle-specific variants, so
-  downstream exhaustive matches must add corresponding arms.
+### Testing
+
+- *(uat)* Add full-protocol acceptance coverage (#24)
+- *(uat)* Keep Atlassian OAuth credentials in memory
+- *(smcp-computer)* #188 staging 根归属复现测试——被根覆盖的资源不再当独立根物化（红灯）
+- *(smcp-computer)* #188 审查跟进——钉住 mode 统一 / 独立坏根 ERROR / 前缀边界 / 无 source 子资源物化
+- *(smcp-computer)* #189 裸 Bearer challenge 准入放开红灯——well-known 回退链 + issuer 一致性门
 
 ## [0.3.1] - 2026-07-27
-
-### Bug Fixes
-
-- *(computer)* Redact marketplace Git credentials (#156)
-
-### Features
-
-- *(computer)* Resolve plugin inputs in scoped-to-global precedence order (#155)
-
-## [0.3.0] - 2026-07-23
 
 ### Bug Fixes
 
@@ -305,12 +253,15 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #151 part1 跨 scope 遮蔽非法声明诊断穿出
 - *(computer)* #152 enabled Plugin bundled MCP 冷启动后恢复运行态
 - *(computer)* AUTH-01 真实传输测试 flake 根治——删裸 403/401 marker + 收尾 fmt
+- *(computer)* Redact marketplace git credentials (#156)
+- *(computer)* Gate CLI-only scope parser
 
 ### Documentation
 
 - *(computer)* #131/#130 隔离复审整改 —— 记录档⑤/⑥ 残留攻击面(#143) + 订正文档过度声称
 - *(smcp)* #133 契约注释订正 —— mcp_server doc 从「名称」订正为 bundle_id（照注释传 display 名必 4014）
 - *(workspace)* #146 rustdoc 清零——73 处 pre-existing 警告归零 + CI -D warnings 门禁
+- *(changelog)* V0.3.0 变更日志
 
 ### Features
 
@@ -336,6 +287,7 @@ All notable changes to this project will be documented in this file.
 - *(computer)* [**breaking**] #140 input env 名 ENV_SEGMENT 单一权威 + A2C_INPUT_→A2C_SMCP_ 硬切（D2/F4-F5·PROTO-5）
 - *(computer)* #151 part2 typed MCP import + 零写 preflight
 - *(computer)* #153 携带 BundleId 的窗口元数据枚举 API
+- *(computer)* #155 plugin input 按 §5.11 scoped→global 解析序
 
 ### Miscellaneous Tasks
 
@@ -348,12 +300,35 @@ All notable changes to this project will be documented in this file.
 - *(computer)* #132 卫生批次 —— 清除「名叫 server_name、值是 bundle_id」残留（归并 #119）
 - *(computer)* #151 隔离复审 🟡 三项——${input:} 文法单一权威 + 原子性文档收窄 + facade 测试
 
+### Styling
+
+- *(computer)* Apply rustfmt
+
 ### Testing
 
 - *(computer)* #143 隔离复审整改 —— 补 merge 交互守护 + 诊断回路闭合（settings show / boot 呈现）
 - *(computer)* AUTH-01 真实传输 401/403 可达性判据（协议 Discussion #34）
 - *(computer)* #142 R5/F7 收官守护——夹具取值分叉 + 异 id 同名寻址对拍 + 消三处假绿（Epic#129 收官）
 - *(computer)* #149 共享 Streamable mock 去重 + auto_reconnect 分支真覆盖
+
+## [0.2.4-dev.0] - 2026-07-01
+
+### Bug Fixes
+
+- *(computer)* Tool_call ack 结果级 _meta 重映射为协议规范 meta（跨 SDK 互通，对齐 protocol#5）
+
+### Features
+
+- *(computer)* Computer 级 marketplace/plugin lifecycle API + CLI 迁移 (#94)
+- *(computer)* Computer::reconcile_governance() + boot 启动恢复 (#95)
+
+### Miscellaneous Tasks
+
+- *(version)* Workspace bump 0.2.3 → 0.2.4-dev.0（预发布内测版）
+
+### Testing
+
+- *(computer)* 补 #93 治理层（#94/#95）代码审查缺口 + CLI JSON 键名 parity
 
 ## [0.2.3] - 2026-06-18
 
@@ -362,9 +337,17 @@ All notable changes to this project will be documented in this file.
 - *(computer)* Forbidden_tools 跨 server 暴露面对账，禁用先于 alias/冲突收集（对标 Python #106/#107）
 - *(skills)* SKILL watcher 回调 marshal 回 Tokio 运行时再 mark_dirty（修热重载 panic）
 
+### Documentation
+
+- *(changelog)* 更新 v0.2.3 变更日志
+
 ### Features
 
 - *(auth)* 全 SDK Socket.IO auth-dict-only 连接面鉴权（退役 HTTP-header 鉴权）
+
+### Miscellaneous Tasks
+
+- Release v0.2.3
 
 ### Testing
 
@@ -699,3 +682,4 @@ All notable changes to this project will be documented in this file.
 ### Ci
 
 - 添加 GitHub Actions 流水线配置
+
