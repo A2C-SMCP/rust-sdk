@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::settings::config::snapshot::{resolve_snapshot, SnapshotArgs};
 use crate::settings::redaction::{
-    git_url_for_display, redact_git_urls_in_text, untrusted_name_for_display,
+    known_git_source_for_display, redact_git_urls_in_text, untrusted_name_for_display,
 };
 use crate::settings::schema::is_valid_marketplace_name;
 use crate::settings::scope::EnvMap;
@@ -173,7 +173,10 @@ pub enum MarketplaceStatus {
 pub struct MarketplaceSnapshot {
     /// marketplace 名 / name。
     pub name: String,
-    /// 记录的 git 源 URL（`source.url`）/ recorded source URL。
+    /// `source.url` 的展示归一值（非可克隆原始值）/ display-normalized source URL.
+    ///
+    /// 已去除 userinfo/query/fragment；scp-like 展示为 `host:path`；无法安全展示时为
+    /// `<redacted-git-source>`。不可回写存储或用于 git 操作。
     pub source_url: Option<String>,
     /// 是否在 `trustedMarketplaces` / trusted。
     pub trusted: bool,
@@ -355,6 +358,8 @@ pub(crate) struct GovernanceArgs<'a> {
     pub env: Option<&'a EnvMap>,
     /// SKILL Home（marketplace/plugin 意图 + 账本根）；`None` → env 解析 / home。
     pub home: Option<&'a Path>,
+    /// `--settings <file>` flag 层（#248 v0.5.1：治理快照与运行期/归属视图同源）/ flag settings path。
+    pub flag_settings_path: Option<&'a Path>,
     /// policy `managed-mcp.json` 覆盖路径（测试隔离用）/ managed mcp path override。
     pub managed_mcp_path: Option<&'a Path>,
     /// 平台标识 / platform override。
@@ -380,6 +385,7 @@ pub(crate) fn resolve_governance_snapshot(
         cwd,
         env,
         home,
+        flag_settings_path,
         managed_mcp_path,
         platform,
         policy_settings,
@@ -390,6 +396,7 @@ pub(crate) fn resolve_governance_snapshot(
         cwd,
         env,
         home,
+        flag_settings_path,
         managed_mcp_path,
         platform,
         policy_settings,
@@ -509,7 +516,7 @@ pub(crate) fn resolve_governance_snapshot(
 
         marketplaces.push(MarketplaceSnapshot {
             name: untrusted_name_for_display(name),
-            source_url: source_url.map(|url| git_url_for_display(&url)),
+            source_url: source_url.map(|url| known_git_source_for_display(&url)),
             trusted: is_trusted,
             blocked: is_blocked,
             strict,
@@ -983,11 +990,16 @@ mod tests {
     }
     fn seed_catalog(dir: &Path, names: &[&str]) {
         let plugins: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+        // 清单顶层 name 取 catalog 目录名（`<home>/marketplace/<name>` 的同名口径）。
+        let marketplace = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("test-marketplace");
         let p = dir.join(".tfrobot-plugin").join("marketplace.json");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(
             &p,
-            serde_json::to_string(&json!({ "plugins": plugins })).unwrap(),
+            serde_json::to_string(&json!({ "name": marketplace, "plugins": plugins })).unwrap(),
         )
         .unwrap();
     }
@@ -1042,6 +1054,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "mp".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type":"git","url":"https://x/y.git"}),
                         extra: e,
                     },
@@ -1083,6 +1096,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "x=https://alice:PW_NAME@secret.example/repo.git".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({
                             "type": "git",
                             "url": "https://bob:PW_URL@example.com/r.git?token=QUERY#FRAGMENT"
@@ -1106,6 +1120,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "safe".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type": "git", "url": "https://example.com/safe.git"}),
                         extra: Map::from_iter([(
                             "installLocation".to_string(),
@@ -1209,6 +1224,7 @@ mod tests {
                 f.account.marketplaces.insert(
                     "mp".to_string(),
                     KnownMarketplaceEntry {
+                        manifest_name_baseline: None,
                         source: json!({"type":"git","url":"https://x/y.git"}),
                         extra: e,
                     },

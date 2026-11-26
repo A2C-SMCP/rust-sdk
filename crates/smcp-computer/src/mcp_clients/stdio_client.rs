@@ -7,7 +7,7 @@
 * 依赖: tokio, rmcp
 * 描述: STDIO类型的MCP客户端实现，委托 rmcp SDK
 */
-use super::base_client::BaseMCPClient;
+use super::base_client::{close_service_bounded, BaseMCPClient};
 use super::model::*;
 use super::{ResourceCache, SubscriptionManager};
 use crate::settings::redaction::redact_git_urls_in_text;
@@ -35,7 +35,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// STDIO 客户端连接超时时间（秒）
 /// Connect timeout for STDIO client (seconds)
@@ -656,15 +656,11 @@ impl MCPClientProtocol for StdioMCPClient {
         }
 
         let service = self.running_service.lock().await.take();
-        if let Some(service) = service {
-            match service.cancel().await {
-                Ok(reason) => {
-                    debug!("Service stopped with reason: {:?}", reason);
-                }
-                Err(e) => {
-                    error!("Error stopping service: {}", e);
-                }
-            }
+        if let Some(mut service) = service {
+            // #267 S4：关闭有界——服务任务不终止时不得挂起 disconnect。超时后 rmcp 已取消
+            // cancellation token 并分离任务；下面的 `terminate_child` 仍会 SIGKILL 子进程，
+            // 让分离的服务任务随 stdout 关闭而收敛。
+            close_service_bounded(&mut service).await;
         }
 
         self.terminate_child().await;

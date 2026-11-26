@@ -469,3 +469,36 @@ a2c> notify update
 - 确认 URL（协议/端口）可访问
 - 需要鉴权时，正确传 `--auth key:value` 或在 `socket connect` 后按系统流程处理
 - 必要时打开更详细日志（如果项目接入了 `tracing`/`RUST_LOG`，可用环境变量控制）
+
+### 10.4 重装报 `plugin root not found after source resolution`
+
+在 0.2.2–0.5.0（0.5.1 之前的全部版本）上卸载过「相对 source」插件时，marketplace catalog 内的插件
+子树可能已被旧版卸载删除，`marketplace refresh` 无法可靠自愈（`git pull` 通常保留本地删除）。先确认
+该插件路径在 **marketplace 上游仓库**确实存在（本地 clone 即被破坏 repo；上游 manifest 失真也会报
+同一错误），再按 [旧版本 → 0.5.1 升级迁移](./marketplace-0.5.1-migration.md) 恢复：
+
+1. `marketplace info <name>` + `plugin list --available` 记下源 URL、注册名、autoUpdate 与各插件的 scope/projectPath/version（`remove` 后 URL 查不到；含 token 的 URL 从自己的记录取；`plugin list` 默认隐藏 installed-disabled）。**真正受损的插件已被旧版卸载移除账本/安装意图，可能查不到——从其原安装命令/历史取，取不到按默认 user/当前版本恢复**
+2. `marketplace remove <name>`（默认级联卸载该 marketplace 下**所有**已安装插件并撤销 trust；**不要**加 `--keep-plugins`）
+3. `marketplace add <git-url> --trust`（重新 clone 并重新授予 trust；**注册名取清单顶层 `name`，`--name` 仅作期望名校验、不再改名**，清单名与旧名不同会导致旧 `<plugin>@<old-name>` 引用失效——见 [Marketplace 身份模型](./marketplace-identity.md)；原来开过 auto-update 的加 `--auto-update`）
+4. 逐一按原 scope `plugin install <plugin>@<name> --scope <scope>`——缺省 user；多 scope 每个 scope 各装一次；project/local 须在原项目目录执行（cwd 即 projectPath）；`--version` 仅恢复账本字段、不锁定内容。此前启用过的再 `plugin enable <plugin>@<name>`
+
+## 11. Marketplace 注册名迁移（#289）
+
+0.5.1 之前注册的 marketplace 可能保留了旧注册名（URL 派生名 / `--name` 别名）。用
+`marketplace migrate` 迁移到清单顶层 `name`（默认 dry-run）：
+
+```text
+marketplace migrate                                   # 只列出计划，零写入
+marketplace migrate --apply                           # 执行（离线；先停所有 Computer）
+marketplace migrate --apply --update-declarations     # 同时改 user 的 extraKnownMarketplaces
+marketplace migrate --resume                          # 中断后幂等续做
+marketplace migrate --rollback <timestamp>            # 按备份回滚
+```
+
+- 退出码：`0` 成功/无操作；`1` 冲突或命令级错误；`3` 部分完成（unresolved/blocked/keyring 不可用/
+  project-local 启用项将失活或 trust/blocked 旧名失效）。
+- `--json` 输出 `dryRun` / `written` / `status` / `items` / `conflicts` / `manualReferences` /
+  `backup` / `corrupt`；apply 报告另含 `warnings`，rollback 报告含 `restored` / `notes` / `warnings`。
+- project/local/policy/flag 的引用只报告；`extraKnownMarketplaces` 仅 `--update-declarations` 改
+  **user** scope。REPL 内只允许 dry-run（`--apply` / `--resume` / `--rollback` 请在 shell 执行）。
+- 完整说明见 [存量 Marketplace 注册名迁移](marketplace-name-migration.md)。

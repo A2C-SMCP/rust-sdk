@@ -300,6 +300,48 @@
       "platform": "windows",
       "input": "C:\\a\\b\u0001c",
       "error": "invalid_path"
+    },
+    {
+      "id": "win-reserved-lt",
+      "platform": "windows",
+      "input": "C:\\a\\b<c.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-reserved-gt",
+      "platform": "windows",
+      "input": "C:\\a\\b>c.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-reserved-pipe",
+      "platform": "windows",
+      "input": "C:\\a\\b|c.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-reserved-quote",
+      "platform": "windows",
+      "input": "C:\\a\\b\"c.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "win-reserved-star",
+      "platform": "windows",
+      "input": "C:\\a\\b*c.txt",
+      "error": "invalid_path"
+    },
+    {
+      "id": "posix-reserved-char-legal",
+      "platform": "posix",
+      "input": "/a/<b>|c\"d*e?f.txt",
+      "expected": "/a/<b>|c\"d*e?f.txt"
+    },
+    {
+      "id": "win-reserved-mid-component",
+      "platform": "windows",
+      "input": "C:\\a\\b<c\\d.txt",
+      "error": "invalid_path"
     }
   ]
 }

@@ -58,6 +58,7 @@ static PLACEHOLDER_RE: LazyLock<Regex> =
 ///
 /// 返回 [`ProjectConfigDoc`]（`settings_local`/`mcp_local` 恒 `None`；project 层已脱敏；project scope 的
 /// `readRoots` 被剔除——协议禁止项且含用户本地绝对路径，#245）。调用方负责序列化落盘/传输。
+/// **#292**：这是分享物隐私边界的显式例外（实体级 executor 写入保留 + WARN，不适用导出）。
 pub fn export_config(config_dir: &Path) -> Result<ProjectConfigDoc, ConfigCrudError> {
     let mut doc = sanitize_for_boundary(&load_project_config_doc(config_dir)?);
     // #245：project scope 的 readRoots 是协议禁止项（且含用户本地绝对路径），不随分享物旅行。
@@ -75,6 +76,7 @@ pub fn import_config(
 ) -> Result<ValidationReport, ConfigCrudError> {
     let sanitized = sanitize_for_boundary(incoming);
     // 先校验（保留 project scope 非法字段的诊断）；`save_config` 负责落盘前剔除（#245）。
+    // #292：整文档 import 属 A+ 的显式例外（不保留 project readRoots）；实体级 executor 写入才保留 + WARN。
     let report = validate_config(&sanitized);
     save_config(config_dir, &sanitized)?;
     Ok(report)

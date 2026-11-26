@@ -99,6 +99,24 @@ fn read_json_object(path: &Path, what: &str) -> Result<Map<String, Value>, Plugi
 }
 
 // ── marketplace.json（仓库级）/ marketplace-level manifest ────────────────────
+/// 解析 marketplace manifest 文本（对象根 / JSON 损坏 → 抛）/ Parse a marketplace manifest string。
+///
+/// 供**无盘**路径复用（如 `git show FETCH_HEAD:.tfrobot-plugin/marketplace.json` 的 refresh 预校验）。
+///
+/// # Errors
+/// JSON 非法或根非对象 → [`PluginManifestError`]。
+pub fn parse_marketplace_manifest(text: &str) -> Result<Map<String, Value>, PluginManifestError> {
+    let data: Value = serde_json::from_str(text).map_err(|e| {
+        PluginManifestError::new(format!("marketplace manifest unreadable/invalid: {e}"))
+    })?;
+    match data {
+        Value::Object(m) => Ok(m),
+        _ => Err(PluginManifestError::new(
+            "marketplace manifest root is not an object",
+        )),
+    }
+}
+
 /// 读 `<catalog>/.tfrobot-plugin/marketplace.json`（缺失/损坏 → 抛）/ Read the marketplace manifest。
 ///
 /// # Errors
@@ -115,7 +133,47 @@ pub fn read_marketplace_manifest(
             path.display()
         )));
     }
-    read_json_object(&path, "marketplace manifest")
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        PluginManifestError::new(format!(
+            "marketplace manifest unreadable/invalid at {}: {e}",
+            path.display()
+        ))
+    })?;
+    parse_marketplace_manifest(&text)
+}
+
+/// 清单顶层 `name` 校验失败（结构化，便于上层区分缺失/非法）/ Manifest name validation errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ManifestNameError {
+    /// 缺失 / `null` / 非字符串。
+    #[error("marketplace manifest is missing the required top-level 'name'")]
+    Missing,
+    /// 存在但不是严格 kebab。
+    #[error("marketplace manifest 'name' must be lowercase kebab-case (1-64 characters)")]
+    Invalid,
+}
+
+/// 取清单顶层 `name` 并做严格 kebab 校验（#272 注册名唯一权威）/ Validate the manifest top-level name。
+///
+/// 缺失 / 非字符串 / 空 / 非严格 kebab（`[a-z0-9-]`，1–64，无首尾 `-`、无 `--`）→ 抛。
+/// 错误文案**不回显**原始值（可能是恶意或含凭据字符串）。
+///
+/// # Errors
+/// 顶层 `name` 缺失或不合规 → [`ManifestNameError`]。
+pub fn marketplace_manifest_name(
+    manifest: &Map<String, Value>,
+) -> Result<String, ManifestNameError> {
+    let Some(value) = manifest.get("name") else {
+        return Err(ManifestNameError::Missing);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(ManifestNameError::Missing);
+    };
+    let name = raw.trim();
+    if !crate::settings::is_valid_marketplace_name(name) {
+        return Err(ManifestNameError::Invalid);
+    }
+    Ok(name.to_string())
 }
 
 /// 取 `manifest.plugins` 中的对象条目（非数组 → 空；非对象条目跳过）/ Object entries under `manifest.plugins`。
@@ -190,6 +248,12 @@ pub fn entry_is_strict(entry: &Map<String, Value>) -> bool {
         Some(Value::Bool(b)) => *b,
         _ => true,
     }
+}
+
+/// marketplace entry 是否声明某组件字段（marketplace-v1：entry 字段即声明；空/缺/falsy 不算）/
+/// Whether a marketplace entry declares a component field。
+pub(crate) fn entry_declares_component(entry: &Map<String, Value>, field: &str) -> bool {
+    entry.get(field).is_some_and(json_truthy)
 }
 
 /// plugin.json 中**真值**组件字段名列表（空/缺/falsy 不算声明）/ Truthy component fields declared。
@@ -376,7 +440,7 @@ mod tests {
     fn test_read_marketplace_manifest() {
         let tmp = TempDir::new().unwrap();
         let mf = tmp.path().join(".tfrobot-plugin/marketplace.json");
-        write(&mf, r#"{"plugins": [{"name": "audit"}]}"#);
+        write(&mf, r#"{"name": "acme", "plugins": [{"name": "audit"}]}"#);
         let m = read_marketplace_manifest(tmp.path()).unwrap();
         assert_eq!(iter_plugin_entries(&m).len(), 1);
         // 缺失 → 抛。
@@ -388,6 +452,41 @@ mod tests {
             "[1,2]",
         );
         assert!(read_marketplace_manifest(tmp2.path()).is_err());
+    }
+
+    #[test]
+    fn test_manifest_marketplace_name_strict_kebab() {
+        let obj = |v: Value| v.as_object().unwrap().clone();
+        assert_eq!(
+            marketplace_manifest_name(&obj(json!({"name": "team-tools"}))).unwrap(),
+            "team-tools"
+        );
+        assert_eq!(
+            marketplace_manifest_name(&obj(json!({"name": " team-tools "}))).unwrap(),
+            "team-tools"
+        );
+        let long = "a".repeat(65);
+        for bad in [
+            json!({}),
+            json!({"name": 1}),
+            json!({"name": ""}),
+            json!({"name": "Bad_Name"}),
+            json!({"name": "a--b"}),
+            json!({"name": "-ab"}),
+            json!({"name": long}),
+        ] {
+            assert!(
+                marketplace_manifest_name(&obj(bad.clone())).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_marketplace_manifest_str() {
+        assert!(parse_marketplace_manifest(r#"{"name":"acme","plugins":[]}"#).is_ok());
+        assert!(parse_marketplace_manifest("[1,2]").is_err());
+        assert!(parse_marketplace_manifest("not json").is_err());
     }
 
     #[test]

@@ -8,23 +8,26 @@
 * 描述: Computer 治理层 settings 模块（意图层 settings.json 结构与字段级容错校验）
 *       Computer governance-layer settings module (intent-layer settings.json schema & validation)
 *
-* ## 写路径约定（#253）
+* ## 写路径约定（#253 / #292）
 *
 * 除显式例外——`config::validate::migrate_config`（有意有损规范化）、`config::crud::save_config`
-* （整文档 import/duplicate）与 `settings edit`（外部编辑器直接写文件）——所有 settings 文件写入均经
-* `raw_write::update_raw_settings` 做 strict raw RMW：只改目标键、保留其余字段、corrupt 或目标容器
-* 畸形 fail-closed（拒绝写盘、原文件逐字节不变）。
+* （整文档 import/duplicate/整体写）与 `settings edit`（外部编辑器直接写文件）——所有 settings 文件写入
+* 均走 strict raw RMW：只改目标键、保留其余字段、corrupt 或目标容器畸形 fail-closed（拒绝写盘、原文件
+* 逐字节不变）。两条落点：`raw_write::update_raw_settings`（点写）与 `config::executor`（实体级写计划，
+* 自带持锁 RMW + 批前目标容器校验，#292）。
 *
 * **A+（2026-11-03 用户拍板）**：project scope 的 `readRoots` 写入期**保留 + WARN**，读面
-* trusted-scope-only 拒绝保持不动；不做任何主动删除。
+* trusted-scope-only 拒绝保持不动；不做任何主动删除。`config::executor` 自 #292 起同口径：显式
+* Set/Delete 命中该键 → 不写新值、保留旧键 + WARN。
 *
-* `config::executor` 的 corrupt root 已 fail-closed（`CorruptTarget`）；其目标容器畸形校验、统一
-* helper 复用**以及 project `readRoots` 剔除的 A+ 对齐**留 PR-B（v0.5.1）。
+* **例外（行为不变）**：`save_config`（含 import/duplicate）与 `export_config` 仍按整文档边界剔除
+* project `readRoots`（分享物隐私边界）；`migrate_config` 经规范化 + `save_config` 有损处理。
 */
 
 pub mod config;
 pub mod installer;
 pub mod lifecycle;
+pub mod marketplace_migration;
 pub mod mcp_config;
 pub mod policy;
 pub(crate) mod raw_write;
@@ -39,14 +42,24 @@ pub mod store;
 pub use installer::{
     disable_plugin, enable_plugin, install_plugin, materialize_plugin_record, uninstall_plugin,
     DisableOptions, EnableOptions, InstallOptions, McpHookError, McpInstallHooks,
-    McpServerNameConflictError, PluginInstallError, UninstallOptions,
+    McpServerNameConflictError, PluginInstallError, PluginNameConflictError,
+    PluginNameConflictKind, ResolvedSettingsProvider, UninstallOptions,
 };
 
 pub use lifecycle::{
     add_marketplace, default_marketplace_name, marketplace_name_taken, normalize_marketplace_url,
-    refresh_marketplaces, remove_marketplace, resolve_marketplace_identity, AddMarketplaceParams,
-    GovernanceError, MarketplaceAddOutcome, MarketplaceIdentity, MarketplaceRefreshRow,
-    MarketplaceRemoveOutcome, RefreshStatus, RemoveMarketplaceParams,
+    refresh_marketplaces, remove_marketplace, resolve_marketplace_add_request,
+    AddMarketplaceParams, GovernanceError, MarketplaceAddOutcome, MarketplaceAddRequest,
+    MarketplaceRefreshDiagnostic, MarketplaceRefreshRow, MarketplaceRemoveOutcome,
+    RefreshDiagnosticCode, RefreshStatus, RemoveMarketplaceParams,
+};
+
+pub use marketplace_migration::{
+    apply_marketplace_name_migration, plan_marketplace_name_migration,
+    resume_marketplace_name_migration, rollback_marketplace_name_migration, BackupRef, EnvRename,
+    ManualReference, MarketplaceMigrationError, MarketplaceMigrationOptions,
+    MarketplaceMigrationPlan, MarketplaceMigrationReport, MarketplaceRollbackReport,
+    MigrationAction, MigrationConflict, MigrationItem, MigrationReason, MigrationStatus,
 };
 
 pub use mcp_config::{
@@ -75,6 +88,7 @@ pub use reconciler::{
 pub use recovery::{
     collect_enabled_bundled_servers, recover_marketplace_skills,
     rematerialize_missing_ledger_records, BundledServerRecord, GovernanceRecoveryReport,
+    MarketplaceDeclarationError, MarketplaceSourceConflict,
 };
 
 pub use schema::{

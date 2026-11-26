@@ -31,6 +31,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use smcp::utils::path_norm::{native_platform, normalize_path, PathPlatform};
 
@@ -97,6 +98,78 @@ pub const FIELD_LANDING_ROOT: &str = "landingRoot";
 /// authorized read roots for `client:resolve_path`.
 pub const FIELD_READ_ROOTS: &str = "readRoots";
 
+/// 错误字段路径是否属于 `extraKnownMarketplaces` 声明（含顶层字段本身）。
+///
+/// 供治理恢复报告筛选与 CLI 呈现共用，避免 `starts_with` 字面量在多处漂移。
+#[must_use]
+pub(crate) fn is_marketplace_declaration_field(field: &str) -> bool {
+    field == FIELD_EXTRA_KNOWN_MARKETPLACES
+        || (field.starts_with(FIELD_EXTRA_KNOWN_MARKETPLACES)
+            && field[FIELD_EXTRA_KNOWN_MARKETPLACES.len()..].starts_with('.'))
+}
+
+/// 对 marketplace 声明错误做统一脱敏；非 marketplace 字段返回 `None`（保持原错误）。
+///
+/// 在 **`validate_settings` 出口**调用一次，使 `SettingsValidationError` 的所有消费者（CLI 文本、
+/// `ConfigSnapshot` / `ImportReport` / `ValidationReport` 的 diagnostics、恢复报告）都拿到同一安全值。
+/// `field` 保留 `extraKnownMarketplaces` 前缀，前缀之后的整段与 `reason` 经
+/// [`untrusted_name_for_display`] 脱敏并清洗控制/格式字符。
+pub(crate) fn sanitized_marketplace_error(
+    error: &SettingsValidationError,
+) -> Option<SettingsValidationError> {
+    if !is_marketplace_declaration_field(&error.field) {
+        return None;
+    }
+    Some(SettingsValidationError {
+        scope: error.scope,
+        field: sanitize_marketplace_field(&error.field),
+        reason: sanitize_marketplace_text(&error.reason),
+        // 路径按路径对待：只清洗控制/格式字符，**不**走 URL 脱敏（避免 Windows `...\alice@corp\...`
+        // 被 scp-like redactor 整段替换）。回填时机见 `validate_settings` 末尾的二次脱敏。
+        source_path: error.source_path.as_deref().map(scrub_diagnostic_chars),
+    })
+}
+
+/// 保留 `extraKnownMarketplaces` 前缀，只对前缀之后的子串脱敏（前缀本身含 `.`，整体喂给 URL 脱敏器会
+/// 被误判为 scheme 的一部分）。前缀用常量，无法剥离时整段脱敏（fail-safe）。
+fn sanitize_marketplace_field(field: &str) -> String {
+    match field
+        .strip_prefix(FIELD_EXTRA_KNOWN_MARKETPLACES)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
+        Some(rest) => format!(
+            "{FIELD_EXTRA_KNOWN_MARKETPLACES}.{}",
+            sanitize_marketplace_text(rest)
+        ),
+        None => sanitize_marketplace_text(field),
+    }
+}
+
+/// 不可信文本 → 诊断展示值：Git URL 凭据剥离 + 控制/格式字符替换为空格。
+pub(crate) fn sanitize_marketplace_text(text: &str) -> String {
+    scrub_diagnostic_chars(&super::redaction::untrusted_name_for_display(text))
+}
+
+/// 控制字符 + Unicode 格式/行分隔符（bidi 覆写 / 零宽 / 行分隔）替换为空格，防 CLI/日志注入。
+pub(crate) fn scrub_diagnostic_chars(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_unsafe_display_char(c) { ' ' } else { c })
+        .collect()
+}
+
+/// 终端展示不安全的字符：C0/C1 控制符（`char::is_control`）+ 常见 Unicode 格式/行分隔符。
+fn is_unsafe_display_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
+}
+
 /// policy-only 字段：出现在非 policy scope → 过滤 + 记错（杜绝用户态自我提权）。
 /// Policy-only fields: filtered + recorded if seen outside the policy scope.
 pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS];
@@ -138,7 +211,8 @@ pub const POLICY_ONLY_FIELDS: &[&str] = &[FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIE
 /// 那是 `client:resolve_path` 的**读授权**：project settings 入 git、随仓库分发，clone 的仓库不得把
 /// 读授权扩到任意路径（如 `~/.ssh`）——`security.md` §读取通道安全与 `computer-management` §7
 /// 不变量 #7 明定仅受信 scope（`user`/`local`/`flag`/`policy`/`embed`）可设，**`project` scope
-/// 提供该键 MUST 被拒绝**（整字段不生效；写入期亦丢弃不落盘，#245）。
+/// 提供该键 MUST 被拒绝**（读面整字段不生效；实体级写入期不写该键、既有键保留并告警，不主动删除，
+/// #245/#292；整文档 `save_config` / `export_config` / `migrate_config` 例外仍按隐私/有损边界剔除）。
 ///
 /// [guide]: https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/develop/docs/guides/mcp-approval-gate-alignment.md
 pub const TRUSTED_SCOPE_ONLY_FIELDS: &[&str] = &[
@@ -207,11 +281,20 @@ pub fn is_valid_enabled_plugin_key(key: &str) -> bool {
 }
 
 /// git url 形态是否合规（scp-like 或 ssh/git/http(s)/file scheme）/ Whether a git url is well-formed.
+///
+/// #285：ssh/git/http(s) 必须带**非空 host**（拒绝 `ssh:///…`、`ssh:/…`）；`file:///abs` 例外
+/// 保持合法。该收紧是公开行为变更：hostless URL 不再被接受为 Git 源（防凭据被派生进名称）。
 pub fn is_valid_git_url(url: &str) -> bool {
     if url.trim().is_empty() {
         return false;
     }
-    GIT_URL_SCHEME_RE.is_match(url) || GIT_SCP_LIKE_RE.is_match(url)
+    if GIT_URL_SCHEME_RE.is_match(url) {
+        let Ok(parsed) = Url::parse(url) else {
+            return false;
+        };
+        return parsed.scheme() == "file" || parsed.host_str().is_some();
+    }
+    GIT_SCP_LIKE_RE.is_match(url)
 }
 
 /// 绝对路径判定：POSIX `/...` 或 Windows 盘符 `X:\` / `X:/` / Absolute path (POSIX or Windows drive).
@@ -503,6 +586,12 @@ fn validate_extra_marketplaces(key: &str, value: &Value, scope: SettingsScope) -
         }
         cleaned.insert(name.clone(), Value::Object(normalized));
     }
+    // #302 🔴：非法 marketplace 名称/来源可能是恶意文本——在**校验出口**统一脱敏一次，保证所有
+    // 消费者（CLI 文本、snapshot/import/validation diagnostics、恢复报告）不会拿到带凭据的原始字段。
+    let errors = errors
+        .into_iter()
+        .map(|error| sanitized_marketplace_error(&error).unwrap_or(error))
+        .collect();
     (Some(Value::Object(cleaned)), errors)
 }
 
@@ -658,6 +747,13 @@ pub fn validate_settings(
         }
     }
 
+    // #302 D3：source_path 在**校验器返回后**才回填；marketplace 错误需在此再脱敏一次
+    // （field/reason 幂等；source_path 仅控制字符清洗）。
+    let errors = errors
+        .into_iter()
+        .map(|error| sanitized_marketplace_error(&error).unwrap_or(error))
+        .collect();
+
     (cleaned, errors)
 }
 
@@ -754,7 +850,24 @@ mod tests {
             ("http://example.com/x.git", true),
             ("ssh://git@host:22/team/skills.git", true),
             ("git://host/path", true),
+            ("ssh://host/repo.git", true),
             ("file:///abs/path/repo", true),
+            ("file://host/path", true),
+            // #285：hostless（空 authority）不是合法 Git 源；file:///abs 例外保持合法。
+            ("ssh:///alice:PW_LEAK@example.com", false),
+            ("ssh:/alice:PW_LEAK@example.com", false),
+            ("git:///alice:PW_LEAK@example.com", false),
+            ("ssh://", false),
+            // Url::parse 失败分支：empty host / 非法端口。
+            ("ssh://user:pw@/repo", false),
+            ("ssh://host:notaport/repo", false),
+            // IPv6 host 与特殊 scheme 归一形态。
+            ("ssh://[::1]/repo.git", true),
+            ("ssh://[::1]:22/repo.git", true),
+            ("https:///hostless", true), // WHATWG 归一为 host=hostless
+            ("ssh://host:", true),       // WHATWG 归一为 ssh://host
+            ("http:///", false),         // Url::parse 失败（empty host）
+            ("file:/abs/repo", false),   // 缺 `://`
             ("not a url", false),
             ("ftp://host/x", false),
             ("", false),
@@ -1153,7 +1266,7 @@ mod tests {
 
     #[test]
     fn test_extra_marketplaces_bad_entry_filtered() {
-        let cases: [(&str, Value, &str); 5] = [
+        let cases: [(&str, Value, &str); 6] = [
             (
                 "Bad_Name",
                 json!({"source": {"type": "git", "url": "git@h:p"}}),
@@ -1167,6 +1280,11 @@ mod tests {
             (
                 "ok-mp",
                 json!({"source": {"type": "git", "url": "garbage"}}),
+                "extraKnownMarketplaces.ok-mp.source.url",
+            ),
+            (
+                "ok-mp",
+                json!({"source": {"type": "git", "url": "ssh:///alice:PW_LEAK@example.com"}}),
                 "extraKnownMarketplaces.ok-mp.source.url",
             ),
             (
@@ -1194,6 +1312,60 @@ mod tests {
                 "missing error {bad_field}"
             );
         }
+    }
+
+    /// #302 🔴：校验出口即脱敏——恶意 marketplace 名称（URL / 编码凭据 / 控制字符）不得进入
+    /// 任何 `SettingsValidationError` 消费者（CLI 文本、snapshot/import/validation diagnostics）。
+    #[test]
+    fn test_extra_marketplaces_error_field_redacts_credentials_and_controls() {
+        for name in [
+            "https://example.com/team/alice%3APW_SECRET%40example.com/repo.git",
+            "ev\u{202E}il\u{2028}NAME",
+        ] {
+            let raw = json!({"extraKnownMarketplaces": {
+                name: {"source": {"type": "git", "url": "git@h:p"}}
+            }});
+            let (_, errors) = validate_settings(&raw, SettingsScope::User, None);
+            assert_eq!(errors.len(), 1, "{name}");
+            let field = &errors[0].field;
+            assert!(
+                field.starts_with("extraKnownMarketplaces."),
+                "前缀必须保留：{field}"
+            );
+            assert!(!field.contains("PW_SECRET"), "{field}");
+            assert!(!field.contains('%'), "{field}");
+            assert!(
+                !field.contains('\u{202E}') && !field.contains('\u{2028}'),
+                "{field}"
+            );
+        }
+    }
+
+    /// #302 D3：`source_path` 只做控制字符清洗（路径按路径对待，不触发 scp/URL 脱敏）；
+    /// 且在 `validate_settings` 末尾回填后仍被脱敏一次。
+    #[test]
+    fn test_extra_marketplaces_error_source_path_scrubbed_not_url_redacted() {
+        let raw = json!({"extraKnownMarketplaces": {
+            "acme": {"source": {"type": "git", "url": "not-a-url"}}
+        }});
+        let windows_path = r"C:\Users\alice@corp\settings.json";
+        let (_, errors) = validate_settings(&raw, SettingsScope::User, Some(windows_path));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].source_path.as_deref(),
+            Some(windows_path),
+            "合法路径（含 @/盘符）不得被 URL 脱敏器改写"
+        );
+
+        let dirty_path = "C:\\Users\\alice@corp\\settings.json\nFAKE\u{202E}";
+        let (_, errors) = validate_settings(&raw, SettingsScope::User, Some(dirty_path));
+        let scrubbed = errors[0].source_path.as_deref().expect("source_path");
+        assert!(!scrubbed.contains('\n'), "{scrubbed:?}");
+        assert!(!scrubbed.contains('\u{202E}'), "{scrubbed:?}");
+        assert!(
+            scrubbed.starts_with(r"C:\Users\alice@corp\settings.json"),
+            "{scrubbed:?}"
+        );
     }
 
     // ---- 标量 / 数组类型校验 ----

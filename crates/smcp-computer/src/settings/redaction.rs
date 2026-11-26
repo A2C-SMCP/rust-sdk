@@ -14,6 +14,7 @@
 //! URL 的 userinfo、query、fragment 都可能承载凭据。公开错误不得保存这些原始片段，因为派生
 //! `Debug` / `Display` 会把枚举字段直接带入日志；配置导出则只替换已确认的 userinfo 面，保留其余 URL。
 
+use percent_encoding::percent_decode_str;
 use url::Url;
 
 /// 无法安全呈现的 Git 来源占位符 / placeholder for a Git source that cannot be shown safely.
@@ -54,6 +55,23 @@ pub(crate) fn git_url_for_display(raw: &str) -> String {
     if !matches!(parsed.scheme(), "ssh" | "git" | "http" | "https" | "file") {
         return REDACTED_GIT_SOURCE.to_string();
     }
+    // 展示值只接受带 authority 且 host 非空的层级 URL：缺 `//`（`ssh:/alice:PW@host`）或
+    // 空 authority（`ssh:///alice:PW@host`）会把 userinfo 落进 path、`username()` 为空，
+    // 原样序列化会回显凭据（含 `%40` 编码与 query/fragment 残差）。file: 的 host 可为空
+    // （`file:///abs` 合法），但 raw 含 `@` 时无法与 userinfo 形态稳定区分 → fail-closed。
+    if parsed.scheme() == "file" {
+        if raw.contains('@') {
+            return REDACTED_GIT_SOURCE.to_string();
+        }
+    } else if !parsed.has_authority() || parsed.host_str().is_none() {
+        return REDACTED_GIT_SOURCE.to_string();
+    }
+
+    // #302 🔴：凭据也可能被百分号编码进 **path**（`/team/alice%3APW%40example.com/repo.git`），
+    // authority 剥离不会碰到它。path 任一段解码后呈 `user:pass@host` 形态 → fail-closed 整段占位。
+    if path_has_credential_like_text(&parsed) {
+        return REDACTED_GIT_SOURCE.to_string();
+    }
 
     if !parsed.username().is_empty() && parsed.set_username("").is_err() {
         return REDACTED_GIT_SOURCE.to_string();
@@ -69,6 +87,65 @@ pub(crate) fn git_url_for_display(raw: &str) -> String {
 /// 非法 Git 来源的公开错误载荷与 CLI 展示共用同一严格安全边界。
 pub(crate) fn git_source_for_error(raw: &str) -> String {
     git_url_for_display(raw)
+}
+
+/// URL path 任一段是否呈凭据样文本（percent-decode 后同时含 `:` 与 `@`，如 `alice:PW@host`）。
+fn path_has_credential_like_text(parsed: &Url) -> bool {
+    parsed.path_segments().is_some_and(|mut segments| {
+        segments.any(|segment| {
+            let decoded = percent_decode_str(segment).decode_utf8_lossy();
+            decoded.contains(':') && decoded.contains('@')
+        })
+    })
+}
+
+/// 展示面的 Git 来源归一值 / display-normalized Git source for presentation surfaces.
+///
+/// 仅用于展示面（治理快照、marketplace CLI）；**错误与诊断边界必须继续使用**
+/// [`git_url_for_display`]。本函数仅对 scp-like 分支做形状级 fail-closed，不依赖调用方预校验：
+///
+/// - ASCII scp-like `user@host:path` → `host:path`（丢弃 userinfo，剥除 query/fragment；
+///   path 含 `@`/`:`/`%` 等嵌套 URL 或编码凭据形态时回退占位符）
+/// - 其余输入委托 [`git_url_for_display`]（scheme URL 行为不变；opaque 形态由严格函数
+///   fail-closed）
+///
+/// 账本（`known_marketplaces.json`）仍须视为不可信输入：本函数只保证不放大凭据与结构，
+/// 不保证展示值可克隆或与存储值逐字一致。
+pub(crate) fn known_git_source_for_display(raw: &str) -> String {
+    scp_like_source_for_display(raw).unwrap_or_else(|| git_url_for_display(raw))
+}
+
+/// scp-like `user@host:path` 的展示值：丢弃 userinfo，剥除 query/fragment。
+///
+/// 仅当 user/host 为 ASCII 且 path 非空、为 ASCII graphic、不含 `@`/`:`/`%`、不以 `//`
+/// 开头（防止嵌套 URL、编码凭据与伪 host 歧义）时返回 `Some`；其余形态交回
+/// [`git_url_for_display`]。
+fn scp_like_source_for_display(raw: &str) -> Option<String> {
+    let (user, rest) = raw.split_once('@')?;
+    if user.is_empty()
+        || !user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+    {
+        return None;
+    }
+    let (host, path) = rest.split_once(':')?;
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    if path.is_empty()
+        || path.contains(['@', ':', '%'])
+        || path.starts_with("//")
+        || !path.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return None;
+    }
+    Some(format!("{host}:{path}"))
 }
 
 fn source_end_boundary(ch: char) -> bool {
@@ -223,15 +300,153 @@ mod tests {
         }
     }
 
+    /// #302 🔴：path 中百分号编码/字面凭据也必须 fail-closed（authority 剥离不覆盖 path）。
+    #[test]
+    fn path_embedded_credentials_are_fully_redacted() {
+        for raw in [
+            "https://example.com/team/alice%3APW_SECRET%40example.com/repo.git",
+            "https://example.com/team/alice:PW_SECRET@example.com/repo.git",
+            "file:///team/alice%3APW_SECRET%40example.com/repo.git",
+        ] {
+            let got = git_url_for_display(raw);
+            assert_eq!(got, REDACTED_GIT_SOURCE, "{raw}");
+            assert!(!got.contains("PW_SECRET"), "{raw}");
+        }
+        // 正常 path（无 `user:pass@host` 形态）不受影响。
+        assert_eq!(
+            git_url_for_display("https://example.com/team/repo.git"),
+            "https://example.com/team/repo.git"
+        );
+    }
+
+    #[test]
+    fn known_source_display_restores_scp_like_host_and_path() {
+        assert_eq!(
+            known_git_source_for_display("git@example.com:org/repo.git"),
+            "example.com:org/repo.git"
+        );
+        assert_eq!(
+            known_git_source_for_display("git@example.com:org/repo.git?token=QUERY#FRAGMENT"),
+            "example.com:org/repo.git"
+        );
+        let got = known_git_source_for_display("deploy-token@example.com:org/repo.git");
+        assert_eq!(got, "example.com:org/repo.git");
+        assert!(!got.contains("deploy-token"));
+        assert_eq!(
+            known_git_source_for_display("git@example.com:~/repo.git"),
+            "example.com:~/repo.git"
+        );
+    }
+
+    #[test]
+    fn known_source_display_matches_strict_display_for_scheme_urls() {
+        for source in [
+            "ssh://git@example.com/org/repo.git",
+            "https://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT",
+            "git://host/path",
+            "file:///abs/path/repo",
+            "https://example.com/org/repo.git",
+        ] {
+            assert_eq!(
+                known_git_source_for_display(source),
+                git_url_for_display(source),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_source_display_fails_closed_for_untrusted_shapes() {
+        for source in [
+            "cnb:FAKE_TOKEN@example.com/org/repo.git",
+            "cnb:FAKE_TOKEN@https://example.com/org/repo.git",
+            "git@example.com:org/repo.git://nested",
+            "git@example.com:https:/alice:PW_LEAK@example.com/repo.git",
+            "git@example.com:user:pass@host/repo.git",
+            "git@example.com:alice%3APW@example.com/repo.git",
+            "git@example.com:org%2Frepo.git",
+            "git@example.com://evil.example/repo.git",
+            "ssh:alice:PW_LEAK@example.com",
+            "git:alice:PW_LEAK@host/repo.git",
+            "ssh:/alice:PW_LEAK@host",
+            "ssh:///alice:PW_LEAK@host",
+            "file:alice:PW_LEAK@host",
+            "@example.com:org/repo.git",
+            "git@:org/repo.git",
+            "git@example.com:",
+            "git@example.com:?token=X",
+            "git@example.com:#frag",
+            "用户@example.com:org/repo.git",
+            "用户@例子.公司:org/repo.git",
+            "alice@my_host: Permission denied (publickey).",
+            "ftp://cnb:FAKE_TOKEN",
+            "not a url",
+            "",
+        ] {
+            let got = known_git_source_for_display(source);
+            assert_eq!(got, REDACTED_GIT_SOURCE, "{source}");
+            for secret in [
+                "cnb",
+                "FAKE_TOKEN",
+                "nested",
+                "PW_LEAK",
+                "user",
+                "pass",
+                "alice",
+                "evil.example",
+                "用户",
+                "my_host",
+            ] {
+                assert!(!got.contains(secret), "{got}");
+            }
+        }
+    }
+
+    #[test]
+    fn strict_display_still_hides_scp_like_sources() {
+        assert_eq!(
+            git_url_for_display("git@example.com:org/repo.git"),
+            REDACTED_GIT_SOURCE
+        );
+    }
+
     #[test]
     fn opaque_invalid_source_is_not_echoed() {
         for source in [
             "cnb:FAKE_TOKEN@example.com/org/repo.git",
             "cnb:FAKE_TOKEN@https://example.com/org/repo.git",
             "ftp://cnb:FAKE_TOKEN",
+            "ssh:alice:PW_LEAK@example.com",
+            "git:alice:PW_LEAK@host/repo.git",
+            "ssh:alice%3APW_LEAK%40example.com",
+            "ssh:opaque?token=QUERY_LEAK#FRAGMENT_LEAK",
+            "ssh:/alice:PW_LEAK@host",
+            "ssh:///alice:PW_LEAK@host",
+            "file:alice:PW_LEAK@host",
+            "file:/alice:PW_LEAK@host",
+            "file:alice@host",
+            // file URL 的 has_authority() 恒 true、username() 恒空：raw 含 `@` 是唯一防线。
+            "file:////alice:PW_LEAK@host",
+            // 锁定 fail-closed 取舍：合法路径含 `@` 也占位（与 #273 known 守卫同口径）。
+            "file:///tmp/user@host/repo",
         ] {
-            assert_eq!(git_url_for_display(source), REDACTED_GIT_SOURCE);
+            assert_eq!(git_url_for_display(source), REDACTED_GIT_SOURCE, "{source}");
         }
+    }
+
+    #[test]
+    fn hierarchical_supported_schemes_still_strip_userinfo() {
+        assert_eq!(
+            git_url_for_display("ssh://alice:PW_LEAK@example.com/repo.git"),
+            "ssh://example.com/repo.git"
+        );
+        assert_eq!(
+            git_url_for_display("git://alice:PW_LEAK@host/repo.git"),
+            "git://host/repo.git"
+        );
+        // file: host 可为空；合法 file 源不得被误杀。
+        assert_eq!(git_url_for_display("file:///abs/path"), "file:///abs/path");
+        assert_eq!(git_url_for_display("file://host/path"), "file://host/path");
     }
 
     #[test]

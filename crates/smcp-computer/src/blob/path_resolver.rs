@@ -204,7 +204,8 @@ pub fn resolve_read_roots_and_landing_root(
     env: Option<&EnvMap>,
     flag_settings_path: Option<&Path>,
 ) -> (Vec<ReadRoot>, Option<PathBuf>) {
-    let policy = resolve_policy_settings(None, None, None);
+    // policy 以**实例 env** 解析（与 reconcile/pending/ownership/config 快照同源；#248 v0.5.1 审查）。
+    let policy = resolve_policy_settings(env, None, None);
     let resolved = resolve_settings(ResolveSettingsArgs {
         cwd: Some(config_dir),
         env,
