@@ -16,7 +16,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! a2c-smcp = { version = "0.5.0", features = ["agent", "computer"] }
+//! a2c-smcp = { version = "0.5.1", features = ["agent", "computer"] }
 //! ```
 //!
 //! ## Example
